@@ -898,21 +898,59 @@ fn validate_scratch_dir(dir: &str) -> WorkspaceResult<()> {
     }
 }
 
+/// What is at `path`, without following a link; `None` when there is nothing.
+async fn lstat_if_exists(path: &Path) -> WorkspaceResult<Option<std::fs::Metadata>> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(WorkspaceError::io(
+            format!("cannot stat {}", path.display()),
+            e,
+        )),
+    }
+}
+
 impl Scratch {
     /// Make the repository if it is not there, and give it its root commit if it has none: what a
     /// crash in the middle leaves is finished by the next call.
+    ///
+    /// The project's directory is in the run's workspace, which the run's commands write: a link
+    /// there (to another run's project, to a mirror) would have `create_dir_all` and `git init`
+    /// make a repository where the link leads. So the directory and its `.git` are looked at
+    /// without following a link first (`lstat`), and nothing is made through one.
     async fn init(&self, author: &GitIdentity) -> WorkspaceResult<()> {
-        if !exists(&self.path.join(".git")).await? {
-            tokio::fs::create_dir_all(&self.path)
-                .await
-                .map_err(|e| WorkspaceError::io("cannot create the scratch directory", e))?;
-            // `--template=`: none of the system's sample hooks.
-            self.ws
-                .git()
-                .args(["init", "--quiet", "--initial-branch=main", "--template="])
-                .arg(&self.path)
-                .run()
-                .await?;
+        let refuse = |what: &Path, is: &str| {
+            WorkspaceError::Corrupt(format!(
+                "{} is {is}, not a directory of its own: the scratch project {} cannot be used; remove the run first",
+                what.display(),
+                self.dir
+            ))
+        };
+        match lstat_if_exists(&self.path).await? {
+            Some(meta) if !meta.is_dir() => return Err(refuse(&self.path, "a link or a file")),
+            _ => {}
+        }
+        let dot_git = self.path.join(".git");
+        match lstat_if_exists(&dot_git).await? {
+            Some(meta) if !meta.is_dir() => return Err(refuse(&dot_git, "a link or a file")),
+            Some(_) => {}
+            None => {
+                tokio::fs::create_dir_all(&self.path)
+                    .await
+                    .map_err(|e| WorkspaceError::io("cannot create the scratch directory", e))?;
+                // `--template=`: none of the system's sample hooks.
+                self.ws
+                    .git()
+                    .args(["init", "--quiet", "--initial-branch=main", "--template="])
+                    .arg(&self.path)
+                    .run()
+                    .await?;
+                // A link put there while the repository was being made: the repository is where
+                // the link leads, and the project is not usable.
+                if !safe_fs::is_plain_path(&self.ws.run_dir(&self.run), &self.path).await {
+                    return Err(refuse(&self.path, "a link"));
+                }
+            }
         }
         let has_commit = self
             .git()

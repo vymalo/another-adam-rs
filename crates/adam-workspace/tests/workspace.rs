@@ -3897,3 +3897,123 @@ async fn a_workspace_with_unreadable_metadata_leaves_none_of_its_directories_in_
     assert!(!staged("run-bbbbbbbb-2").exists());
     assert!(!b_admin.exists());
 }
+
+// ------------------------------------------------------------ a scratch project a run replaced by a link
+
+#[tokio::test]
+async fn a_scratch_directory_that_is_a_link_is_not_made_into_a_repository_where_it_leads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let first = run.add_scratch("fib", &me()).await.unwrap();
+
+    // The directory of another run's project (or any directory the coder can write), which has no
+    // repository yet: `git init` would make one in it.
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::rename(first.path(), first.path().with_extension("away")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, first.path()).unwrap();
+
+    let refused = run.add_scratch("fib", &me()).await.unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    assert!(
+        refused.to_string().contains("not a directory of its own"),
+        "{refused}"
+    );
+    assert!(
+        std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+        "nothing was made where the link leads"
+    );
+
+    // The same for a project that is not there yet: its name is a link planted before it was added.
+    let planted = run.path().join("notes");
+    std::fs::create_dir_all(run.path()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+    let refused = run.add_scratch("notes", &me()).await.unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Conflict(_)), "{refused}");
+    assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn a_scratch_projects_dot_git_that_is_a_link_or_a_file_is_refused_and_nothing_is_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_scratch("fib", &me()).await.unwrap();
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+
+    let dot_git = slot.path().join(".git");
+    std::fs::rename(&dot_git, slot.path().join("git.away")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &dot_git).unwrap();
+    let refused = run.add_scratch("fib", &me()).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("not a directory of its own"),
+        "{refused}"
+    );
+    assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+
+    std::fs::remove_file(&dot_git).unwrap();
+    std::fs::write(&dot_git, "gitdir: /somewhere\n").unwrap();
+    let refused = run.add_scratch("fib", &me()).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("not a directory of its own"),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dot_git).unwrap(),
+        "gitdir: /somewhere\n"
+    );
+}
+
+// ------------------------------------------------------------ the generation of a git directory
+
+#[tokio::test]
+async fn a_slot_made_again_under_the_same_name_has_another_generation_of_its_git_directory() {
+    let env = Env::new();
+    let run = env.ws.run("run-aaaaaaaa-1").unwrap();
+    let slot = run.add_repository(&env.repo).await.unwrap();
+    let wt = slot.worktree().unwrap();
+    let (admin, generation) = (
+        wt.git_dir().unwrap().to_owned(),
+        wt.git_dir_generation().expect("recorded").to_owned(),
+    );
+    // Found again, it is the same directory and the same generation (also by another handle).
+    let again = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let same = again
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    assert_eq!(
+        same.worktree().unwrap().git_dir_generation(),
+        Some(generation.as_str())
+    );
+
+    // The slot's directory is lost; adding the repository makes the worktree again, its directory
+    // in the mirror has the same name and is another directory.
+    std::fs::remove_dir_all(slot.path()).unwrap();
+    let remade = run.add_repository(&env.repo).await.unwrap();
+    let remade = remade.worktree().unwrap();
+    assert_eq!(remade.git_dir().unwrap(), admin, "the name is the same");
+    let new = remade.git_dir_generation().expect("recorded").to_owned();
+    assert_ne!(new, generation);
+    // A line of an annotation: lowercase hex and a dash.
+    assert!(
+        new.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
+        "{new}"
+    );
+    assert!(!new.contains(char::is_uppercase), "{new}");
+    assert_eq!(
+        run.slot(slot.dir())
+            .await
+            .unwrap()
+            .unwrap()
+            .worktree()
+            .unwrap()
+            .git_dir_generation(),
+        Some(new.as_str()),
+        "and it is what the metadata says now"
+    );
+}

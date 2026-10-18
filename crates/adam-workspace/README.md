@@ -33,7 +33,7 @@ authentication behave like the real tool.
 | `confine_git_env(&mut tokio::process::Command)`, `GIT_INHERITED_ENV` | the environment of a `git` a caller starts itself: empty, plus only the variables of `GIT_INHERITED_ENV` (`PATH`, `HOME`, the locale and temp dirs, certificate and proxy settings, `GIT_CONFIG_GLOBAL`). Every `git` this crate runs starts this way, and the coder's own (`git apply`, the tree-id probes) too ([below](#git-starts-from-an-empty-environment)) |
 | `login_shell()` | `bash` where the image has one, else `sh` (the shell of a `Program::Shell`) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
-| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `mirror` (the bare mirror the worktree is linked to: an environment that runs `git` in the worktree has to read it), `dir` (the slot's name), **`git_dir`** (the worktree's directory in the mirror, from the coder's metadata; `None` when it cannot be told), **`git_pin`**, `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)` (committed onto the run's own branch explicitly, whatever `HEAD` says), `push` (the run's own branch), `publish` (moves the continued branch), `base_commit` (what `origin/<base>` is at), `add_base_checkout` / `remove_base_checkout` (a temporary detached checkout of it, a `BaseCheckout`, below) |
+| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `mirror` (the bare mirror the worktree is linked to: an environment that runs `git` in the worktree has to read it), `dir` (the slot's name), **`git_dir`** (the worktree's directory in the mirror, from the coder's metadata; `None` when it cannot be told), **`git_dir_generation`** (a token that is new each time the coder makes that directory: the name is the same when a slot is made again, the directory is not, and a pod's mounts follow the directory; `None` for a worktree made before it was recorded), **`git_pin`**, `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)` (committed onto the run's own branch explicitly, whatever `HEAD` says), `push` (the run's own branch), `publish` (moves the continued branch), `base_commit` (what `origin/<base>` is at), `add_base_checkout` / `remove_base_checkout` (a temporary detached checkout of it, a `BaseCheckout`, below) |
 | `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files (`FileStatus` is `Display`: `modified`, `type changed`) |
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString`, and `acts_for() -> Option<Vec<String>>` (the accounts the credentials are confined to: a GitHub App's, `None` for a token; **a provided method**, so an implementer keeps compiling; `HostScoped` forwards it) |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
@@ -124,7 +124,7 @@ command wrote. So the coder **records the worktree's directory in the mirror** (
 optional) when it makes the worktree, and every `git` it runs on the slot is **pinned** (`GitPin`):
 `GIT_DIR=<mirror>/worktrees/<name>`, `GIT_COMMON_DIR=<mirror>`, `GIT_WORK_TREE=<slot>`. Git's reference store still follows
 `commondir` (*verified*, git 2.43.0), and the coder cannot put it right by writing it (it would open a file a run can replace by a
-link), so **a run pod cannot write it** (`adam-env-kubernetes` mounts `commondir`, `gitdir` and `logs` of the directory
+link), so **a run pod cannot write it** (`adam-env-kubernetes` mounts `HEAD`, `commondir`, `gitdir` and `logs` of the directory
 read-only) and `GitPin::check` only refuses a worktree whose `commondir` is not what git wrote. `commit_all` commits onto
 `refs/heads/<the run's branch>` with `commit-tree` and `update-ref` (the old tip as the compare), because `HEAD` is a file a
 command can write.
@@ -169,17 +169,27 @@ mirror. Anything a run puts where the coder will look is met with the coder's ri
   (`GitPin::check`); and `git worktree remove`, which resolves a link and deletes the worktree it leads to when the path is not the one a worktree is
   registered at (*verified*, git 2.43.0; a run that wrote its own `gitdir` arranges that), is asked only about a path that is plain all the way down;
 * git itself appends to the reflog through a link (*verified*, git 2.43.0): `GitPin::check` refuses a worktree whose `logs` or
-  `logs/HEAD` is not plain, and a run pod cannot replace them (they are read-only mounts).
+  `logs/HEAD` is not plain, and a run pod cannot replace them (they are read-only mounts);
+* a scratch project's directory and its `.git` are looked at without following a link before `create_dir_all` and `git init` (on every
+  `add_scratch`): a link or a file there is `WorkspaceError::Corrupt`, and nothing is made where the link leads;
+* a worktree is moved into its slot with `git worktree move`, which follows a link on the way and, when something is at the destination,
+  moves the tree **into** it. The way to the destination is looked at before the move and after it; when the new directory in the mirror
+  does not name the destination, or a link appeared on the way, the directory in the mirror, the staging copy and the tree where git put
+  it (if the way to it is plain) are removed and the call fails. A tree behind a link is left, not removed through the link.
 
 What this does not close is a swap between a check and the use that follows it: the pod's commands run while the coder checks. In a run
-pod the files that matter (`commondir`, `gitdir`, `logs`) are read-only mounts and cannot be swapped; a slot's directory can be (a run
-may rename it), and the window is the time between `GitPin::check` and git's own read. Local mode and Podman share the coder's container
+pod the files that matter (`HEAD`, `commondir`, `gitdir`, `logs`) are read-only mounts and cannot be swapped; a slot's directory can be (a run
+may rename it), and the window is the time between `GitPin::check` and git's own read (and, for the move into a slot, the time between
+the look at the destination and git's move: detected afterwards and undone, not prevented). Local mode and Podman share the coder's container
 or bind the mirror read-write, and are not protected at all ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md), "Known limits").
 Tests: `workspace.rs`, `a_commondir_that_is_a_link_is_refused_and_nothing_is_written_through_it`, `a_commondir_that_is_a_pipe_is_refused_and_does_not_hang_the_coder`,
 `a_temporary_index_is_not_a_name_a_run_can_plant_a_link_at`, `an_index_that_is_a_link_is_refused_and_nothing_is_copied_from_it`,
 `a_slot_that_is_a_link_to_another_runs_slot_is_not_a_slot`, `removing_a_run_whose_slot_became_a_link_does_not_remove_what_the_link_leads_to`,
 `a_base_checkout_directory_that_is_a_link_is_replaced_and_never_followed`, `a_planted_reflog_link_is_not_appended_to`,
-`a_gitdir_file_that_is_a_pipe_does_not_hang_the_coder`; `safe_fs.rs` has unit tests.
+`a_gitdir_file_that_is_a_pipe_does_not_hang_the_coder`, `a_scratch_directory_that_is_a_link_is_not_made_into_a_repository_where_it_leads`,
+`a_scratch_projects_dot_git_that_is_a_link_or_a_file_is_refused_and_nothing_is_made`,
+`a_slot_made_again_under_the_same_name_has_another_generation_of_its_git_directory`; `workspace.rs` (`placement_tests`: a directory that appeared at
+the destination, a tree behind a link, a destination there before the move, a parent that is a link) and `safe_fs.rs` have unit tests.
 
 ### A check on the base: `BaseCheckout`
 

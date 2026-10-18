@@ -31,6 +31,8 @@ pub struct Worktree {
     mirror: PathBuf,
     /// The worktree's directory in the mirror's `worktrees/`, from the coder's metadata.
     admin: Option<PathBuf>,
+    /// Which making of `admin` this is (see [`Worktree::git_dir_generation`]).
+    admin_gen: Option<String>,
 }
 
 impl fmt::Debug for Worktree {
@@ -146,6 +148,13 @@ impl Worktree {
                 .as_deref()
                 .filter(|name| is_admin_name(name))
                 .map(|name| mirror.join("worktrees").join(name)),
+            admin_gen: meta
+                .admin
+                .as_deref()
+                .filter(|name| is_admin_name(name))
+                .and(meta.admin_gen.as_deref())
+                .filter(|token| crate::workspace::is_generation(token))
+                .map(str::to_owned),
             mirror,
         }
     }
@@ -225,6 +234,15 @@ impl Worktree {
     /// recorded, and a mirror with no or several candidates.
     pub fn git_dir(&self) -> Option<&Path> {
         self.admin.as_deref()
+    }
+
+    /// A token that is new each time the coder makes the directory [`git_dir`](Self::git_dir) names.
+    /// The name is the same when a slot is removed and added again, the directory is not, and a run
+    /// pod's mounts follow the directory it was made with: a caller that records what a pod mounts
+    /// records this with the path, and makes the pod again when it changes. `None` for a worktree
+    /// made before it was recorded, and without a git directory.
+    pub fn git_dir_generation(&self) -> Option<&str> {
+        self.admin.as_ref().and(self.admin_gen.as_deref())
     }
 
     /// Where `git` works for this worktree: [`git_dir`](Self::git_dir) and the mirror, with the
