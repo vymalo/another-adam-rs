@@ -42,7 +42,7 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    | `<root>/workspaces/<run>` | read-write | the run's slots |
    | `<root>/git/<host>/<owner>/<repo>.git`, for each worktree slot | **read-only** | the objects, refs and configuration a worktree's `.git` file points into |
    | `<root>/git/<host>/<owner>/<repo>.git/worktrees/<name>`, for each worktree slot | read-write, mounted on top | the worktree's `HEAD` and `index`, which `git status` refreshes |
-   | `.../worktrees/<name>/commondir`, `.../gitdir` and `.../logs` | **read-only**, mounted on top of that | what the coder's `git` follows out of the directory (decision 7), what ties it to its slot, and the reflog it appends to |
+   | `.../worktrees/<name>/HEAD`, `commondir`, `gitdir` and `logs` | **read-only**, mounted on top of that | the branch the coder's `reset` moves (decision 11), what its `git` follows out of the directory (decision 7), what ties it to its slot, and the reflog it appends to |
 
    Nothing of `meta/`, of another run, or of another repository's mirror is in the pod. `<name>` is `<run>+<slot>` (decision 9)
    and **comes from the coder's metadata, never from the slot's `.git` file** (decision 6). A bind mount of a file or of a
@@ -50,8 +50,8 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    directory around it is writable and its files belong to the very uid that tries. A
    scratch slot is a repository inside the run's directory and needs nothing more. The legacy worktree of a run
    (`<root>/worktrees/<run>`) is outside the run's directory, where `prepare` already refuses a working directory, and
-   gets no mount. A worktree whose directory in the mirror is not known (decision 6), or whose `commondir`, `gitdir` or `logs`
-   is not what git wrote (a link, a pipe, a missing file; a missing `logs` is made by the coder), gets no git mounts and a
+   gets no mount. A worktree whose directory in the mirror is not known (decision 6), or whose `HEAD`, `commondir`, `gitdir` or
+   `logs` is not what git wrote (a link, a pipe, a missing file; a missing `logs` is made by the coder), gets no git mounts and a
    warning in the log: less access is safe, and the next `ensure` tries again.
 2. **The template marks the workspace by mounting its volume once, whole, at the workspace root; the code replaces that
    mount.** This amends decision 2 of ADR 0019: the code fills in the pod's name, namespace, labels and annotations,
@@ -62,10 +62,17 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    the pod does not have, or when the volume is mounted by any other container or a second time. Where the template
    mounts the volume is where the `subPath`s start.
 3. **The mounts of a pod are fixed when it is made, so a repository added later needs a pod made again.** The pod's
-   annotation `adam.vymalo.com/workspace-mounts` records its mounts (`rw <path>` / `ro <path>`, one per line). Each
+   annotation `adam.vymalo.com/workspace-mounts` records its mounts (`rw <path>` / `ro <path>`, one per line; the lines of
+   a worktree's directory in the mirror end in ` @<generation>`, below). Each
    `ensure` computes the mounts the run's workspace needs now and compares: a mount the pod lacks (a worktree slot added
    since; a pod of the earlier version, which has no annotation and mounts everything) is a reason to make the pod
-   again, and a mount the pod has and the run no longer needs is not. `ensure` asks the pod with `adam-exec active`:
+   again, and a mount the pod has and the run no longer needs is not. **A bind mount follows a directory and not its name**:
+   a slot whose directory was lost and added again has the same name for its directory in the mirror (decision 9) and a new
+   directory under it, and the pod's mounts, whose lines would be the same, keep the deleted one, so git in the pod would see
+   a `HEAD` and an index that are not the coder's. So the coder records a *generation* in the slot's metadata (`admin_gen`, new
+   each time it makes the directory: the time in nanoseconds and a count, in hex), `Worktree::git_dir_generation` says it, and
+   the lines of the directory and of its four read-only entries carry it: a changed generation is a mount the pod lacks. A
+   slot made before the generation was recorded has none, and its lines are what they were. `ensure` asks the pod with `adam-exec active`:
    with no command running it deletes the pod and makes another (the files are on the volume, ADR 0019 decision 5);
    with one running, or when the pod cannot be asked, it answers `EnvError::Unavailable`, which the caller waits out as
    it waits for a slot (ADR 0019 decision 6, up to `RUN_POD_WAIT_SECS`). A command prepared a moment before is killed
@@ -107,7 +114,7 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    |---|---|---|
    | `.git` file of the slot | ignored once `GIT_DIR` is set (*verified*: a clean filter planted in the repository it names did not run, and ran for an unpinned `git add -A`) | pinned |
    | `commondir` of the worktree's directory | `GIT_COMMON_DIR` wins for the configuration, hooks, attributes and objects (*verified*: the planted filter did not run), **but git's reference store still reads the file** (`refs/remotes/origin/main` was "not a valid object name" with `commondir` pointing at another directory) | a **read-only mount** in a run pod, so a run cannot write it; the coder only **checks** it (`GitPin::check`: a regular file, opened without following a link, that says `../..`) and refuses git on the worktree otherwise. It does not put the file back: the first version did, by opening the file a run can replace by a link, and wrote through the link to any file the coder can write (*verified* by a test that failed before) |
-   | `HEAD` of the worktree's directory | data, but `git commit` follows it: a run that points it at another run's branch has the coder commit its files there (*verified* with a test that failed before) | the commit is made with plumbing onto `refs/heads/<the run's branch>`, whatever `HEAD` says, with the old tip as the compare-and-swap (`commit_all_in`) |
+   | `HEAD` of the worktree's directory | data, but `git commit` follows it: a run that points it at another run's branch has the coder commit its files there (*verified* with a test that failed before); and `reset` follows it too (decision 11) | the commit is made with plumbing onto `refs/heads/<the run's branch>`, whatever `HEAD` says, with the old tip as the compare-and-swap (`commit_all_in`); the coder's snapshot and restore take the branch from the metadata (decision 11); and a **read-only mount** in a run pod, so a run cannot write it |
    | `config.worktree` of the worktree's directory | read **only** with `core.repositoryformatversion` 1 **and** `extensions.worktreeConfig` true in the common configuration (*verified*: with both, a filter in it ran; with format 0 it did not) | the coder makes format-0 mirrors and never turns the extension on (a test pins both); `extensions.worktreeConfig` is among the keys the workspace removes from the mirror's configuration before a credentialed command |
    | `logs/HEAD` of the worktree's directory | git **appends** to the file a link there names (*verified* with git 2.43.0: a line `<old> <new> <identity> <time> <message>` was added to a file that is not a log), which would corrupt any file the coder can write, the mirror's `config` among them | `logs` is a read-only mount in a run pod, and `GitPin::check` refuses a worktree whose `logs` or `logs/HEAD` is a link or a pipe (a check, not a seal, where nothing is mounted) |
    | `index` | data: no command named in it runs (`core.fsmonitor` is forced off); the coder copies it (`diff_stat`, the tree ids) | read as a regular file and copied into a private directory of the coder (decision 10) |
@@ -125,7 +132,8 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    `fetch` that brings objects, and a script that installs hooks (`husky install`). **So does moving `HEAD`** (`switch --detach`,
    `checkout <commit>`): it appends to `logs/HEAD`, which is read-only (decision 1), and git says "unable to append to ...
    Read-only file system". Before decision 1 had `logs` it worked; the coder's `run_command` undoes and refuses such a change
-   anyway. That is the point, and the coder does the
+   anyway. `HEAD` itself is a read-only file there (decision 11): `blame`, `show`, `for-each-ref` and `branch --show-current` work,
+   and nothing git does for what a check needs writes `HEAD`. That is the point, and the coder does the
    committing (ADR 0010: git stays in the coder). The mirror's `worktrees/` still lists every run's directory of that
    repository, with their `HEAD`, index and log (below).
 
@@ -141,6 +149,14 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    directory that carries no run and names the same slot), removes a run's directories by name when the run goes (and, when its
    metadata cannot be read, every `<run>+...` directory of every mirror), and does not judge another run's directory stale,
    whatever its `gitdir` says. The base checkout (`add_base_checkout`) is called `<run>+<slot>+base` and made the same way.
+    The directories above the destination (the run's directory, `.adam-base`) are the run's to write, and `git worktree move`
+    follows a link there and, when something is at the destination, moves the tree **into** it. So the way to the destination
+    is looked at before the move and again after it (every component a plain directory, from the run's directory down), and the
+    new directory in the mirror must name the destination. When it does not, the coder removes the directory in the mirror, the
+    staging copy and the tree where git put it (`<destination>/<name>`) **if the way to it is plain**, and returns an error that
+    says where it went; a tree behind a link is left (a removal would follow the link to wherever the run points it by now: it is
+    inert, its directory in the mirror being gone), and so is a directory that appeared at the destination, which is not the
+    coder's. A swap in the milliseconds between the first look and the move is detected and undone this way, not prevented.
 10. **What the coder opens in a directory a run can write, it opens without following a link.** The run's pod writes
     its run's directory and the worktree's directory in the mirror, and the coder later meets whatever it left there, with the
     rights of the coder, which holds the whole volume and the GitHub App's key (`crates/adam-workspace/src/safe_fs.rs`):
@@ -155,11 +171,38 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
       pinned to (`GitPin::check`): a link in place of a slot, to another run's slot, is not a slot, is not listed, and is refused
       by every `git`; the coder's file tools (`confine`) look at the root without following a link before they canonicalise it. The
       first version took such a link for a slot (*verified*: another run's `.env` was committed on this run's branch);
+    * a scratch project's directory and its `.git` are looked at without following a link before `create_dir_all` and `git init`
+      (`Scratch::init`, on every `add_scratch`), and are refused when they are a link or a file: the first version asked `try_exists`,
+      which follows a link, and made the repository where the link led. The repository's `info/exclude`, which a snapshot reads
+      and a restore writes, is read as a regular file, and written by replacing it; `info` must be a directory itself, or the
+      state is not known and nothing is run (`run_command`'s `RepoState`);
     * `git worktree remove` resolves a link and deletes the worktree it leads to (*verified*, git 2.43.0) when the path is not
       the one a worktree is registered at (a run that writes its own `gitdir`, as local mode, Podman and a pod made before the
       mounts can, arranges that; when it is, git checks that the `.git` file points back and refuses), so it is asked only about a
       path that is plain all the way down from the run's directory; a link is removed, not followed. The same holds for the base
       checkout and its directory `.adam-base`.
+
+11. **`HEAD` of the worktree's directory is read-only in a run pod, and the coder's restore takes the run's branch from its
+    metadata.** `HEAD` is a file the run's pod could write (the directory is read-write for `index`), and `reset` and `commit`
+    act on the branch it names. The coder's `run_command` and `run` snapshot the worktree before a command and put it back when
+    the command changed what it must not; the first version took the branch to put `HEAD` on, and to reset, from `HEAD` itself:
+    when a command (or an earlier one) had written another run's `agent/*` branch there, the restore reset **that** branch to the
+    commit the snapshot had seen (*verified*: a test failed before; the other run's branch was moved back to the older commit).
+    Now:
+    * in a run pod `HEAD` is a **read-only file mount** like `commondir` (decision 1). Git in the pod does not write it: it cannot move a
+      ref (the mirror is read-only), and the commands that move `HEAD` fail anyway on the reflog (decision 8). *Verified 2026-10-18*
+      with `git-in-run-pod.sh` (status, log, diff, describe, blame, show, for-each-ref, `branch --show-current`, `checkout -- <file>`
+      and a refreshed index work; a write, append, rename over, removal or link at `HEAD`, `symbolic-ref HEAD` and `update-ref
+      --no-deref HEAD` fail; the script fails when `HEAD` is left out of the mounts). The coder does not rewrite it either: it puts
+      `HEAD` back only when it differs (`point_head`), because a file replaced by a new one is a file the pod's mount no longer
+      follows (the problem of decision 3);
+    * the snapshot of a repository's worktree (`Snapshot::of_slot`) takes the branch from `Worktree::local_branch`, never from
+      `HEAD`; it records whether `HEAD` was on `refs/heads/<that>`; when it was not, `run_command` and `run` **run nothing**
+      and say so ("HEAD of this worktree is on ..., not on the run's own branch ...: nothing was run ... tell the person"), and a
+      restore from such a snapshot writes nothing and returns `false`. A restore of a worktree whose `HEAD` was on its branch
+      before the command puts `HEAD` back on that branch and resets that branch only;
+    * `reset` follows `HEAD`, so a `HEAD` that is flipped between the restore's `symbolic-ref` and its `reset` would still be
+      followed. In a pod `HEAD` cannot be flipped; in local mode and Podman, which nothing here protects (Known limits), it can.
 
 ## Known limits, not built
 
@@ -185,10 +228,9 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   coder's container, which holds the GitHub App key. Closing it needs the coder's git to run apart from the coder's secrets
   (another user, or a sandbox), or to refuse a worktree with an embedded repository (racy, since the run writes the index
   and the directory at any time). Open decision 6.
-* **A run's commands can still write `HEAD` and the index of their own directory in the mirror.** `HEAD` decides
-  what `status`, `diff` and `describe` say and what the model is told (the coder's own commit does not follow it, decision 7);
-  the index is the content of the next commit, which is the run's own work. (`commondir`, `gitdir` and `logs` cannot be written
-  from a pod, decision 1.)
+* **A run's commands can still write the index of their own directory in the mirror.** The index is the content of the next
+  commit, which is the run's own work. (`HEAD`, `commondir`, `gitdir` and `logs` cannot be written from a pod, decisions 1 and 11;
+  in local mode and Podman `HEAD` can, and the coder's commit and restore do not follow it.)
 * **A swap between a check and the use that follows it is not closed for a slot's directory.** `GitPin::check` and the reads of
   decision 10 look at a path and then git (or the coder) uses it; in a run pod the files that matter (`commondir`, `gitdir`,
   `logs`) are mounts and cannot be swapped, but a slot's directory can be renamed by the run's commands at any time, and a link put
@@ -198,7 +240,10 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
 * **A scratch project is a repository the run controls entirely.** Its `.git` is a directory in the run's directory, with its own
   `config` (a `filter.*.clean` or a `core.fsmonitor` there runs in the coder's `git add -A`, decision 7's open decision 6), its
   own `logs` (the link-append of decision 7 reaches any file through `.git/logs/HEAD`), and its own hooks (off). The pin requires
-  `.git` to be a plain directory without a `commondir`; it cannot make what is inside it the coder's. The remedy is the one for the
+  `.git` to be a plain directory without a `commondir`; it cannot make what is inside it the coder's. The coder's own reads and
+  writes of its files are made without following a link (decision 10: `info/exclude`), but `git` itself reads `info/exclude`,
+  `info/attributes` and `packed-refs` there with a plain `open`: a link or a pipe at one of them would be followed or waited on by the
+  coder's `git add -A` (*unverified*: not tried). The remedy is the one for the
   embedded repository below: the coder's git apart from the coder's secrets.
 * **Slots made before decision 9 keep git's own names** (`worktrees/<repo>`, no run in them). They are found by the one `gitdir`
   that names the slot among the directories that carry no run, as before; a run that owns another such directory can make that
@@ -248,6 +293,14 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   on another run's branch; and a pipe where the coder reads a file hung it. Each of those in `crates/adam-workspace/tests/workspace.rs`
   failed when run against the sources of the first version (`dc7e4d5`); the tests of `bin/adam-coder` (`gitcli.rs`, `files.rs`) were
   written with the change and are the same cases on the coder's side.
+* The behaviours of decisions 3, 9 to 11 added by the third version, *verified 2026-10-18* with git 2.43.0 and each failing against
+  the sources of `5aa41e5`: a snapshot taken with `HEAD` on another run's branch restored by resetting that branch
+  (`bin/adam-coder` `head_tests`, and `run_command` and `run` refusing, `tests/tools.rs`); a slot made again under the same name
+  gives the pod's annotation another line, and the pod is made again (`fake.rs`, with the generation of `tests/workspace.rs`); `git
+  worktree move` into a directory that appeared at the destination puts the tree at `<destination>/<name>` and leaves the directory
+  in the mirror naming it (`placement_tests`); a scratch directory or `.git` that is a link was made into a repository where it led
+  (`tests/workspace.rs`); `info/exclude` as a link was read and written through (`exclude_tests`); a read-only bind mount of `HEAD`
+  cannot be written, renamed over, removed or linked, and git's read-only commands work with it (`git-in-run-pod.sh`).
 * The policy's expressions: *verified 2026-10-18* with an independent CEL implementation (cel-python) on thirteen sample
   pods (the intended pod admitted; another key, another Secret's key, a Secret volume, an init container's reference,
   `envFrom` and a projected Secret refused; a ConfigMap reference admitted); *unverified* against the API server's own
@@ -276,6 +329,13 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    make the coder's git append to any file it can write; the coder could instead never write the worktree's reflog (its own
    `update-ref` through the mirror, its restores without `reset`), which is a rewrite of `run_command`'s restore and does not hold
    for a future command.
+8. **`HEAD` is read-only in a run pod, and a worktree whose `HEAD` is not on its branch runs no command.** Sealing `HEAD` closes
+   the reset of another run's branch for pods; the metadata rule closes it for the coder's own state and covers local mode and
+   Podman up to the race in decision 11. The cost: a run that wanted to move `HEAD` by hand in its pod could not (it already
+   could not, decision 7 of this list), and a worktree that is found with `HEAD` elsewhere (only a command that wrote the file can
+   have done it) is not usable by `run_command` and `run` until the person looks at it, instead of being put right by the coder. The
+   alternative is to put `HEAD` back on the run's branch and go on, which leaves the question of what else that command changed.
+   A pod made before this change has no `HEAD` mount in its annotation and is made again once, when no command runs in it.
 6. **The embedded-repository vector above.** Run the coder's git apart from its secrets (a user of its own or a sandbox), or
    accept it while every run is a person who may be trusted with the coder's container. (The pin and the explicit commit
    are decided and built; whether the Podman devcontainer should get a read-only mirror too is still open.)
@@ -286,11 +346,14 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   run, of `meta/` or of any other repository's mirror. It can no longer write what the coder's git reads in other runs.
 * A run that adds a repository while a command runs waits for it to end; one that adds a repository while nothing runs
   pays the making of a pod (scheduling, and a pull on a node that lacks the image) once more.
-* A pod made by the earlier version is made again at the next `ensure` (it has no annotation), after its command ends.
+* A pod made by the earlier version is made again at the next `ensure` (it has no annotation, or lacks the `HEAD` mount), after its
+  command ends; and so is the pod of a run whose slot was made again under the same name (the generation).
 * The coder's `git` on a slot is pinned and `Worktree::commit_all` commits with plumbing onto the run's own branch; this
   holds in local mode and with Podman too (the pin names the directories git would have found). A slot made before the
   directory in the mirror was recorded is resolved from the mirror at its next listing, or refused if that is ambiguous.
-  `Worktree` gains `git_dir` and `git_pin`, `Slot` and `Scratch` gain `git_pin`, and the new public type is `GitPin`.
+  `Worktree` gains `git_dir`, `git_dir_generation` and `git_pin`, `Slot` and `Scratch` gain `git_pin`, and the new public type is
+  `GitPin`. `WorktreeDirs` gains the field `generation` and `Mount` the method `generation` (a struct literal of `WorktreeDirs`
+  needs the field).
 * `PodTemplate::parse` and `from_file` take the workspace root; `render` takes the mounts; `MOUNTS_ANNOTATION`,
   `WorkspaceMounts`, `Mount` and `WorktreeDirs` are new. The chart's template, its policy and the goldens change; no value
   and no environment variable does, and `RUN_ENVIRONMENT=local` and `runPods.enabled: false` are as they were.
@@ -303,3 +366,8 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   read-only mounts and `GitPin::check` only checks (decisions 1 and 7), where the first version rewrote `commondir` through the link
   the run had put there; the sibling `worktrees/*` exposure is stated (Known limits); moving `HEAD` in a pod no longer works (decision
   8, owner decision 7). The residual races and the scratch project are in Known limits.
+* **2026-10-18, after the second review.** `HEAD` of the worktree's directory is a read-only mount, and the coder's snapshot and
+  restore take the run's branch from the metadata and run nothing when `HEAD` is elsewhere (decision 11); a scratch project's
+  directory and `.git` are looked at without following a link before they are made, and its `info/exclude` is read and written like
+  `commondir` (decision 10); `git worktree move` is verified afterwards and undone when it went somewhere else (decision 9); the
+  mounts of a pod carry the generation of the worktree's directory, so a slot made again has the pod made again (decision 3).
