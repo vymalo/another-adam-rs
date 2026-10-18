@@ -11,6 +11,8 @@
 #
 #   * the objects the chart renders for runPods apply, the quota and the admission policy take effect, and a run pod
 #     made from the chart's own template runs commands, is killed, swept when idle and released (the cluster test);
+#   * a run pod sees only its own run (ADR 0041): the volume is seeded with two runs, a mirror and another mirror, and
+#     the cluster test makes the pod of one run and looks at what it can see, read and write;
 #   * not that the coder runs a task over a model through it, and not the NetworkPolicy (kind's network plugin may not
 #     enforce one).
 #
@@ -82,6 +84,61 @@ open(sys.argv[2], "w").write("---\n".join(keep))
 PY
 kubectl apply -n "$namespace" -f "$work/run-pods.yaml"
 
+say "the volume's content for the isolation check: two runs of one mirror, the second's metadata, another mirror"
+# As the coder would have left it: a bare mirror with a worktree for each run (git picks the directory of each in the
+# mirror's worktrees/), a file only the second run has, its metadata, and a mirror of another repository.
+# shellcheck disable=SC2016  # the $mirror of the script is the pod's to expand
+seed_script='set -eu
+export HOME=/tmp GIT_CONFIG_GLOBAL=/dev/null GIT_AUTHOR_NAME=seed GIT_AUTHOR_EMAIL=seed@example.test GIT_COMMITTER_NAME=seed GIT_COMMITTER_EMAIL=seed@example.test
+mirror=/work/git/example.test/o/r.git
+mkdir -p /work/git/example.test/o /work/git/example.test/p /work/workspaces/kind-iso-a /work/workspaces/kind-iso-b /work/meta/kind-iso-b
+git init -q --bare -b main "$mirror"
+git init -q --bare -b main /work/git/example.test/p/other.git
+git init -q -b main /tmp/seed
+cd /tmp/seed
+echo hi > README.md
+git add README.md
+git commit -qm seed
+git push -q "$mirror" main
+cd "$mirror"
+git branch --no-track agent/kind-iso-a main
+git branch --no-track agent/kind-iso-b main
+git worktree add -q /work/workspaces/kind-iso-a/r agent/kind-iso-a
+git worktree add -q /work/workspaces/kind-iso-b/r agent/kind-iso-b
+echo private > /work/workspaces/kind-iso-b/r/private.txt
+echo "{}" > /work/meta/kind-iso-b/r.json
+sed -n "s/^gitdir: //p" /work/workspaces/kind-iso-a/r/.git'
+kubectl delete pod seed -n "$namespace" --ignore-not-found --wait=true
+kubectl apply -n "$namespace" -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seed
+spec:
+  terminationGracePeriodSeconds: 1
+  automountServiceAccountToken: false
+  securityContext: {runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, fsGroup: 10001}
+  containers:
+    - name: seed
+      image: $image:$tag
+      imagePullPolicy: IfNotPresent
+      command: [sleep, "600"]
+      volumeMounts:
+        - {name: work, mountPath: /work}
+  volumes:
+    - name: work
+      persistentVolumeClaim: {claimName: work-test}
+YAML
+kubectl wait pod/seed -n "$namespace" --for=condition=Ready --timeout=180s \
+  || { kubectl describe pod seed -n "$namespace" | tail -n 40 || true; exit 1; }
+# The last line the seed prints is where git put the first run's directory in the mirror.
+kubectl exec -n "$namespace" seed -- sh -c "$seed_script" > "$work/seed.out" \
+  || { cat "$work/seed.out" >&2; exit 1; }
+isolation_admin=$(tail -n 1 "$work/seed.out")
+kubectl delete pod seed -n "$namespace" --wait=true
+say "the first run's worktree directory in the mirror is $isolation_admin"
+case "$isolation_admin" in /work/git/example.test/o/r.git/worktrees/?*) ;; *) echo "unexpected: $isolation_admin" >&2; exit 1 ;; esac
+
 say "the admission policy is in force"
 i=0
 while [ "$i" -lt 30 ]; do
@@ -126,6 +183,8 @@ ADAM_TEST_KUBE_INSTANCE=coder \
 ADAM_TEST_KUBE_WORKER=ci-0 \
 ADAM_TEST_KUBE_QUOTA_PODS=4 \
 ADAM_TEST_KUBE_MODEL_KEY="$secret_key" \
+ADAM_TEST_KUBE_ISOLATION_MIRROR=/work/git/example.test/o/r.git \
+ADAM_TEST_KUBE_ISOLATION_ADMIN="$isolation_admin" \
 ADAM_TEST_REQUIRE_KUBERNETES=1 \
   cargo test --locked -p adam-env-kubernetes --test cluster -- --nocapture || status=$?
 

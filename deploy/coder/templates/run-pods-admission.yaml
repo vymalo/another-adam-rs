@@ -1,5 +1,6 @@
 {{- if and (include "coder.runPods" .) (eq (toString .Values.runPods.admissionPolicy.enabled) "true") }}
 {{- $secret := include "coder.secretName" . -}}
+{{- $secretKey := include "coder.runPodSecretKey" . -}}
 {{- $claim := include "coder.runPodWorkClaim" . -}}
 {{- /* With cache.*, the package cache's claim is the second one a run pod may mount (ADR 0040). */ -}}
 {{- $claims := list $claim -}}
@@ -8,7 +9,9 @@
 # runPods.enabled: the guard that lets the coder make pods without being able to read the namespace's other Secrets,
 # mount the host, or run anything privileged. It applies to pods CREATED BY the coder's ServiceAccount (the match
 # condition) in this namespace (the binding), and refuses any that is not the intended run pod. Without it the RBAC
-# alone would let the coder create any pod in its namespace. Needs Kubernetes 1.30 or later (admissionregistration.k8s.io/v1).
+# alone would let the coder create any pod in its namespace. A run pod may reference exactly one Secret key, the model
+# key, by the Secret's name and the key: no Secret volume, no envFrom, no other key of that Secret (ADR 0041).
+# Needs Kubernetes 1.30 or later (admissionregistration.k8s.io/v1).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -37,14 +40,14 @@ spec:
     - expression: {{ printf "variables.containers.all(c, c.image in [%s])" (include "coder.runPodAllowedImages" . | trim | splitList "\n" | join "', '" | printf "'%s'") | quote }}
       message: "a run pod uses only the images the chart allows"
     {{- if gt (len $claims) 1 }}
-    - expression: {{ printf "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName in ['%s']) || (has(v.secret) && v.secret.secretName == '%s'))" (join "', '" $claims) $secret | quote }}
-      message: {{ printf "a run pod mounts only emptyDir volumes, the claims %s and the Secret %s: no hostPath, no other Secret or claim" (join " and " $claims) $secret | quote }}
+    - expression: {{ printf "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName in ['%s']))" (join "', '" $claims) | quote }}
+      message: {{ printf "a run pod mounts only emptyDir volumes and the claims %s: no hostPath, no Secret, no other claim" (join " and " $claims) | quote }}
     {{- else }}
-    - expression: {{ printf "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == '%s') || (has(v.secret) && v.secret.secretName == '%s'))" $claim $secret | quote }}
-      message: {{ printf "a run pod mounts only emptyDir volumes, the claim %s and the Secret %s: no hostPath, no other Secret or claim" $claim $secret | quote }}
+    - expression: {{ printf "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == '%s'))" $claim | quote }}
+      message: {{ printf "a run pod mounts only emptyDir volumes and the claim %s: no hostPath, no Secret, no other claim" $claim | quote }}
     {{- end }}
-    - expression: {{ printf "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || e.valueFrom.secretKeyRef.name == '%s')) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))" $secret | quote }}
-      message: {{ printf "a run pod reads no Secret but %s, and only by key" $secret | quote }}
+    - expression: {{ printf "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || (e.valueFrom.secretKeyRef.name == '%s' && e.valueFrom.secretKeyRef.key == '%s'))) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))" $secret $secretKey | quote }}
+      message: {{ printf "a run pod references no Secret but the key %s of %s (as one variable): no Secret volume, no envFrom, no other key" $secretKey $secret | quote }}
     - expression: "variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && (!has(c.securityContext.privileged) || c.securityContext.privileged == false))"
       message: "a run pod is not privileged and sets allowPrivilegeEscalation: false on every container"
     - expression: "variables.containers.all(c, (has(c.securityContext) && has(c.securityContext.runAsUser) ? c.securityContext.runAsUser : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser) ? object.spec.securityContext.runAsUser : 0)) != 0 && (has(c.securityContext) && has(c.securityContext.runAsNonRoot) ? c.securityContext.runAsNonRoot : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) ? object.spec.securityContext.runAsNonRoot : false)))"
