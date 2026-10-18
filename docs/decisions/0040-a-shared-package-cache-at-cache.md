@@ -158,4 +158,7 @@ stays as a per-node or per-release local cache, or goes. Products are not chosen
 
 ## Amended
 
-Nothing yet.
+*2026-10-18 ([ADR 0041](0041-a-run-pod-sees-only-its-own-run.md), proposed):* "one trust domain: every run on it is the owner's" holds
+only while the runs are. Once runs belong to different people, one run can write into the cache other people's builds read
+(cross-tenant integrity). Nothing about the cache changes; "a cache for each person, or read-only in run pods" is an open decision
+of ADR 0041.
