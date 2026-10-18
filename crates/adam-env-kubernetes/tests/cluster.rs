@@ -862,7 +862,7 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
     // Git works in the run's own worktree: the mirror is read, the worktree's own directory is written.
     let (code, out) = sh("cd /work/workspaces/kind-iso-a/r && git status --short --branch").await;
     assert_eq!(code, 0, "git status: {out}");
-    assert!(out.contains("agent/a"), "{out}");
+    assert!(out.contains("agent/kind-iso-a"), "{out}");
     let (code, out) = sh("cd /work/workspaces/kind-iso-a/r && echo more >> README.md && git status --short && git diff --stat | tail -1").await;
     assert_eq!(code, 0, "git status after a change: {out}");
     assert!(out.contains("README.md"), "{out}");
