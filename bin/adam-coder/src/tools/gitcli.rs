@@ -172,11 +172,7 @@ pub(crate) async fn restore_worktree(
     head_ref: Option<&str>,
     tree: &str,
 ) -> bool {
-    let point_head = match head_ref {
-        Some(branch) => git_stdout(at, &["symbolic-ref", "HEAD", branch]).await,
-        None => git_stdout(at, &["update-ref", "--no-deref", "HEAD", head]).await,
-    };
-    point_head.is_some()
+    point_head(at, head_ref, head).await
         && git_stdout(at, &["reset", "--hard", "--quiet", head])
             .await
             .is_some()
@@ -185,6 +181,27 @@ pub(crate) async fn restore_worktree(
             .await
             .is_some()
         && git_stdout(at, &["reset", "--quiet", head]).await.is_some()
+}
+
+/// Put `HEAD` on the branch `head_ref` (or, with `None`, detached at `head`). `true` when it is
+/// there. `HEAD` is a file in the worktree's directory in the mirror, which a run pod mounts: git
+/// replaces it by a new file when it writes it, and a pod's mount of it would keep the old one, so
+/// it is not written when it already says what it should.
+pub(crate) async fn point_head(at: &GitAt, head_ref: Option<&str>, head: &str) -> bool {
+    match head_ref {
+        Some(branch) if self::head_ref(at).await.as_deref() == Some(branch) => true,
+        Some(branch) => git_stdout(at, &["symbolic-ref", "HEAD", branch])
+            .await
+            .is_some(),
+        None if self::head_ref(at).await.is_none()
+            && head_sha(at).await.as_deref() == Some(head) =>
+        {
+            true
+        }
+        None => git_stdout(at, &["update-ref", "--no-deref", "HEAD", head])
+            .await
+            .is_some(),
+    }
 }
 
 /// What `git status` says, as it says it (`--porcelain=v1 -z`, every untracked file): a cheap
@@ -241,10 +258,54 @@ fn written_per_run(key: &str) -> bool {
             .any(|suffix| key.ends_with(suffix))
 }
 
+/// The most of `info/exclude` that is read or kept.
+const MAX_EXCLUDE: u64 = 1024 * 1024;
+
 /// `<common dir>/info/exclude`, where the repository's local ignore rules live.
 async fn exclude_path(at: &GitAt) -> Option<std::path::PathBuf> {
     let common = git_stdout(at, &["rev-parse", "--git-common-dir"]).await?;
     Some(at.path().join(common).join("info/exclude"))
+}
+
+/// The content of the exclude file at `path`: `Some(None)` when there is none, and `None` when it
+/// cannot be read **safely**.
+///
+/// A scratch project's `.git` is a directory its run's commands write, so `info` can be a link and
+/// `info/exclude` a link or a pipe. A link would have the coder read any file it can (the GitHub
+/// App's key among them) into the snapshot and, on a restore, write it back through the link; a
+/// pipe would have it wait for ever. So `info` must be a directory itself, and the file is read as
+/// a regular file ([`adam_workspace::safe_fs`]).
+async fn read_exclude(path: &Path) -> Option<Option<String>> {
+    let info = path.parent()?;
+    match tokio::fs::symlink_metadata(info).await {
+        Ok(meta) if meta.is_dir() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(None),
+        _ => return None,
+    }
+    match adam_workspace::safe_fs::read_regular_text(path, MAX_EXCLUDE).await {
+        Ok(text) => Some(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// Put the exclude file at `path` back as `content` (`None`: no file). The file is replaced and not
+/// written through: a link at `path` is replaced by the file, and `info`, when it is not a
+/// directory itself, is not written in at all. `true` when it is done.
+async fn put_exclude(path: &Path, content: Option<&str>) -> bool {
+    let Some(info) = path.parent() else {
+        return false;
+    };
+    if !adam_workspace::safe_fs::is_real_directory(info).await {
+        return false;
+    }
+    match content {
+        Some(text) => adam_workspace::safe_fs::replace_file(path, text.as_bytes())
+            .await
+            .is_ok(),
+        // `remove_file` removes a link and does not follow it.
+        None => tokio::fs::remove_file(path).await.is_ok(),
+    }
 }
 
 /// [`RepoState`] now, `None` when it cannot be read.
@@ -269,11 +330,7 @@ pub(crate) async fn repo_state(at: &GitAt) -> Option<RepoState> {
     // Where a key sits in the file does not matter (restoring it appends), what it says does; the
     // values of one key keep their order (the sort is stable).
     config.sort_by(|a, b| a.0.cmp(&b.0));
-    let exclude = match tokio::fs::read_to_string(exclude_path(at).await?).await {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return None,
-    };
+    let exclude = read_exclude(&exclude_path(at).await?).await?;
     Some(RepoState {
         refs,
         config,
@@ -343,10 +400,7 @@ pub(crate) async fn restore_repo_state(at: &GitAt, before: &RepoState) -> bool {
         let Some(path) = exclude_path(at).await else {
             return false;
         };
-        ok &= match &before.exclude {
-            Some(text) => tokio::fs::write(&path, text).await.is_ok(),
-            None => tokio::fs::remove_file(&path).await.is_ok(),
-        };
+        ok &= put_exclude(&path, before.exclude.as_deref()).await;
     }
     ok && repo_state(at).await.as_ref() == Some(before)
 }
@@ -517,14 +571,14 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pinned_tests {
+pub(super) mod pinned_tests {
     use std::sync::Arc;
 
     use adam_workspace::{RepoRef, StaticToken, Workspaces};
 
     use super::*;
 
-    fn git(dir: &Path, args: &[&str]) -> String {
+    pub(super) fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)
             .args(args)
@@ -546,14 +600,16 @@ mod pinned_tests {
 
     /// A worktree of a local repository, and a repository whose configuration runs `spy` as a clean
     /// filter (its marker is `marker`), the way a run's commands could make one.
-    struct Fixture {
-        _tmp: tempfile::TempDir,
-        slot: adam_workspace::Slot,
-        planted: PathBuf,
-        marker: PathBuf,
+    pub(super) struct Fixture {
+        pub(super) _tmp: tempfile::TempDir,
+        pub(super) workspaces: Workspaces,
+        pub(super) repo: RepoRef,
+        pub(super) slot: adam_workspace::Slot,
+        pub(super) planted: PathBuf,
+        pub(super) marker: PathBuf,
     }
 
-    async fn fixture() -> Fixture {
+    pub(super) async fn fixture() -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let remote = tmp.path().join("remote.git");
         let seed = tmp.path().join("seed");
@@ -576,10 +632,11 @@ mod pinned_tests {
             tmp.path().join("root"),
             Arc::new(StaticToken::new("unused-in-these-tests")),
         );
+        let repo = RepoRef::new(remote.to_str().unwrap(), "main");
         let slot = workspaces
             .run("run-aaaaaaaa-1")
             .unwrap()
-            .add_repository(&RepoRef::new(remote.to_str().unwrap(), "main"))
+            .add_repository(&repo)
             .await
             .unwrap();
         // The repository a command plants: a clean filter that leaves a marker.
@@ -607,6 +664,8 @@ mod pinned_tests {
         std::fs::write(slot.path().join("README.md"), "changed by the run\n").unwrap();
         Fixture {
             _tmp: tmp,
+            workspaces,
+            repo,
             slot,
             planted,
             marker,
@@ -758,15 +817,14 @@ mod pinned_tests {
         use super::super::inspect::Snapshot;
 
         let f = fixture().await;
-        let at = GitAt::slot(&f.slot);
-        let before = Snapshot::take(&at).await.unwrap();
+        let before = Snapshot::of_slot(&f.slot).await.unwrap();
         let text = std::fs::read_to_string(f.slot.path().join(".git")).unwrap();
 
         // A command replaces the slot's `.git` by a link to a file the coder can write.
         let secret = victim(&f, "app-key.pem");
         std::fs::remove_file(f.slot.path().join(".git")).unwrap();
         std::os::unix::fs::symlink(&secret, f.slot.path().join(".git")).unwrap();
-        let during = Snapshot::take(&at).await.unwrap();
+        let during = Snapshot::of_slot(&f.slot).await.unwrap();
         assert!(!during.same_git_as(&before), "the change is seen");
         assert_eq!(
             std::fs::read_to_string(&secret).unwrap(),
@@ -795,6 +853,263 @@ mod pinned_tests {
         let refused = GitAt::of(f.slot.path(), None);
         assert_eq!(ask_everything(&refused).await, (None, None, None));
         assert!(!f.marker.exists());
+    }
+}
+
+#[cfg(test)]
+mod head_tests {
+    use super::super::inspect::Snapshot;
+    use super::pinned_tests::{Fixture, fixture, git};
+    use super::*;
+
+    /// Another run's worktree of the repository, with a commit of its own on its branch.
+    async fn another_run(f: &Fixture) -> adam_workspace::Slot {
+        let other = f
+            .workspaces
+            .run("run-bbbbbbbb-2")
+            .unwrap()
+            .add_repository(&f.repo)
+            .await
+            .unwrap();
+        std::fs::write(other.path().join("theirs.txt"), "theirs\n").unwrap();
+        other
+            .worktree()
+            .unwrap()
+            .commit_all(
+                "their work",
+                &adam_workspace::GitIdentity::new("T", "t@example.com"),
+            )
+            .await
+            .unwrap();
+        other
+    }
+
+    fn tip(slot: &adam_workspace::Slot, branch: &str) -> String {
+        let wt = slot.worktree().unwrap();
+        git(wt.mirror(), &["rev-parse", &format!("refs/heads/{branch}")])
+    }
+
+    fn head_file(slot: &adam_workspace::Slot) -> PathBuf {
+        slot.worktree().unwrap().git_dir().unwrap().join("HEAD")
+    }
+
+    #[tokio::test]
+    async fn a_head_on_another_runs_branch_is_not_a_state_to_restore_and_that_branch_is_left_alone()
+    {
+        let f = fixture().await;
+        let theirs = another_run(&f).await;
+        let their_branch = theirs.worktree().unwrap().local_branch().to_owned();
+        let own_branch = f.slot.worktree().unwrap().local_branch().to_owned();
+
+        // The run's commands write HEAD: it names the other run's branch.
+        std::fs::write(
+            head_file(&f.slot),
+            format!("ref: refs/heads/{their_branch}\n"),
+        )
+        .unwrap();
+        let before = Snapshot::of_slot(&f.slot).await.unwrap();
+        let said = before.refusal().expect("a HEAD that is not the run's own");
+        assert!(
+            said.contains(&format!("refs/heads/{their_branch}")) && said.contains(&own_branch),
+            "{said}"
+        );
+        assert!(said.contains("Nothing was run"), "{said}");
+
+        // A command changes a file (as `run_command` would find it), and the other run commits
+        // meanwhile, so its tip is not the commit the snapshot saw.
+        std::fs::write(f.slot.path().join("README.md"), "changed by the command\n").unwrap();
+        let (own_tip, their_tip_then) = (tip(&f.slot, &own_branch), tip(&theirs, &their_branch));
+        std::fs::write(theirs.path().join("more.txt"), "more\n").unwrap();
+        theirs
+            .worktree()
+            .unwrap()
+            .commit_all(
+                "more of theirs",
+                &adam_workspace::GitIdentity::new("T", "t@example.com"),
+            )
+            .await
+            .unwrap();
+        let their_tip = tip(&theirs, &their_branch);
+        assert_ne!(their_tip, their_tip_then);
+
+        // Nothing is restored, and nothing is written: no branch moved, HEAD is as it was.
+        assert!(!before.restore(&f.slot).await);
+        assert_eq!(tip(&theirs, &their_branch), their_tip, "their branch");
+        assert_eq!(tip(&f.slot, &own_branch), own_tip, "the run's own branch");
+        assert_eq!(
+            std::fs::read_to_string(head_file(&f.slot)).unwrap(),
+            format!("ref: refs/heads/{their_branch}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_that_moves_head_to_another_runs_branch_is_undone_on_the_runs_own_branch() {
+        let f = fixture().await;
+        let theirs = another_run(&f).await;
+        let their_branch = theirs.worktree().unwrap().local_branch().to_owned();
+        let own_branch = f.slot.worktree().unwrap().local_branch().to_owned();
+        let before = Snapshot::of_slot(&f.slot).await.unwrap();
+        assert!(before.refusal().is_none());
+        let (own_tip, their_tip) = (tip(&f.slot, &own_branch), tip(&theirs, &their_branch));
+
+        // The command points HEAD at the other run's branch, and edits a file.
+        std::fs::write(
+            head_file(&f.slot),
+            format!("ref: refs/heads/{their_branch}\n"),
+        )
+        .unwrap();
+        std::fs::write(f.slot.path().join("README.md"), "changed\n").unwrap();
+        let during = Snapshot::of_slot(&f.slot).await.unwrap();
+        assert!(!during.same_git_as(&before), "the move is seen");
+
+        assert!(before.restore(&f.slot).await);
+        assert_eq!(
+            std::fs::read_to_string(head_file(&f.slot)).unwrap(),
+            format!("ref: refs/heads/{own_branch}\n"),
+            "back on the run's own branch"
+        );
+        assert_eq!(tip(&f.slot, &own_branch), own_tip);
+        assert_eq!(tip(&theirs, &their_branch), their_tip, "theirs untouched");
+        assert_eq!(
+            std::fs::read_to_string(f.slot.path().join("README.md")).unwrap(),
+            "changed by the run\n",
+            "the files are as they were before the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scratch_project_has_no_own_branch_to_hold_head_to() {
+        let f = fixture().await;
+        let scratch = f
+            .workspaces
+            .run("run-aaaaaaaa-1")
+            .unwrap()
+            .add_scratch(
+                "fib",
+                &adam_workspace::GitIdentity::new("A", "a@example.com"),
+            )
+            .await
+            .unwrap();
+        let before = Snapshot::of_slot(&scratch).await.unwrap();
+        assert!(before.refusal().is_none());
+    }
+}
+
+#[cfg(test)]
+mod exclude_tests {
+    use super::pinned_tests::fixture;
+    use super::*;
+
+    const VICTIM: &str = "not the coder's to write\n";
+
+    async fn scratch(f: &super::pinned_tests::Fixture) -> adam_workspace::Slot {
+        f.workspaces
+            .run("run-aaaaaaaa-1")
+            .unwrap()
+            .add_scratch(
+                "fib",
+                &adam_workspace::GitIdentity::new("A", "a@example.com"),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn victim(f: &super::pinned_tests::Fixture) -> PathBuf {
+        let path = f._tmp.path().join("app-key.pem");
+        std::fs::write(&path, VICTIM).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn an_exclude_file_is_read_as_a_regular_file_or_the_state_is_not_known() {
+        let f = fixture().await;
+        let slot = scratch(&f).await;
+        let at = GitAt::slot(&slot);
+        let info = slot.path().join(".git/info");
+        let exclude = info.join("exclude");
+        // `git init --template=` makes no `info`.
+        assert!(repo_state(&at).await.is_some());
+        std::fs::create_dir_all(&info).unwrap();
+
+        // The ordinary file is read; a missing one is none.
+        std::fs::write(&exclude, "target/\n").unwrap();
+        assert_eq!(
+            repo_state(&at).await.unwrap().exclude.as_deref(),
+            Some("target/\n")
+        );
+        std::fs::remove_file(&exclude).unwrap();
+        assert_eq!(repo_state(&at).await.unwrap().exclude, None);
+
+        // A link to a file the coder can read is not read through.
+        let secret = victim(&f);
+        std::os::unix::fs::symlink(&secret, &exclude).unwrap();
+        assert!(repo_state(&at).await.is_none(), "a link at info/exclude");
+        std::fs::remove_file(&exclude).unwrap();
+
+        // A pipe is not waited on.
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&exclude)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(10), repo_state(&at))
+            .await
+            .expect("the coder waited on a pipe");
+        assert!(asked.is_none());
+        std::fs::remove_file(&exclude).unwrap();
+
+        // `info` itself a link to a directory with an exclude file in it.
+        let elsewhere = f._tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("exclude"), "from elsewhere\n").unwrap();
+        std::fs::remove_dir_all(&info).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &info).unwrap();
+        assert!(repo_state(&at).await.is_none(), "a link at info");
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
+    }
+
+    #[tokio::test]
+    async fn an_exclude_file_is_put_back_by_replacing_it_never_by_writing_through_a_link() {
+        let f = fixture().await;
+        let slot = scratch(&f).await;
+        let info = slot.path().join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        let secret = victim(&f);
+
+        // A link at the file is replaced by a regular file with the content, and the target is left.
+        std::os::unix::fs::symlink(&secret, &exclude).unwrap();
+        assert!(put_exclude(&exclude, Some("target/\n")).await);
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), "target/\n");
+        assert!(
+            !std::fs::symlink_metadata(&exclude)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
+
+        // Removing is removing the link, not what it leads to.
+        std::fs::remove_file(&exclude).unwrap();
+        std::os::unix::fs::symlink(&secret, &exclude).unwrap();
+        assert!(put_exclude(&exclude, None).await);
+        assert!(!exclude.exists() && std::fs::symlink_metadata(&exclude).is_err());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
+
+        // `info` a link to a directory: nothing is written in it, or removed from it.
+        let elsewhere = f._tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("exclude"), "theirs\n").unwrap();
+        std::fs::remove_dir_all(&info).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &info).unwrap();
+        assert!(!put_exclude(&exclude, Some("target/\n")).await);
+        assert!(!put_exclude(&exclude, None).await);
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join("exclude")).unwrap(),
+            "theirs\n"
+        );
     }
 }
 

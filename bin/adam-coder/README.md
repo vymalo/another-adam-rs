@@ -1327,7 +1327,11 @@ still read everything the process can, use the network and write outside the wor
 configuration are shared by every run on the mirror and other runs change them while a command runs, so
 these are **not** compared, and a command can change them unseen: `refs/heads/agent/*` (another run's
 branch), `refs/remotes/*`, `refs/tags/*` (a fetch follows tags) and `refs/stash` (a `git stash` elsewhere),
-and the configuration keys `branch.agent/*.adam-run`, `.remote` and `.merge`. `info/exclude` is compared.
+and the configuration keys `branch.agent/*.adam-run`, `.remote` and `.merge`. `info/exclude` is compared (read as a regular file, and put back by replacing it:
+a link or a pipe at it, or a link at `.git/info`, makes the state unknown and nothing is run).
+**The branch a worktree is put back on is the run's own, from the metadata (`Worktree::local_branch`), never what `HEAD` names** (`HEAD` is a file the run's commands can write
+unless the pod mounts it read-only): when `HEAD` is not on that branch before the command, `run_command` and `run` run nothing and say why, and a restore from such a
+record writes nothing, so no other run's branch is reset. `HEAD` is written back only when it differs.
 The restore holds the mirror lock, refuses to touch anything if the worktree's `.git` no longer points at this
 run's git directory (and puts that file back first, written beside it and renamed over it, so that a link a command put there is replaced and never written through), and deletes and sets refs with `--no-deref`. **Every `git` the coder
 runs on a slot here is pinned to the repository the coder's own metadata names** (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`:

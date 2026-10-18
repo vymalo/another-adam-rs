@@ -25,7 +25,7 @@ use adam::prelude::*;
 
 use super::checks::missing_tool_answer;
 use super::gitcli::{
-    GitAt, RepoState, git_stdout, head_ref, head_sha, repo_state, restore_repo_state,
+    GitAt, RepoState, git_stdout, head_ref, head_sha, point_head, repo_state, restore_repo_state,
     restore_worktree, status_text, working_tree_id,
 };
 use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_in, shell_spec};
@@ -67,13 +67,15 @@ pub async fn run_command(
     let environment = env.session(ctx).await?;
 
     // What the worktree is before the command: nothing it does may change it.
-    let at = GitAt::slot(&slot);
-    let Some(before) = Snapshot::take(&at).await else {
+    let Some(before) = Snapshot::of_slot(&slot).await else {
         return Ok(ToolOutput::error(
             "Cannot read the state of the worktree, so nothing was run (a command that might \
              change it cannot be undone). Try again; if it persists, tell the person.",
         ));
     };
+    if let Some(refusal) = before.refusal() {
+        return Ok(ToolOutput::error(refusal));
+    }
 
     let redactor = &env.redactor;
     let shown = redactor.scrub(command).into_owned();
@@ -90,7 +92,7 @@ pub async fn run_command(
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
 
     // Did it change anything it should not have?
-    let after = Snapshot::take(&at).await;
+    let after = Snapshot::of_slot(&slot).await;
     if after.as_ref() != Some(&before) {
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("undid a change made by: {shown}"))
@@ -134,7 +136,18 @@ pub(super) struct Snapshot {
     /// it is put right before anything else, since git would act on wherever it points now.
     dot_git: Option<String>,
     head: String,
+    /// What `HEAD` names (`refs/heads/...`), `None` when it is detached. **Compared**, so that a
+    /// command that moves `HEAD` is seen; for a worktree of a repository it is not what a restore
+    /// moves ([`own_ref`](Self::own_ref) is).
     branch: Option<String>,
+    /// For a worktree of a repository: the run's own branch (`agent/...`), from the coder's metadata
+    /// and never from `HEAD`. `HEAD` is a file in the worktree's directory in the mirror, which the
+    /// run's commands can write: one that names another run's branch must not make that branch what
+    /// a restore resets. `None` for a scratch project, whose repository is its own.
+    own_branch: Option<String>,
+    /// `HEAD` was not on `refs/heads/<own_branch>` when the snapshot was taken, so what it holds
+    /// (`head`, the tree) is not the run's branch's and nothing can be restored from it.
+    head_is_foreign: bool,
     tree: Option<String>,
     /// `git status`, for the worktree that has no tree id.
     status: Option<String>,
@@ -142,7 +155,18 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) async fn take(at: &GitAt) -> Option<Self> {
+    /// The state of `slot`'s worktree, with the run's own branch from the coder's metadata.
+    pub(super) async fn of_slot(slot: &adam_workspace::Slot) -> Option<Self> {
+        Self::take(
+            &GitAt::slot(slot),
+            slot.worktree().map(adam_workspace::Worktree::local_branch),
+        )
+        .await
+    }
+
+    /// The state of the worktree `at`. `own` is the branch the run's metadata says the worktree is on
+    /// (a repository's worktree; `None` for a scratch project).
+    pub(super) async fn take(at: &GitAt, own: Option<&str>) -> Option<Self> {
         let git_dir = git_stdout(at, &["rev-parse", "--absolute-git-dir"]).await?;
         // The file is in the slot, which a command can have replaced: read as a regular file and
         // not through a link.
@@ -152,7 +176,10 @@ impl Snapshot {
         )
         .await
         .ok();
+        let branch = head_ref(at).await;
         let head = head_sha(at).await?;
+        let head_is_foreign =
+            own.is_some_and(|own| branch.as_deref() != Some(format!("refs/heads/{own}").as_str()));
         let tree = working_tree_id(at).await;
         let status = match tree {
             Some(_) => None,
@@ -162,11 +189,33 @@ impl Snapshot {
             git_dir,
             dot_git,
             head,
-            branch: head_ref(at).await,
+            branch,
+            own_branch: own.map(str::to_owned),
+            head_is_foreign,
             tree,
             status,
             repo: repo_state(at).await?,
         })
+    }
+
+    /// Why nothing may be run in this worktree, when `HEAD` is not on the run's own branch: a
+    /// command that changes git could not be undone, since the commit `HEAD` is at is not the run's
+    /// (a restore would reset whatever branch `HEAD` names).
+    pub(super) fn refusal(&self) -> Option<String> {
+        if !self.head_is_foreign {
+            return None;
+        }
+        let own = self.own_branch.as_deref().unwrap_or("its branch");
+        let now = self
+            .branch
+            .as_deref()
+            .map_or_else(|| "no branch (it is detached)".to_owned(), str::to_owned);
+        Some(format!(
+            "HEAD of this worktree is on {now}, not on the run's own branch {own}: something moved it \
+             (it is a file that commands of the run can write). Nothing was run, because a command \
+             that changes git could not be undone here. Do not try to move HEAD back with git; tell \
+             the person."
+        ))
     }
 
     /// Whether everything but the files is as `other` has it: the git directory, the `.git` file,
@@ -191,6 +240,17 @@ impl Snapshot {
 
     /// Put it all back; `true` when the worktree is exactly as it was.
     pub(super) async fn restore(&self, slot: &adam_workspace::Slot) -> bool {
+        // `HEAD` was on another branch when this was taken: `head` is that branch's commit, and
+        // `reset` follows `HEAD`. Nothing is written, so no branch of any run is moved.
+        if self.head_is_foreign {
+            tracing::warn!(
+                slot = slot.dir(),
+                head = ?self.branch,
+                own = ?self.own_branch,
+                "not restoring: HEAD was not on the run's own branch"
+            );
+            return false;
+        }
         let dir = slot.path();
         let at = GitAt::slot(slot);
         if let Some(text) = &self.dot_git
@@ -226,19 +286,22 @@ impl Snapshot {
             None => None,
         };
         let repo = restore_repo_state(&at, &self.repo).await;
+        // The branch to put `HEAD` on: the run's own, from the metadata, for a worktree of a
+        // repository; what it was on, for a scratch project.
+        let own_ref = self.own_branch.as_ref().map(|b| format!("refs/heads/{b}"));
+        let branch = own_ref.as_deref().or(self.branch.as_deref());
         let Some(tree) = &self.tree else {
             // No tree to write back: point `HEAD` where it was and keep the files as they are.
-            // (Whether these work or not, the files are not known to be as they were.)
-            let _ = match &self.branch {
-                Some(branch) => git_stdout(&at, &["symbolic-ref", "HEAD", branch]).await,
-                None => git_stdout(&at, &["update-ref", "--no-deref", "HEAD", &self.head]).await,
-            };
-            let _ = git_stdout(&at, &["reset", "--soft", "--quiet", &self.head]).await;
+            // (Whether these work or not, the files are not known to be as they were.) `reset`
+            // follows `HEAD`, so it is only run once `HEAD` is where it should be.
+            if point_head(&at, branch, &self.head).await {
+                let _ = git_stdout(&at, &["reset", "--soft", "--quiet", &self.head]).await;
+            }
             let _ = repo;
             return false;
         };
-        repo && restore_worktree(&at, &self.head, self.branch.as_deref(), tree).await
-            && Self::take(&at).await.as_ref() == Some(self)
+        repo && restore_worktree(&at, &self.head, branch, tree).await
+            && Self::take(&at, self.own_branch.as_deref()).await.as_ref() == Some(self)
     }
 }
 

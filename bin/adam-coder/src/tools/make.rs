@@ -84,12 +84,15 @@ pub async fn run(
     let environment = env.session(ctx).await?;
 
     // What git is before the command: nothing it does may change that.
-    let Some(before) = Snapshot::take(&GitAt::slot(&slot)).await else {
+    let Some(before) = Snapshot::of_slot(&slot).await else {
         return Ok(ToolOutput::error(
             "Cannot read the state of the worktree, so nothing was run (a command that might \
              change git cannot be undone). Try again; if it persists, tell the person.",
         ));
     };
+    if let Some(refusal) = before.refusal() {
+        return Ok(ToolOutput::error(refusal));
+    }
 
     let redactor = &env.redactor;
     let shown = redactor.scrub(command).into_owned();
@@ -109,7 +112,7 @@ pub async fn run(
     // configuration and `.git` are not.
     // A worktree whose git cannot be read after the command is not known to be untouched, so
     // it is undone as one that changed git would be; the model is told which of the two it was.
-    let Some(after) = Snapshot::take(&GitAt::slot(&slot)).await else {
+    let Some(after) = Snapshot::of_slot(&slot).await else {
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("could not check git after: {shown}; undid it"))
             .await;

@@ -2074,6 +2074,57 @@ async fn run_command_leaves_what_other_runs_write_meanwhile_alone() {
     assert!(!status.is_error, "{}", status.content);
 }
 
+/// The worktree's `HEAD` is a file the run's commands can write. One that names another run's
+/// branch is a state nothing is restored from (`reset` would move that branch), so neither command
+/// tool runs anything in it, and no branch of any run moves.
+#[tokio::test]
+async fn a_head_on_another_runs_branch_stops_both_command_tools_and_moves_no_branch() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    common::git(&dir, &["branch", "agent/other-run"]);
+    let other = common::git(&dir, &["rev-parse", "refs/heads/agent/other-run"]);
+    let own = common::git(&dir, &["symbolic-ref", "HEAD"]);
+    let own_tip = common::git(&dir, &["rev-parse", &own]);
+    let admin = common::git(&dir, &["rev-parse", "--absolute-git-dir"]);
+    std::fs::write(
+        std::path::Path::new(&admin).join("HEAD"),
+        "ref: refs/heads/agent/other-run\n",
+    )
+    .unwrap();
+
+    for command in ["echo ran > created.txt", "ls"] {
+        let looked = RunCommand
+            .call(&rig.ctx, json!({ "command": command }))
+            .await
+            .unwrap();
+        let made = Run
+            .call(&rig.ctx, json!({ "command": command }))
+            .await
+            .unwrap();
+        for out in [looked, made] {
+            assert!(out.is_error, "{command}: {}", out.content);
+            assert!(
+                out.content.contains("refs/heads/agent/other-run")
+                    && out.content.contains("Nothing was run"),
+                "{command}: {}",
+                out.content
+            );
+        }
+        assert!(!dir.join("created.txt").exists(), "{command} did not run");
+    }
+    assert_eq!(
+        common::git(&dir, &["rev-parse", "refs/heads/agent/other-run"]),
+        other
+    );
+    assert_eq!(common::git(&dir, &["rev-parse", &own]), own_tip);
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&admin).join("HEAD")).unwrap(),
+        "ref: refs/heads/agent/other-run\n",
+        "and HEAD was left as it was"
+    );
+}
+
 /// A continued branch's base is the base of its pull request: when that base is gone upstream, the
 /// error says it is fixed and to ask, not to pick another.
 #[tokio::test]
