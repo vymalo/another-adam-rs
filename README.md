@@ -83,14 +83,18 @@ the agent registry. Image `ghcr.io/vymalo/another-adam-rs/operator`, charts [`de
 | [Crates](docs/architecture.md#the-crate-map) | every crate has a `README.md` next to its `Cargo.toml` |
 | [Chart](deploy/coder/README.md) | the Helm chart of the coder |
 
-## Contributing
+## Roadmap and contributing
 
-Work on a branch and open a pull request against `main`; commits are Conventional Commits. The checks CI runs
-are in [Testing](docs/guides/testing.md#the-commands-ci-runs). Update the matching guide, reference or crate
-README in the same change as any change to behaviour. AI assistants: read [`CLAUDE.md`](CLAUDE.md); the skills
-for repositories that integrate adam-rs install with `npx skills add vymalo/another-adam-rs --list`
-(`adam-agent-folder`, `adam-embed`, `adam-store-adapter`, `adam-a2a-extensions`, `adam-coder-deploy`,
-`adam-operator`, `adam-upgrade`). Roadmap: [`docs/roadmap.md`](docs/roadmap.md).
+- **Roadmap:** the product roadmap to launch, with every open piece of work as an issue, is
+  [`ROADMAP.md` in another-agentic-system](https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md).
+  The library's own table is [`docs/roadmap.md`](docs/roadmap.md).
+- **Contributing:** [`CONTRIBUTING.md`](CONTRIBUTING.md). Work on a branch and open a pull request against `main`;
+  commits are Conventional Commits; the checks CI runs are in [Testing](docs/guides/testing.md#the-commands-ci-runs).
+  Update the matching guide, reference or crate README in the same change as any change to behaviour.
+- **Security:** report a vulnerability privately, as [`SECURITY.md`](SECURITY.md) says.
+- **AI assistants:** read [`CLAUDE.md`](CLAUDE.md). The skills for repositories that integrate adam-rs install with
+  `npx skills add vymalo/another-adam-rs --list` (`adam-agent-folder`, `adam-embed`, `adam-store-adapter`,
+  `adam-a2a-extensions`, `adam-coder-deploy`, `adam-operator`, `adam-upgrade`).
 
 ## License
 

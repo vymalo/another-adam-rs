@@ -1,5 +1,9 @@
 # Roadmap
 
+> The product roadmap to launch, with its milestones and issues, is in
+> [`ROADMAP.md` of another-agentic-system](https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md).
+> The table below is this library's own roadmap.
+
 | # | Item | State |
 |---|---|---|
 | 1 | `Store` trait and its adapters (`adam-core`, PostgreSQL, MongoDB) | built |
