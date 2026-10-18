@@ -3,11 +3,11 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{GitCmd, GitPin};
 use crate::repo::RepoRef;
+use crate::safe_fs;
 use crate::workspace::{Inner, Meta, REMOTE_TRACKING_PREFIX};
 
 /// A run's isolated working tree on its own branch.
@@ -251,11 +251,11 @@ impl Worktree {
     /// working tree: committed, staged, unstaged and untracked changes alike.
     ///
     /// Untracked files are counted through a temporary copy of the index, so
-    /// the real index is not modified.
+    /// the real index is not modified. The copy is made in a directory of the coder's own, outside
+    /// the volume, from the index read as a regular file and not through a link (the index is in a
+    /// directory the run's commands write): see [`safe_fs`](crate::safe_fs).
     #[tracing::instrument(skip(self), fields(run = %self.run))]
     pub async fn diff_stat(&self) -> WorkspaceResult<String> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-
         let base_ref = format!("{REMOTE_TRACKING_PREFIX}{}", self.repo.base_branch);
         let merge_base = self
             .git()
@@ -270,62 +270,34 @@ impl Worktree {
             base_ref
         };
 
-        let index = self
-            .git()
-            .args(["rev-parse", "--git-path", "index"])
-            .run()
-            .await?
-            .stdout_text();
-        let index = self.path.join(index);
-        let tmp = PathBuf::from(format!(
-            "{}.adam-diff-{}-{}",
-            index.display(),
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        tokio::fs::copy(&index, &tmp)
+        // `git()` has refused already if there is no git directory.
+        let Some(admin) = self.git_dir() else {
+            return Err(WorkspaceError::Corrupt(
+                "the worktree's git directory is not known".to_owned(),
+            ));
+        };
+        let copy = safe_fs::private_copy_of(&admin.join("index"), safe_fs::MAX_INDEX_COPY)
             .await
-            .map_err(|e| WorkspaceError::io("cannot copy the index", e))?;
-        // The copy keeps the index's modification time: git re-reads an entry that is as new as
-        // the index file ("racily clean"), and a copy stamped with the time it was made would
-        // make every entry look old, so a file rewritten with the same size right after the
-        // checkout would be counted with its old content.
-        let keep = async {
-            let modified = tokio::fs::metadata(&index).await?.modified()?;
-            let copy = tmp.clone();
-            tokio::task::spawn_blocking(move || {
-                std::fs::File::options()
-                    .write(true)
-                    .open(copy)?
-                    .set_modified(modified)
-            })
-            .await
-            .map_err(std::io::Error::other)?
-        }
-        .await;
-        if let Err(e) = keep {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(WorkspaceError::io("cannot copy the index's timestamp", e));
-        }
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::InvalidInput => {
+                    WorkspaceError::Corrupt(format!("the worktree's index cannot be used: {e}"))
+                }
+                _ => WorkspaceError::io("cannot copy the index", e),
+            })?;
 
-        let result = async {
-            self.git()
-                .env("GIT_INDEX_FILE", &tmp)
-                .args(["add", "-A", "--intent-to-add"])
-                .run()
-                .await?;
-            self.git()
-                .env("GIT_INDEX_FILE", &tmp)
-                .args(["diff", "--stat", "--no-color", "--no-ext-diff"])
-                .arg(&base)
-                .arg("--")
-                .run()
-                .await
-                .map(|out| out.stdout_text())
-        }
-        .await;
-        let _ = tokio::fs::remove_file(&tmp).await;
-        result
+        self.git()
+            .env("GIT_INDEX_FILE", copy.path())
+            .args(["add", "-A", "--intent-to-add"])
+            .run()
+            .await?;
+        self.git()
+            .env("GIT_INDEX_FILE", copy.path())
+            .args(["diff", "--stat", "--no-color", "--no-ext-diff"])
+            .arg(&base)
+            .arg("--")
+            .run()
+            .await
+            .map(|out| out.stdout_text())
     }
 
     /// Stage everything (`git add -A`) and commit as `author`. Returns the new
@@ -563,26 +535,27 @@ impl Worktree {
         let Some(commit) = self.base_commit().await? else {
             return Ok(None);
         };
-        let path = run_dir.join(BASE_CHECKOUTS_DIR).join(&self.dir);
+        let base_dir = run_dir.join(BASE_CHECKOUTS_DIR);
+        let path = base_dir.join(&self.dir);
         let leftover = BaseCheckout {
             path: path.clone(),
             commit: commit.clone(),
             links: Vec::new(),
         };
         self.remove_base_checkout(&leftover).await?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| WorkspaceError::io(format!("cannot make {}", parent.display()), e))?;
-        }
+        // The directory of the base checkouts is the run's to write: a link there, to a directory
+        // anywhere, would have the checkout made (and later removed) where the link leads.
+        make_plain_directory(&base_dir).await?;
         {
             let _guard = self.ws.lock_mirror(&self.mirror).await?;
             self.ws
-                .mirror_git(&self.mirror)
-                .args(["worktree", "add", "--quiet", "--detach"])
-                .arg(&path)
-                .arg(&commit)
-                .run()
+                .add_linked(
+                    &self.mirror,
+                    &self.run,
+                    &self.base_admin_name(),
+                    &path,
+                    |cmd, staging| cmd.arg("--detach").arg(staging).arg(&commit),
+                )
                 .await?;
         }
         let mut checkout = BaseCheckout {
@@ -646,17 +619,53 @@ impl Worktree {
         Ok(())
     }
 
-    /// Remove a checkout, its links first, and forget it in the mirror. Idempotent.
+    /// The name of this worktree's base checkout in the mirror's `worktrees/`: the slot's name and
+    /// `+base`, after the run (see `admin_name`), so that it is one of the run's and no other's.
+    fn base_admin_name(&self) -> String {
+        crate::workspace::admin_name(&self.run, &format!("{}+base", self.dir))
+    }
+
+    /// Remove a checkout, its links first, and forget it in the mirror: its directory is removed by
+    /// name, and nothing else of the mirror is touched (no `git worktree prune`, which judges every
+    /// run's directories). Idempotent.
+    ///
+    /// The checkout is in the run's workspace, where the run's commands can put a link in place of
+    /// `.adam-base` or of the checkout. A link is removed and not followed: it is not asked to
+    /// `git worktree remove`, which would delete the worktree the link leads to.
     ///
     /// # Errors
     ///
     /// A git or file system failure; the directory is removed whatever git says.
     #[tracing::instrument(skip(self, checkout), fields(run = %self.run))]
     pub async fn remove_base_checkout(&self, checkout: &BaseCheckout) -> WorkspaceResult<()> {
+        let run_dir = self.ws.run_dir(&self.run);
+        let base_dir = run_dir.join(BASE_CHECKOUTS_DIR);
+        let _guard = self.ws.lock_mirror(&self.mirror).await?;
+        let forget = || async {
+            crate::workspace::remove_dir_if_exists(
+                &self.mirror.join("worktrees").join(self.base_admin_name()),
+            )
+            .await
+        };
+        if let Ok(meta) = tokio::fs::symlink_metadata(&base_dir).await
+            && !meta.is_dir()
+        {
+            tokio::fs::remove_file(&base_dir).await.map_err(|e| {
+                WorkspaceError::io("cannot remove a link in the run's workspace", e)
+            })?;
+            return forget().await;
+        }
+        if let Ok(meta) = tokio::fs::symlink_metadata(&checkout.path).await
+            && !meta.is_dir()
+        {
+            tokio::fs::remove_file(&checkout.path).await.map_err(|e| {
+                WorkspaceError::io("cannot remove a link in the run's workspace", e)
+            })?;
+            return forget().await;
+        }
         for link in &checkout.links {
             let _ = tokio::fs::remove_file(link).await;
         }
-        let _guard = self.ws.lock_mirror(&self.mirror).await?;
         if tokio::fs::symlink_metadata(&checkout.path).await.is_ok() {
             let _ = self
                 .ws
@@ -667,13 +676,24 @@ impl Worktree {
                 .await?;
         }
         crate::workspace::remove_dir_if_exists(&checkout.path).await?;
-        self.ws
-            .mirror_git(&self.mirror)
-            .args(["worktree", "prune"])
-            .run()
-            .await?;
-        Ok(())
+        forget().await
     }
+}
+
+/// `path` as a directory of its own: made when it is not there, and a link or a file in its place
+/// is removed first.
+async fn make_plain_directory(path: &Path) -> WorkspaceResult<()> {
+    if let Ok(meta) = tokio::fs::symlink_metadata(path).await {
+        if meta.is_dir() {
+            return Ok(());
+        }
+        tokio::fs::remove_file(path)
+            .await
+            .map_err(|e| WorkspaceError::io(format!("cannot remove {}", path.display()), e))?;
+    }
+    tokio::fs::create_dir_all(path)
+        .await
+        .map_err(|e| WorkspaceError::io(format!("cannot make {}", path.display()), e))
 }
 
 /// Stage everything (`git add -A`) and commit as `author`, in the repository `git` runs in: the

@@ -254,7 +254,7 @@ subscriber sees it once. The exception is a file the coder shares with `share_fi
 | `passed` | bool | the command exited 0 in time **and** `commit` was determined |
 | `commit` | string | the 40-hex SHA of a commit: for `run_checks`, the `HEAD` of the run's worktree when the command ran (`""` only when it could not be read); for `commit_and_push`, the pushed commit |
 | `repository` | string, optional | the URL of the repository of the slot the command ran in; for the verdict `commit_and_push` binds to a pushed commit, the repository it was pushed to. Absent for a check that ran in a scratch project (it has none), and from a report of an older coder |
-| `tree` | string, optional | the 40-hex git tree id of the code that was checked: the worktree as `commit_and_push` would commit it (`git add -A`: tracked changes and untracked files, minus what `.gitignore` excludes), computed in a temporary index. Absent when it could not be computed |
+| `tree` | string, optional | the 40-hex git tree id of the code that was checked: the worktree as `commit_and_push` would commit it (`git add -A`: tracked changes and untracked files, minus what `.gitignore` excludes), computed in a temporary copy of the index that is made outside the volume (a `0700` directory of the process's temporary directory, read from the index as a regular file and not through a link). Absent when it could not be computed |
 | `summary` | string, optional | one line: `` `cmd` passed ``, or `` `cmd` failed: exit code 2 `` / `timed out after 900s` / `killed by a signal`. Says so when the worktree had uncommitted changes on top of `commit`, or that the tree was checked before it was committed |
 | `preexisting` | bool, optional | `true` when the command failed **and also fails on the base commit** (`base_commit`), before the run changed anything: the failure is the repository's. `passed` is still `false`; a gate that accepts such a failure reads this. Absent otherwise, and from a report of an older coder |
 | `base_commit` | string, optional | with `preexisting`: the 40-hex commit `origin/<base>` was at when the command failed there too |
@@ -492,7 +492,9 @@ process, and the instructions say when to use which: small, well-located changes
   inside a `.git`: a symlink that stays inside the worktree is read, one that leads out is refused;
 * to **write**, the deepest part of the path that exists is looked at one component at a time: **any symlink on the way,
   the file itself included, is refused** (also one that stays inside: a write through a link is a write to a place the
-  model did not name), and what exists must be inside the canonical root.
+  model did not name), and what exists must be inside the canonical root;
+* the **root** is looked at first, without following a link (`lstat`): the slot's directory is the run's to rename, and a link in
+  its place (to another run's slot) would be canonicalised into the root. A root that is not a directory itself is refused.
 
 Every refusal is a tool **result** that names its reason, not a failed run. `apply_patch` does not trust its own reading
 of the patch: it asks `git apply --numstat -z` which paths git would touch (a rename names both ends, however the patch
@@ -1327,11 +1329,12 @@ these are **not** compared, and a command can change them unseen: `refs/heads/ag
 branch), `refs/remotes/*`, `refs/tags/*` (a fetch follows tags) and `refs/stash` (a `git stash` elsewhere),
 and the configuration keys `branch.agent/*.adam-run`, `.remote` and `.merge`. `info/exclude` is compared.
 The restore holds the mirror lock, refuses to touch anything if the worktree's `.git` no longer points at this
-run's git directory (and puts that file back first), and deletes and sets refs with `--no-deref`. **Every `git` the coder
+run's git directory (and puts that file back first, written beside it and renamed over it, so that a link a command put there is replaced and never written through), and deletes and sets refs with `--no-deref`. **Every `git` the coder
 runs on a slot here is pinned to the repository the coder's own metadata names** (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`:
 `GitAt` in `tools/gitcli.rs`, `adam_workspace::GitPin`), so the `.git` file and the `commondir` and `gitdir` of the worktree's
 directory in the mirror, which a command can rewrite, steer nothing ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md)); a
-worktree whose git directory the metadata cannot tell is refused (every question about it is "unknown"). Where the tree cannot be computed (an embedded repository without a commit), the record falls back to
+worktree whose git directory the metadata cannot tell, or whose `commondir` is not what git wrote, is refused (every question about it is "unknown"). The copy of the index the tree id is computed in is made outside the volume
+(`adam_workspace::safe_fs`), so no name in the run's directory can be a link to somewhere else. Where the tree cannot be computed (an embedded repository without a commit), the record falls back to
 `git status`: a change is still seen and refused, but only `HEAD` and the branch are put back, and the model
 is told the files may differ.
 

@@ -19,6 +19,10 @@
 //!   is refused too: a write through a link is a write to a place the model did not name), and what
 //!   exists must be inside the canonical root.
 //!
+//! * The **root** is looked at first, without following a link: the slot's directory is the run's to
+//!   rename, and a link in its place (to another run's slot) would be canonicalised into the
+//!   root. A root that is not a directory itself is refused.
+//!
 //! A refusal names its reason and is a tool **result**, not a failed run.
 //!
 //! # What stays out of these tools
@@ -140,6 +144,18 @@ fn parts_of(rel: &str) -> Result<Vec<OsString>, String> {
 /// A message for the model: the path is empty, absolute, goes up, names `.git`, leaves the
 /// worktree through a symlink, goes through a symlink to write, or (to read) does not exist.
 pub fn confine(slot_root: &Path, rel: &str, access: Access) -> Result<PathBuf, String> {
+    // The slot's directory is the run's to rename: a link in its place leads to another run's
+    // files, and canonicalising the root would take that for the root.
+    match fs::symlink_metadata(slot_root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(
+                "the worktree's directory is not a plain directory (a command replaced it by a link or a file): refused"
+                    .to_owned(),
+            );
+        }
+        Err(e) => return Err(format!("cannot resolve the worktree: {e}")),
+    }
     let root = slot_root
         .canonicalize()
         .map_err(|e| format!("cannot resolve the worktree: {e}"))?;
@@ -1258,6 +1274,26 @@ mod tests {
         // A dangling link is a link too.
         std::os::unix::fs::symlink("nowhere", dir.path().join("dangling")).unwrap();
         assert!(refused(dir.path(), "dangling", Access::Write).contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_a_link_to_another_directory_is_not_a_root() {
+        let dir = root();
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join(".env"), "TOKEN=another run's").unwrap();
+        let link = other.path().join("slot");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        // A link to a worktree is canonicalised into that worktree: refused before.
+        for access in [Access::Read, Access::Write] {
+            let why = refused(&link, "README.md", access);
+            assert!(why.contains("not a plain directory"), "{why}");
+        }
+        // And the real directory is as it was.
+        assert!(confine(dir.path(), "README.md", Access::Read).is_ok());
+        // A file is no root either.
+        let why = refused(&dir.path().join("README.md"), "x", Access::Write);
+        assert!(why.contains("not a plain directory"), "{why}");
     }
 
     #[cfg(unix)]

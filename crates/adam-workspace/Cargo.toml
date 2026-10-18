@@ -22,11 +22,13 @@ async-trait.workspace = true
 aws-lc-rs = { workspace = true, optional = true }
 base64.workspace = true
 chrono = { workspace = true, optional = true }
+libc.workspace = true
 reqwest = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "sync", "time"] }
 tracing.workspace = true
@@ -36,7 +38,6 @@ url.workspace = true
 proptest.workspace = true
 # Enables the `test-util` feature for this crate's own tests.
 adam-workspace = { workspace = true, features = ["test-util"] }
-tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "sync", "time", "macros", "rt-multi-thread"] }
 wiremock.workspace = true
 

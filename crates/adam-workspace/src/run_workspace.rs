@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{GitCmd, GitPin};
 use crate::repo::RepoRef;
+use crate::safe_fs;
 use crate::workspace::{
     Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists,
     remove_dir_if_exists, remove_file_if_exists, slot_name,
@@ -317,7 +318,7 @@ impl RunWorkspace {
             SlotMeta::Repo(m) => {
                 let dir = m.dir.clone().unwrap_or_default();
                 let path = inner.slot_path(&self.run, &dir);
-                if !looks_like_worktree(&path).await {
+                if !is_slot_name(&dir) || !looks_like_worktree(&path).await {
                     return Ok(None);
                 }
                 let loc = RepoRef::new(&m.url, &m.base_branch).locate()?;
@@ -335,7 +336,9 @@ impl RunWorkspace {
             }
             SlotMeta::Scratch(m) => {
                 let path = inner.slot_path(&self.run, &m.dir);
-                if !matches!(tokio::fs::metadata(path.join(".git")).await, Ok(meta) if meta.is_dir())
+                if !is_slot_name(&m.dir)
+                    || !safe_fs::is_real_directory(&path).await
+                    || !safe_fs::is_real_directory(&path.join(".git")).await
                 {
                     return Ok(None);
                 }
@@ -784,7 +787,14 @@ impl RunWorkspace {
                             match RepoRef::new(&m.url, &m.base_branch).locate() {
                                 Ok(loc) => {
                                     let mirror = inner.root().join(loc.mirror_relative());
-                                    inner.remove_worktree_dir(&path, &mirror).await?;
+                                    inner
+                                        .remove_worktree_dir(
+                                            &path,
+                                            &mirror,
+                                            &self.path,
+                                            Some((&self.run, &dir)),
+                                        )
+                                        .await?;
                                 }
                                 Err(_) => remove_dir_if_exists(&path).await?,
                             }
@@ -801,10 +811,12 @@ impl RunWorkspace {
                     remove_file_if_exists(&inner.slot_meta_path(&self.run, meta.dir())).await?;
                 }
             }
-            // Metadata that cannot be read is no reason to keep the files: the mirrors forget
-            // worktrees whose directories are gone the next time they are changed.
+            // Metadata that cannot be read is no reason to keep the files, and the run's directories
+            // are found in the mirrors by their names, which carry the run.
             Err(WorkspaceError::Corrupt(why)) => {
                 tracing::warn!(run = %self.run, %why, "removing a workspace whose metadata cannot be read");
+                remove_dir_if_exists(&self.path).await?;
+                inner.forget_run_admins(&self.run).await?;
             }
             Err(e) => return Err(e),
         }
@@ -831,9 +843,19 @@ fn repository_slot(wt: Worktree, seq: u32) -> Slot {
     }
 }
 
-/// `path` has what a worktree has: a `.git` file.
+/// `path` is a worktree's directory itself, not a link a run's commands put there (to send the
+/// coder's `git add -A` into another run's files), with the `.git` file a worktree has.
 async fn looks_like_worktree(path: &Path) -> bool {
-    matches!(tokio::fs::metadata(path.join(".git")).await, Ok(meta) if meta.is_file())
+    safe_fs::is_real_directory(path).await && safe_fs::is_real_file(&path.join(".git")).await
+}
+
+/// `dir` is one plain component: the name of a direct child of a run's workspace.
+fn is_slot_name(dir: &str) -> bool {
+    let mut parts = Path::new(dir).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(name)), None) if name == std::ffi::OsStr::new(dir)
+    )
 }
 
 /// The directory name of a new repository slot: the repository's name; if that is taken,

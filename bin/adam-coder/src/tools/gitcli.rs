@@ -63,6 +63,27 @@ impl GitAt {
         &self.dir
     }
 
+    /// The repository's index: the file in the git directory the pin names (not what `git` is
+    /// asked, which reads files a run writes), or, for a directory `git` finds by itself, what it
+    /// says. `None` for a refused repository.
+    pub(crate) async fn index_path(&self) -> Option<PathBuf> {
+        match &self.pin {
+            #[cfg(test)]
+            Pin::Plain => {
+                let path = git_stdout(self, &["rev-parse", "--git-path", "index"]).await?;
+                Some(self.dir.join(path))
+            }
+            Pin::Pinned(pin) => Some(pin.git_dir().join("index")),
+            Pin::Refused => None,
+        }
+    }
+
+    /// Whether the slot's directory is a directory itself and not a link a command put in its
+    /// place: what a caller that writes in it checks first.
+    pub(crate) async fn is_plain_directory(&self) -> bool {
+        adam_workspace::safe_fs::is_real_directory(&self.dir).await
+    }
+
     /// `git`, from an empty environment ([`adam_workspace::confine_git_env`]: a filter the
     /// repository configures runs in it), in the directory and pinned. `None` when the repository
     /// is refused or its pin cannot be trusted (see [`GitPin::check`]).
@@ -341,65 +362,43 @@ pub(crate) async fn head_tree(at: &GitAt) -> Option<String> {
 /// (`git add -A`, then commit) would record it: tracked and untracked files,
 /// minus what `.gitignore` excludes. Computed in a temporary copy of the
 /// index, so the real index is untouched. `None` when it cannot be computed.
-pub(crate) async fn working_tree_id(at: &GitAt) -> Option<String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let index = git_stdout(at, &["rev-parse", "--git-path", "index"]).await?;
-    let index = at.path().join(index);
-    let tmp = index.with_extension(format!(
-        "adam-tree-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    tokio::fs::copy(&index, &tmp).await.ok()?;
-    keep_mtime(&index, &tmp).await?;
-    let tree = async {
-        let run = |args: &'static [&'static str]| {
-            let tmp = tmp.clone();
-            async move {
-                let mut cmd = at.command().await?;
-                let out = cmd
-                    .args(args)
-                    .env("GIT_INDEX_FILE", &tmp)
-                    .output()
-                    .await
-                    .ok()?;
-                out.status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-            }
-        };
-        run(&["add", "-A"]).await?;
-        run(&["write-tree"]).await.filter(|s| !s.is_empty())
-    }
-    .await;
-    let _ = tokio::fs::remove_file(&tmp).await;
-    tree
-}
-
-/// Give `copy` the modification time of `original`, an index file.
 ///
-/// Git takes an index entry whose file looks unchanged (same size, same mtime) as unchanged,
-/// except when the entry is as new as the index file itself: then it reads the file again
-/// ("racily clean"), because the file may have been rewritten within one timestamp tick of the
-/// index being written. A copy that is stamped with the time it was made makes every entry look
-/// older than the index, so a file rewritten with the same size right after the checkout would
-/// keep its old content in the tree computed from the copy. Keeping the original's mtime keeps
-/// the protection. `None` when it cannot be done (the caller then has no tree id, which is
-/// "unknown" and never a wrong one).
-pub(crate) async fn keep_mtime(original: &Path, copy: &Path) -> Option<()> {
-    let modified = tokio::fs::metadata(original).await.ok()?.modified().ok()?;
-    let copy = copy.to_owned();
-    tokio::task::spawn_blocking(move || {
-        std::fs::File::options()
-            .write(true)
-            .open(copy)?
-            .set_modified(modified)
-    })
+/// The index is in a directory the run's commands write. It is read as a regular file and not
+/// through a link, copied into a directory of the coder's own outside the volume (a name nobody
+/// chose, made with `O_EXCL`), and `git` works on that copy (`GIT_INDEX_FILE`): nothing is made
+/// in the run's directory, so no name there can be a link to somewhere else, and a link in place
+/// of the index copies nothing.
+pub(crate) async fn working_tree_id(at: &GitAt) -> Option<String> {
+    let index = at.index_path().await?;
+    let copy = match adam_workspace::safe_fs::private_copy_of(
+        &index,
+        adam_workspace::safe_fs::MAX_INDEX_COPY,
+    )
     .await
-    .ok()?
-    .ok()
+    {
+        Ok(copy) => copy,
+        Err(e) => {
+            tracing::warn!(index = %index.display(), error = %e, "the index is not copied");
+            return None;
+        }
+    };
+    let run = |args: &'static [&'static str]| {
+        let tmp = copy.path().to_owned();
+        async move {
+            let mut cmd = at.command().await?;
+            let out = cmd
+                .args(args)
+                .env("GIT_INDEX_FILE", &tmp)
+                .output()
+                .await
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        }
+    };
+    run(&["add", "-A"]).await?;
+    run(&["write-tree"]).await.filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -644,18 +643,20 @@ mod pinned_tests {
         assert!(f.marker.exists(), "the control ran the planted filter");
         std::fs::remove_file(&f.marker).unwrap();
 
-        // The pinned slot: the same files, and nothing runs.
+        // The pinned slot: refused (git's reference store follows this file even when the common
+        // directory is named), nothing runs, and the file is left as it is.
+        assert_eq!(ask_everything(&at).await, (None, None, None));
+        assert!(!f.marker.exists(), "commondir rewritten");
+        assert_eq!(
+            std::fs::read_to_string(admin.join("commondir")).unwrap(),
+            format!("{}\n", f.planted.display()),
+            "refused, not rewritten"
+        );
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
         let (tree, status, head) = ask_everything(&at).await;
         assert!(tree.is_some() && head.is_some());
         assert!(status.unwrap().contains("README.md"));
-        assert!(!f.marker.exists(), "commondir rewritten");
-        assert_eq!(
-            std::fs::read_to_string(admin.join("commondir"))
-                .unwrap()
-                .trim(),
-            "../..",
-            "put back"
-        );
+        assert!(!f.marker.exists(), "commondir as git wrote it");
 
         // The slot's `.git` file naming a repository with a working tree of its own.
         let project = f._tmp.path().join("project");
@@ -690,6 +691,99 @@ mod pinned_tests {
         let (tree, status, head) = ask_everything(&at).await;
         assert!(tree.is_some() && head.is_some() && status.unwrap().contains("README.md"));
         assert!(!f.marker.exists(), ".git file rewritten");
+    }
+
+    const VICTIM: &str = "not the coder's to write\n";
+
+    fn victim(f: &Fixture, name: &str) -> PathBuf {
+        let path = f._tmp.path().join(name);
+        std::fs::write(&path, VICTIM).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn the_copy_of_the_index_is_made_outside_the_directory_a_run_writes() {
+        let f = fixture().await;
+        let admin = f.slot.worktree().unwrap().git_dir().unwrap().to_owned();
+        let secret = victim(&f, "app-key.pem");
+        // The names the copy used to have: `index.adam-tree-<pid>-<n>`, planted as links.
+        for n in 0..256 {
+            let link = admin.join(format!("index.adam-tree-{}-{n}", std::process::id()));
+            std::os::unix::fs::symlink(&secret, link).unwrap();
+        }
+        let at = GitAt::slot(&f.slot);
+        assert!(working_tree_id(&at).await.is_some());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
+        // And nothing new is made in the directory.
+        let made = std::fs::read_dir(&admin)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("index.adam-")
+            })
+            .count();
+        assert_eq!(made, 256, "only the planted links");
+    }
+
+    #[tokio::test]
+    async fn an_index_that_is_a_link_or_a_pipe_is_not_copied_from() {
+        let f = fixture().await;
+        let admin = f.slot.worktree().unwrap().git_dir().unwrap().to_owned();
+        let at = GitAt::slot(&f.slot);
+        let secret = victim(&f, "app-key.pem");
+        std::fs::remove_file(admin.join("index")).unwrap();
+        std::os::unix::fs::symlink(&secret, admin.join("index")).unwrap();
+        assert_eq!(working_tree_id(&at).await, None);
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
+
+        std::fs::remove_file(admin.join("index")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(admin.join("index"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(10), working_tree_id(&at))
+            .await
+            .expect("the coder waited on a pipe");
+        assert_eq!(asked, None);
+    }
+
+    #[tokio::test]
+    async fn a_dot_git_that_became_a_link_is_replaced_and_never_written_through() {
+        use super::super::inspect::Snapshot;
+
+        let f = fixture().await;
+        let at = GitAt::slot(&f.slot);
+        let before = Snapshot::take(&at).await.unwrap();
+        let text = std::fs::read_to_string(f.slot.path().join(".git")).unwrap();
+
+        // A command replaces the slot's `.git` by a link to a file the coder can write.
+        let secret = victim(&f, "app-key.pem");
+        std::fs::remove_file(f.slot.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(&secret, f.slot.path().join(".git")).unwrap();
+        let during = Snapshot::take(&at).await.unwrap();
+        assert!(!during.same_git_as(&before), "the change is seen");
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            VICTIM,
+            "and nothing is read through the link to be put back later"
+        );
+
+        before.restore(&f.slot).await;
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
+        let dot_git = f.slot.path().join(".git");
+        assert!(
+            !std::fs::symlink_metadata(&dot_git)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&dot_git).unwrap(), text);
     }
 
     #[tokio::test]

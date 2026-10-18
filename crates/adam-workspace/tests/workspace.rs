@@ -3170,15 +3170,32 @@ async fn a_commondir_or_a_git_file_a_run_rewrites_steers_nothing_of_the_coders_g
         "changed after the control, and longer\n",
     )
     .unwrap();
-    the_coders_git_works_on(&slot).await;
+    // Git's reference store follows this file even when the common directory is named, so the
+    // coder does not run git at all, and does not put the file right either (it would have to open
+    // a file a run can replace by a link): a run pod cannot write it.
+    let wt = slot.worktree().unwrap();
+    for refused in [
+        wt.status().await.map(drop),
+        wt.diff_stat().await.map(drop),
+        wt.commit_all("x", &me()).await.map(drop),
+    ] {
+        let refused = refused.unwrap_err();
+        assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    }
     assert_eq!(spy.ran(), Vec::<String>::new(), "commondir rewritten");
     assert_eq!(
-        std::fs::read_to_string(admin.join("commondir"))
-            .unwrap()
-            .trim(),
-        "../..",
-        "git's reference store follows this file even when the common directory is named, so the coder puts it right"
+        std::fs::read_to_string(admin.join("commondir")).unwrap(),
+        format!("{}\n", fake.display()),
+        "refused, not rewritten"
     );
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    the_coders_git_works_on(&slot).await;
+    assert_eq!(spy.ran(), Vec::<String>::new(), "commondir as git wrote it");
+    std::fs::write(
+        slot.path().join("README.md"),
+        "changed again after, and longer still\n",
+    )
+    .unwrap();
 
     // The same with the slot's `.git` file naming a repository with a working tree of its own.
     let fake_project = env._tmp.path().join("fake-project");
@@ -3335,7 +3352,7 @@ async fn a_scratch_projects_git_is_its_own_directory_and_nothing_a_command_put_t
     assert_eq!(pin.git_dir(), project.path().join(".git"));
     assert_eq!(pin.common_dir(), project.path().join(".git"));
 
-    // A `commondir` file in the project's repository would move its refs elsewhere: it is removed.
+    // A `commondir` file in the project's repository would move its refs elsewhere: git is not run.
     let elsewhere = env._tmp.path().join("elsewhere.git");
     git(
         env._tmp.path(),
@@ -3347,12 +3364,18 @@ async fn a_scratch_projects_git_is_its_own_directory_and_nothing_a_command_put_t
     )
     .unwrap();
     std::fs::write(project.path().join("a.txt"), "b\n").unwrap();
-    assert!(project.commit_all("second", &me()).await.unwrap().is_some());
-    assert!(!project.path().join(".git/commondir").exists());
+    let refused = project.commit_all("second", &me()).await.unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    assert!(
+        project.path().join(".git/commondir").exists(),
+        "refused, not removed"
+    );
     assert!(
         git(&elsewhere, &["for-each-ref"]).is_empty(),
         "nothing was written there"
     );
+    std::fs::remove_file(project.path().join(".git/commondir")).unwrap();
+    assert!(project.commit_all("second", &me()).await.unwrap().is_some());
 
     // A `.git` that is a file naming another run's worktree directory: git is not run.
     let b = env
@@ -3384,4 +3407,493 @@ async fn a_scratch_projects_git_is_its_own_directory_and_nothing_a_command_put_t
         b_tip,
         "B's branch did not move"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the coder opens in a directory a run can write is never followed anywhere (ADR 0041)
+// ---------------------------------------------------------------------------------------------
+
+const VICTIM: &str = "not the coder's to write\n";
+
+/// A file the coder must never write to or copy from on a run's behalf.
+fn victim(env: &Env, name: &str) -> PathBuf {
+    let path = env._tmp.path().join(name);
+    std::fs::write(&path, VICTIM).unwrap();
+    path
+}
+
+fn symlink_over(target: &Path, link: &Path) {
+    let _ = std::fs::remove_file(link);
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[tokio::test]
+async fn a_commondir_that_is_a_link_is_refused_and_nothing_is_written_through_it() {
+    let env = Env::new();
+    let slot = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let wt = slot.worktree().unwrap();
+    let admin = wt.git_dir().unwrap().to_owned();
+    let secret = victim(&env, "victim.txt");
+
+    symlink_over(&secret, &admin.join("commondir"));
+    for refused in [
+        wt.status().await.map(drop),
+        wt.diff_stat().await.map(drop),
+        wt.commit_all("x", &me()).await.map(drop),
+    ] {
+        let refused = refused.unwrap_err();
+        assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+        assert!(refused.to_string().contains("commondir"), "{refused}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        VICTIM,
+        "the coder wrote through the link"
+    );
+
+    // A file with other content is refused too, and not put right: the pod cannot write it, so a
+    // run that did is not on the pod's mounts, and the coder does not rewrite what it did not make.
+    std::fs::remove_file(admin.join("commondir")).unwrap();
+    std::fs::write(admin.join("commondir"), "/somewhere/else\n").unwrap();
+    assert!(wt.status().await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(admin.join("commondir")).unwrap(),
+        "/somewhere/else\n",
+        "refused, not rewritten"
+    );
+    // What git wrote is accepted.
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    the_coders_git_works_on(&slot).await;
+}
+
+#[tokio::test]
+async fn a_commondir_that_is_a_pipe_is_refused_and_does_not_hang_the_coder() {
+    let env = Env::new();
+    let slot = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let wt = slot.worktree().unwrap();
+    let fifo = wt.git_dir().unwrap().join("commondir");
+    std::fs::remove_file(&fifo).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), wt.status()).await;
+    // Let a reader that waits for a writer (a coder that opens the pipe) end, so that the test
+    // reports the failure and does not hang with it.
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(0o4000)
+            .open(&fifo);
+    }
+    let refused = result.expect("the coder waited on a pipe").unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+}
+
+#[tokio::test]
+async fn a_temporary_index_is_not_a_name_a_run_can_plant_a_link_at() {
+    let env = Env::new();
+    let slot = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let wt = slot.worktree().unwrap();
+    let admin = wt.git_dir().unwrap().to_owned();
+    let secret = victim(&env, "victim.txt");
+    // The name the copy of the index used to have: `index.adam-diff-<pid>-<n>`.
+    for n in 0..256 {
+        symlink_over(
+            &secret,
+            &admin.join(format!("index.adam-diff-{}-{n}", std::process::id())),
+        );
+    }
+    wt.diff_stat().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        VICTIM,
+        "the copy of the index was written through a link a run planted"
+    );
+    let names: Vec<String> = std::fs::read_dir(&admin)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with("index.adam-diff-"))
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.contains("adam-")),
+        "no copy of the index is left in the directory a run writes: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_index_that_is_a_link_is_refused_and_nothing_is_copied_from_it() {
+    let env = Env::new();
+    let slot = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let wt = slot.worktree().unwrap();
+    let admin = wt.git_dir().unwrap().to_owned();
+    // The coder's own secrets stand for any file it can read: the App key, the token.
+    let secret = victim(&env, "app-key.pem");
+    symlink_over(&secret, &admin.join("index"));
+    let refused = wt.diff_stat().await.unwrap_err();
+    assert!(
+        refused.to_string().contains("not a plain file"),
+        "the index is read through no link: {refused}"
+    );
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
+
+    // Another repository's index, which the link would make the coder's: refused, not used.
+    let other = env._tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(other.join("elsewhere.txt"), "e\n").unwrap();
+    git(&other, &["add", "-A"]);
+    symlink_over(&other.join(".git/index"), &admin.join("index"));
+    let refused = wt.diff_stat().await.unwrap_err();
+    assert!(
+        refused.to_string().contains("not a plain file"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_slot_that_is_a_link_to_another_runs_slot_is_not_a_slot() {
+    let env = Env::new();
+    let a = env
+        .ws
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let b = env
+        .ws
+        .run("run-bbbbbbbb-2")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    std::fs::write(b.path().join(".env"), "TOKEN=b's\n").unwrap();
+    std::fs::write(a.path().join("README.md"), "a's change\n").unwrap();
+    let a_wt = a.worktree().unwrap().clone();
+    let a_tip = git(
+        &env.mirror(),
+        &["rev-parse", &format!("refs/heads/{}", a_wt.branch())],
+    );
+
+    // A's commands move A's slot away and put a link to B's in its place. (B's directory is not
+    // in A's pod, but the coder sees the whole volume.)
+    std::fs::rename(a.path(), a.path().with_extension("away")).unwrap();
+    std::os::unix::fs::symlink(b.path(), a.path()).unwrap();
+
+    let again = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let run = again.run("run-aaaaaaaa-1").unwrap();
+    assert!(
+        run.slots().await.unwrap().is_empty(),
+        "a link is not a slot"
+    );
+    assert!(run.slot(a.dir()).await.unwrap().is_none());
+    // The worktree the coder holds does not act on what the link leads to either.
+    let refused = a_wt.commit_all("A's", &me()).await.unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    assert!(a_wt.status().await.is_err());
+    assert_eq!(
+        git(
+            &env.mirror(),
+            &["rev-parse", &format!("refs/heads/{}", a_wt.branch())]
+        ),
+        a_tip,
+        "A's branch did not move"
+    );
+    assert!(
+        git(&env.mirror(), &["ls-tree", "-r", "--name-only", &a_tip])
+            .lines()
+            .all(|f| f != ".env"),
+        "B's .env is not on A's branch"
+    );
+    // And it is not adopted when the repository is added again.
+    assert!(run.add_repository(&env.repo).await.is_err());
+}
+
+#[tokio::test]
+async fn a_worktree_directory_of_the_mirror_is_never_taken_over_by_another_run() {
+    let env = Env::new();
+    let a = env
+        .ws
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let a_admin = a.worktree().unwrap().git_dir().unwrap().to_owned();
+    // A's commands move A's slot away: its directory in the mirror now names a slot that is not there.
+    let away = a.path().with_extension("away");
+    std::fs::rename(a.path(), &away).unwrap();
+
+    // Other runs add worktrees to the mirror. Nothing of A's is pruned, so no name is free to reuse.
+    let c = env
+        .ws
+        .run("run-cccccccc-3")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let d = env
+        .ws
+        .run("run-dddddddd-4")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let (c_admin, d_admin) = (
+        c.worktree().unwrap().git_dir().unwrap().to_owned(),
+        d.worktree().unwrap().git_dir().unwrap().to_owned(),
+    );
+    assert!(a_admin.is_dir(), "A's directory in the mirror was pruned");
+    assert_ne!(c_admin, a_admin);
+    assert_ne!(d_admin, a_admin);
+    for (admin, run) in [
+        (&a_admin, "run-aaaaaaaa-1"),
+        (&c_admin, "run-cccccccc-3"),
+        (&d_admin, "run-dddddddd-4"),
+    ] {
+        let name = admin.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(&format!("{run}+")),
+            "{name} carries its run: no other run's directory is called that"
+        );
+    }
+
+    // A puts its slot back: it is still on its own directory, and its own branch gets its work.
+    std::fs::rename(&away, a.path()).unwrap();
+    let again = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let slots = again.run("run-aaaaaaaa-1").unwrap().slots().await.unwrap();
+    let a_wt = slots[0].worktree().unwrap();
+    assert_eq!(a_wt.git_dir().unwrap(), a_admin);
+    std::fs::write(a.path().join("README.md"), "A's work\n").unwrap();
+    let sha = a_wt.commit_all("A", &me()).await.unwrap().unwrap();
+    assert_eq!(
+        git(&env.mirror(), &["show", &format!("{sha}:README.md")]),
+        "A's work"
+    );
+
+    // A directory that is not A's any more (another run's, whose `gitdir` names its own slot) is
+    // not A's, whatever the record says.
+    std::fs::write(
+        a_admin.join("gitdir"),
+        format!("{}\n", d.path().join(".git").display()),
+    )
+    .unwrap();
+    let slots = again.run("run-aaaaaaaa-1").unwrap().slots().await.unwrap();
+    let a_wt = slots[0].worktree().unwrap();
+    assert!(a_wt.git_dir().is_none(), "{:?}", a_wt.git_dir());
+    assert!(a_wt.status().await.is_err());
+    // A directory that is called after another run is not taken either.
+    let mut meta = meta_json(&env, "run-aaaaaaaa-1", &a);
+    meta["admin"] = d_admin.file_name().unwrap().to_str().unwrap().into();
+    let meta_path = env
+        .root
+        .join("meta/run-aaaaaaaa-1")
+        .join(format!("{}.json", a.dir()));
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+    std::fs::write(
+        d_admin.join("gitdir"),
+        format!("{}\n", a.path().join(".git").display()),
+    )
+    .unwrap();
+    let slots = again.run("run-aaaaaaaa-1").unwrap().slots().await.unwrap();
+    assert!(
+        slots[0].worktree().unwrap().git_dir().is_none(),
+        "a record that names another run's directory is not believed even when its gitdir was made to agree"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_run_whose_slot_became_a_link_does_not_remove_what_the_link_leads_to() {
+    let env = Env::new();
+    let a = env
+        .ws
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let b = worktree_with_a_change(&env, "run-bbbbbbbb-2").await;
+    let b_admin = b.worktree().unwrap().git_dir().unwrap().to_owned();
+
+    // `git worktree remove` resolves a link and deletes the worktree it leads to (*verified* with
+    // git 2.43.0) unless the path is the very one a worktree is registered at (then it checks that
+    // the `.git` file points back, and refuses). A's slot is replaced by a link to B's, and A's
+    // `gitdir` (which a pod without the read-only mount, local mode and Podman can write) names
+    // another path.
+    let a_admin = a.worktree().unwrap().git_dir().unwrap().to_owned();
+    std::fs::write(a_admin.join("gitdir"), "/nowhere/.git\n").unwrap();
+    std::fs::rename(a.path(), a.path().with_extension("away")).unwrap();
+    std::os::unix::fs::symlink(b.path(), a.path()).unwrap();
+
+    env.ws.remove("run-aaaaaaaa-1").await.unwrap();
+    assert!(
+        b.path().join("README.md").is_file() && b_admin.is_dir(),
+        "B's worktree and its directory in the mirror are still there"
+    );
+    assert!(!a.path().exists() && std::fs::symlink_metadata(a.path()).is_err());
+    the_coders_git_works_on(&b).await;
+}
+
+#[tokio::test]
+async fn a_base_checkout_directory_that_is_a_link_is_replaced_and_never_followed() {
+    let env = Env::new();
+    let slot = env
+        .ws
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let wt = slot.worktree().unwrap();
+    let other = env
+        .ws
+        .run("run-bbbbbbbb-2")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    // A's `.adam-base` leads into B's workspace, where a directory is called like A's slot.
+    let run_dir = slot.path().parent().unwrap().to_owned();
+    let lure = other.path().parent().unwrap().to_owned();
+    std::os::unix::fs::symlink(&lure, run_dir.join(".adam-base")).unwrap();
+    std::fs::create_dir_all(lure.join(slot.dir())).unwrap();
+    std::fs::write(lure.join(slot.dir()).join("precious"), "p\n").unwrap();
+
+    let base = wt.add_base_checkout().await.unwrap().unwrap();
+    assert!(
+        base.path().starts_with(&run_dir)
+            && !std::fs::symlink_metadata(run_dir.join(".adam-base"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+        "the link was replaced by a directory of the run"
+    );
+    assert!(lure.join(slot.dir()).join("precious").is_file());
+    // The checkout's directory in the mirror carries the run.
+    let admins: Vec<String> = std::fs::read_dir(env.mirror().join("worktrees"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        admins.contains(&format!("run-aaaaaaaa-1+{}+base", slot.dir())),
+        "{admins:?}"
+    );
+
+    // Now the checkout itself is replaced by a link to B's slot: removing it removes the link.
+    std::fs::remove_dir_all(base.path()).unwrap();
+    std::os::unix::fs::symlink(other.path(), base.path()).unwrap();
+    wt.remove_base_checkout(&base).await.unwrap();
+    assert!(
+        other.path().join("README.md").is_file(),
+        "B's worktree is intact"
+    );
+    assert!(std::fs::symlink_metadata(base.path()).is_err());
+    assert!(
+        std::fs::read_dir(env.mirror().join("worktrees"))
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with("+base")),
+        "its directory in the mirror is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_planted_reflog_link_is_not_appended_to() {
+    let env = Env::new();
+    let slot = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let wt = slot.worktree().unwrap();
+    let logs = wt.git_dir().unwrap().join("logs");
+    // git appends a line to the file a link at `logs/HEAD` names (*verified* with git 2.43.0).
+    let secret = victim(&env, "mirror-config");
+    symlink_over(&secret, &logs.join("HEAD"));
+    let refused = wt.commit_all("x", &me()).await.unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
+    // A link in place of the directory is as bad.
+    std::fs::remove_file(logs.join("HEAD")).unwrap();
+    std::fs::rename(&logs, logs.with_extension("moved")).unwrap();
+    std::os::unix::fs::symlink(env._tmp.path(), &logs).unwrap();
+    assert!(wt.status().await.is_err());
+}
+
+#[tokio::test]
+async fn a_gitdir_file_that_is_a_pipe_does_not_hang_the_coder() {
+    let env = Env::new();
+    let slot = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let gitdir = slot.worktree().unwrap().git_dir().unwrap().join("gitdir");
+    std::fs::remove_file(&gitdir).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(&gitdir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let again = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let listed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        again.run("run-aaaaaaaa-1").unwrap().slots(),
+    )
+    .await;
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(0o4000)
+            .open(&gitdir);
+    }
+    let slots = listed.expect("the coder waited on a pipe").unwrap();
+    // The directory is the run's by its record, and its back-pointer cannot be read: not its own.
+    assert!(slots[0].worktree().unwrap().git_dir().is_none());
+}
+
+#[tokio::test]
+async fn a_workspace_with_unreadable_metadata_leaves_none_of_its_directories_in_the_mirror() {
+    let env = Env::new();
+    let other = env
+        .ws
+        .run("run-bbbbbbbb-2")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let a = env
+        .ws
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let a_admin = a.worktree().unwrap().git_dir().unwrap().to_owned();
+    let b_admin = other.worktree().unwrap().git_dir().unwrap().to_owned();
+    // What a try that died between making a worktree and moving it left in staging.
+    let staged = |run: &str| env.root.join("staging").join(format!("{run}+remote"));
+    for run in ["run-aaaaaaaa-1", "run-bbbbbbbb-2"] {
+        std::fs::create_dir_all(staged(run)).unwrap();
+        std::fs::write(staged(run).join("README.md"), "x").unwrap();
+    }
+    std::fs::write(
+        env.root
+            .join("meta/run-aaaaaaaa-1")
+            .join(format!("{}.json", a.dir())),
+        "not json",
+    )
+    .unwrap();
+    env.ws.remove("run-aaaaaaaa-1").await.unwrap();
+    assert!(!a.path().exists());
+    assert!(
+        !a_admin.exists(),
+        "A's directory in the mirror went with it"
+    );
+    assert!(b_admin.is_dir(), "B's did not");
+    assert!(!staged("run-aaaaaaaa-1").exists(), "nor does its staging");
+    assert!(staged("run-bbbbbbbb-2").is_dir());
+    // With readable metadata the same is found by name.
+    env.ws.remove("run-bbbbbbbb-2").await.unwrap();
+    assert!(!staged("run-bbbbbbbb-2").exists());
+    assert!(!b_admin.exists());
 }

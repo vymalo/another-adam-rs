@@ -68,6 +68,7 @@ mod github;
 mod github_app;
 mod repo;
 mod run_workspace;
+pub mod safe_fs;
 #[cfg(all(feature = "github", feature = "test-util"))]
 pub mod testing;
 mod workspace;

@@ -144,7 +144,14 @@ pub(super) struct Snapshot {
 impl Snapshot {
     pub(super) async fn take(at: &GitAt) -> Option<Self> {
         let git_dir = git_stdout(at, &["rev-parse", "--absolute-git-dir"]).await?;
-        let dot_git = tokio::fs::read_to_string(at.path().join(".git")).await.ok();
+        // The file is in the slot, which a command can have replaced: read as a regular file and
+        // not through a link.
+        let dot_git = adam_workspace::safe_fs::read_regular_text(
+            &at.path().join(".git"),
+            adam_workspace::safe_fs::MAX_SMALL_FILE,
+        )
+        .await
+        .ok();
         let head = head_sha(at).await?;
         let tree = working_tree_id(at).await;
         let status = match tree {
@@ -187,13 +194,19 @@ impl Snapshot {
         let dir = slot.path();
         let at = GitAt::slot(slot);
         if let Some(text) = &self.dot_git
-            && tokio::fs::read_to_string(dir.join(".git"))
-                .await
-                .ok()
-                .as_deref()
+            && adam_workspace::safe_fs::read_regular_text(
+                &dir.join(".git"),
+                adam_workspace::safe_fs::MAX_SMALL_FILE,
+            )
+            .await
+            .ok()
+            .as_deref()
                 != Some(text)
+            && at.is_plain_directory().await
         {
-            let _ = tokio::fs::write(dir.join(".git"), text).await;
+            // Written next to it and renamed over it: a link or a pipe a command put at `.git` is
+            // replaced, never written through.
+            let _ = adam_workspace::safe_fs::replace_file(&dir.join(".git"), text.as_bytes()).await;
         }
         // Still this run's git directory? Otherwise git would act on another repository.
         if git_stdout(&at, &["rev-parse", "--absolute-git-dir"])
