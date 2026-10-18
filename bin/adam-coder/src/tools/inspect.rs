@@ -25,8 +25,8 @@ use adam::prelude::*;
 
 use super::checks::missing_tool_answer;
 use super::gitcli::{
-    RepoState, git_stdout, head_ref, head_sha, repo_state, restore_repo_state, restore_worktree,
-    status_text, working_tree_id,
+    GitAt, RepoState, git_stdout, head_ref, head_sha, repo_state, restore_repo_state,
+    restore_worktree, status_text, working_tree_id,
 };
 use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_in, shell_spec};
 use super::{Outcome, ToolEnv, non_empty, run_error};
@@ -67,7 +67,8 @@ pub async fn run_command(
     let environment = env.session(ctx).await?;
 
     // What the worktree is before the command: nothing it does may change it.
-    let Some(before) = Snapshot::take(slot.path()).await else {
+    let at = GitAt::slot(&slot);
+    let Some(before) = Snapshot::take(&at).await else {
         return Ok(ToolOutput::error(
             "Cannot read the state of the worktree, so nothing was run (a command that might \
              change it cannot be undone). Try again; if it persists, tell the person.",
@@ -89,7 +90,7 @@ pub async fn run_command(
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
 
     // Did it change anything it should not have?
-    let after = Snapshot::take(slot.path()).await;
+    let after = Snapshot::take(&at).await;
     if after.as_ref() != Some(&before) {
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("undid a change made by: {shown}"))
@@ -141,23 +142,23 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) async fn take(dir: &std::path::Path) -> Option<Self> {
-        let git_dir = git_stdout(dir, &["rev-parse", "--absolute-git-dir"]).await?;
-        let dot_git = tokio::fs::read_to_string(dir.join(".git")).await.ok();
-        let head = head_sha(dir).await?;
-        let tree = working_tree_id(dir).await;
+    pub(super) async fn take(at: &GitAt) -> Option<Self> {
+        let git_dir = git_stdout(at, &["rev-parse", "--absolute-git-dir"]).await?;
+        let dot_git = tokio::fs::read_to_string(at.path().join(".git")).await.ok();
+        let head = head_sha(at).await?;
+        let tree = working_tree_id(at).await;
         let status = match tree {
             Some(_) => None,
-            None => Some(status_text(dir).await?),
+            None => Some(status_text(at).await?),
         };
         Some(Self {
             git_dir,
             dot_git,
             head,
-            branch: head_ref(dir).await,
+            branch: head_ref(at).await,
             tree,
             status,
-            repo: repo_state(dir).await?,
+            repo: repo_state(at).await?,
         })
     }
 
@@ -184,6 +185,7 @@ impl Snapshot {
     /// Put it all back; `true` when the worktree is exactly as it was.
     pub(super) async fn restore(&self, slot: &adam_workspace::Slot) -> bool {
         let dir = slot.path();
+        let at = GitAt::slot(slot);
         if let Some(text) = &self.dot_git
             && tokio::fs::read_to_string(dir.join(".git"))
                 .await
@@ -194,7 +196,7 @@ impl Snapshot {
             let _ = tokio::fs::write(dir.join(".git"), text).await;
         }
         // Still this run's git directory? Otherwise git would act on another repository.
-        if git_stdout(dir, &["rev-parse", "--absolute-git-dir"])
+        if git_stdout(&at, &["rev-parse", "--absolute-git-dir"])
             .await
             .as_deref()
             != Some(self.git_dir.as_str())
@@ -210,20 +212,20 @@ impl Snapshot {
             },
             None => None,
         };
-        let repo = restore_repo_state(dir, &self.repo).await;
+        let repo = restore_repo_state(&at, &self.repo).await;
         let Some(tree) = &self.tree else {
             // No tree to write back: point `HEAD` where it was and keep the files as they are.
             // (Whether these work or not, the files are not known to be as they were.)
             let _ = match &self.branch {
-                Some(branch) => git_stdout(dir, &["symbolic-ref", "HEAD", branch]).await,
-                None => git_stdout(dir, &["update-ref", "--no-deref", "HEAD", &self.head]).await,
+                Some(branch) => git_stdout(&at, &["symbolic-ref", "HEAD", branch]).await,
+                None => git_stdout(&at, &["update-ref", "--no-deref", "HEAD", &self.head]).await,
             };
-            let _ = git_stdout(dir, &["reset", "--soft", "--quiet", &self.head]).await;
+            let _ = git_stdout(&at, &["reset", "--soft", "--quiet", &self.head]).await;
             let _ = repo;
             return false;
         };
-        repo && restore_worktree(dir, &self.head, self.branch.as_deref(), tree).await
-            && Self::take(dir).await.as_ref() == Some(self)
+        repo && restore_worktree(&at, &self.head, self.branch.as_deref(), tree).await
+            && Self::take(&at).await.as_ref() == Some(self)
     }
 }
 

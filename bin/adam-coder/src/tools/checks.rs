@@ -669,9 +669,10 @@ pub async fn run_checks(
 
     // The code the command just ran on, so a pull request can be tied to
     // the exact tree that was verified.
-    let tree = super::gitcli::working_tree_id(slot.path()).await;
-    let head = super::gitcli::head_sha(slot.path()).await;
-    let dirty = match (&tree, super::gitcli::head_tree(slot.path()).await) {
+    let at = super::gitcli::GitAt::slot(&slot);
+    let tree = super::gitcli::working_tree_id(&at).await;
+    let head = super::gitcli::head_sha(&at).await;
+    let dirty = match (&tree, super::gitcli::head_tree(&at).await) {
         (Some(tree), Some(head_tree)) => *tree != head_tree,
         _ => false,
     };

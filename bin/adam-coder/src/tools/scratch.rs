@@ -32,7 +32,7 @@ use adam_workspace::{
     copy_into,
 };
 
-use super::gitcli::{head_tree, working_tree_id};
+use super::gitcli::{GitAt, head_tree, working_tree_id};
 use super::named::key_of_argument;
 use super::prepare::not_named;
 use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, workspace_error};
@@ -224,7 +224,7 @@ pub async fn publish_scratch(
     // A repository whose files are somebody's: where the project goes is the person's to say.
     if destination.is_none()
         && !overwrite
-        && head_tree(wt.path()).await.as_deref() != Some(EMPTY_TREE)
+        && head_tree(&GitAt::worktree(wt)).await.as_deref() != Some(EMPTY_TREE)
     {
         return Ok(ToolOutput::error(format!(
             "{url} already has files on {}. Do not guess where the project goes: ask the person \
@@ -260,7 +260,7 @@ pub async fn publish_scratch(
         .map_err(|e| workspace_error(&e))?;
 
     // What the model has to do next depends on what the checks said about this very code.
-    let tree = working_tree_id(wt.path()).await;
+    let tree = working_tree_id(&GitAt::worktree(wt)).await;
     let verdict = match tree.as_deref().and_then(|tree| notes.checked(tree)) {
         Some(record) if record.passed => format!(
             "The checks passed on exactly this code (`{}`, run in `{}`): commit_and_push now.",
@@ -524,7 +524,7 @@ pub(crate) async fn commit_locally(
         Err(e @ WorkspaceError::Invalid(_)) => return Ok(ToolOutput::error(e.to_string())),
         Err(e) => return Err(workspace_error(&e)),
     };
-    let head = super::gitcli::head_sha(slot.path()).await;
+    let head = super::gitcli::head_sha(&GitAt::slot(slot)).await;
     let at = head.as_deref().unwrap_or("HEAD");
     let mut text = match committed {
         Some(sha) => format!(

@@ -1,60 +1,138 @@
-//! The few read-only `git` questions the tools ask that `adam-workspace` does
-//! not answer. The worktree's git directory is discovered from its path; no
-//! credentials are involved.
+//! The few `git` questions the tools ask that `adam-workspace` does not answer. They are asked
+//! **pinned** to the slot's repository as the coder's own metadata names it ([`GitAt`]): never to
+//! wherever the slot's `.git` file, a `commondir` or a `gitdir` says, which a run's commands write.
+//! No credentials are involved.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use adam_workspace::{GitPin, Slot, Worktree};
 use tokio::process::Command;
 
-/// Run `git <args>` in `dir`; `Some(stdout)` (trimmed) on exit 0.
-pub(crate) async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("git");
-    // From an empty environment: a filter the repository configures runs in it (`git add` below).
-    adam_workspace::confine_git_env(&mut cmd);
-    let out = cmd
-        .args([
+/// Where a git question is asked: a directory, and the repository `git` works on there.
+///
+/// A slot's repository is pinned (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, from the coder's
+/// metadata; see [`GitPin`]). A worktree whose repository the metadata cannot tell is **refused**: no
+/// `git` is started, and every question about it is "unknown" (`None`), as for a repository that
+/// cannot be read. A plain directory is discovered as `git` always did (the tests').
+#[derive(Debug, Clone)]
+pub(crate) struct GitAt {
+    dir: PathBuf,
+    pin: Pin,
+}
+
+#[derive(Debug, Clone)]
+enum Pin {
+    /// Discover the repository from the directory.
+    #[cfg(test)]
+    Plain,
+    Pinned(GitPin),
+    Refused,
+}
+
+impl GitAt {
+    /// A directory whose repository `git` finds by itself: for tests and for directories that are
+    /// no slot.
+    #[cfg(test)]
+    pub(crate) fn plain(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            pin: Pin::Plain,
+        }
+    }
+
+    /// A slot: a worktree of a repository or a scratch project.
+    pub(crate) fn slot(slot: &Slot) -> Self {
+        Self::of(slot.path(), slot.git_pin())
+    }
+
+    /// A repository's worktree.
+    pub(crate) fn worktree(worktree: &Worktree) -> Self {
+        Self::of(worktree.path(), worktree.git_pin())
+    }
+
+    fn of(dir: &Path, pin: Option<GitPin>) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            pin: pin.map_or(Pin::Refused, Pin::Pinned),
+        }
+    }
+
+    /// The directory the questions are asked in: the slot's.
+    pub(crate) fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// `git`, from an empty environment ([`adam_workspace::confine_git_env`]: a filter the
+    /// repository configures runs in it), in the directory and pinned. `None` when the repository
+    /// is refused or its pin cannot be trusted (see [`GitPin::check`]).
+    pub(crate) async fn command(&self) -> Option<Command> {
+        let mut cmd = Command::new("git");
+        adam_workspace::confine_git_env(&mut cmd);
+        match &self.pin {
+            #[cfg(test)]
+            Pin::Plain => {}
+            Pin::Pinned(pin) => {
+                if let Err(why) = pin.check().await {
+                    tracing::warn!(dir = %self.dir.display(), %why, "git is not run here");
+                    return None;
+                }
+                pin.apply(&mut cmd);
+            }
+            Pin::Refused => {
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    "git is not run here: which directory of the mirror is this worktree's is not known"
+                );
+                return None;
+            }
+        }
+        cmd.args([
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
             "core.fsmonitor=false",
         ])
-        .args(args)
-        .current_dir(dir)
+        .current_dir(&self.dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true);
+        Some(cmd)
+    }
+}
+
+/// Run `git <args>` where `at` says; `Some(stdout)` (trimmed) on exit 0.
+pub(crate) async fn git_stdout(at: &GitAt, args: &[&str]) -> Option<String> {
+    let mut cmd = at.command().await?;
+    let out = cmd.args(args).output().await.ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 /// The commit `HEAD` points at.
-pub(crate) async fn head_sha(dir: &Path) -> Option<String> {
-    git_stdout(dir, &["rev-parse", "HEAD"])
+pub(crate) async fn head_sha(at: &GitAt) -> Option<String> {
+    git_stdout(at, &["rev-parse", "HEAD"])
         .await
         .filter(|s| !s.is_empty())
 }
 
 /// How many commits `HEAD` has beyond `origin/<base_branch>` (as fetched into
 /// the mirror). `None` when it cannot be told.
-pub(crate) async fn commits_ahead(dir: &Path, base_branch: &str) -> Option<u64> {
+pub(crate) async fn commits_ahead(at: &GitAt, base_branch: &str) -> Option<u64> {
     let range = format!("refs/remotes/origin/{base_branch}..HEAD");
-    git_stdout(dir, &["rev-list", "--count", &range])
+    git_stdout(at, &["rev-list", "--count", &range])
         .await?
         .parse()
         .ok()
 }
 
 /// The branch `HEAD` is on (`refs/heads/...`), `None` when it is detached.
-pub(crate) async fn head_ref(dir: &Path) -> Option<String> {
-    git_stdout(dir, &["symbolic-ref", "-q", "HEAD"])
+pub(crate) async fn head_ref(at: &GitAt) -> Option<String> {
+    git_stdout(at, &["symbolic-ref", "-q", "HEAD"])
         .await
         .filter(|s| !s.is_empty())
 }
@@ -68,31 +146,31 @@ pub(crate) async fn head_ref(dir: &Path) -> Option<String> {
 /// --reset -u` writes back what the worktree held before (uncommitted work included, files that
 /// were untracked included). `true` when every step succeeded.
 pub(crate) async fn restore_worktree(
-    dir: &Path,
+    at: &GitAt,
     head: &str,
     head_ref: Option<&str>,
     tree: &str,
 ) -> bool {
     let point_head = match head_ref {
-        Some(branch) => git_stdout(dir, &["symbolic-ref", "HEAD", branch]).await,
-        None => git_stdout(dir, &["update-ref", "--no-deref", "HEAD", head]).await,
+        Some(branch) => git_stdout(at, &["symbolic-ref", "HEAD", branch]).await,
+        None => git_stdout(at, &["update-ref", "--no-deref", "HEAD", head]).await,
     };
     point_head.is_some()
-        && git_stdout(dir, &["reset", "--hard", "--quiet", head])
+        && git_stdout(at, &["reset", "--hard", "--quiet", head])
             .await
             .is_some()
-        && git_stdout(dir, &["clean", "-ffdq"]).await.is_some()
-        && git_stdout(dir, &["read-tree", "--reset", "-u", tree])
+        && git_stdout(at, &["clean", "-ffdq"]).await.is_some()
+        && git_stdout(at, &["read-tree", "--reset", "-u", tree])
             .await
             .is_some()
-        && git_stdout(dir, &["reset", "--quiet", head]).await.is_some()
+        && git_stdout(at, &["reset", "--quiet", head]).await.is_some()
 }
 
 /// What `git status` says, as it says it (`--porcelain=v1 -z`, every untracked file): a cheap
 /// picture of the worktree that needs no commit and no index copy.
-pub(crate) async fn status_text(dir: &Path) -> Option<String> {
+pub(crate) async fn status_text(at: &GitAt) -> Option<String> {
     git_stdout(
-        dir,
+        at,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )
     .await
@@ -143,21 +221,21 @@ fn written_per_run(key: &str) -> bool {
 }
 
 /// `<common dir>/info/exclude`, where the repository's local ignore rules live.
-async fn exclude_path(dir: &Path) -> Option<std::path::PathBuf> {
-    let common = git_stdout(dir, &["rev-parse", "--git-common-dir"]).await?;
-    Some(dir.join(common).join("info/exclude"))
+async fn exclude_path(at: &GitAt) -> Option<std::path::PathBuf> {
+    let common = git_stdout(at, &["rev-parse", "--git-common-dir"]).await?;
+    Some(at.path().join(common).join("info/exclude"))
 }
 
 /// [`RepoState`] now, `None` when it cannot be read.
-pub(crate) async fn repo_state(dir: &Path) -> Option<RepoState> {
-    let refs = git_stdout(dir, &["for-each-ref", "--format=%(refname) %(objectname)"]).await?;
+pub(crate) async fn repo_state(at: &GitAt) -> Option<RepoState> {
+    let refs = git_stdout(at, &["for-each-ref", "--format=%(refname) %(objectname)"]).await?;
     let refs = refs
         .lines()
         .filter_map(|l| l.split_once(' '))
         .filter(|(name, _)| !moved_by_others(name))
         .map(|(n, id)| (n.to_owned(), id.to_owned()))
         .collect();
-    let config = git_stdout(dir, &["config", "--local", "--list", "-z"]).await?;
+    let config = git_stdout(at, &["config", "--local", "--list", "-z"]).await?;
     let mut config: Vec<(String, String)> = config
         .split('\0')
         .filter(|e| !e.is_empty())
@@ -170,7 +248,7 @@ pub(crate) async fn repo_state(dir: &Path) -> Option<RepoState> {
     // Where a key sits in the file does not matter (restoring it appends), what it says does; the
     // values of one key keep their order (the sort is stable).
     config.sort_by(|a, b| a.0.cmp(&b.0));
-    let exclude = match tokio::fs::read_to_string(exclude_path(dir).await?).await {
+    let exclude = match tokio::fs::read_to_string(exclude_path(at).await?).await {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return None,
@@ -185,8 +263,8 @@ pub(crate) async fn repo_state(dir: &Path) -> Option<RepoState> {
 /// Put the refs, the configuration and `info/exclude` that [`repo_state`] reads back as `before`
 /// had them. `true` when every step succeeded. The caller holds the mirror lock
 /// (`Worktree::lock_mirror`): the configuration is written by one at a time.
-pub(crate) async fn restore_repo_state(dir: &Path, before: &RepoState) -> bool {
-    let Some(now) = repo_state(dir).await else {
+pub(crate) async fn restore_repo_state(at: &GitAt, before: &RepoState) -> bool {
+    let Some(now) = repo_state(at).await else {
         return false;
     };
     let mut ok = true;
@@ -194,14 +272,14 @@ pub(crate) async fn restore_repo_state(dir: &Path, before: &RepoState) -> bool {
     // points at.
     for (name, _) in &now.refs {
         if !before.refs.iter().any(|(n, _)| n == name) {
-            ok &= git_stdout(dir, &["update-ref", "--no-deref", "-d", name])
+            ok &= git_stdout(at, &["update-ref", "--no-deref", "-d", name])
                 .await
                 .is_some();
         }
     }
     for (name, id) in &before.refs {
         if !now.refs.iter().any(|r| r == &(name.clone(), id.clone())) {
-            ok &= git_stdout(dir, &["update-ref", "--no-deref", name, id])
+            ok &= git_stdout(at, &["update-ref", "--no-deref", name, id])
                 .await
                 .is_some();
         }
@@ -232,16 +310,16 @@ pub(crate) async fn restore_repo_state(dir: &Path, before: &RepoState) -> bool {
                 continue;
             }
             // `--unset-all` fails when the key is not there, which is fine.
-            let _ = git_stdout(dir, &["config", "--local", "--unset-all", key]).await;
+            let _ = git_stdout(at, &["config", "--local", "--unset-all", key]).await;
             for value in was {
-                ok &= git_stdout(dir, &["config", "--local", "--add", key, value])
+                ok &= git_stdout(at, &["config", "--local", "--add", key, value])
                     .await
                     .is_some();
             }
         }
     }
     if now.exclude != before.exclude {
-        let Some(path) = exclude_path(dir).await else {
+        let Some(path) = exclude_path(at).await else {
             return false;
         };
         ok &= match &before.exclude {
@@ -249,12 +327,12 @@ pub(crate) async fn restore_repo_state(dir: &Path, before: &RepoState) -> bool {
             None => tokio::fs::remove_file(&path).await.is_ok(),
         };
     }
-    ok && repo_state(dir).await.as_ref() == Some(before)
+    ok && repo_state(at).await.as_ref() == Some(before)
 }
 
 /// The tree id of `HEAD`: the code a pull request from this branch contains.
-pub(crate) async fn head_tree(dir: &Path) -> Option<String> {
-    git_stdout(dir, &["rev-parse", "HEAD^{tree}"])
+pub(crate) async fn head_tree(at: &GitAt) -> Option<String> {
+    git_stdout(at, &["rev-parse", "HEAD^{tree}"])
         .await
         .filter(|s| !s.is_empty())
 }
@@ -263,12 +341,12 @@ pub(crate) async fn head_tree(dir: &Path) -> Option<String> {
 /// (`git add -A`, then commit) would record it: tracked and untracked files,
 /// minus what `.gitignore` excludes. Computed in a temporary copy of the
 /// index, so the real index is untouched. `None` when it cannot be computed.
-pub(crate) async fn working_tree_id(dir: &Path) -> Option<String> {
+pub(crate) async fn working_tree_id(at: &GitAt) -> Option<String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let index = git_stdout(dir, &["rev-parse", "--git-path", "index"]).await?;
-    let index = dir.join(index);
+    let index = git_stdout(at, &["rev-parse", "--git-path", "index"]).await?;
+    let index = at.path().join(index);
     let tmp = index.with_extension(format!(
         "adam-tree-{}-{}",
         std::process::id(),
@@ -280,24 +358,10 @@ pub(crate) async fn working_tree_id(dir: &Path) -> Option<String> {
         let run = |args: &'static [&'static str]| {
             let tmp = tmp.clone();
             async move {
-                let mut cmd = Command::new("git");
-                adam_workspace::confine_git_env(&mut cmd);
+                let mut cmd = at.command().await?;
                 let out = cmd
-                    .args([
-                        "-c",
-                        "core.hooksPath=/dev/null",
-                        "-c",
-                        "core.fsmonitor=false",
-                    ])
                     .args(args)
-                    .current_dir(dir)
                     .env("GIT_INDEX_FILE", &tmp)
-                    .env("GIT_TERMINAL_PROMPT", "0")
-                    .env("GIT_CONFIG_NOSYSTEM", "1")
-                    .env("LC_ALL", "C")
-                    .stdin(Stdio::null())
-                    .stderr(Stdio::null())
-                    .kill_on_drop(true)
                     .output()
                     .await
                     .ok()?;
@@ -410,13 +474,13 @@ mod tests {
         git(dir, Some(&fresh), &["read-tree", "HEAD"]);
         git(dir, Some(&fresh), &["add", "-A"]);
         let expected = git(dir, Some(&fresh), &["write-tree"]);
-        let head = head_tree(dir).await.unwrap();
+        let head = head_tree(&GitAt::plain(dir)).await.unwrap();
         assert_ne!(expected, head, "the rewrite is a change");
 
         // Git compares these timestamps in whole seconds, so the copy has to be made in a later
         // second than the entry's to look older than it.
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        assert_eq!(working_tree_id(dir).await.unwrap(), expected);
+        assert_eq!(working_tree_id(&GitAt::plain(dir)).await.unwrap(), expected);
     }
 
     /// Repository code can write a `filter.*.clean` command to `.git/config` (a check script can),
@@ -445,11 +509,198 @@ mod tests {
         std::fs::write(dir.join("new.txt"), "to be filtered\n").unwrap();
 
         // `working_tree_id` runs `git add -A` in a copy of the index: the filter runs.
-        assert!(working_tree_id(&dir).await.is_some());
+        assert!(working_tree_id(&GitAt::plain(&dir)).await.is_some());
         let env = std::fs::read_to_string(&seen).expect("the filter ran");
         // `CARGO_PKG_NAME` is set by cargo in every test process: it stands for a secret.
         assert!(!env.contains("CARGO_PKG_NAME"), "{env}");
         assert!(env.contains("PATH="), "what git needs is kept: {env}");
+    }
+}
+
+#[cfg(test)]
+mod pinned_tests {
+    use std::sync::Arc;
+
+    use adam_workspace::{RepoRef, StaticToken, Workspaces};
+
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// A worktree of a local repository, and a repository whose configuration runs `spy` as a clean
+    /// filter (its marker is `marker`), the way a run's commands could make one.
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        slot: adam_workspace::Slot,
+        planted: PathBuf,
+        marker: PathBuf,
+    }
+
+    async fn fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&seed).unwrap();
+        git(
+            &remote,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        );
+        git(&seed, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(seed.join("README.md"), "widgets\n").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "--quiet", "origin", "main"]);
+        let workspaces = Workspaces::new(
+            tmp.path().join("root"),
+            Arc::new(StaticToken::new("unused-in-these-tests")),
+        );
+        let slot = workspaces
+            .run("run-aaaaaaaa-1")
+            .unwrap()
+            .add_repository(&RepoRef::new(remote.to_str().unwrap(), "main"))
+            .await
+            .unwrap();
+        // The repository a command plants: a clean filter that leaves a marker.
+        let marker = tmp.path().join("marker");
+        let spy = tmp.path().join("spy.sh");
+        std::fs::write(
+            &spy,
+            format!("#!/bin/sh\necho ran > {}\ncat\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&spy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let planted = tmp.path().join("planted.git");
+        git(
+            tmp.path(),
+            &["init", "--bare", "--quiet", planted.to_str().unwrap()],
+        );
+        git(
+            &planted,
+            &["config", "filter.spy.clean", spy.to_str().unwrap()],
+        );
+        std::fs::write(slot.path().join(".gitattributes"), "*.md filter=spy\n").unwrap();
+        std::fs::write(slot.path().join("README.md"), "changed by the run\n").unwrap();
+        Fixture {
+            _tmp: tmp,
+            slot,
+            planted,
+            marker,
+        }
+    }
+
+    /// The questions the coder asks of a worktree that read the index, run `add -A` in a copy of it
+    /// and read the status: all of them.
+    async fn ask_everything(at: &GitAt) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            working_tree_id(at).await,
+            status_text(at).await,
+            head_sha(at).await,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_coders_questions_run_nothing_a_rewritten_commondir_or_git_file_names() {
+        let f = fixture().await;
+        let admin = f.slot.worktree().unwrap().git_dir().unwrap().to_owned();
+        let at = GitAt::slot(&f.slot);
+
+        // The control: a plain directory is discovered through the files, and the filter runs.
+        std::fs::write(
+            admin.join("commondir"),
+            format!("{}\n", f.planted.display()),
+        )
+        .unwrap();
+        assert!(
+            working_tree_id(&GitAt::plain(f.slot.path()))
+                .await
+                .is_some()
+        );
+        assert!(f.marker.exists(), "the control ran the planted filter");
+        std::fs::remove_file(&f.marker).unwrap();
+
+        // The pinned slot: the same files, and nothing runs.
+        let (tree, status, head) = ask_everything(&at).await;
+        assert!(tree.is_some() && head.is_some());
+        assert!(status.unwrap().contains("README.md"));
+        assert!(!f.marker.exists(), "commondir rewritten");
+        assert_eq!(
+            std::fs::read_to_string(admin.join("commondir"))
+                .unwrap()
+                .trim(),
+            "../..",
+            "put back"
+        );
+
+        // The slot's `.git` file naming a repository with a working tree of its own.
+        let project = f._tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        git(&project, &["init", "--quiet", "--initial-branch=main"]);
+        git(
+            &project,
+            &[
+                "config",
+                "filter.spy.clean",
+                f.marker.parent().unwrap().join("spy.sh").to_str().unwrap(),
+            ],
+        );
+        git(&project, &["commit", "--allow-empty", "--quiet", "-m", "x"]);
+        std::fs::write(
+            f.slot.path().join(".git"),
+            format!("gitdir: {}\n", project.join(".git").display()),
+        )
+        .unwrap();
+        assert!(
+            working_tree_id(&GitAt::plain(f.slot.path()))
+                .await
+                .is_some()
+        );
+        assert!(f.marker.exists(), "the control ran the planted filter");
+        std::fs::remove_file(&f.marker).unwrap();
+        std::fs::write(
+            f.slot.path().join("README.md"),
+            "changed once more, longer\n",
+        )
+        .unwrap();
+        let (tree, status, head) = ask_everything(&at).await;
+        assert!(tree.is_some() && head.is_some() && status.unwrap().contains("README.md"));
+        assert!(!f.marker.exists(), ".git file rewritten");
+    }
+
+    #[tokio::test]
+    async fn a_worktree_whose_directory_in_the_mirror_is_not_known_is_not_asked_at_all() {
+        let f = fixture().await;
+        let at = GitAt::slot(&f.slot);
+        assert!(head_sha(&at).await.is_some());
+        // The same slot as the coder finds it when its metadata cannot say: no pin.
+        let refused = GitAt::of(f.slot.path(), None);
+        assert_eq!(ask_everything(&refused).await, (None, None, None));
+        assert!(!f.marker.exists());
     }
 }
 

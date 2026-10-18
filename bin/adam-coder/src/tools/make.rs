@@ -38,7 +38,7 @@ use std::fmt::Write as _;
 use adam::prelude::*;
 
 use super::checks::missing_tool_answer;
-use super::gitcli::status_text;
+use super::gitcli::{GitAt, status_text};
 use super::inspect::{Snapshot, render};
 use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_in, shell_spec};
 use super::{Outcome, ToolEnv, non_empty, run_error};
@@ -84,7 +84,7 @@ pub async fn run(
     let environment = env.session(ctx).await?;
 
     // What git is before the command: nothing it does may change that.
-    let Some(before) = Snapshot::take(slot.path()).await else {
+    let Some(before) = Snapshot::take(&GitAt::slot(&slot)).await else {
         return Ok(ToolOutput::error(
             "Cannot read the state of the worktree, so nothing was run (a command that might \
              change git cannot be undone). Try again; if it persists, tell the person.",
@@ -109,7 +109,7 @@ pub async fn run(
     // configuration and `.git` are not.
     // A worktree whose git cannot be read after the command is not known to be untouched, so
     // it is undone as one that changed git would be; the model is told which of the two it was.
-    let Some(after) = Snapshot::take(slot.path()).await else {
+    let Some(after) = Snapshot::take(&GitAt::slot(&slot)).await else {
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("could not check git after: {shown}; undid it"))
             .await;
@@ -139,7 +139,9 @@ pub async fn run(
     let changed = after.files_differ_from(&before);
     let mut text = render(&shown, &outcome);
     if changed {
-        text.push_str(&changes_note(status_text(slot.path()).await.as_deref()));
+        text.push_str(&changes_note(
+            status_text(&GitAt::slot(&slot)).await.as_deref(),
+        ));
         super::files::push_published_note(&mut text, &slot);
     } else {
         text.push_str(

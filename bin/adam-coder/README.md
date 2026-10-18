@@ -1327,7 +1327,11 @@ these are **not** compared, and a command can change them unseen: `refs/heads/ag
 branch), `refs/remotes/*`, `refs/tags/*` (a fetch follows tags) and `refs/stash` (a `git stash` elsewhere),
 and the configuration keys `branch.agent/*.adam-run`, `.remote` and `.merge`. `info/exclude` is compared.
 The restore holds the mirror lock, refuses to touch anything if the worktree's `.git` no longer points at this
-run's git directory (and puts that file back first), and deletes and sets refs with `--no-deref`. Where the tree cannot be computed (an embedded repository without a commit), the record falls back to
+run's git directory (and puts that file back first), and deletes and sets refs with `--no-deref`. **Every `git` the coder
+runs on a slot here is pinned to the repository the coder's own metadata names** (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`:
+`GitAt` in `tools/gitcli.rs`, `adam_workspace::GitPin`), so the `.git` file and the `commondir` and `gitdir` of the worktree's
+directory in the mirror, which a command can rewrite, steer nothing ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md)); a
+worktree whose git directory the metadata cannot tell is refused (every question about it is "unknown"). Where the tree cannot be computed (an embedded repository without a commit), the record falls back to
 `git status`: a change is still seen and refused, but only `HEAD` and the branch are put back, and the model
 is told the files may differ.
 
