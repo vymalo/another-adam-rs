@@ -321,7 +321,7 @@ impl KubeEnvironment {
                             self.free_for_new_mount(name, &missing).await?;
                         }
                         reporter.running(format!(
-                            "making the pod again: the run's workspace has {missing}, which the pod does not mount"
+                            "making the pod again: the run's workspace has {missing} as it is now, which the pod does not mount"
                         ));
                         inner.delete(name).await?;
                     } else if is_ready(&pod) {
@@ -384,10 +384,10 @@ impl KubeEnvironment {
         match self.busy(name).await {
             Ok(false) => Ok(()),
             Ok(true) => Err(EnvError::Unavailable(format!(
-                "the run's workspace has {missing}, which its pod does not mount, and a command is running in the pod; the pod is made again when it ends"
+                "the run's workspace has {missing} as it is now, which its pod does not mount, and a command is running in the pod; the pod is made again when it ends"
             ))),
             Err(e) => Err(EnvError::Unavailable(format!(
-                "the run's workspace has {missing}, which its pod does not mount, and the pod cannot be asked whether a command is running: {e}"
+                "the run's workspace has {missing} as it is now, which its pod does not mount, and the pod cannot be asked whether a command is running: {e}"
             ))),
         }
     }

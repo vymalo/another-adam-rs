@@ -671,13 +671,13 @@ mounts the claim once, whole, at `/work`; the coder replaces that one mount, for
 | `workspaces/<run>`, the run's slots | read-write |
 | `git/<host>/<owner>/<repo>.git`, the mirror of each worktree slot | **read-only** |
 | that mirror's `worktrees/<name>` (`<run>+<slot>`), the worktree's own `HEAD` and `index` | read-write, on top of the mirror |
-| that directory's `commondir`, `gitdir` and `logs` | **read-only**, on top of that (a bind mount of a file or a directory cannot be written, renamed over, replaced by a link or removed from the pod) |
+| that directory's `HEAD`, `commondir`, `gitdir` and `logs` | **read-only**, on top of that (a bind mount of a file or a directory cannot be written, renamed over, replaced by a link or removed from the pod) |
 
 No `meta/`, no other run, no other mirror. Git in the pod reads and refreshes its index; whatever writes an object, a ref or the mirror's
 configuration (`git add`, `commit`, `stash`, `reset`, `tag`, `branch`, `config --local`, a hook installer) fails there, and so does moving `HEAD`
 (`git switch --detach`: it appends to the read-only reflog), and the coder commits. A repository
 the run adds later needs a pod made again: when no command runs in it the coder does it, and when one does the tool waits for it to end
-(`RUN_POD_WAIT_SECS`) like it waits for a quota slot. A pod made by an earlier release is made again the same way. Limits (ADR 0041): the mirror of a
+(`RUN_POD_WAIT_SECS`) like it waits for a quota slot. A pod made by an earlier release is made again the same way, and so is the pod of a run whose slot was lost and added again (the mounts follow a directory, and the slot's directory in the mirror is a new one under the same name). Limits (ADR 0041): the mirror of a
 repository is shared by everyone who works on it, so their unpushed `agent/*` branches and worktree directories in it can be read; the [package
 cache](#the-package-cache) is writable by every run; the model key is a variable of the run pod, readable by its commands, as it was in the coder's own.
 
@@ -685,7 +685,7 @@ cache](#the-package-cache) is writable by every run; the model key is a variable
 `tests/golden/run-pods.yaml`), kubeconform on the renders (`.github/workflows/coder.yml`), and the `run-pods` job of `.github/workflows/ci.yml`, which applies the
 objects to a `kind` cluster and runs the environment against it as the coder's ServiceAccount (`tests/kind-run-pods.sh`): a pod from the template, commands
 in it, a kill, the idle sweep, the policy refusing sixteen changes to the pod, the quota refusing the fifth, and a run pod that sees only its own run on a volume the script
-seeds with two runs of one mirror (*unverified* until CI has run it). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid) as bind mounts in a private mount
+seeds with two runs of one mirror (*unverified* until CI has run it). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `HEAD`, `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid) as bind mounts in a private mount
 namespace (needs root; CI runs it before the kind job). It does not run the coder over a model, and it
 does not check the NetworkPolicy (kind's network plugin may not enforce one). **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
 sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy, and the HTTP status of an admission refusal (the

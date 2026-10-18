@@ -971,7 +971,8 @@ mod tests {
     /// the pod may not change, read-only.
     fn admin_mounts(admin: &Path) -> Vec<(PathBuf, bool)> {
         let mut mounts = vec![(admin.to_owned(), false)];
-        mounts.extend(["commondir", "gitdir", "logs"].map(|entry| (admin.join(entry), true)));
+        mounts
+            .extend(["HEAD", "commondir", "gitdir", "logs"].map(|entry| (admin.join(entry), true)));
         mounts
     }
 
@@ -1052,7 +1053,7 @@ mod tests {
         );
         // What git follows out of the worktree's directory is read-only in it.
         let mounts = fx.work_mounts(&pod_name(RUN));
-        for entry in ["commondir", "gitdir", "logs"] {
+        for entry in ["HEAD", "commondir", "gitdir", "logs"] {
             let path = admin.join(entry).display().to_string();
             assert!(
                 mounts.iter().any(|(p, _, ro)| *p == path && *ro),
@@ -1216,7 +1217,7 @@ mod tests {
         // the coder did not name.
         let elsewhere = fx.workspaces.root().join("elsewhere");
         std::fs::write(&elsewhere, "x").unwrap();
-        for entry in ["commondir", "gitdir"] {
+        for entry in ["HEAD", "commondir", "gitdir"] {
             let file = admin.join(entry);
             let kept = std::fs::read(&file).unwrap();
             std::fs::remove_file(&file).unwrap();
@@ -1315,6 +1316,57 @@ mod tests {
         }));
 
         // And the new pod is the pod now: nothing more to change.
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_slot_made_again_under_the_same_name_has_the_pod_made_again_because_its_mounts_follow_the_old_directory()
+     {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        let remote = fx.remote("alpha");
+        let slot = ws.add_repository(&remote).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        let pod = pod_name(RUN);
+        let mounted = fx
+            .annotation(&pod, "adam.vymalo.com/workspace-mounts")
+            .unwrap();
+        let admin = admin_of(&slot);
+        assert!(
+            mounted.contains(&format!("rw {} @", admin.display())),
+            "the directory is recorded with its generation: {mounted}"
+        );
+        // Nothing changed: the pod is the pod.
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (1, 0));
+
+        // The slot's directory is lost and the repository is added again: the same slot, the same
+        // name of its directory in the mirror, and another directory under it.
+        std::fs::remove_dir_all(slot.path()).unwrap();
+        let again = ws.add_repository(&remote).await.unwrap();
+        assert_eq!(admin_of(&again), admin, "the name is the same");
+        assert!(admin.join("HEAD").is_file());
+
+        let steps = Steps::default();
+        fx.env.ensure(&ws, &steps).await.unwrap();
+        assert_eq!(
+            (fx.requests("POST"), fx.requests("DELETE")),
+            (2, 1),
+            "made again"
+        );
+        let remounted = fx
+            .annotation(&pod, "adam.vymalo.com/workspace-mounts")
+            .unwrap();
+        assert_ne!(remounted, mounted, "the new pod records the new directory");
+        assert!(steps.0.lock().unwrap().iter().any(|s| {
+            s.detail.as_deref().is_some_and(|d| {
+                d.contains("making the pod again") && d.contains(&admin.display().to_string())
+            })
+        }));
+
+        // And that pod is the pod now.
         fx.env.ensure(&ws, &Steps::default()).await.unwrap();
         assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
     }

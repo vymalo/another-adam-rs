@@ -795,6 +795,7 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
         &[WorktreeDirs {
             mirror: PathBuf::from(&mirror),
             admin: PathBuf::from(&admin),
+            generation: None,
         }],
     )
     .expect("the mounts");
@@ -889,11 +890,22 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
         assert_ne!(code, 0, "`{write}` wrote the mirror: {out}");
     }
 
-    // What the coder's git follows out of the worktree's directory is read-only inside it: a
-    // `commondir` that names another repository moves the refs the coder reads and writes, a link
-    // at `logs/HEAD` is appended to by git, and neither is the pod's to write, rename over, replace
-    // or remove, though the directory itself is writable and the files are its own uid's.
+    // What the coder's git follows out of the worktree's directory, or acts on, is read-only inside
+    // it: a `HEAD` that names another run's branch is the branch the coder resets, a `commondir`
+    // that names another repository moves the refs the coder reads and writes, a link at
+    // `logs/HEAD` is appended to by git, and none is the pod's to write, rename over, replace or
+    // remove, though the directory itself is writable and the files are its own uid's.
     for write in [
+        format!("echo 'ref: refs/heads/agent/kind-iso-b' > {admin}/HEAD"),
+        format!("echo 'ref: refs/heads/agent/kind-iso-b' >> {admin}/HEAD"),
+        format!(
+            "echo 'ref: refs/heads/agent/kind-iso-b' > {admin}/h2 && mv {admin}/h2 {admin}/HEAD"
+        ),
+        format!("rm {admin}/HEAD"),
+        format!("ln -sf /etc/passwd {admin}/HEAD"),
+        "cd /work/workspaces/kind-iso-a/r && git symbolic-ref HEAD refs/heads/agent/kind-iso-b"
+            .to_owned(),
+        "cd /work/workspaces/kind-iso-a/r && git switch --detach".to_owned(),
         format!("echo /elsewhere > {admin}/commondir"),
         format!("echo x >> {admin}/commondir"),
         format!("echo /elsewhere > {admin}/c2 && mv {admin}/c2 {admin}/commondir"),
@@ -917,6 +929,12 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
         (code, out.trim()),
         (0, "../.."),
         "commondir is what git wrote"
+    );
+    let (code, out) = sh(&format!("cat {admin}/HEAD")).await;
+    assert_eq!(
+        (code, out.trim()),
+        (0, "ref: refs/heads/agent/kind-iso-a"),
+        "HEAD is what git wrote"
     );
     let (code, out) = sh(&format!(
         "cd /work/workspaces/kind-iso-a/r && git status --short && git log --oneline | head -1 && touch {admin}/probe2"

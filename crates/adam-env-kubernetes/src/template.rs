@@ -495,6 +495,7 @@ spec:
             &[WorktreeDirs {
                 mirror: "/work/git/github.com/o/r.git".into(),
                 admin: "/work/git/github.com/o/r.git/worktrees/r".into(),
+                generation: None,
             }],
         )
         .unwrap()
@@ -596,6 +597,12 @@ spec:
                     "/work/git/github.com/o/r.git/worktrees/r",
                     Some("git/github.com/o/r.git/worktrees/r"),
                     None
+                ),
+                (
+                    "work",
+                    "/work/git/github.com/o/r.git/worktrees/r/HEAD",
+                    Some("git/github.com/o/r.git/worktrees/r/HEAD"),
+                    Some(true)
                 ),
                 (
                     "work",

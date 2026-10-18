@@ -3,10 +3,10 @@
 #
 # A run pod mounts its own run's directory read-write, a worktree's mirror READ-ONLY and the worktree's own
 # directory in the mirror (<mirror>/worktrees/<name>) read-write on top, each at the path the coder has it at, and
-# nothing else of the volume. On top of the worktree's directory, READ-ONLY, are three entries the coder's git
-# follows out of it: commondir and gitdir (single-file mounts) and logs (a directory). This builds that view in a
-# private mount namespace (bind mounts, as the container runtime makes them from the pod's subPath mounts) and runs
-# git as uid 10001 in it:
+# nothing else of the volume. On top of the worktree's directory, READ-ONLY, are four entries the coder's git
+# follows out of it or acts on: HEAD, commondir and gitdir (single-file mounts) and logs (a directory). This builds
+# that view in a private mount namespace (bind mounts, as the container runtime makes them from the pod's subPath
+# mounts) and runs git as uid 10001 in it:
 #
 #   * what a repository's checks do with git works: status (also after the working tree changed: the index is
 #     refreshed in the worktree's own directory), log, diff, describe, rev-parse, grep;
@@ -15,9 +15,10 @@
 #     (switch, checkout of another commit), which appends to the reflog in logs/;
 #   * nothing of another run, of meta/ or of another mirror is there, and a scratch project (its own repository
 #     inside the run's directory) commits;
-#   * the three read-only entries cannot be written, appended to, renamed over, replaced by a link or removed (the
-#     coder's git would follow a rewritten commondir to another repository, and appends to a reflog that is a
-#     link), the files owned by the very uid that tries, and git still works with them.
+#   * the four read-only entries cannot be written, appended to, renamed over, replaced by a link or removed (the
+#     coder's git would follow a rewritten commondir to another repository, appends to a reflog that is a link,
+#     and resets the branch a rewritten HEAD names, which could be another run's), the files owned by the very uid
+#     that tries, and git still works with them: nothing git does for what a check needs writes HEAD.
 #
 #   sudo sh deploy/coder/tests/git-in-run-pod.sh        (from the repository root; needs root, unshare and setpriv)
 #
@@ -92,8 +93,8 @@ mount --bind "$volume/workspaces/a" /work/workspaces/a
 mount --bind "$volume/git/example.test/o/r.git" "$mirror"
 mount -o remount,bind,ro "$mirror"
 mount --bind "$volume/git/example.test/o/r.git/worktrees/${admin##*/}" "$admin"
-# The entries of the worktree's directory the coder's git follows: read-only on top of it.
-for entry in commondir gitdir logs; do
+# The entries of the worktree's directory the coder's git follows or acts on: read-only on top of it.
+for entry in HEAD commondir gitdir logs; do
   mount --bind "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/$entry" "$admin/$entry"
   mount -o remount,bind,ro "$admin/$entry"
 done
@@ -115,6 +116,7 @@ ok "describe finds the tag the mirror has" "cd $w && git describe --tags | grep 
 ok "rev-parse" "cd $w && git rev-parse HEAD"
 ok "diff, ls-files and grep" "cd $w && git diff --stat && git ls-files | grep -q README && git grep -q hi"
 ok "worktree list" "cd $w && git worktree list"
+ok "blame, show, for-each-ref and the branch's name" "cd $w && git blame README.md >/dev/null && git show -s HEAD >/dev/null && git for-each-ref >/dev/null && test \"\$(git branch --show-current)\" = agent/a"
 ok "show a remote-tracking-free ref of the mirror" "cd $w && git show --stat main"
 as_pod "cd $w && echo more >> README.md && touch new.txt"
 says "status sees a change and an untracked file" "cd $w && git status --short" 'M README.md'
@@ -126,6 +128,14 @@ ok "writes to the worktree and the run's directory" "echo y > $w/y.txt && echo y
 ok "a scratch project is a repository of its own and commits" "cd /work/workspaces/a/scratch && git add -A && git commit -qm s"
 
 echo "-- what the pod cannot change in the worktree's directory"
+no "HEAD cannot be written (it would name another run's branch, which the coder would then reset)" "echo 'ref: refs/heads/agent/b' > $admin/HEAD"
+no "HEAD cannot be appended to" "echo x >> $admin/HEAD"
+no "HEAD cannot be renamed over" "echo 'ref: refs/heads/agent/b' > $admin/h2 && mv $admin/h2 $admin/HEAD"
+no "HEAD cannot be removed" "rm $admin/HEAD"
+no "HEAD cannot be replaced by a link" "ln -sf /etc/passwd $admin/HEAD"
+no "git cannot point HEAD at another branch" "cd $w && git symbolic-ref HEAD refs/heads/agent/b"
+no "git cannot detach HEAD (update-ref --no-deref)" "cd $w && git update-ref --no-deref HEAD main"
+equals "HEAD says what git wrote" "cat $admin/HEAD" 'ref: refs/heads/agent/a '
 no "commondir cannot be written" "echo /elsewhere > $admin/commondir"
 no "commondir cannot be appended to" "echo x >> $admin/commondir"
 no "commondir cannot be renamed over" "echo /elsewhere > $admin/c2 && mv $admin/c2 $admin/commondir"
@@ -141,13 +151,13 @@ no "logs/HEAD cannot be replaced" "echo x > $admin/logs/new && mv $admin/logs/ne
 no "nothing can be made in logs" "touch $admin/logs/new"
 equals "commondir says what git wrote" "cat $admin/commondir" '../.. '
 equals "and so does the volume" "cat /work/git/example.test/o/r.git/worktrees/${admin##*/}/commondir" '../.. '
-if [ "$(cat "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/commondir")" = "../.." ] && [ -f "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/logs/HEAD" ] && [ ! -L "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/logs/HEAD" ]; then
+if [ "$(cat "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/HEAD")" = "ref: refs/heads/agent/a" ] && [ "$(cat "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/commondir")" = "../.." ] && [ -f "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/logs/HEAD" ] && [ ! -L "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/logs/HEAD" ]; then
   echo "ok   the coder's side of the volume is as git wrote it"
 else
   echo "FAIL the coder's side of the volume changed"; fail=1
 fi
 ok "git still works with them in place" "cd $w && git status --short && git log --oneline | grep -q seed && git diff --stat"
-ok "the other entries of the directory are writable" "touch $admin/probe2 && echo ref: refs/heads/agent/a > $admin/HEAD"
+ok "the other entries of the directory are writable (the index, a lock, a probe)" "touch $admin/probe2 && cd $w && touch README.md && git status --short && test -f $admin/index"
 
 echo "-- what is refused"
 no "add" "cd $w && echo z > z.txt && git add z.txt"

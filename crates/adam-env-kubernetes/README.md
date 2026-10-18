@@ -25,7 +25,7 @@ coder `prepare`s a command and spawns it. The files, the paths and all git work 
 |---|---|
 | `KubeEnvironment` | the `Environment`: `connect(Settings, PodTemplate)` (the cluster this process runs in, or `KUBECONFIG`'s), `new(Client, Settings, PodTemplate)`, `reap_idle()` (one sweep of idle pods), `reap_loop()` and `spawn_reaper()` (the sweep, for as long as the runtime lives), `pod_name(run)`. `rebuild(run, _)` deletes the pod and answers `true`; the next `ensure` makes another |
 | `PodTemplate` | the deployment's pod: `from_file(path, container, workspace_root)` or `parse(text, source, container, workspace_root)` (a Pod, or a bare PodSpec, in YAML or JSON), checked at startup, which includes finding the one mount of the workspace volume at `workspace_root` (the coder's `WORKSPACE_ROOT`, or the worker's folder under it); `mounts_for(&RunWorkspace)` (the mounts the run's workspace needs now); `render(run, name, Placement, &WorkspaceMounts)` fills in the name, namespace, labels and annotations, and replaces that one mount by the mounts, and nothing else; `image()`, `workspace_path()` |
-| `WorkspaceMounts`, `Mount`, `WorktreeDirs` | what a run pod mounts of the workspace volume ([below](#what-a-run-pod-mounts)): `plan(base, run_dir, &[WorktreeDirs { mirror, admin }])` (pure), `iter()` (a `Mount` has `path()`, `sub_path()`, `read_only()`), `encode()` (the annotation's value), `missing_from(recorded)` |
+| `WorkspaceMounts`, `Mount`, `WorktreeDirs` | what a run pod mounts of the workspace volume ([below](#what-a-run-pod-mounts)): `plan(base, run_dir, &[WorktreeDirs { mirror, admin, generation }])` (pure), `iter()` (a `Mount` has `path()`, `sub_path()`, `read_only()`, `generation()`), `encode()` (the annotation's value), `missing_from(recorded)` |
 | `Settings` | the namespace, the release's instance label, the worker, the container the commands run in (`run`), the exec client program, where `adam-exec` and the tools are in the pod, the time to be ready, the idle timeout, the sweep interval and the environment `adam-kube-exec` is started with; `Settings::new(namespace, instance, worker)` has the defaults |
 | `Invocation` | the command line of `adam-kube-exec`: `to_args()`, `parse(args)`, `remote_argv()` (the command run in the pod); `Mode::{Run, Shell}`, `UsageError` |
 | `names` | `pod_name(run)` (`adam-run-<12 hex of the sha256 of the run id>`), `run_hash`, `selector(instance)` and the label and annotation keys (`MANAGED_BY_LABEL`, `INSTANCE_LABEL`, `RUN_LABEL`, `RUN_ID_ANNOTATION`, `WORKER_ANNOTATION`, `MOUNTS_ANNOTATION`) |
@@ -95,10 +95,10 @@ The coder's volume holds every run's files. A run pod gets only these, each **at
 | `<root>/workspaces/<run>` | read-write | the run's slots: its worktrees and scratch projects, also those added later |
 | `<root>/git/<host>/<owner>/<repo>.git`, for each worktree slot | **read-only** | the objects, refs and configuration a worktree's `.git` file points into; the coder's own `git` reads this directory in every run's worktree, so no run may write it |
 | `<mirror>/worktrees/<name>`, for each worktree slot | read-write, on top of the mirror | the worktree's own `HEAD` and `index`, which `git status` refreshes (`<name>` is the coder's record, `<run>+<slot>`: no other run's directory is called that) |
-| `<mirror>/worktrees/<name>/commondir`, `.../gitdir` and `.../logs` | **read-only**, on top of that | what the coder's `git` follows out of the directory (`commondir`: git's reference store reads it even when `GIT_COMMON_DIR` is set), what ties the directory to its slot (`gitdir`), and the reflog it appends to (`logs/HEAD`, through a link: *verified*, git 2.43.0). A read-only bind mount of a file or a directory cannot be written, renamed over, replaced by a link or removed from the pod |
+| `<mirror>/worktrees/<name>/HEAD`, `.../commondir`, `.../gitdir` and `.../logs` | **read-only**, on top of that | the branch the coder's `reset` and `commit` act on (`HEAD`: a run that wrote another run's branch there would have the coder reset it), what the coder's `git` follows out of the directory (`commondir`: git's reference store reads it even when `GIT_COMMON_DIR` is set), what ties the directory to its slot (`gitdir`), and the reflog it appends to (`logs/HEAD`, through a link: *verified*, git 2.43.0). A read-only bind mount of a file or a directory cannot be written, renamed over, replaced by a link or removed from the pod |
 
 Nothing of `meta/`, of another run or of another repository's mirror. The legacy worktree of a run (outside the run's directory)
-gets no mount, and a worktree whose directory in the mirror the coder cannot tell (a slot made before it was recorded, with none or several candidates in the mirror), or whose `commondir`, `gitdir` or `logs` is not what git wrote (a link, a pipe, a missing file; a missing `logs` is made by the coder) gets no git mounts and a warning.
+gets no mount, and a worktree whose directory in the mirror the coder cannot tell (a slot made before it was recorded, with none or several candidates in the mirror), or whose `HEAD`, `commondir`, `gitdir` or `logs` is not what git wrote (a link, a pipe, a missing file; a missing `logs` is made by the coder) gets no git mounts and a warning.
 `ensure` makes the run's directory first (the coder owns the volume; the kubelet would make a missing `subPath` as root).
 
 Git in the pod reads and refreshes its index (`status`, `log`, `diff`, `describe`, `rev-parse`, `grep`, `checkout -- file`);
@@ -110,6 +110,13 @@ stay readable through it (ADR 0041, "Known limits").
 The mounts of a pod are fixed when it is made. Its annotation `adam.vymalo.com/workspace-mounts` records them (`rw <path>` or
 `ro <path>`, one per line), and `ensure` compares it with what the workspace needs: a worktree added after the pod was made
 needs a pod made again (see the table above), and a mount the pod has and no longer needs is left.
+
+A bind mount follows a **directory**, not its name. A slot whose directory was lost and added again has the same directory name in
+the mirror (`<run>+<slot>`) and a new directory under it, which the pod's mounts would not follow (git in the pod would read a
+`HEAD` and an index that are not the coder's). So the lines of that directory and of its four read-only entries end in
+` @<generation>` (`WorktreeDirs::generation`, from `Worktree::git_dir_generation`, a token the coder records in the slot's
+metadata each time it makes the directory), and a changed generation makes the pod again, when no command runs in it. A worktree made
+before it was recorded has no generation and its lines are unchanged.
 
 ## Processes
 
@@ -180,9 +187,9 @@ one line); none carries a secret, and the API server never echoes one in a refus
   steps, idempotency, concurrent calls, a create that races), the refusals above, `release`, `held_runs` (this release's pods
   only), the idle sweep (idle, busy, cannot be asked, another worker's, off), `prepare` and the quoting of the words, `kill`,
   and `tool_path` and `secret_ref`; the mounts (a run with no worktree, one, several and a scratch project, the legacy worktree,
-  a run that rewrites its `.git` to another run's directory, a slot whose directory in the mirror is ambiguous or absent, a directory whose `commondir`, `gitdir` or `logs` is a link (no git mounts) and a missing `logs` (made), a workspace outside the volume, with real `git` worktrees), the pod made again for a worktree
+  a run that rewrites its `.git` to another run's directory, a slot whose directory in the mirror is ambiguous or absent, a directory whose `HEAD`, `commondir`, `gitdir` or `logs` is a link (no git mounts) and a missing `logs` (made), a workspace outside the volume, with real `git` worktrees), the pod made again for a worktree
   added later (no command running), waited for (a command running, or a pod that cannot be asked), left alone (nothing new, a
-  spare mount) and replaced (no annotation); and the template's startup refusals (no mount at the workspace root, a `subPath`,
+  spare mount) and replaced (no annotation; a slot made again under the same name); and the template's startup refusals (no mount at the workspace root, a `subPath`,
   read-only, no such volume, the volume mounted twice or by another container).
 * **Tests that need a cluster** (`tests/cluster.rs`): one test, gated on **`ADAM_TEST_KUBECONFIG`**, that makes a pod from the
   chart's own template, runs commands in it through `adam-kube-exec` (both streams, the exit code, the working directory,
