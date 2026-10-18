@@ -29,6 +29,11 @@ pub const RUN_ID_ANNOTATION: &str = "adam.vymalo.com/run-id";
 /// timeout is that worker's, so that a worker never deletes a pod another worker is using.
 pub const WORKER_ANNOTATION: &str = "adam.vymalo.com/worker";
 
+/// The mounts of the workspace volume the pod was made with (`rw <path>` or `ro <path>`, one per line):
+/// what [`ensure`](adam_workspace::Environment::ensure) compares with the run's workspace to know that a
+/// slot added since needs a mount the pod does not have ([`WorkspaceMounts`](crate::WorkspaceMounts)).
+pub const MOUNTS_ANNOTATION: &str = "adam.vymalo.com/workspace-mounts";
+
 /// How many hex digits of the run's hash name the pod: 48 bits, so a collision needs about 16
 /// million runs alive at once, and the annotation catches it.
 const HASH_DIGITS: usize = 12;

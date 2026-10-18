@@ -3,7 +3,8 @@
 A run's processes in a Kubernetes pod of its own: the cluster-backed
 [`Environment`](../adam-workspace/README.md#where-a-runs-processes-run-the-environment-port) of `adam-workspace`.
 The decision, the facts it rests on, and the lifecycle of a run pod are
-[ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md).
+[ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md); what a run pod can see of the
+volume is [ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md) (proposed).
 
 ## Where it sits
 
@@ -15,18 +16,19 @@ coder's own container, so nothing changes for a deployment that does not opt in.
 
 A run's commands (`run_command`, `run_checks`, OpenCode and everything OpenCode starts) go through the run's `EnvSession`: the
 coder `prepare`s a command and spawns it. The files, the paths and all git work stay in the coder, which holds the credentials;
-**a path means the same in the pod as in the coder**, because the pod mounts the coder's workspace volume at the same path.
-**No GitHub credential, database URL or bearer token is ever in a run pod.**
+**a path means the same in the pod as in the coder**, because the pod mounts the parts of the coder's workspace volume it needs at the same paths.
+**A run pod sees only its own run** ([below](#what-a-run-pod-mounts)). **No GitHub credential, database URL or bearer token is ever in a run pod.**
 
 ## API at a glance
 
 | Item | What |
 |---|---|
 | `KubeEnvironment` | the `Environment`: `connect(Settings, PodTemplate)` (the cluster this process runs in, or `KUBECONFIG`'s), `new(Client, Settings, PodTemplate)`, `reap_idle()` (one sweep of idle pods), `reap_loop()` and `spawn_reaper()` (the sweep, for as long as the runtime lives), `pod_name(run)`. `rebuild(run, _)` deletes the pod and answers `true`; the next `ensure` makes another |
-| `PodTemplate` | the deployment's pod: `from_file(path, container)` or `parse(text, source, container)` (a Pod, or a bare PodSpec, in YAML or JSON), checked at startup; `render(run, name, Placement)` fills in the name, namespace, labels and annotations and nothing else; `image()` |
+| `PodTemplate` | the deployment's pod: `from_file(path, container, workspace_root)` or `parse(text, source, container, workspace_root)` (a Pod, or a bare PodSpec, in YAML or JSON), checked at startup, which includes finding the one mount of the workspace volume at `workspace_root` (the coder's `WORKSPACE_ROOT`, or the worker's folder under it); `mounts_for(&RunWorkspace)` (the mounts the run's workspace needs now); `render(run, name, Placement, &WorkspaceMounts)` fills in the name, namespace, labels and annotations, and replaces that one mount by the mounts, and nothing else; `image()`, `workspace_path()` |
+| `WorkspaceMounts`, `Mount`, `WorktreeDirs` | what a run pod mounts of the workspace volume ([below](#what-a-run-pod-mounts)): `plan(base, run_dir, &[WorktreeDirs { mirror, admin }])` (pure), `iter()` (a `Mount` has `path()`, `sub_path()`, `read_only()`), `encode()` (the annotation's value), `missing_from(recorded)` |
 | `Settings` | the namespace, the release's instance label, the worker, the container the commands run in (`run`), the exec client program, where `adam-exec` and the tools are in the pod, the time to be ready, the idle timeout, the sweep interval and the environment `adam-kube-exec` is started with; `Settings::new(namespace, instance, worker)` has the defaults |
 | `Invocation` | the command line of `adam-kube-exec`: `to_args()`, `parse(args)`, `remote_argv()` (the command run in the pod); `Mode::{Run, Shell}`, `UsageError` |
-| `names` | `pod_name(run)` (`adam-run-<12 hex of the sha256 of the run id>`), `run_hash`, `selector(instance)` and the label and annotation keys (`MANAGED_BY_LABEL`, `INSTANCE_LABEL`, `RUN_LABEL`, `RUN_ID_ANNOTATION`, `WORKER_ANNOTATION`) |
+| `names` | `pod_name(run)` (`adam-run-<12 hex of the sha256 of the run id>`), `run_hash`, `selector(instance)` and the label and annotation keys (`MANAGED_BY_LABEL`, `INSTANCE_LABEL`, `RUN_LABEL`, `RUN_ID_ANNOTATION`, `WORKER_ANNOTATION`, `MOUNTS_ANNOTATION`) |
 | `install_crypto_provider()` | names rustls' process default provider (aws-lc-rs) unless one is named: `kube` builds its TLS configuration with the default, and rustls panics rather than guess when a binary's tree enables two providers, which the coder's does (sqlx's rustls enables `ring`). `KubeEnvironment::connect` and `adam-kube-exec` call it; a caller that makes its own `kube::Client` calls it first. Idempotent. Proved in a tree that has both by a test in the coder (`tests/environment.rs`) |
 | `exec` | what `pods/exec` gives: `stream(..)` joins a command's stdin, stdout and stderr to the caller's, `exit_status(&Status)` reads the exit code, `stdin_is_null()` |
 
@@ -34,7 +36,7 @@ coder `prepare`s a command and spawns it. The files, the paths and all git work 
 use adam_env_kubernetes::{KubeEnvironment, PodTemplate, Settings};
 use adam_workspace::Environment;
 
-let template = PodTemplate::from_file("/etc/adam/run-pod/pod.yaml".as_ref(), "run")?;
+let template = PodTemplate::from_file("/etc/adam/run-pod/pod.yaml".as_ref(), "run", "/work".as_ref())?;
 let settings = Settings::new("coder", "coder", "coder-0");
 let environment = KubeEnvironment::connect(settings, template).await?;
 environment.spawn_reaper();
@@ -45,9 +47,9 @@ environment.spawn_reaper();
 
 It looks for the pod `adam-run-<hash>` of the run and makes it when it is not there, from the template, with the labels
 `app.kubernetes.io/managed-by=adam-coder`, `app.kubernetes.io/instance=<release>` and `adam.vymalo.com/run=<hash>` and the
-annotations `adam.vymalo.com/run-id` (the full id) and `adam.vymalo.com/worker`. A name that is another run's is refused. It
-then waits until the pod is `Running` and `Ready`, polling, and reports one step (`run-pod`) while it waits and when it is
-done; a pod that is there and ready is reused with **no step**, so a command does not announce itself. It is single-flight per
+annotations `adam.vymalo.com/run-id` (the full id), `adam.vymalo.com/worker` and `adam.vymalo.com/workspace-mounts` (the mounts of the
+workspace volume it was made with). A name that is another run's is refused. It then waits until the pod is `Running` and `Ready`,
+polling, and reports one step (`run-pod`) while it waits and when it is done; a pod that is there and ready is reused with **no step**, so a command does not announce itself. It is single-flight per
 run in a process (a lock), and across workers the pod's name is the lock: a create that answers "already exists" goes on with
 the pod that is there. A dropped call leaves nothing a later call cannot use.
 
@@ -61,22 +63,52 @@ the pod that is there. A dropped call leaves nothing a later call cannot use.
 | not ready in `ready_timeout`, and a container's image is refused or its configuration is wrong (`ErrImagePull`, `ImagePullBackOff`, `InvalidImageName`, `CreateContainerConfigError`, ...) | the pod is deleted; `EnvError::Build` with the reason |
 | not ready in `ready_timeout`, only slow | `EnvError::Timeout { phase: "start" }`; the pod stays, the next `ensure` waits for it again |
 | the pod ended (`Failed`, `Succeeded`: evicted) | it is deleted and made again |
+| the run's workspace needs a mount the pod lacks (a worktree added since; a pod made before mounts were recorded) and no command runs in the pod (`adam-exec active`) | the pod is deleted and made again, with a step that says why; the files are on the volume |
+| ... and a command runs in it, or it cannot be asked | `EnvError::Unavailable` (class `Transient`): the coder waits as it waits for a slot, and the pod is made again when the command ends |
+| the run's directory is not below where the template mounts the volume | `EnvError::Refused`: `WORKSPACE_ROOT` and the template disagree |
 
 ## The template
 
 The pod is the deployment's, not the code's: the image, the resources, the priority class, the security context, the volumes,
-the variables from Secrets and the node affinity are in the file. The code adds only the name, the namespace, the labels and
-the annotations. The file is read and checked at startup, so that a template that cannot work stops the coder and not a run:
-it may not set `metadata.name`, `generateName` or owner references, nor the coder's labels and annotations; it must have the
-container the commands run in (`RUN_POD_CONTAINER`, `run`); and it may not ask for what the chart's admission policy
-refuses (`hostNetwork`, `hostPID`, `hostIPC`, a `hostPath` volume, a privileged container, privilege escalation, a pinned
-`nodeName`, or an `automountServiceAccountToken` that is not `false`). The chart renders it (`runPods` in
-[`deploy/coder`](../../deploy/coder/README.md)); `src/template.rs` has the shape in its tests.
+the variables from Secrets and the node affinity are in the file. The code adds the name, the namespace, the labels and
+the annotations, and narrows the one mount of the workspace volume ([below](#what-a-run-pod-mounts)). The file is read and
+checked at startup, so that a template that cannot work stops the coder and not a run: it may not set `metadata.name`,
+`generateName` or owner references, nor the coder's labels and annotations; it must have the container the commands run in
+(`RUN_POD_CONTAINER`, `run`); it must mount a volume in that container **once, whole and writable, at the workspace root or the
+closest directory above it** (the mount the code replaces), and no other container may mount that volume; and it may not ask for
+what the chart's admission policy refuses (`hostNetwork`, `hostPID`, `hostIPC`, a `hostPath` volume, a privileged container,
+privilege escalation, a pinned `nodeName`, or an `automountServiceAccountToken` that is not `false`). The chart renders it
+(`runPods` in [`deploy/coder`](../../deploy/coder/README.md)); `src/template.rs` has the shape in its tests.
 
 The commands run in the container named `run`, which must mount `/opt/adam/bin` read-only from an `emptyDir` that an init
 container filled from the coder's image (`adam-exec`, and `opencode` for `tool_path("opencode")`), the workspace volume at the
-same path as in the coder, and have `MODEL_API_KEY` from the deployment's Secret when the gateway needs a key
+workspace root, and have `MODEL_API_KEY` from the deployment's Secret when the gateway needs a key
 (`Settings::model_key`, which `secret_ref("model-key")` follows).
+
+## What a run pod mounts
+
+The coder's volume holds every run's files. A run pod gets only these, each **at the path the coder has it at**
+(`WorkspaceMounts`, from `PodTemplate::mounts_for`, which lists the run's slots and reads each worktree's `.git` file):
+
+| Mount | Mode | Why |
+|---|---|---|
+| `<root>/workspaces/<run>` | read-write | the run's slots: its worktrees and scratch projects, also those added later |
+| `<root>/git/<host>/<owner>/<repo>.git`, for each worktree slot | **read-only** | the objects, refs and configuration a worktree's `.git` file points into; the coder's own `git` reads this directory in every run's worktree, so no run may write it |
+| `<mirror>/worktrees/<name>`, for each worktree slot | read-write, on top of the mirror | the worktree's own `HEAD`, `index` and logs (`<name>` is what the `.git` file says: git names a second worktree `r1`) |
+
+Nothing of `meta/`, of another run or of another repository's mirror. The legacy worktree of a run (outside the run's directory)
+gets no mount, and a worktree whose `.git` does not lead to a directory of its own mirror gets no git mounts and a warning.
+`ensure` makes the run's directory first (the coder owns the volume; the kubelet would make a missing `subPath` as root).
+
+Git in the pod reads and refreshes its index (`status`, `log`, `diff`, `describe`, `rev-parse`, `grep`, `checkout -- file`,
+moving `HEAD`); whatever writes an object, a ref or the mirror's configuration fails (`add`, `commit`, `stash`, `reset`, `tag`,
+`branch`, `config --local`): the coder commits. `deploy/coder/tests/git-in-run-pod.sh` proves it with real git and real mounts.
+The mirror is shared by everyone who works on a repository, so the refs and `worktrees/` of the other runs of that repository
+stay readable through it (ADR 0041, "Known limits").
+
+The mounts of a pod are fixed when it is made. Its annotation `adam.vymalo.com/workspace-mounts` records them (`rw <path>` or
+`ro <path>`, one per line), and `ensure` compares it with what the workspace needs: a worktree added after the pod was made
+needs a pod made again (see the table above), and a mount the pod has and no longer needs is left.
 
 ## Processes
 
@@ -146,18 +178,31 @@ one line); none carries a secret, and the API server never echoes one in a refus
   cannot be pulled). Commands in a pod are another seam (`PodExec`) with a fake. They cover `ensure` (the pod, its labels, its
   steps, idempotency, concurrent calls, a create that races), the refusals above, `release`, `held_runs` (this release's pods
   only), the idle sweep (idle, busy, cannot be asked, another worker's, off), `prepare` and the quoting of the words, `kill`,
-  and `tool_path` and `secret_ref`.
+  and `tool_path` and `secret_ref`; the mounts (a run with no worktree, one, several and a scratch project, the legacy worktree,
+  a `.git` that leads nowhere, a workspace outside the volume, with real `git` worktrees), the pod made again for a worktree
+  added later (no command running), waited for (a command running, or a pod that cannot be asked), left alone (nothing new, a
+  spare mount) and replaced (no annotation); and the template's startup refusals (no mount at the workspace root, a `subPath`,
+  read-only, no such volume, the volume mounted twice or by another container).
 * **Tests that need a cluster** (`tests/cluster.rs`): one test, gated on **`ADAM_TEST_KUBECONFIG`**, that makes a pod from the
   chart's own template, runs commands in it through `adam-kube-exec` (both streams, the exit code, the working directory,
   variables, every word its own argument, stdin and `/dev/null`, 3 MB of output, what a spec hides, that the coder's secrets are
   not in the pod), kills a command (the client alone leaves it, `kill` stops it and ends the client), sweeps an idle pod and not
-  a busy one, releases, and checks that the chart's admission policy refuses each of thirteen changes to the pod while accepting
-  the unchanged one, and (with `ADAM_TEST_KUBE_QUOTA_PODS`) that the quota refuses one pod beyond its limit with
-  `EnvError::Unavailable`. The kubeconfig must be **the coder's ServiceAccount's**, or the policy tests nothing. Without the
+  a busy one, releases, and checks that the chart's admission policy refuses each of sixteen changes to the pod while accepting
+  the unchanged one (among them another key of the model key's Secret, that Secret as a volume and that Secret as `envFrom`),
+  and (with `ADAM_TEST_KUBE_ISOLATION_MIRROR` and `_ADMIN`) that a run pod sees only its own run: on a volume seeded with two
+  runs of one mirror, `meta/` and another mirror, the pod made as `ensure` makes it lists only its own directory and mirror,
+  cannot read the other run's file or `meta/`, runs `git status` and `git log` in its worktree, and cannot write the mirror's
+  configuration, hooks, refs or objects, or commit; and (with `ADAM_TEST_KUBE_QUOTA_PODS`) that the quota refuses one pod
+  beyond its limit with `EnvError::Unavailable`. The kubeconfig must be **the coder's ServiceAccount's**, or the policy tests nothing. Without the
   variable the test says it skipped; **with `ADAM_TEST_REQUIRE_KUBERNETES=1` it fails instead** (the `run-pods` job of CI sets
   it). The other variables (`ADAM_TEST_KUBE_TEMPLATE`, `ADAM_TEST_KUBE_NAMESPACE`, `ADAM_TEST_KUBE_INSTANCE`,
-  `ADAM_TEST_KUBE_WORKER`, `ADAM_TEST_KUBE_MODEL_KEY`) are in the header of the file, and the script that sets a `kind` cluster up
-  is [`deploy/coder/tests/kind-run-pods.sh`](../../deploy/coder/tests/kind-run-pods.sh). The `NetworkPolicy` is not exercised: it
+  `ADAM_TEST_KUBE_WORKER`, `ADAM_TEST_KUBE_MODEL_KEY`, `ADAM_TEST_KUBE_ISOLATION_MIRROR`, `ADAM_TEST_KUBE_ISOLATION_ADMIN`) are in
+  the header of the file, and the script that sets a `kind` cluster up and seeds the volume is
+  [`deploy/coder/tests/kind-run-pods.sh`](../../deploy/coder/tests/kind-run-pods.sh). The isolation scenario and the nested
+  read-only and read-write `subPath` mounts it relies on are *unverified* until CI has run that job. The `NetworkPolicy` is not exercised: it
   needs a CNI that enforces it.
+* **Git under the pod's mounts, no cluster** ([`deploy/coder/tests/git-in-run-pod.sh`](../../deploy/coder/tests/git-in-run-pod.sh)): real
+  git as uid 10001 in a private mount namespace with the three mounts as bind mounts; what works, what is refused and what is
+  not there. Needs root, `unshare` and `setpriv`; `ADAM_TEST_REQUIRE_MOUNTS=1` (CI) makes it fail instead of skip.
 * `ADAM_TEST_REQUIRE_DB=1`, which CI sets for the database suites, does **not** turn this test on: a runner without a cluster
   would fail every other job.

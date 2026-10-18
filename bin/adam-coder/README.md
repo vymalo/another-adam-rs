@@ -1283,8 +1283,12 @@ every other problem of the configuration (exit 78).
 * **Where the pod comes from.** `RUN_POD_TEMPLATE_FILE`, a Pod the chart mounts: the image (the `workspace` image, by tag and digest), the resources,
   the priority class, the security context, the volumes, `MODEL_API_KEY` from the deployment's Secret and the node affinity are the deployment's; the
   coder only adds a name (`adam-run-<hash of the run id>`), the namespace, labels and annotations. The file is read and checked at startup (a template
-  the cluster's admission policy would refuse, or without the container the commands run in, is exit 78). The pod mounts the coder's workspace volume
-  at the **same path**, so a path means the same in both.
+  the cluster's admission policy would refuse, without the container the commands run in, or in which that container does not mount a volume at `WORKSPACE_ROOT`
+  once and whole, is exit 78). The pod mounts only what its run needs of the coder's workspace volume, at the **same paths**, so a path means the same in both and
+  the pod sees no other run ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md)): the run's directory, and for each worktree its mirror
+  **read-only** and the worktree's own directory in it. Git in the pod reads; whatever writes the mirror (`git commit`, `add`, `tag`, `config --local`) fails, and the
+  coder's tools commit. A repository added to the run later makes the pod again when no command runs in it, and otherwise the tool waits for the command like it
+  waits for a slot.
 * **A command** is the program `adam-kube-exec` (in the image: `RUN_POD_EXEC_BINARY`), which the tools spawn as any command, in a process group of its
   own, with an empty environment but the variables it needs to reach the cluster. It runs `adam-exec run|shell` in the pod over `pods/exec` and exits
   with the command's code. A timeout or a cancel kills the client **and** runs `adam-exec kill` in the pod. **No GitHub credential, `DATABASE_URL` or
