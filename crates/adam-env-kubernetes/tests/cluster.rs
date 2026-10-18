@@ -11,10 +11,17 @@
 //!   release's namespace and instance label, and `ADAM_TEST_KUBE_WORKER` (default `ci-0`);
 //! * optionally `ADAM_TEST_KUBE_QUOTA_PODS`, the `pods` of the chart's ResourceQuota, which turns on the
 //!   test of the quota, and `ADAM_TEST_KUBE_MODEL_KEY`, the value of the model key the template's
-//!   Secret holds, which turns on the test of what a spec hides.
+//!   Secret holds, which turns on the test of what a spec hides;
+//! * optionally `ADAM_TEST_KUBE_ISOLATION_MIRROR` and `ADAM_TEST_KUBE_ISOLATION_ADMIN`, which turn on the
+//!   test that a run pod sees only its own run. The volume must hold, made by whoever sets the cluster
+//!   up (`kind-run-pods.sh` does): a bare mirror at the first path, a worktree of it for the run
+//!   `kind-iso-a` at `/work/workspaces/kind-iso-a/r` whose directory in the mirror is the second path, a
+//!   worktree of the same mirror for the run `kind-iso-b` with a file `private.txt` in it,
+//!   `/work/meta/kind-iso-b/r.json`, and another mirror at `/work/git/example.test/p/other.git`.
 //!
 //! The template's `/work` must be a volume the pod's user can write, and its image must have `sh`,
-//! `env`, `cat` and `sleep` and carry `adam-exec` at `/opt/adam/bin` (the chart's init container).
+//! `env`, `cat` and `sleep` and carry `adam-exec` at `/opt/adam/bin` (the chart's init container); the
+//! isolation test also needs `git`.
 //!
 //! `ADAM_TEST_REQUIRE_KUBERNETES=1` makes a run that would skip fail instead (the `kind` job sets it).
 //! The job that sets all of this up is `.github/workflows/ci.yml` (`run-pods`), and
@@ -22,18 +29,22 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use adam_env_kubernetes::{KubeEnvironment, Placement, PodTemplate, Settings, pod_name, run_hash};
+use adam_env_kubernetes::{
+    KubeEnvironment, Placement, PodTemplate, Settings, WorkspaceMounts, WorktreeDirs, pod_name,
+    run_hash,
+};
 use adam_workspace::{
     EnvError, EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec, NoProgress,
     StaticToken, Workspaces,
 };
 use k8s_openapi::api::core::v1::{
-    HostPathVolumeSource, Pod, SecretVolumeSource, SecurityContext, Volume,
+    EnvFromSource, HostPathVolumeSource, Pod, SecretEnvSource, SecretVolumeSource, SecurityContext,
+    Volume,
 };
 use kube::api::{AttachParams, DeleteParams, PostParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -100,7 +111,8 @@ impl EnvProgress for Steps {
 
 impl Cluster {
     fn template(&self) -> PodTemplate {
-        PodTemplate::from_file(&self.template_file, "run").expect("the chart's template")
+        PodTemplate::from_file(&self.template_file, "run", Path::new("/work"))
+            .expect("the chart's template")
     }
 
     fn pods(&self) -> Api<Pod> {
@@ -266,6 +278,7 @@ async fn against_a_real_cluster() {
     kill_stops_what_the_client_started(&cluster).await;
     an_idle_pod_is_deleted_and_a_busy_one_is_not(&cluster).await;
     release_and_held_runs(&cluster).await;
+    a_run_pod_sees_only_its_own_run(&cluster).await;
     the_admission_policy_refuses_everything_but_the_intended_pod(&cluster).await;
     if cluster.quota_pods.is_some() {
         the_quota_refuses_a_pod_beyond_its_limit(&cluster).await;
@@ -530,7 +543,12 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
     };
     let pods = c.pods();
 
-    let good = |run: &str| template.render(run, &pod_name(run), placement);
+    // The pod `ensure` makes for a run that has no worktree: the template with the run's own mount.
+    let good = |run: &str| {
+        let run_dir = PathBuf::from(format!("/work/workspaces/{run}"));
+        let mounts = WorkspaceMounts::plan(template.workspace_path(), &run_dir, &[]).unwrap();
+        template.render(run, &pod_name(run), placement, &mounts)
+    };
     let accepted = c.run_id("adm-ok");
     pods.create(&PostParams::default(), &good(&accepted))
         .await
@@ -602,6 +620,59 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
                             ..SecretVolumeSource::default()
                         }),
                         ..Volume::default()
+                    });
+            }),
+        ),
+        (
+            "another key of the Secret the model key is in",
+            Box::new(|p| {
+                let mut reference = model_key_reference(p);
+                reference.key = "GITHUB_TOKEN".into();
+                p.spec.as_mut().unwrap().containers[0]
+                    .env
+                    .get_or_insert_default()
+                    .push(k8s_openapi::api::core::v1::EnvVar {
+                        name: "TOKEN".into(),
+                        value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                            secret_key_ref: Some(reference),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+            }),
+        ),
+        (
+            "the Secret the model key is in, as a volume",
+            Box::new(|p| {
+                let name = model_key_reference(p).name;
+                p.spec
+                    .as_mut()
+                    .unwrap()
+                    .volumes
+                    .get_or_insert_default()
+                    .push(Volume {
+                        name: "model-secret".into(),
+                        secret: Some(SecretVolumeSource {
+                            secret_name: Some(name),
+                            ..SecretVolumeSource::default()
+                        }),
+                        ..Volume::default()
+                    });
+            }),
+        ),
+        (
+            "every key of the Secret the model key is in, as envFrom",
+            Box::new(|p| {
+                let name = model_key_reference(p).name;
+                p.spec.as_mut().unwrap().containers[0]
+                    .env_from
+                    .get_or_insert_default()
+                    .push(EnvFromSource {
+                        secret_ref: Some(SecretEnvSource {
+                            name,
+                            optional: None,
+                        }),
+                        ..EnvFromSource::default()
                     });
             }),
         ),
@@ -684,6 +755,198 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
         );
         eprintln!("refused {what}: HTTP {}", status.code);
     }
+}
+
+/// The reference to the model key the template's run container has, whose Secret is the one Secret
+/// the policy allows.
+fn model_key_reference(pod: &Pod) -> k8s_openapi::api::core::v1::SecretKeySelector {
+    pod.spec
+        .as_ref()
+        .unwrap()
+        .containers
+        .iter()
+        .flat_map(|c| c.env.iter().flatten())
+        .find(|e| e.name == "MODEL_API_KEY")
+        .and_then(|e| e.value_from.as_ref()?.secret_key_ref.clone())
+        .expect("the template gives the run container MODEL_API_KEY from a Secret")
+}
+
+/// A run pod sees its own run and the git directories its worktree needs, and nothing of any other run:
+/// not their files, not `meta/`, not another mirror, and it cannot write the mirror.
+///
+/// The pod is made as `ensure` makes it (the template with the run's mounts), by the coder's
+/// ServiceAccount, so the policy admits it too. Needs the volume `kind-run-pods.sh` seeds: see the header.
+async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
+    eprintln!("--- a run pod sees only its own run");
+    let (Ok(mirror), Ok(admin)) = (
+        std::env::var("ADAM_TEST_KUBE_ISOLATION_MIRROR"),
+        std::env::var("ADAM_TEST_KUBE_ISOLATION_ADMIN"),
+    ) else {
+        eprintln!(
+            "skipped the isolation scenario: ADAM_TEST_KUBE_ISOLATION_MIRROR and _ADMIN are not set"
+        );
+        return;
+    };
+    const RUN: &str = "kind-iso-a";
+    let template = c.template();
+    let mounts = WorkspaceMounts::plan(
+        template.workspace_path(),
+        Path::new("/work/workspaces/kind-iso-a"),
+        &[WorktreeDirs {
+            mirror: PathBuf::from(&mirror),
+            admin: PathBuf::from(&admin),
+            generation: None,
+        }],
+    )
+    .expect("the mounts");
+    let pod = template.render(
+        RUN,
+        &pod_name(RUN),
+        Placement {
+            namespace: &c.namespace,
+            instance: &c.instance,
+            worker: &c.worker,
+        },
+        &mounts,
+    );
+    let pods = c.pods();
+    // A leftover of an earlier attempt is not this attempt's pod.
+    let _ = pods.delete(&pod_name(RUN), &DeleteParams::default()).await;
+    c.wait_for("an earlier pod to be gone", 60, async || c.gone(RUN).await)
+        .await;
+    pods.create(&PostParams::default(), &pod)
+        .await
+        .expect("the policy admits the pod with the run's own mounts");
+    c.wait_for("the pod to be ready", 240, async || {
+        pods.get_opt(&pod_name(RUN))
+            .await
+            .unwrap()
+            .and_then(|p| p.status)
+            .and_then(|s| s.conditions)
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|cond| cond.type_ == "Ready" && cond.status == "True")
+            })
+    })
+    .await;
+
+    let sh = async |script: &str| {
+        let script = format!("export HOME=/tmp GIT_CONFIG_GLOBAL=/dev/null; {script}");
+        c.exec_in(RUN, &["sh", "-c", &script]).await
+    };
+    let (code, out) = sh("ls /work").await;
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "git\nworkspaces\n"),
+        "the volume's root"
+    );
+    let (code, out) = sh("ls /work/workspaces").await;
+    assert_eq!((code, out.as_str()), (0, "kind-iso-a\n"), "no other run");
+    // The mirror of the worktree, and not the other mirror the volume holds (`p/other.git`).
+    let (code, out) =
+        sh("ls /work/git; ls /work/git/example.test; ls /work/git/example.test/o").await;
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "example.test\no\nr.git\n"),
+        "only the mirror of the worktree"
+    );
+    for hidden in [
+        "/work/meta",
+        "/work/workspaces/kind-iso-b",
+        "/work/workspaces/kind-iso-b/r/private.txt",
+    ] {
+        let (code, out) = sh(&format!("test -e {hidden} || cat {hidden}")).await;
+        assert_ne!(code, 0, "{hidden} is visible in the pod: {out}");
+    }
+
+    // Git works in the run's own worktree: the mirror is read, the worktree's own directory is written.
+    let (code, out) = sh("cd /work/workspaces/kind-iso-a/r && git status --short --branch").await;
+    assert_eq!(code, 0, "git status: {out}");
+    assert!(out.contains("agent/kind-iso-a"), "{out}");
+    let (code, out) = sh("cd /work/workspaces/kind-iso-a/r && echo more >> README.md && git status --short && git diff --stat | tail -1").await;
+    assert_eq!(code, 0, "git status after a change: {out}");
+    assert!(out.contains("README.md"), "{out}");
+    let (code, out) = sh("cd /work/workspaces/kind-iso-a/r && git log --oneline").await;
+    assert_eq!(code, 0, "git log: {out}");
+    assert!(out.contains("seed"), "{out}");
+    let (code, out) = sh(&format!(
+        "touch {admin}/probe && echo y > /work/workspaces/kind-iso-a/y"
+    ))
+    .await;
+    assert_eq!(code, 0, "the run's own directories are writable: {out}");
+
+    // The mirror is read-only: its configuration, its hooks, its refs and its objects are the coder's.
+    for write in [
+        format!("echo x >> {mirror}/config"),
+        format!("echo x > {mirror}/hooks/post-checkout"),
+        format!("mkdir {mirror}/refs/heads/evil"),
+        format!("mkdir {mirror}/objects/ff"),
+        format!("mkdir {mirror}/worktrees/new"),
+        "cd /work/workspaces/kind-iso-a/r && git commit -qam x".to_owned(),
+        "cd /work/workspaces/kind-iso-a/r && git tag evil".to_owned(),
+    ] {
+        let (code, out) = sh(&write).await;
+        assert_ne!(code, 0, "`{write}` wrote the mirror: {out}");
+    }
+
+    // What the coder's git follows out of the worktree's directory, or acts on, is read-only inside
+    // it: a `HEAD` that names another run's branch is the branch the coder resets, a `commondir`
+    // that names another repository moves the refs the coder reads and writes, a link at
+    // `logs/HEAD` is appended to by git, and none is the pod's to write, rename over, replace or
+    // remove, though the directory itself is writable and the files are its own uid's.
+    for write in [
+        format!("echo 'ref: refs/heads/agent/kind-iso-b' > {admin}/HEAD"),
+        format!("echo 'ref: refs/heads/agent/kind-iso-b' >> {admin}/HEAD"),
+        format!(
+            "echo 'ref: refs/heads/agent/kind-iso-b' > {admin}/h2 && mv {admin}/h2 {admin}/HEAD"
+        ),
+        format!("rm {admin}/HEAD"),
+        format!("ln -sf /etc/passwd {admin}/HEAD"),
+        "cd /work/workspaces/kind-iso-a/r && git symbolic-ref HEAD refs/heads/agent/kind-iso-b"
+            .to_owned(),
+        "cd /work/workspaces/kind-iso-a/r && git switch --detach".to_owned(),
+        format!("echo /elsewhere > {admin}/commondir"),
+        format!("echo x >> {admin}/commondir"),
+        format!("echo /elsewhere > {admin}/c2 && mv {admin}/c2 {admin}/commondir"),
+        format!("rm {admin}/commondir"),
+        format!("ln -sf /etc/passwd {admin}/commondir"),
+        format!("echo /work/workspaces/kind-iso-b/r/.git > {admin}/gitdir"),
+        format!("echo x > {admin}/g2 && mv {admin}/g2 {admin}/gitdir"),
+        format!("rm {admin}/gitdir"),
+        format!("mv {admin}/logs {admin}/logs.moved"),
+        format!("rm {admin}/logs/HEAD && ln -s /etc/passwd {admin}/logs/HEAD"),
+        format!("touch {admin}/logs/new"),
+    ] {
+        let (code, out) = sh(&write).await;
+        assert_ne!(
+            code, 0,
+            "`{write}` changed the worktree's directory in the mirror: {out}"
+        );
+    }
+    let (code, out) = sh(&format!("cat {admin}/commondir")).await;
+    assert_eq!(
+        (code, out.trim()),
+        (0, "../.."),
+        "commondir is what git wrote"
+    );
+    let (code, out) = sh(&format!("cat {admin}/HEAD")).await;
+    assert_eq!(
+        (code, out.trim()),
+        (0, "ref: refs/heads/agent/kind-iso-a"),
+        "HEAD is what git wrote"
+    );
+    let (code, out) = sh(&format!(
+        "cd /work/workspaces/kind-iso-a/r && git status --short && git log --oneline | head -1 && touch {admin}/probe2"
+    ))
+    .await;
+    assert_eq!(code, 0, "git works with the entries read-only: {out}");
+
+    pods.delete(&pod_name(RUN), &DeleteParams::default())
+        .await
+        .unwrap();
+    c.wait_for("the pod to be gone", 60, async || c.gone(RUN).await)
+        .await;
 }
 
 async fn the_quota_refuses_a_pod_beyond_its_limit(c: &Cluster) {

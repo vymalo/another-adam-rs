@@ -642,10 +642,10 @@ What it renders, and why each is there:
 
 | Object | What |
 |---|---|
-| `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, `MODEL_API_KEY` from the ExternalSecret's Secret, `/work` the coder's workspace claim at the same path, and an init container that copies `adam-exec` and OpenCode out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations; a changed template is a deploy (a checksum annotation) |
+| `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, `MODEL_API_KEY` from the ExternalSecret's Secret, the coder's workspace claim at `/work` **whole, which the coder replaces by the run's own mounts** ([below](#what-a-run-pod-sees)), and an init container that copies `adam-exec` and OpenCode out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations and narrows the `/work` mount; it refuses to start when the run container does not mount a volume at its `WORKSPACE_ROOT` once and whole; a changed template is a deploy (a checksum annotation) |
 | `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot. `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
 | `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is mounted in the coder pod alone; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
-| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim (and the [cache](#the-package-cache) claim, when it is on) and the one Secret (so no `hostPath`), reads a Secret other than the ExternalSecret's, or any by `envFrom`, is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
+| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references a Secret key other than `MODEL_API_KEY` of the ExternalSecret's Secret (by name **and** key), or any Secret by `envFrom`, is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
 | `NetworkPolicy` `<release>-coder-run-pods` | no ingress; egress to DNS and to the internet **except** `networkPolicy.blockedCIDRs` (RFC 1918, link-local, which holds the cloud metadata address, and the shared address space) and `networkPolicy.clusterCIDRs` (the pod and service CIDRs: yours to name), so builds reach registries and the model gateway and not the services of the cluster. A gateway inside the cluster needs `networkPolicy.extraEgress`. IPv4 only |
 
 The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_POD_NAMESPACE` (its own, by the downward API), `RUN_POD_INSTANCE` (the release),
@@ -653,7 +653,7 @@ The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_P
 `WORKER_ID` from the pod name (a worker sweeps only its own idle pods), the ServiceAccount, and **`runPods.coderResources`
 (a 1Gi memory limit) instead of `resources`** (6Gi), which is untouched while run pods are off. Set `runPods.coderResources: null` to keep `resources`.
 
-**Where `/work` comes from.** The run pod mounts the coder's workspace volume at the same path, so a path means the same in both:
+**Where `/work` comes from.** The run pod mounts the parts of the coder's workspace volume it needs at the same paths ([below](#what-a-run-pod-sees)), so a path means the same in both; the template names the claim:
 
 * `workspace.placement: shared` or `affinity` (a `ReadWriteMany` volume): the run pod mounts that claim, on any node.
 * The default, a `ReadWriteOnce` claim of the coder pod (`work-<release>-coder-0`; `isolated` too): the template adds a **required pod affinity** to the coder pod
@@ -661,13 +661,32 @@ The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_P
   node mount one `ReadWriteOnce` volume.** Kubernetes' definition of `ReadWriteOnce` is one *node*, which allows it; the owner checks it on the cluster.
   More than one replica with these claims is refused (a run pod mounts one claim).
 
-A run pod sees the whole volume, the other runs' files included: it bounds a build's memory and the blast radius of a crash, it is not isolation between
-runs (ADR 0019, "Consequences"). The model key is a variable of the run pod, readable by its commands, as it was in the coder's own.
+### What a run pod sees
+
+A run pod sees its own run and nothing of any other ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md), proposed). The template
+mounts the claim once, whole, at `/work`; the coder replaces that one mount, for each pod, by `subPath` mounts at the same paths:
+
+| Mount | Mode |
+|---|---|
+| `workspaces/<run>`, the run's slots | read-write |
+| `git/<host>/<owner>/<repo>.git`, the mirror of each worktree slot | **read-only** |
+| that mirror's `worktrees/<name>` (`<run>+<slot>`), the worktree's own `HEAD` and `index` | read-write, on top of the mirror |
+| that directory's `HEAD`, `commondir`, `gitdir` and `logs` | **read-only**, on top of that (a bind mount of a file or a directory cannot be written, renamed over, replaced by a link or removed from the pod) |
+
+No `meta/`, no other run, no other mirror. Git in the pod reads and refreshes its index; whatever writes an object, a ref or the mirror's
+configuration (`git add`, `commit`, `stash`, `reset`, `tag`, `branch`, `config --local`, a hook installer) fails there, and so does moving `HEAD`
+(`git switch --detach`: it appends to the read-only reflog), and the coder commits. A repository
+the run adds later needs a pod made again: when no command runs in it the coder does it, and when one does the tool waits for it to end
+(`RUN_POD_WAIT_SECS`) like it waits for a quota slot. A pod made by an earlier release is made again the same way, and so is the pod of a run whose slot was lost and added again (the mounts follow a directory, and the slot's directory in the mirror is a new one under the same name). Limits (ADR 0041): the mirror of a
+repository is shared by everyone who works on it, so their unpushed `agent/*` branches and worktree directories in it can be read; the [package
+cache](#the-package-cache) is writable by every run; the model key is a variable of the run pod, readable by its commands, as it was in the coder's own.
 
 **Checked by:** `tests/render-check.sh` (each object, the pod template, every rule of the policy, the quota's scope, the values and the refusals; the render is
 `tests/golden/run-pods.yaml`), kubeconform on the renders (`.github/workflows/coder.yml`), and the `run-pods` job of `.github/workflows/ci.yml`, which applies the
 objects to a `kind` cluster and runs the environment against it as the coder's ServiceAccount (`tests/kind-run-pods.sh`): a pod from the template, commands
-in it, a kill, the idle sweep, the policy refusing thirteen changes to the pod and the quota refusing the fifth. It does not run the coder over a model, and it
+in it, a kill, the idle sweep, the policy refusing sixteen changes to the pod, the quota refusing the fifth, and a run pod that sees only its own run on a volume the script
+seeds with two runs of one mirror (*unverified* until CI has run it). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `HEAD`, `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid) as bind mounts in a private mount
+namespace (needs root; CI runs it before the kind job). It does not run the coder over a model, and it
 does not check the NetworkPolicy (kind's network plugin may not enforce one). **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
 sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy, and the HTTP status of an admission refusal (the
 coder treats 403, 422 and 400 as the deployment's mistake).

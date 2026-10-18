@@ -1,6 +1,6 @@
 //! Mirrors and per-run worktrees.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{Auth, GitCmd};
 use crate::repo::{RepoLocation, RepoRef, fnv1a};
 use crate::run_workspace::RunWorkspace;
+use crate::safe_fs;
 use crate::worktree::{GitIdentity, Worktree};
 
 pub(crate) const REMOTE_TRACKING_PREFIX: &str = "refs/remotes/origin/";
@@ -206,6 +207,21 @@ pub(crate) struct Meta {
     /// Version 2: `"repo"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
+    /// The name of the worktree's directory in the mirror's `worktrees/`, which is its git
+    /// directory (`<mirror>/worktrees/<admin>`). The coder records it when it makes the worktree
+    /// and pins every `git` it runs on the slot to it ([`GitPin`](crate::GitPin)): the slot's `.git`
+    /// file says the same, but a run's commands can write that file, and a name read from it could
+    /// be another run's directory. Absent from metadata written before it existed, which is then
+    /// resolved from the mirror (see `Inner::admin_by_backpointer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admin: Option<String>,
+    /// A token that is new each time the coder makes the directory `admin` names (the name is the
+    /// same when a slot is removed and added again, the directory is not). A run pod's mounts
+    /// follow a directory and not its name, so what a pod mounted of the directory is told apart
+    /// from what is there now by this ([`Worktree::git_dir_generation`]). Absent from metadata
+    /// written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admin_gen: Option<String>,
 }
 
 /// The metadata of a scratch slot (version 2).
@@ -506,7 +522,10 @@ impl Workspaces {
                 }));
             }
             if self.inner.is_valid_worktree(path, &mirror).await {
-                return Ok(self.inner.worktree(m, &target.dir, path.clone(), mirror));
+                return Ok(self
+                    .inner
+                    .open_worktree(m, &target.dir, path.clone(), mirror, &target.meta_path)
+                    .await);
             }
         }
         if exists(path).await? {
@@ -573,6 +592,8 @@ impl Workspaces {
                         dir: target.seq.map(|_| target.dir.clone()),
                         seq: target.seq,
                         kind: target.seq.map(|_| "repo".to_owned()),
+                        admin: None,
+                        admin_gen: None,
                     },
                     true,
                 )
@@ -590,14 +611,23 @@ impl Workspaces {
 
         let added = self
             .inner
-            .add_worktree(&mirror, path, &meta, &start_ref)
+            .add_worktree(&mirror, path, &meta, &start_ref, &target.dir)
             .await;
-        if let Err(e) = added {
-            if fresh {
-                let _ = tokio::fs::remove_file(&target.meta_path).await;
+        let admin = match added {
+            Ok(admin) => admin,
+            Err(e) => {
+                if fresh {
+                    let _ = tokio::fs::remove_file(&target.meta_path).await;
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
+        // The worktree's git directory, from the mirror's own listing and not from the `.git`
+        // file: recorded now, while no command of the run has had a chance to write anything.
+        let mut meta = meta;
+        meta.admin = Some(admin);
+        meta.admin_gen = Some(new_generation());
+        self.inner.write_meta_at(&target.meta_path, &meta).await?;
         Ok(self
             .inner
             .worktree(&meta, &target.dir, path.clone(), mirror))
@@ -900,6 +930,89 @@ impl Workspaces {
     }
 }
 
+/// The names in `<mirror>/worktrees/`: the git directories of the mirror's linked worktrees. A
+/// mirror with none lists none.
+async fn list_admin_dirs(mirror: &Path) -> WorkspaceResult<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut entries = match tokio::fs::read_dir(mirror.join("worktrees")).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(names),
+        Err(e) => return Err(WorkspaceError::io("cannot list the mirror's worktrees", e)),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| WorkspaceError::io("cannot list the mirror's worktrees", e))?
+    {
+        if let Some(name) = entry.file_name().to_str() {
+            names.insert(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// Whether `<mirror>/worktrees/<name>/gitdir`, which git writes, names the `.git` file of the slot
+/// at `slot` (as written, or as the same file by another path). The file is in a directory a run's
+/// commands write: it is read as a regular file and not through a link ([`safe_fs`]).
+async fn names_worktree(mirror: &Path, name: &str, slot: &Path) -> bool {
+    let Ok(text) = safe_fs::read_regular_text(
+        &mirror.join("worktrees").join(name).join("gitdir"),
+        safe_fs::MAX_SMALL_FILE,
+    )
+    .await
+    else {
+        return false;
+    };
+    let Some(named) = text.lines().next().map(str::trim).filter(|l| !l.is_empty()) else {
+        return false;
+    };
+    let (named, wanted) = (Path::new(named), slot.join(".git"));
+    if named == wanted {
+        return true;
+    }
+    match (
+        tokio::fs::canonicalize(named).await,
+        tokio::fs::canonicalize(&wanted).await,
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// What every directory of a mirror's `worktrees/` that a run's worktree has starts with: the run
+/// and `+`. A `+` is in no run id and in no slot name, so no run's directories can begin with
+/// another run's prefix, and a name that has none is from before names carried the run.
+pub(crate) fn admin_prefix(run: &str) -> String {
+    format!("{run}+")
+}
+
+/// The name of a worktree's directory in the mirror's `worktrees/`: `<run>+<slot>`. Unique to the
+/// run for as long as the run has the slot, and never a name another run's worktree could be given.
+pub(crate) fn admin_name(run: &str, dir: &str) -> String {
+    format!("{run}+{dir}")
+}
+
+/// A token that is not the one of any directory the coder made before ([`Meta::admin_gen`]): the
+/// time in nanoseconds and a count, in hex.
+pub(crate) fn new_generation() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    format!("{nanos:x}-{:x}", COUNT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Whether `token` can be a [`new_generation`]: lowercase hex and a dash, short. The token goes into
+/// a line of a pod's annotation, so what is read back is held to what is written.
+pub(crate) fn is_generation(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 64
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
+}
+
 /// Whether the (lowercased-section) configuration `key` is one the mirror must not carry into a
 /// credentialed command (see [`Inner::sanitize_mirror_config`]).
 fn is_unwanted_config(key: &str) -> bool {
@@ -919,6 +1032,9 @@ fn is_unwanted_config(key: &str) -> bool {
         "core.fsmonitor",
         "core.hookspath",
         "core.askpass",
+        // With `core.repositoryformatversion` 1, git reads `config.worktree` of each worktree's own
+        // directory, which a run's commands can write; the coder never turns this on.
+        "extensions.worktreeconfig",
     ];
     PREFIXES.iter().any(|p| key.starts_with(p))
 }
@@ -946,7 +1062,7 @@ impl Inner {
     }
 
     /// The metadata of the legacy worktree of `run`.
-    fn meta_path(&self, run: &str) -> PathBuf {
+    pub(crate) fn meta_path(&self, run: &str) -> PathBuf {
         self.root.join("meta").join(format!("{run}.json"))
     }
 
@@ -1002,12 +1118,16 @@ impl Inner {
         let mirror = self.root.join(loc.mirror_relative());
         let path = self.worktree_path(run);
         if self.is_valid_worktree(&path, &mirror).await {
-            Ok(Some(self.worktree(
-                &meta,
-                &slot_name(&loc.name),
-                path,
-                mirror,
-            )))
+            Ok(Some(
+                self.open_worktree(
+                    &meta,
+                    &slot_name(&loc.name),
+                    path,
+                    mirror,
+                    &self.meta_path(run),
+                )
+                .await,
+            ))
         } else {
             Ok(None)
         }
@@ -1359,19 +1479,27 @@ impl Inner {
         Ok(true)
     }
 
+    /// Add the worktree at `path` and say which directory of the mirror's `worktrees/` is its git
+    /// directory.
+    ///
+    /// The directory is called `<run>+<dir>` ([`admin_name`]), not what git would call it (the last
+    /// component of `path`, which two runs share, so that the name of one run's directory could be
+    /// handed to another when the first was pruned). Git names it after the path it is given, so
+    /// the worktree is made in `<root>/staging/<run>+<dir>`, where no run can reach, and moved to
+    /// `path` (`git worktree move` keeps the name).
+    ///
+    /// Nothing is pruned: what an earlier try left of this slot (its directory in the mirror, or one
+    /// of the unprefixed names git used to give it that names `path`) is removed, and no other
+    /// run's directory is touched, whatever it names. The mirror is locked by the caller, and a run's
+    /// commands cannot write `worktrees/` itself.
     async fn add_worktree(
         &self,
         mirror: &Path,
         path: &Path,
         meta: &Meta,
         start_ref: &str,
-    ) -> WorkspaceResult<()> {
-        // Forget worktrees whose directories vanished, so their branches are
-        // not considered checked out.
-        self.mirror_git(mirror)
-            .args(["worktree", "prune"])
-            .run()
-            .await?;
+        dir: &str,
+    ) -> WorkspaceResult<String> {
         let branch_ref = format!("refs/heads/{}", meta.branch);
         let branch_exists = self
             .mirror_git(mirror)
@@ -1380,22 +1508,345 @@ impl Inner {
             .run_status()
             .await?
             .success;
-        let mut cmd = self.mirror_git(mirror).args(["worktree", "add", "--quiet"]);
-        cmd = if branch_exists {
-            // Re-attach the run's surviving branch, keeping its commits.
-            cmd.arg(path).arg(&meta.branch)
-        } else {
-            cmd.args(["--no-track", "-b", &meta.branch])
-                .arg(path)
-                .arg(start_ref)
+        self.add_linked(
+            mirror,
+            &meta.run,
+            &admin_name(&meta.run, dir),
+            path,
+            |cmd, staging| {
+                if branch_exists {
+                    // Re-attach the run's surviving branch, keeping its commits.
+                    cmd.arg(staging).arg(&meta.branch)
+                } else {
+                    cmd.args(["--no-track", "-b", &meta.branch])
+                        .arg(staging)
+                        .arg(start_ref)
+                }
+            },
+        )
+        .await
+    }
+
+    /// Make a linked worktree of `mirror` at `path` whose directory in the mirror is called `name`
+    /// (which carries `run`), and return that name: `add` completes `git worktree add --quiet` with
+    /// the arguments after the options, given the path git is to make it at. See
+    /// [`add_worktree`](Self::add_worktree).
+    pub(crate) async fn add_linked(
+        &self,
+        mirror: &Path,
+        run: &str,
+        name: &str,
+        path: &Path,
+        add: impl FnOnce(GitCmd, &Path) -> GitCmd,
+    ) -> WorkspaceResult<String> {
+        self.forget_stale_admin(mirror, name, path).await?;
+        let staging = self.staging_path(name);
+        remove_dir_if_exists(&staging).await?;
+        if let Some(parent) = staging.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| WorkspaceError::io("cannot make the staging directory", e))?;
+        }
+        let before = list_admin_dirs(mirror).await?;
+        add(
+            self.mirror_git(mirror).args(["worktree", "add", "--quiet"]),
+            &staging,
+        )
+        .run()
+        .await?;
+
+        let made = self.own_admin_dir(mirror, &before, &staging, run).await;
+        let moved = match &made {
+            Ok(_) => self.move_into_place(mirror, run, &staging, path).await,
+            Err(_) => Ok(()),
         };
-        cmd.run().await?;
+        let admin = match (made, moved) {
+            (Ok(admin), Ok(())) => admin,
+            (made, moved) => {
+                // What was made is undone, at the path it was made at and by its name.
+                let _ = self
+                    .mirror_git(mirror)
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&staging)
+                    .run_status()
+                    .await;
+                let _ = remove_dir_if_exists(&staging).await;
+                if let Ok(admin) = &made {
+                    let _ = remove_dir_if_exists(&mirror.join("worktrees").join(admin)).await;
+                }
+                return Err(made.err().or_else(|| moved.err()).unwrap_or_else(|| {
+                    WorkspaceError::Corrupt("the worktree could not be made".to_owned())
+                }));
+            }
+        };
+        if let Err(e) = self
+            .settle_placed(mirror, run, &admin, &staging, path)
+            .await
+        {
+            self.undo_placed(mirror, run, &admin, &staging, path).await;
+            return Err(e);
+        }
+        Ok(admin)
+    }
+
+    /// Whether the worktree that `git worktree move` put at `path` is there and is the new one: the
+    /// way to it is still plain directories (the parent of `path` is the run's to write, and a link
+    /// put there after it was looked at would have had the tree moved to where the link leads), and
+    /// its git directory `admin` names it. A directory that appeared at `path` in the meantime has
+    /// git move the tree **into** it, and then `admin` names `path/<name>`.
+    async fn settle_placed(
+        &self,
+        mirror: &Path,
+        run: &str,
+        admin: &str,
+        staging: &Path,
+        path: &Path,
+    ) -> WorkspaceResult<()> {
+        if !safe_fs::is_plain_path(&self.plain_below(run, path), path).await {
+            return Err(WorkspaceError::Corrupt(format!(
+                "a link appeared on the way to {} while its worktree was being made; the worktree was not kept (remove the run first)",
+                path.display()
+            )));
+        }
+        if !names_worktree(mirror, admin, path).await {
+            return Err(WorkspaceError::Corrupt(format!(
+                "the git directory {admin} of the new worktree {} does not name it: something appeared at {} while the worktree was being made ({} is where git put it); remove the run first",
+                path.display(),
+                path.display(),
+                path.join(staging.file_name().unwrap_or_default()).display()
+            )));
+        }
         Ok(())
     }
 
-    /// `path` is a checked-out worktree whose git dir belongs to `mirror`.
+    /// Undo what [`settle_placed`](Self::settle_placed) refused: the directory `admin` in the
+    /// mirror, and the tree wherever git put it, if the way to it is plain: `path/<name>`, which is
+    /// where git moves a tree to when a directory is at `path`. A tree behind a link is left (a
+    /// removal would follow the link to wherever the run points it by now), and so is the directory
+    /// that appeared at `path`, which is not the coder's.
+    async fn undo_placed(
+        &self,
+        mirror: &Path,
+        run: &str,
+        admin: &str,
+        staging: &Path,
+        path: &Path,
+    ) {
+        let _ = remove_dir_if_exists(&mirror.join("worktrees").join(admin)).await;
+        let _ = remove_dir_if_exists(staging).await;
+        let inside = path.join(staging.file_name().unwrap_or_default());
+        if safe_fs::is_plain_path(&self.plain_below(run, path), &inside).await {
+            let _ = remove_dir_if_exists(&inside).await;
+        }
+    }
+
+    /// The directory the way to `path` is checked from: the run's workspace for a slot or a base
+    /// checkout, `<root>/worktrees` for the legacy worktree of a run.
+    fn plain_below(&self, run: &str, path: &Path) -> PathBuf {
+        let run_dir = self.run_dir(run);
+        if path.starts_with(&run_dir) {
+            run_dir
+        } else {
+            self.root.join("worktrees")
+        }
+    }
+
+    /// The directory git just made for the worktree at `staging`: the one entry that was not there
+    /// before whose `gitdir` file names it, and that is called after `run`.
+    async fn own_admin_dir(
+        &self,
+        mirror: &Path,
+        before: &BTreeSet<String>,
+        staging: &Path,
+        run: &str,
+    ) -> WorkspaceResult<String> {
+        let mut added = Vec::new();
+        for name in list_admin_dirs(mirror).await?.difference(before) {
+            if names_worktree(mirror, name, staging).await {
+                added.push(name.clone());
+            }
+        }
+        match <[String; 1]>::try_from(added) {
+            Ok([admin]) if admin.starts_with(&admin_prefix(run)) => Ok(admin),
+            Ok([admin]) => Err(WorkspaceError::Corrupt(format!(
+                "git called the directory of the new worktree {admin}, which does not carry the run {run}"
+            ))),
+            Err(_) => Err(WorkspaceError::Corrupt(format!(
+                "cannot tell which directory of {}/worktrees is the git directory of the new worktree {}",
+                mirror.display(),
+                staging.display()
+            ))),
+        }
+    }
+
+    /// `git worktree move staging path`: the parent of `path` is made first, and `path` is not there
+    /// (git would move the worktree **into** a directory that is).
+    async fn move_into_place(
+        &self,
+        mirror: &Path,
+        run: &str,
+        staging: &Path,
+        path: &Path,
+    ) -> WorkspaceResult<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| WorkspaceError::io(format!("cannot make {}", parent.display()), e))?;
+            if !safe_fs::is_plain_path(&self.plain_below(run, path), parent).await {
+                return Err(WorkspaceError::Corrupt(format!(
+                    "{} is not a plain directory (a link is on the way to it); remove the run first",
+                    parent.display()
+                )));
+            }
+        }
+        if tokio::fs::symlink_metadata(path).await.is_ok() {
+            return Err(WorkspaceError::Corrupt(format!(
+                "{} appeared while its worktree was being made; remove the run first",
+                path.display()
+            )));
+        }
+        self.mirror_git(mirror)
+            .args(["worktree", "move"])
+            .arg(staging)
+            .arg(path)
+            .run()
+            .await
+            .map(drop)
+    }
+
+    /// Where a worktree is made before it is moved to its slot: `<root>/staging/<name>`, which no
+    /// pod mounts.
+    fn staging_path(&self, name: &str) -> PathBuf {
+        self.root.join("staging").join(name)
+    }
+
+    /// Remove what an earlier try at `slot` left in the mirror's `worktrees/`: the directory called
+    /// `name`, and a directory that carries no run (git's own name, from before names did) whose
+    /// `gitdir` names `slot`. Another run's directory is not touched, whatever its `gitdir` says: a
+    /// run's commands write its own, and "stale" is not for a run to say.
+    async fn forget_stale_admin(
+        &self,
+        mirror: &Path,
+        name: &str,
+        slot: &Path,
+    ) -> WorkspaceResult<()> {
+        remove_dir_if_exists(&mirror.join("worktrees").join(name)).await?;
+        for other in list_admin_dirs(mirror).await? {
+            if !other.contains('+') && names_worktree(mirror, &other, slot).await {
+                remove_dir_if_exists(&mirror.join("worktrees").join(&other)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The worktree whose git directory is not recorded (metadata written before it was): its
+    /// directory in the mirror is the **one** `worktrees/*/gitdir` that names this slot's `.git`,
+    /// among the directories that are not another run's (those that carry no run, and those that
+    /// carry `run`). None when there is none or more than one, and then no git directory is mounted
+    /// into a run pod and the coder's own `git` refuses the slot. Another run's directory cannot be
+    /// taken for this one: it carries its run, and what a run's commands can rewrite (its own
+    /// `gitdir`) can only add a second candidate, which makes the answer none.
+    pub(crate) async fn admin_by_backpointer(
+        &self,
+        mirror: &Path,
+        run: &str,
+        slot: &Path,
+    ) -> Option<String> {
+        let prefix = admin_prefix(run);
+        let mut found = None;
+        for name in list_admin_dirs(mirror).await.ok()? {
+            if name.contains('+') && !name.starts_with(&prefix) {
+                continue;
+            }
+            if names_worktree(mirror, &name, slot).await {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(name);
+            }
+        }
+        found
+    }
+
+    /// Whether the recorded directory `name` is still `run`'s worktree directory for the slot at
+    /// `slot`: it carries the run, it is a directory of its own (not a link, not a file) and its
+    /// `gitdir` names the slot. A name that was pruned, and then given to another run, fails the
+    /// first or the last.
+    async fn admin_is_current(&self, mirror: &Path, run: &str, name: &str, slot: &Path) -> bool {
+        crate::worktree::is_admin_name(name)
+            && name.starts_with(&admin_prefix(run))
+            && safe_fs::is_real_directory(&mirror.join("worktrees").join(name)).await
+            && names_worktree(mirror, name, slot).await
+    }
+
+    /// The worktree `meta` describes, at `path`: with the git directory it records if that is
+    /// still this run's ([`admin_is_current`](Self::admin_is_current)), or, for metadata that
+    /// predates the record, the one the mirror says (`admin_by_backpointer`; not recorded again:
+    /// it is told each time). A worktree whose git directory cannot be told has none and git
+    /// refuses it ([`Worktree::git_dir`]).
+    pub(crate) async fn open_worktree(
+        self: &Arc<Self>,
+        meta: &Meta,
+        dir: &str,
+        path: PathBuf,
+        mirror: PathBuf,
+        meta_path: &Path,
+    ) -> Worktree {
+        let recorded = meta
+            .admin
+            .as_deref()
+            .filter(|name| name.starts_with(&admin_prefix(&meta.run)));
+        let (admin, generation) = match recorded {
+            Some(name) if self.admin_is_current(&mirror, &meta.run, name, &path).await => {
+                (Some(name.to_owned()), meta.admin_gen.clone())
+            }
+            Some(name) => {
+                tracing::warn!(
+                    slot = %path.display(),
+                    admin = name,
+                    "the recorded git directory of this worktree is gone or is not its own; \
+                     git is not run on it and no git directory is mounted into its pod"
+                );
+                (None, None)
+            }
+            None => {
+                let found = self.admin_by_backpointer(&mirror, &meta.run, &path).await;
+                let mut generation = None;
+                match &found {
+                    // One of the run's own, from before it was recorded: recorded, so that the
+                    // mirror is not searched again. A name from before names carried the run is
+                    // told each time and never recorded: the record is what vouches for a name.
+                    Some(name) if name.starts_with(&admin_prefix(&meta.run)) => {
+                        let mut recorded = meta.clone();
+                        recorded.admin = Some(name.clone());
+                        recorded.admin_gen = Some(new_generation());
+                        generation.clone_from(&recorded.admin_gen);
+                        if let Err(e) = self.write_meta_at(meta_path, &recorded).await {
+                            tracing::warn!(error = %e, "cannot record the worktree's git directory");
+                        }
+                    }
+                    Some(_) => {}
+                    None => tracing::warn!(
+                        slot = %path.display(),
+                        "cannot tell which directory of the mirror is this worktree's git directory; \
+                         git is not run on it and no git directory is mounted into its pod"
+                    ),
+                }
+                (found, generation)
+            }
+        };
+        let mut told = meta.clone();
+        told.admin = admin;
+        told.admin_gen = generation;
+        self.worktree(&told, dir, path, mirror)
+    }
+
+    /// `path` is a checked-out worktree whose git dir belongs to `mirror`: a plain directory (not a
+    /// link a run put in its place) with a `.git` file.
     async fn is_valid_worktree(&self, path: &Path, mirror: &Path) -> bool {
-        if !matches!(tokio::fs::metadata(path.join(".git")).await, Ok(m) if m.is_file()) {
+        if !safe_fs::is_real_directory(path).await
+            || !safe_fs::is_real_file(&path.join(".git")).await
+        {
             return false;
         }
         let out = self
@@ -1537,15 +1988,26 @@ impl Inner {
     }
 
     /// Remove a worktree (or what is left of one) at `path` of the repository mirrored at
-    /// `mirror`, and prune the mirror's bookkeeping. Idempotent.
+    /// `mirror`, and its directory in the mirror's `worktrees/`. Idempotent.
+    ///
+    /// `owner` is the run and the slot the worktree is: its directory in the mirror is removed by
+    /// its name, whatever git could find, and nothing else of the mirror is: no `git worktree
+    /// prune`, which judges every run's directory by what its `gitdir` says.
+    ///
+    /// `path` is a directory of the run's workspace, which the run's commands can replace by a link
+    /// to another run's worktree. `git worktree remove` resolves a link and would delete **that**
+    /// worktree, so git is asked only about a path that is a plain directory all the way down from
+    /// `below`; otherwise only what is at `path` is removed (a link is removed, not followed).
     pub(crate) async fn remove_worktree_dir(
         &self,
         path: &Path,
         mirror: &Path,
+        below: &Path,
+        owner: Option<(&str, &str)>,
     ) -> WorkspaceResult<()> {
         let _guard = self.lock_mirror(mirror).await?;
         let have_mirror = exists(&mirror.join("HEAD")).await?;
-        if have_mirror {
+        if have_mirror && safe_fs::is_plain_path(below, path).await {
             // Failure is fine (e.g. not registered any more); the directory is
             // removed below regardless.
             let _ = self
@@ -1556,11 +2018,68 @@ impl Inner {
                 .await?;
         }
         remove_dir_if_exists(path).await?;
-        if have_mirror {
-            self.mirror_git(mirror)
-                .args(["worktree", "prune"])
-                .run()
-                .await?;
+        if let Some((run, dir)) = owner {
+            if have_mirror {
+                remove_dir_if_exists(&mirror.join("worktrees").join(admin_name(run, dir))).await?;
+            }
+            // What a try that died between making the worktree and moving it left.
+            remove_dir_if_exists(&self.staging_path(&admin_name(run, dir))).await?;
+        }
+        Ok(())
+    }
+
+    /// Every mirror under the root: `<root>/git/<host>/<owner>/<name>.git`, as plain directories.
+    async fn mirrors(&self) -> Vec<PathBuf> {
+        async fn subdirs(dir: &Path) -> Vec<PathBuf> {
+            let mut found = Vec::new();
+            if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+                        found.push(entry.path());
+                    }
+                }
+            }
+            found
+        }
+        let mut level = vec![self.root.join("git")];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for dir in &level {
+                next.extend(subdirs(dir).await);
+            }
+            level = next;
+        }
+        level
+            .into_iter()
+            .filter(|dir| dir.extension().is_some_and(|ext| ext == "git"))
+            .collect()
+    }
+
+    /// Remove every directory called after `run` (`<run>+...`) from the `worktrees/` of every
+    /// mirror: what a workspace whose metadata cannot be read leaves, since the metadata is what
+    /// says which mirrors it was in. Nothing that does not carry the run is touched.
+    pub(crate) async fn forget_run_admins(&self, run: &str) -> WorkspaceResult<()> {
+        let prefix = admin_prefix(run);
+        if let Ok(mut staged) = tokio::fs::read_dir(self.root.join("staging")).await {
+            while let Ok(Some(entry)) = staged.next_entry().await {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    remove_dir_if_exists(&entry.path()).await?;
+                }
+            }
+        }
+        for mirror in self.mirrors().await {
+            let names: Vec<String> = list_admin_dirs(&mirror)
+                .await?
+                .into_iter()
+                .filter(|name| name.starts_with(&prefix))
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let _guard = self.lock_mirror(&mirror).await?;
+            for name in names {
+                remove_dir_if_exists(&mirror.join("worktrees").join(name)).await?;
+            }
         }
         Ok(())
     }
@@ -1575,7 +2094,9 @@ impl Inner {
         };
         let loc = RepoRef::new(&meta.url, &meta.base_branch).locate()?;
         let mirror = self.root.join(loc.mirror_relative());
-        self.remove_worktree_dir(&path, &mirror).await?;
+        let below = self.root.join("worktrees");
+        self.remove_worktree_dir(&path, &mirror, &below, Some((run, &slot_name(&loc.name))))
+            .await?;
         remove_file_if_exists(&self.meta_path(run)).await
     }
 }
@@ -1697,6 +2218,7 @@ mod tests {
             "core.sshcommand",
             "core.fsmonitor",
             "core.hookspath",
+            "extensions.worktreeconfig",
         ] {
             assert!(is_unwanted_config(key), "{key}");
         }
@@ -1726,5 +2248,272 @@ mod tests {
         // An empty repository, or a detached HEAD, has no symref line.
         assert_eq!(parse_symref_head(""), None);
         assert_eq!(parse_symref_head("0123abcd\tHEAD"), None);
+    }
+}
+
+/// What `add_linked` does after `git worktree move`: it looks at where the tree went, and undoes
+/// it when that is not where it was meant to go. The moment between its last look at the destination
+/// and the move is the run's to use, so these make the states it can leave by hand.
+#[cfg(test)]
+mod placement_tests {
+    use std::process::Command;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::StaticToken;
+
+    const RUN: &str = "placement-run-1";
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_AUTHOR_NAME", "Seed")
+            .env("GIT_AUTHOR_EMAIL", "seed@example.com")
+            .env("GIT_COMMITTER_NAME", "Seed")
+            .env("GIT_COMMITTER_EMAIL", "seed@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    struct Fx {
+        _tmp: tempfile::TempDir,
+        ws: Workspaces,
+        mirror: PathBuf,
+        run_dir: PathBuf,
+    }
+
+    /// A mirror with a commit, and the run's directory.
+    async fn fx() -> Fx {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("acme/app.git");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&seed).unwrap();
+        git(
+            &remote,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        );
+        git(&seed, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(seed.join("README.md"), "hello\n").unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "--quiet", "origin", "main"]);
+        let ws = Workspaces::new(tmp.path().join("root"), Arc::new(StaticToken::new("t")));
+        let slot = ws
+            .run(RUN)
+            .unwrap()
+            .add_repository(&RepoRef::new(remote.to_str().unwrap(), "main"))
+            .await
+            .unwrap();
+        let mirror = slot.worktree().unwrap().mirror().to_owned();
+        let run_dir = ws.inner.run_dir(RUN);
+        Fx {
+            _tmp: tmp,
+            ws,
+            mirror,
+            run_dir,
+        }
+    }
+
+    impl Fx {
+        /// What `add_linked` has done up to the move: a worktree at `staging`, called `name` in the
+        /// mirror.
+        fn staged(&self, name: &str) -> PathBuf {
+            let staging = self.ws.inner.staging_path(name);
+            std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+            git(
+                &self.mirror,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    staging.to_str().unwrap(),
+                    "refs/remotes/origin/main",
+                ],
+            );
+            staging
+        }
+
+        fn admin(&self, name: &str) -> PathBuf {
+            self.mirror.join("worktrees").join(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_appeared_at_the_destination_has_the_tree_and_its_directory_cleaned_up()
+     {
+        let fx = fx().await;
+        let name = admin_name(RUN, "race");
+        let staging = fx.staged(&name);
+        let path = fx.run_dir.join("race");
+
+        // The run makes the directory after the coder looked and before git moved the tree.
+        std::fs::create_dir(&path).unwrap();
+        git(
+            &fx.mirror,
+            &[
+                "worktree",
+                "move",
+                staging.to_str().unwrap(),
+                path.to_str().unwrap(),
+            ],
+        );
+        let landed = path.join(&name);
+        assert!(
+            landed.join(".git").is_file(),
+            "git moved the tree into the directory"
+        );
+
+        let inner = &fx.ws.inner;
+        let error = inner
+            .settle_placed(&fx.mirror, RUN, &name, &staging, &path)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkspaceError::Corrupt(_)), "{error}");
+        assert!(error.to_string().contains("does not name it"), "{error}");
+        assert!(
+            error.to_string().contains(&landed.display().to_string()),
+            "said where: {error}"
+        );
+
+        inner
+            .undo_placed(&fx.mirror, RUN, &name, &staging, &path)
+            .await;
+        assert!(!landed.exists(), "the tree is gone");
+        assert!(
+            !fx.admin(&name).exists(),
+            "and so is its directory in the mirror"
+        );
+        assert!(!staging.exists());
+        assert!(
+            path.is_dir(),
+            "the directory that appeared is not the coder's to remove"
+        );
+        assert!(
+            !git(&fx.mirror, &["worktree", "list", "--porcelain"]).contains(&name),
+            "git forgot it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tree_that_went_where_a_link_leads_is_not_kept_and_the_link_is_not_followed() {
+        let fx = fx().await;
+        let name = admin_name(RUN, "base");
+        let staging = fx.staged(&name);
+        // `.adam-base` was a directory when it was looked at; it is a link when git moves the tree.
+        let elsewhere = fx._tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, fx.run_dir.join(".adam-base")).unwrap();
+        let path = fx.run_dir.join(".adam-base").join("base");
+        git(
+            &fx.mirror,
+            &[
+                "worktree",
+                "move",
+                staging.to_str().unwrap(),
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            elsewhere.join("base/.git").is_file(),
+            "it landed where the link leads"
+        );
+
+        let inner = &fx.ws.inner;
+        let error = inner
+            .settle_placed(&fx.mirror, RUN, &name, &staging, &path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("a link appeared"), "{error}");
+        inner
+            .undo_placed(&fx.mirror, RUN, &name, &staging, &path)
+            .await;
+        assert!(!fx.admin(&name).exists(), "the mirror forgot it");
+        assert!(
+            elsewhere.join("base").is_dir(),
+            "what is behind a link is left, not removed through it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destination_that_is_there_before_the_move_leaves_nothing_behind_and_is_reported() {
+        let fx = fx().await;
+        let name = admin_name(RUN, "taken");
+        let path = fx.run_dir.join("taken");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("theirs.txt"), "theirs\n").unwrap();
+
+        let error = fx
+            .ws
+            .inner
+            .add_linked(&fx.mirror, RUN, &name, &path, |cmd, staging| {
+                cmd.arg("--detach")
+                    .arg(staging)
+                    .arg("refs/remotes/origin/main")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkspaceError::Corrupt(_)), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("appeared while its worktree was being made"),
+            "{error}"
+        );
+        assert!(!fx.admin(&name).exists());
+        assert!(!fx.ws.inner.staging_path(&name).exists());
+        assert_eq!(
+            std::fs::read_to_string(path.join("theirs.txt")).unwrap(),
+            "theirs\n",
+            "what is there is left as it was"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_parent_that_is_a_link_is_refused_before_the_move() {
+        let fx = fx().await;
+        let name = admin_name(RUN, "linked");
+        let elsewhere = fx._tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, fx.run_dir.join(".adam-base")).unwrap();
+        let path = fx.run_dir.join(".adam-base").join("linked");
+
+        let error = fx
+            .ws
+            .inner
+            .add_linked(&fx.mirror, RUN, &name, &path, |cmd, staging| {
+                cmd.arg("--detach")
+                    .arg(staging)
+                    .arg("refs/remotes/origin/main")
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("a link is on the way"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "nothing went through it"
+        );
+        assert!(!fx.admin(&name).exists());
+        assert!(!fx.ws.inner.staging_path(&name).exists());
     }
 }

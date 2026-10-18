@@ -163,7 +163,10 @@ stateDiagram-v2
 A build is bounded by the pod's memory (2Gi in the chart), and the coder shrinks to about 1Gi
 ([ADR 0019](../decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)). The pod is made from a template
 that holds the image, resources, priority class, security context and volumes; the code adds a name, labels and
-annotations, and the pod mounts the coder's workspace volume at the same path. A command is
+annotations, and narrows the template's one mount of the workspace volume to the run: its own directory, and for
+each worktree its mirror read-only and the worktree's own directory in it (with `HEAD`, `commondir`, `gitdir` and `logs` read-only on
+top), each at the same path as in the coder, so a pod sees no other run ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md)). A repository added to a
+run later, or a slot made again under the same name, makes the pod again, when no command runs in it. A command is
 `adam-kube-exec`, which runs `adam-exec` in the pod over `pods/exec`. No GitHub credential ever enters a
 pod. The chart's `runPods` block renders what surrounds it
 ([deploy guide](../guides/deploy-the-coder.md#run-pods)).
@@ -178,7 +181,11 @@ sequenceDiagram
     participant P as adam-exec in the run pod
     participant J as janitor
     T->>E: ensure(workspace of the run, progress)
+    E->>E: the mounts the run's slots need (its directory, each mirror, each worktree's directory)
     E->>A: GET the pod adam-run-hash, POST it from the template when it is not there
+    opt the pod lacks a mount the slots need now
+        E->>A: pods/exec adam-exec active, then DELETE the pod and POST another (EnvError::Unavailable while a command runs)
+    end
     alt the quota refuses
         E-->>T: EnvError::Unavailable (the tool waits for a slot and tries again)
     else
@@ -212,6 +219,7 @@ stateDiagram-v2
     Ready --> Ready: exec, ensure reuses the pod
     Ready --> Deleted: idle with no command running, or released
     Ready --> Deleted: the pod ended and ensure replaces it
+    Ready --> Deleted: a worktree was added, no command runs, and ensure makes the pod again
     Starting --> Deleted: released
     Deleted --> Absent
     Absent --> [*]: the run ended

@@ -21,8 +21,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{WorkspaceError, WorkspaceResult};
-use crate::git::GitCmd;
+use crate::git::{GitCmd, GitPin};
 use crate::repo::RepoRef;
+use crate::safe_fs;
 use crate::workspace::{
     Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists,
     remove_dir_if_exists, remove_file_if_exists, slot_name,
@@ -114,6 +115,16 @@ impl Slot {
             SlotKind::Repository(_) => None,
         }
     }
+
+    /// Where `git` works for this slot, from the coder's own metadata ([`GitPin`]): a worktree's
+    /// directory in its mirror and the mirror, or a scratch project's own `.git`. `None` for a
+    /// worktree whose directory in the mirror cannot be told (then no `git` is run on it).
+    pub fn git_pin(&self) -> Option<GitPin> {
+        match &self.kind {
+            SlotKind::Repository(wt) => wt.git_pin(),
+            SlotKind::Scratch(s) => Some(s.git_pin()),
+        }
+    }
 }
 
 /// A scratch project: a local git repository (branch `main`, an empty root commit) in a slot of a
@@ -194,8 +205,18 @@ impl Scratch {
         inner.write_meta_at(&path, &meta).await
     }
 
+    /// `git` in the project, pinned to its own `.git` directory ([`GitPin`]): a `.git` that a
+    /// command replaced by a file or a link, to send the coder's `git` into another run's worktree
+    /// or a mirror, is refused.
     fn git(&self) -> GitCmd {
-        self.ws.git().cwd(&self.path)
+        self.ws.git().cwd(&self.path).pinned(self.git_pin())
+    }
+
+    /// Where `git` works for this project: its own `.git` directory, for the git directory and the
+    /// common directory alike, and its directory for the work tree. A caller that starts `git`
+    /// itself applies it ([`GitPin::apply`]) and checks it ([`GitPin::check`]).
+    pub fn git_pin(&self) -> GitPin {
+        GitPin::own_repository(&self.path)
     }
 
     /// The files that differ from the last commit: staged, unstaged and untracked ones (each
@@ -227,7 +248,7 @@ impl Scratch {
         message: &str,
         author: &GitIdentity,
     ) -> WorkspaceResult<Option<String>> {
-        commit_all_in(|| self.git(), message, author).await
+        commit_all_in(|| self.git(), message, author, None).await
     }
 
     /// The files of the project: tracked ones and untracked ones that `.gitignore` does not
@@ -297,21 +318,27 @@ impl RunWorkspace {
             SlotMeta::Repo(m) => {
                 let dir = m.dir.clone().unwrap_or_default();
                 let path = inner.slot_path(&self.run, &dir);
-                if !looks_like_worktree(&path).await {
+                if !is_slot_name(&dir) || !looks_like_worktree(&path).await {
                     return Ok(None);
                 }
                 let loc = RepoRef::new(&m.url, &m.base_branch).locate()?;
                 let mirror = inner.root().join(loc.mirror_relative());
+                let meta_path = inner.slot_meta_path(&self.run, &dir);
+                let worktree = inner
+                    .open_worktree(m, &dir, path.clone(), mirror, &meta_path)
+                    .await;
                 Ok(Some(Slot {
                     seq: m.seq.unwrap_or(0),
-                    kind: SlotKind::Repository(inner.worktree(m, &dir, path.clone(), mirror)),
+                    kind: SlotKind::Repository(worktree),
                     dir,
                     path,
                 }))
             }
             SlotMeta::Scratch(m) => {
                 let path = inner.slot_path(&self.run, &m.dir);
-                if !matches!(tokio::fs::metadata(path.join(".git")).await, Ok(meta) if meta.is_dir())
+                if !is_slot_name(&m.dir)
+                    || !safe_fs::is_real_directory(&path).await
+                    || !safe_fs::is_real_directory(&path.join(".git")).await
                 {
                     return Ok(None);
                 }
@@ -345,9 +372,13 @@ impl RunWorkspace {
         }
         let dir = slot_name(&loc.name);
         let mirror = inner.root().join(loc.mirror_relative());
+        let meta_path = inner.meta_path(&self.run);
+        let worktree = inner
+            .open_worktree(&meta, &dir, path.clone(), mirror, &meta_path)
+            .await;
         Ok(Some(Slot {
             seq: 0,
-            kind: SlotKind::Repository(inner.worktree(&meta, &dir, path.clone(), mirror)),
+            kind: SlotKind::Repository(worktree),
             dir,
             path,
         }))
@@ -756,7 +787,14 @@ impl RunWorkspace {
                             match RepoRef::new(&m.url, &m.base_branch).locate() {
                                 Ok(loc) => {
                                     let mirror = inner.root().join(loc.mirror_relative());
-                                    inner.remove_worktree_dir(&path, &mirror).await?;
+                                    inner
+                                        .remove_worktree_dir(
+                                            &path,
+                                            &mirror,
+                                            &self.path,
+                                            Some((&self.run, &dir)),
+                                        )
+                                        .await?;
                                 }
                                 Err(_) => remove_dir_if_exists(&path).await?,
                             }
@@ -773,10 +811,12 @@ impl RunWorkspace {
                     remove_file_if_exists(&inner.slot_meta_path(&self.run, meta.dir())).await?;
                 }
             }
-            // Metadata that cannot be read is no reason to keep the files: the mirrors forget
-            // worktrees whose directories are gone the next time they are changed.
+            // Metadata that cannot be read is no reason to keep the files, and the run's directories
+            // are found in the mirrors by their names, which carry the run.
             Err(WorkspaceError::Corrupt(why)) => {
                 tracing::warn!(run = %self.run, %why, "removing a workspace whose metadata cannot be read");
+                remove_dir_if_exists(&self.path).await?;
+                inner.forget_run_admins(&self.run).await?;
             }
             Err(e) => return Err(e),
         }
@@ -803,9 +843,19 @@ fn repository_slot(wt: Worktree, seq: u32) -> Slot {
     }
 }
 
-/// `path` has what a worktree has: a `.git` file.
+/// `path` is a worktree's directory itself, not a link a run's commands put there (to send the
+/// coder's `git add -A` into another run's files), with the `.git` file a worktree has.
 async fn looks_like_worktree(path: &Path) -> bool {
-    matches!(tokio::fs::metadata(path.join(".git")).await, Ok(meta) if meta.is_file())
+    safe_fs::is_real_directory(path).await && safe_fs::is_real_file(&path.join(".git")).await
+}
+
+/// `dir` is one plain component: the name of a direct child of a run's workspace.
+fn is_slot_name(dir: &str) -> bool {
+    let mut parts = Path::new(dir).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(name)), None) if name == std::ffi::OsStr::new(dir)
+    )
 }
 
 /// The directory name of a new repository slot: the repository's name; if that is taken,
@@ -848,21 +898,59 @@ fn validate_scratch_dir(dir: &str) -> WorkspaceResult<()> {
     }
 }
 
+/// What is at `path`, without following a link; `None` when there is nothing.
+async fn lstat_if_exists(path: &Path) -> WorkspaceResult<Option<std::fs::Metadata>> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(WorkspaceError::io(
+            format!("cannot stat {}", path.display()),
+            e,
+        )),
+    }
+}
+
 impl Scratch {
     /// Make the repository if it is not there, and give it its root commit if it has none: what a
     /// crash in the middle leaves is finished by the next call.
+    ///
+    /// The project's directory is in the run's workspace, which the run's commands write: a link
+    /// there (to another run's project, to a mirror) would have `create_dir_all` and `git init`
+    /// make a repository where the link leads. So the directory and its `.git` are looked at
+    /// without following a link first (`lstat`), and nothing is made through one.
     async fn init(&self, author: &GitIdentity) -> WorkspaceResult<()> {
-        if !exists(&self.path.join(".git")).await? {
-            tokio::fs::create_dir_all(&self.path)
-                .await
-                .map_err(|e| WorkspaceError::io("cannot create the scratch directory", e))?;
-            // `--template=`: none of the system's sample hooks.
-            self.ws
-                .git()
-                .args(["init", "--quiet", "--initial-branch=main", "--template="])
-                .arg(&self.path)
-                .run()
-                .await?;
+        let refuse = |what: &Path, is: &str| {
+            WorkspaceError::Corrupt(format!(
+                "{} is {is}, not a directory of its own: the scratch project {} cannot be used; remove the run first",
+                what.display(),
+                self.dir
+            ))
+        };
+        match lstat_if_exists(&self.path).await? {
+            Some(meta) if !meta.is_dir() => return Err(refuse(&self.path, "a link or a file")),
+            _ => {}
+        }
+        let dot_git = self.path.join(".git");
+        match lstat_if_exists(&dot_git).await? {
+            Some(meta) if !meta.is_dir() => return Err(refuse(&dot_git, "a link or a file")),
+            Some(_) => {}
+            None => {
+                tokio::fs::create_dir_all(&self.path)
+                    .await
+                    .map_err(|e| WorkspaceError::io("cannot create the scratch directory", e))?;
+                // `--template=`: none of the system's sample hooks.
+                self.ws
+                    .git()
+                    .args(["init", "--quiet", "--initial-branch=main", "--template="])
+                    .arg(&self.path)
+                    .run()
+                    .await?;
+                // A link put there while the repository was being made: the repository is where
+                // the link leads, and the project is not usable.
+                if !safe_fs::is_plain_path(&self.ws.run_dir(&self.run), &self.path).await {
+                    return Err(refuse(&self.path, "a link"));
+                }
+            }
         }
         let has_commit = self
             .git()

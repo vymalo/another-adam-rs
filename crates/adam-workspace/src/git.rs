@@ -34,6 +34,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::process::Command;
 
 use crate::error::{WorkspaceError, WorkspaceResult};
+use crate::safe_fs;
 
 /// Commands that talk to a remote may take long (first clone of a big repo).
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -126,6 +127,166 @@ impl GitOutput {
     }
 }
 
+/// The directories a `git` that works on a slot is **pinned** to: `GIT_DIR`, `GIT_COMMON_DIR` and
+/// `GIT_WORK_TREE`, all from the coder's own metadata and never from a file the run's commands can
+/// write.
+///
+/// Without the pin git finds its way from the slot's `.git` file, then the worktree's directory in
+/// the mirror (`commondir`, `gitdir`) and reads the configuration of wherever that leads. A command
+/// that rewrites any of them points the coder's own `git add -A` at a repository whose
+/// configuration it wrote (`filter.*.clean`, `core.fsmonitor`), which runs in the coder's container.
+/// With the pin, none of those files steers anything.
+///
+/// A worktree's pin is `GIT_DIR=<mirror>/worktrees/<name>`, `GIT_COMMON_DIR=<mirror>`; a scratch
+/// project's is its own `.git` directory for both (it must be a real directory, not a file or a
+/// link that would send git elsewhere).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPin {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    work_tree: PathBuf,
+    /// The git directory is inside the work tree, so it has to be checked to be a directory there.
+    inside: bool,
+}
+
+impl GitPin {
+    /// The pin of a linked worktree: `admin` is its directory in `mirror`'s `worktrees/`.
+    pub(crate) fn worktree(admin: &Path, mirror: &Path, work_tree: &Path) -> Self {
+        Self {
+            git_dir: admin.to_owned(),
+            common_dir: mirror.to_owned(),
+            work_tree: work_tree.to_owned(),
+            inside: false,
+        }
+    }
+
+    /// The pin of a repository that lives in its own work tree (a scratch project).
+    pub(crate) fn own_repository(work_tree: &Path) -> Self {
+        let git_dir = work_tree.join(".git");
+        Self {
+            common_dir: git_dir.clone(),
+            git_dir,
+            work_tree: work_tree.to_owned(),
+            inside: true,
+        }
+    }
+
+    /// `GIT_DIR`: the worktree's directory in the mirror, or the scratch project's `.git`.
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// `GIT_COMMON_DIR`: the mirror, or the scratch project's `.git`.
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+
+    /// `GIT_WORK_TREE`: the slot's directory.
+    pub fn work_tree(&self) -> &Path {
+        &self.work_tree
+    }
+
+    /// Set the three variables on `cmd`, which a caller that starts `git` itself does after
+    /// [`confine_git_env`](crate::confine_git_env) (an empty environment) and before it sets
+    /// anything of its own. Run it in [`work_tree`](Self::work_tree).
+    pub fn apply(&self, cmd: &mut Command) {
+        cmd.env("GIT_DIR", &self.git_dir)
+            .env("GIT_COMMON_DIR", &self.common_dir)
+            .env("GIT_WORK_TREE", &self.work_tree);
+    }
+
+    /// Make the pin hold, and say what is wrong when it cannot. Call it before starting `git` with
+    /// [`apply`](Self::apply); the `git` the workspace starts itself is checked as it starts.
+    ///
+    /// The environment variables are not all there is to it: git's **reference store** reads the
+    /// `commondir` file of the git directory even when `GIT_COMMON_DIR` is set (*verified* with git
+    /// 2.43.0), so a file that says anything but what git wrote (`../..`) moves the refs the coder's
+    /// git reads and writes (the run's branch, the commit it pushes) into a directory of the run's
+    /// choosing. A run pod cannot write it (`commondir` and `gitdir` are read-only mounts there, see
+    /// `adam-env-kubernetes`), so this is **only a check**: it refuses, it never rewrites. A rewrite
+    /// would open the file a run can replace by a link, and write through the link to any file the
+    /// coder can write. Everything it looks at is looked at without following a link
+    /// ([`safe_fs`](crate::safe_fs)): the file must be a regular file, so a pipe cannot make the
+    /// coder wait.
+    ///
+    /// Also refused: a work tree or a git directory that is not a plain directory (a link a command
+    /// put where the slot was, to send the coder's `git add -A` into another run's files), a
+    /// `HEAD`, `index` or reflog (`logs/HEAD`, which git appends to through a link: *verified* with
+    /// git 2.43.0) that is not a regular file, and, for a scratch project, any `commondir` at all.
+    /// A command that swaps one of them again between this check and git's read is a race this does
+    /// not close; in a run pod the files that matter cannot be swapped (see the ADR).
+    ///
+    /// # Errors
+    ///
+    /// What is wrong, in a sentence.
+    pub async fn check(&self) -> Result<(), String> {
+        if !safe_fs::is_real_directory(&self.work_tree).await {
+            return Err(format!(
+                "{} is not a plain directory (it is gone, or a command replaced it by a link or a file): git is not run on it",
+                self.work_tree.display()
+            ));
+        }
+        if !safe_fs::is_real_directory(&self.git_dir).await {
+            return Err(format!(
+                "{} is not a plain directory: git is not run on a project whose repository was replaced by a file or a link",
+                self.git_dir.display()
+            ));
+        }
+        let commondir = self.git_dir.join("commondir");
+        if self.inside {
+            return match tokio::fs::symlink_metadata(&commondir).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("cannot look at {}: {e}", commondir.display())),
+                Ok(_) => Err(format!(
+                    "{} exists: a project's own repository has none, and git would follow it to another repository",
+                    commondir.display()
+                )),
+            };
+        }
+        match safe_fs::read_regular_text(&commondir, 64).await {
+            Ok(text) if text.trim() == COMMONDIR => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} does not say `{COMMONDIR}` any more, so git would find the references of another repository: git is not run on this worktree",
+                    commondir.display()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "{} cannot be trusted ({e}): git is not run on this worktree",
+                    commondir.display()
+                ));
+            }
+        }
+        // (name, must be there, a directory and not a file)
+        for (name, required, directory) in [
+            ("HEAD", true, false),
+            ("index", false, false),
+            ("logs", false, true),
+            ("logs/HEAD", false, false),
+        ] {
+            let path = self.git_dir.join(name);
+            match tokio::fs::symlink_metadata(&path).await {
+                Ok(meta) if meta.is_dir() == directory && (meta.is_dir() || meta.is_file()) => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "{} is not a plain {} (a link, a pipe or the other kind): git is not run on this worktree",
+                        path.display(),
+                        if directory { "directory" } else { "file" }
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {}
+                Err(e) => return Err(format!("cannot look at {}: {e}", path.display())),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What git writes in the `commondir` file of a linked worktree's directory
+/// (`<mirror>/worktrees/<name>`): the way up to the mirror.
+const COMMONDIR: &str = "../..";
+
 /// Builder for one `git` invocation.
 pub(crate) struct GitCmd {
     args: Vec<OsString>,
@@ -134,6 +295,8 @@ pub(crate) struct GitCmd {
     ceiling: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
     auth: Option<Auth>,
+    pin: Option<GitPin>,
+    refusal: Option<String>,
 }
 
 impl GitCmd {
@@ -145,7 +308,24 @@ impl GitCmd {
             ceiling: None,
             env: Vec::new(),
             auth: None,
+            pin: None,
+            refusal: None,
         }
+    }
+
+    /// Work on this slot's repository, wherever its files say it is not (see [`GitPin`]).
+    pub(crate) fn pinned(mut self, pin: GitPin) -> Self {
+        self.pin = Some(pin);
+        self
+    }
+
+    /// Do not run: [`run`](Self::run) and [`run_status`](Self::run_status) fail with
+    /// [`WorkspaceError::Corrupt`] and `reason`, and no process is started. For a slot whose
+    /// repository cannot be told from the coder's own metadata: git must not find it in a file the
+    /// run's commands can write.
+    pub(crate) fn refusing(mut self, reason: impl Into<String>) -> Self {
+        self.refusal = Some(reason.into());
+        self
     }
 
     /// Operate on this bare repository explicitly (never discover one).
@@ -257,6 +437,9 @@ impl GitCmd {
                 .env("GIT_CONFIG_KEY_0", auth.config_key())
                 .env("GIT_CONFIG_VALUE_0", auth.config_value());
         }
+        if let Some(pin) = &self.pin {
+            pin.apply(&mut cmd);
+        }
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
@@ -290,6 +473,12 @@ impl GitCmd {
     }
 
     async fn exec(&self) -> WorkspaceResult<(GitOutput, String)> {
+        if let Some(reason) = &self.refusal {
+            return Err(WorkspaceError::Corrupt(reason.clone()));
+        }
+        if let Some(pin) = &self.pin {
+            pin.check().await.map_err(WorkspaceError::Corrupt)?;
+        }
         let timeout = if self.auth.is_some() {
             NETWORK_TIMEOUT
         } else {

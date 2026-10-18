@@ -19,6 +19,10 @@
 //!   is refused too: a write through a link is a write to a place the model did not name), and what
 //!   exists must be inside the canonical root.
 //!
+//! * The **root** is looked at first, without following a link: the slot's directory is the run's to
+//!   rename, and a link in its place (to another run's slot) would be canonicalised into the
+//!   root. A root that is not a directory itself is refused.
+//!
 //! A refusal names its reason and is a tool **result**, not a failed run.
 //!
 //! # What stays out of these tools
@@ -44,8 +48,8 @@ use std::time::Duration;
 
 use adam::prelude::*;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
+use super::gitcli::GitAt;
 use super::{Outcome, ToolEnv, non_empty};
 
 /// Most bytes `read_file` returns. A longer file is cut and the result says so.
@@ -140,6 +144,18 @@ fn parts_of(rel: &str) -> Result<Vec<OsString>, String> {
 /// A message for the model: the path is empty, absolute, goes up, names `.git`, leaves the
 /// worktree through a symlink, goes through a symlink to write, or (to read) does not exist.
 pub fn confine(slot_root: &Path, rel: &str, access: Access) -> Result<PathBuf, String> {
+    // The slot's directory is the run's to rename: a link in its place leads to another run's
+    // files, and canonicalising the root would take that for the root.
+    match fs::symlink_metadata(slot_root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(
+                "the worktree's directory is not a plain directory (a command replaced it by a link or a file): refused"
+                    .to_owned(),
+            );
+        }
+        Err(e) => return Err(format!("cannot resolve the worktree: {e}")),
+    }
     let root = slot_root
         .canonicalize()
         .map_err(|e| format!("cannot resolve the worktree: {e}"))?;
@@ -420,45 +436,26 @@ struct Applied {
     stderr: String,
 }
 
-/// `git apply <flags> -` in `root`, with `patch` on its standard input.
+/// `git apply <flags> -` where `at` says, with `patch` on its standard input.
 ///
 /// Hooks and the file system monitor are off, and so are the user's and the system's git
 /// configuration and every variable that would point git elsewhere: the patch comes from the model.
-async fn git_apply(root: &Path, flags: &[&str], patch: &str) -> io::Result<Applied> {
-    let mut cmd = Command::new("git");
+/// The repository is the slot's, pinned (`GitAt`), never found through files a command wrote.
+async fn git_apply(at: &GitAt, flags: &[&str], patch: &str) -> io::Result<Applied> {
     // From an empty environment: the repository's own configuration can run a program.
-    adam_workspace::confine_git_env(&mut cmd);
-    cmd.args([
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        "apply",
-    ])
-    .args(flags)
-    .arg("-")
-    .current_dir(root)
-    .env("GIT_TERMINAL_PROMPT", "0")
-    .env("GIT_CONFIG_NOSYSTEM", "1")
-    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-    .env("LC_ALL", "C")
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
-    for name in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_COMMON_DIR",
-        "GIT_NAMESPACE",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-    ] {
-        cmd.env_remove(name);
-    }
+    let Some(mut cmd) = at.command().await else {
+        return Err(io::Error::other(
+            "git is not run here: the worktree's repository cannot be trusted",
+        ));
+    };
+    cmd.arg("apply")
+        .args(flags)
+        .arg("-")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = cmd.spawn()?;
     // Written from a task of its own: git may answer before it has read everything.
     let stdin = child.stdin.take();
@@ -554,7 +551,7 @@ struct Plan {
 ///
 /// `PatchError::Unreadable` is git saying it cannot read or apply the patch (the one thing
 /// `--recount` may cure); `PatchError::Refused` is a rule of ours, which no flag changes.
-async fn plan(root: &Path, patch: &str, recount: bool) -> Result<Plan, PatchError> {
+async fn plan(at: &GitAt, patch: &str, recount: bool) -> Result<Plan, PatchError> {
     let with = |flags: &[&'static str]| -> Vec<&'static str> {
         let mut all = flags.to_vec();
         if recount {
@@ -562,7 +559,7 @@ async fn plan(root: &Path, patch: &str, recount: bool) -> Result<Plan, PatchErro
         }
         all
     };
-    let listed = git_apply(root, &with(&["--numstat", "-z"]), patch).await?;
+    let listed = git_apply(at, &with(&["--numstat", "-z"]), patch).await?;
     if !listed.success {
         return Err(PatchError::Unreadable(format!(
             "the patch is not a unified diff git can read: {}. Use `--- a/<path>`, `+++ b/<path>` \
@@ -579,15 +576,15 @@ async fn plan(root: &Path, patch: &str, recount: bool) -> Result<Plan, PatchErro
         return Err(PatchError::Refused("the patch changes no file".to_owned()));
     }
     for path in &paths {
-        confine(root, path, Access::Write).map_err(PatchError::Refused)?;
+        confine(at.path(), path, Access::Write).map_err(PatchError::Refused)?;
     }
-    let summary = git_apply(root, &with(&["--summary"]), patch).await?;
+    let summary = git_apply(at, &with(&["--summary"]), patch).await?;
     if summary.success && summary_has_link(&String::from_utf8_lossy(&summary.stdout)) {
         return Err(PatchError::Refused(
             "the patch creates or changes a symlink or a submodule: refused".to_owned(),
         ));
     }
-    let check = git_apply(root, &with(&["--check", "--whitespace=nowarn"]), patch).await?;
+    let check = git_apply(at, &with(&["--check", "--whitespace=nowarn"]), patch).await?;
     if !check.success {
         return Err(PatchError::Unreadable(format!(
             "the patch does not apply, and nothing was changed: {}. Read the file again with \
@@ -610,7 +607,7 @@ async fn plan(root: &Path, patch: &str, recount: bool) -> Result<Plan, PatchErro
 /// lines themselves). It is a second try and not the rule, because `--recount` cannot tell where
 /// a hunk ends when the next file's `--- ` line follows it without a `diff --git` line: it takes
 /// that line for a removed one.
-async fn apply_in(root: &Path, patch: &str) -> Result<Vec<String>, PatchError> {
+async fn apply_in(at: &GitAt, patch: &str) -> Result<Vec<String>, PatchError> {
     if patch.len() > PATCH_CAP {
         return Err(PatchError::Refused(format!(
             "the patch is {} bytes, over the limit of {PATCH_CAP}: split it, or have OpenCode make \
@@ -623,9 +620,9 @@ async fn apply_in(root: &Path, patch: &str) -> Result<Vec<String>, PatchError> {
             "the patch contains a NUL byte: binary patches are not accepted".to_owned(),
         ));
     }
-    let Plan { paths, recount } = match plan(root, patch, false).await {
+    let Plan { paths, recount } = match plan(at, patch, false).await {
         Ok(plan) => plan,
-        Err(PatchError::Unreadable(first)) => match plan(root, patch, true).await {
+        Err(PatchError::Unreadable(first)) => match plan(at, patch, true).await {
             Ok(plan) => plan,
             Err(PatchError::Git(e)) => return Err(PatchError::Git(e)),
             // Neither reading works: the first one, as git said it, is the one to act on.
@@ -637,7 +634,7 @@ async fn apply_in(root: &Path, patch: &str) -> Result<Vec<String>, PatchError> {
     if recount {
         flags.push(RECOUNT);
     }
-    let applied = git_apply(root, &flags, patch).await?;
+    let applied = git_apply(at, &flags, patch).await?;
     if !applied.success {
         return Err(PatchError::Refused(format!(
             "the patch could not be applied: {}",
@@ -771,7 +768,7 @@ pub async fn apply_patch(
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    match apply_in(slot.path(), &patch).await {
+    match apply_in(&GitAt::slot(&slot), &patch).await {
         Ok(paths) => {
             ctx.emit_progress(format!("patched {} ({})", listed(&paths), slot.dir()))
                 .await;
@@ -1277,6 +1274,26 @@ mod tests {
         // A dangling link is a link too.
         std::os::unix::fs::symlink("nowhere", dir.path().join("dangling")).unwrap();
         assert!(refused(dir.path(), "dangling", Access::Write).contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_a_link_to_another_directory_is_not_a_root() {
+        let dir = root();
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join(".env"), "TOKEN=another run's").unwrap();
+        let link = other.path().join("slot");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        // A link to a worktree is canonicalised into that worktree: refused before.
+        for access in [Access::Read, Access::Write] {
+            let why = refused(&link, "README.md", access);
+            assert!(why.contains("not a plain directory"), "{why}");
+        }
+        // And the real directory is as it was.
+        assert!(confine(dir.path(), "README.md", Access::Read).is_ok());
+        // A file is no root either.
+        let why = refused(&dir.path().join("README.md"), "x", Access::Write);
+        assert!(why.contains("not a plain directory"), "{why}");
     }
 
     #[cfg(unix)]

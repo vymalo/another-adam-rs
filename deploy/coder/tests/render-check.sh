@@ -1031,6 +1031,9 @@ check "template: an init container copies adam-exec and OpenCode out of the code
   tpl 'cp -L /opt/adam/bin/adam-exec /opt/adam/bin/opencode /tools/'
 check "template: the init container is the coder's image" tpl 'image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"'
 check "template: /work is the coder's claim, the per-pod one" tpl 'claimName: work-coder-0'
+one_work_mount() { [ "$(run_pod_template | grep -c 'mountPath: /work$')" -eq 1 ] && notpl 'subPath'; }
+check "template: the workspace volume is mounted once, whole, at /work (the coder narrows that mount to the run: ADR 0041)" \
+  one_work_mount
 check "template: required pod affinity to the coder pod, by hostname (a ReadWriteOnce volume is attached to one node)" \
   tpl 'requiredDuringSchedulingIgnoredDuringExecution'
 check "template: ... topologyKey kubernetes.io/hostname" tpl 'topologyKey: kubernetes.io/hostname'
@@ -1085,9 +1088,16 @@ check "policy: refuses a pod without the run label and the managed-by label" pol
 check "policy: ... or without the priority class" policy_has "$pn" "object.spec.priorityClassName == 'coder-run'"
 check "policy: ... or with another image (the run image by digest and the coder's)" \
   policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-e6a528f@sha256:d2aae762ecad2c13bb697332507d236a75d8233d061f38cc97dc9227192b0797', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
-check "policy: ... or a hostPath: only emptyDir, the work claim and the one Secret" \
-  policy_has "$pn" "has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0') || (has(v.secret) && v.secret.secretName == 'coder')"
-check "policy: ... or a Secret other than the allowed one, by key" policy_has "$pn" "e.valueFrom.secretKeyRef.name == 'coder'"
+check "policy: ... or a hostPath: only emptyDir and the work claim" \
+  policy_has "$pn" "has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0'))"
+check "policy: ... or a Secret as a volume (a run pod mounts no Secret at all)" \
+  fails policy_has "$pn" 'has(v.secret)'
+check "policy: ... or any Secret reference but the model key: the Secret's name and the key MODEL_API_KEY" \
+  policy_has "$pn" "(e.valueFrom.secretKeyRef.name == 'coder' && e.valueFrom.secretKeyRef.key == 'MODEL_API_KEY')"
+one_secret_reference() {
+  [ "$(run_pod_template | grep -c 'secretKeyRef:')" -eq 1 ] && tpl '^              name: coder$' && tpl '^              key: MODEL_API_KEY$'
+}
+check "policy: ... the template makes that one reference, and no other" one_secret_reference
 check "policy: ... or envFrom a Secret" policy_has "$pn" '!has(f.secretRef)'
 check "policy: ... or a privileged container or one that may escalate" policy_has "$pn" 'c.securityContext.allowPrivilegeEscalation == false'
 check "policy: ... or root" policy_has "$pn" ') != 0 &&'
@@ -1142,6 +1152,11 @@ check "service account named: the chart renders none" lacks '^kind: ServiceAccou
 check "service account named: the coder pod uses it" sts_of '^      serviceAccountName: my-sa$'
 check "service account named: the binding is to it" rhas RoleBinding coder-run-pods 'name: my-sa$'
 check "service account named: the policy is matched to it" policy_has "$pn" "system:serviceaccount:coder-ns:my-sa"
+helm_rp --set externalSecrets.targetSecretName=model-secrets > "$out"
+check "a named target Secret: the policy allows the model key of that Secret, by name and key, and no other reference" \
+  policy_has "$pn" "(e.valueFrom.secretKeyRef.name == 'model-secrets' && e.valueFrom.secretKeyRef.key == 'MODEL_API_KEY')"
+check "... and the template references that Secret" tpl '^              name: model-secrets$'
+check "... and still no Secret volume" fails policy_has "$pn" 'has(v.secret)'
 helm_rp --set 'runPods.admissionPolicy.extraAllowedImages={registry.example/extra:1}' > "$out"
 check "policy: extra allowed images are values-driven" policy_has "$pn" "'registry.example/extra:1'"
 helm_rp --set runPods.toolsImage.repository=registry.example/tools --set runPods.toolsImage.tag=9 > "$out"
@@ -1330,6 +1345,7 @@ check "cache with run pods: the pod template mounts /cache from the claim" tpl '
 check "cache with run pods: ... as a persistentVolumeClaim" tpl 'claimName: coder-cache$'
 check "cache with run pods: the admission policy lets a run pod mount the work claim and the cache claim, no other" \
   policy_has "$pn" "claimName in ['work-coder-0', 'coder-cache']"
+check "cache with run pods: ... and still no Secret volume" fails policy_has "$pn" 'has(v.secret)'
 helm_cache --set runPods.enabled=true --set cache.existingClaim=shared-cache > "$out"
 check "cache.existingClaim with run pods: the policy names that claim" \
   policy_has "$pn" "claimName in ['work-coder-0', 'shared-cache']"

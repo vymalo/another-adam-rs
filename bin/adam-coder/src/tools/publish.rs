@@ -7,7 +7,7 @@ use adam_workspace::{NewPullRequest, WorkspaceError};
 use serde_json::json;
 
 use super::checks::ChecksReport;
-use super::gitcli::{commits_ahead, head_sha, head_tree};
+use super::gitcli::{GitAt, commits_ahead, head_sha, head_tree};
 use super::named::key_of_argument;
 use super::notes::{PullRef, PullRequestNote, PushedBranch};
 use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, scratch, workspace_error};
@@ -108,14 +108,14 @@ pub async fn commit_and_push(
         Err(e) => return Err(workspace_error(&e)),
     };
     let base = &wt.repo().base_branch;
-    let ahead = commits_ahead(wt.path(), base).await;
+    let ahead = commits_ahead(&GitAt::worktree(&wt), base).await;
     if committed.is_none() && ahead == Some(0) {
         return Ok(ToolOutput::error(format!(
             "Nothing to commit: the worktree has no changes and the branch has no commits \
              beyond origin/{base}. Have OpenCode make the change first."
         )));
     }
-    let Some(sha) = head_sha(wt.path()).await else {
+    let Some(sha) = head_sha(&GitAt::worktree(&wt)).await else {
         return Err(ToolError::Transient(
             "cannot read HEAD of the worktree".into(),
         ));
@@ -148,7 +148,7 @@ pub async fn commit_and_push(
         .map_err(|e| notes_error(&e))?;
 
     // The verdict on exactly what was pushed, before the branch that names it.
-    let pushed_tree = head_tree(wt.path()).await;
+    let pushed_tree = head_tree(&GitAt::worktree(&wt)).await;
     let checks = checks_for_pushed(&notes, &sha, pushed_tree.as_deref())
         .in_repository(&wt.repo().url)
         .into_artifact(&env.redactor);
@@ -313,7 +313,7 @@ pub async fn open_pull_request(
             notes.failures_in(false)
         )));
     }
-    let Some(head) = head_sha(wt.path()).await else {
+    let Some(head) = head_sha(&GitAt::worktree(&wt)).await else {
         return Err(ToolError::Transient(
             "cannot read HEAD of the worktree".into(),
         ));
@@ -328,7 +328,7 @@ pub async fn open_pull_request(
     // "Green" means: the most recent check run on exactly the code this pull request contains (the
     // tree of the pushed HEAD, in whichever slot it ran) passed. A change made after the checks
     // passed, committed or not, is not verified.
-    let tree = head_tree(wt.path()).await;
+    let tree = head_tree(&GitAt::worktree(&wt)).await;
     let verified = notes.verified_tree(tree.as_deref());
     // A check that fails on the base commit too is the repository's: it does not stop the pull
     // request, which says so (ADR 0026).

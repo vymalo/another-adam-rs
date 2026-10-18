@@ -471,6 +471,8 @@ jobs:
   # template runs commands (both streams, exit codes, stdin), is killed, swept when idle and released through
   # adam-kube-exec. What it does not: the coder over a model through it, the images (a small local one plays
   # the run image and the coder's), and the NetworkPolicy (kind's network plugin may not enforce one).
+  # It also proves, on a volume the script seeds with two runs of one mirror, that a run pod sees only its
+  # own run and cannot write the mirror (ADR 0041).
   # ADAM_TEST_REQUIRE_KUBERNETES makes the test fail instead of skipping, so a typo in the variables cannot
   # turn the job green. The runner's preinstalled `kind` is used (*unverified*, from memory of the runner
   # image's software list), with the node image that kind release defaults to; the script stops on a cluster
@@ -480,6 +482,10 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      # ADR 0041: what git does in a run pod whose mirror is mounted read-only and whose worktree's own
+      # directory in it is read-write, with real git and real bind mounts in a private mount namespace.
+      - name: Git in a run pod's mounts
+        run: sudo env ADAM_TEST_REQUIRE_MOUNTS=1 sh deploy/coder/tests/git-in-run-pod.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: A kind cluster

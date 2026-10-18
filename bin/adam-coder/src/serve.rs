@@ -231,14 +231,15 @@ pub async fn environment_for(
 ) -> anyhow::Result<DynEnvironment> {
     match &worker.run_environment {
         RunEnvironment::Local => local_environment(worker, root).await,
-        RunEnvironment::Kubernetes(pods) => kubernetes_environment(worker, pods).await,
+        RunEnvironment::Kubernetes(pods) => kubernetes_environment(worker, pods, root).await,
     }
 }
 
 /// `RUN_ENVIRONMENT=kubernetes`: a pod of its own for each run ([ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)).
 ///
 /// 1. the pod template is read and checked, which fails the start (exit 78): a template the cluster
-///    would refuse is a mistake of the deployment, not of a run;
+///    would refuse, or one that does not mount the workspace volume once, whole, at `root` (the coder
+///    narrows that mount to each run's own directory), is a mistake of the deployment, not of a run;
 /// 2. the client is made from the pod's ServiceAccount (`KUBERNETES_SERVICE_HOST` and its token), and
 ///    the process does not start without one (exit 69). **No call is made to the API yet**: the first
 ///    command of a run makes its pod;
@@ -252,9 +253,10 @@ pub async fn environment_for(
 async fn kubernetes_environment(
     worker: &WorkerConfig,
     pods: &RunPodsConfig,
+    root: &std::path::Path,
 ) -> anyhow::Result<DynEnvironment> {
     let template =
-        adam_env_kubernetes::PodTemplate::from_file(&pods.template_file, &pods.container)
+        adam_env_kubernetes::PodTemplate::from_file(&pods.template_file, &pods.container, root)
             .context("reading the run pod template (RUN_POD_TEMPLATE_FILE)")?;
     let image = template.image().map(str::to_owned);
     let key = &worker.model.api_key;

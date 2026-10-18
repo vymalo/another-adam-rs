@@ -10,6 +10,7 @@
 //!                  ▼            ▼
 //!              Unavailable    Deleted (unschedulable, image refused) ─▶ Requested   (the next ensure)
 //! Ready ─▶ Deleted     the pod ended (OOM, eviction), or no command used it for `idle`
+//! Ready ─▶ Deleted     a worktree was added and the pod lacks its mounts, with no command running (else: wait)
 //! Ready, Starting ─▶ Deleted   the run ended: the janitor's `release`
 //! ```
 
@@ -31,7 +32,8 @@ use tokio::sync::Mutex;
 
 use crate::cluster::{clip, env_error, is_already_exists, is_not_found};
 use crate::exec::{ClusterExec, ExitStatus, PodExec};
-use crate::names::{RUN_ID_ANNOTATION, WORKER_ANNOTATION, pod_name, selector};
+use crate::mounts::WorkspaceMounts;
+use crate::names::{MOUNTS_ANNOTATION, RUN_ID_ANNOTATION, WORKER_ANNOTATION, pod_name, selector};
 use crate::session::KubeSession;
 use crate::settings::Settings;
 use crate::template::{Placement, PodTemplate};
@@ -276,11 +278,17 @@ impl KubeEnvironment {
             .map_err(|e| env_error(&e, "listing the run pods"))
     }
 
-    /// A ready pod for `run`: the one that is there, or a new one.
+    /// A ready pod for `run`: the one that is there, or a new one, mounting what `mounts` says.
+    ///
+    /// A pod whose mounts lack one of `mounts` (a worktree added since it was made, or a pod made before
+    /// mounts were recorded) is made again, because the mounts of a pod are fixed when it is made. The files
+    /// are on the volume, so only what is running in it is lost: a pod that runs a command (or cannot be
+    /// asked) is waited for instead, as a quota is ([`EnvError::Unavailable`]).
     async fn ready_pod(
         &self,
         run: &str,
         name: &str,
+        mounts: &WorkspaceMounts,
         progress: &dyn EnvProgress,
     ) -> Result<Pod, EnvError> {
         let inner = &self.inner;
@@ -304,6 +312,17 @@ impl KubeEnvironment {
                         reporter.running("the run's earlier pod is going away".to_owned());
                     } else if ended(&pod) {
                         reporter.running("the pod ended; making another".to_owned());
+                        inner.delete(name).await?;
+                    } else if let Some(mount) =
+                        mounts.missing_from(annotation(&pod, MOUNTS_ANNOTATION))
+                    {
+                        let missing = mount.path().display().to_string();
+                        if is_ready(&pod) {
+                            self.free_for_new_mount(name, &missing).await?;
+                        }
+                        reporter.running(format!(
+                            "making the pod again: the run's workspace has {missing} as it is now, which the pod does not mount"
+                        ));
                         inner.delete(name).await?;
                     } else if is_ready(&pod) {
                         reporter.completed(format!(
@@ -333,6 +352,7 @@ impl KubeEnvironment {
                             instance: &settings.instance,
                             worker: &settings.worker,
                         },
+                        mounts,
                     );
                     match inner.pods.create(&PostParams::default(), &wanted).await {
                         Ok(_) => {}
@@ -355,6 +375,20 @@ impl KubeEnvironment {
                 });
             }
             tokio::time::sleep(settings.ready_poll).await;
+        }
+    }
+
+    /// The pod is up and lacks a mount the workspace needs: it may be made again only when nothing runs
+    /// in it. Otherwise the caller waits (it is not a failure of the run: the command ends).
+    async fn free_for_new_mount(&self, name: &str, missing: &str) -> Result<(), EnvError> {
+        match self.busy(name).await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(EnvError::Unavailable(format!(
+                "the run's workspace has {missing} as it is now, which its pod does not mount, and a command is running in the pod; the pod is made again when it ends"
+            ))),
+            Err(e) => Err(EnvError::Unavailable(format!(
+                "the run's workspace has {missing} as it is now, which its pod does not mount, and the pod cannot be asked whether a command is running: {e}"
+            ))),
         }
     }
 
@@ -589,7 +623,8 @@ impl Environment for KubeEnvironment {
         // that the next call finds.
         let lock = self.inner.lock_of(&run);
         let _held = lock.lock().await;
-        self.ready_pod(&run, &name, progress).await?;
+        let mounts = self.inner.template.mounts_for(workspace).await?;
+        self.ready_pod(&run, &name, &mounts, progress).await?;
         self.inner.touch(&run);
         Ok(Arc::new(KubeSession {
             inner: Arc::clone(&self.inner),

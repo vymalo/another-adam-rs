@@ -5,7 +5,9 @@
 # source (/opt/adam/bin/adam-exec and an opencode). It is small on purpose: the real run image is the workspace
 # image of another-agentic-images (2.92 GB compressed, verified 2026-10-09) and the real coder image takes a Rust
 # build, and the job tests the chart's objects and the environment, not those images. The opencode here is a stub;
-# adam-exec is the real script (one source with the devcontainer crate). Build from the REPOSITORY ROOT:
+# adam-exec is the real script (one source with the devcontainer crate). It has git because the isolation check (ADR 0041)
+# runs git in a worktree whose mirror is mounted read-only, and the script seeds the volume with it. Build from the
+# REPOSITORY ROOT:
 #
 #   docker build -f docker/coder/test/run-pod.Dockerfile -t adam-run-test:ci .
 #
@@ -15,7 +17,7 @@ FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee
 
 # hadolint ignore=DL3008
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini \
+ && apt-get install -y --no-install-recommends git tini \
  && rm -rf /var/lib/apt/lists/*
 COPY --chmod=0755 crates/adam-devcontainer/src/adam-exec.sh /opt/adam/bin/adam-exec
 RUN printf '#!/bin/sh\necho opencode-stub\n' > /opt/adam/bin/opencode && chmod 0755 /opt/adam/bin/opencode

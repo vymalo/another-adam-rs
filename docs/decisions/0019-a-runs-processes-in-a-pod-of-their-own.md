@@ -12,6 +12,12 @@ amends its decision 9 (see the note there).
 copies only `adam-exec`, and there is no `tool_path`. OD-K5 is reversed: a run pod gets no model key, and the admission
 policy lets it read no Secret.
 
+*Amended 2026-10-18 ([ADR 0041](0041-a-run-pod-sees-only-its-own-run.md), proposed; built):* a run pod sees only its own run. The
+template mounts the workspace volume once, whole, and the code replaces that mount by the run's directory, each worktree's
+mirror read-only and the worktree's own directory in it (decision 3, OD-K1 and the consequence "It is not isolation between runs");
+decision 2's "nothing else" now includes those mounts; the admission policy lets a run pod reference the model key and no other
+Secret key, mount no Secret (decision 7). A new repository needs a pod made again (waited for like a slot, decision 6).
+
 ## Context
 
 The coder runs every command of every run in its own container: `run_command`, `run_checks`, OpenCode and every command

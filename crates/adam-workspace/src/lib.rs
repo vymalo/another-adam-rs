@@ -68,6 +68,7 @@ mod github;
 mod github_app;
 mod repo;
 mod run_workspace;
+pub mod safe_fs;
 #[cfg(all(feature = "github", feature = "test-util"))]
 pub mod testing;
 mod workspace;
@@ -86,6 +87,7 @@ pub use environment::{
     NoProgress, PreparedCommand, Program, SecretRef, login_shell,
 };
 pub use error::{WorkspaceError, WorkspaceResult};
+pub use git::GitPin;
 pub use git_env::{GIT_INHERITED_ENV, confine_git_env};
 #[cfg(feature = "github")]
 pub use github::GitHub;

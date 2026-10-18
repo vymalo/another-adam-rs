@@ -3,8 +3,10 @@
 //! [`KubeEnvironment`] is an [`Environment`](adam_workspace::Environment) of `adam-workspace`: the coder
 //! asks it for the session of a run, has the session prepare each command (`run_command`, `run_checks`,
 //! OpenCode and every command OpenCode starts), and spawns what comes back. The files and the paths are
-//! the same in the pod as in the coder (the pod mounts the coder's workspace volume at the same path), so
-//! the file tools and all git work stay in the coder, which is also where the credentials are.
+//! the same in the pod as in the coder (the pod mounts the run's own directory of the coder's workspace
+//! volume at the same path, and the git directories its worktrees need), so the file tools and all git work
+//! stay in the coder, which is also where the credentials are. **A run pod sees only its own run**
+//! ([`WorkspaceMounts`]).
 //!
 //! * **One pod per run.** `ensure` makes the pod `adam-run-<hash of the run id>` from the deployment's
 //!   pod template ([`PodTemplate`]) and waits for it to be ready, reporting what it waits for as a step.
@@ -12,8 +14,12 @@
 //!   later call cannot use.
 //! * **The template is the deployment's.** Image, resources, priority class, security context, volumes,
 //!   variables from Secrets and node affinity are in a file the chart mounts; the code fills in a name,
-//!   labels and annotations. No GitHub credential is ever in a pod, and the cluster's admission policy
+//!   labels and annotations, and narrows the one mount of the workspace volume to the run
+//!   ([`PodTemplate::render`]). No GitHub credential is ever in a pod, and the cluster's admission policy
 //!   (the chart's) refuses a pod that is anything else.
+//! * **A new repository needs a new pod.** The mounts of a pod are fixed when it is made and recorded in an
+//!   annotation; `ensure` compares them with the run's workspace, and a worktree added since is mounted by
+//!   making the pod again when no command runs in it, and by waiting when one does.
 //! * **A command** is the program `adam-kube-exec`, which runs `adam-exec run|shell` in the pod
 //!   (`pods/exec`) and ends with its exit code. [`Invocation`] is its command line.
 //! * **Nothing is held for ever.** `release` deletes the pod; `held_runs` lists them for the janitor's
@@ -30,7 +36,11 @@
 //! use adam_env_kubernetes::{KubeEnvironment, PodTemplate, Settings};
 //! use adam_workspace::{Environment, ExecSpec, NoProgress};
 //!
-//! let template = PodTemplate::from_file("/etc/adam/run-pod/pod.yaml".as_ref(), "run")?;
+//! let template = PodTemplate::from_file(
+//!     "/etc/adam/run-pod/pod.yaml".as_ref(),
+//!     "run",
+//!     workspaces.root(),
+//! )?;
 //! let settings = Settings::new("coder", "coder", "coder-0");
 //! let environment = KubeEnvironment::new(kube::Client::try_default().await?, settings, template);
 //!
@@ -48,6 +58,7 @@ mod cluster;
 mod environment;
 mod exec;
 mod invocation;
+mod mounts;
 mod names;
 mod session;
 mod settings;
@@ -59,9 +70,10 @@ mod fake;
 pub use environment::{KubeEnvironment, install_crypto_provider};
 pub use exec::{ExecError, ExitStatus, Target, exit_status, stdin_is_null, stream};
 pub use invocation::{DEFAULT_ADAM_EXEC, Invocation, Mode, UsageError, is_env_name, is_exec_id};
+pub use mounts::{Mount, WorkspaceMounts, WorktreeDirs};
 pub use names::{
-    INSTANCE_LABEL, MANAGED_BY, MANAGED_BY_LABEL, RUN_ID_ANNOTATION, RUN_LABEL, WORKER_ANNOTATION,
-    is_label_value, pod_name, run_hash, selector,
+    INSTANCE_LABEL, MANAGED_BY, MANAGED_BY_LABEL, MOUNTS_ANNOTATION, RUN_ID_ANNOTATION, RUN_LABEL,
+    WORKER_ANNOTATION, is_label_value, pod_name, run_hash, selector,
 };
 pub use settings::{CLIENT_ENV, DEFAULT_CONTAINER, Settings, TOOLS_DIR};
 pub use template::{Placement, PodTemplate};

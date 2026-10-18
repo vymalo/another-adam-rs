@@ -673,9 +673,12 @@ async fn owes_delivery(notes: &RunNotes, slots: &[adam_workspace::Slot]) -> bool
         // A run that continues a branch starts with that branch's commits: only its own pushes count,
         // which `pushed_sha` has said.
         if wt.continues().is_none()
-            && crate::tools::gitcli::commits_ahead(wt.path(), &wt.repo().base_branch)
-                .await
-                .is_none_or(|ahead| ahead > 0)
+            && crate::tools::gitcli::commits_ahead(
+                &crate::tools::gitcli::GitAt::worktree(wt),
+                &wt.repo().base_branch,
+            )
+            .await
+            .is_none_or(|ahead| ahead > 0)
         {
             return true;
         }

@@ -69,6 +69,12 @@ refuses more than one replica with it, because a run pod can mount one claim.
 {{- if include "coder.sharedWork" . -}}{{ include "coder.workClaim" . }}{{- else -}}{{ printf "work-%s-0" (include "coder.fullname" .) }}{{- end -}}
 {{- end -}}
 
+{{/*
+The one key of the coder's Secret a run pod reads: the model key OpenCode uses (secret_ref "model-key"). The pod template
+sets it and the admission policy allows exactly this reference, by the Secret's name (coder.secretName) and this key.
+*/}}
+{{- define "coder.runPodSecretKey" -}}MODEL_API_KEY{{- end -}}
+
 {{/* The name label of run pods: not the coder's, so the StatefulSet's selector and the coder's NetworkPolicy never match them. */}}
 {{- define "coder.runPodNameLabel" -}}
 {{- printf "%s-run" (include "coder.name" .) | trunc 63 | trimSuffix "-" -}}
@@ -77,7 +83,11 @@ refuses more than one replica with it, because a run pod can mount one claim.
 {{/*
 The pod every run pod is made from: a Pod, as YAML, with no name, namespace or owner (the coder fills in a name, the
 namespace, the labels app.kubernetes.io/managed-by, app.kubernetes.io/instance and adam.vymalo.com/run, and the
-annotations adam.vymalo.com/run-id and adam.vymalo.com/worker). Read by the coder at startup (RUN_POD_TEMPLATE_FILE).
+annotations adam.vymalo.com/run-id, adam.vymalo.com/worker and adam.vymalo.com/workspace-mounts) and replaces the run
+container's one mount of the workspace volume (the volume `work` at the coder's WORKSPACE_ROOT, whole) by the mounts of the
+run's own directory and of the git directories its worktrees need (ADR 0041), so that a run pod sees no other run. The
+coder refuses to start when the run container does not mount a volume at WORKSPACE_ROOT once and whole. Read by the coder at
+startup (RUN_POD_TEMPLATE_FILE).
 */}}
 {{- define "coder.runPodTemplate" -}}
 {{- $perPod := not (include "coder.sharedWork" .) -}}
@@ -158,16 +168,17 @@ spec:
           value: {{ $value | quote }}
         {{- end }}
         {{- if .Values.externalSecrets.enabled }}
-        {{- /* The model key OpenCode reads (secret_ref "model-key"): the one Secret the admission policy lets a run pod use. */}}
-        - name: MODEL_API_KEY
+        {{- /* The model key OpenCode reads (secret_ref "model-key"): the one reference to a Secret the admission policy lets a run pod have, by name and key. */}}
+        - name: {{ include "coder.runPodSecretKey" . }}
           valueFrom:
             secretKeyRef:
               name: {{ include "coder.secretName" . }}
-              key: MODEL_API_KEY
+              key: {{ include "coder.runPodSecretKey" . }}
         {{- end }}
       resources:
         {{- toYaml .Values.runPods.resources | nindent 8 }}
       volumeMounts:
+        {{- /* The one mount of the workspace volume, whole: the coder replaces it by the run's own mounts (see above). */}}
         - name: work
           mountPath: /work
         {{- if include "coder.cache" . }}

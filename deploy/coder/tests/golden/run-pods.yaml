@@ -579,7 +579,9 @@ spec:
 # runPods.enabled: the guard that lets the coder make pods without being able to read the namespace's other Secrets,
 # mount the host, or run anything privileged. It applies to pods CREATED BY the coder's ServiceAccount (the match
 # condition) in this namespace (the binding), and refuses any that is not the intended run pod. Without it the RBAC
-# alone would let the coder create any pod in its namespace. Needs Kubernetes 1.30 or later (admissionregistration.k8s.io/v1).
+# alone would let the coder create any pod in its namespace. A run pod may reference exactly one Secret key, the model
+# key, by the Secret's name and the key: no Secret volume, no envFrom, no other key of that Secret (ADR 0041).
+# Needs Kubernetes 1.30 or later (admissionregistration.k8s.io/v1).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -611,10 +613,10 @@ spec:
       message: "a run pod has the priority class coder-run, which the quota is scoped to"
     - expression: "variables.containers.all(c, c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-e6a528f@sha256:d2aae762ecad2c13bb697332507d236a75d8233d061f38cc97dc9227192b0797', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234'])"
       message: "a run pod uses only the images the chart allows"
-    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0') || (has(v.secret) && v.secret.secretName == 'coder'))"
-      message: "a run pod mounts only emptyDir volumes, the claim work-coder-0 and the Secret coder: no hostPath, no other Secret or claim"
-    - expression: "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || e.valueFrom.secretKeyRef.name == 'coder')) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))"
-      message: "a run pod reads no Secret but coder, and only by key"
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0'))"
+      message: "a run pod mounts only emptyDir volumes and the claim work-coder-0: no hostPath, no Secret, no other claim"
+    - expression: "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || (e.valueFrom.secretKeyRef.name == 'coder' && e.valueFrom.secretKeyRef.key == 'MODEL_API_KEY'))) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))"
+      message: "a run pod references no Secret but the key MODEL_API_KEY of coder (as one variable): no Secret volume, no envFrom, no other key"
     - expression: "variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && (!has(c.securityContext.privileged) || c.securityContext.privileged == false))"
       message: "a run pod is not privileged and sets allowPrivilegeEscalation: false on every container"
     - expression: "variables.containers.all(c, (has(c.securityContext) && has(c.securityContext.runAsUser) ? c.securityContext.runAsUser : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser) ? object.spec.securityContext.runAsUser : 0)) != 0 && (has(c.securityContext) && has(c.securityContext.runAsNonRoot) ? c.securityContext.runAsNonRoot : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) ? object.spec.securityContext.runAsNonRoot : false)))"
