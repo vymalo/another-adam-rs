@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{WorkspaceError, WorkspaceResult};
-use crate::git::GitCmd;
+use crate::git::{GitCmd, GitPin};
 use crate::repo::RepoRef;
 use crate::workspace::{
     Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists,
@@ -114,6 +114,16 @@ impl Slot {
             SlotKind::Repository(_) => None,
         }
     }
+
+    /// Where `git` works for this slot, from the coder's own metadata ([`GitPin`]): a worktree's
+    /// directory in its mirror and the mirror, or a scratch project's own `.git`. `None` for a
+    /// worktree whose directory in the mirror cannot be told (then no `git` is run on it).
+    pub fn git_pin(&self) -> Option<GitPin> {
+        match &self.kind {
+            SlotKind::Repository(wt) => wt.git_pin(),
+            SlotKind::Scratch(s) => Some(s.git_pin()),
+        }
+    }
 }
 
 /// A scratch project: a local git repository (branch `main`, an empty root commit) in a slot of a
@@ -194,8 +204,18 @@ impl Scratch {
         inner.write_meta_at(&path, &meta).await
     }
 
+    /// `git` in the project, pinned to its own `.git` directory ([`GitPin`]): a `.git` that a
+    /// command replaced by a file or a link, to send the coder's `git` into another run's worktree
+    /// or a mirror, is refused.
     fn git(&self) -> GitCmd {
-        self.ws.git().cwd(&self.path)
+        self.ws.git().cwd(&self.path).pinned(self.git_pin())
+    }
+
+    /// Where `git` works for this project: its own `.git` directory, for the git directory and the
+    /// common directory alike, and its directory for the work tree. A caller that starts `git`
+    /// itself applies it ([`GitPin::apply`]) and checks it ([`GitPin::check`]).
+    pub fn git_pin(&self) -> GitPin {
+        GitPin::own_repository(&self.path)
     }
 
     /// The files that differ from the last commit: staged, unstaged and untracked ones (each
@@ -227,7 +247,7 @@ impl Scratch {
         message: &str,
         author: &GitIdentity,
     ) -> WorkspaceResult<Option<String>> {
-        commit_all_in(|| self.git(), message, author).await
+        commit_all_in(|| self.git(), message, author, None).await
     }
 
     /// The files of the project: tracked ones and untracked ones that `.gitignore` does not
@@ -302,9 +322,13 @@ impl RunWorkspace {
                 }
                 let loc = RepoRef::new(&m.url, &m.base_branch).locate()?;
                 let mirror = inner.root().join(loc.mirror_relative());
+                let meta_path = inner.slot_meta_path(&self.run, &dir);
+                let worktree = inner
+                    .open_worktree(m, &dir, path.clone(), mirror, &meta_path)
+                    .await;
                 Ok(Some(Slot {
                     seq: m.seq.unwrap_or(0),
-                    kind: SlotKind::Repository(inner.worktree(m, &dir, path.clone(), mirror)),
+                    kind: SlotKind::Repository(worktree),
                     dir,
                     path,
                 }))
@@ -345,9 +369,13 @@ impl RunWorkspace {
         }
         let dir = slot_name(&loc.name);
         let mirror = inner.root().join(loc.mirror_relative());
+        let meta_path = inner.meta_path(&self.run);
+        let worktree = inner
+            .open_worktree(&meta, &dir, path.clone(), mirror, &meta_path)
+            .await;
         Ok(Some(Slot {
             seq: 0,
-            kind: SlotKind::Repository(inner.worktree(&meta, &dir, path.clone(), mirror)),
+            kind: SlotKind::Repository(worktree),
             dir,
             path,
         }))

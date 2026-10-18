@@ -126,6 +126,130 @@ impl GitOutput {
     }
 }
 
+/// The directories a `git` that works on a slot is **pinned** to: `GIT_DIR`, `GIT_COMMON_DIR` and
+/// `GIT_WORK_TREE`, all from the coder's own metadata and never from a file the run's commands can
+/// write.
+///
+/// Without the pin git finds its way from the slot's `.git` file, then the worktree's directory in
+/// the mirror (`commondir`, `gitdir`) and reads the configuration of wherever that leads. A command
+/// that rewrites any of them points the coder's own `git add -A` at a repository whose
+/// configuration it wrote (`filter.*.clean`, `core.fsmonitor`), which runs in the coder's container.
+/// With the pin, none of those files steers anything.
+///
+/// A worktree's pin is `GIT_DIR=<mirror>/worktrees/<name>`, `GIT_COMMON_DIR=<mirror>`; a scratch
+/// project's is its own `.git` directory for both (it must be a real directory, not a file or a
+/// link that would send git elsewhere).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPin {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    work_tree: PathBuf,
+    /// The git directory is inside the work tree, so it has to be checked to be a directory there.
+    inside: bool,
+}
+
+impl GitPin {
+    /// The pin of a linked worktree: `admin` is its directory in `mirror`'s `worktrees/`.
+    pub(crate) fn worktree(admin: &Path, mirror: &Path, work_tree: &Path) -> Self {
+        Self {
+            git_dir: admin.to_owned(),
+            common_dir: mirror.to_owned(),
+            work_tree: work_tree.to_owned(),
+            inside: false,
+        }
+    }
+
+    /// The pin of a repository that lives in its own work tree (a scratch project).
+    pub(crate) fn own_repository(work_tree: &Path) -> Self {
+        let git_dir = work_tree.join(".git");
+        Self {
+            common_dir: git_dir.clone(),
+            git_dir,
+            work_tree: work_tree.to_owned(),
+            inside: true,
+        }
+    }
+
+    /// `GIT_DIR`: the worktree's directory in the mirror, or the scratch project's `.git`.
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// `GIT_COMMON_DIR`: the mirror, or the scratch project's `.git`.
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+
+    /// `GIT_WORK_TREE`: the slot's directory.
+    pub fn work_tree(&self) -> &Path {
+        &self.work_tree
+    }
+
+    /// Set the three variables on `cmd`, which a caller that starts `git` itself does after
+    /// [`confine_git_env`](crate::confine_git_env) (an empty environment) and before it sets
+    /// anything of its own. Run it in [`work_tree`](Self::work_tree).
+    pub fn apply(&self, cmd: &mut Command) {
+        cmd.env("GIT_DIR", &self.git_dir)
+            .env("GIT_COMMON_DIR", &self.common_dir)
+            .env("GIT_WORK_TREE", &self.work_tree);
+    }
+
+    /// Make the pin hold, and say what is wrong when it cannot. Call it before starting `git` with
+    /// [`apply`](Self::apply); the `git` the workspace starts itself is checked as it starts.
+    ///
+    /// The environment variables are not all there is to it: git's **reference store** reads the
+    /// `commondir` file of the git directory even when `GIT_COMMON_DIR` is set (*verified* with git
+    /// 2.43.0), so a command that rewrites it moves the refs the coder's git reads and writes (the
+    /// run's branch, the commit it pushes) into a directory of its own. So `commondir` is put back
+    /// to what git wrote (`../..`) before every command, and a scratch project's `.git`, which has
+    /// none, loses any a command made, and must be a directory, not a file or a link a command put
+    /// there to send git into another run's worktree or a mirror. A command that rewrites it again
+    /// between this check and git's read only moves its own run's refs: that run's own branch is
+    /// all it can reach, and the commit the coder makes names its branch explicitly.
+    ///
+    /// # Errors
+    ///
+    /// What is wrong, in a sentence.
+    pub async fn check(&self) -> Result<(), String> {
+        let commondir = self.git_dir.join("commondir");
+        if self.inside {
+            match tokio::fs::symlink_metadata(&self.git_dir).await {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "{} is not a directory: git is not run on a project whose repository was replaced by a file or a link",
+                        self.git_dir.display()
+                    ));
+                }
+                Err(e) => return Err(format!("cannot look at {}: {e}", self.git_dir.display())),
+            }
+            return match tokio::fs::remove_file(&commondir).await {
+                Ok(()) => {
+                    tracing::warn!(file = %commondir.display(), "removed a commondir file from a project's repository");
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("cannot remove {}: {e}", commondir.display())),
+            };
+        }
+        match tokio::fs::read_to_string(&commondir).await {
+            Ok(text) if text.trim() == COMMONDIR => Ok(()),
+            read => {
+                if read.is_ok() {
+                    tracing::warn!(file = %commondir.display(), "put a rewritten commondir file back");
+                }
+                tokio::fs::write(&commondir, format!("{COMMONDIR}\n"))
+                    .await
+                    .map_err(|e| format!("cannot write {}: {e}", commondir.display()))
+            }
+        }
+    }
+}
+
+/// What git writes in the `commondir` file of a linked worktree's directory
+/// (`<mirror>/worktrees/<name>`): the way up to the mirror.
+const COMMONDIR: &str = "../..";
+
 /// Builder for one `git` invocation.
 pub(crate) struct GitCmd {
     args: Vec<OsString>,
@@ -134,6 +258,8 @@ pub(crate) struct GitCmd {
     ceiling: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
     auth: Option<Auth>,
+    pin: Option<GitPin>,
+    refusal: Option<String>,
 }
 
 impl GitCmd {
@@ -145,7 +271,24 @@ impl GitCmd {
             ceiling: None,
             env: Vec::new(),
             auth: None,
+            pin: None,
+            refusal: None,
         }
+    }
+
+    /// Work on this slot's repository, wherever its files say it is not (see [`GitPin`]).
+    pub(crate) fn pinned(mut self, pin: GitPin) -> Self {
+        self.pin = Some(pin);
+        self
+    }
+
+    /// Do not run: [`run`](Self::run) and [`run_status`](Self::run_status) fail with
+    /// [`WorkspaceError::Corrupt`] and `reason`, and no process is started. For a slot whose
+    /// repository cannot be told from the coder's own metadata: git must not find it in a file the
+    /// run's commands can write.
+    pub(crate) fn refusing(mut self, reason: impl Into<String>) -> Self {
+        self.refusal = Some(reason.into());
+        self
     }
 
     /// Operate on this bare repository explicitly (never discover one).
@@ -257,6 +400,9 @@ impl GitCmd {
                 .env("GIT_CONFIG_KEY_0", auth.config_key())
                 .env("GIT_CONFIG_VALUE_0", auth.config_value());
         }
+        if let Some(pin) = &self.pin {
+            pin.apply(&mut cmd);
+        }
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
@@ -290,6 +436,12 @@ impl GitCmd {
     }
 
     async fn exec(&self) -> WorkspaceResult<(GitOutput, String)> {
+        if let Some(reason) = &self.refusal {
+            return Err(WorkspaceError::Corrupt(reason.clone()));
+        }
+        if let Some(pin) = &self.pin {
+            pin.check().await.map_err(WorkspaceError::Corrupt)?;
+        }
         let timeout = if self.auth.is_some() {
             NETWORK_TIMEOUT
         } else {

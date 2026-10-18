@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{WorkspaceError, WorkspaceResult};
-use crate::git::GitCmd;
+use crate::git::{GitCmd, GitPin};
 use crate::repo::RepoRef;
 use crate::workspace::{Inner, Meta, REMOTE_TRACKING_PREFIX};
 
@@ -29,6 +29,8 @@ pub struct Worktree {
     /// The local branch that is checked out, always the run's own.
     local: String,
     mirror: PathBuf,
+    /// The worktree's directory in the mirror's `worktrees/`, from the coder's metadata.
+    admin: Option<PathBuf>,
 }
 
 impl fmt::Debug for Worktree {
@@ -139,6 +141,11 @@ impl Worktree {
                 .clone()
                 .unwrap_or_else(|| meta.branch.clone()),
             local: meta.branch.clone(),
+            admin: meta
+                .admin
+                .as_deref()
+                .filter(|name| is_admin_name(name))
+                .map(|name| mirror.join("worktrees").join(name)),
             mirror,
         }
     }
@@ -197,8 +204,35 @@ impl Worktree {
         &self.repo
     }
 
+    /// `git` in the worktree, pinned to the git directory the coder recorded for it ([`GitPin`]), or
+    /// refusing to run when there is none: never to wherever the slot's `.git` file points, which a
+    /// command of the run can rewrite.
     fn git(&self) -> GitCmd {
-        self.ws.git().cwd(&self.path)
+        let git = self.ws.git().cwd(&self.path);
+        match self.git_pin() {
+            Some(pin) => git.pinned(pin),
+            None => git.refusing(format!(
+                "cannot tell which directory of {}/worktrees is the git directory of {}: remove the run's workspace and add the repository again",
+                self.mirror.display(),
+                self.path.display()
+            )),
+        }
+    }
+
+    /// The worktree's git directory: its directory in the mirror's `worktrees/`, as the coder
+    /// recorded it when it made the worktree (not read from the worktree's `.git` file, which a
+    /// command of the run can write). `None` when it cannot be told: metadata from before it was
+    /// recorded, and a mirror with no or several candidates.
+    pub fn git_dir(&self) -> Option<&Path> {
+        self.admin.as_deref()
+    }
+
+    /// Where `git` works for this worktree: [`git_dir`](Self::git_dir) and the mirror, with the
+    /// worktree's directory as the work tree. `None` without a git directory.
+    pub fn git_pin(&self) -> Option<GitPin> {
+        self.admin
+            .as_deref()
+            .map(|admin| GitPin::worktree(admin, &self.mirror, &self.path))
     }
 
     /// Changed files: staged, unstaged and untracked (each untracked file
@@ -297,6 +331,11 @@ impl Worktree {
     /// Stage everything (`git add -A`) and commit as `author`. Returns the new
     /// commit's sha, or `None` if there was nothing to commit.
     ///
+    /// The commit goes onto the run's own branch ([`local_branch`](Self::local_branch)), which is
+    /// named and not followed from `HEAD`: `HEAD` is a file in the worktree's directory in the mirror
+    /// that a command of the run can write. The branch moves only if its tip is still the one the
+    /// commit was made on.
+    ///
     /// Hooks and commit signing are disabled.
     ///
     /// # Errors
@@ -309,7 +348,7 @@ impl Worktree {
         message: &str,
         author: &GitIdentity,
     ) -> WorkspaceResult<Option<String>> {
-        commit_all_in(|| self.git(), message, author).await
+        commit_all_in(|| self.git(), message, author, Some(&self.local)).await
     }
 
     /// Push the run's own branch ([`local_branch`](Self::local_branch), `agent/<run-short-id>`) to
@@ -538,7 +577,8 @@ impl Worktree {
         }
         {
             let _guard = self.ws.lock_mirror(&self.mirror).await?;
-            self.git()
+            self.ws
+                .mirror_git(&self.mirror)
                 .args(["worktree", "add", "--quiet", "--detach"])
                 .arg(&path)
                 .arg(&commit)
@@ -619,14 +659,19 @@ impl Worktree {
         let _guard = self.ws.lock_mirror(&self.mirror).await?;
         if tokio::fs::symlink_metadata(&checkout.path).await.is_ok() {
             let _ = self
-                .git()
+                .ws
+                .mirror_git(&self.mirror)
                 .args(["worktree", "remove", "--force"])
                 .arg(&checkout.path)
                 .run_status()
                 .await?;
         }
         crate::workspace::remove_dir_if_exists(&checkout.path).await?;
-        self.git().args(["worktree", "prune"]).run().await?;
+        self.ws
+            .mirror_git(&self.mirror)
+            .args(["worktree", "prune"])
+            .run()
+            .await?;
         Ok(())
     }
 }
@@ -634,10 +679,18 @@ impl Worktree {
 /// Stage everything (`git add -A`) and commit as `author`, in the repository `git` runs in: the
 /// sha, or `None` when there was nothing to commit. What [`Worktree::commit_all`] and
 /// [`Scratch::commit_all`](crate::Scratch::commit_all) do.
+///
+/// With `branch` (a worktree's own branch) the commit is made with plumbing onto
+/// `refs/heads/<branch>`, whatever `HEAD` says: the worktree's `HEAD` is a file in the worktree's
+/// directory in the mirror, which the run's commands can write, and a `git commit` follows it. A
+/// run that pointed it at another run's branch would have the coder commit its files there. The
+/// new commit's parent is the branch's tip, and the branch moves only if it is still there
+/// (`update-ref` with the old value).
 pub(crate) async fn commit_all_in(
     git: impl Fn() -> GitCmd,
     message: &str,
     author: &GitIdentity,
+    branch: Option<&str>,
 ) -> WorkspaceResult<Option<String>> {
     author.validate()?;
     if message.trim().is_empty() {
@@ -646,6 +699,9 @@ pub(crate) async fn commit_all_in(
         ));
     }
     git().args(["add", "-A"]).run().await?;
+    if let Some(branch) = branch {
+        return commit_staged_on(git, message, author, &format!("refs/heads/{branch}")).await;
+    }
     let staged = git()
         .args(["diff", "--cached", "--quiet"])
         .run_status()
@@ -668,6 +724,50 @@ pub(crate) async fn commit_all_in(
         .await?;
     let sha = git().args(["rev-parse", "HEAD"]).run().await?;
     Ok(Some(sha.stdout_text()))
+}
+
+/// What `git commit` does for the index, onto `reference`, named and not followed from `HEAD`:
+/// the tree of the index, a commit on the reference's tip, and the reference moved to it.
+async fn commit_staged_on(
+    git: impl Fn() -> GitCmd,
+    message: &str,
+    author: &GitIdentity,
+    reference: &str,
+) -> WorkspaceResult<Option<String>> {
+    let tip = git()
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{reference}^{{commit}}"))
+        .run()
+        .await?
+        .stdout_text();
+    let tree = git().arg("write-tree").run().await?.stdout_text();
+    let tip_tree = git()
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{tip}^{{tree}}"))
+        .run()
+        .await?
+        .stdout_text();
+    if tree == tip_tree {
+        return Ok(None);
+    }
+    let commit = git()
+        .config("user.name", &author.name)
+        .config("user.email", &author.email)
+        .args(["commit-tree", &tree, "-p", &tip, "-m"])
+        .arg(message)
+        .run()
+        .await?
+        .stdout_text();
+    let subject = message.lines().next().unwrap_or_default();
+    git()
+        .args(["update-ref", "-m"])
+        .arg(format!("commit: {subject}"))
+        .arg(reference)
+        .arg(&commit)
+        .arg(&tip)
+        .run()
+        .await?;
+    Ok(Some(commit))
 }
 
 /// The lock of a mirror, held by [`Worktree::lock_mirror`] until it is dropped.
@@ -704,6 +804,12 @@ pub(crate) fn parse_porcelain(bytes: &[u8]) -> Vec<ChangedFile> {
         files.push(ChangedFile { path, status });
     }
     files
+}
+
+/// Whether `name` can be the name of a directory in the mirror's `worktrees/`: one plain path
+/// component. The name is read from the coder's metadata, but a path is built from it.
+pub(crate) fn is_admin_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }
 
 #[cfg(test)]

@@ -2856,3 +2856,532 @@ async fn two_workspaces_on_one_root_add_slots_without_clashing() {
         git(&mirror, &["fsck", "--strict", "--no-dangling"]);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The coder's git works where its own metadata says, not where files a run writes say (ADR 0041)
+// ---------------------------------------------------------------------------------------------
+
+/// A program that records that it ran (`<dir>/markers/<its first argument>`) and then behaves as a
+/// `filter.*.clean` (copies stdin to stdout) or a `core.fsmonitor` (fails, which git tolerates)
+/// would. Configured in a repository the run controls, it stands for any command a run can make the
+/// coder's git run.
+struct Planted {
+    dir: PathBuf,
+}
+
+impl Planted {
+    fn new(under: &Path) -> Self {
+        let dir = under.join("spy");
+        std::fs::create_dir_all(dir.join("markers")).unwrap();
+        let script = dir.join("spy.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$1\" > {}/markers/\"$1\"\ncat\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Self { dir }
+    }
+
+    /// `<spy> <name>`: the command a configuration key names.
+    fn command(&self, name: &str) -> String {
+        format!("{} {name}", self.dir.join("spy.sh").display())
+    }
+
+    /// The names of the markers left since the last call, sorted; they are cleared.
+    fn ran(&self) -> Vec<String> {
+        let dir = self.dir.join("markers");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for name in &names {
+            std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        names.sort();
+        names
+    }
+
+    /// A repository, bare or not, whose configuration runs the spy as a clean filter and as the
+    /// file system monitor, and whose attributes apply the filter to markdown files.
+    fn plant(&self, repo: &Path, bare: bool) {
+        std::fs::create_dir_all(repo).unwrap();
+        let mut init = vec!["init", "--quiet", "--initial-branch=main"];
+        if bare {
+            init.push("--bare");
+        }
+        git(repo, &init);
+        let dir = if bare {
+            repo.to_owned()
+        } else {
+            repo.join(".git")
+        };
+        git(
+            repo,
+            &["config", "filter.spy.clean", &self.command("filter")],
+        );
+        git(
+            repo,
+            &["config", "core.fsmonitor", &self.command("fsmonitor")],
+        );
+        std::fs::create_dir_all(dir.join("info")).unwrap();
+        std::fs::write(dir.join("info/attributes"), "*.md filter=spy\n").unwrap();
+    }
+}
+
+/// A run's worktree with `README.md` changed (so that `add -A` reads it) and the attributes that
+/// would apply a filter named `spy` to it.
+async fn worktree_with_a_change(env: &Env, run: &str) -> adam_workspace::Slot {
+    let slot = env
+        .ws
+        .run(run)
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    std::fs::write(slot.path().join(".gitattributes"), "*.md filter=spy\n").unwrap();
+    std::fs::write(slot.path().join("README.md"), format!("changed by {run}\n")).unwrap();
+    slot
+}
+
+/// What the coder does to a worktree that reads the repository's configuration and would run what
+/// it names: `status`, `diff_stat` (`add -A --intent-to-add` in a copy of the index) and
+/// `commit_all` (`add -A`, `diff --cached`, `commit`). All must work.
+async fn the_coders_git_works_on(slot: &adam_workspace::Slot) {
+    let wt = slot.worktree().unwrap();
+    let status = wt.status().await.unwrap();
+    assert!(status.iter().any(|f| f.path == "README.md"), "{status:?}");
+    wt.diff_stat().await.unwrap();
+    let sha = wt.commit_all("a change", &me()).await.unwrap();
+    assert!(sha.is_some(), "the change was committed");
+}
+
+/// `git add -A` as a person would run it in the worktree: it finds the repository through the files
+/// in the slot, and runs what that repository's configuration names.
+fn git_as_discovered(slot: &adam_workspace::Slot) {
+    Command::new("git")
+        .current_dir(slot.path())
+        .args(["-c", "core.hooksPath=/dev/null", "add", "-A"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+}
+
+fn meta_json(env: &Env, run: &str, slot: &adam_workspace::Slot) -> serde_json::Value {
+    let path = env
+        .root
+        .join("meta")
+        .join(run)
+        .join(format!("{}.json", slot.dir()));
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn the_worktrees_git_directory_is_recorded_by_the_coder_and_each_run_has_its_own() {
+    let env = Env::new();
+    let run_a = env.ws.run("run-aaaaaaaa-1").unwrap();
+    let a = run_a.add_repository(&env.repo).await.unwrap();
+    let b = env
+        .ws
+        .run("run-bbbbbbbb-2")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let (da, db) = (
+        a.worktree().unwrap().git_dir().unwrap().to_owned(),
+        b.worktree().unwrap().git_dir().unwrap().to_owned(),
+    );
+    assert_ne!(
+        da, db,
+        "git names the second worktree of a mirror differently"
+    );
+    for (slot, dir) in [(&a, &da), (&b, &db)] {
+        assert_eq!(dir.parent().unwrap(), env.mirror().join("worktrees"));
+        // What git wrote in the `.git` file is the same directory.
+        let text = std::fs::read_to_string(slot.path().join(".git")).unwrap();
+        assert_eq!(text.trim(), format!("gitdir: {}", dir.display()));
+        // The pin is that directory, the mirror and the slot.
+        let pin = slot.git_pin().unwrap();
+        assert_eq!(pin.git_dir(), dir);
+        assert_eq!(pin.common_dir(), env.mirror());
+        assert_eq!(pin.work_tree(), slot.path());
+    }
+    // It is in the coder's metadata, which a pod never mounts.
+    let meta = meta_json(&env, "run-aaaaaaaa-1", &a);
+    assert_eq!(
+        meta["admin"].as_str().unwrap(),
+        da.file_name().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        meta["version"], 2,
+        "no new metadata version: the field is optional"
+    );
+    // And it is found again after a restart, from the metadata.
+    let again = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let slots = again.run("run-aaaaaaaa-1").unwrap().slots().await.unwrap();
+    assert_eq!(slots[0].worktree().unwrap().git_dir().unwrap(), da);
+}
+
+#[tokio::test]
+async fn a_run_that_points_its_git_file_at_another_runs_directory_does_not_get_it() {
+    let env = Env::new();
+    let a = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let b = env
+        .ws
+        .run("run-bbbbbbbb-2")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let (da, db) = (
+        a.worktree().unwrap().git_dir().unwrap().to_owned(),
+        b.worktree().unwrap().git_dir().unwrap().to_owned(),
+    );
+    // A's commands write A's `.git` file, naming B's directory in the mirror.
+    std::fs::write(a.path().join(".git"), format!("gitdir: {}\n", db.display())).unwrap();
+
+    // The coder takes A's directory from its own record, as it did and as a restart will.
+    let again = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let slots = again.run("run-aaaaaaaa-1").unwrap().slots().await.unwrap();
+    assert_eq!(slots[0].worktree().unwrap().git_dir().unwrap(), da);
+    assert_eq!(slots[0].git_pin().unwrap().git_dir(), da);
+
+    // And git acts on A's branch, not on B's.
+    let branch = |wt: &adam_workspace::Worktree| format!("refs/heads/{}", wt.branch());
+    let b_wt = b.worktree().unwrap();
+    let b_before = git(&env.mirror(), &["rev-parse", &branch(b_wt)]);
+    let b_index = std::fs::read(db.join("index")).unwrap();
+    let a_wt = slots[0].worktree().unwrap();
+    let sha = a_wt.commit_all("A's change", &me()).await.unwrap().unwrap();
+    assert_eq!(git(&env.mirror(), &["rev-parse", &branch(a_wt)]), sha);
+    assert_eq!(
+        git(&env.mirror(), &["show", &format!("{sha}:README.md")]),
+        "changed by run-aaaaaaaa-1",
+        "the commit holds A's files, from A's index and not B's"
+    );
+    assert_eq!(
+        git(&env.mirror(), &["rev-parse", &branch(b_wt)]),
+        b_before,
+        "B's branch did not move"
+    );
+    assert_eq!(
+        std::fs::read(db.join("index")).unwrap(),
+        b_index,
+        "B's index was not written"
+    );
+}
+
+#[tokio::test]
+async fn a_slot_made_before_the_directory_was_recorded_is_resolved_from_the_mirror_only_when_that_is_unambiguous()
+ {
+    let env = Env::new();
+    let a = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let da = a.worktree().unwrap().git_dir().unwrap().to_owned();
+    let meta_path = env
+        .root
+        .join("meta/run-aaaaaaaa-1")
+        .join(format!("{}.json", a.dir()));
+    let forget = || {
+        let mut meta = meta_json(&env, "run-aaaaaaaa-1", &a);
+        meta.as_object_mut().unwrap().remove("admin");
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+    };
+    let reopen = || async {
+        let ws = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+        ws.run("run-aaaaaaaa-1").unwrap().slots().await.unwrap()
+    };
+
+    // The one directory whose `gitdir` names this slot's `.git`: found, and recorded.
+    forget();
+    let slots = reopen().await;
+    assert_eq!(slots[0].worktree().unwrap().git_dir().unwrap(), da);
+    assert_eq!(
+        meta_json(&env, "run-aaaaaaaa-1", &a)["admin"],
+        da.file_name().unwrap().to_str().unwrap()
+    );
+    the_coders_git_works_on(&slots[0]).await;
+
+    // Two directories name it (a run's commands can add a candidate by writing their own `gitdir`):
+    // none is taken, git is not run on the slot, and nothing is recorded.
+    forget();
+    let forged = env.mirror().join("worktrees/forged");
+    std::fs::create_dir_all(&forged).unwrap();
+    std::fs::write(
+        forged.join("gitdir"),
+        format!("{}\n", a.path().join(".git").display()),
+    )
+    .unwrap();
+    let slots = reopen().await;
+    let wt = slots[0].worktree().unwrap();
+    assert!(wt.git_dir().is_none() && wt.git_pin().is_none() && slots[0].git_pin().is_none());
+    let refused = wt.status().await.unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    assert!(
+        refused.to_string().contains("cannot tell which directory"),
+        "{refused}"
+    );
+    assert!(meta_json(&env, "run-aaaaaaaa-1", &a).get("admin").is_none());
+
+    // None names it (its `gitdir` file is gone): the same.
+    std::fs::remove_dir_all(&forged).unwrap();
+    std::fs::remove_file(da.join("gitdir")).unwrap();
+    let slots = reopen().await;
+    let wt = slots[0].worktree().unwrap();
+    assert!(wt.git_dir().is_none());
+    assert!(matches!(
+        wt.commit_all("x", &me()).await.unwrap_err(),
+        WorkspaceError::Corrupt(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_commondir_or_a_git_file_a_run_rewrites_steers_nothing_of_the_coders_git() {
+    let env = Env::new();
+    let spy = Planted::new(env._tmp.path());
+    let slot = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let admin = slot.worktree().unwrap().git_dir().unwrap().to_owned();
+
+    // The control: git as a person would run it finds the configuration through the files, and
+    // the planted command runs. Without this the rest would prove nothing.
+    let fake = env._tmp.path().join("fake.git");
+    spy.plant(&fake, true);
+    std::fs::write(admin.join("commondir"), format!("{}\n", fake.display())).unwrap();
+    git_as_discovered(&slot);
+    assert!(
+        spy.ran().contains(&"filter".to_owned()),
+        "the control ran the filter"
+    );
+
+    // The coder's git, with the `commondir` of the worktree's directory pointing at that repository.
+    // (The control put the files in the other repository's objects and their entries in this index:
+    // the index is made `HEAD`'s again, and the file is written again, so that the coder's `add` has
+    // to read them.)
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    git(slot.path(), &["read-tree", "HEAD"]);
+    std::fs::write(admin.join("commondir"), format!("{}\n", fake.display())).unwrap();
+    std::fs::write(
+        slot.path().join("README.md"),
+        "changed after the control, and longer\n",
+    )
+    .unwrap();
+    the_coders_git_works_on(&slot).await;
+    assert_eq!(spy.ran(), Vec::<String>::new(), "commondir rewritten");
+    assert_eq!(
+        std::fs::read_to_string(admin.join("commondir"))
+            .unwrap()
+            .trim(),
+        "../..",
+        "git's reference store follows this file even when the common directory is named, so the coder puts it right"
+    );
+
+    // The same with the slot's `.git` file naming a repository with a working tree of its own.
+    let fake_project = env._tmp.path().join("fake-project");
+    spy.plant(&fake_project, false);
+    git(
+        &fake_project,
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "commit",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            "f",
+        ],
+    );
+    std::fs::write(
+        slot.path().join(".git"),
+        format!("gitdir: {}\n", fake_project.join(".git").display()),
+    )
+    .unwrap();
+    std::fs::write(slot.path().join("README.md"), "changed again\n").unwrap();
+    git_as_discovered(&slot);
+    assert!(
+        spy.ran().contains(&"filter".to_owned()),
+        "the control ran the filter"
+    );
+    std::fs::write(slot.path().join("README.md"), "changed once more\n").unwrap();
+    the_coders_git_works_on(&slot).await;
+    assert_eq!(spy.ran(), Vec::<String>::new(), ".git file rewritten");
+
+    // Asking for the worktree again reads the files git reads (`rev-parse` checks that the slot is
+    // still a worktree of its mirror): it may say the slot is not, and it runs nothing.
+    let _ = env
+        .ws
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await;
+    assert_eq!(spy.ran(), Vec::<String>::new(), "add_repository again");
+}
+
+#[tokio::test]
+async fn a_worktree_configuration_file_is_never_read_because_the_coder_never_turns_it_on() {
+    let env = Env::new();
+    let spy = Planted::new(env._tmp.path());
+    let slot = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let admin = slot.worktree().unwrap().git_dir().unwrap().to_owned();
+    let mirror = env.mirror();
+
+    // What the workspace makes: a repository of format 0 that does not turn the extension on, so
+    // the `config.worktree` of a worktree's directory, which a run can write, is not read.
+    let config = |key: &str| {
+        Command::new("git")
+            .args(["config", "--file"])
+            .arg(mirror.join("config"))
+            .args(["--get", key])
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&config("core.repositoryformatversion").stdout).trim(),
+        "0"
+    );
+    assert!(config("extensions.worktreeConfig").stdout.is_empty());
+    git(
+        &admin,
+        &[
+            "config",
+            "--file",
+            "config.worktree",
+            "filter.spy.clean",
+            &spy.command("worktree-config"),
+        ],
+    );
+    the_coders_git_works_on(&slot).await;
+    assert_eq!(
+        spy.ran(),
+        Vec::<String>::new(),
+        "config.worktree is not read"
+    );
+
+    // Whoever turns it on (a command of a run that shares the coder's container, on a mirror it can
+    // write) is undone the next time the workspace works on the mirror: it asks for a worktree.
+    git(&mirror, &["config", "core.repositoryformatversion", "1"]);
+    git(&mirror, &["config", "extensions.worktreeConfig", "true"]);
+    let other = env
+        .ws
+        .run("run-bbbbbbbb-2")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    assert!(other.worktree().is_some());
+    assert!(
+        config("extensions.worktreeConfig").stdout.is_empty(),
+        "the extension is turned off again"
+    );
+}
+
+#[tokio::test]
+async fn a_head_a_run_points_at_another_runs_branch_is_not_where_the_coder_commits() {
+    let env = Env::new();
+    let a = worktree_with_a_change(&env, "run-aaaaaaaa-1").await;
+    let b = env
+        .ws
+        .run("run-bbbbbbbb-2")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let (a_wt, b_wt) = (a.worktree().unwrap(), b.worktree().unwrap());
+    let branch = |wt: &adam_workspace::Worktree| format!("refs/heads/{}", wt.branch());
+    let (a_before, b_before) = (
+        git(&env.mirror(), &["rev-parse", &branch(a_wt)]),
+        git(&env.mirror(), &["rev-parse", &branch(b_wt)]),
+    );
+    // A's commands write the HEAD of A's directory in the mirror: it names B's branch.
+    std::fs::write(
+        a_wt.git_dir().unwrap().join("HEAD"),
+        format!("ref: {}\n", branch(b_wt)),
+    )
+    .unwrap();
+
+    let sha = a_wt.commit_all("A's change", &me()).await.unwrap().unwrap();
+    assert_eq!(
+        git(&env.mirror(), &["rev-parse", &branch(a_wt)]),
+        sha,
+        "the commit is on A's own branch, which it extends"
+    );
+    assert_eq!(
+        git(&env.mirror(), &["rev-parse", &format!("{sha}^")]),
+        a_before
+    );
+    assert_eq!(
+        git(&env.mirror(), &["rev-parse", &branch(b_wt)]),
+        b_before,
+        "B's branch did not move"
+    );
+    // Nothing more to commit is nothing, as for `git commit`.
+    assert_eq!(a_wt.commit_all("again", &me()).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_scratch_projects_git_is_its_own_directory_and_nothing_a_command_put_there_redirects_it()
+{
+    let env = Env::new();
+    let run = env.ws.run("run-aaaaaaaa-1").unwrap();
+    let scratch = run.add_scratch("notes", &me()).await.unwrap();
+    let project = scratch.scratch().unwrap();
+    std::fs::write(project.path().join("a.txt"), "a\n").unwrap();
+    assert!(project.commit_all("first", &me()).await.unwrap().is_some());
+    let pin = scratch.git_pin().unwrap();
+    assert_eq!(pin.git_dir(), project.path().join(".git"));
+    assert_eq!(pin.common_dir(), project.path().join(".git"));
+
+    // A `commondir` file in the project's repository would move its refs elsewhere: it is removed.
+    let elsewhere = env._tmp.path().join("elsewhere.git");
+    git(
+        env._tmp.path(),
+        &["init", "--bare", "--quiet", elsewhere.to_str().unwrap()],
+    );
+    std::fs::write(
+        project.path().join(".git/commondir"),
+        format!("{}\n", elsewhere.display()),
+    )
+    .unwrap();
+    std::fs::write(project.path().join("a.txt"), "b\n").unwrap();
+    assert!(project.commit_all("second", &me()).await.unwrap().is_some());
+    assert!(!project.path().join(".git/commondir").exists());
+    assert!(
+        git(&elsewhere, &["for-each-ref"]).is_empty(),
+        "nothing was written there"
+    );
+
+    // A `.git` that is a file naming another run's worktree directory: git is not run.
+    let b = env
+        .ws
+        .run("run-bbbbbbbb-2")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let b_wt = b.worktree().unwrap();
+    let b_tip = git(
+        &env.mirror(),
+        &["rev-parse", &format!("refs/heads/{}", b_wt.branch())],
+    );
+    std::fs::remove_dir_all(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join(".git"),
+        format!("gitdir: {}\n", b_wt.git_dir().unwrap().display()),
+    )
+    .unwrap();
+    std::fs::write(project.path().join("a.txt"), "c\n").unwrap();
+    let refused = project.commit_all("third", &me()).await.unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    assert_eq!(
+        git(
+            &env.mirror(),
+            &["rev-parse", &format!("refs/heads/{}", b_wt.branch())]
+        ),
+        b_tip,
+        "B's branch did not move"
+    );
+}

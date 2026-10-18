@@ -1,6 +1,6 @@
 //! Mirrors and per-run worktrees.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -206,6 +206,14 @@ pub(crate) struct Meta {
     /// Version 2: `"repo"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
+    /// The name of the worktree's directory in the mirror's `worktrees/`, which is its git
+    /// directory (`<mirror>/worktrees/<admin>`). The coder records it when it makes the worktree
+    /// and pins every `git` it runs on the slot to it ([`GitPin`](crate::GitPin)): the slot's `.git`
+    /// file says the same, but a run's commands can write that file, and a name read from it could
+    /// be another run's directory. Absent from metadata written before it existed, which is then
+    /// resolved from the mirror (see `Inner::admin_by_backpointer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admin: Option<String>,
 }
 
 /// The metadata of a scratch slot (version 2).
@@ -506,7 +514,10 @@ impl Workspaces {
                 }));
             }
             if self.inner.is_valid_worktree(path, &mirror).await {
-                return Ok(self.inner.worktree(m, &target.dir, path.clone(), mirror));
+                return Ok(self
+                    .inner
+                    .open_worktree(m, &target.dir, path.clone(), mirror, &target.meta_path)
+                    .await);
             }
         }
         if exists(path).await? {
@@ -573,6 +584,7 @@ impl Workspaces {
                         dir: target.seq.map(|_| target.dir.clone()),
                         seq: target.seq,
                         kind: target.seq.map(|_| "repo".to_owned()),
+                        admin: None,
                     },
                     true,
                 )
@@ -592,12 +604,20 @@ impl Workspaces {
             .inner
             .add_worktree(&mirror, path, &meta, &start_ref)
             .await;
-        if let Err(e) = added {
-            if fresh {
-                let _ = tokio::fs::remove_file(&target.meta_path).await;
+        let admin = match added {
+            Ok(admin) => admin,
+            Err(e) => {
+                if fresh {
+                    let _ = tokio::fs::remove_file(&target.meta_path).await;
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
+        // The worktree's git directory, from the mirror's own listing and not from the `.git`
+        // file: recorded now, while no command of the run has had a chance to write anything.
+        let mut meta = meta;
+        meta.admin = Some(admin);
+        self.inner.write_meta_at(&target.meta_path, &meta).await?;
         Ok(self
             .inner
             .worktree(&meta, &target.dir, path.clone(), mirror))
@@ -900,6 +920,51 @@ impl Workspaces {
     }
 }
 
+/// The names in `<mirror>/worktrees/`: the git directories of the mirror's linked worktrees. A
+/// mirror with none lists none.
+async fn list_admin_dirs(mirror: &Path) -> WorkspaceResult<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut entries = match tokio::fs::read_dir(mirror.join("worktrees")).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(names),
+        Err(e) => return Err(WorkspaceError::io("cannot list the mirror's worktrees", e)),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| WorkspaceError::io("cannot list the mirror's worktrees", e))?
+    {
+        if let Some(name) = entry.file_name().to_str() {
+            names.insert(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// Whether `<mirror>/worktrees/<name>/gitdir`, which git writes, names the `.git` file of the slot
+/// at `slot` (as written, or as the same file by another path).
+async fn names_worktree(mirror: &Path, name: &str, slot: &Path) -> bool {
+    let Ok(text) =
+        tokio::fs::read_to_string(mirror.join("worktrees").join(name).join("gitdir")).await
+    else {
+        return false;
+    };
+    let Some(named) = text.lines().next().map(str::trim).filter(|l| !l.is_empty()) else {
+        return false;
+    };
+    let (named, wanted) = (Path::new(named), slot.join(".git"));
+    if named == wanted {
+        return true;
+    }
+    match (
+        tokio::fs::canonicalize(named).await,
+        tokio::fs::canonicalize(&wanted).await,
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Whether the (lowercased-section) configuration `key` is one the mirror must not carry into a
 /// credentialed command (see [`Inner::sanitize_mirror_config`]).
 fn is_unwanted_config(key: &str) -> bool {
@@ -919,6 +984,9 @@ fn is_unwanted_config(key: &str) -> bool {
         "core.fsmonitor",
         "core.hookspath",
         "core.askpass",
+        // With `core.repositoryformatversion` 1, git reads `config.worktree` of each worktree's own
+        // directory, which a run's commands can write; the coder never turns this on.
+        "extensions.worktreeconfig",
     ];
     PREFIXES.iter().any(|p| key.starts_with(p))
 }
@@ -946,7 +1014,7 @@ impl Inner {
     }
 
     /// The metadata of the legacy worktree of `run`.
-    fn meta_path(&self, run: &str) -> PathBuf {
+    pub(crate) fn meta_path(&self, run: &str) -> PathBuf {
         self.root.join("meta").join(format!("{run}.json"))
     }
 
@@ -1002,12 +1070,16 @@ impl Inner {
         let mirror = self.root.join(loc.mirror_relative());
         let path = self.worktree_path(run);
         if self.is_valid_worktree(&path, &mirror).await {
-            Ok(Some(self.worktree(
-                &meta,
-                &slot_name(&loc.name),
-                path,
-                mirror,
-            )))
+            Ok(Some(
+                self.open_worktree(
+                    &meta,
+                    &slot_name(&loc.name),
+                    path,
+                    mirror,
+                    &self.meta_path(run),
+                )
+                .await,
+            ))
         } else {
             Ok(None)
         }
@@ -1359,19 +1431,23 @@ impl Inner {
         Ok(true)
     }
 
+    /// Add the worktree and say which directory of the mirror's `worktrees/` is its git directory:
+    /// the one entry that was not there before (the mirror is locked by the caller, and a run's
+    /// commands cannot write `worktrees/` itself), whose `gitdir` file names this worktree.
     async fn add_worktree(
         &self,
         mirror: &Path,
         path: &Path,
         meta: &Meta,
         start_ref: &str,
-    ) -> WorkspaceResult<()> {
+    ) -> WorkspaceResult<String> {
         // Forget worktrees whose directories vanished, so their branches are
         // not considered checked out.
         self.mirror_git(mirror)
             .args(["worktree", "prune"])
             .run()
             .await?;
+        let before = list_admin_dirs(mirror).await?;
         let branch_ref = format!("refs/heads/{}", meta.branch);
         let branch_exists = self
             .mirror_git(mirror)
@@ -1390,7 +1466,70 @@ impl Inner {
                 .arg(start_ref)
         };
         cmd.run().await?;
-        Ok(())
+        let mut added = Vec::new();
+        for name in list_admin_dirs(mirror).await?.difference(&before) {
+            if names_worktree(mirror, name, path).await {
+                added.push(name.clone());
+            }
+        }
+        match <[String; 1]>::try_from(added) {
+            Ok([admin]) => Ok(admin),
+            Err(_) => Err(WorkspaceError::Corrupt(format!(
+                "cannot tell which directory of {}/worktrees is the git directory of the new worktree {}",
+                mirror.display(),
+                path.display()
+            ))),
+        }
+    }
+
+    /// The worktree whose git directory is not recorded (metadata written before it was): its
+    /// directory in the mirror is the **one** `worktrees/*/gitdir` that names this slot's `.git`.
+    /// None when there is none or more than one, and then no git directory is mounted into a run
+    /// pod and the coder's own `git` refuses the slot. Another run's directory cannot be taken for
+    /// this one: it names its own slot, and what a run's commands can rewrite (its own `gitdir`)
+    /// can only add a second candidate, which makes the answer none.
+    pub(crate) async fn admin_by_backpointer(&self, mirror: &Path, slot: &Path) -> Option<String> {
+        let mut found = None;
+        for name in list_admin_dirs(mirror).await.ok()? {
+            if names_worktree(mirror, &name, slot).await {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(name);
+            }
+        }
+        found
+    }
+
+    /// The worktree `meta` describes, at `path`: with the git directory it records, or, for
+    /// metadata that predates the record, the one the mirror says (and then it is recorded in
+    /// `meta_path`, so the mirror is not searched again). A worktree whose git directory cannot be
+    /// told has none and git refuses it ([`Worktree::git_dir`]).
+    pub(crate) async fn open_worktree(
+        self: &Arc<Self>,
+        meta: &Meta,
+        dir: &str,
+        path: PathBuf,
+        mirror: PathBuf,
+        meta_path: &Path,
+    ) -> Worktree {
+        if meta.admin.is_some() {
+            return self.worktree(meta, dir, path, mirror);
+        }
+        let Some(admin) = self.admin_by_backpointer(&mirror, &path).await else {
+            tracing::warn!(
+                slot = %path.display(),
+                "cannot tell which directory of the mirror is this worktree's git directory; \
+                 git is not run on it and no git directory is mounted into its pod"
+            );
+            return self.worktree(meta, dir, path, mirror);
+        };
+        let mut recorded = meta.clone();
+        recorded.admin = Some(admin);
+        if let Err(e) = self.write_meta_at(meta_path, &recorded).await {
+            tracing::warn!(error = %e, "cannot record the worktree's git directory");
+        }
+        self.worktree(&recorded, dir, path, mirror)
     }
 
     /// `path` is a checked-out worktree whose git dir belongs to `mirror`.
@@ -1697,6 +1836,7 @@ mod tests {
             "core.sshcommand",
             "core.fsmonitor",
             "core.hookspath",
+            "extensions.worktreeconfig",
         ] {
             assert!(is_unwanted_config(key), "{key}");
         }

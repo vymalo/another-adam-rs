@@ -28,10 +28,11 @@ authentication behave like the real tool.
 | `ExecSpec`, `Program`, `PreparedCommand`, `ExecId`, `SecretRef` | what to run (`ExecSpec::shell(command, cwd)` or `::argv(..)`, `.env(..)`, `.hide(names)`), the command an environment made of it (`PreparedCommand::command()` is a `tokio::process::Command` with its program, arguments, directory and environment), and how a process reads a secret (`SecretRef::Env` or `File`) |
 | `EnvProgress` (trait), `EnvStep`, `EnvStepState`, `NoProgress`, `EnvKind`, `EnvDescription` | the steps of a slow `ensure`, and what an environment says it is (`EnvKind::{Local, DevContainer { source, image }, Kubernetes { pod, image }}`, `#[non_exhaustive]`: a `match` over it needs a wildcard) |
 | `EnvError` | `Unavailable`, `Config { file, reason }`, `Refused`, `Build { reason, log_tail }`, `Timeout { phase, secs }`, `Lost`, `Io`; `#[non_exhaustive]`, see *Errors* |
+| `GitPin` | where `git` works for a slot, from the coder's metadata: `git_dir()`, `common_dir()`, `work_tree()`, `apply(&mut Command)` (sets `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE`), `check().await` (puts a worktree's `commondir` file back, requires a scratch project's `.git` to be a directory). `Worktree::git_pin()`, `Scratch::git_pin()` and `Slot::git_pin()` give it ([below](#git-is-pinned-to-the-slots-repository)) |
 | `confine_git_env(&mut tokio::process::Command)`, `GIT_INHERITED_ENV` | the environment of a `git` a caller starts itself: empty, plus only the variables of `GIT_INHERITED_ENV` (`PATH`, `HOME`, the locale and temp dirs, certificate and proxy settings, `GIT_CONFIG_GLOBAL`). Every `git` this crate runs starts this way, and the coder's own (`git apply`, the tree-id probes) too ([below](#git-starts-from-an-empty-environment)) |
 | `login_shell()` | `bash` where the image has one, else `sh` (the shell of a `Program::Shell`) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
-| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `mirror` (the bare mirror the worktree is linked to: an environment that runs `git` in the worktree has to read it), `dir` (the slot's name), `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch), `base_commit` (what `origin/<base>` is at), `add_base_checkout` / `remove_base_checkout` (a temporary detached checkout of it, a `BaseCheckout`, below) |
+| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `mirror` (the bare mirror the worktree is linked to: an environment that runs `git` in the worktree has to read it), `dir` (the slot's name), **`git_dir`** (the worktree's directory in the mirror, from the coder's metadata; `None` when it cannot be told), **`git_pin`**, `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)` (committed onto the run's own branch explicitly, whatever `HEAD` says), `push` (the run's own branch), `publish` (moves the continued branch), `base_commit` (what `origin/<base>` is at), `add_base_checkout` / `remove_base_checkout` (a temporary detached checkout of it, a `BaseCheckout`, below) |
 | `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files (`FileStatus` is `Display`: `modified`, `type changed`) |
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString`, and `acts_for() -> Option<Vec<String>>` (the accounts the credentials are confined to: a GitHub App's, `None` for a token; **a provided method**, so an implementer keeps compiling; `HostScoped` forwards it) |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
@@ -114,6 +115,26 @@ the one invocation that carries **the token** (fetch, ls-remote, push) has it in
 is a list of keys, not a proof that nothing in a repository's configuration runs there; a proxy URL with a password in
 `HTTPS_PROXY` is inherited. Test: `git_env::tests::a_filter_a_repository_configures_does_not_see_the_coders_environment`.
 
+### `git` is pinned to the slot's repository
+
+The `.git` file of a worktree, and the `commondir` and `gitdir` files of its directory in the mirror, are written by git and
+then by whatever runs in the slot. Followed by the coder's own `git`, they send it to a repository whose configuration a
+command wrote. So the coder **records the worktree's directory in the mirror** (`Meta.admin`, a name; version 2 stays, the field is
+optional) when it makes the worktree, from the mirror's `worktrees/` before and after `git worktree add`, and every `git` it runs on
+the slot is **pinned** (`GitPin`): `GIT_DIR=<mirror>/worktrees/<name>`, `GIT_COMMON_DIR=<mirror>`, `GIT_WORK_TREE=<slot>`. Git's
+reference store still follows `commondir` (*verified*, git 2.43.0), so `GitPin::check` puts it back to `../..` before each command;
+`commit_all` commits onto `refs/heads/<the run's branch>` with `commit-tree` and `update-ref` (the old tip as the compare), because
+`HEAD` is a file a command can write. A slot made before the record has the one `worktrees/*/gitdir` that names its `.git`, recorded when
+found; none or several, and `git_dir()` is `None`, no `git` runs on it (`WorkspaceError::Corrupt`) and `adam-env-kubernetes` mounts no
+git directories for it. A scratch project is pinned to its own `.git`, which must be a directory; a `commondir` file in it is removed.
+`extensions.worktreeConfig` (which would make git read `config.worktree`, also writable by a command) is never set by the workspace and is among the
+keys it removes from the mirror's configuration. What stays: an embedded repository in the working tree is entered by `status`, `add -A` and
+`diff` with its own configuration ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md), "Known limits"). Tests:
+`workspace.rs`, `a_commondir_or_a_git_file_a_run_rewrites_steers_nothing_of_the_coders_git` (a planted filter and monitor leave no marker, and
+the control without the pin does), `a_run_that_points_its_git_file_at_another_runs_directory_does_not_get_it`,
+`a_slot_made_before_the_directory_was_recorded_is_resolved_from_the_mirror_only_when_that_is_unambiguous`,
+`a_head_a_run_points_at_another_runs_branch_is_not_where_the_coder_commits`, `a_worktree_configuration_file_is_never_read_because_the_coder_never_turns_it_on`.
+
 ### A check on the base: `BaseCheckout`
 
 `Worktree::add_base_checkout()` checks `origin/<base>` out **detached** in `<run's workspace>/.adam-base/<slot>`: a second
@@ -135,8 +156,9 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
 <root>/workspaces/<run>/<dir>/          a slot: a worktree on agent/<run-short-id>, or a scratch project
 <root>/workspaces/<run>.lock            the run's lock, beside its directory
 <root>/meta/<run>/<dir>.json            the slot's metadata, version 2: dir, seq, kind ("repo" | "scratch"),
-                                        for a repository url, base_branch, branch, remote_branch, for a scratch
-                                        project published_to and conversation (no secrets)
+                                        for a repository url, base_branch, branch, remote_branch and admin (the
+                                        worktree's directory in the mirror's worktrees/), for a scratch project
+                                        published_to and conversation (no secrets)
 <root>/worktrees/<run>                  legacy (one worktree per run): read as a slot, removed by remove(),
 <root>/meta/<run>.json                  made only by prepare / prepare_continuing
 ```

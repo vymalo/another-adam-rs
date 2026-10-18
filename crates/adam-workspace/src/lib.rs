@@ -86,6 +86,7 @@ pub use environment::{
     NoProgress, PreparedCommand, Program, SecretRef, login_shell,
 };
 pub use error::{WorkspaceError, WorkspaceResult};
+pub use git::GitPin;
 pub use git_env::{GIT_INHERITED_ENV, confine_git_env};
 #[cfg(feature = "github")]
 pub use github::GitHub;
