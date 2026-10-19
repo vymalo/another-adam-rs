@@ -2655,7 +2655,7 @@ fn warned(p: &Proc, needle: &str) -> bool {
 /// key any command can read, mint installation tokens with and act as the App at any access tier. The
 /// coder refuses to start with it (exit 78, so a supervisor does not restart it) unless the
 /// deployment accepts the risk by name; with the acceptance it starts and still warns. A key given
-/// inline is kept out of the commands' environment and needs no acceptance.
+/// inline is not a file and needs no acceptance.
 #[tokio::test]
 async fn an_app_key_file_next_to_local_commands_is_refused_at_startup_unless_accepted() {
     let key = adam_workspace::testing::TestAppKey::generate();
@@ -2683,7 +2683,6 @@ async fn an_app_key_file_next_to_local_commands_is_refused_at_startup_unless_acc
         "any access tier, a `plan` included",
         "RUN_ENVIRONMENT=kubernetes",
         "DEVCONTAINER_RUNTIME=podman",
-        "GITHUB_APP_PRIVATE_KEY,",
         "ALLOW_COMMANDS_NEXT_TO_SECRETS=true",
     ] {
         assert!(err.contains(part), "{part:?} missing from:\n{err}");

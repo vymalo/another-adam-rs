@@ -904,7 +904,7 @@ installation token and act as the App at any tier, a `plan` included. **The code
 `ALLOW_COMMANDS_NEXT_TO_SECRETS=true`; accepted, it starts and logs a **startup warning** that says so
 (`WorkerConfig::commands_can_read_the_app_key`, [Configuration](#configuration)). The ways out that need no acceptance: run the
 commands in run pods (`RUN_ENVIRONMENT=kubernetes`) or in Podman devcontainers (`DEVCONTAINER_RUNTIME=podman`), which have no such
-file, or give the key inline (`GITHUB_APP_PRIVATE_KEY`). A role that runs no workers (`control-plane`) reads none of this. The
+file. A role that runs no workers (`control-plane`) reads none of this. The
 refusal came with [vymalo/another-adam-rs#120](https://github.com/vymalo/another-adam-rs/issues/120): a deployment that ran an App
 with a key file and no run pods before it **fails to start after it**, and the
 [upgrade note](../../docs/guides/deploy-the-coder.md#upgrading-an-app-deployment) says what to set. The real fix (a uid that cannot

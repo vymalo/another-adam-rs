@@ -1256,8 +1256,7 @@ const COMMANDS_NEXT_TO_THE_APP_KEY: &str = "refusing to start with the GitHub Ap
     in this container (RUN_ENVIRONMENT=local, DEVCONTAINER_RUNTIME=off) as the user that can read the file, so a \
     command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included. \
     Change one of these: run the commands in run pods (RUN_ENVIRONMENT=kubernetes) or in Podman devcontainers \
-    (DEVCONTAINER_RUNTIME=podman); give the key inline (GITHUB_APP_PRIVATE_KEY, which is kept out of the commands' \
-    environment); or accept the risk with ALLOW_COMMANDS_NEXT_TO_SECRETS=true";
+    (DEVCONTAINER_RUNTIME=podman), or accept the risk with ALLOW_COMMANDS_NEXT_TO_SECRETS=true";
 
 /// `GITHUB_APP_OWNERS`: account names separated by commas or white space, compared without case, or
 /// `*` alone for every account the App is installed on. A name that is no account name, `*` beside
@@ -3204,7 +3203,6 @@ mod tests {
             "any access tier, a `plan` included",
             "RUN_ENVIRONMENT=kubernetes",
             "DEVCONTAINER_RUNTIME=podman",
-            "GITHUB_APP_PRIVATE_KEY,",
             "ALLOW_COMMANDS_NEXT_TO_SECRETS=true",
         ] {
             assert!(message.contains(part), "{part:?} missing from: {message}");
@@ -3281,7 +3279,7 @@ mod tests {
         let worker = parse_owned(&vars).unwrap().worker.unwrap();
         assert!(!worker.commands_can_read_the_app_key());
 
-        // A key given inline is kept out of the commands' environment, and there is no file.
+        // A key given inline is not a file: nothing is refused.
         let key = TestAppKey::generate();
         let mut vars = app_key_file_next_to_local_commands(dir.path());
         vars.remove("GITHUB_APP_PRIVATE_KEY_PATH");

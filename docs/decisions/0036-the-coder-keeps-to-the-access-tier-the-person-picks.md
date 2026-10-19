@@ -429,8 +429,7 @@ any access tier. [vymalo/another-adam-rs#120](https://github.com/vymalo/another-
   of a run run in its own container (`RUN_ENVIRONMENT=local` and `DEVCONTAINER_RUNTIME=off`: `WorkerConfig::commands_can_read_the_app_key`
   is the whole test, the same that chose the warning), unless the deployment sets `ALLOW_COMMANDS_NEXT_TO_SECRETS=true`. The refusal is
   a problem of the configuration like any other, reported with the others in one round trip; the message says why and names every way
-  out: run pods (`RUN_ENVIRONMENT=kubernetes`), Podman devcontainers (`DEVCONTAINER_RUNTIME=podman`), a key given inline
-  (`GITHUB_APP_PRIVATE_KEY`), or the variable. Accepted, the coder starts and **still logs the warning**. The variable is read as the other
+  out: run pods (`RUN_ENVIRONMENT=kubernetes`), Podman devcontainers (`DEVCONTAINER_RUNTIME=podman`), or the variable. Accepted, the coder starts and **still logs the warning**. The variable is read as the other
   flags are (`true`, `1`, `false`, `0`; anything else is exit 78), by the roles that run workers only; a control plane holds no key.
 * **The chart refuses to render the same configuration** (`github.auth: app`, `runPods.enabled: false`) unless
   `runPods.allowCommandsNextToSecrets: true`, which it renders as the variable, and only when it is `true`. A GitOps sync that fails
