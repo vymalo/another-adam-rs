@@ -1,0 +1,40 @@
+# The coder as a production deployment of a GitHub App: the commands of a run (run_command, run_checks, OpenCode) run in
+# a pod of their own, which has no key, and the App's private key is a file that only the coder pod mounts. This is the
+# shape the chart asks for. With github.auth=app and runPods.enabled=false the chart refuses to render and the coder
+# refuses to start (exit 78): a command in the coder's own container can read the key file, mint installation tokens
+# and act as the App at any access tier, a `plan` included (ADR 0036, decision 6).
+#
+#   helm upgrade --install coder deploy/coder --namespace another-agentic-system \
+#     -f deploy/coder/examples/production.values.yaml -f my-values.yaml
+#
+# Put your own values in my-values.yaml, or edit the lines marked `set:`. image.tag is bumped by CI: do not set it.
+# tests/render-check.sh renders this file and asserts what it is for. Upgrading a deployment that runs without run pods:
+# docs/guides/deploy-the-coder.md, "Upgrading an App deployment".
+
+# The model gateway (an OpenAI-compatible endpoint, with its /v1 prefix) and the alias of the model.
+config:
+  modelBaseUrl: https://gateway.example.com/v1 # set:
+  model: coder
+  opencodeModel: coder
+
+# The App. The key is a Secret you make yourself (the chart never holds it), with one key, `private-key.pem`:
+#   kubectl -n another-agentic-system create secret generic coder-github-app --from-file=private-key.pem=app.pem
+github:
+  auth: app
+  app:
+    id: Iv1.0123456789abcdef # set: the App's client ID, or its application ID
+    owners: [acme] # set: the accounts the App may act for (or installationId: to pin one installation)
+    privateKeySecret: coder-github-app
+
+# A pod for each active run (ADR 0019). Needs Kubernetes 1.30 or later and externalSecrets.enabled (below). Keep
+# allowCommandsNextToSecrets false (the default): it accepts the risk this file exists to avoid.
+runPods:
+  enabled: true
+
+# Every secret comes from AWS Secrets Manager through External Secrets (the model key, the A2A bearer tokens).
+externalSecrets:
+  enabled: true
+  secretStoreRef:
+    name: my-secret-store # set:
+    kind: ClusterSecretStore
+  key: prod/coder # set: the AWS secret that holds the properties listed in values.yaml

@@ -403,9 +403,13 @@ check "an empty placement string is the unset default" \
 
 # github.auth: a personal access token (the default) or a GitHub App installation (ADR 0009).
 app_env='name: (GITHUB_APP_ID|GITHUB_APP_INSTALLATION_ID|GITHUB_APP_PRIVATE_KEY_PATH)$'
+# These checks are about the App's wiring, not about where its commands run, so they accept what the chart refuses by
+# default: a key file next to the commands of a run (runPods.allowCommandsNextToSecrets; "App mode and where the
+# commands run" below is what asserts the refusal, the acceptance and the safe deployment).
 helm_app() { # the three values an App needs, then any more
   helm template coder "$chart" --namespace coder-ns --set github.auth=app --set github.app.id=1234567 \
-    --set github.app.installationId=98765432 --set github.app.privateKeySecret=coder-github-app "$@"
+    --set github.app.installationId=98765432 --set github.app.privateKeySecret=coder-github-app \
+    --set runPods.allowCommandsNextToSecrets=true "$@"
 }
 
 helm template coder "$chart" --namespace coder-ns > "$out"
@@ -443,6 +447,8 @@ github:
     id: 1234567
     installationId: 98765432
     privateKeySecret: coder-github-app
+runPods:
+  allowCommandsNextToSecrets: true
 YAML
 helm template coder "$chart" --namespace coder-ns -f "$vals" > "$out"
 check "app: numbers from a values file keep their digits" has '^              value: "(1234567|98765432)"$'
@@ -569,9 +575,10 @@ check "shared: every worker has the sidecar (it is part of the pod)" count '^   
 # github.app.owners: no pin, the installation of each owner is found (ADR 0017). Exactly one of the pin and the
 # owners; the owners are what the coder may act for, and there is no default.
 owners_env='name: (GITHUB_APP_ID|GITHUB_APP_OWNERS|GITHUB_APP_PRIVATE_KEY_PATH)$'
-helm_owners() { # the values an App with owners needs, then any more
+helm_owners() { # the values an App with owners needs, then any more (accepting a key file next to the commands, as helm_app)
   helm template coder "$chart" --namespace coder-ns --set github.auth=app --set github.app.id=1234567 \
-    --set 'github.app.owners={acme,Other-Org}' --set github.app.privateKeySecret=coder-github-app "$@"
+    --set 'github.app.owners={acme,Other-Org}' --set github.app.privateKeySecret=coder-github-app \
+    --set runPods.allowCommandsNextToSecrets=true "$@"
 }
 helm_owners > "$out"
 check "owners: the pod gets the App's ID, the owners and the key path" count "$owners_env" 3
@@ -597,6 +604,8 @@ github:
     id: 1234567
     privateKeySecret: coder-github-app
     owners: "acme, Other-Org  third,"
+runPods:
+  allowCommandsNextToSecrets: true
 YAML
 helm template coder "$chart" --namespace coder-ns -f "$vals" > "$out"
 check "owners: a string of names separated by commas or spaces is accepted" dhas StatefulSet '^              value: "acme,Other-Org,third"$'
@@ -607,6 +616,8 @@ github:
     id: 1234567
     privateKeySecret: coder-github-app
     owners: ["  acme ", "", 42]
+runPods:
+  allowCommandsNextToSecrets: true
 YAML
 helm template coder "$chart" --namespace coder-ns -f "$vals" > "$out"
 check "owners: entries are trimmed, blanks dropped, a number is its digits" dhas StatefulSet '^              value: "acme,42"$'
@@ -633,6 +644,8 @@ github:
     id: 1234567
     privateKeySecret: coder-github-app
     owners: [" ", ""]
+runPods:
+  allowCommandsNextToSecrets: true
 YAML
 check "a blank-only owners list with no pin fails" fails helm template coder "$chart" --namespace coder-ns -f "$vals"
 check "a bad pin is not mistaken for no pin: installationId=abc with owners fails" \
@@ -776,7 +789,8 @@ check "control plane: no ConfigMap, no file, no key, no MCP_ALLOW_INSECURE" \
   lacks 'kind: ConfigMap|extra-mcp|EXTRA_MCP|SEARCH_MCP_TOKEN|CONTEXT7_API_KEY|MCP_ALLOW_INSECURE'
 check "control plane: the ExternalSecret copies no MCP key" dlacks ExternalSecret 'SEARCH_MCP_TOKEN|CONTEXT7_API_KEY|search_mcp_token|context7_api_key'
 helm_mcp --set mcp.websearch.url=$search_url --set mcp.websearch.allowInsecure=true --set github.auth=app --set github.app.id=1 --set github.app.installationId=2 \
-  --set github.app.privateKeySecret=k --set workspace.placement=shared --set workspace.sharedVolume.storageClass=x --set replicaCount=2 > "$out"
+  --set github.app.privateKeySecret=k --set runPods.allowCommandsNextToSecrets=true \
+  --set workspace.placement=shared --set workspace.sharedVolume.storageClass=x --set replicaCount=2 > "$out"
 check "with the App key and a shared volume the file is a third volume" count '^        - name: (extra-mcp|github-app|work)$' 3
 helm_mcp --set mcp.websearch.url=$search_url --set mcp.websearch.allowInsecure=true --set githubMcp.port=9100 > "$out"
 check "the GitHub sidecar and GITHUB_MCP_URL still follow githubMcp.port, the file never names github" \
@@ -1375,5 +1389,106 @@ check "refused: CARGO_HOME in extraEnv beside the cache" \
   fails helm_cache --set cache.existingClaim=shared-cache --set-string config.extraEnv.CARGO_HOME=/elsewhere
 message=$(helm_cache --set cache.existingClaim=x --set cache.create=true 2>&1 || true)
 check "... the error says what to choose" says "$message" 'not both'
+
+# ---------------------------------------------------------------------------------------------------------------
+# App mode and where the commands run (ADR 0036, decision 6; vymalo/another-adam-rs#120). The commands of a run
+# run in the coder's own container unless runPods.enabled, next to the App's key file (the chart always mounts the key
+# as a file), and a command can read it, mint installation tokens and act as the App at any access tier. The coder
+# refuses to start that way (exit 78) unless ALLOW_COMMANDS_NEXT_TO_SECRETS=true, so the chart refuses to render it:
+# a sync that fails keeps the running pods, where a rollout would crash-loop the coder. The chart's variable is
+# runPods.allowCommandsNextToSecrets; the variable is rendered only when it is true.
+# ---------------------------------------------------------------------------------------------------------------
+accept='ALLOW_COMMANDS_NEXT_TO_SECRETS'
+helm_key() { # an App (a pin, the key a file) with nothing said about where its commands run, then any more
+  helm template coder "$chart" --namespace coder-ns --set github.auth=app --set github.app.id=1234567 \
+    --set github.app.installationId=98765432 --set github.app.privateKeySecret=coder-github-app "$@"
+}
+
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 > "$out"
+check "the default render (a token) has no $accept" lacks "$accept"
+check "... and the golden has none either" fails grep -q "$accept" "$golden"
+
+# The refusal: the default of an App is the deployment the chart used to render and the coder now refuses.
+message=$(helm_key 2>&1 || true)
+check "an App with run pods off and nothing accepted is refused" fails helm_key
+check "... the error says the coder refuses to start that way (exit 78)" says "$message" 'refuses to start that way (exit 78)'
+check "... and why: a command can read the key and act as the App at any tier" says "$message" 'a command can read the key.*at any access tier'
+check "... and the first way out: runPods.enabled=true" says "$message" 'Set runPods.enabled=true'
+check "... and the second: runPods.allowCommandsNextToSecrets=true to accept the risk" \
+  says "$message" 'runPods.allowCommandsNextToSecrets=true to accept the risk'
+check "... and where the upgrade is written down" says "$message" 'Upgrading an App deployment'
+message=$(helm_key --set github.app.installationId= --set 'github.app.owners={acme}' 2>&1 || true)
+check "an App by owners is refused the same way" says "$message" 'refuses to start that way'
+message=$(helm_key --set topology=split 2>&1 || true)
+check "split: the worker, which holds the key, is refused too" says "$message" 'refuses to start that way'
+check "an App with run pods off is refused in a shared volume too" \
+  fails helm_key --set workspace.placement=shared --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=2
+check "acceptance written as a string is refused: it must be a boolean" \
+  fails helm_key --set-string runPods.allowCommandsNextToSecrets=true
+message=$(helm_key --set-string runPods.allowCommandsNextToSecrets=true 2>&1 || true)
+check "... the error names the value and what it got" says "$message" 'runPods.allowCommandsNextToSecrets must be true or false, got "true"'
+check "acceptance that is not a boolean at all is refused" fails helm_key --set runPods.allowCommandsNextToSecrets=yes
+
+# The acceptance: the variable is rendered, once, as true; the coder still warns.
+helm_key --set runPods.allowCommandsNextToSecrets=true > "$out"
+check "an App that accepts the risk renders" envval "$accept" true
+check "... the variable once" count "name: $accept\$" 1
+check "... only in the coder's container" chas "name: $accept\$"
+check "... not in the GitHub MCP sidecar" slacks "$accept"
+check "... the key is still a file mounted in the coder's container" chas 'mountPath: /var/run/secrets/github-app'
+check "... and the commands still run here: no run pods" lacks 'RUN_ENVIRONMENT|RUN_POD_'
+helm_key --set topology=split --set runPods.allowCommandsNextToSecrets=true > "$out"
+check "split: the worker gets the variable" dhas StatefulSet "name: $accept\$"
+check "split: the front, which runs no command, does not" dlacks Deployment "$accept"
+helm template coder "$chart" --namespace coder-ns --set runPods.allowCommandsNextToSecrets=true > "$out"
+check "a token deployment that sets it renders it too: it is the value that decides, not the mode" envval "$accept" true
+helm template coder "$chart" --namespace coder-ns --set runPods.allowCommandsNextToSecrets=true --set config.role=control-plane > "$out"
+check "a control plane runs no command: no variable" lacks "$accept"
+helm template coder "$chart" --namespace coder-ns --set runPods.allowCommandsNextToSecrets=false > "$out"
+check "false renders nothing (the variable is only ever true)" lacks "$accept"
+check "extraEnv cannot set it: the chart owns the variable" \
+  fails helm_key --set runPods.allowCommandsNextToSecrets=true --set-string config.extraEnv.$accept=true
+message=$(helm_key --set-string config.extraEnv.$accept=true 2>&1 || true)
+check "... the error says which value to set" says "$message" 'set runPods.allowCommandsNextToSecrets instead'
+
+# The deployments that need no acceptance: where a command cannot read the key.
+helm_key --set runPods.enabled=true > "$out"
+check "an App with run pods on renders without the acceptance" lacks "$accept"
+check "... the commands run in run pods: RUN_ENVIRONMENT=kubernetes" sts_of 'value: kubernetes'
+check "... the run pod template holds no key, App setting or mount of the key" notpl 'github-app|private-key|PRIVATE KEY|GITHUB_APP'
+check "... the key is mounted in the coder's container alone" chas 'mountPath: /var/run/secrets/github-app'
+helm_key --set topology=split --set runPods.enabled=true > "$out"
+check "split with run pods: the worker renders without the acceptance" dlacks StatefulSet "$accept"
+helm_key --set config.role=control-plane > "$out"
+check "a control plane runs no command and holds no key: an App renders without the acceptance" lacks "$accept|github-app"
+check "Podman devcontainers named in extraEnv are not the coder's container: no acceptance needed" \
+  helm_key --set-string config.extraEnv.DEVCONTAINER_RUNTIME=podman
+helm_key --set-string config.extraEnv.DEVCONTAINER_RUNTIME=Podman > "$out"
+check "... in any case, and the variable is still not rendered" lacks "$accept"
+check "DEVCONTAINER_RUNTIME=off in extraEnv is the coder's container: refused" \
+  fails helm_key --set-string config.extraEnv.DEVCONTAINER_RUNTIME=off
+
+# The production values: run pods on, an App by owners, the key a file. They render, and nothing accepts the risk.
+prod="$chart/examples/production.values.yaml"
+check "the production values render" helm template coder "$chart" --namespace coder-ns -f "$prod"
+helm template coder "$chart" --namespace coder-ns -f "$prod" > "$out"
+check "production: an App, the key a file (GITHUB_APP_PRIVATE_KEY_PATH)" \
+  dhas StatefulSet '^              value: /var/run/secrets/github-app/private-key.pem$'
+check "production: the App acts for its owners, no pin" dhas StatefulSet 'name: GITHUB_APP_OWNERS$'
+check "production: no $accept" lacks "$accept"
+check "production: the example does not accept the risk (the value is never true in the file)" \
+  fails grep -Eq '^[[:space:]]*allowCommandsNextToSecrets:[[:space:]]*true' "$prod"
+check "production: RUN_ENVIRONMENT=kubernetes, the commands run in a pod of their own" sts_of 'value: kubernetes'
+check "production: the run pod template and its admission policy exist" \
+  count '^kind: (ConfigMap|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding)$' 3
+check "production: the run pod template holds no key, App setting or mount of the key" notpl 'github-app|private-key|PRIVATE KEY|GITHUB_APP'
+key_mount_readonly() { doc StatefulSet | grep -A1 -- 'mountPath: /var/run/secrets/github-app$' | grep -q 'readOnly: true'; }
+check "production: the key is mounted once, in the coder's container, read-only" \
+  count 'mountPath: /var/run/secrets/github-app$' 1
+check "production: ... read-only" key_mount_readonly
+check "production: the GitHub MCP sidecar holds no key" slacks 'github-app|secretName|GITHUB_APP|PRIVATE KEY'
+check "production: no Secret object and no key in the render" lacks '^kind: Secret$|PRIVATE KEY'
+check "production: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
+check "production: no GITHUB_TOKEN anywhere (an App has none)" lacks 'GITHUB_TOKEN'
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

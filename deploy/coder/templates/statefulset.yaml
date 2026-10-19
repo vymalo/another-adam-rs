@@ -214,6 +214,11 @@ spec:
             - name: GITHUB_APP_PRIVATE_KEY_PATH
               value: /var/run/secrets/github-app/private-key.pem
             {{- end }}
+            {{- if include "coder.allowCommandsNextToSecrets" . }}
+            {{- /* runPods.allowCommandsNextToSecrets: the deployment accepts that a command can read the App's key file. Only ever rendered true. */}}
+            - name: ALLOW_COMMANDS_NEXT_TO_SECRETS
+              value: "true"
+            {{- end }}
             - name: PR_DRAFT
               value: {{ .Values.config.prDraft | quote }}
             - name: GIT_AUTHOR_NAME

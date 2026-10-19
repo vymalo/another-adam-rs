@@ -123,6 +123,16 @@ it only with agents you trust: whatever a run writes there every run reads. The 
 template to pass it to; the front of a `split` service runs no toolchain and mounts nothing. A commented line is in
 [`examples/coder.yaml`](examples/coder.yaml).
 
+## A GitHub App needs `ALLOW_COMMANDS_NEXT_TO_SECRETS`
+
+The operator makes no run pods, so an agent's commands run in its own container. With `github.app` (the key a file) the coder
+refuses to start in that case, exit 78, because a command could read the key and act as the App at any access tier
+([vymalo/another-adam-rs#120](https://github.com/vymalo/another-adam-rs/issues/120)), unless the `AgentConfig` accepts it:
+`spec.extraEnv: {ALLOW_COMMANDS_NEXT_TO_SECRETS: "true"}`. The operator checks nothing here (the coder image decides, and an older
+image ignores the variable, so it can be added first); the service shows `ConfigRejected` until it is there
+([upgrading](../../docs/guides/deploy-the-coder.md#upgrading-an-app-deployment)). A commented line is in
+[`examples/coder.yaml`](examples/coder.yaml), whose pinned image does not read it yet. A coder on a token needs none.
+
 ## The image
 
 `ghcr.io/vymalo/another-adam-rs/operator`, built from [`docker/operator/Dockerfile`](../../docker/operator/Dockerfile) by

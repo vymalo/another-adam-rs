@@ -116,7 +116,7 @@ default) and go under `Delete`.
 | `Blocked`, `NameConflict` | an object of that name is not the operator's (a Helm release's): remove it, the operator looks again every 15 s |
 | `Degraded`, `MissingSecret` | the reason names the Secret: create it |
 | `Degraded`, `ImagePull` | the tag is wrong, or the package is private (the CRD has no pull secret) |
-| `Degraded`, `ConfigRejected` or `DependencyUnavailable` | the process exited 78 (read its log) or 69 (Postgres or a required MCP server is down) |
+| `Degraded`, `ConfigRejected` or `DependencyUnavailable` | the process exited 78 (read its log) or 69 (Postgres or a required MCP server is down). A coder with `github.app` exits 78 with `refusing to start with the GitHub App's private key in a file` until `spec.extraEnv` has `ALLOW_COMMANDS_NEXT_TO_SECRETS: "true"`: the operator makes no run pods, so its commands run beside the key ([upgrading](deploy-the-coder.md#upgrading-an-app-deployment)) |
 | `StoreReady` false, `CNPGNotInstalled` | `cnpg` without CloudNativePG, or `storeCnpg: false` in the operator chart |
 
 ## Moving the coder off its chart

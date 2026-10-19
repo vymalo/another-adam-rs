@@ -193,6 +193,16 @@ from service.yaml, which every render contains, so they always run.
 {{- if not (kindIs "bool" .Values.runPods.enabled) -}}
 {{- fail (printf "runPods.enabled must be true or false, got %q" (toString .Values.runPods.enabled)) -}}
 {{- end -}}
+{{- /* A command that runs next to the GitHub App's key file can read it (ADR 0036, decision 6): refused, as the coder refuses it, unless accepted. */ -}}
+{{- if not (kindIs "bool" .Values.runPods.allowCommandsNextToSecrets) -}}
+{{- fail (printf "runPods.allowCommandsNextToSecrets must be true or false, got %q" (toString .Values.runPods.allowCommandsNextToSecrets)) -}}
+{{- end -}}
+{{- if hasKey .Values.config.extraEnv "ALLOW_COMMANDS_NEXT_TO_SECRETS" -}}
+{{- fail "config.extraEnv sets ALLOW_COMMANDS_NEXT_TO_SECRETS: set runPods.allowCommandsNextToSecrets instead (the chart renders the variable from it, and only then)" -}}
+{{- end -}}
+{{- if and (include "coder.commandsReadTheAppKey" .) (not (include "coder.allowCommandsNextToSecrets" .)) -}}
+{{- fail "github.auth=app with runPods.enabled=false runs the commands of a run (run_command, run_checks, OpenCode) in the coder's own container, next to the App's private key file: a command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included, and the coder refuses to start that way (exit 78), so a rollout would crash-loop. Set runPods.enabled=true (the commands then run in pods that have no key; needs externalSecrets.enabled and Kubernetes 1.30 or later), or set runPods.allowCommandsNextToSecrets=true to accept the risk (see deploy/coder/README.md, \"The access tiers\", and docs/guides/deploy-the-coder.md, \"Upgrading an App deployment\")" -}}
+{{- end -}}
 {{- if include "coder.runPods" . -}}
 {{- $rp := .Values.runPods -}}
 {{- if not .Values.externalSecrets.enabled -}}
