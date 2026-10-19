@@ -16,7 +16,8 @@ that integrate adam-rs.
 
 | Path | What |
 |---|---|
-| `README.md`, `docs/` | the human docs: `docs/README.md` (index), `architecture.md`, `guides/`, `reference/`, `roadmap.md`, `decisions/NNNN-*.md` (ADRs) |
+| `README.md`, `docs/` | the human docs: `docs/README.md` (index), `architecture.md`, `guides/`, `reference/`, `roadmap.md` (the library's own; the product roadmap is `ROADMAP.md` in another-agentic-system, https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md), `decisions/NNNN-*.md` (ADRs) |
+| `CONTRIBUTING.md`, `SECURITY.md` | how to contribute (claim an issue, build, test, open a pull request) and how to report a vulnerability privately; the front door for outside contributors |
 | `crates/`, `bin/adam-coder`, `bin/adam-agent` | libraries, one per concern, and the two agents (library and binary each); each has a `README.md` |
 | `deploy/coder/`, `docker/coder/` | the Helm chart (`bump-tag.sh`, `tests/`: renders, goldens, schemas) and the image with its smoke tests |
 | `crates/adam-operator-*`, `bin/adam-operator` | the Kubernetes operator of `AgentService` and `AgentConfig` (ADR 0029): its own ports and testkits, separate from the run path |
