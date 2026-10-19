@@ -66,7 +66,10 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      there is no default list, because a public App can be installed by anyone);
      `createRepoOwners` turns the repository-creation tool on (an App that names its accounts does it by itself, not
      with `owners: ["*"]`). `accessTiers.max` (`MAX_ACCESS_TIER`, empty is `auto`) caps the access tiers a person may pick;
-     `bypass` is opt-in. An App's key is readable by the commands of a run in the coder's own container: use run pods or Podman.
+     `bypass` is opt-in. An App's key is readable by the commands of a run in the coder's own container, so the coder refuses to
+     start that way (exit 78) and the chart refuses to render `github.auth: app` with `runPods.enabled: false`, unless
+     `runPods.allowCommandsNextToSecrets: true` (`ALLOW_COMMANDS_NEXT_TO_SECRETS=true`) accepts the risk: use run pods
+     (`deploy/coder/examples/production.values.yaml`) or Podman.
    * `githubMcp` (default on): the official GitHub MCP server as a **native sidecar** (an init
      container with `restartPolicy: Always`, Kubernetes 1.29+) of every pod that runs workers,
      `github-mcp-server http --read-only` on 127.0.0.1:8082 from the coder's own image. It holds no

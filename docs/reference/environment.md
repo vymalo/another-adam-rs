@@ -68,6 +68,7 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `GITHUB_APP_INSTALLATION_ID` | **pins** the App to one installation | this or `GITHUB_APP_OWNERS`, exactly one |
 | `GITHUB_APP_OWNERS` | no pin: the accounts the App may act for (comma or space list, or `*`); the installation of each owner is found with the JWT | as above |
 | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's PEM key, a file or inline; exactly one; parsed at startup | one required in App mode |
+| `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` accepts, `false` refuses at startup (**exit 78**), a GitHub App whose key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in the coder's own container (`RUN_ENVIRONMENT=local`, `DEVCONTAINER_RUNTIME=off`): a command can read the key, mint installation tokens and act as the App at any access tier. Accepted, the coder still logs a warning. Not needed with `RUN_ENVIRONMENT=kubernetes`, `DEVCONTAINER_RUNTIME=podman`, an inline key or a token. `true`/`1`/`false`/`0`; anything else is exit 78. [Upgrade note](../guides/deploy-the-coder.md#upgrading-an-app-deployment) | `false` |
 | `ALLOWED_REPO_HOSTS` | hosts repositories may live on (`name` or `name:port`); the token is scoped to them; the first is what `owner/name` means | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (Enterprise: `https://<host>/api/v3`) | `https://api.github.com` |
 | `GITHUB_MCP_URL` | origin of the GitHub MCP server (the sidecar); no credentials | `http://127.0.0.1:8082` |
@@ -88,7 +89,7 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `RUN_ENVIRONMENT` | `local` or `kubernetes` (a pod for each run; refused with `DEVCONTAINER_RUNTIME=podman`) | `local` |
+| `RUN_ENVIRONMENT` | `local` or `kubernetes` (a pod for each run; refused with `DEVCONTAINER_RUNTIME=podman`). With a GitHub App key file, `local` and `DEVCONTAINER_RUNTIME=off` need `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` (above) | `local` |
 | `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod every run pod is made from (the chart's ConfigMap) | required |
 | `RUN_POD_NAMESPACE` | the namespace of run pods | the ServiceAccount's namespace |
 | `RUN_POD_INSTANCE` | the release's `app.kubernetes.io/instance`, which finds this deployment's pods | required |

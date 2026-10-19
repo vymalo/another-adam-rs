@@ -44,13 +44,19 @@ def probe(p):
     return out
 
 
+# Left out of the projection: the chart's runPods.allowCommandsNextToSecrets renders this on the pods that run workers,
+# and the operator, which makes no run pods (ADR 0029), takes it in extraEnv, which it puts on every workload (a split
+# front too). The cases accept the risk the chart refuses by default; the example says so in a comment.
+NOT_PROJECTED_ENV = {"ALLOW_COMMANDS_NEXT_TO_SECRETS"}
+
+
 def container(c):
     res = c.get("resources", {})
     return {
         "image": c["image"],
         "command": c.get("command", []),
         "args": c.get("args", []),
-        "env": [source(e) for e in c.get("env", [])],
+        "env": [source(e) for e in c.get("env", []) if e["name"] not in NOT_PROJECTED_ENV],
         "mounts": [{"name": m["name"], "path": m["mountPath"], "readOnly": bool(m.get("readOnly", False))}
                    for m in c.get("volumeMounts", [])],
         "probes": {k: probe(c.get(k + "Probe")) for k in ("startup", "liveness", "readiness")},

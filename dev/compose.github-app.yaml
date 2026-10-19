@@ -53,6 +53,9 @@ services:
       # exclusive). `local` and `scratch` are the owners of the stack's repositories.
       GITHUB_APP_OWNERS: local,scratch,other-org
       GITHUB_APP_PRIVATE_KEY_PATH: /run/github-app/github-app.pem
+      # The commands run in this container beside the key file, which the coder refuses (exit 78) unless accepted:
+      # fine for a throwaway key and a mock GitHub. A deployment runs the commands in run pods instead.
+      ALLOW_COMMANDS_NEXT_TO_SECRETS: "true"
     volumes:
       - coder-github-app-key:/run/github-app:ro
 

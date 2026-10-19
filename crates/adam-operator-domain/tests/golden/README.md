@@ -58,6 +58,11 @@ And these are not compared, because they are structure or the chart's own busine
   `websearch` and `context7`, one header each), `MCP_ALLOW_INSECURE=true` whenever `tools.allowInsecureHttp` is
   (the chart sets it only for a plain-http extra server; `examples/chat.yaml` has none and still needs it for the
   orchestrator's thread tools), and the whole of `adam-agent` (a folder, `ADAM_AGENT_DIR`, the command).
+* **`ALLOW_COMMANDS_NEXT_TO_SECRETS`.** The three cases with a GitHub App set the chart's `runPods.allowCommandsNextToSecrets`,
+  since the chart refuses an App with no run pods otherwise, and `extract.py` does not project the variable (`NOT_PROJECTED_ENV`):
+  the operator makes no run pods (ADR 0029) and takes the variable in `extraEnv`, which it puts on every workload (a split front
+  included), where the chart renders it on the pods that run workers. The commented line in `examples/coder.yaml` says what an
+  `AgentConfig` needs from a coder image that refuses a key file beside local commands (vymalo/another-adam-rs#120).
 * **Validation messages** differ (the chart's are `fail` strings, the operator's are `ConfigIssue`s); the
   *mistakes* are the same.
 

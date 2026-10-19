@@ -2435,7 +2435,26 @@ async fn a_worker_with_devcontainers_on_starts_when_the_service_does_not_answer(
 
 /// `valid_env` for a GitHub App installation instead of a token: `GITHUB_TOKEN` is gone, and the key
 /// is a file under `dir` (what a deployment mounts).
+///
+/// The commands run in this process's container, next to the key file, which the coder refuses
+/// unless the deployment accepts it: these tests are about the App's credentials and run no command,
+/// so they accept it. `an_app_key_file_next_to_local_commands_*` is the test that does not.
 fn app_env(
+    database_url: &str,
+    workspace: &Path,
+    key: &adam_workspace::testing::TestAppKey,
+    dir: &Path,
+) -> Vec<(String, String)> {
+    let mut env = app_env_refused_by_default(database_url, workspace, key, dir);
+    env.push((
+        "ALLOW_COMMANDS_NEXT_TO_SECRETS".to_owned(),
+        "true".to_owned(),
+    ));
+    env
+}
+
+/// [`app_env`] as a deployment writes it before it has decided where the commands run.
+fn app_env_refused_by_default(
     database_url: &str,
     workspace: &Path,
     key: &adam_workspace::testing::TestAppKey,
@@ -2597,6 +2616,137 @@ async fn a_github_app_configuration_is_checked_at_startup_and_exits_78_with_ever
         err.contains("GITHUB_APP_PRIVATE_KEY_PATH") && err.contains("cannot be read"),
         "{err}"
     );
+}
+
+/// Wait until the process logged something that contains `needle`; it must not exit first.
+async fn until_logged(p: &mut Proc, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !p.stdout().contains(needle) {
+        assert!(p.still_running(), "exited before {needle:?}\n{}", p.logs());
+        assert!(
+            Instant::now() < deadline,
+            "never logged {needle:?}\n{}",
+            p.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Stop a process that started (it would go on to wait for a Postgres that is not there).
+async fn stop(p: &mut Proc) {
+    p.child.start_kill().expect("kill");
+    p.exit_within(Duration::from_secs(15)).await;
+}
+
+/// Whether the process logged a warning that contains `needle`.
+fn warned(p: &Proc, needle: &str) -> bool {
+    p.stdout()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .any(|v| {
+            v["level"] == "WARN"
+                && v["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(needle))
+        })
+}
+
+/// A GitHub App whose key is a file, with the commands of a run in the coder's own container, is a
+/// key any command can read, mint installation tokens with and act as the App at any access tier. The
+/// coder refuses to start with it (exit 78, so a supervisor does not restart it) unless the
+/// deployment accepts the risk by name; with the acceptance it starts and still warns. A key given
+/// inline is not a file and needs no acceptance.
+#[tokio::test]
+async fn an_app_key_file_next_to_local_commands_is_refused_at_startup_unless_accepted() {
+    let key = adam_workspace::testing::TestAppKey::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let unreachable = "postgres://u:p@127.0.0.1:1/x";
+    let warning = "NO access tier holds against a command";
+    let run = |env: Vec<(String, String)>| {
+        let mut p = Proc::spawn(&env);
+        async move {
+            let status = p.exit_within(Duration::from_secs(45)).await;
+            (status.code(), p)
+        }
+    };
+
+    // The default: refused before anything connects, saying why and every setting that changes it.
+    let env = app_env_refused_by_default(unreachable, tmp.path(), &key, tmp.path());
+    let (code, p) = run(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    let fields = failure(&p);
+    assert_eq!(fields["code"], 78);
+    let err = fields["error"].as_str().unwrap().to_owned();
+    assert!(err.contains("reading the configuration"), "{err}");
+    for part in [
+        "GITHUB_APP_PRIVATE_KEY_PATH",
+        "any access tier, a `plan` included",
+        "RUN_ENVIRONMENT=kubernetes",
+        "DEVCONTAINER_RUNTIME=podman",
+        "ALLOW_COMMANDS_NEXT_TO_SECRETS=true",
+    ] {
+        assert!(err.contains(part), "{part:?} missing from:\n{err}");
+    }
+    assert!(
+        !err.contains("connecting to Postgres") && !warned(&p, warning),
+        "a refused configuration stops before anything starts:\n{}",
+        p.logs()
+    );
+    assert!(!p.logs().contains("BEGIN"), "no key in the output");
+
+    // Said as no, and a value that is no boolean: refused too, the second naming the variable.
+    let mut env = app_env_refused_by_default(unreachable, tmp.path(), &key, tmp.path());
+    env.push((
+        "ALLOW_COMMANDS_NEXT_TO_SECRETS".to_owned(),
+        "false".to_owned(),
+    ));
+    let (code, p) = run(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    let mut env = app_env_refused_by_default(unreachable, tmp.path(), &key, tmp.path());
+    env.push((
+        "ALLOW_COMMANDS_NEXT_TO_SECRETS".to_owned(),
+        "sure".to_owned(),
+    ));
+    let (code, p) = run(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(
+        err.contains("ALLOW_COMMANDS_NEXT_TO_SECRETS must be true or false")
+            && err.contains("\"sure\""),
+        "{err}"
+    );
+
+    // Accepted: it starts (it assembles its agent, and would go on to Postgres, which is not there),
+    // and says what it accepted.
+    let mut p = Proc::spawn(&app_env(unreachable, tmp.path(), &key, tmp.path()));
+    until_logged(&mut p, "workspace placement").await;
+    assert!(
+        warned(&p, warning),
+        "the warning is still logged:\n{}",
+        p.logs()
+    );
+    assert!(!p.logs().contains("BEGIN"), "no key in the output");
+    stop(&mut p).await;
+
+    // A key given inline: nothing to accept, and so nothing to warn about.
+    let mut env = app_env_refused_by_default(unreachable, tmp.path(), &key, tmp.path());
+    env.retain(|(k, _)| k != "GITHUB_APP_PRIVATE_KEY_PATH");
+    env.push((
+        "GITHUB_APP_PRIVATE_KEY".to_owned(),
+        key.pkcs8_pem.trim().replace('\n', "\\n"),
+    ));
+    let mut p = Proc::spawn(&env);
+    until_logged(&mut p, "workspace placement").await;
+    assert!(!warned(&p, warning), "{}", p.logs());
+    stop(&mut p).await;
+
+    // A control plane holds no key and runs no command: it reads none of this.
+    let mut env = app_env_refused_by_default(unreachable, tmp.path(), &key, tmp.path());
+    env.push(("ROLE".to_owned(), "control-plane".to_owned()));
+    let mut p = Proc::spawn(&env);
+    until_logged(&mut p, "starting adam-coder").await;
+    assert!(!warned(&p, warning), "{}", p.logs());
+    stop(&mut p).await;
 }
 
 /// An App with no pin takes a task for each of two owners to a pull request: the installation of

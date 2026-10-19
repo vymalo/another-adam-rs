@@ -20,6 +20,10 @@ config:
   prDraft: true
   gitAuthorName: "bored-giant-panda[bot]"
   gitAuthorEmail: "337696346+bored-giant-panda[bot]@users.noreply.github.com"
+# The operator makes no run pods (ADR 0029), so this coder runs its commands beside the App's key file: the chart refuses
+# that unless the deployment accepts it, which the example says as extraEnv ALLOW_COMMANDS_NEXT_TO_SECRETS.
+runPods:
+  allowCommandsNextToSecrets: true
 github:
   auth: app
   createRepoOwners: []

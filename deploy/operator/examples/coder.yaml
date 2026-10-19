@@ -142,3 +142,9 @@ spec:
     fsGroup: 10001
     fsGroupChangePolicy: OnRootMismatch
   extraEnv: {}
+  # A coder image that refuses an App key file beside local commands (exit 78; vymalo/another-adam-rs#120) needs this line
+  # here, since the operator makes no run pods (ADR 0029) and this coder runs its commands in its own container, a command
+  # able to read the key and act as the App at any access tier. The image pinned above does not read it yet; the pin of a
+  # newer one comes with it. A coder on a token needs none.
+  #   extraEnv:
+  #     ALLOW_COMMANDS_NEXT_TO_SECRETS: "true"
