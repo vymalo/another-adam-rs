@@ -1,6 +1,6 @@
 # 0036. The coder keeps to the access tier the person picks
 
-Status: **Accepted** (2026-10-11), amended after security reviews (three *Amended 2026-10-11* sections, the first for the first two reviews, and *Amended 2026-10-17* for the fifth, below), and *Amended 2026-10-17 (an asked agent)*: an agent asked by another agent never parks on a person's consent, and (built 2026-10-17) names only the repositories the person named in the words the orchestrator carries
+Status: **Accepted** (2026-10-11), amended after security reviews (three *Amended 2026-10-11* sections, the first for the first two reviews, and *Amended 2026-10-17* for the fifth, below), and *Amended 2026-10-17 (an asked agent)*: an agent asked by another agent never parks on a person's consent, and (built 2026-10-17) names only the repositories the person named in the words the orchestrator carries, and *Amended 2026-10-19 (the key file next to local commands)*: decision 6's follow-up is done in part, the coder refuses to start (exit 78) where it only warned
 Implements the A2A extension `https://agents.vymalo.com/a2a/extensions/access-tier/v1`, designed in
 `vymalo/another-agentic-system` ([ADR 0061](https://github.com/vymalo/another-agentic-system/blob/main/docs/decisions/0061-the-person-picks-an-access-tier-for-each-message-the-agent-keeps-to-it.md),
 [`docs/api/access-tier-v1.md`](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/access-tier-v1.md)).
@@ -80,7 +80,8 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
    whose key is a file and the commands run locally (`WorkerConfig::commands_can_read_the_app_key`). A deployment that needs a boundary runs the
    commands in run pods (`runPods.enabled`) or in Podman devcontainers (`DEVCONTAINER_RUNTIME=podman`), or gives the App only the
    permissions it can live with. **Follow-up (the real fix, not done here):** run the coder's local commands as a uid that cannot
-   read `/var/run/secrets`, or refuse App mode unless the commands run in run pods or Podman.
+   read `/var/run/secrets`, or refuse App mode unless the commands run in run pods or Podman. *Amended 2026-10-19:* the second half
+   is done, below.
 7. **The new tools** (`bin/adam-coder/src/tools/admin.rs`, each a `#[tool]`):
    * `merge_pull_request { repo, number, method: squash | merge | rebase = squash, delete_branch? }`, icon `git`, `asks_user`.
      *Amended 2026-10-11 (a fourth review):* **it never reads the person's words.** Three reviews each found another way for the
@@ -416,3 +417,26 @@ answer. Decided on the owner's direction: **an agent asked by another agent neve
   nothing, as intended. The gap that remains is the orchestrator's: a person's form
   answers (a typed field, a note) are not carried, so a repository named only there is not named in an asked run; the person can
   write it in a message.
+
+## Amended 2026-10-19 (the key file next to local commands)
+
+Decision 6 left the exposure of a GitHub App's key file to a startup warning, and a follow-up: "refuse App mode unless the commands
+run in run pods or Podman". The warning was the only guard, and the chart's defaults (`runPods.enabled: false`, `DEVCONTAINER_RUNTIME=off`)
+were the configuration it warned about, so a deployment that never read the log ran with an App that any command could act as, at
+any access tier. [vymalo/another-adam-rs#120](https://github.com/vymalo/another-adam-rs/issues/120) closes that half of the follow-up:
+
+* **The coder refuses to start (exit 78)** with an App whose private key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands
+  of a run run in its own container (`RUN_ENVIRONMENT=local` and `DEVCONTAINER_RUNTIME=off`: `WorkerConfig::commands_can_read_the_app_key`
+  is the whole test, the same that chose the warning), unless the deployment sets `ALLOW_COMMANDS_NEXT_TO_SECRETS=true`. The refusal is
+  a problem of the configuration like any other, reported with the others in one round trip; the message says why and names every way
+  out: run pods (`RUN_ENVIRONMENT=kubernetes`), Podman devcontainers (`DEVCONTAINER_RUNTIME=podman`), or the variable. Accepted, the coder starts and **still logs the warning**. The variable is read as the other
+  flags are (`true`, `1`, `false`, `0`; anything else is exit 78), by the roles that run workers only; a control plane holds no key.
+* **The chart refuses to render the same configuration** (`github.auth: app`, `runPods.enabled: false`) unless
+  `runPods.allowCommandsNextToSecrets: true`, which it renders as the variable, and only when it is `true`. A GitOps sync that fails
+  keeps the running pods; a coder that exits 78 would have replaced them with a crash loop. `config.extraEnv` may not set the variable.
+* **A deployment that ran an App without run pods breaks on upgrade**: it must turn run pods on or accept the risk. The upgrade note is
+  [Upgrading an App deployment](../guides/deploy-the-coder.md#upgrading-an-app-deployment). The operator makes no run pods (ADR 0029) and
+  does not check: an `AgentConfig` with `github.app` takes the variable in `spec.extraEnv`, and the coder refuses to start without it.
+* **What does not change:** a token, an inline key, run pods and Podman devcontainers start as before; the tier is still not a boundary
+  against a command wherever the commands run in the coder's own container, and the other half of the follow-up (a uid that cannot read
+  `/var/run/secrets`) is still not done.

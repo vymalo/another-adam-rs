@@ -135,7 +135,7 @@ The values you will actually set:
 | `config.publicUrl` | the URL clients reach (goes into the agent card); empty is the in-cluster Service URL |
 | `topology` | `combined` (default) or `split`. Switch with `--set topology=split`; the Service selector moves to the front once it exists, so do it at a quiet moment |
 | `replicaCount`, `workspace.placement` | more than one worker **needs** a placement (`isolated`, `affinity` or `shared`, [why](../reference/workspace-and-environments.md#placement-which-worker-holds-a-runs-files)); the chart refuses `replicaCount > 1` without one. Switching between a per-pod and a shared volume needs `kubectl delete statefulset <release>-coder --cascade=orphan` first |
-| `github.auth`, `github.app.*` | `token`, or `app` with exactly one of `installationId` (pinned) or `owners` (the accounts it may act for; no default list) |
+| `github.auth`, `github.app.*` | `token`, or `app` with exactly one of `installationId` (pinned) or `owners` (the accounts it may act for; no default list). **An App needs `runPods.enabled: true`**, or `runPods.allowCommandsNextToSecrets: true` to accept the risk: [upgrading](#upgrading-an-app-deployment) |
 | `config.allowedRepoHosts`, `config.githubApiUrl` | repository hosts the token may go to; GitHub Enterprise: add the host and `https://<host>/api/v3` |
 | `github.createRepoOwners` | owners the coder may create repositories for (a list restricts); empty: the accounts a GitHub App names (not `owners: ["*"]`), and nothing for a token. The person agrees first, unless they picked the `bypass` access tier |
 | `accessTiers.max` | the highest access tier a person may pick: `plan`, `edits`, `auto` (empty, the default) or `bypass`, which is opt-in (rename and delete repositories). With an App and the commands in the coder's container, a command can read the key: [the access tiers](../../deploy/coder/README.md#the-access-tiers) |
@@ -144,7 +144,8 @@ The values you will actually set:
 | `a2a.push.allowedUrls`, `a2a.cardSigning.secretName` | optional A2A push notifications (the webhooks they may reach) and a signed agent card (a Secret with the key), both off by default ([the chart](../../deploy/coder/README.md#push-notifications-and-the-cards-signature-a2a)) |
 | `config.modelExtraBody`, `config.modelEchoReasoning` | to make a model emit its reasoning |
 | `config.modelContextWindow` | the model's context window in tokens (`MODEL_CONTEXT_WINDOW`), so a screen shows how full the context is |
-| `runPods.enabled` | [below](#run-pods) |
+| `runPods.enabled` | [below](#run-pods). Production runs the commands of a run in run pods; [an example of the values](../../deploy/coder/examples/production.values.yaml) |
+| `runPods.allowCommandsNextToSecrets` | `false` (default). `true` accepts that, with an App and no run pods, a command can read the App's key file; only for an upgrade you cannot finish yet: [upgrading](#upgrading-an-app-deployment) |
 
 Render-time guards stop a bad combination at `helm template`, not at rollout (`templates/_validate.tpl`).
 
@@ -157,8 +158,9 @@ Render-time guards stop a bad combination at `helm template`, not at rollout (`t
   `http://127.0.0.1:8080/docs`, **Authorize** with a token and **Try it out**
   ([the chart](../../deploy/coder/README.md#swagger-ui)).
 * Send a task as in [Run it locally](run-locally.md#send-the-coder-a-task) with a real repository.
-* A pod that exits **78** has a configuration problem (the log names the variable); **69** means Postgres is not
-  reachable; a missing `ExternalSecret` property leaves pods in `CreateContainerConfigError`.
+* A pod that exits **78** has a configuration problem (the log names the variable; an App with a key file and no run pods says
+  `refusing to start with the GitHub App's private key in a file`: [upgrading](#upgrading-an-app-deployment)); **69** means
+  Postgres is not reachable; a missing `ExternalSecret` property leaves pods in `CreateContainerConfigError`.
 
 Graceful shutdown gets 120 seconds: on SIGTERM the workers finish the steps they are in; a step cut short by
 SIGKILL is taken over once its lease expires.
@@ -177,6 +179,51 @@ mirror fails in the pod, the coder commits. The template must mount the work cla
 chart's does; a hand-written one that does not stops the coder, exit 78). Details and what is unverified on the owner's cluster:
 [chart README, "Run pods"](../../deploy/coder/README.md#run-pods). The repository's devcontainer is **not** used
 on Kubernetes ([why](../../deploy/coder/README.md#devcontainers-are-off-here)).
+
+## Upgrading an App deployment
+
+**A breaking change** ([vymalo/another-adam-rs#120](https://github.com/vymalo/another-adam-rs/issues/120), ADR 0036 decision 6).
+With `github.auth: app` and `runPods.enabled: false`, the default, the commands of a run (`run_command`, `run_checks`, OpenCode)
+run in the coder's own container as the user that can read the App's private key, a mounted file. A command can read it, mint
+installation tokens and act as the App at **any access tier, a `plan` included**. The coder used to log a warning and go on. It
+now **refuses to start** (exit 78), and the chart **refuses to render**.
+
+| Your release | After the upgrade |
+|---|---|
+| `github.auth: token` | nothing changes |
+| `github.auth: app` and `runPods.enabled: true` | nothing changes: the commands run in pods that have no key |
+| `config.role: control-plane`, or the front of `topology: split` | nothing changes: it runs no command and holds no key |
+| `github.auth: app` and `runPods.enabled: false` | **`helm template` fails** and names the values below |
+
+Choose one, in the same change that moves `image.tag` (the chart's bump):
+
+1. **Turn on run pods** (the safe one): `runPods.enabled: true`. It needs Kubernetes 1.30 or later,
+   `externalSecrets.enabled: true` and the right to make the cluster-scoped objects the chart renders (a `PriorityClass`, a
+   `ValidatingAdmissionPolicy` and its binding); [Run pods](#run-pods) and the
+   [chart README](../../deploy/coder/README.md#run-pods) have the rest, and
+   [`deploy/coder/examples/production.values.yaml`](../../deploy/coder/examples/production.values.yaml) is a complete set of values
+   (an App by owners, the key a file, run pods on) that the render checks assert.
+2. **Accept the risk for now**: `runPods.allowCommandsNextToSecrets: true`. The coder starts as before and still logs the warning
+   at every start. Remove the line when run pods are on. Grant the App only the permissions you can live with meanwhile
+   ([the tiers](../../deploy/coder/README.md#what-the-github-app-must-be-granted)).
+
+The render failing is the point: with Argo CD or another GitOps tool the sync fails and **the running pods stay**, where a rollout
+would replace the coder with one that exits 78 in a loop. Run `helm template` on your values before you merge.
+
+Things to know:
+
+* The chart sets the variable itself, and only when the value is `true`: `config.extraEnv.ALLOW_COMMANDS_NEXT_TO_SECRETS` is
+  refused. If you set it there to get ahead of the upgrade (an older chart accepts it, an older image ignores it), move it to the
+  value in the upgrade.
+* A deployment that pins `image.tag` to a new image under an **older chart** has no value to set and crash-loops: set
+  `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` in `config.extraEnv` first, or move the chart first.
+* The operator makes no run pods ([ADR 0029](../decisions/0029-adam-rs-has-an-operator.md)), so an `AgentConfig` with
+  `github.app` needs `spec.extraEnv.ALLOW_COMMANDS_NEXT_TO_SECRETS: "true"` before its image moves to this revision; the operator
+  does not check for it, the pod exits 78 until it is there ([`examples/coder.yaml`](../../deploy/operator/examples/coder.yaml)).
+  Compose and any other deployment set the variable themselves.
+* A key given **inline** (`GITHUB_APP_PRIVATE_KEY`) is not a file and is not refused. The chart never uses it.
+* To see whether a release is affected, run `helm template` with its values: it fails if it is. A pod that is already failing
+  says `refusing to start with the GitHub App's private key in a file` in its log.
 
 ## A package cache shared by pods
 

@@ -899,10 +899,16 @@ ask for a change the tier forbids) and a server's write tool with a reading name
 **The tier is not a boundary against a command.** `run_command`, `run`, `run_checks` and OpenCode run in the coder's own container
 when there are no run pods and `DEVCONTAINER_RUNTIME=off` (the default), as the user that can read the GitHub App's private key
 **file** (`GITHUB_APP_PRIVATE_KEY_PATH`; a key given inline is hidden from the commands): a command can read it, mint an
-installation token and act as the App at any tier, a `plan` included. The coder logs a **startup warning** when it is an App with
-a key file and the commands run locally (`WorkerConfig::commands_can_read_the_app_key`). Run the commands in run
-pods or Podman devcontainers to confine them; the real fix (a uid that cannot read `/var/run/secrets`, or refusing App mode
-without them) is a follow-up (ADR 0036, decision 6).
+installation token and act as the App at any tier, a `plan` included. **The coder refuses to start in that configuration**
+(exit 78, with every other problem of the configuration) unless the deployment accepts the risk by name with
+`ALLOW_COMMANDS_NEXT_TO_SECRETS=true`; accepted, it starts and logs a **startup warning** that says so
+(`WorkerConfig::commands_can_read_the_app_key`, [Configuration](#configuration)). The ways out that need no acceptance: run the
+commands in run pods (`RUN_ENVIRONMENT=kubernetes`) or in Podman devcontainers (`DEVCONTAINER_RUNTIME=podman`), which have no such
+file. A role that runs no workers (`control-plane`) reads none of this. The
+refusal came with [vymalo/another-adam-rs#120](https://github.com/vymalo/another-adam-rs/issues/120): a deployment that ran an App
+with a key file and no run pods before it **fails to start after it**, and the
+[upgrade note](../../docs/guides/deploy-the-coder.md#upgrading-an-app-deployment) says what to set. The real fix (a uid that cannot
+read `/var/run/secrets`) is still a follow-up (ADR 0036, decision 6).
 
 **What counts as the person's words** (`RunNotes::hear`, `named::typed_by_the_person`): what they typed, in their messages and in
 the typed parts of a form's answer (`other:`, `text:`, `Note:`). They name **repositories** (`RunNotes::named_repos`, which
@@ -1179,7 +1185,8 @@ stateDiagram-v2
   the first four for OpenCode (which reads the model key from its environment). The App's key as a *file*
   (`GITHUB_APP_PRIVATE_KEY_PATH`) is a path, not a secret, and the file is readable by the user the checks run as: **in this
   container (no run pods, `DEVCONTAINER_RUNTIME=off`) a command can read the key and mint a token, so no access tier holds
-  against a command**; the coder warns at startup, and run pods or Podman devcontainers are what confine it. A name in `hide` stays hidden even when a spec sets it.
+  against a command**; the coder refuses to start that way unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it (and then
+  warns at startup), and run pods or Podman devcontainers are what confine it. A name in `hide` stays hidden even when a spec sets it.
 * **A failure to make the environment is a result for the model**, worded `the work environment: <reason>` (the end of a
   failed build's output follows, scrubbed): permanent for a configuration or a build that is wrong, transient for a runtime
   that is down or too slow. Nothing ran, no check cycle was used, no `checks` artifact was emitted. A cancel of the run ends
@@ -1824,6 +1831,7 @@ way; every problem is reported at once at startup):
 | `GITHUB_APP_INSTALLATION_ID` | App mode: **pins** the App to one installation (a positive integer), which serves every repository, with no lookup | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
 | `GITHUB_APP_OWNERS` | App mode **without a pin**: the accounts (users and organisations) the App may act for, separated by commas or spaces, compared without case, or `*` for every account the App is installed on (a startup warning; refused beside other names). The installation of each repository's owner is found with the App's JWT. The chart's `github.app.owners` | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 as GitHub gives it, or PKCS#8): a file, or inline (`\n` escapes accepted). Exactly one. Parsed at startup | one required in App mode |
+| `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` (or `1`) accepts, `false` (or `0`, the default) refuses at startup (**exit 78**), a GitHub App whose private key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in this container (`RUN_ENVIRONMENT=local` with `DEVCONTAINER_RUNTIME=off`): a command runs as the user that can read the file, mints installation tokens and acts as the App at any access tier. Accepted, the coder still logs a warning. `kubernetes`, `podman`, a key given inline and a token need no acceptance and ignore it. Read as every flag of the coder is (`true`/`1`/`false`/`0`, any case); anything else is exit 78. The chart sets it from `runPods.allowCommandsNextToSecrets`; the operator takes it in `extraEnv` | `false` |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `GITHUB_MCP_URL` | where the GitHub MCP server is (`github-mcp-server http`, the sidecar of the pod): an http(s) URL with no credentials, of which only the origin counts. The agent folder's `github` server has to be at that origin, and the coder gives that server the credentials of each call. The chart sets it from `githubMcp.port`; `compose.yaml` points it at `mock-github-mcp`. Read by the roles that run workers | `http://127.0.0.1:8082` |
@@ -2030,7 +2038,9 @@ Both set, an App set that is partial (`GITHUB_APP_ID` without the key, a key wit
 **neither the pin nor the owners**, **a pin together with owners**, **owners with a token**, `*` beside other names, an
 owner that is no account name, an installation ID that is not a positive integer, a key file that cannot be read, and a
 key that is not an unencrypted RSA key in PEM form (PKCS#1, as GitHub lets the owner download it, or PKCS#8) are
-configuration errors: exit 78, every problem listed, the name of the variable and never a value. The key is
+configuration errors: exit 78, every problem listed, the name of the variable and never a value. **So is a key file with the
+commands in this container** unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it ([Access tiers](#access-tiers-what-the-person-lets-it-do-alone);
+`WorkerConfig` has a new field, `allow_commands_next_to_secrets`, so a struct literal of it needs it). The key is
 **parsed at startup**, so a deployment learns of a bad one when it rolls out, not at the first push. A rotated
 key needs a restart. `GITHUB_APP_ID` is the App's application ID or its client ID (the JWT's `iss`).
 **Breaking change of the library's API:** `GitHubAppConfig::installation_id: u64` is now `installations: AppInstallations`
@@ -2502,7 +2512,11 @@ database of its own, so the role needs `CREATEDB`):
   refused at startup naming the variable and not the key; a control plane reads none of it, bad values included;
   `an_app_without_an_installation_id_needs_its_owners` (owners in any separator and case, neither is a problem naming
   both, an entry that is no account name), `the_installation_id_and_the_owners_are_one_or_the_other` (a pin with owners,
-  owners with a token) and `a_star_is_any_owner` (and not beside names)), of
+  owners with a token), `a_star_is_any_owner` (and not beside names), and for `ALLOW_COMMANDS_NEXT_TO_SECRETS`:
+  `an_app_key_file_next_to_local_commands_is_refused_unless_it_is_accepted` (the message, exit 78, `true`/`1`/`false`/`0` in any case),
+  `the_deployments_where_a_command_cannot_read_the_key_start_without_the_override` (run pods, Podman, an inline key, a token, a control
+  plane), `a_value_of_the_override_that_is_not_a_boolean_is_a_configuration_error` and
+  `the_refusal_is_reported_with_the_other_problems_and_never_on_a_guess` (a wrong `RUN_ENVIRONMENT` is the problem, not the key)), of
   `src/redact.rs` (a secret added later is scrubbed by every clone, only the latest 128 are kept,
   `the_redactor_remembers_two_tokens_per_cached_installation`, a token is registered as it is
   handed out, an App's key is redacted as its PEM and as its body) and of `src/repos.rs` (an App mints at the API root, for the
@@ -2511,6 +2525,10 @@ database of its own, so the role needs `CREATEDB`):
   nothing sent); in `tests/binary.rs`, `a_github_app_configuration_is_checked_at_startup_and_exits_78_with_every_problem`,
   `an_app_with_neither_installation_nor_owners_is_refused_at_startup` (neither, a pin with owners, owners with a token:
   78, naming the variables),
+  `an_app_key_file_next_to_local_commands_is_refused_at_startup_unless_accepted` (a key file and the commands in the container: 78
+  before anything starts, saying why and every setting that changes it; `false` and a word that is no boolean too; accepted, it starts
+  and still warns; a key given inline starts without a warning; a control plane reads none of it. The other App tests accept the risk
+  in `app_env`),
   `a_github_app_installation_gets_its_token_minted_and_opens_the_pull_request` (with Postgres: the real binary against a
   mock that hands a token for a JWT, every call to the repositories' API carries it, and no secret is in the output) and
   `a_github_app_without_an_installation_id_opens_pull_requests_for_two_owners` (two tasks for two owners: the installations

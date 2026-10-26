@@ -357,6 +357,16 @@ cache:
 # owner's cluster); the render refuses an older one (`helm template --kube-version`).
 runPods:
   enabled: false
+  # Accept that, with runPods.enabled false, the commands of a run (run_command, run_checks, OpenCode) run in the
+  # coder's own container, as the user that can read the GitHub App's private key (github.auth=app: the chart
+  # always mounts the key as a file). A command can then read the key, mint installation tokens and act as the App
+  # at any access tier, a `plan` included (ADR 0036, decision 6; issue vymalo/another-adam-rs#120). The coder
+  # refuses to start in that configuration unless it is accepted (ALLOW_COMMANDS_NEXT_TO_SECRETS, exit 78), and the
+  # chart refuses to render it, so that a sync fails and keeps the running pods instead of rolling out a coder that
+  # crash-loops. Leave false and set runPods.enabled=true; set true only for a deployment that accepts the risk, and
+  # remove it when run pods are on. Rendered as ALLOW_COMMANDS_NEXT_TO_SECRETS only when true, on the roles that run
+  # workers; config.extraEnv may not set it.
+  allowCommandsNextToSecrets: false
   # The run container's image: the workspace image of another-agentic-images (the toolchains, user 10001, /work),
   # by tag AND digest. *Verified 2026-10-11*: an anonymous ghcr.io token and a manifest request for the tag
   # returned this digest (a single linux/amd64 manifest of 2.92 GB compressed, config `User: agent`,

@@ -136,19 +136,26 @@ jobs:
             --set workspace.placement=shared --set workspace.sharedVolume.storageClass=longhorn \
             --set topology=split --set replicaCount=3 > "$RUNNER_TEMP/rendered-shared-split.yaml"
           # github.auth=app: the key Secret is a second volume of the pod, beside the per-pod claim
-          # template, and beside the shared claim.
+          # template, and beside the shared claim. An App needs run pods: the chart refuses to render the
+          # key file beside local commands unless runPods.allowCommandsNextToSecrets accepts the risk.
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set github.auth=app --set github.app.id=1234567 --set github.app.installationId=98765432 \
-            --set github.app.privateKeySecret=coder-github-app > "$RUNNER_TEMP/rendered-app.yaml"
+            --set github.app.privateKeySecret=coder-github-app --set runPods.enabled=true \
+            > "$RUNNER_TEMP/rendered-app.yaml"
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set github.auth=app --set github.app.id=1234567 --set github.app.installationId=98765432 \
             --set github.app.privateKeySecret=coder-github-app --set workspace.placement=shared \
-            --set workspace.sharedVolume.storageClass=longhorn --set replicaCount=3 \
+            --set workspace.sharedVolume.storageClass=longhorn --set replicaCount=3 --set runPods.enabled=true \
             > "$RUNNER_TEMP/rendered-app-shared.yaml"
-          # The same App with no pin: owners instead of an installation ID (GITHUB_APP_OWNERS).
+          # The same App with no pin: owners instead of an installation ID (GITHUB_APP_OWNERS), and the risk
+          # accepted instead of run pods (ALLOW_COMMANDS_NEXT_TO_SECRETS, rendered only when it is true).
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set github.auth=app --set github.app.id=1234567 --set 'github.app.owners={acme,octocat}' \
-            --set github.app.privateKeySecret=coder-github-app > "$RUNNER_TEMP/rendered-app-owners.yaml"
+            --set github.app.privateKeySecret=coder-github-app --set runPods.allowCommandsNextToSecrets=true \
+            > "$RUNNER_TEMP/rendered-app-owners.yaml"
+          # The production values: an App by owners, the key a file, run pods on.
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            -f deploy/coder/examples/production.values.yaml > "$RUNNER_TEMP/rendered-production.yaml"
           # The extra MCP servers on (mcp.websearch.url and mcp.context7.enabled): the servers ConfigMap and
           # its volume, in the combined pod, and in the split worker (the front gets none).
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
@@ -180,7 +187,7 @@ jobs:
                 "$RUNNER_TEMP/rendered-split.yaml" "$RUNNER_TEMP/rendered-isolated.yaml" \
                 "$RUNNER_TEMP/rendered-affinity.yaml" "$RUNNER_TEMP/rendered-shared-split.yaml" \
                 "$RUNNER_TEMP/rendered-app.yaml" "$RUNNER_TEMP/rendered-app-shared.yaml" \
-                "$RUNNER_TEMP/rendered-app-owners.yaml" \
+                "$RUNNER_TEMP/rendered-app-owners.yaml" "$RUNNER_TEMP/rendered-production.yaml" \
                 "$RUNNER_TEMP/rendered-mcp.yaml" "$RUNNER_TEMP/rendered-mcp-split.yaml" \
                 "$RUNNER_TEMP/rendered-a2a.yaml" "$RUNNER_TEMP/rendered-a2a-split.yaml" \
                 "$RUNNER_TEMP/rendered-model-url.yaml" "$RUNNER_TEMP/rendered-model-url-split.yaml" \

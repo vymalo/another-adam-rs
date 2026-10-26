@@ -184,6 +184,26 @@ Whether this pod authenticates to GitHub as an App installation: github.auth=app
 {{- end -}}
 
 {{/*
+Whether the deployment accepts that a command can read a secret of the coder's own container
+(runPods.allowCommandsNextToSecrets): the value is true and the role runs workers (a control plane runs no
+command). Renders "true" or nothing, like coder.runsWorkers. ALLOW_COMMANDS_NEXT_TO_SECRETS is rendered only then.
+*/}}
+{{- define "coder.allowCommandsNextToSecrets" -}}
+{{- if and (eq (toString .Values.runPods.allowCommandsNextToSecrets) "true") (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Whether a command of a run can read the GitHub App's private key: the pod authenticates as an App, whose key the
+chart always mounts as a file, and the commands run in the coder's own container (no run pods, and no Podman
+devcontainers named in config.extraEnv: the chart sets no DEVCONTAINER_* itself). The chart refuses it unless it is
+accepted, as the coder does (`WorkerConfig::commands_can_read_the_app_key`, bin/adam-coder/src/config.rs). Renders
+"true" or nothing.
+*/}}
+{{- define "coder.commandsReadTheAppKey" -}}
+{{- if and (include "coder.githubApp" .) (not (include "coder.runPods" .)) (ne (lower (trim (toString (get .Values.config.extraEnv "DEVCONTAINER_RUNTIME")))) "podman") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 Whether this pod runs the GitHub MCP server beside the coder (a native sidecar): githubMcp.enabled, and the
 role runs workers (a control plane connects no MCP server). Renders "true" or nothing, like coder.runsWorkers.
 */}}

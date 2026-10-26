@@ -24,6 +24,7 @@ helm lint deploy/coder
 helm template coder deploy/coder --namespace another-agentic-system
 sh deploy/coder/tests/render-check.sh   # the guarantees above, asserted on the render
 helm template coder deploy/coder --set topology=split   # front Deployment + worker StatefulSet
+helm template coder deploy/coder -f deploy/coder/examples/production.values.yaml   # an App with run pods: the shape a production deployment has
 ```
 
 `image.tag` is bumped by `.github/workflows/coder.yml` on every green build of
@@ -384,14 +385,15 @@ accepts exactly one (`bin/adam-coder/README.md`, "GitHub credentials").
 
 ```sh
 helm template coder deploy/coder --set github.auth=app --set github.app.id=1234567 \
-  --set github.app.installationId=98765432 --set github.app.privateKeySecret=coder-github-app
+  --set github.app.installationId=98765432 --set github.app.privateKeySecret=coder-github-app --set runPods.enabled=true
 helm template coder deploy/coder --set github.auth=app --set github.app.id=1234567 \
-  --set 'github.app.owners={acme,octocat}' --set github.app.privateKeySecret=coder-github-app
+  --set 'github.app.owners={acme,octocat}' --set github.app.privateKeySecret=coder-github-app --set runPods.enabled=true
 ```
 
 The render fails, naming the value, for `github.auth` that is neither, and (for a role that runs workers, in app
 mode) for an empty `github.app.id`, an `installationId` that is not a positive integer, **both `installationId` and
-`owners`**, **neither of them**, or an empty `privateKeySecret`. A numeric `id` or `installationId` from a values file keeps its
+`owners`**, **neither of them**, an empty `privateKeySecret`, or **`runPods.enabled: false` without
+`runPods.allowCommandsNextToSecrets: true`** (the key file would be next to the commands, [The access tiers](#the-access-tiers)). A numeric `id` or `installationId` from a values file keeps its
 digits (Helm reads such numbers as floats; the chart converts them). A control plane renders no GitHub setting and no key volume in
 either mode, and with `topology: split` only the worker StatefulSet has them. The coder reads the key at startup: after
 rotating the Secret, restart the pods. The key is a second volume of the pod, beside the per-pod claim or the shared one
@@ -429,10 +431,17 @@ credentials you are willing to see used that way. Do not also set `config.extraE
 **The tier is not a boundary against a command.** With `runPods.enabled: false` and no Podman devcontainers (the default),
 `run_command`, `run`, `run_checks` and OpenCode run **in the coder's own container**, as the user that holds the GitHub App's
 private key (a mounted file, `/var/run/secrets/github-app/private-key.pem`; the chart always uses the file form). A command can read it, mint an installation token
-and do whatever the App may, at any tier, a `plan` included. The coder logs a startup warning when it is an App and the commands
-run locally. If that is not acceptable: run the commands in run pods (`runPods.enabled: true`, [below](#run-pods)) or in Podman
-devcontainers (`DEVCONTAINER_RUNTIME=podman`), or grant the App only what you can live with. (A follow-up, not done: run local
-commands as a user that cannot read `/var/run/secrets`, or refuse App mode without run pods or Podman.)
+and do whatever the App may, at any tier, a `plan` included. **So an App needs run pods: the chart refuses to render
+`github.auth: app` with `runPods.enabled: false`, and the coder refuses to start that way (exit 78)**
+([vymalo/another-adam-rs#120](https://github.com/vymalo/another-adam-rs/issues/120)). Set `runPods.enabled: true`
+([below](#run-pods); [`examples/production.values.yaml`](examples/production.values.yaml) is a complete set of values that
+`tests/render-check.sh` renders and asserts), or **accept the risk** with `runPods.allowCommandsNextToSecrets: true`, which the chart
+renders as `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` (only when it is `true`, and on the roles that run workers; `config.extraEnv` may not set it).
+Accepted, the coder starts and still logs the warning at every start. The failure is at `helm template`, not at the rollout: a GitOps
+sync that fails keeps the running pods, where a coder that exits 78 would crash-loop. A token (`github.auth: token`), a control plane and
+the front of `topology: split` are not affected. **A deployment that runs an App without run pods fails to render after this change**:
+[upgrading an App deployment](../../docs/guides/deploy-the-coder.md#upgrading-an-app-deployment) says what to set. (A follow-up, not done: run
+local commands as a user that cannot read `/var/run/secrets`.)
 
 ### What the GitHub App must be granted
 
@@ -637,6 +646,9 @@ run, the project's checks, the commands that look around, OpenCode and everythin
 a pod's memory and not by the coder's. The files, git and every credential stay in the coder pod, which then needs about 1Gi instead of 6Gi.
 **Off by default, and then invisible**: the render is the golden `tests/golden/combined.yaml`, byte for byte (the chart version moved to 0.3.0, the one
 line that differs). Nothing of it is rendered for a control plane (`config.role: control-plane`), which starts no commands.
+**With `github.auth: app` it is required**, unless `runPods.allowCommandsNextToSecrets: true` accepts that a command can read the
+App's key ([The access tiers](#the-access-tiers)); the value is `false` by default, is rendered as `ALLOW_COMMANDS_NEXT_TO_SECRETS=true`
+only when it is `true`, and should be removed when run pods are on.
 
 What it renders, and why each is there:
 

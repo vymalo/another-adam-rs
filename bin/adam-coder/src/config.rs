@@ -21,6 +21,7 @@
 //! | `GITHUB_APP_INSTALLATION_ID` | the installation's ID, a positive integer: **pins** the App to that one installation, which serves every repository (no lookup) | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
 //! | `GITHUB_APP_OWNERS` | the accounts (users and organisations, comma- or space-separated, compared without case) the App may act for, **without a pin**: the installation of each repository's owner is found with the App's JWT. `*` is every account the App is installed on (a startup warning: a public App can be installed by anyone). Refused with a pin and in token mode (exit 78) | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 //! | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 or PKCS#8), as a file or inline (`\n` escapes accepted); exactly one; parsed at startup | one required in App mode |
+//! | `ALLOW_COMMANDS_NEXT_TO_SECRETS` | roles that run workers: `true` accepts, and `false` (the default) refuses at startup (exit 78), a GitHub App whose private key is a **file** (`GITHUB_APP_PRIVATE_KEY_PATH`) while the commands of a run run in this container (`RUN_ENVIRONMENT=local` with `DEVCONTAINER_RUNTIME=off`): a command runs as the user that can read the file, so it can mint installation tokens and act as the App at any access tier, a `plan` included. The coder still logs a warning when it is accepted. Nothing else reads it: `kubernetes`, `podman` and a key given inline (`GITHUB_APP_PRIVATE_KEY`) need no override. `true`, `1`, `false` and `0` (any case); anything else is exit 78 | `false` |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them; the first is the host `owner/name` stands for | `github.com` |
 //! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees (not under the `bypass` access tier). A list restricts to exactly these. Empty: a GitHub App creates for the accounts it acts for (**not** with `GITHUB_APP_OWNERS=*`: list the owners), a token creates nothing (the tool is off) | empty |
 //! | `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass` ([`tier`](crate::tier)). The card lists the tiers up to it and the tools check it again. `bypass` (rename and delete repositories, no consent form) is the deployment's opt-in. Read by every role | `auto` |
@@ -213,6 +214,10 @@ pub struct WorkerConfig {
     /// `RUN_ENVIRONMENT` and `RUN_POD_*`: this container (with the devcontainers above), or a pod of
     /// its own for each run.
     pub run_environment: RunEnvironment,
+    /// `ALLOW_COMMANDS_NEXT_TO_SECRETS`: the deployment accepts that a command can read a secret
+    /// that is a file of this container (see [`WorkerConfig::commands_can_read_the_app_key`]).
+    /// Without it such a configuration is refused when it is read.
+    pub allow_commands_next_to_secrets: bool,
 }
 
 /// Where the commands of a run run (`RUN_ENVIRONMENT`). A closed enum on purpose: a new place must
@@ -930,6 +935,10 @@ impl std::fmt::Debug for WorkerConfig {
             .field("extra_mcp_file", &self.extra_mcp_file)
             .field("devcontainer", &self.devcontainer)
             .field("run_environment", &self.run_environment)
+            .field(
+                "allow_commands_next_to_secrets",
+                &self.allow_commands_next_to_secrets,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1008,6 +1017,10 @@ impl WorkerConfig {
     /// `DEVCONTAINER_RUNTIME=off`), as the user that holds the file. Then any access tier, a `plan`
     /// too, can mint an installation token and do what the App may. A run pod or a Podman
     /// devcontainer has no such file, and a key given inline is hidden from the commands.
+    ///
+    /// Reading the configuration refuses this unless `ALLOW_COMMANDS_NEXT_TO_SECRETS` accepts it
+    /// ([`WorkerConfig::allow_commands_next_to_secrets`]), so a worker that is running has either
+    /// `false` here or the deployment's explicit consent.
     pub fn commands_can_read_the_app_key(&self) -> bool {
         matches!(&self.github, GitHubAuth::App(app) if app.key_file)
             && matches!(self.run_environment, RunEnvironment::Local)
@@ -1090,6 +1103,10 @@ impl WorkerConfig {
             parse_or(get, "CHECK_OUTPUT_TAIL_BYTES", 16_384usize, problems).max(256);
         let pr_draft = parse_flag(get, "PR_DRAFT", problems);
         let allow_local_repos = parse_flag(get, "ALLOW_LOCAL_REPOS", problems);
+        let before_flag = problems.len();
+        let allow_commands_next_to_secrets =
+            parse_flag(get, "ALLOW_COMMANDS_NEXT_TO_SECRETS", problems);
+        let flag_is_valid = problems.len() == before_flag;
         let mcp = McpSettings::parse(lookup, problems);
         let extra_mcp_file = adam_service::parse_file(get, adam::EXTRA_MCP_FILE_ENV, problems);
         let allowed_repo_hosts = match get("ALLOWED_REPO_HOSTS") {
@@ -1171,6 +1188,7 @@ impl WorkerConfig {
             .map(str::to_owned)
             .collect();
 
+        let before_environment = problems.len();
         let devcontainer = DevcontainerConfig::parse(
             get,
             settings.worker_id.as_deref(),
@@ -1178,13 +1196,14 @@ impl WorkerConfig {
             problems,
         );
         let run_environment = RunEnvironment::parse(get, &devcontainer, problems);
+        let environment_is_known = problems.len() == before_environment;
 
         // `github`, `github_api_url` and `github_mcp_url` are `None` only after a problem was
         // recorded above.
         let github = github?;
         let github_api_url = github_api_url?;
         let github_mcp_url = github_mcp_url?;
-        Some(Self {
+        let worker = Self {
             model,
             opencode_model,
             github,
@@ -1209,12 +1228,35 @@ impl WorkerConfig {
             pr_draft,
             devcontainer,
             run_environment,
+            allow_commands_next_to_secrets,
             opencode_command,
             mcp,
             extra_mcp_file,
-        })
+        };
+        // The default is the safe deployment: a key a command can read is a configuration error
+        // (exit 78) that the deployment accepts by name, not a line in a log that somebody may read.
+        // Only when it is known: a wrong `RUN_ENVIRONMENT` or `RUN_POD_*` leaves `Local` in its place,
+        // and a flag that is neither `true` nor `false` reads as `false`; the problem recorded for
+        // either says what to fix.
+        if flag_is_valid
+            && environment_is_known
+            && worker.commands_can_read_the_app_key()
+            && !worker.allow_commands_next_to_secrets
+        {
+            problems.push(COMMANDS_NEXT_TO_THE_APP_KEY.into());
+        }
+        Some(worker)
     }
 }
+
+/// The problem reported when a command can read the GitHub App's key file and the deployment has
+/// not accepted it (`ALLOW_COMMANDS_NEXT_TO_SECRETS`): why, and every way out.
+const COMMANDS_NEXT_TO_THE_APP_KEY: &str = "refusing to start with the GitHub App's private key in a file \
+    (GITHUB_APP_PRIVATE_KEY_PATH) next to the commands of a run (run_command, run, run_checks, OpenCode): they run \
+    in this container (RUN_ENVIRONMENT=local, DEVCONTAINER_RUNTIME=off) as the user that can read the file, so a \
+    command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included. \
+    Change one of these: run the commands in run pods (RUN_ENVIRONMENT=kubernetes) or in Podman devcontainers \
+    (DEVCONTAINER_RUNTIME=podman), or accept the risk with ALLOW_COMMANDS_NEXT_TO_SECRETS=true";
 
 /// `GITHUB_APP_OWNERS`: account names separated by commas or white space, compared without case, or
 /// `*` alone for every account the App is installed on. A name that is no account name, `*` beside
@@ -2124,13 +2166,19 @@ mod tests {
 
     use adam_workspace::testing::TestAppKey;
 
-    /// `full()` without the token, as owned strings, plus `extra`.
+    /// `full()` without the token, as owned strings, plus `extra`. The commands run in this container
+    /// and most tests that use this have a key file: they are about the App's settings, so they accept
+    /// what the default refuses (`ALLOW_COMMANDS_NEXT_TO_SECRETS`); `an_app_key_file_*` below do not.
     fn without_token(extra: &[(&str, String)]) -> HashMap<String, String> {
         let mut vars: HashMap<String, String> = full()
             .into_iter()
             .filter(|(k, _)| *k != "GITHUB_TOKEN")
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
+        vars.insert(
+            "ALLOW_COMMANDS_NEXT_TO_SECRETS".to_owned(),
+            "true".to_owned(),
+        );
         vars.extend(extra.iter().map(|(k, v)| ((*k).to_owned(), v.clone())));
         vars
     }
@@ -3116,5 +3164,217 @@ mod tests {
         inline.remove("GITHUB_TOKEN");
         let inline = parse_owned(&inline).unwrap().worker.unwrap();
         assert!(!inline.commands_can_read_the_app_key());
+    }
+
+    // ----- ALLOW_COMMANDS_NEXT_TO_SECRETS ---------------------------------------------------------
+
+    /// An App with its key in a file under `dir` and the commands in this container, as the
+    /// default deployment of the chart was: the combination the coder refuses unless it is accepted.
+    fn app_key_file_next_to_local_commands(dir: &std::path::Path) -> HashMap<String, String> {
+        let mut vars = without_token(&owners_vars("acme", dir));
+        vars.remove("ALLOW_COMMANDS_NEXT_TO_SECRETS");
+        vars
+    }
+
+    fn is_the_refusal(problem: &str) -> bool {
+        problem.starts_with("refusing to start with the GitHub App's private key in a file")
+    }
+
+    /// The default is the safe deployment: a key a command can read is a configuration error (exit
+    /// 78) that says why and names every way out, and the deployment accepts the risk by name.
+    #[test]
+    fn an_app_key_file_next_to_local_commands_is_refused_unless_it_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = app_key_file_next_to_local_commands(dir.path());
+        let error = parse_owned(&vars).expect_err("refused by default");
+        let refusals: Vec<&String> = error
+            .problems
+            .iter()
+            .filter(|p| is_the_refusal(p))
+            .collect();
+        assert_eq!(refusals.len(), 1, "{:?}", error.problems);
+        assert_eq!(error.problems.len(), 1, "nothing else is wrong: {error}");
+        let message = refusals[0];
+        // Why, and which setting to change: each way out is named, with its value.
+        for part in [
+            "GITHUB_APP_PRIVATE_KEY_PATH",
+            "RUN_ENVIRONMENT=local",
+            "DEVCONTAINER_RUNTIME=off",
+            "any access tier, a `plan` included",
+            "RUN_ENVIRONMENT=kubernetes",
+            "DEVCONTAINER_RUNTIME=podman",
+            "ALLOW_COMMANDS_NEXT_TO_SECRETS=true",
+        ] {
+            assert!(message.contains(part), "{part:?} missing from: {message}");
+        }
+        assert!(!message.contains("BEGIN"), "no key material: {message}");
+        // A configuration error is exit code 78: a supervisor does not restart it.
+        assert_eq!(
+            crate::exit_code(&anyhow::Error::from(error)),
+            crate::exit::EX_CONFIG
+        );
+
+        // Accepted, in the forms every flag of the coder is read in: it starts, as before, and the
+        // worker still knows that the commands can read the key (`serve` logs a warning for it).
+        for accepted in ["true", "TRUE", "True", "1"] {
+            let mut vars = app_key_file_next_to_local_commands(dir.path());
+            vars.insert("ALLOW_COMMANDS_NEXT_TO_SECRETS".into(), accepted.to_owned());
+            let worker = parse_owned(&vars)
+                .unwrap_or_else(|e| panic!("{accepted:?}: {e}"))
+                .worker
+                .unwrap();
+            assert!(worker.allow_commands_next_to_secrets, "{accepted:?}");
+            assert!(worker.commands_can_read_the_app_key(), "{accepted:?}");
+        }
+        // Said as no, or not said: refused.
+        for declined in ["false", "FALSE", "0"] {
+            let mut vars = app_key_file_next_to_local_commands(dir.path());
+            vars.insert("ALLOW_COMMANDS_NEXT_TO_SECRETS".into(), declined.to_owned());
+            let problems = problems_of(&vars);
+            assert!(problems.iter().any(|p| is_the_refusal(p)), "{declined}");
+        }
+        // A blank value is no value.
+        let mut vars = app_key_file_next_to_local_commands(dir.path());
+        vars.insert("ALLOW_COMMANDS_NEXT_TO_SECRETS".into(), "  ".into());
+        assert!(problems_of(&vars).iter().any(|p| is_the_refusal(p)));
+    }
+
+    /// Where the commands do not run next to the key, or there is no key file to read, nothing is
+    /// refused and nothing needs to be accepted: the deployments that are safe start as before.
+    #[test]
+    fn the_deployments_where_a_command_cannot_read_the_key_start_without_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Run pods: the commands run in a pod that has no such file.
+        let mut vars = app_key_file_next_to_local_commands(dir.path());
+        let template = dir.path().join("pod.yaml");
+        std::fs::write(&template, "spec: {containers: []}\n").unwrap();
+        vars.extend([
+            ("RUN_ENVIRONMENT".to_owned(), "kubernetes".to_owned()),
+            (
+                "RUN_POD_TEMPLATE_FILE".to_owned(),
+                template.to_string_lossy().into_owned(),
+            ),
+            ("RUN_POD_NAMESPACE".to_owned(), "coder-ns".to_owned()),
+            ("RUN_POD_INSTANCE".to_owned(), "coder".to_owned()),
+        ]);
+        let worker = parse_owned(&vars).unwrap().worker.unwrap();
+        assert!(matches!(
+            worker.run_environment,
+            RunEnvironment::Kubernetes(_)
+        ));
+        assert!(!worker.commands_can_read_the_app_key());
+        assert!(!worker.allow_commands_next_to_secrets);
+
+        // Podman devcontainers: the repository's container has no such file either.
+        let mut vars = app_key_file_next_to_local_commands(dir.path());
+        vars.extend([
+            ("DEVCONTAINER_RUNTIME".to_owned(), "podman".to_owned()),
+            (
+                "CONTAINER_HOST".to_owned(),
+                "unix:///run/podman/podman.sock".to_owned(),
+            ),
+            ("OPENCODE_BINARY".to_owned(), elf_in(dir.path(), "opencode")),
+        ]);
+        let worker = parse_owned(&vars).unwrap().worker.unwrap();
+        assert!(!worker.commands_can_read_the_app_key());
+
+        // A key given inline is not a file: nothing is refused.
+        let key = TestAppKey::generate();
+        let mut vars = app_key_file_next_to_local_commands(dir.path());
+        vars.remove("GITHUB_APP_PRIVATE_KEY_PATH");
+        vars.insert("GITHUB_APP_PRIVATE_KEY".into(), key.pkcs8_pem.clone());
+        let worker = parse_owned(&vars).unwrap().worker.unwrap();
+        assert!(!worker.commands_can_read_the_app_key());
+
+        // A token has no key file.
+        assert!(parse(&full()).is_ok());
+
+        // A control plane runs no commands and holds no key: it reads none of this.
+        let mut vars = app_key_file_next_to_local_commands(dir.path());
+        vars.insert("ROLE".into(), "control-plane".into());
+        vars.insert("ALLOW_COMMANDS_NEXT_TO_SECRETS".into(), "perhaps".into());
+        assert!(parse_owned(&vars).unwrap().worker.is_none());
+    }
+
+    /// A value that is neither `true` nor `false` is a configuration error naming the variable, and
+    /// it is the only one reported for it: the refusal depends on a value nobody can read yet.
+    #[test]
+    fn a_value_of_the_override_that_is_not_a_boolean_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["yes", "on", "enabled", "2"] {
+            let mut vars = app_key_file_next_to_local_commands(dir.path());
+            vars.insert("ALLOW_COMMANDS_NEXT_TO_SECRETS".into(), bad.to_owned());
+            let error = parse_owned(&vars).expect_err(bad);
+            assert_eq!(error.problems.len(), 1, "{bad}: {:?}", error.problems);
+            assert!(
+                error.problems[0]
+                    .starts_with("ALLOW_COMMANDS_NEXT_TO_SECRETS must be true or false")
+                    && error.problems[0].contains(&format!("{bad:?}")),
+                "{bad}: {:?}",
+                error.problems
+            );
+            assert_eq!(
+                crate::exit_code(&anyhow::Error::from(error)),
+                crate::exit::EX_CONFIG,
+                "{bad}"
+            );
+        }
+        // Read, and so checked, wherever a worker is: a token deployment with a bad value is wrong too.
+        let mut vars = owned_full();
+        vars.insert("ALLOW_COMMANDS_NEXT_TO_SECRETS", "yes".into());
+        assert!(
+            kube_problems(&vars)
+                .iter()
+                .any(|p| p.starts_with("ALLOW_COMMANDS_NEXT_TO_SECRETS"))
+        );
+        // Accepting what nothing needs accepted is harmless.
+        let mut vars = owned_full();
+        vars.insert("ALLOW_COMMANDS_NEXT_TO_SECRETS", "true".into());
+        assert!(
+            parse_dc(&vars)
+                .unwrap()
+                .worker
+                .unwrap()
+                .allow_commands_next_to_secrets
+        );
+    }
+
+    /// The refusal is one problem among the others: a deployment is fixed in one round trip. And it
+    /// is not added when where the commands run is itself wrong (`Local` is then a placeholder).
+    #[test]
+    fn the_refusal_is_reported_with_the_other_problems_and_never_on_a_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = app_key_file_next_to_local_commands(dir.path());
+        vars.insert("WORKERS".into(), "none".into());
+        let problems = problems_of(&vars);
+        assert!(problems.iter().any(|p| is_the_refusal(p)), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.starts_with("WORKERS")),
+            "{problems:?}"
+        );
+
+        // RUN_ENVIRONMENT=kubernetes without its template: the run pod variable is the problem, not
+        // the key (the commands would not run here).
+        let mut vars = app_key_file_next_to_local_commands(dir.path());
+        vars.insert("RUN_ENVIRONMENT".into(), "kubernetes".into());
+        vars.insert("RUN_POD_NAMESPACE".into(), "coder-ns".into());
+        vars.insert("RUN_POD_INSTANCE".into(), "coder".into());
+        let problems = problems_of(&vars);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("RUN_POD_TEMPLATE_FILE is required")),
+            "{problems:?}"
+        );
+        assert!(!problems.iter().any(|p| is_the_refusal(p)), "{problems:?}");
+        let mut vars = app_key_file_next_to_local_commands(dir.path());
+        vars.insert("RUN_ENVIRONMENT".into(), "docker".into());
+        let problems = problems_of(&vars);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("must be local or kubernetes"),
+            "{problems:?}"
+        );
     }
 }

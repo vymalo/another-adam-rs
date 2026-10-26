@@ -26,4 +26,12 @@ Workspace placement: {{ . }}
 GitHub: App {{ include "coder.githubAppId" . }}, installation {{ include "coder.githubAppInstallationId" . }}. The coder trades a JWT signed with
 the key in Secret {{ .Values.github.app.privateKeySecret }} (key private-key.pem) for installation access tokens, and renews
 them before they run out. It reads the key at startup: after rotating it, restart the pods.
+{{- if include "coder.allowCommandsNextToSecrets" . }}
+{{- if include "coder.commandsReadTheAppKey" . }}
+
+WARNING: the commands of a run (run_command, run_checks, OpenCode) run in the coder's own container, as the user that
+can read the App's key (runPods.allowCommandsNextToSecrets accepts that). A command can mint installation tokens and
+act as the App at any access tier. Turn on runPods.enabled to remove the risk.
+{{- end }}
+{{- end }}
 {{- end }}

@@ -238,6 +238,8 @@ mod tests {
                 ("GITHUB_APP_ID", "12345"),
                 ("GITHUB_APP_INSTALLATION_ID", "67890"),
                 ("GITHUB_APP_PRIVATE_KEY_PATH", &file.to_string_lossy()),
+                // These tests run no command; the default refuses a key file next to local commands.
+                ("ALLOW_COMMANDS_NEXT_TO_SECRETS", "true"),
                 ("GITHUB_API_URL", &github.uri()),
             ],
             &tmp.path().join("work"),
@@ -336,6 +338,8 @@ mod tests {
                 ("GITHUB_APP_ID", "12345"),
                 ("GITHUB_APP_OWNERS", "Acme octocat"),
                 ("GITHUB_APP_PRIVATE_KEY_PATH", &file.to_string_lossy()),
+                // These tests run no command; the default refuses a key file next to local commands.
+                ("ALLOW_COMMANDS_NEXT_TO_SECRETS", "true"),
                 ("GITHUB_API_URL", &github.uri()),
             ],
             &tmp.path().join("work"),
