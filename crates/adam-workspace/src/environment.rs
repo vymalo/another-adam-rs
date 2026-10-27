@@ -197,6 +197,31 @@ pub enum SecretRef {
     File(PathBuf),
 }
 
+/// What a sandbox reserves for the processes in it: the shape a command's time is weighted by when an
+/// environment meters it ([`EnvSession::sandbox_shape`]).
+///
+/// A run pod's is the **requests** of the run container in the deployment's pod template (what the
+/// scheduler reserves and the quota counts; limits are not a cost). A request the template does not
+/// make is `None`, which is not zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct SandboxShape {
+    /// CPU, in thousandths of a core (`250` is `250m`).
+    pub cpu_millis: Option<u64>,
+    /// Memory, in bytes.
+    pub memory_bytes: Option<u64>,
+}
+
+impl SandboxShape {
+    /// A shape that reserves `cpu_millis` and `memory_bytes`.
+    pub fn new(cpu_millis: Option<u64>, memory_bytes: Option<u64>) -> Self {
+        Self {
+            cpu_millis,
+            memory_bytes,
+        }
+    }
+}
+
 /// What an environment is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -398,6 +423,16 @@ pub trait EnvSession: Send + Sync {
     /// caller uses the program as it names it (the default, and [`Local`]).
     fn tool_path(&self, name: &str) -> Option<PathBuf> {
         let _ = name;
+        None
+    }
+
+    /// What a process in this environment reserves, **when the environment meters the time of its
+    /// processes**: the coder reports how long each command ran, weighted by this shape, as the run's
+    /// sandbox usage (ADR 0043). `None`, the default, is an environment that is not metered (the
+    /// caller's own container, a dev container): the usage says where the run was and not how long,
+    /// which is *not measured* and not zero. An implementation that wraps another one must forward
+    /// this ([`HidingEnvironment`] does), or the default hides the shape.
+    fn sandbox_shape(&self) -> Option<SandboxShape> {
         None
     }
 
@@ -682,6 +717,10 @@ impl EnvSession for HidingSession {
         self.inner.tool_path(name)
     }
 
+    fn sandbox_shape(&self) -> Option<SandboxShape> {
+        self.inner.sandbox_shape()
+    }
+
     fn secret_ref(&self, name: &str) -> Option<SecretRef> {
         self.inner.secret_ref(name)
     }
@@ -935,6 +974,86 @@ mod tests {
         assert_eq!(
             session.secret_ref("model-key"),
             Some(SecretRef::Env("MODEL_API_KEY".to_owned()))
+        );
+    }
+
+    /// An environment whose sessions say they are metered.
+    struct Metered;
+
+    struct MeteredSession;
+
+    #[async_trait]
+    impl EnvSession for MeteredSession {
+        fn describe(&self) -> EnvDescription {
+            EnvDescription {
+                kind: EnvKind::Kubernetes {
+                    pod: "adam-run-x".to_owned(),
+                    image: None,
+                },
+                summary: "a metered pod".to_owned(),
+            }
+        }
+
+        fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {
+            LocalSession.prepare(spec)
+        }
+
+        async fn kill(&self, _exec: &ExecId) {}
+
+        fn sandbox_shape(&self) -> Option<SandboxShape> {
+            Some(SandboxShape::new(Some(250), Some(512 * 1024 * 1024)))
+        }
+
+        fn secret_ref(&self, _name: &str) -> Option<SecretRef> {
+            None
+        }
+    }
+
+    #[async_trait]
+    impl Environment for Metered {
+        async fn ensure(
+            &self,
+            _workspace: &RunWorkspace,
+            _progress: &dyn EnvProgress,
+        ) -> Result<Arc<dyn EnvSession>, EnvError> {
+            Ok(Arc::new(MeteredSession))
+        }
+
+        async fn release(&self, _run: &str) -> Result<(), EnvError> {
+            Ok(())
+        }
+
+        async fn held_runs(&self) -> Result<Vec<String>, EnvError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_environment_is_not_metered_unless_its_session_says_so_and_wrapping_it_keeps_what_it_says()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            LocalSession.sandbox_shape(),
+            None,
+            "the caller's own container is not metered"
+        );
+
+        let hiding = HidingEnvironment::new(Arc::new(Local), ["MCP_SECRET"]);
+        let session = hiding
+            .ensure(&a_run(dir.path()), &NoProgress)
+            .await
+            .unwrap();
+        assert_eq!(session.sandbox_shape(), None);
+
+        let hiding = HidingEnvironment::new(Arc::new(Metered), ["MCP_SECRET"]);
+        let session = hiding
+            .ensure(&a_run(dir.path()), &NoProgress)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.sandbox_shape(),
+            Some(SandboxShape::new(Some(250), Some(512 * 1024 * 1024))),
+            "the wrapper forwards the shape: the default would hide it"
         );
     }
 }

@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use adam_workspace::{EnvError, RunWorkspace};
+use adam_workspace::{EnvError, RunWorkspace, SandboxShape};
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, VolumeMount};
 use serde_json::Value;
 
@@ -27,6 +27,7 @@ use crate::names::{
     INSTANCE_LABEL, MANAGED_BY, MANAGED_BY_LABEL, MOUNTS_ANNOTATION, RUN_ID_ANNOTATION, RUN_LABEL,
     WORKER_ANNOTATION, run_hash,
 };
+use crate::quantity;
 
 /// A checked pod template.
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ pub struct PodTemplate {
     pod: Pod,
     container: String,
     workspace: WorkspaceVolume,
+    shape: SandboxShape,
 }
 
 /// The one mount of the workspace volume the template has, which the code replaces.
@@ -103,10 +105,12 @@ impl PodTemplate {
         check(&pod, container).map_err(wrong)?;
         let root = std::path::absolute(workspace_root).unwrap_or_else(|_| workspace_root.into());
         let workspace = locate_workspace(&pod, container, &root).map_err(wrong)?;
+        let shape = requests_of(&pod, container).map_err(wrong)?;
         Ok(Self {
             pod,
             container: container.to_owned(),
             workspace,
+            shape,
         })
     }
 
@@ -143,6 +147,14 @@ impl PodTemplate {
     /// The name of the container the processes run in.
     pub fn container(&self) -> &str {
         &self.container
+    }
+
+    /// What the pod reserves: the **requests** of the container the processes run in, which is
+    /// what the scheduler reserves and the namespace's quota counts (limits are not read). A request
+    /// the template does not make is `None`, not zero. A command's time in the pod is weighted by this
+    /// ([`EnvSession::sandbox_shape`](adam_workspace::EnvSession::sandbox_shape)).
+    pub fn sandbox_shape(&self) -> SandboxShape {
+        self.shape
     }
 
     /// Where the template mounts the workspace volume: the volume's root is this directory, and the
@@ -302,6 +314,35 @@ fn check(pod: &Pod, container: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The requests of the run container as a shape. A request that is not a quantity is an error, so
+/// that it fails the coder's start (the cluster would refuse the pod, run after run).
+fn requests_of(pod: &Pod, container: &str) -> Result<SandboxShape, String> {
+    let requests = pod
+        .spec
+        .iter()
+        .flat_map(|spec| &spec.containers)
+        .find(|c| c.name == container)
+        .and_then(|c| c.resources.as_ref())
+        .and_then(|resources| resources.requests.as_ref());
+    let read = |name: &str, parse: fn(&str) -> Option<u64>| -> Result<Option<u64>, String> {
+        requests
+            .and_then(|requests| requests.get(name))
+            .map(|quantity| {
+                parse(&quantity.0).ok_or_else(|| {
+                    format!(
+                        "the container {container:?} requests {name} {:?}, which is not a Kubernetes quantity",
+                        quantity.0
+                    )
+                })
+            })
+            .transpose()
+    };
+    Ok(SandboxShape::new(
+        read("cpu", quantity::cpu_millis)?,
+        read("memory", quantity::bytes)?,
+    ))
 }
 
 /// The run container's mount of the workspace volume, which the code replaces by the mounts of the run.
@@ -518,6 +559,63 @@ spec:
         );
         assert_eq!(t.container(), "run");
         assert_eq!(t.workspace_path(), Path::new("/work"));
+    }
+
+    #[test]
+    fn the_shape_is_the_run_containers_requests_and_never_its_limits_or_a_sidecars() {
+        // 250m and 512Mi are the requests; the limit of 2Gi is not a cost.
+        assert_eq!(
+            template().sandbox_shape(),
+            SandboxShape::new(Some(250), Some(512 * 1024 * 1024))
+        );
+
+        // A request the template does not make is absent, not zero.
+        let cpu_only = template_text("/work").replace(
+            "requests: {cpu: 250m, memory: 512Mi}",
+            "requests: {cpu: '1.5'}",
+        );
+        let t = PodTemplate::parse(&cpu_only, Path::new("pod.yaml"), "run", Path::new("/work"))
+            .unwrap();
+        assert_eq!(t.sandbox_shape(), SandboxShape::new(Some(1500), None));
+        let bare = template_text("/work")
+            .replace("requests: {cpu: 250m, memory: 512Mi}\n", "")
+            .replace("limits: {memory: 2Gi}", "limits: {cpu: '4', memory: 2Gi}");
+        let t =
+            PodTemplate::parse(&bare, Path::new("pod.yaml"), "run", Path::new("/work")).unwrap();
+        assert_eq!(
+            t.sandbox_shape(),
+            SandboxShape::new(None, None),
+            "only limits: no request"
+        );
+
+        // The init container's requests are not the run container's.
+        let sidecar = template_text("/work").replace(
+            "      command: [sh, -c, 'cp -L /opt/adam/bin/* /tools/']",
+            "      command: [sh, -c, 'cp -L /opt/adam/bin/* /tools/']\n      resources: {requests: {cpu: 8, memory: 64Gi}}",
+        );
+        let t =
+            PodTemplate::parse(&sidecar, Path::new("pod.yaml"), "run", Path::new("/work")).unwrap();
+        assert_eq!(
+            t.sandbox_shape(),
+            SandboxShape::new(Some(250), Some(512 * 1024 * 1024))
+        );
+    }
+
+    #[test]
+    fn a_request_that_is_not_a_quantity_fails_the_start_and_says_which() {
+        for (wrong, name) in [
+            ("{cpu: 250x, memory: 512Mi}", "cpu"),
+            ("{cpu: 250m, memory: 512mb}", "memory"),
+            ("{cpu: -1}", "cpu"),
+        ] {
+            let text = template_text("/work").replace("{cpu: 250m, memory: 512Mi}", wrong);
+            let reason = refused(&text);
+            assert!(
+                reason.contains(&format!("requests {name}"))
+                    && reason.contains("not a Kubernetes quantity"),
+                "{reason}"
+            );
+        }
     }
 
     #[test]

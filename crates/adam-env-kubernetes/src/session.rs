@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 
 use adam_workspace::{
     EnvDescription, EnvError, EnvKind, EnvSession, ExecId, ExecSpec, PreparedCommand, Program,
-    SecretRef,
+    SandboxShape, SecretRef,
 };
 use async_trait::async_trait;
 
@@ -205,6 +205,10 @@ impl EnvSession for KubeSession {
         // The coder's own OpenCode, which the template's init container put in the tools directory.
         (name == OPENCODE && settings.opencode)
             .then(|| PathBuf::from(format!("{}/{OPENCODE}", settings.tools_dir)))
+    }
+
+    fn sandbox_shape(&self) -> Option<SandboxShape> {
+        Some(self.inner.template.sandbox_shape())
     }
 
     fn secret_ref(&self, name: &str) -> Option<SecretRef> {
