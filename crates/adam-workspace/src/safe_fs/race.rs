@@ -44,9 +44,16 @@ pub use hooks::{Hook, on_checkpoint};
 
 #[cfg(any(test, feature = "test-util"))]
 mod hooks {
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+
+    thread_local! {
+        /// The hooks whose closure this thread is running: a checkpoint reached from inside one
+        /// skips it, where waiting for its own lock would never return.
+        static RUNNING: RefCell<Vec<*const Registered>> = const { RefCell::new(Vec::new()) };
+    }
 
     type Callback = Box<dyn FnMut(&'static str, usize) + Send>;
 
@@ -121,7 +128,9 @@ mod hooks {
 
     pub(super) fn fire(slot: &Path, at: &'static str) {
         // The closures run outside the registry's lock: they touch the file system, and a
-        // checkpoint may be reached from inside one.
+        // checkpoint may be reached from inside one. That checkpoint is counted, and the closure
+        // already running on this thread is not called again for it (its own lock would never be
+        // free); another thread waits for it.
         let hooks: Vec<Arc<Registered>> = registry().get(slot).cloned().unwrap_or_default();
         for hook in hooks {
             let n = {
@@ -131,8 +140,48 @@ mod hooks {
                 *count += 1;
                 before
             };
+            let id = Arc::as_ptr(&hook);
+            if RUNNING.with(|running| running.borrow().contains(&id)) {
+                continue;
+            }
+            RUNNING.with(|running| running.borrow_mut().push(id));
             let mut callback = hook.callback.lock().unwrap_or_else(PoisonError::into_inner);
             (*callback)(at, n);
+            drop(callback);
+            RUNNING.with(|running| running.borrow_mut().retain(|r| *r != id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{checkpoint, on_checkpoint};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    /// A closure that reaches a checkpoint of its own slot returns: the inner checkpoint is
+    /// counted and does not call the closure again (before, it waited for its own lock forever).
+    #[test]
+    fn a_checkpoint_reached_from_inside_its_own_closure_returns() {
+        let slot = Path::new("/race-test/reentrant");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let hook = on_checkpoint(slot, move |at, _| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            if at == "outer" {
+                checkpoint(Path::new("/race-test/reentrant"), "inner");
+            }
+        });
+        let (done, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            checkpoint(Path::new("/race-test/reentrant"), "outer");
+            let _ = done.send(());
+        });
+        wait.recv_timeout(Duration::from_secs(10))
+            .expect("a checkpoint reached from inside its own closure must not wait forever");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!((hook.reached("outer"), hook.reached("inner")), (1, 1));
     }
 }
