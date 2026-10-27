@@ -465,21 +465,33 @@ jobs:
 
   # The run pods (crates/adam-env-kubernetes, the chart's `runPods`, ADR 0019) against a real cluster:
   # deploy/coder/tests/kind-run-pods.sh applies the chart's run-pod objects (the template, the priority
-  # class and quota, the RBAC, the admission policy and the network policy) to a kind cluster and runs the
-  # cluster test of adam-env-kubernetes as the coder's ServiceAccount. What it proves: the objects apply,
-  # the policy refuses what it should and the quota refuses a fifth pod, and a pod made from the chart's own
-  # template runs commands (both streams, exit codes, stdin), is killed, swept when idle and released through
-  # adam-kube-exec. What it does not: the coder over a model through it, the images (a small local one plays
-  # the run image and the coder's), and the NetworkPolicy (kind's network plugin may not enforce one).
-  # It also proves, on a volume the script seeds with two runs of one mirror, that a run pod sees only its
-  # own run and cannot write the mirror (ADR 0041).
+  # class and quota, the RBAC, the admission policy, the network policies and the egress proxy) to a kind
+  # cluster and runs the cluster test of adam-env-kubernetes as the coder's ServiceAccount. What it proves:
+  # the objects apply, the policy refuses what it should and the quota refuses a fifth pod, and a pod made
+  # from the chart's own template runs commands (both streams, exit codes, stdin), is killed, swept when idle
+  # and released through adam-kube-exec. It also proves, on a volume the script seeds with two runs of one
+  # mirror, that a run pod sees only its own run and cannot write the mirror, and that the slot of a run is a
+  # mount it cannot rename, remove or replace (ADR 0041; *verified 2026-10-27* in run 40456829784, job
+  # 122032008830). And it proves the NETWORK POLICY of run pods (ADR 0042): the run pods reach the internet
+  # only through the chart's egress proxy (`adam-egress`, built in the job and loaded into kind). A direct
+  # connection from a run pod to a public address, to the API server and to another pod is refused, DNS still
+  # works, and the proxy's own pod reaches the public address (the control); curl and `npm view` in the run
+  # pod reach registry.npmjs.org through the proxy; example.com is answered 403 and the proxy logs the refusal
+  # and nothing of the request. It FAILS when a policy is not enforced (ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1,
+  # which this job does not set, is for a cluster known not to enforce them). What it does not prove: the coder
+  # over a model through it, the images (a small local one plays the run image, the coder's and the proxy's),
+  # IPv6 (kind is IPv4 only: only that no rule names an IPv6 range is checked) and a CNI other than kindnet.
   # ADAM_TEST_REQUIRE_KUBERNETES makes the test fail instead of skipping, so a typo in the variables cannot
-  # turn the job green. The runner's preinstalled `kind` is used (*unverified*, from memory of the runner
-  # image's software list), with the node image that kind release defaults to; the script stops on a cluster
-  # older than Kubernetes 1.30.
+  # turn the job green. The runner's preinstalled `kind` is used with the node image operator.yml pins
+  # (Kubernetes v1.35.8, whose network plugin, kindnet, enforces NetworkPolicies: the platform's run-pods-e2e
+  # requires the refusal there and passed, *verified 2026-10-27*, run 40435825771); the script stops on a
+  # cluster older than Kubernetes 1.30.
   run-pods:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
+    env:
+      # The digest of the index of the tag, as operator.yml and the platform pin it.
+      KIND_NODE_IMAGE: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
     steps:
       - uses: actions/checkout@v4
       # ADR 0041: what git does in a run pod whose mirror is mounted read-only and whose worktree's own
@@ -492,7 +504,7 @@ jobs:
         run: |
           set -eu
           kind version
-          kind create cluster --wait 180s
+          kind create cluster --image "$KIND_NODE_IMAGE" --wait 180s
           kubectl version
-      - name: The chart's run pod objects, and the cluster test as the coder's ServiceAccount
+      - name: The chart's run pod objects, the cluster test as the coder's ServiceAccount, and the network policies
         run: sh deploy/coder/tests/kind-run-pods.sh
