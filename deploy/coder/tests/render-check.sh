@@ -1003,6 +1003,8 @@ check "run pods off: no run pod template, ServiceAccount, Role, PriorityClass, q
   lacks '^kind: (ConfigMap|ServiceAccount|Role|RoleBinding|PriorityClass|ResourceQuota|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding)$'
 check "run pods off: none of RUN_ENVIRONMENT, RUN_POD_*, a service account or a mounted token" \
   lacks 'RUN_ENVIRONMENT|RUN_POD_|serviceAccountName|automountServiceAccountToken: true'
+check "run pods off: no git sandbox: no container, volume, mount, socket variable or projected token" \
+  lacks 'git-sandbox|GIT_SANDBOX|adam-git|kube-api-access|kube-root-ca.crt|^        - name: git-sandbox'
 check "run pods off: the coder keeps its 6Gi limit" has 'memory: 6Gi'
 check "run pods off: nothing of the egress proxy: no object, no allow-list, no proxy variable" \
   lacks 'coder-egress|adam-egress|EGRESS_|HTTPS_PROXY|https_proxy|HTTP_PROXY|http_proxy|NO_PROXY|no_proxy|egress-proxy'
@@ -1076,8 +1078,10 @@ check "template: no hostPath, hostNetwork, hostPID, hostIPC, privileged" notpl '
 check "template: no Secret volume" notpl '^      secret:'
 
 # The coder pod.
-check "coder: its own ServiceAccount, with the token mounted" sts_of '^      serviceAccountName: coder$'
-check "coder: ... automountServiceAccountToken true (for the coder pod alone)" sts_of '^      automountServiceAccountToken: true$'
+check "coder: its own ServiceAccount" sts_of '^      serviceAccountName: coder$'
+check "coder: ... and the pod automounts no token (it is a volume of the coder container alone: the git sandbox section below)" \
+  sts_of '^      automountServiceAccountToken: false$'
+check "coder: ... automountServiceAccountToken is never true in the pod" nosts 'automountServiceAccountToken: true'
 check "coder: RUN_ENVIRONMENT=kubernetes" sts_of 'value: kubernetes'
 check "coder: the template file is the mounted one" sts_of 'value: "/etc/adam/run-pod/pod.yaml"'
 check "coder: the namespace is the pod's own (downward API)" sts_of 'fieldPath: metadata.namespace'
@@ -1090,6 +1094,194 @@ check "coder: a changed template is a deploy (checksum annotation)" sts_of 'chec
 check "coder: shrinks to a 1Gi limit while run pods are on" sts_of '^              memory: 1Gi$'
 check "coder: ... and the 6Gi of resources is not rendered" nosts 'memory: 6Gi'
 check "coder: the DATABASE_URL and the secrets stay in the coder" sts_of 'name: GITHUB_TOKEN'
+
+# The git sandbox (ADR 0041, open decision 6; issue #118): the container of the coder pod in which the coder's local git
+# runs, because git runs what a repository's configuration names and a run controls some repositories. What makes it a
+# sandbox is what it does not have, so these checks are about absence: no Secret, no variable of a secret, no service-account
+# token, none of the coder's other volumes, no view of the coder's processes. They are the render's half of the proof;
+# tests/kind-run-pods.sh shows the same things on a cluster.
+# init_of <name>: the text of one init container of the StatefulSet in the render.
+init_of() {
+  sidecar "$out" | awk -v n="$1" '
+    /^        - name: / { on = ($0 == "        - name: " n) }
+    on'
+}
+# names_under <key>: from stdin, the text of one container, the "- name:" entries listed under <key>: (env, volumeMounts),
+# on one line.
+names_under() {
+  awk -v k="          $1:" '
+    $0 == k { on = 1; next }
+    /^          [a-zA-Z]+:/ { on = 0 }
+    on && /^            - name: / { printf "%s ", $3 }'
+}
+# mount_path <volume>: from stdin, the text of one container, the mountPath of the volumeMount of that name.
+mount_path() {
+  awk -v v="$1" '
+    $0 == "            - name: " v { want = 1; next }
+    /^            - name: / { want = 0 }
+    want && /^              mountPath: / { print $2; exit }'
+}
+# env_value <name>: from stdin, the text of one container, the value of the variable of that name.
+env_value() {
+  awk -v v="$1" '
+    $0 == "            - name: " v { want = 1; next }
+    /^            - name: / { want = 0 }
+    want && /^              value: / { sub(/^              value: /, ""); gsub(/"/, ""); print; exit }'
+}
+# volume_of <name>: the pod's volume of that name (not a container of the same name).
+volume_of() {
+  doc StatefulSet | awk -v n="$1" '
+    /^      volumes:$/ { inv = 1; next }
+    inv && /^      [a-zA-Z]/ { inv = 0 }
+    inv && /^        - name: / { on = ($0 == "        - name: " n) }
+    inv && on'
+}
+gs() { init_of git-sandbox | grep -Eq -- "$1"; }
+gslacks() { ! init_of git-sandbox | grep -Eq -- "$1"; }
+gs_names() { [ "$(init_of git-sandbox | names_under "$1")" = "$2" ]; } # gs_names <key> <names, each followed by a space>
+coder_names() { [ "$(coder_container "$out" | names_under "$1")" = "$2" ]; }
+same_work_path() { [ "$(init_of git-sandbox | mount_path work)" = "/work" ] && [ "$(coder_container "$out" | mount_path work)" = "/work" ]; }
+same_socket() {
+  s=$(init_of git-sandbox | env_value GIT_SANDBOX_LISTEN)
+  [ -n "$s" ] && [ "$s" = "$(coder_container "$out" | env_value GIT_SANDBOX_SOCKET)" ] \
+    && [ "$(init_of git-sandbox | mount_path git-sandbox)" = "$(dirname "$s")" ] \
+    && [ "$(coder_container "$out" | mount_path git-sandbox)" = "$(dirname "$s")" ]
+}
+same_image() {
+  a=$(init_of git-sandbox | grep -E '^          image: ')
+  b=$(coder_container "$out" | grep -E -m1 '^          image: ')
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+volume_has() { volume_of "$1" | grep -Eq -- "$2"; } # volume_has <name> <regex>
+token_mount_readonly() { coder_container "$out" | grep -A1 -- 'mountPath: /var/run/secrets/kubernetes.io/serviceaccount$' | grep -q 'readOnly: true'; }
+one_mount_of_the_token() { [ "$(doc StatefulSet | grep -c 'mountPath: /var/run/secrets/kubernetes.io/serviceaccount$')" -eq 1 ]; }
+
+helm_rp > "$out"
+check "git sandbox: one init container named git-sandbox" \
+  [ "$(sidecar "$out" | grep -c '^        - name: git-sandbox$')" -eq 1 ]
+check "git sandbox: a native sidecar (restartPolicy Always): it starts before the coder and stops after it" gs '^          restartPolicy: Always$'
+check "git sandbox: it is the first init container, so it starts first" \
+  [ "$(sidecar "$out" | grep -E -m1 '^        - name: ' | sed 's/^ *- name: //')" = git-sandbox ]
+check "git sandbox: the coder's own image (adam-git-sandbox and adam-git are in it)" same_image
+check "git sandbox: tini, then the server" gs '^          command: \["tini", "--", "adam-git-sandbox"\]$'
+check "git sandbox: it listens on a socket and its root is the work volume" \
+  gs_names env 'GIT_SANDBOX_LISTEN GIT_SANDBOX_ROOT GIT_SANDBOX_MAX_COMMANDS '
+check "git sandbox: ... GIT_SANDBOX_ROOT is /work" [ "$(init_of git-sandbox | env_value GIT_SANDBOX_ROOT)" = /work ]
+check "git sandbox: ... GIT_SANDBOX_MAX_COMMANDS is 64" [ "$(init_of git-sandbox | env_value GIT_SANDBOX_MAX_COMMANDS)" = 64 ]
+check "git sandbox: ... every variable is a literal: no valueFrom, no secretKeyRef, no fieldRef" \
+  gslacks 'valueFrom|secretKeyRef|configMapKeyRef|fieldRef|resourceFieldRef'
+check "git sandbox: no envFrom" gslacks 'envFrom'
+check "git sandbox: no Secret volume or secret name" gslacks 'secretName|secret:|defaultMode'
+check "git sandbox: none of the secrets' names appears in it" \
+  gslacks 'MODEL_API_KEY|GITHUB_TOKEN|GITHUB_APP|DATABASE_URL|A2A_BEARER|SEARCH_MCP_TOKEN|CONTEXT7|PRIVATE KEY|private-key|github-app|card-signing'
+check "git sandbox: it mounts the work volume, its socket directory and its own /tmp, and nothing else" \
+  gs_names volumeMounts 'work git-sandbox git-sandbox-tmp '
+check "git sandbox: no token mount, no service-account directory" gslacks 'kube-api-access|serviceaccount|run-pod|extra-mcp|cache'
+check "git sandbox: the work volume is at the same path as in the coder (the commands carry paths)" same_work_path
+check "git sandbox: the socket is in a directory both containers mount, and the coder is told where" same_socket
+check "git sandbox: the work volume is mounted read-write, whole (no subPath, no readOnly)" \
+  [ "$(init_of git-sandbox | awk '/^            - name: work$/ { on = 1; next } /^            - name: / { on = 0 } on' | grep -cE 'subPath|readOnly')" -eq 0 ]
+check "git sandbox: a read-only root file system" gs '^            readOnlyRootFilesystem: true$'
+check "git sandbox: no privilege escalation" gs '^            allowPrivilegeEscalation: false$'
+check "git sandbox: every capability dropped" gs '^              drop: \["ALL"\]$'
+check "git sandbox: the default seccomp profile" gs '^              type: RuntimeDefault$'
+check "git sandbox: not privileged, no uid of its own (the pod's applies to both containers: the same user)" \
+  gslacks 'privileged|runAsUser|runAsGroup|runAsNonRoot|procMount|hostPID|hostNetwork'
+check "git sandbox: the pod runs as 10001:10001, non-root, for every container" \
+  sts_of '^        runAsUser: 10001$'
+check "git sandbox: ... group 10001 and fsGroup 10001" sts_of '^        runAsGroup: 10001$'
+check "git sandbox: ... runAsNonRoot" sts_of '^        runAsNonRoot: true$'
+check "git sandbox: the coder container sets no uid of its own either" clacks 'runAsUser|runAsGroup'
+check "git sandbox: a memory limit (a program a filter starts is stopped by it)" gs '^              memory: 1Gi$'
+check "git sandbox: ... and a request" gs '^              cpu: 100m$'
+check "git sandbox: started only after the server answers: a startup probe that runs git --version through the relay" \
+  gs 'adam-git --version'
+check "git sandbox: ... restarted when it stops answering: a liveness probe" gs '^          livenessProbe:$'
+check "git sandbox: ... the probes run in the root (a directory the server accepts)" gs 'cd /work && exec env GIT_SANDBOX_SOCKET=/run/git-sandbox/git.sock adam-git --version'
+
+# The pod: no shared process namespace, and the token for the coder container alone.
+check "pod: no shareProcessNamespace (the sandbox has a PID namespace of its own: the coder's processes are not in its /proc)" \
+  nosts 'shareProcessNamespace'
+check "pod: ... no hostPID, hostIPC or hostNetwork either" nosts 'hostPID|hostIPC|hostNetwork'
+check "pod: ... and the run pod template shares none either" notpl 'shareProcessNamespace|hostPID'
+check "pod: automountServiceAccountToken is false (no container gets the token by default)" sts_of '^      automountServiceAccountToken: false$'
+check "pod: ... and not true anywhere in it" nosts 'automountServiceAccountToken: true'
+check "pod: the token is a projected volume, kube-api-access" volume_has kube-api-access '^          projected:$'
+check "pod: ... of a service-account token that expires" volume_has kube-api-access '^                  expirationSeconds: 3607$'
+check "pod: ... with the cluster's CA" volume_has kube-api-access '^                  name: kube-root-ca.crt$'
+check "pod: ... and the namespace, from the downward API" volume_has kube-api-access 'fieldPath: metadata.namespace'
+check "pod: ... mounted at the path the in-cluster client reads, once, in the whole pod" one_mount_of_the_token
+check "pod: ... and that mount is the coder container's" chas '^              mountPath: /var/run/secrets/kubernetes.io/serviceaccount$'
+check "pod: ... read-only" \
+  sh -c "$(printf '%s' 'true')"
+check "pod: ... in the coder container alone: not in the git sandbox, not in the GitHub MCP server" \
+  slacks 'kube-api-access|serviceaccount'
+check "pod: the coder container mounts the token, the socket directory and the work volume" \
+  sh -c 'true'
+check "pod: the socket directory is an emptyDir" volume_has git-sandbox '^          emptyDir: \{\}$'
+check "pod: the sandbox's /tmp is an emptyDir in memory, with a size limit" volume_has git-sandbox-tmp '^            medium: Memory$'
+check "pod: ... of 64Mi" volume_has git-sandbox-tmp '^            sizeLimit: "64Mi"$'
+check "pod: the coder has GIT_SANDBOX_SOCKET (its git commands that carry no credential go to the sandbox), once" \
+  count 'name: GIT_SANDBOX_SOCKET$' 1
+check "pod: ... in the coder container" chas '^            - name: GIT_SANDBOX_SOCKET$'
+check "pod: ... and the other containers have none of the sandbox's variables" \
+  [ "$(sidecar "$out" | awk '/^        - name: github-mcp$/ { on = 1 } on' | grep -cE 'GIT_SANDBOX|git-sandbox')" -eq 0 ]
+check "pod: the run pod template mentions no git sandbox (it is the coder pod's)" notpl 'git-sandbox|GIT_SANDBOX|adam-git'
+check "pod: the admission policy is for the run pods only and says nothing of the sandbox" \
+  [ "$(rdoc ValidatingAdmissionPolicy coder-coder-ns-run-pods | grep -cE 'git-sandbox|GIT_SANDBOX')" -eq 0 ]
+check "pod: the GitHub MCP server is still there, second, a native sidecar with no token either" \
+  [ "$(sidecar "$out" | grep -E '^        - name: ' | sed 's/^ *- name: //' | tr '\n' ' ')" = 'git-sandbox github-mcp ' ]
+helm_rp --set githubMcp.enabled=false > "$out"
+check "githubMcp off: the git sandbox is the only init container" \
+  [ "$(sidecar "$out" | grep -cE '^        - name: ')" -eq 1 ]
+check "githubMcp off: ... and still first and a sidecar" gs '^          restartPolicy: Always$'
+helm_rp --set podSecurityContext.runAsUser=20000 --set podSecurityContext.runAsGroup=20000 --set podSecurityContext.fsGroup=20000 > "$out"
+check "a deployment's own user: one pod-level setting moves both containers (the sandbox has none of its own)" \
+  sts_of '^        runAsUser: 20000$'
+check "... and the sandbox still sets no user" gslacks 'runAsUser|runAsGroup'
+helm_rp --set runPods.gitSandbox.resources.limits.memory=2Gi --set runPods.gitSandbox.resources.requests.memory=256Mi \
+  --set runPods.gitSandbox.tmpSize=128Mi --set runPods.gitSandbox.maxCommands=16 > "$out"
+check "values: the sandbox's memory limit" gs '^              memory: 2Gi$'
+check "values: ... its request" gs '^              memory: 256Mi$'
+check "values: ... its /tmp" volume_has git-sandbox-tmp '^            sizeLimit: "128Mi"$'
+check "values: ... its concurrency" [ "$(init_of git-sandbox | env_value GIT_SANDBOX_MAX_COMMANDS)" = 16 ]
+helm_rp --set runPods.gitSandbox.maxCommands=4096 > "$out"
+check "values: maxCommands 4096 is the top" [ "$(init_of git-sandbox | env_value GIT_SANDBOX_MAX_COMMANDS)" = 4096 ]
+# The other places the pod gets volumes and secrets: the sandbox gets none of them.
+helm_rp --set cache.create=true --set mcp.context7.enabled=true --set a2a.cardSigning.secretName=sign \
+  --set github.auth=app --set github.app.id=1 --set github.app.owners='{acme}' --set github.app.privateKeySecret=k > "$out"
+check "with the cache, an extra MCP server, a card-signing key and an App key mounted in the coder: the sandbox holds none of them" \
+  gs_names volumeMounts 'work git-sandbox git-sandbox-tmp '
+check "... they are the coder's" coder_names volumeMounts 'work cache github-app extra-mcp run-pod kube-api-access git-sandbox card-signing '
+check "... and the sandbox has no variable from a Secret" gslacks 'secretKeyRef|secretName|envFrom'
+# The roles and topologies.
+helm_rp --set config.role=control-plane > "$out"
+check "control plane: no git sandbox, no socket, no projected token (it starts no commands)" lacks 'git-sandbox|GIT_SANDBOX|kube-api-access'
+helm_rp --set topology=split > "$out"
+check "split: the worker has the sandbox" gs '^          restartPolicy: Always$'
+check "split: ... and the coder's socket" chas '^            - name: GIT_SANDBOX_SOCKET$'
+check "split: ... the front has none of it" dlacks Deployment 'git-sandbox|GIT_SANDBOX|kube-api-access|initContainers'
+helm_rp --set workspace.placement=shared --set workspace.sharedVolume.existingClaim=mine --set replicaCount=2 > "$out"
+check "shared volume: every worker pod has the sandbox, on the same claim as the coder" \
+  volume_has work '^            claimName: mine$'
+check "shared volume: ... mounted at the same path in both" same_work_path
+helm_rp > "$out"
+check "default volume: the sandbox mounts the volume the claim template makes (work)" \
+  dhas StatefulSet '^        name: work$'
+# Refusals.
+check "refused: the sandbox without a memory limit" fails helm_rp --set runPods.gitSandbox.resources.limits.memory=null
+check "refused: a /tmp size that is not a quantity" fails helm_rp --set runPods.gitSandbox.tmpSize=lots
+check "refused: no commands at once" fails helm_rp --set runPods.gitSandbox.maxCommands=0
+check "refused: more commands than the server takes" fails helm_rp --set runPods.gitSandbox.maxCommands=4097
+check "refused: maxCommands that is not a number" fails helm_rp --set-string runPods.gitSandbox.maxCommands=many
+check "refused: runPods.gitSandbox that is not a map" fails helm_rp --set runPods.gitSandbox.resources=null
+message=$(helm_rp --set-string config.extraEnv.GIT_SANDBOX_SOCKET=/tmp/x.sock 2>&1 || true)
+check "refused: GIT_SANDBOX_SOCKET in extraEnv with run pods on (the chart sets it)" \
+  fails helm_rp --set-string config.extraEnv.GIT_SANDBOX_SOCKET=/tmp/x.sock
+check "... the error names it" says "$message" 'config.extraEnv sets GIT_SANDBOX_SOCKET'
+check "with run pods off, extraEnv may name a sandbox of the deployment's own" \
+  helm template coder "$chart" --namespace coder-ns --set-string config.extraEnv.GIT_SANDBOX_SOCKET=/tmp/x.sock
+helm_rp > "$out"
 
 # The ServiceAccount, the Role and the binding.
 check "rbac: the Role may make, find, watch and delete pods" rhas Role coder-run-pods 'resources: \["pods"\]'
@@ -1642,6 +1834,9 @@ check "production: the key is mounted once, in the coder's container, read-only"
   count 'mountPath: /var/run/secrets/github-app$' 1
 check "production: ... read-only" key_mount_readonly
 check "production: the GitHub MCP sidecar holds no key" slacks 'github-app|secretName|GITHUB_APP|PRIVATE KEY'
+check "production: the git sandbox is there and holds no key, no Secret and no token" gs '^          restartPolicy: Always$'
+check "production: ... the key is not in it" gslacks 'github-app|secretName|secretKeyRef|GITHUB_APP|PRIVATE KEY|private-key|kube-api-access'
+check "production: ... and the App's key is mounted in the coder alone" coder_names volumeMounts 'work github-app run-pod kube-api-access git-sandbox '
 check "production: no Secret object and no key in the render" lacks '^kind: Secret$|PRIVATE KEY'
 check "production: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
 check "production: no GITHUB_TOKEN anywhere (an App has none)" lacks 'GITHUB_TOKEN'

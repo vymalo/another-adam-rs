@@ -352,9 +352,11 @@ cache:
 # that let the coder make, list and delete pods and `exec` in them, a PriorityClass and a ResourceQuota scoped to
 # it (a quota cannot select pods by label; a priority class is what it can select by), a ValidatingAdmissionPolicy
 # and its binding that refuse every pod of the coder's ServiceAccount but the intended one (this is what lets the
-# coder make pods without being able to read the namespace's other Secrets, mount the host or run privileged), and
-# a NetworkPolicy for the run pods. Needs Kubernetes 1.30 or later for the admission policy (*unverified* for the
-# owner's cluster); the render refuses an older one (`helm template --kube-version`).
+# coder make pods without being able to read the namespace's other Secrets, mount the host or run privileged), a
+# NetworkPolicy for the run pods, the egress proxy, and the git sandbox container of the coder pod (`gitSandbox`
+# below), which also takes the service-account token away from every container of that pod but the coder. Needs
+# Kubernetes 1.30 or later for the admission policy (*unverified* for the owner's cluster); the render refuses an
+# older one (`helm template --kube-version`).
 runPods:
   enabled: false
   # Accept that, with runPods.enabled false, the commands of a run (run_command, run_checks, OpenCode) run in the
@@ -424,6 +426,30 @@ runPods:
       memory: 512Mi
     limits:
       memory: 1Gi
+  # The git sandbox (ADR 0041, open decision 6; issue vymalo/another-adam-rs#118): a second container in the coder pod,
+  # `git-sandbox`, from the coder's own image (`image.*`), in which the coder's local git runs. `git` runs what a
+  # repository's configuration names (a `filter.*.clean`, a `core.fsmonitor`), and some repositories are the run's own, so
+  # that program has to run where nothing secret is readable: the container has no Secret volume, no secret variable and no
+  # service-account token (the token is a projected volume of the coder container alone), a PID namespace of its own (the
+  # pod does not share one), a read-only root file system and a `/tmp` of its own. It mounts the work volume at the same
+  # path as the coder and runs as the same user. There is no switch to turn it off: it is on with `runPods.enabled`, which
+  # is the mode where a run's commands leave the coder's container too. The coder reaches it over a Unix socket in an
+  # `emptyDir` (GIT_SANDBOX_SOCKET); `fetch`, `push` and `ls-remote`, which carry a token, stay in the coder. Without run
+  # pods nothing of it is rendered and git runs in the coder's container, unprotected, as before.
+  gitSandbox:
+    # Its own, not the coder's: the git that used to run in the coder's memory runs here, and a program a filter starts is
+    # stopped by this limit and not by the node's. A memory limit is required.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 1Gi
+    # The size of its `/tmp`, in memory (a file there counts against the limit above). A program that fills it gets "no
+    # space left on device"; a disk-backed `emptyDir` would instead get the whole coder pod evicted.
+    tmpSize: 64Mi
+    # GIT_SANDBOX_MAX_COMMANDS: commands run at once (1 to 4096); the next waits.
+    maxCommands: 64
   # Where run pods may be scheduled, on top of what the volume needs (see the README, "Run pods").
   nodeSelector: {}
   tolerations: []

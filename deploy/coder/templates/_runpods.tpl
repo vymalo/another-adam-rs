@@ -75,6 +75,21 @@ sets it and the admission policy allows exactly this reference, by the Secret's 
 */}}
 {{- define "coder.runPodSecretKey" -}}MODEL_API_KEY{{- end -}}
 
+{{/*
+The git sandbox (values runPods.gitSandbox, ADR 0041 open decision 6): the directory of an emptyDir that the coder container
+and the git-sandbox container both mount, and the socket the server makes in it (GIT_SANDBOX_LISTEN there, GIT_SANDBOX_SOCKET
+in the coder). Nothing else is shared between the two containers but the work volume.
+*/}}
+{{- define "coder.gitSandboxDir" -}}/run/git-sandbox{{- end -}}
+{{- define "coder.gitSandboxSocket" -}}/run/git-sandbox/git.sock{{- end -}}
+
+{{/*
+Where the Kubernetes client of the coder finds its credential (the in-cluster convention that kube reads). With run pods on,
+the pod does not automount the service-account token; this directory is a projected volume mounted in the coder container
+alone, so the git-sandbox container (and the GitHub MCP server's) holds no token.
+*/}}
+{{- define "coder.serviceAccountDir" -}}/var/run/secrets/kubernetes.io/serviceaccount{{- end -}}
+
 {{/* The name label of run pods: not the coder's, so the StatefulSet's selector and the coder's NetworkPolicy never match them. */}}
 {{- define "coder.runPodNameLabel" -}}
 {{- printf "%s-run" (include "coder.name" .) | trunc 63 | trimSuffix "-" -}}
