@@ -1,0 +1,42 @@
+[package]
+name = "adam-git-sandbox"
+description = "Runs the coder's local git where no secret is readable: a server on a Unix socket that only executes git, and the relay that stands in for git"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "adam_git_sandbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adam-git-sandbox"
+path = "src/bin/adam-git-sandbox.rs"
+
+[[bin]]
+name = "adam-git"
+path = "src/bin/adam-git.rs"
+
+[dependencies]
+adam-error.workspace = true
+base64.workspace = true
+# `kill_process_group`, `umask` and `openat` as safe functions, so the crate stays `forbid(unsafe_code)`.
+# Already in the tree through `adam-service` and `adam-workspace`.
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "io-std", "net", "process", "signal", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

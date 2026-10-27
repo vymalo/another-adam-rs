@@ -240,7 +240,24 @@ pub async fn replace_file(path: &Path, content: &[u8]) -> io::Result<()> {
 ///
 /// As [`read_regular_file`]; and the errors of making the directory and the file.
 pub async fn private_copy_of(source: &Path, max: u64) -> io::Result<PrivateCopy> {
+    private_copy_in(None, source, max).await
+}
+
+/// [`private_copy_of`] in a directory of `base`'s, made when it is not there (mode `0700`), instead
+/// of the process's temporary directory: for a `git` that runs in another container (the git
+/// sandbox), which does not see this one's `/tmp` but does see the work volume. `None` is the
+/// process's temporary directory.
+///
+/// # Errors
+///
+/// As [`private_copy_of`]; and the errors of making `base`.
+pub async fn private_copy_in(
+    base: Option<&Path>,
+    source: &Path,
+    max: u64,
+) -> io::Result<PrivateCopy> {
     let source = source.to_owned();
+    let base = base.map(Path::to_owned);
     blocking(move || {
         let (mut from, meta) = open_regular(&source)?;
         if meta.len() > max {
@@ -256,7 +273,13 @@ pub async fn private_copy_of(source: &Path, max: u64) -> io::Result<PrivateCopy>
             use std::os::unix::fs::PermissionsExt as _;
             dir.permissions(std::fs::Permissions::from_mode(0o700));
         }
-        let dir = dir.tempdir()?;
+        let dir = match &base {
+            Some(base) => {
+                make_private_directory(base)?;
+                dir.tempdir_in(base)?
+            }
+            None => dir.tempdir()?,
+        };
         let path = dir.path().join("index");
         let mut to = OpenOptions::new()
             .write(true)
@@ -273,6 +296,22 @@ pub async fn private_copy_of(source: &Path, max: u64) -> io::Result<PrivateCopy>
         Ok(PrivateCopy { path, _dir: dir })
     })
     .await
+}
+
+/// `path` and what is missing above it, made as directories only the coder's user can use.
+fn make_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        // A directory that was there with other modes is the coder's own to tighten.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)
 }
 
 async fn blocking<T: Send + 'static>(

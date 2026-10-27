@@ -26,6 +26,7 @@ adam-core = { path = "crates/adam-core", version = "0.1.0" }
 adam-devcontainer = { path = "crates/adam-devcontainer", version = "0.1.0" }
 adam-env-kubernetes = { path = "crates/adam-env-kubernetes", version = "0.1.0" }
 adam-error = { path = "crates/adam-error", version = "0.1.0" }
+adam-git-sandbox = { path = "crates/adam-git-sandbox", version = "0.1.0" }
 adam-host = { path = "crates/adam-host", version = "0.1.0" }
 adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.1.0" }
 adam-macros = { path = "crates/adam-macros", version = "0.1.0" }

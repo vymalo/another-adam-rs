@@ -77,9 +77,20 @@ pub fn workspaces_for(
         }
     };
     let creds: DynGitCredentials = Arc::new(RedactingCredentials::new(scoped, redactor.clone()));
-    let workspaces = Workspaces::new(config.placed_root(), creds.clone())
+    let mut workspaces = Workspaces::new(config.placed_root(), creds.clone())
         .allow_hosts(&config.allowed_repo_hosts)
         .allow_local(config.allow_local_repos);
+    if let Some(socket) = &config.git_sandbox_socket {
+        // The commands that carry no credential run in the git sandbox; the ones that talk to a
+        // remote stay here (ADR 0041).
+        workspaces = workspaces.with_git_sandbox(socket);
+        tracing::info!(socket = %socket.display(), "git runs in the git sandbox when it carries no credential");
+    } else {
+        tracing::info!(
+            "no git sandbox (GIT_SANDBOX_SOCKET is unset): git runs in this container, next to the \
+             repositories a run controls"
+        );
+    }
     Ok((workspaces, creds))
 }
 
@@ -112,6 +123,21 @@ mod tests {
         vars.extend(extra.iter().map(|(k, v)| (*k, (*v).to_owned())));
         let config = crate::Config::from_lookup(|k| vars.get(k).cloned()).unwrap();
         config.worker.expect("the default role runs workers")
+    }
+
+    /// `GIT_SANDBOX_SOCKET` reaches the workspaces: with it the commands that carry no credential run
+    /// in the sandbox, without it nothing changes.
+    #[test]
+    fn the_git_sandbox_socket_reaches_the_workspaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, _) = built(&config(&[], tmp.path()));
+        assert!(ws.git_sandbox().is_none());
+        let (ws, _) = built(&config(
+            &[("GIT_SANDBOX_SOCKET", "/run/git/git.sock")],
+            tmp.path(),
+        ));
+        let sandbox = ws.git_sandbox().expect("the sandbox is configured");
+        assert_eq!(sandbox.socket(), std::path::Path::new("/run/git/git.sock"));
     }
 
     /// The configuration reaches the workspaces: by default a foreign host and

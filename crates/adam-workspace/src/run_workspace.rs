@@ -261,7 +261,7 @@ impl Scratch {
     /// common directory alike, and its directory for the work tree. A caller that starts `git`
     /// itself applies it ([`GitPin::apply`]) and checks it ([`GitPin::check`]).
     pub fn git_pin(&self) -> GitPin {
-        GitPin::own_repository(&self.path, Arc::clone(&self.root))
+        GitPin::own_repository(&self.path, Arc::clone(&self.root)).with_sandbox(self.ws.sandbox())
     }
 
     /// The files that differ from the last commit: staged, unstaged and untracked ones (each

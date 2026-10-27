@@ -66,14 +66,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, Read, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use adam::prelude::*;
 use adam_workspace::safe_fs::{BeneathError, Dir, Meta, SlotDir, WalkError, race};
-use tokio::io::AsyncWriteExt;
 
 use super::gitcli::GitAt;
 use super::{Outcome, ToolEnv, non_empty};
@@ -544,44 +542,33 @@ struct Applied {
 /// configuration and every variable that would point git elsewhere: the patch comes from the model.
 /// The repository is the slot's, pinned (`GitAt`), never found through files a command wrote.
 async fn git_apply(at: &GitAt, flags: &[&str], patch: &str) -> io::Result<Applied> {
-    // From an empty environment: the repository's own configuration can run a program.
-    let Some(mut cmd) = at.command().await else {
+    // From an empty environment: the repository's own configuration can run a program. In the git
+    // sandbox when the deployment has one: the patch is the model's, and applying it writes files
+    // the repository's attributes may run a filter on.
+    let Some(cmd) = at.command().await else {
         return Err(io::Error::other(
             "git is not run here: the worktree's repository cannot be trusted",
         ));
     };
-    cmd.arg("apply")
+    // The patch is the command's input. A patch git stops reading early (a parse error) breaks the
+    // pipe: its verdict is what counts.
+    let cmd = cmd
+        .arg("apply")
         .args(flags)
         .arg("-")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = cmd.spawn()?;
-    // Written from a task of its own: git may answer before it has read everything.
-    let stdin = child.stdin.take();
-    let bytes = patch.as_bytes().to_vec();
-    let feeder = tokio::spawn(async move {
-        if let Some(mut stdin) = stdin {
-            // A patch git stops reading early (a parse error) breaks the pipe: its verdict is
-            // what counts.
-            let _ = stdin.write_all(&bytes).await;
-        }
-    });
-    let output = match tokio::time::timeout(APPLY_TIMEOUT, child.wait_with_output()).await {
+        .stdin(patch.as_bytes().to_vec());
+    let output = match tokio::time::timeout(APPLY_TIMEOUT, cmd.output()).await {
         Ok(output) => output?,
         Err(_) => {
-            feeder.abort();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("git apply took more than {}s", APPLY_TIMEOUT.as_secs()),
             ));
         }
     };
-    let _ = feeder.await;
     Ok(Applied {
-        success: output.status.success(),
+        success: output.success,
         stdout: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
@@ -2244,5 +2231,61 @@ mod tests {
         assert!(similarity("println!(\"hello\")", "println!(\"hallo\")") > 700);
         assert!(similarity("println!(\"hello\")", "fn main() {") < 400);
         assert_eq!(line_of("a\nb\nc", 4), 3);
+    }
+}
+
+/// The patch the model writes is applied by the git of the sandbox when the deployment has one: it
+/// travels as the command's standard input.
+#[cfg(test)]
+mod apply_sandbox_tests {
+    use std::sync::Arc;
+
+    use adam_workspace::testing_sandbox::GitSandboxServer;
+    use adam_workspace::{GitIdentity, StaticToken, Workspaces};
+
+    use super::*;
+    use crate::tools::gitcli::GitAt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_patch_is_applied_by_the_git_of_the_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let server = GitSandboxServer::start(tmp.path(), &root);
+        let workspaces = Workspaces::new(root, Arc::new(StaticToken::new("unused")))
+            .with_git_sandbox(server.socket());
+        let slot = workspaces
+            .run("run-aaaaaaaa-1")
+            .unwrap()
+            .add_scratch("proj", &GitIdentity::new("t", "t@example.com"))
+            .await
+            .unwrap();
+        fs::write(slot.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let at = GitAt::slot(&slot);
+        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n";
+
+        let checked = git_apply(&at, &["--check"], patch).await.unwrap();
+        assert!(checked.success, "{}", checked.stderr);
+        assert_eq!(
+            fs::read_to_string(slot.path().join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        let applied = git_apply(&at, &[], patch).await.unwrap();
+        assert!(applied.success, "{}", applied.stderr);
+        assert_eq!(
+            fs::read_to_string(slot.path().join("a.txt")).unwrap(),
+            "one\nthree\n"
+        );
+        // A patch that does not apply is git's verdict, not an error of the call.
+        let refused = git_apply(&at, &[], patch).await.unwrap();
+        assert!(!refused.success);
+        assert!(!refused.stderr.is_empty());
+
+        let ran = server.subcommands();
+        assert_eq!(
+            ran.iter().filter(|s| *s == "apply").count(),
+            3,
+            "all three went through the server: {ran:?}"
+        );
     }
 }

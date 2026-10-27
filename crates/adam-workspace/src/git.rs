@@ -22,16 +22,32 @@
 //! The one place the token is visible is the child's environment
 //! (`/proc/<pid>/environ`, readable by the same uid only) for the duration of
 //! the command.
+//!
+//! # Where a command runs
+//!
+//! `git` runs what a repository's configuration names (a `filter.*.clean`, a `textconv`), and a
+//! repository can be one a run wrote. So the commands that **carry no credential** run in the git
+//! sandbox ([`GitSandbox`]) when the deployment has one: another container, with no secret, that
+//! executes only `git`. The commands that talk to a remote (`fetch`, `push`, `ls-remote`, a
+//! first `init` of a mirror) and everything that carries a token always run in this process's
+//! container, on the bare mirror, after its configuration has been put back to what the workspace
+//! writes (`mirror_config`). The choice is made in [`GitCmd::route`] and nowhere
+//! else; a command with a credential is never sent to the sandbox, and the sandbox drops the
+//! variables a credential travels in even if one were.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use adam_git_sandbox::{Client, ClientError, Request, environment};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use secrecy::{ExposeSecret, SecretString};
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
 use crate::error::{WorkspaceError, WorkspaceResult};
@@ -151,6 +167,9 @@ pub struct GitPin {
     /// The work tree's directory as the coder opened it: `git` can only be given its name, and this
     /// says whether the name still leads to it ([`SlotDir::is_still_here`]).
     root: Arc<SlotDir>,
+    /// The git sandbox of the deployment, if it has one: where the questions asked of this
+    /// repository are run ([`LocalGit`]).
+    sandbox: Option<GitSandbox>,
 }
 
 impl GitPin {
@@ -167,6 +186,7 @@ impl GitPin {
             work_tree: work_tree.to_owned(),
             inside: false,
             root,
+            sandbox: None,
         }
     }
 
@@ -179,7 +199,29 @@ impl GitPin {
             work_tree: work_tree.to_owned(),
             inside: true,
             root,
+            sandbox: None,
         }
+    }
+
+    /// This pin, for a deployment that has a git sandbox.
+    pub(crate) fn with_sandbox(mut self, sandbox: Option<GitSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// The git sandbox the questions asked of this repository are run in (see [`LocalGit`]), `None`
+    /// when git runs in the coder's own container.
+    pub fn sandbox(&self) -> Option<&GitSandbox> {
+        self.sandbox.as_ref()
+    }
+
+    /// The three variables as pairs.
+    pub(crate) fn pairs(&self) -> [(OsString, OsString); 3] {
+        [
+            ("GIT_DIR".into(), self.git_dir.clone().into()),
+            ("GIT_COMMON_DIR".into(), self.common_dir.clone().into()),
+            ("GIT_WORK_TREE".into(), self.work_tree.clone().into()),
+        ]
     }
 
     /// `GIT_DIR`: the worktree's directory in the mirror, or the scratch project's `.git`.
@@ -329,6 +371,191 @@ impl GitPin {
 /// (`<mirror>/worktrees/<name>`): the way up to the mirror.
 const COMMONDIR: &str = "../..";
 
+/// The git sandbox of a deployment: where the commands that carry no credential run (the crate
+/// README's "Where `git` runs: the git sandbox" says how). It is a handle on the socket of an `adam-git-sandbox` server
+/// (`GIT_SANDBOX_SOCKET`), whose container mounts the same work volume at the same path.
+///
+/// Made by [`Workspaces::with_git_sandbox`](crate::Workspaces::with_git_sandbox); cheap to clone. A
+/// sandbox that cannot be reached makes the commands that need it fail: **they are not run in this
+/// container instead**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitSandbox {
+    client: Client,
+    private_dir: PathBuf,
+}
+
+impl GitSandbox {
+    /// The sandbox whose server listens on `socket`, for the work volume at `root`.
+    pub fn new(socket: impl Into<PathBuf>, root: &Path) -> Self {
+        Self {
+            client: Client::new(socket),
+            private_dir: root.join("staging").join("private"),
+        }
+    }
+
+    /// The server's socket.
+    pub fn socket(&self) -> &Path {
+        self.client.socket()
+    }
+
+    /// A directory of the work volume that no run's pod mounts and the coder can write: where the
+    /// copy of an index a command works on is made, because the sandbox does not see this container's
+    /// own temporary directory but does see the volume.
+    pub fn private_dir(&self) -> &Path {
+        &self.private_dir
+    }
+}
+
+/// One `git` command as data: what is run, where, with what environment and input. The same value
+/// is run in this container ([`run_here`](Self::run_here)) or in the sandbox
+/// ([`run_in`](Self::run_in)).
+#[derive(Debug, Clone)]
+pub(crate) struct Invocation {
+    /// The arguments after `git`, global options (`-c ...`) first.
+    pub(crate) args: Vec<OsString>,
+    /// The whole environment: nothing else is inherited.
+    pub(crate) env: BTreeMap<OsString, OsString>,
+    /// The working directory.
+    pub(crate) cwd: Option<PathBuf>,
+    /// The work volume's root: where a command with no directory of its own runs in the sandbox,
+    /// which runs git in the volume and nowhere else (this container's own directory is not a place
+    /// it knows).
+    pub(crate) root: Option<PathBuf>,
+    /// The standard input; empty for none.
+    pub(crate) stdin: Vec<u8>,
+}
+
+/// What a finished command left.
+#[derive(Debug)]
+pub(crate) struct Ran {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) code: Option<i32>,
+    pub(crate) success: bool,
+}
+
+/// Why a command could not be run in the sandbox.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SandboxFailure {
+    /// The command carries a credential. It is not sent, whatever asked for it.
+    #[error("the command carries a credential and is never sent to the git sandbox")]
+    Credential,
+    /// The command names no directory and the workspace has no root to run it in.
+    #[error("the command has no directory to run in")]
+    NoDirectory,
+    /// The sandbox could not run it.
+    #[error(transparent)]
+    Client(ClientError),
+}
+
+impl Invocation {
+    /// Whether this command could carry a credential: a variable git reads configuration from (the
+    /// way the token is handed to a network command), or a `-c` that sets a request header or a
+    /// credential helper. Such a command runs in this container or not at all.
+    pub(crate) fn carries_credentials(&self) -> bool {
+        let in_env = self.env.keys().any(|name| {
+            let name = name.to_string_lossy();
+            name == "GIT_CONFIG_COUNT"
+                || name == "GIT_CONFIG_PARAMETERS"
+                || name.starts_with("GIT_CONFIG_KEY_")
+                || name.starts_with("GIT_CONFIG_VALUE_")
+        });
+        let in_args = self.args.windows(2).any(|pair| {
+            if pair[0] != "-c" {
+                return false;
+            }
+            let setting = pair[1].to_string_lossy().to_ascii_lowercase();
+            let (key, value) = setting.split_once('=').unwrap_or((&setting, ""));
+            key.starts_with("http.") || (key.starts_with("credential.") && !value.is_empty())
+        });
+        in_env || in_args
+    }
+
+    /// Run `git` in this container: a child process of this one, from the environment in `env`
+    /// and no other, killed if the future is dropped.
+    pub(crate) async fn run_here(&self) -> io::Result<Ran> {
+        let mut cmd = Command::new("git");
+        cmd.args(&self.args).env_clear().envs(&self.env);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(if self.stdin.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+        let mut child = cmd.spawn()?;
+        // Written from a task of its own: git may answer before it has read everything, and a
+        // patch it stops reading (a parse error) breaks the pipe; its verdict is what counts.
+        let feeder = child.stdin.take().map(|mut stdin| {
+            let bytes = self.stdin.clone();
+            tokio::spawn(async move {
+                let _ = stdin.write_all(&bytes).await;
+            })
+        });
+        let output = child.wait_with_output().await;
+        if let Some(feeder) = feeder {
+            let _ = feeder.await;
+        }
+        let output = output?;
+        Ok(Ran {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            code: output.status.code(),
+            success: output.status.success(),
+        })
+    }
+
+    /// Run `git` in the sandbox. Only the variables the sandbox allows are sent
+    /// ([`adam_git_sandbox::environment`]); a command that [carries a credential] is refused here,
+    /// before anything is sent.
+    ///
+    /// [carries a credential]: Self::carries_credentials
+    pub(crate) async fn run_in(&self, sandbox: &GitSandbox) -> Result<Ran, SandboxFailure> {
+        if self.carries_credentials() {
+            return Err(SandboxFailure::Credential);
+        }
+        let cwd = self
+            .cwd
+            .clone()
+            .or_else(|| self.root.clone())
+            .ok_or(SandboxFailure::NoDirectory)?;
+        let env = environment::filter(self.env.clone())
+            .into_iter()
+            .filter(|(name, _)| name != "PATH")
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value)));
+        let request = Request::new(self.args.clone(), cwd, env);
+        let out = sandbox
+            .client
+            .output(request, &self.stdin)
+            .await
+            .map_err(SandboxFailure::Client)?;
+        Ok(Ran {
+            success: out.exit.success(),
+            code: out.exit.code,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+}
+
+/// The subcommands that talk to a remote: they run in this container, with or without a token,
+/// because what they read is the other end's, and because they are where a token goes.
+const NETWORK_SUBCOMMANDS: &[&str] = &[
+    "fetch",
+    "push",
+    "pull",
+    "ls-remote",
+    "clone",
+    "remote",
+    "fetch-pack",
+    "send-pack",
+    "submodule",
+];
+
 /// Builder for one `git` invocation.
 pub(crate) struct GitCmd {
     args: Vec<OsString>,
@@ -339,6 +566,8 @@ pub(crate) struct GitCmd {
     auth: Option<Auth>,
     pin: Option<GitPin>,
     refusal: Option<String>,
+    sandbox: Option<GitSandbox>,
+    in_coder: bool,
 }
 
 impl GitCmd {
@@ -352,7 +581,22 @@ impl GitCmd {
             auth: None,
             pin: None,
             refusal: None,
+            sandbox: None,
+            in_coder: false,
         }
+    }
+
+    /// Run in this sandbox, if the command is one that may ([`route`](Self::route)).
+    pub(crate) fn sandbox(mut self, sandbox: Option<GitSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// Run in this container whatever the sandbox is: a command on a mirror that has no
+    /// repository code in it yet (its `init`), or one that must be the coder's own.
+    pub(crate) fn in_coder(mut self) -> Self {
+        self.in_coder = true;
+        self
     }
 
     /// Work on this slot's repository, wherever its files say it is not (see [`GitPin`]).
@@ -437,62 +681,89 @@ impl GitCmd {
         }
     }
 
-    fn build(&self) -> Command {
-        let mut cmd = Command::new("git");
+    /// **Where this command runs**: the sandbox, or `None` for this container.
+    ///
+    /// The sandbox, when the deployment has one, for every command that is not network: it carries no
+    /// token, is not a [network subcommand](NETWORK_SUBCOMMANDS) (a `fetch` from a filesystem remote
+    /// has no token and is still the coder's), and was not asked to stay ([`in_coder`](Self::in_coder)).
+    pub(crate) fn route(&self) -> Option<&GitSandbox> {
+        let sandbox = self.sandbox.as_ref()?;
+        let network = NETWORK_SUBCOMMANDS.contains(&self.subcommand().as_str());
+        (!self.in_coder && self.auth.is_none() && !network).then_some(sandbox)
+    }
+
+    /// The command as data: hardening options, the empty environment plus what git needs, the token's
+    /// header if there is one, the pin, and the caller's own variables.
+    pub(crate) fn invocation(&self) -> Invocation {
         // Never run repository hooks, credential helpers or background gc from
         // an orchestrator-driven command; these -c flags are protected config.
-        cmd.args(["-c", "core.hooksPath=/dev/null"])
-            .args(["-c", "gc.auto=0"])
-            .args(["-c", "maintenance.auto=false"])
-            .args(["-c", "credential.helper="])
+        let mut args: Vec<OsString> = [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "credential.helper=",
             // A configured fsmonitor is a program git runs on every status.
-            .args(["-c", "core.fsmonitor=false"])
-            .args(["-c", "commit.gpgsign=false"]);
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "commit.gpgsign=false",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
         for (k, v) in &self.config {
-            cmd.arg("-c").arg(format!("{k}={v}"));
+            args.push("-c".into());
+            args.push(format!("{k}={v}").into());
         }
-        cmd.args(&self.args);
+        args.extend(self.args.iter().cloned());
+
         // An empty environment plus what git needs: the repository's own configuration can run a
         // program (a `filter.*.clean` written by a check script), and it must not find the coder's
         // secrets in the environment it runs in.
-        crate::git_env::confine_git_env(&mut cmd);
+        let mut env: BTreeMap<OsString, OsString> =
+            crate::git_env::inherited_pairs().into_iter().collect();
         for var in SCRUBBED_ENV {
-            cmd.env_remove(var);
+            env.remove(OsStr::new(var));
         }
-        cmd.env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_ASKPASS", "false")
-            .env("SSH_ASKPASS", "false")
-            .env("LC_ALL", "C");
+        for (name, value) in [
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_ASKPASS", "false"),
+            ("SSH_ASKPASS", "false"),
+            ("LC_ALL", "C"),
+        ] {
+            env.insert(name.into(), value.into());
+        }
         // No global configuration, unless the operator of this process named one in its own
         // environment (`GIT_CONFIG_GLOBAL`): `$HOME/.gitconfig` is a file that code running in a
         // worktree can write, and a `url.*.insteadOf` in it would redirect what carries the token.
-        cmd.env(
-            "GIT_CONFIG_GLOBAL",
+        env.insert(
+            "GIT_CONFIG_GLOBAL".into(),
             std::env::var_os("GIT_CONFIG_GLOBAL").unwrap_or_else(|| "/dev/null".into()),
         );
         if let Some(ceiling) = &self.ceiling {
-            cmd.env("GIT_CEILING_DIRECTORIES", ceiling);
+            env.insert("GIT_CEILING_DIRECTORIES".into(), ceiling.clone().into());
         }
         if let Some(auth) = &self.auth {
-            cmd.env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", auth.config_key())
-                .env("GIT_CONFIG_VALUE_0", auth.config_value());
+            env.insert("GIT_CONFIG_COUNT".into(), "1".into());
+            env.insert("GIT_CONFIG_KEY_0".into(), auth.config_key().into());
+            env.insert("GIT_CONFIG_VALUE_0".into(), auth.config_value().into());
         }
         if let Some(pin) = &self.pin {
-            pin.apply(&mut cmd);
+            env.extend(pin.pairs());
         }
-        for (k, v) in &self.env {
-            cmd.env(k, v);
+        env.extend(self.env.iter().cloned());
+        Invocation {
+            args,
+            env,
+            cwd: self.cwd.clone(),
+            root: self.ceiling.clone(),
+            stdin: Vec::new(),
         }
-        if let Some(cwd) = &self.cwd {
-            cmd.current_dir(cwd);
-        }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        cmd
     }
 
     /// Run to completion; a non-zero exit is an error.
@@ -530,28 +801,198 @@ impl GitCmd {
             LOCAL_TIMEOUT
         };
         let sub = self.subcommand();
-        let child = self
-            .build()
-            .spawn()
-            .map_err(|e| WorkspaceError::io(format!("cannot run git {sub}"), e))?;
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        let invocation = self.invocation();
+        let sandbox = self.route();
+        let run = async {
+            match sandbox {
+                Some(sandbox) => invocation
+                    .run_in(sandbox)
+                    .await
+                    .map_err(|e| sandbox_failed(&sub, e)),
+                None => invocation
+                    .run_here()
+                    .await
+                    .map_err(|e| WorkspaceError::io(format!("cannot run git {sub}"), e)),
+            }
+        };
+        let ran = match tokio::time::timeout(timeout, run).await {
             Err(_) => {
                 return Err(WorkspaceError::transient(format!(
                     "git {sub} timed out after {}s",
                     timeout.as_secs()
                 )));
             }
-            Ok(res) => res.map_err(|e| WorkspaceError::io(format!("git {sub} failed"), e))?,
+            Ok(ran) => ran?,
         };
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stderr = String::from_utf8_lossy(&ran.stderr).into_owned();
         Ok((
             GitOutput {
-                stdout: output.stdout,
-                success: output.status.success(),
-                code: output.status.code(),
+                stdout: ran.stdout,
+                success: ran.success,
+                code: ran.code,
             },
             stderr,
         ))
+    }
+}
+
+/// The error of a command that could not be run in the sandbox. It was **not** run anywhere else.
+fn sandbox_failed(sub: &str, failure: SandboxFailure) -> WorkspaceError {
+    use adam_git_sandbox::RefusalReason;
+    match failure {
+        SandboxFailure::Credential => WorkspaceError::Corrupt(format!(
+            "git {sub} carries a credential and was not sent to the git sandbox"
+        )),
+        SandboxFailure::NoDirectory => WorkspaceError::Corrupt(format!(
+            "git {sub} has no directory to run in the git sandbox"
+        )),
+        SandboxFailure::Client(ClientError::Refused(refusal)) => match refusal.reason {
+            RefusalReason::ShuttingDown => {
+                WorkspaceError::transient(format!("the git sandbox is shutting down (git {sub})"))
+            }
+            RefusalReason::BadDirectory => WorkspaceError::Corrupt(format!(
+                "the git sandbox does not run git {sub} there: {}",
+                refusal.message
+            )),
+            _ => WorkspaceError::io(
+                format!("the git sandbox refused git {sub}"),
+                io::Error::other(refusal.message),
+            ),
+        },
+        SandboxFailure::Client(e) => {
+            WorkspaceError::transient(format!("the git sandbox cannot run git {sub}"))
+                .with_source(e)
+        }
+    }
+}
+
+/// A `git` command that carries no credential, for the questions a caller asks of a repository
+/// (what the coder's tools do: `status`, `diff`, `apply`). It runs where the workspace's own git would run a
+/// command of its kind: in the git sandbox when there is one, else a child of this process, from
+/// the confined environment ([`confine_git_env`](crate::confine_git_env)) and with hooks and the
+/// file system monitor off. A sandbox that cannot be reached is an error; git is not run here
+/// instead.
+///
+/// It is never a way to talk to a remote: a command that carries a credential is refused.
+#[derive(Debug, Clone)]
+pub struct LocalGit {
+    invocation: Invocation,
+    sandbox: Option<GitSandbox>,
+}
+
+/// What a [`LocalGit`] left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalOutput {
+    /// Whether it exited with code 0.
+    pub success: bool,
+    /// What it wrote to its standard output.
+    pub stdout: Vec<u8>,
+    /// What it wrote to its standard error.
+    pub stderr: Vec<u8>,
+}
+
+impl LocalGit {
+    /// `git` in `cwd`, from an empty environment plus [`GIT_INHERITED_ENV`](crate::GIT_INHERITED_ENV),
+    /// with no prompts, no system configuration and a `C` locale. Run it in `sandbox` if there is one.
+    pub fn new(cwd: &Path, sandbox: Option<&GitSandbox>) -> Self {
+        let mut env: BTreeMap<OsString, OsString> =
+            crate::git_env::inherited_pairs().into_iter().collect();
+        for (name, value) in [
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("LC_ALL", "C"),
+        ] {
+            env.insert(name.into(), value.into());
+        }
+        Self {
+            invocation: Invocation {
+                args: [
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+                env,
+                cwd: Some(cwd.to_owned()),
+                root: None,
+                stdin: Vec::new(),
+            },
+            sandbox: sandbox.cloned(),
+        }
+    }
+
+    /// Work on the repository `pin` names (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`).
+    #[must_use]
+    pub fn pinned(mut self, pin: &GitPin) -> Self {
+        self.invocation.env.extend(pin.pairs());
+        self
+    }
+
+    /// Add an argument.
+    #[must_use]
+    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.invocation.args.push(arg.as_ref().to_owned());
+        self
+    }
+
+    /// Add arguments.
+    #[must_use]
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.invocation
+            .args
+            .extend(args.into_iter().map(|a| a.as_ref().to_owned()));
+        self
+    }
+
+    /// Set a variable of the command's environment.
+    #[must_use]
+    pub fn env(mut self, name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.invocation
+            .env
+            .insert(name.as_ref().to_owned(), value.as_ref().to_owned());
+        self
+    }
+
+    /// The command's standard input.
+    #[must_use]
+    pub fn stdin(mut self, bytes: Vec<u8>) -> Self {
+        self.invocation.stdin = bytes;
+        self
+    }
+
+    /// Run it to the end. Dropping the future stops the command (in the sandbox, its process group).
+    ///
+    /// # Errors
+    ///
+    /// When git cannot be started, the sandbox cannot be reached or refuses the command, or the
+    /// command carries a credential. A command that ran and failed is an `Ok` with
+    /// `success: false`.
+    pub async fn output(self) -> io::Result<LocalOutput> {
+        let ran = match &self.sandbox {
+            Some(sandbox) => self
+                .invocation
+                .run_in(sandbox)
+                .await
+                .map_err(io::Error::other)?,
+            None => {
+                if self.invocation.carries_credentials() {
+                    return Err(io::Error::other(SandboxFailure::Credential));
+                }
+                self.invocation.run_here().await?
+            }
+        };
+        Ok(LocalOutput {
+            success: ran.success,
+            stdout: ran.stdout,
+            stderr: ran.stderr,
+        })
     }
 }
 
@@ -622,6 +1063,8 @@ fn truncate_tail(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use adam_error::Classify as _;
+
     use super::*;
 
     #[test]
@@ -703,6 +1146,220 @@ mod tests {
     fn truncate_tail_keeps_the_end() {
         assert_eq!(truncate_tail("abcdef", 3), "...def");
         assert_eq!(truncate_tail("abc", 3), "abc");
+    }
+
+    fn sandbox() -> GitSandbox {
+        GitSandbox::new("/run/git/git.sock", Path::new("/work"))
+    }
+
+    fn with_token(cmd: GitCmd) -> GitCmd {
+        cmd.maybe_auth(Some(Auth::new(
+            "ghp_s3cr3t-token".into(),
+            Some("https://github.com/"),
+        )))
+    }
+
+    #[test]
+    fn a_command_without_a_credential_goes_to_the_sandbox_when_there_is_one() {
+        for args in [
+            vec!["status", "--porcelain"],
+            vec!["add", "-A"],
+            vec!["diff", "--cached", "--quiet"],
+            vec!["commit-tree", "abc", "-m", "m"],
+            vec!["worktree", "add", "--quiet", "/work/staging/x"],
+            vec!["config", "branch.agent/x.adam-run", "run"],
+            vec!["init", "--quiet", "/work/workspaces/run/proj"],
+            vec![
+                "--git-dir=/work/git/m.git",
+                "update-ref",
+                "refs/heads/x",
+                "abc",
+            ],
+        ] {
+            let cmd = GitCmd::new().sandbox(Some(sandbox())).args(&args);
+            assert!(cmd.route().is_some(), "{args:?} stays here");
+            assert!(
+                GitCmd::new().args(&args).route().is_none(),
+                "{args:?}: there is no sandbox to go to"
+            );
+        }
+    }
+
+    #[test]
+    fn what_talks_to_a_remote_or_carries_a_token_stays_in_the_coder() {
+        for sub in NETWORK_SUBCOMMANDS {
+            // With no token at all (a filesystem remote): still the coder's.
+            let cmd = GitCmd::new().sandbox(Some(sandbox())).args([
+                "--git-dir=/work/git/m.git",
+                sub,
+                "/srv/r.git",
+            ]);
+            assert!(cmd.route().is_none(), "{sub} goes to the sandbox");
+        }
+        // With a token, whatever the subcommand.
+        let cmd = with_token(GitCmd::new().sandbox(Some(sandbox())).arg("status"));
+        assert!(cmd.route().is_none());
+        // And a command that was asked to stay.
+        let cmd = GitCmd::new()
+            .sandbox(Some(sandbox()))
+            .in_coder()
+            .arg("init");
+        assert!(cmd.route().is_none());
+    }
+
+    #[test]
+    fn the_token_is_in_the_environment_of_the_command_that_carries_it() {
+        let inv = with_token(GitCmd::new().arg("fetch")).invocation();
+        let get = |name: &str| {
+            inv.env
+                .get(OsStr::new(name))
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("1"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_0").as_deref(),
+            Some("http.https://github.com/.extraHeader")
+        );
+        let value = get("GIT_CONFIG_VALUE_0").unwrap();
+        let want = format!(
+            "Authorization: Basic {}",
+            STANDARD.encode("x-access-token:ghp_s3cr3t-token")
+        );
+        assert_eq!(value, want);
+        assert!(inv.carries_credentials());
+        // The token is in no argument.
+        assert!(
+            !inv.args
+                .iter()
+                .any(|a| a.to_string_lossy().contains("s3cr3t")),
+            "{:?}",
+            inv.args
+        );
+    }
+
+    #[test]
+    fn the_hardening_options_alone_are_not_a_credential() {
+        let inv = GitCmd::new().arg("status").invocation();
+        assert!(
+            !inv.carries_credentials(),
+            "`-c credential.helper=` switches helpers off: it carries nothing"
+        );
+        assert!(
+            inv.args
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "credential.helper=")
+        );
+        // user.name and user.email, which commit-tree is given, are not either.
+        let inv = GitCmd::new()
+            .config("user.name", "Ada")
+            .config("user.email", "ada@example.com")
+            .arg("commit-tree")
+            .invocation();
+        assert!(!inv.carries_credentials());
+    }
+
+    #[tokio::test]
+    async fn a_command_with_a_credential_is_never_sent_to_the_sandbox() {
+        // Nobody listens at the socket: a command that was sent would fail as unreachable. These fail
+        // as what they are, before any connection.
+        let sandbox = sandbox();
+        let token = with_token(GitCmd::new().arg("status")).invocation();
+        let header = GitCmd::new()
+            .config("http.extraHeader", "Authorization: Basic eA==")
+            .arg("status")
+            .invocation();
+        let helper = GitCmd::new()
+            .config("credential.helper", "!store")
+            .arg("status")
+            .invocation();
+        let env = GitCmd::new()
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env("GIT_CONFIG_VALUE_0", "x")
+            .arg("status")
+            .invocation();
+        for (what, inv) in [
+            ("token", token),
+            ("header", header),
+            ("helper", helper),
+            ("env", env),
+        ] {
+            let failure = inv.run_in(&sandbox).await.unwrap_err();
+            assert!(
+                matches!(failure, SandboxFailure::Credential),
+                "{what}: {failure:?}"
+            );
+        }
+        // The same without a credential does try the sandbox, and finds nobody.
+        let plain = GitCmd::new()
+            .cwd(Path::new("/work"))
+            .arg("status")
+            .invocation();
+        let failure = plain.run_in(&sandbox).await.unwrap_err();
+        assert!(
+            matches!(
+                failure,
+                SandboxFailure::Client(ClientError::Unreachable { .. })
+            ),
+            "{failure:?}"
+        );
+        // A failure is an error of the command, and is not run here instead.
+        let error = sandbox_failed("status", failure);
+        assert!(error.is_retryable(), "{error:?}");
+        assert!(error.to_string().contains("git sandbox"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_command_with_no_directory_runs_in_the_root_of_the_volume() {
+        let cmd = GitCmd::new()
+            .ceiling(Path::new("/work"))
+            .arg("check-ref-format");
+        let inv = cmd.invocation();
+        assert_eq!(inv.cwd, None);
+        assert_eq!(inv.root.as_deref(), Some(Path::new("/work")));
+        // With nothing to run in, it is not sent.
+        let bare = GitCmd::new().arg("check-ref-format").invocation();
+        let failure = bare.run_in(&sandbox()).await.unwrap_err();
+        assert!(
+            matches!(failure, SandboxFailure::NoDirectory),
+            "{failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_question_without_a_sandbox_is_a_child_of_this_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = LocalGit::new(tmp.path(), None)
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.success, "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(tmp.path().join(".git").is_dir());
+        let out = LocalGit::new(tmp.path(), None)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "HEAD");
+        // A failing command is an output, not an error.
+        let out = LocalGit::new(tmp.path(), None)
+            .args(["rev-parse", "--verify", "nope"])
+            .output()
+            .await
+            .unwrap();
+        assert!(!out.success);
+        // The input reaches it.
+        let out = LocalGit::new(tmp.path(), None)
+            .args(["hash-object", "--stdin"])
+            .stdin(b"hello\n".to_vec())
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
     }
 
     mod prop {

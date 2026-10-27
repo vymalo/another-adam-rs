@@ -75,9 +75,12 @@ flowchart LR
 ## The image
 
 `docker/coder/Dockerfile`, built from the **repository root**, has three stages: it compiles `adam-coder`,
-`adam-agent`, `adam-kube-exec` and `adam-egress` on a pinned `rust:1.94-trixie` (tag and digest, so glibc matches the
+`adam-agent`, `adam-kube-exec`, `adam-egress` and the two binaries of `adam-git-sandbox` on a pinned `rust:1.94-trixie` (tag and digest, so glibc matches the
 runtime image; `adam-egress` is the HTTPS-only proxy for run pods, [`bin/adam-egress`](../../bin/adam-egress/README.md),
-smoke-tested in the image and not deployed by the chart yet); it takes the official `github-mcp-server` binary (pinned by tag and digest); and the runtime is the
+smoke-tested in the image and not deployed by the chart yet; `adam-git-sandbox` is the server that runs the coder's git
+where no secret is readable and `adam-git` the relay that stands in for git, [`crates/adam-git-sandbox`](../../crates/adam-git-sandbox/README.md),
+smoke-tested in the image and **not deployed by the chart yet**: a deployment that sets `GIT_SANDBOX_SOCKET` runs the server
+itself, as a container of the coder's pod that mounts the same work volume and holds no secret); it takes the official `github-mcp-server` binary (pinned by tag and digest); and the runtime is the
 `workspace` image of `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini, OpenCode, the obscura
 headless browser), pinned by an immutable tag, with those binaries, the devcontainer CLI and Podman's remote client
 added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is

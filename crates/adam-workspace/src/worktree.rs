@@ -258,9 +258,10 @@ impl Worktree {
     /// Where `git` works for this worktree: [`git_dir`](Self::git_dir) and the mirror, with the
     /// worktree's directory as the work tree. `None` without a git directory.
     pub fn git_pin(&self) -> Option<GitPin> {
-        self.admin
-            .as_deref()
-            .map(|admin| GitPin::worktree(admin, &self.mirror, &self.path, Arc::clone(&self.root)))
+        self.admin.as_deref().map(|admin| {
+            GitPin::worktree(admin, &self.mirror, &self.path, Arc::clone(&self.root))
+                .with_sandbox(self.ws.sandbox())
+        })
     }
 
     /// Changed files: staged, unstaged and untracked (each untracked file
@@ -304,14 +305,18 @@ impl Worktree {
                 "the worktree's git directory is not known".to_owned(),
             ));
         };
-        let copy = safe_fs::private_copy_of(&admin.join("index"), safe_fs::MAX_INDEX_COPY)
-            .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::InvalidInput => {
-                    WorkspaceError::Corrupt(format!("the worktree's index cannot be used: {e}"))
-                }
-                _ => WorkspaceError::io("cannot copy the index", e),
-            })?;
+        let copy = safe_fs::private_copy_in(
+            self.ws.private_dir().as_deref(),
+            &admin.join("index"),
+            safe_fs::MAX_INDEX_COPY,
+        )
+        .await
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::InvalidInput => {
+                WorkspaceError::Corrupt(format!("the worktree's index cannot be used: {e}"))
+            }
+            _ => WorkspaceError::io("cannot copy the index", e),
+        })?;
 
         self.git()
             .env("GIT_INDEX_FILE", copy.path())
@@ -320,7 +325,13 @@ impl Worktree {
             .await?;
         self.git()
             .env("GIT_INDEX_FILE", copy.path())
-            .args(["diff", "--stat", "--no-color", "--no-ext-diff"])
+            .args([
+                "diff",
+                "--stat",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+            ])
             .arg(&base)
             .arg("--")
             .run()
@@ -367,20 +378,19 @@ impl Worktree {
     pub async fn push(&self) -> WorkspaceResult<()> {
         let loc = self.repo.locate()?;
         let auth = self.ws.authorize(&self.repo, &loc).await?;
-        // The mirror lock is held from the clean-up of the configuration to the end of the
-        // push and of the upstream bookkeeping: what carries the token runs on a configuration
-        // that was just made safe, and the branch config (the mirror's shared file, which
-        // concurrent pushes of different runs would otherwise race on) is written by one at a time.
+        // The mirror lock is held from the check of the configuration to the end of the push and
+        // of the upstream bookkeeping: what carries the token runs on a configuration that was
+        // just checked, and the branch config (the mirror's shared file, which concurrent pushes
+        // of different runs would otherwise race on) is written by one at a time. The push is made
+        // on the bare mirror: the branch is there, and it needs nothing of the worktree.
         let _guard = self.ws.lock_mirror(&self.mirror).await?;
+        let url = loc.remote_url(&self.repo.url);
         self.ws
-            .sanitize_mirror_config(&self.mirror, loc.remote_url(&self.repo.url))
-            .await?;
-        self.git()
-            .args(["push", "--quiet"])
-            .arg(loc.remote_url(&self.repo.url))
-            .arg(format!("refs/heads/{0}:refs/heads/{0}", self.local))
-            .maybe_auth(auth)
-            .run()
+            .run_network(&self.mirror, url, auth, |git| {
+                git.args(["push", "--quiet"])
+                    .arg(url)
+                    .arg(format!("refs/heads/{0}:refs/heads/{0}", self.local))
+            })
             .await?;
         self.record_pushed(&self.local).await;
 
@@ -424,19 +434,15 @@ impl Worktree {
         let loc = self.repo.locate()?;
         let auth = self.ws.authorize(&self.repo, &loc).await?;
         let _guard = self.ws.lock_mirror(&self.mirror).await?;
-        self.ws
-            .sanitize_mirror_config(&self.mirror, loc.remote_url(&self.repo.url))
-            .await?;
+        let url = loc.remote_url(&self.repo.url);
         let pushed = self
-            .git()
-            .args(["push", "--quiet"])
-            .arg(loc.remote_url(&self.repo.url))
-            .arg(format!(
-                "refs/heads/{}:refs/heads/{}",
-                self.local, self.branch
-            ))
-            .maybe_auth(auth)
-            .run()
+            .ws
+            .run_network(&self.mirror, url, auth, |git| {
+                git.args(["push", "--quiet"]).arg(url).arg(format!(
+                    "refs/heads/{}:refs/heads/{}",
+                    self.local, self.branch
+                ))
+            })
             .await;
         match pushed {
             Err(WorkspaceError::Invalid(message))
@@ -751,7 +757,13 @@ pub(crate) async fn commit_all_in(
         return commit_staged_on(git, message, author, &format!("refs/heads/{branch}")).await;
     }
     let staged = git()
-        .args(["diff", "--cached", "--quiet"])
+        .args([
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+        ])
         .run_status()
         .await?;
     match staged.code {

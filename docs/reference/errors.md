@@ -68,6 +68,13 @@ flowchart LR
             Refusal
             EgressNames["ConfigError, NameError, AllowError, CidrError"]
         end
+        subgraph sandbox_e["adam-git-sandbox"]
+            SandboxError
+            SandboxConfigError["ConfigError"]
+            ClientError
+            SandboxRefusal["protocol::Refusal"]
+            ProtocolError
+        end
     end
 
     subgraph classes["adam_error::ErrorClass"]
@@ -152,6 +159,18 @@ flowchart LR
     EgressNames --> Invalid
     Refusal -->|"Malformed, HeadTooLarge, PlainHttp, IpLiteral, PortNotAllowed, HostNotAllowed, NoPublicAddress"| Invalid
     Refusal -->|"HeadTimeout, ResolutionFailed, ResolutionTimeout, ConnectFailed, ConnectTimeout, AtCapacity"| Transient
+
+    SandboxError -->|Config| Invalid
+    SandboxError -->|Bind| Transient
+    SandboxConfigError --> Invalid
+    ClientError -->|"Unreachable, Disconnected, Output"| Transient
+    ClientError -->|Refused| SandboxRefusal
+    SandboxRefusal -->|"BadRequest, UnsupportedVersion, NoArguments, BadDirectory"| Invalid
+    SandboxRefusal -->|ShuttingDown| Transient
+    SandboxRefusal -->|SpawnFailed| Internal
+    ClientError -->|Protocol| ProtocolError
+    ProtocolError -->|"Io, Truncated"| Transient
+    ProtocolError -->|"TooLarge, UnexpectedKind, Malformed"| Corrupt
 ```
 
 ## What each class decides
@@ -254,6 +273,19 @@ cause chain and none of the process's secrets.
 configuration and 71 when it cannot bind `EGRESS_LISTEN` (`bin/adam-egress/src/error.rs`); it logs `adam-egress failed`
 in the same way. What it refuses per request is an HTTP status, not an exit: the `Refusal` enum maps each reason to
 its status and class.
+
+`adam-git-sandbox` (the git sandbox, [its README](../../crates/adam-git-sandbox/README.md)) ends with 0 after SIGTERM, 78 for
+its configuration and 71 when it cannot make its socket (`crates/adam-git-sandbox/src/error.rs`). The relay `adam-git`
+ends with **git's own exit code** (128 plus the signal for a command a signal killed), and with these when the command did
+not run or its conversation failed: 78 `GIT_SANDBOX_SOCKET` is unset or not an absolute path, 69 nobody answers at the socket,
+77 the sandbox refused the command (a directory outside its root), 74 the connection ended before the command did or broke
+the protocol, 141 its output could not be written. A command that could not go through the sandbox is a
+`WorkspaceError` of the coder, never a command run in its own container instead: `Transient` when the sandbox cannot be
+reached (the step is retried), `Corrupt` when it refuses the directory, and `Corrupt` for a command that carries a credential.
+A mirror whose configuration holds keys the workspace did not write is not an error: they are removed before the next
+command that carries a credential, and one warning names the keys and not their values ([the repair](../../crates/adam-workspace/README.md#the-mirrors-configuration-is-put-back-not-trusted)).
+A mirror whose `config`, `HEAD` or `packed-refs` is not a regular file (or whose `config` is over 1 MiB), or that has a `commondir`, is
+a `WorkspaceError::Corrupt` that names the file; git never makes any of them, so nothing is put back and no credential is sent.
 
 ## Rules for an error enum
 
