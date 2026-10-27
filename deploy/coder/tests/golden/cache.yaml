@@ -636,7 +636,7 @@ spec:
         checksum/run-pod: e9ef0ea52208cdbb2fddcf963429e33d92570fd9ba7aa859e69ff574a9690b8f
     spec:
       serviceAccountName: coder
-      automountServiceAccountToken: true
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 120
       securityContext:
         fsGroup: 10001
@@ -647,6 +647,50 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
+        - name: git-sandbox
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          command: ["tini", "--", "adam-git-sandbox"]
+          env:
+            - name: GIT_SANDBOX_LISTEN
+              value: "/run/git-sandbox/git.sock"
+            - name: GIT_SANDBOX_ROOT
+              value: /work
+            - name: GIT_SANDBOX_MAX_COMMANDS
+              value: "64"
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "cd /work && exec env GIT_SANDBOX_SOCKET=/run/git-sandbox/git.sock adam-git --version"]
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "cd /work && exec env GIT_SANDBOX_SOCKET=/run/git-sandbox/git.sock adam-git --version"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: git-sandbox
+              mountPath: /run/git-sandbox
+            - name: git-sandbox-tmp
+              mountPath: /tmp
         - name: github-mcp
           image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
           imagePullPolicy: IfNotPresent
@@ -747,6 +791,8 @@ spec:
               value: "900"
             - name: RUN_POD_WAIT_SECS
               value: "600"
+            - name: GIT_SANDBOX_SOCKET
+              value: "/run/git-sandbox/git.sock"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -801,6 +847,11 @@ spec:
             - name: run-pod
               mountPath: /etc/adam/run-pod
               readOnly: true
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            - name: git-sandbox
+              mountPath: /run/git-sandbox
       volumes:
         - name: cache
           persistentVolumeClaim:
@@ -810,6 +861,33 @@ spec:
             name: coder-run-pod
             # The pod template: no secret in it.
             defaultMode: 0444
+        - name: kube-api-access
+          projected:
+            # 420 is 0644, as the kubelet's own volume has it (decimal, so that no YAML reader takes it for another number).
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3607
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+        # The socket of the git sandbox: the coder container and the git-sandbox container share this and the work volume, and nothing else.
+        - name: git-sandbox
+          emptyDir: {}
+        # The sandbox's /tmp, in memory and sized: a program that fills it gets ENOSPC, where a disk-backed emptyDir would get the whole pod evicted.
+        - name: git-sandbox-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: "64Mi"
   volumeClaimTemplates:
     - metadata:
         name: work

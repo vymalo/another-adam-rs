@@ -232,6 +232,25 @@ from service.yaml, which every render contains, so they always run.
 {{- if not (get (get $rp.resources "limits" | default dict) "memory") -}}
 {{- fail "runPods.resources.limits.memory is required: the quota counts it, and a pod without a memory limit is refused by it" -}}
 {{- end -}}
+{{- /* The git sandbox container of the coder pod (ADR 0041, open decision 6): always rendered with run pods. */ -}}
+{{- if not (kindIs "map" $rp.gitSandbox) -}}
+{{- fail "runPods.gitSandbox must be a map (resources, tmpSize, maxCommands); the git sandbox container is always rendered with run pods" -}}
+{{- end -}}
+{{- if not (kindIs "map" $rp.gitSandbox.resources) -}}
+{{- fail "runPods.gitSandbox.resources must be a map (requests and limits)" -}}
+{{- end -}}
+{{- if not (get (get $rp.gitSandbox.resources "limits" | default dict) "memory") -}}
+{{- fail "runPods.gitSandbox.resources.limits.memory is required: a program that a repository's configuration makes git run in the sandbox must be stopped by the container's limit, not by the node's, and the sandbox's /tmp counts against it" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$" (toString $rp.gitSandbox.tmpSize)) -}}
+{{- fail (printf "runPods.gitSandbox.tmpSize must be a quantity such as 64Mi, got %q" (toString $rp.gitSandbox.tmpSize)) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $rp.gitSandbox.maxCommands))) (lt (int64 $rp.gitSandbox.maxCommands) 1) (gt (int64 $rp.gitSandbox.maxCommands) 4096) -}}
+{{- fail (printf "runPods.gitSandbox.maxCommands must be a whole number from 1 to 4096 (GIT_SANDBOX_MAX_COMMANDS), got %q" (toString $rp.gitSandbox.maxCommands)) -}}
+{{- end -}}
+{{- if hasKey .Values.config.extraEnv "GIT_SANDBOX_SOCKET" -}}
+{{- fail "config.extraEnv sets GIT_SANDBOX_SOCKET while runPods.enabled is on: the chart sets it itself, to the socket of the git sandbox container it runs in the coder pod" -}}
+{{- end -}}
 {{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$" (toString $rp.quota.limitsMemory)) -}}
 {{- fail (printf "runPods.quota.limitsMemory must be a quantity such as 8Gi, got %q" (toString $rp.quota.limitsMemory)) -}}
 {{- end -}}

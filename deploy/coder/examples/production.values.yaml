@@ -1,5 +1,6 @@
 # The coder as a production deployment of a GitHub App: the commands of a run (run_command, run_checks, OpenCode) run in
-# a pod of their own, which has no key, and the App's private key is a file that only the coder pod mounts. This is the
+# a pod of their own, which has no key, and the App's private key is a file that only the coder container mounts; the coder's
+# own git runs in a sandbox container of its pod that has no key either (ADR 0041, open decision 6). This is the
 # shape the chart asks for. With github.auth=app and runPods.enabled=false the chart refuses to render and the coder
 # refuses to start (exit 78): a command in the coder's own container can read the key file, mint installation tokens
 # and act as the App at any access tier, a `plan` included (ADR 0036, decision 6).

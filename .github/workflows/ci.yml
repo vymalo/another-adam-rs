@@ -478,9 +478,17 @@ jobs:
   # works, and the proxy's own pod reaches the public address (the control); curl and `npm view` in the run
   # pod reach registry.npmjs.org through the proxy; example.com is answered 403 and the proxy logs the refusal
   # and nothing of the request. It FAILS when a policy is not enforced (ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1,
-  # which this job does not set, is for a cluster known not to enforce them). What it does not prove: the coder
-  # over a model through it, the images (a small local one plays the run image, the coder's and the proxy's),
-  # IPv6 (kind is IPv4 only: only that no rule names an IPv6 range is checked) and a CNI other than kindnet.
+  # which this job does not set, is for a cluster known not to enforce them). And it proves the GIT SANDBOX
+  # (ADR 0041, open decision 6; issue #118): a pod made from the chart's own StatefulSet (the coder container
+  # sleeps; its environment, mounts and projected token are the chart's, with canaries for the App's key, the
+  # model key, a bearer token and the database URL) has a `git-sandbox` container with no token, no Secret, no
+  # secret variable and no view of the coder's processes; a git command through its socket works; and a
+  # scratch project whose own .git/config names a clean filter and an fsmonitor that write what they can read to
+  # a marker runs them in the sandbox, with a marker that holds no canary, where the same program run by plain
+  # git in the coder container (the control) reads them all. `adam-git-sandbox` and `adam-git` are built in
+  # the job, like `adam-egress`. What it does not prove: the coder over a model through it, the images (a small
+  # local one plays the run image, the coder's, the proxy's and the sandbox's), IPv6 (kind is IPv4 only: only
+  # that no rule names an IPv6 range is checked) and a CNI other than kindnet.
   # ADAM_TEST_REQUIRE_KUBERNETES makes the test fail instead of skipping, so a typo in the variables cannot
   # turn the job green. The runner's preinstalled `kind` is used with the node image operator.yml pins
   # (Kubernetes v1.35.8, whose network plugin, kindnet, enforces NetworkPolicies: the platform's run-pods-e2e

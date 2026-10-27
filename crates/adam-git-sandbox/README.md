@@ -212,8 +212,10 @@ The coder's own code paths (`RunWorkspace`, `Worktree::commit_all`, the tools' q
   the test's files. The isolation is the deployment's: another container with **no Secret volume, no secret variable and no
   service-account token** (the token becomes a projected volume mounted into the coder alone), **its own PID namespace** (no
   `shareProcessNamespace`, so it cannot read the `/proc` of the coder's processes), a read-only root filesystem and an `emptyDir` for
-  `/tmp`. The chart does not run the server yet; a kind check that the sidecar has no token, no Secret and no view of the coder's
-  processes, and that a commit made through it works, comes with it.
+  `/tmp`. The coder chart runs the server so whenever `runPods.enabled` is on ([the chart's section](../../deploy/coder/README.md#the-git-sandbox)),
+  and the `run-pods` CI job shows on a kind cluster that the sidecar has no token, no Secret and no view of the coder's processes, that a commit
+  made through it works, and that a repository whose configuration names a filter and an fsmonitor runs them in it and reads no canary (*unverified*
+  until CI has run it).
 * **A filter in the sandbox still sees the whole work volume**: every run's files, as the coder's `git` does today, and it can **write
   the shared mirrors** (which is why the coder puts a mirror's configuration back to what it writes before every network command,
   [`adam-workspace`](../adam-workspace/README.md#the-mirrors-configuration-is-put-back-not-trusted)). Closing that needs git per run in
