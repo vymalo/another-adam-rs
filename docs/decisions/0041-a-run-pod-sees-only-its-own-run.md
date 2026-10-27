@@ -237,6 +237,19 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   there in the milliseconds between the check and git's read would be followed once. Closing it makes each slot a mount point (a
   new slot would then need a pod made again, which decision 3 already does for worktrees but not for scratch projects), or has the
   coder hold a descriptor of the directory for the length of a command. Not built.
+  *Amended (2026-10-27, [#125](https://github.com/vymalo/another-adam-rs/issues/125), the first of two changes):* the coder's **own**
+  opens are now relative to the slot. `Slot`, `Worktree` and `Scratch` hold the slot's directory, opened where the slot is checked
+  without following a link (`SlotDir`, `crates/adam-workspace/src/safe_fs/slot_dir.rs`), and the file tools (`read_file`,
+  `write_file`, `edit_file`, `share_file`, and the paths `apply_patch` checks), `copy_into`, `Scratch::files`, the restore of the
+  worktree's `.git` file and of a scratch project's `info/exclude` resolve, open, make and rename relative to that descriptor
+  (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` where the kernel has it, a walk with `O_NOFOLLOW` where not). A swap of a
+  slot, or of a directory below it, between the check and the use is not followed; the tests make the swap happen at that point
+  (`safe_fs::race`) and fail on the code before. An absolute link inside the worktree is no longer followed by a read (it was). **What
+  stays open:** `git` finds its work tree by name inside its own process, whatever the coder holds (*verified* with git 2.43.0), so
+  a swap in the instant between the last look at the slot and `git`'s read of its name is still not closed: `GitPin::check`, `GitCmd`
+  and `GitAt::command` now look at the directory against the descriptor first and last (a slot moved away and replaced by a directory
+  of the same name is refused), which narrows the window and does not close it, and `apply_patch` still has `git apply` write by name.
+  Closing it is the second change: every slot a mount point of the run's pod (`subPath`), which the run cannot rename. Not built.
 * **A scratch project is a repository the run controls entirely.** Its `.git` is a directory in the run's directory, with its own
   `config` (a `filter.*.clean` or a `core.fsmonitor` there runs in the coder's `git add -A`, decision 7's open decision 6), its
   own `logs` (the link-append of decision 7 reaches any file through `.git/logs/HEAD`), and its own hooks (off). The pin requires
@@ -371,3 +384,7 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   directory and `.git` are looked at without following a link before they are made, and its `info/exclude` is read and written like
   `commondir` (decision 10); `git worktree move` is verified afterwards and undone when it went somewhere else (decision 9); the
   mounts of a pod carry the generation of the worktree's directory, so a slot made again has the pod made again (decision 3).
+* **2026-10-27, [#125](https://github.com/vymalo/another-adam-rs/issues/125) (first of two changes).** The coder holds each slot's
+  directory open and does its own file work relative to it (Known limits: *a swap between a check and the use*); decision 10's
+  "the coder's file tools (`confine`) look at the root without following a link" is now "open it without following a link, and use the
+  descriptor". The second change, the slot as a mount point of the pod, is not built.

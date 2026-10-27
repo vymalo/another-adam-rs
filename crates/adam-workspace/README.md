@@ -20,7 +20,7 @@ authentication behave like the real tool.
 | Item | What |
 |---|---|
 | `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, **`check_repository(&RepoRef)`** (whether the policy accepts a repository: nothing is spawned, requested or written), **`acts_for()`** (the accounts the credentials are confined to, `None` for a token), **`run(run)`** (a run's workspace, below), **`runs()`** (the runs that have one on disk), **`remote_is_empty(url)`**, **`initialize_empty(&RepoRef, &GitIdentity)`**, **`wait_reachable(url, Duration)`**, `default_branch(url)`, `remove(run)` (everything of the run's workspace, the legacy worktree included), and the single-repository helpers `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `open_existing(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`); a remote whose `HEAD` names none is `NoDefaultBranch` (class `NotFound`: a caller that solves it by naming a branch matches this variant and no other). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
-| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, **`add_scratch_for(dir, &GitIdentity, Option<&str>)`** (for a conversation), **`adopt_scratch(conversation)`**, `remove()`, **`remove_keeping_scratch()`**; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)`, `files()`, `status()`, `published_to()`, `set_published_to(url)` and **`conversation()`** |
+| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, **`add_scratch_for(dir, &GitIdentity, Option<&str>)`** (for a conversation), **`adopt_scratch(conversation)`**, `remove()`, **`remove_keeping_scratch()`**; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)`, `files()`, `status()`, `published_to()`, `set_published_to(url)` and **`conversation()`** **`root()`** on a `Slot`, a `Worktree` and a `Scratch`: the slot's directory as the coder opened it, `&Arc<SlotDir>` ([below](#a-slots-directory-is-held-not-named)); `path()` stays what it was, the name. `copy_into` and `Scratch::files()` work relative to those directories |
 | `copy_into(&Scratch, &Worktree, path, overwrite)`, `CopyReport`, `Collision` | the files of a scratch project into a worktree, all or nothing: `copied`, `unchanged`, `collisions` |
 | `Environment` (trait), `DynEnvironment`, `Local` | where a run's processes run: `ensure(&RunWorkspace, &dyn EnvProgress)` gives the run's `EnvSession` (made on first need, then the same), `release(run)` (idempotent), `held_runs()`, `rebuild(run, use_default)` (throw the run's environment away and make it again on the next `ensure`; `false` where there is nothing of its own to make again). `Local` is the caller's own container and holds nothing |
 | `HidingEnvironment` | `HidingEnvironment::new(inner, names)`: an `Environment` that adds `names` to the `hide` list of **every** `ExecSpec` its sessions prepare, so a process that holds secrets keeps them from the code it runs for others (the coder passes the variables its `mcp.json` files read as `${VAR}`) without every caller having to remember them; everything else (`describe`, `kill`, `tool_path`, `secret_ref`, `release`, `held_runs`, `rebuild`) is the inner environment's. `hidden()` lists the names |
@@ -28,8 +28,8 @@ authentication behave like the real tool.
 | `ExecSpec`, `Program`, `PreparedCommand`, `ExecId`, `SecretRef` | what to run (`ExecSpec::shell(command, cwd)` or `::argv(..)`, `.env(..)`, `.hide(names)`), the command an environment made of it (`PreparedCommand::command()` is a `tokio::process::Command` with its program, arguments, directory and environment), and how a process reads a secret (`SecretRef::Env` or `File`) |
 | `EnvProgress` (trait), `EnvStep`, `EnvStepState`, `NoProgress`, `EnvKind`, `EnvDescription` | the steps of a slow `ensure`, and what an environment says it is (`EnvKind::{Local, DevContainer { source, image }, Kubernetes { pod, image }}`, `#[non_exhaustive]`: a `match` over it needs a wildcard) |
 | `EnvError` | `Unavailable`, `Config { file, reason }`, `Refused`, `Build { reason, log_tail }`, `Timeout { phase, secs }`, `Lost`, `Io`; `#[non_exhaustive]`, see *Errors* |
-| `GitPin` | where `git` works for a slot, from the coder's metadata: `git_dir()`, `common_dir()`, `work_tree()`, `apply(&mut Command)` (sets `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE`), `check().await` (**only checks**: the work tree and the git directory are plain directories, a worktree's `commondir` is a regular file that says `../..`, its `HEAD`, `index` and reflog are regular files, a scratch project has no `commondir`; it never rewrites anything). `Worktree::git_pin()`, `Scratch::git_pin()` and `Slot::git_pin()` give it ([below](#git-is-pinned-to-the-slots-repository)) |
-| `safe_fs` (module) | how the coder opens what a run's commands can write, without being led anywhere by it: `read_regular_file(path, max)` / `read_regular_text` (`O_NOFOLLOW | O_NONBLOCK`, `fstat`: not a link, not a pipe, not longer than `max`), `private_copy_of(path, max)` (a copy, mtime kept, in a `0700` directory of the process's own temporary directory, made with `O_EXCL`; removed when the `PrivateCopy` is dropped), `replace_file(path, bytes)` (written next to it and renamed over it), `is_real_directory`, `is_real_file`, `is_plain_path(below, path)` (`lstat`, so a link is not a directory) and the constants `MAX_SMALL_FILE`, `MAX_INDEX_COPY` ([below](#what-the-coder-opens-in-a-directory-a-run-writes)) |
+| `GitPin` | where `git` works for a slot, from the coder's metadata: `git_dir()`, `common_dir()`, `work_tree()`, `apply(&mut Command)` (sets `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE`), `check().await` (**only checks**: the work tree and the git directory are plain directories, a worktree's `commondir` is a regular file that says `../..`, its `HEAD`, `index` and reflog are regular files, a scratch project has no `commondir`; it never rewrites anything), **`still_here().await`** (the work tree's name still leads to the directory the coder opened as the slot, [`SlotDir::is_still_here`](#a-slots-directory-is-held-not-named): not moved away, not replaced by another directory or a link; `check()` asks it first and last, and `GitCmd` once more as `git` starts; a tripwire, which narrows the window and does not close it). A `GitPin` now holds the slot's `Arc<SlotDir>` (its `Eq` compares the directory too). `Worktree::git_pin()`, `Scratch::git_pin()` and `Slot::git_pin()` give it ([below](#git-is-pinned-to-the-slots-repository)) |
+| `safe_fs` (module) | how the coder opens what a run's commands can write, without being led anywhere by it: `read_regular_file(path, max)` / `read_regular_text` (`O_NOFOLLOW | O_NONBLOCK`, `fstat`: not a link, not a pipe, not longer than `max`), `private_copy_of(path, max)` (a copy, mtime kept, in a `0700` directory of the process's own temporary directory, made with `O_EXCL`; removed when the `PrivateCopy` is dropped), `replace_file(path, bytes)` (written next to it and renamed over it), `is_real_directory`, `is_real_file`, `is_plain_path(below, path)` (`lstat`, so a link is not a directory) and the constants `MAX_SMALL_FILE`, `MAX_INDEX_COPY` ([below](#what-the-coder-opens-in-a-directory-a-run-writes)); and, for a slot's directory, **`SlotDir`** (opened once, without following a link, and held: everything in the slot is relative to it), its `Dir` (an open directory: `lstat`, `open_dir`, `open_regular`, `create_new`, `mkdir`, `rename`, `unlink`, `symlink`, `read_link`, `replace_file`), `Meta`, `Backend`, `WalkError`, `BeneathError`, and **`safe_fs::race`**, the seam the tests swap a directory with ([below](#a-slots-directory-is-held-not-named)) |
 | `confine_git_env(&mut tokio::process::Command)`, `GIT_INHERITED_ENV` | the environment of a `git` a caller starts itself: empty, plus only the variables of `GIT_INHERITED_ENV` (`PATH`, `HOME`, the locale and temp dirs, certificate and proxy settings, `GIT_CONFIG_GLOBAL`). Every `git` this crate runs starts this way, and the coder's own (`git apply`, the tree-id probes) too ([below](#git-starts-from-an-empty-environment)) |
 | `login_shell()` | `bash` where the image has one, else `sh` (the shell of a `Program::Shell`) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
@@ -177,10 +177,12 @@ mirror. Anything a run puts where the coder will look is met with the coder's ri
   does not name the destination, or a link appeared on the way, the directory in the mirror, the staging copy and the tree where git put
   it (if the way to it is plain) are removed and the call fails. A tree behind a link is left, not removed through the link.
 
-What this does not close is a swap between a check and the use that follows it: the pod's commands run while the coder checks. In a run
-pod the files that matter (`HEAD`, `commondir`, `gitdir`, `logs`) are read-only mounts and cannot be swapped; a slot's directory can be (a run
-may rename it), and the window is the time between `GitPin::check` and git's own read (and, for the move into a slot, the time between
-the look at the destination and git's move: detected afterwards and undone, not prevented). Local mode and Podman share the coder's container
+What this does not close is a swap between a check and the use that follows it **in `git`**: the pod's commands run while the coder
+checks. The coder's own opens are relative to the slot's directory as it opened it ([above](#a-slots-directory-is-held-not-named)), so a
+slot swapped for a link is not followed by them. In a run pod the files that matter (`HEAD`, `commondir`, `gitdir`, `logs`) are read-only
+mounts and cannot be swapped; a slot's directory can be (a run may rename it), and the window is the time between the last look at the slot
+(`GitPin::check`, then `GitPin::still_here`) and git's own read of its name (and, for the move into a slot, the time between the look at the
+destination and git's move: detected afterwards and undone, not prevented). Local mode and Podman share the coder's container
 or bind the mirror read-write, and are not protected at all ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md), "Known limits").
 Tests: `workspace.rs`, `a_commondir_that_is_a_link_is_refused_and_nothing_is_written_through_it`, `a_commondir_that_is_a_pipe_is_refused_and_does_not_hang_the_coder`,
 `a_temporary_index_is_not_a_name_a_run_can_plant_a_link_at`, `an_index_that_is_a_link_is_refused_and_nothing_is_copied_from_it`,
@@ -190,6 +192,62 @@ Tests: `workspace.rs`, `a_commondir_that_is_a_link_is_refused_and_nothing_is_wri
 `a_scratch_projects_dot_git_that_is_a_link_or_a_file_is_refused_and_nothing_is_made`,
 `a_slot_made_again_under_the_same_name_has_another_generation_of_its_git_directory`; `workspace.rs` (`placement_tests`: a directory that appeared at
 the destination, a tree behind a link, a destination there before the move, a parent that is a link) and `safe_fs.rs` have unit tests.
+
+### A slot's directory is held, not named
+
+A slot's directory is the run's to rename: a command in the run's pod, and a process it leaves running (which outlives the command
+in a pod), can move the directory away and put a link to another run's directory at its name at any moment. The coder holds the
+whole volume, so a path that is checked and then used by name may be followed there. [`SlotDir`](src/safe_fs/slot_dir.rs) makes the
+check and the hold one step (vymalo/another-adam-rs#125):
+
+* `SlotDir::open(path)` opens the directory without following a link (`O_DIRECTORY | O_NOFOLLOW`, `openat2` with
+  `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH` where the kernel has it, from the parent the coder made) and keeps the descriptor. A
+  `Slot`, a `Worktree` and a `Scratch` hold it as an `Arc<SlotDir>` (`root()`), opened where the slot is **checked**
+  (`RunWorkspace::slots()`, `slot()`, `add_repository`, `add_scratch`, `Workspaces::prepare`): a link, a file or a worktree
+  without its `.git` there is not a slot, as before. A directory that is moved or replaced afterwards is still the one the coder
+  opened.
+* Everything the coder does in the slot is relative to the descriptor: `Dir` has the `*at` calls (`lstat`, `open_dir`,
+  `open_regular`, `create_new` with `O_EXCL`, `mkdir`, `rename`, `unlink`, `symlink`, `read_link`, `replace_file`), each taking one
+  plain component, and `SlotDir` the paths below it: `dir_below`, `lstat_below`, `open_regular_below`, `read_regular_below`,
+  `replace_file_below` (no link anywhere on the way, the last component included, refused with `ELOOP`), `walk(rel, create)` (one
+  directory at a time with `mkdirat`, and the component that is a link or a file is named: `WalkError`) and, for a read that may
+  go through a link that stays inside the slot, `resolve_inside(rel, avoid)` and `open_following(rel, avoid)`. Resolving is done in
+  this process over held directories and never by asking the kernel to resolve a link or a `..`: an absolute link and a `..` above
+  the slot's root are `BeneathError::Escapes`, a name `avoid` rejects (`.git`) is `Avoided` however it is reached, and the file is
+  opened by the path the resolution found, which has no link in it, so a link put there meanwhile is `Changed` and never followed.
+* Where `openat2` is missing (Linux before 5.6, a seccomp profile that does not allow it, other systems), the same refusals are made by a
+  walk of one component at a time with `O_NOFOLLOW` (`Backend::Walk`; `Backend::detect()` probes once). The tests run every case both ways
+  (`SlotDir::open_using`, under `test-util`).
+* `copy_into` plans and writes relative to the scratch project's and the worktree's directories: the destination's directories are
+  made with `mkdirat`, a file is a new one (`O_EXCL`) renamed over its target, a source file is opened without following a link and must
+  still be a regular file, and a link is written as the plan read it. `Scratch::files()` lists a name only if `lstat` relative to the
+  directory, with no link on the way, says it is not a directory. **Behaviour that changed**: a file behind a link inside the project is
+  not one of its files any more (it was listed, and copied through the link).
+* `git` cannot be given a descriptor: it finds its work tree by name inside its own process (*verified*, git 2.43.0: a held descriptor,
+  `/proc/self/fd/N` and a relative `GIT_WORK_TREE` do not change that). So `GitPin::check` looks at the directory against the descriptor
+  first and last, and `GitCmd` and the coder's `GitAt::command` once more after that, as near to the start of `git` as they can
+  (`SlotDir::is_still_here`: `fstat` of the descriptor against `lstat` of the name, which must be a directory and not a link). A slot that
+  was moved away and replaced by a directory of the same name (which `lstat` of the name alone calls fine, and `git add -A` calls a work
+  tree in which every file was deleted) is refused. **This narrows the window and does not close it.** What closes it is a slot that cannot
+  be renamed in the run's pod: a mount point of its own (the second change of #125, not built).
+* `apply_patch` writes by `git apply`, by name: the coder checks the paths of a patch relative to the descriptor, then `git` writes them.
+  The same limit.
+
+**Public API** (this change; nothing here is a trait, so no implementer breaks): `SlotDir` (also `adam_workspace::SlotDir`), `Dir`, `Meta`,
+`Backend`, `WalkError`, `BeneathError` and `safe_fs::race` are new; `Slot::root()`, `Worktree::root()`, `Scratch::root()` and
+`GitPin::still_here()` are new; a `GitPin` holds the slot's directory (`Eq` compares it too); `Worktree`'s and `Scratch`'s constructors
+are the crate's own, so nothing outside changes; `rustix` (`fs`, `std`; already in the tree through `tempfile`) is a direct dependency.
+`safe_fs::race::checkpoint(slot, at)` is called where a check ends and the use begins and does nothing unless the crate is built for its
+tests or with `test-util`; `race::on_checkpoint(slot, |at, n| ..)` (under the same condition) runs a closure there, keyed by the slot's path.
+
+Tests: `src/safe_fs/slot_dir.rs` (both backends: what a slot may be, `is_still_here`, what is done after the slot moved lands in the
+directory that was opened, links anywhere refused, a pipe not waited on, replace without writing through, `walk`, `resolve_inside`
+and `open_following` with relative, absolute, escaping, looping, dangling and `.git` links, a directory swapped after the resolution);
+`workspace.rs`: `copy_into_does_not_write_through_a_destination_slot_swapped_after_the_plan`,
+`copy_into_does_not_copy_a_source_file_swapped_for_a_link_after_the_plan`,
+`copy_into_does_not_read_a_source_slot_swapped_after_the_plan`, `a_file_behind_a_link_in_the_project_is_not_one_of_its_files`,
+`git_is_not_run_on_a_slot_replaced_by_a_directory_after_the_coder_opened_it`,
+`git_is_not_started_on_a_slot_replaced_between_the_check_and_the_start`.
 
 ### A check on the base: `BaseCheckout`
 
@@ -552,7 +610,7 @@ token, and a message does not repeat its source.
 | Feature | Default | Effect |
 |---|---|---|
 | `github` | yes | the `GitHub` code host and the `GitHubApp` credentials (pull in `reqwest`, and `aws-lc-rs`, `rustls-pki-types` and `chrono` to sign and read the App's JWT and key; `aws-lc-rs` and `rustls-pki-types` are already in the tree under `rustls`) |
-| `test-util` | no | `MemoryCodeHost` for downstream tests, and with `github` also `testing::TestAppKey` |
+| `test-util` | no | `MemoryCodeHost` for downstream tests, and with `github` also `testing::TestAppKey`; and the seam that makes a slot's directory swap between a check and the use that follows it (`safe_fs::race::on_checkpoint`, `SlotDir::open_using`): without it `race::checkpoint` does nothing |
 
 The only environment variable the crate reads is the one you name in
 `StaticToken::from_env` / `ScopedToken::from_env` (for example `GITHUB_TOKEN`).
@@ -574,6 +632,9 @@ Offline. The `git` CLI must be on `PATH`.
   lock it fails with "could not lock" in 5 of 5 runs) and
   `a_mirror_locked_by_another_process_makes_prepare_wait` (a lock held on the lock file blocks
   `prepare` until it is released).
+* A slot swapped between a check and the use that follows it (the seam `safe_fs::race`): see
+  [A slot's directory is held, not named](#a-slots-directory-is-held-not-named). The tests are in `tests/workspace.rs` and
+  `src/safe_fs/slot_dir.rs`, and in `adam-coder` for its file tools.
 * `tests/workspace.rs` also covers the workspace of slots, against local bare repositories: two repositories in one run
   (their directories, their `seq`, the order they joined, each a worktree like any other), asking for one repository twice
   (also spelled as `file://` with another base: the same slot, uncommitted work kept), three repositories called `lib` (told

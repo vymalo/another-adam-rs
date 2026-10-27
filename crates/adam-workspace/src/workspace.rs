@@ -15,7 +15,7 @@ use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{Auth, GitCmd};
 use crate::repo::{RepoLocation, RepoRef, fnv1a};
 use crate::run_workspace::RunWorkspace;
-use crate::safe_fs;
+use crate::safe_fs::{self, SlotDir};
 use crate::worktree::{GitIdentity, Worktree};
 
 pub(crate) const REMOTE_TRACKING_PREFIX: &str = "refs/remotes/origin/";
@@ -521,10 +521,10 @@ impl Workspaces {
                     ),
                 }));
             }
-            if self.inner.is_valid_worktree(path, &mirror).await {
+            if let Some(root) = self.inner.valid_worktree(path, &mirror).await {
                 return Ok(self
                     .inner
-                    .open_worktree(m, &target.dir, path.clone(), mirror, &target.meta_path)
+                    .open_worktree(m, &target.dir, root, mirror, &target.meta_path)
                     .await);
             }
         }
@@ -628,9 +628,16 @@ impl Workspaces {
         meta.admin = Some(admin);
         meta.admin_gen = Some(new_generation());
         self.inner.write_meta_at(&target.meta_path, &meta).await?;
+        // The directory `git worktree add` made, opened as a plain directory and held.
+        let root = SlotDir::open_async(path).await.map_err(|e| {
+            WorkspaceError::Corrupt(format!(
+                "the worktree {} cannot be opened as a directory of its own: {e}",
+                path.display()
+            ))
+        })?;
         Ok(self
             .inner
-            .worktree(&meta, &target.dir, path.clone(), mirror))
+            .worktree(&meta, &target.dir, Arc::new(root), mirror))
     }
 
     /// The default branch of the repository at `repo_url`: what the remote's `HEAD` points at
@@ -1117,19 +1124,18 @@ impl Inner {
         let loc = RepoRef::new(&meta.url, &meta.base_branch).locate()?;
         let mirror = self.root.join(loc.mirror_relative());
         let path = self.worktree_path(run);
-        if self.is_valid_worktree(&path, &mirror).await {
-            Ok(Some(
+        match self.valid_worktree(&path, &mirror).await {
+            Some(root) => Ok(Some(
                 self.open_worktree(
                     &meta,
                     &slot_name(&loc.name),
-                    path,
+                    root,
                     mirror,
                     &self.meta_path(run),
                 )
                 .await,
-            ))
-        } else {
-            Ok(None)
+            )),
+            None => Ok(None),
         }
     }
 
@@ -1221,10 +1227,10 @@ impl Inner {
         self: &Arc<Self>,
         meta: &Meta,
         dir: &str,
-        path: PathBuf,
+        root: Arc<SlotDir>,
         mirror: PathBuf,
     ) -> Worktree {
-        Worktree::new(Arc::clone(self), meta, dir.to_owned(), path, mirror)
+        Worktree::new(Arc::clone(self), meta, dir.to_owned(), root, mirror)
     }
 
     /// The remote's branches as the last fetch saw them (`origin/*` of the mirror), sorted, the
@@ -1788,10 +1794,11 @@ impl Inner {
         self: &Arc<Self>,
         meta: &Meta,
         dir: &str,
-        path: PathBuf,
+        root: Arc<SlotDir>,
         mirror: PathBuf,
         meta_path: &Path,
     ) -> Worktree {
+        let path = root.path().to_path_buf();
         let recorded = meta
             .admin
             .as_deref()
@@ -1838,42 +1845,36 @@ impl Inner {
         let mut told = meta.clone();
         told.admin = admin;
         told.admin_gen = generation;
-        self.worktree(&told, dir, path, mirror)
+        self.worktree(&told, dir, root, mirror)
     }
 
     /// `path` is a checked-out worktree whose git dir belongs to `mirror`: a plain directory (not a
-    /// link a run put in its place) with a `.git` file.
-    async fn is_valid_worktree(&self, path: &Path, mirror: &Path) -> bool {
-        if !safe_fs::is_real_directory(path).await
-            || !safe_fs::is_real_file(&path.join(".git")).await
-        {
-            return false;
-        }
+    /// link a run put in its place) with a `.git` file. The directory, opened and held: the check
+    /// and the hold are one step.
+    async fn valid_worktree(&self, path: &Path, mirror: &Path) -> Option<Arc<SlotDir>> {
+        let root = open_worktree_root(path).await?;
         let out = self
             .git()
             .cwd(path)
             .args(["rev-parse", "--is-inside-work-tree", "--git-common-dir"])
             .run_status()
             .await;
-        let Ok(out) = out else { return false };
+        let Ok(out) = out else { return None };
         if !out.success {
-            return false;
+            return None;
         }
         let text = out.stdout_text();
         let mut lines = text.lines();
         if lines.next() != Some("true") {
-            return false;
+            return None;
         }
-        let Some(common) = lines.next() else {
-            return false;
-        };
-        let common = path.join(common);
+        let common = path.join(lines.next()?);
         match (
             tokio::fs::canonicalize(&common).await,
             tokio::fs::canonicalize(mirror).await,
         ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
+            (Ok(a), Ok(b)) if a == b => Some(root),
+            _ => None,
         }
     }
 
@@ -2129,6 +2130,30 @@ pub(crate) fn validate_run(run: &str) -> WorkspaceResult<()> {
             "run id {run:?} must be 1-{MAX_RUN_ID} characters of [A-Za-z0-9._-] and not start with '.'"
         )))
     }
+}
+
+/// Open `path` as the directory of a repository slot: a directory itself (not a link a run put in
+/// its place) with the `.git` file of a worktree. `None` for anything else. The directory is held:
+/// the check and the hold are one step ([`SlotDir`]).
+pub(crate) async fn open_worktree_root(path: &Path) -> Option<Arc<SlotDir>> {
+    open_slot_root(path, |meta| meta.is_file()).await
+}
+
+/// Open `path` as the directory of a scratch slot: a directory itself with a `.git` directory.
+pub(crate) async fn open_scratch_root(path: &Path) -> Option<Arc<SlotDir>> {
+    open_slot_root(path, safe_fs::Meta::is_dir).await
+}
+
+async fn open_slot_root(path: &Path, git_is: fn(safe_fs::Meta) -> bool) -> Option<Arc<SlotDir>> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let root = SlotDir::open(&path).ok()?;
+        let git = root.lstat(std::ffi::OsStr::new(".git")).ok()?;
+        git_is(git).then(|| Arc::new(root))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// A directory name for a repository called `name` in a run's workspace: lowercased, only

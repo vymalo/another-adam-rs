@@ -11,17 +11,23 @@
 //! * An empty path, an absolute path, any `..` component and any component equal to `.git`
 //!   (compared without regard to case: a case-insensitive file system has the same `.git`) are
 //!   refused. The path is relative to the root of the worktree.
-//! * To **read**, the path is canonicalised (every symlink followed) and the result must still be
-//!   inside the canonical root, and not inside a `.git` either. So a symlink that stays inside the
-//!   worktree is read, and one that leads out is refused.
-//! * To **write**, the deepest part of the path that exists is looked at one component at a
-//!   time: any symlink on the way, the file itself included, is refused (a link that stays inside
-//!   is refused too: a write through a link is a write to a place the model did not name), and what
-//!   exists must be inside the canonical root.
+//! * To **read**, the path is resolved inside the worktree, following every symlink on the way
+//!   that stays inside it, and the result must not be inside a `.git` either. So a symlink that
+//!   stays inside the worktree is read, and one that leads out (an absolute one, or one that goes
+//!   up past the root) is refused.
+//! * To **write**, every component of the path that exists is looked at: any symlink on the way, the
+//!   file itself included, is refused (a link that stays inside is refused too: a write through a
+//!   link is a write to a place the model did not name).
 //!
-//! * The **root** is looked at first, without following a link: the slot's directory is the run's to
-//!   rename, and a link in its place (to another run's slot) would be canonicalised into the
-//!   root. A root that is not a directory itself is refused.
+//! # Relative to the slot
+//!
+//! The **root** is the slot's directory *as the coder opened it* ([`SlotDir`], held by the slot):
+//! the directory is the run's to rename, and a link put at its name (to another run's slot) would
+//! be followed by anything that uses the name. Nothing here uses the name. A path is resolved and
+//! opened relative to the descriptor, a file is written to a name nobody chose in the directory's
+//! own descriptor and renamed over its target, and a directory is made with `mkdirat`. A swap of the
+//! slot, or of a directory below it, at any moment is not followed: the tools go on in the directory
+//! they opened, or fail.
 //!
 //! A refusal names its reason and is a tool **result**, not a failed run.
 //!
@@ -33,20 +39,32 @@
 //!
 //! # Races
 //!
-//! The checks and the write are not one atomic step. The tools of one run are called one at a
-//! time and what a command leaves running is killed with it, so nothing else changes the worktree
-//! between them; the write itself goes to a new file next to its target and is renamed over it,
-//! which replaces a symlink that appeared meanwhile instead of following it.
+//! A command in the run's pod, and a process it left running (which outlives the command in a
+//! pod), can rename the slot's directory, or a directory below it, and put a link at the old name
+//! while a tool works: a path may be checked and then used. So the tools do not use a name for what
+//! they check. The checks and the use are relative to the same descriptors (see above): the slot's,
+//! and the directory a file is written in; a link that appears on a path after it was resolved
+//! is refused when the file is opened (`RESOLVE_NO_SYMLINKS`, or `O_NOFOLLOW` one component at a
+//! time where `openat2` is missing), and the write is a new file renamed over its target, which
+//! replaces a symlink that appeared meanwhile instead of following it.
+//!
+//! What is **not** covered: `git apply` (the paths of a patch are checked here, then `git` writes
+//! them by name, and `git` finds its work tree by name inside its own process: the slot's directory
+//! being looked at again just before is a tripwire, not a lock), and everything a command itself
+//! does. Making the slot's directory a mount point of the run's pod, which cannot be renamed, is
+//! what closes that.
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use adam::prelude::*;
+use adam_workspace::safe_fs::{BeneathError, Dir, Meta, SlotDir, WalkError, race};
 use tokio::io::AsyncWriteExt;
 
 use super::gitcli::GitAt;
@@ -132,104 +150,178 @@ fn parts_of(rel: &str) -> Result<Vec<OsString>, String> {
     Ok(parts)
 }
 
-/// The absolute path of `rel` under `slot_root` for `access`, or the reason the model is told.
+/// A path that [`confine`] accepted: the components below the slot's root. For a read they are the
+/// path with every link on the way followed (it has none), for a write the path as given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confined {
+    parts: Vec<OsString>,
+}
+
+impl Confined {
+    /// The path, relative to the slot's root.
+    pub fn rel(&self) -> PathBuf {
+        self.parts.iter().collect()
+    }
+}
+
+/// Check `rel` against the slot `root` for `access`, or give the reason the model is told.
 ///
-/// The rule is in the [module docs](self#the-confinement-rule-confine). The result starts with the
-/// canonical `slot_root`; for [`Access::Read`] it is the canonical path of an existing file or
-/// directory, for [`Access::Write`] the path of a file that may not exist yet (its parents may not
-/// either).
+/// The rule is in the [module docs](self#the-confinement-rule-confine). Everything is looked at
+/// relative to `root`, the slot's directory as the coder opened it, never by its name. For
+/// [`Access::Read`] the path must exist; for [`Access::Write`] it may not exist yet (nor its
+/// parents).
+///
+/// This is a **check**: it opens nothing the caller can use. A caller that goes on to read or write
+/// does it with `open_for_read` and `locate_for_write`, which look at the path again as they
+/// open it.
 ///
 /// # Errors
 ///
 /// A message for the model: the path is empty, absolute, goes up, names `.git`, leaves the
 /// worktree through a symlink, goes through a symlink to write, or (to read) does not exist.
-pub fn confine(slot_root: &Path, rel: &str, access: Access) -> Result<PathBuf, String> {
-    // The slot's directory is the run's to rename: a link in its place leads to another run's
-    // files, and canonicalising the root would take that for the root.
-    match fs::symlink_metadata(slot_root) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => {
-            return Err(
-                "the worktree's directory is not a plain directory (a command replaced it by a link or a file): refused"
-                    .to_owned(),
-            );
-        }
-        Err(e) => return Err(format!("cannot resolve the worktree: {e}")),
-    }
-    let root = slot_root
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve the worktree: {e}"))?;
+pub fn confine(root: &SlotDir, rel: &str, access: Access) -> Result<Confined, String> {
     let parts = parts_of(rel)?;
     let shown = rel.trim();
     match access {
         Access::Read => {
-            let mut joined = root.clone();
-            joined.extend(&parts);
-            let canonical = joined.canonicalize().map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => format!("`{shown}` does not exist"),
-                _ => format!("cannot resolve `{shown}`: {e}"),
-            })?;
-            let Ok(inside) = canonical.strip_prefix(&root) else {
-                return Err(format!(
-                    "`{shown}` leads outside the worktree (through a symlink): refused"
-                ));
-            };
-            if inside
-                .components()
-                .any(|c| matches!(c, Component::Normal(name) if is_dot_git(name)))
-            {
-                return Err(format!(
-                    "`{shown}` leads into .git (through a symlink): refused"
-                ));
-            }
-            Ok(canonical)
+            let path: PathBuf = parts.iter().collect();
+            let resolved = root
+                .resolve_inside(&path, &is_dot_git)
+                .map_err(|e| read_refusal(e, shown))?;
+            Ok(Confined { parts: resolved })
         }
         Access::Write => {
-            let mut current = root.clone();
-            let mut existing = root.clone();
-            let last = parts.len() - 1;
-            for (i, name) in parts.iter().enumerate() {
-                current.push(name);
-                match fs::symlink_metadata(&current) {
-                    Ok(meta) if meta.file_type().is_symlink() => {
-                        return Err(format!(
-                            "`{shown}` goes through the symlink `{}`: writing through a symlink is refused",
-                            parts[..=i].iter().collect::<PathBuf>().display()
-                        ));
-                    }
-                    Ok(meta) if i < last && !meta.is_dir() => {
-                        return Err(format!(
-                            "`{}` is a file, not a directory: `{shown}` cannot be inside it",
-                            parts[..=i].iter().collect::<PathBuf>().display()
-                        ));
-                    }
-                    Ok(meta) if i == last && meta.is_dir() => {
-                        return Err(format!("`{shown}` is a directory: name a file"));
-                    }
-                    Ok(_) => existing.clone_from(&current),
-                    // The rest of the path is new.
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => break,
-                    Err(e) => return Err(format!("cannot look at `{shown}`: {e}")),
-                }
-            }
-            // Nothing on the way is a symlink, so this holds by construction; it is checked
-            // anyway, since it is what the rule is for.
-            let canonical = existing
-                .canonicalize()
-                .map_err(|e| format!("cannot resolve `{shown}`: {e}"))?;
-            if !canonical.starts_with(&root) {
-                return Err(format!("`{shown}` resolves outside the worktree: refused"));
-            }
-            let mut path = root;
-            path.extend(&parts);
-            Ok(path)
+            locate_for_write(root, &parts, shown, false)?;
+            Ok(Confined { parts })
         }
     }
 }
 
+/// What the model is told when a path cannot be resolved for a read.
+fn read_refusal(e: BeneathError, shown: &str) -> String {
+    match e {
+        BeneathError::Escapes => {
+            format!("`{shown}` leads outside the worktree (through a symlink): refused")
+        }
+        BeneathError::Avoided(_) => {
+            format!("`{shown}` leads into .git (through a symlink): refused")
+        }
+        BeneathError::TooManyLinks => {
+            format!("cannot resolve `{shown}`: too many levels of symbolic links")
+        }
+        BeneathError::Changed => {
+            format!("`{shown}` changed while it was opened (a symlink is on its way now): refused")
+        }
+        BeneathError::Io(e) if e.kind() == io::ErrorKind::NotFound => {
+            format!("`{shown}` does not exist")
+        }
+        BeneathError::Io(e) => format!("cannot resolve `{shown}`: {e}"),
+    }
+}
+
+/// Open `rel` of the slot `root` for reading, and say what it is (a file, a directory or
+/// something else: the caller tells the model).
+///
+/// The path is resolved inside the slot, following the links that stay inside it; the file is then
+/// opened by the path that resolution found, which has no link in it, relative to `root`. So a
+/// link put on the way after the resolution is refused and never followed, and so is a slot
+/// swapped for a link meanwhile (the descriptor is the directory that was opened).
+pub(super) fn open_for_read(root: &SlotDir, rel: &str) -> Result<(fs::File, Meta), String> {
+    let parts = parts_of(rel)?;
+    let shown = rel.trim();
+    let path: PathBuf = parts.iter().collect();
+    root.open_following(&path, &is_dot_git)
+        .map_err(|e| read_refusal(e, shown))
+}
+
+/// Where a write goes: the directory the file is in, as a descriptor, and the file.
+struct Located {
+    /// What the model called the file.
+    shown: String,
+    /// The slot, for the checkpoints of the tests.
+    slot: PathBuf,
+    /// The directory of the file; `None` when it (or a directory above it) is not there yet and
+    /// nothing was made.
+    parent: Option<Dir>,
+    name: OsString,
+    /// What is at `name`, without following it.
+    existing: Option<Meta>,
+}
+
+/// Find the directory a write to `parts` goes in, relative to `root`, making the directories that
+/// are missing when `create` is set, and what is at the file now. Refuses (as [`confine`] says) a
+/// link anywhere on the way, the file itself included, a file where a directory is needed and a
+/// directory where the file is to be.
+fn locate_for_write(
+    root: &SlotDir,
+    parts: &[OsString],
+    shown: &str,
+    create: bool,
+) -> Result<Located, String> {
+    let Some((name, dirs)) = parts.split_last() else {
+        return Err("path is required".to_owned());
+    };
+    let prefix = |upto: usize| -> String {
+        parts[..=upto]
+            .iter()
+            .collect::<PathBuf>()
+            .display()
+            .to_string()
+    };
+    let linked = |upto: usize| {
+        format!(
+            "`{shown}` goes through the symlink `{}`: writing through a symlink is refused",
+            prefix(upto)
+        )
+    };
+    let dir_path: PathBuf = dirs.iter().collect();
+    let parent = match root.walk(&dir_path, create) {
+        Ok(dir) => Some(dir),
+        Err(WalkError::Missing(_)) => None,
+        Err(WalkError::Link(at)) => return Err(linked(at)),
+        Err(WalkError::NotDirectory(at)) => {
+            return Err(format!(
+                "`{}` is a file, not a directory: `{shown}` cannot be inside it",
+                prefix(at)
+            ));
+        }
+        Err(WalkError::Io(e)) if create => {
+            return Err(format!("cannot create the directories of `{shown}`: {e}"));
+        }
+        Err(WalkError::Io(e)) => return Err(format!("cannot look at `{shown}`: {e}")),
+    };
+    let existing = match &parent {
+        Some(dir) => match dir.lstat(name) {
+            Ok(meta) => Some(meta),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("cannot look at `{shown}`: {e}")),
+        },
+        None => None,
+    };
+    match existing {
+        Some(meta) if meta.is_symlink() => return Err(linked(parts.len() - 1)),
+        Some(meta) if meta.is_dir() => {
+            return Err(format!("`{shown}` is a directory: name a file"));
+        }
+        _ => {}
+    }
+    Ok(Located {
+        shown: shown.to_owned(),
+        slot: root.path().to_path_buf(),
+        parent,
+        name: name.clone(),
+        existing,
+    })
+}
+
 /// The text of `rel` under `root`: the whole file up to [`READ_CAP`], or the lines `start..=end`
 /// with their numbers.
-fn read_in(root: &Path, rel: &str, start: Option<u32>, end: Option<u32>) -> Result<String, String> {
+fn read_in(
+    root: &SlotDir,
+    rel: &str,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<String, String> {
     if start == Some(0) || end == Some(0) {
         return Err("lines are numbered from 1: start_line and end_line must be at least 1".into());
     }
@@ -240,9 +332,8 @@ fn read_in(root: &Path, rel: &str, start: Option<u32>, end: Option<u32>) -> Resu
             "end_line ({end}) is before start_line ({start}): the range is empty"
         ));
     }
-    let path = confine(root, rel, Access::Read)?;
+    let (file, meta) = open_for_read(root, rel)?;
     let shown = rel.trim();
-    let meta = fs::metadata(&path).map_err(|e| format!("cannot read `{shown}`: {e}"))?;
     if meta.is_dir() {
         return Err(format!(
             "`{shown}` is a directory: list it with run_command (`ls {shown}`)"
@@ -251,13 +342,12 @@ fn read_in(root: &Path, rel: &str, start: Option<u32>, end: Option<u32>) -> Resu
     if !meta.is_file() {
         return Err(format!("`{shown}` is not a regular file"));
     }
-    let file = fs::File::open(&path).map_err(|e| format!("cannot read `{shown}`: {e}"))?;
     if start.is_none() && end.is_none() {
-        read_whole(file, meta.len(), shown)
+        read_whole(file, meta.size(), shown)
     } else {
         read_range(
             io::BufReader::new(file),
-            meta.len(),
+            meta.size(),
             shown,
             start.unwrap_or(1),
             end,
@@ -363,11 +453,10 @@ struct Written {
     bytes: usize,
 }
 
-/// Write `content` to `rel` under `root`: parents are created, the file is written next to its
-/// target and renamed over it (an interrupted write leaves the old file or the new one, never half
-/// of one), and the mode of a file that is replaced is kept (an executable script stays one).
-fn write_in(root: &Path, rel: &str, content: &str) -> Result<Written, String> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Write `content` to `rel` of the slot `root`: parents are created, the file is written next to
+/// its target and renamed over it (an interrupted write leaves the old file or the new one, never
+/// half of one), and the mode of a file that is replaced is kept (an executable script stays one).
+fn write_in(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String> {
     if content.len() > WRITE_CAP {
         return Err(format!(
             "content is {} bytes, over the limit of {WRITE_CAP}: write the file in parts with \
@@ -376,37 +465,42 @@ fn write_in(root: &Path, rel: &str, content: &str) -> Result<Written, String> {
         ));
     }
     let shown = rel.trim();
-    let path = confine(root, rel, Access::Write)?;
-    let existing = fs::symlink_metadata(&path).ok();
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("`{shown}` has no directory to be written in"))?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("cannot create the directories of `{shown}`: {e}"))?;
-    let tmp = parent.join(format!(
+    let parts = parts_of(rel)?;
+    let located = locate_for_write(root, &parts, shown, true)?;
+    write_located(&located, content)
+}
+
+/// The write of [`write_in`], to the directory [`locate_for_write`] found: a new file made in it
+/// (`O_EXCL`, so nothing is followed), written, and renamed over the target.
+fn write_located(located: &Located, content: &str) -> Result<Written, String> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let shown = &located.shown;
+    let Some(parent) = &located.parent else {
+        return Err(format!("`{shown}` has no directory to be written in"));
+    };
+    race::checkpoint(&located.slot, "write");
+    let tmp = OsString::from(format!(
         ".adam-write-{}-{}.tmp",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let written = (|| -> io::Result<()> {
-        use std::io::Write as _;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut file = parent.create_new(&tmp)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
-        if let Some(meta) = &existing {
-            fs::set_permissions(&tmp, meta.permissions())?;
+        if let Some(meta) = &located.existing {
+            file.set_permissions(fs::Permissions::from_mode(meta.permissions()))?;
         }
-        fs::rename(&tmp, &path)
+        drop(file);
+        parent.rename(&tmp, &located.name)
     })();
     if let Err(e) = written {
-        let _ = fs::remove_file(&tmp);
+        let _ = parent.unlink(&tmp);
         return Err(format!("cannot write `{shown}`: {e}"));
     }
     Ok(Written {
-        created: existing.is_none(),
+        created: located.existing.is_none(),
         bytes: content.len(),
     })
 }
@@ -575,8 +669,10 @@ async fn plan(at: &GitAt, patch: &str, recount: bool) -> Result<Plan, PatchError
     if paths.is_empty() {
         return Err(PatchError::Refused("the patch changes no file".to_owned()));
     }
+    // Only a check: `git apply` writes these paths by name, which the coder cannot protect (see the
+    // module docs, *Races*).
     for path in &paths {
-        confine(at.path(), path, Access::Write).map_err(PatchError::Refused)?;
+        confine(at.root(), path, Access::Write).map_err(PatchError::Refused)?;
     }
     let summary = git_apply(at, &with(&["--summary"]), patch).await?;
     if summary.success && summary_has_link(&String::from_utf8_lossy(&summary.stdout)) {
@@ -693,7 +789,7 @@ pub async fn read_file(
     };
     ctx.emit_progress(format!("read {path} ({})", slot.dir()))
         .await;
-    let (root, rel) = (slot.path().to_path_buf(), path.to_owned());
+    let (root, rel) = (Arc::clone(slot.root()), path.to_owned());
     let read = tokio::task::spawn_blocking(move || read_in(&root, &rel, start_line, end_line))
         .await
         .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
@@ -725,7 +821,7 @@ pub async fn write_file(
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    let (root, rel) = (slot.path().to_path_buf(), path.to_owned());
+    let (root, rel) = (Arc::clone(slot.root()), path.to_owned());
     let written = tokio::task::spawn_blocking(move || write_in(&root, &rel, &content))
         .await
         .map_err(|e| ToolError::Transient(format!("the write was interrupted: {e}")))?;
@@ -807,14 +903,15 @@ const REGION_CONTEXT: usize = 2;
 /// Longest line an error quotes, in characters.
 const MAX_QUOTED_CHARS: usize = 200;
 
-/// Replace `old` with `new` in `rel` under `root`: exactly, once or everywhere.
+/// Replace `old` with `new` in `rel` of the slot `root`: exactly, once or everywhere.
 ///
 /// The file must exist, be a regular file of at most [`WRITE_CAP`] bytes, and be UTF-8 text without
 /// NUL. The path is confined as a write is ([`confine`] with [`Access::Write`]), so nothing inside
-/// `.git`, nothing outside the worktree and nothing through a symlink is edited. The write is
-/// [`write_in`]'s (a new file renamed over the old, the mode kept).
+/// `.git`, nothing outside the worktree and nothing through a symlink is edited. The file is read
+/// and written in the directory the path was located in, and the write is [`write_in`]'s (a new
+/// file renamed over the old, the mode kept).
 fn edit_in(
-    root: &Path,
+    root: &SlotDir,
     rel: &str,
     old: &str,
     new: &str,
@@ -829,35 +926,45 @@ fn edit_in(
     if old == new {
         return Err("old and new are the same text: there is nothing to change".into());
     }
-    let path = confine(root, rel, Access::Write)?;
-    let meta = match fs::metadata(&path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(format!(
-                "`{shown}` does not exist: edit_file changes a file that is there (write_file \
-                 creates one)"
-            ));
-        }
-        Err(e) => return Err(format!("cannot read `{shown}`: {e}")),
+    let parts = parts_of(rel)?;
+    let located = locate_for_write(root, &parts, shown, false)?;
+    race::checkpoint(root.path(), "edit");
+    let (Some(parent), Some(meta)) = (&located.parent, located.existing) else {
+        return Err(format!(
+            "`{shown}` does not exist: edit_file changes a file that is there (write_file \
+             creates one)"
+        ));
     };
     if !meta.is_file() {
         return Err(format!("`{shown}` is not a regular file"));
     }
-    if meta.len() > WRITE_CAP as u64 {
+    if meta.size() > WRITE_CAP as u64 {
         return Err(format!(
             "`{shown}` is {} bytes, over the {WRITE_CAP} bytes edit_file works on: use apply_patch, \
              or have OpenCode make the change",
-            meta.len()
+            meta.size()
         ));
     }
-    let bytes = fs::read(&path).map_err(|e| format!("cannot read `{shown}`: {e}"))?;
+    let (file, _) = parent
+        .open_regular(&located.name)
+        .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(WRITE_CAP as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
+    if bytes.len() > WRITE_CAP {
+        return Err(format!(
+            "`{shown}` is over the {WRITE_CAP} bytes edit_file works on: use apply_patch, or have \
+             OpenCode make the change"
+        ));
+    }
     let Ok(content) = String::from_utf8(bytes) else {
         return Err(format!(
             "`{shown}` is not UTF-8 text: edit_file changes text files"
         ));
     };
     if content.contains('\0') {
-        return Err(binary_notice(shown, meta.len()));
+        return Err(binary_notice(shown, meta.size()));
     }
 
     let places: Vec<usize> = content.match_indices(old).map(|(at, _)| at).collect();
@@ -880,7 +987,7 @@ fn edit_in(
     } else {
         content.replacen(old, new, 1)
     };
-    let written = write_in(root, rel, &edited)?;
+    let written = write_located(&located, &edited)?;
     Ok(Edited {
         replaced: places.len(),
         lines,
@@ -1109,7 +1216,7 @@ pub async fn edit_file(
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    let (root, rel) = (slot.path().to_path_buf(), path.to_owned());
+    let (root, rel) = (Arc::clone(slot.root()), path.to_owned());
     let all = replace_all.unwrap_or(false);
     let edited = tokio::task::spawn_blocking(move || edit_in(&root, &rel, &old, &new, all))
         .await
@@ -1133,9 +1240,369 @@ pub async fn edit_file(
     }
 }
 
+/// A slot and another run's directory of the same shape, and what a command of the run can do
+/// to the slot between the coder's check of a path and its use of it
+/// (vymalo/another-adam-rs#125).
+#[cfg(test)]
+pub(super) mod swapped {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// What the other run's files say; nothing of the slot's may ever show it.
+    pub(crate) const SECRET: &str = "ANOTHER RUN'S SECRET";
+    /// The files of the slot and of the other run share their first line, so that an edit of the
+    /// one that is read in the place of the other says, in its error, what the other holds.
+    pub(crate) const MINE_TOP: &str = "shared line\noriginal top\n";
+    pub(crate) const MINE_SUB: &str = "shared line\noriginal sub\n";
+    const THEIRS_TOP: &str = "shared line\nANOTHER RUN'S SECRET\n";
+    const THEIRS_SUB: &str = "shared line\nANOTHER RUN'S SECRET\n";
+
+    pub(crate) struct Pair {
+        pub(crate) _tmp: tempfile::TempDir,
+        /// `top.txt`, `sub/file.txt` and a `.git` file.
+        pub(crate) slot: PathBuf,
+        /// The same files, saying [`SECRET`] on their second line.
+        pub(crate) other: PathBuf,
+    }
+
+    pub(crate) fn pair() -> Pair {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = tmp.path().join("slot");
+        let other = tmp.path().join("other");
+        for (dir, top, sub) in [
+            (&slot, MINE_TOP, MINE_SUB),
+            (&other, THEIRS_TOP, THEIRS_SUB),
+        ] {
+            fs::create_dir_all(dir.join("sub")).unwrap();
+            fs::write(dir.join("top.txt"), top).unwrap();
+            fs::write(dir.join("sub/file.txt"), sub).unwrap();
+            fs::write(dir.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        }
+        Pair {
+            _tmp: tmp,
+            slot,
+            other,
+        }
+    }
+
+    /// Where a swapped directory is moved to.
+    pub(crate) fn away_of(dir: &Path) -> PathBuf {
+        dir.with_file_name(format!(
+            "{}.away",
+            dir.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    /// The slot's directory moved away and a link to `other` at its name.
+    pub(crate) fn swap_slot(slot: &Path, other: &Path) {
+        fs::rename(slot, away_of(slot)).unwrap();
+        std::os::unix::fs::symlink(other, slot).unwrap();
+    }
+
+    /// `sub` of the slot moved away and a link to `sub` of `other` at its name.
+    pub(crate) fn swap_sub(slot: &Path, other: &Path) {
+        fs::rename(slot.join("sub"), away_of(&slot.join("sub"))).unwrap();
+        std::os::unix::fs::symlink(other.join("sub"), slot.join("sub")).unwrap();
+    }
+
+    /// Every file below `dir`, by relative path.
+    pub(crate) fn tree(dir: &Path) -> BTreeMap<String, String> {
+        fn walk(dir: &Path, at: &Path, out: &mut BTreeMap<String, String>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if fs::symlink_metadata(&path).unwrap().is_dir() {
+                    walk(&path, at, out);
+                } else {
+                    out.insert(
+                        path.strip_prefix(at).unwrap().display().to_string(),
+                        fs::read_to_string(&path).unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use adam_workspace::safe_fs::race;
+
+    use super::swapped::*;
+    use super::*;
+
+    /// The slot at `path`, opened as the tools open it: the check of the tests below, after which
+    /// the swap happens.
+    fn open(path: &Path) -> SlotDir {
+        SlotDir::open(path).unwrap()
+    }
+
+    fn read(root: &SlotDir, rel: &str) -> Result<String, String> {
+        read_in(root, rel, None, None)
+    }
+
+    fn write(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String> {
+        write_in(root, rel, content)
+    }
+
+    fn edit(root: &SlotDir, rel: &str, old: &str, new: &str) -> Result<Edited, String> {
+        edit_in(root, rel, old, new, false)
+    }
+
+    /// Run `swap` when the checkpoint `at` is reached for `slot`.
+    fn at(slot: &Path, checkpoint: &'static str, swap: impl Fn() + Send + 'static) -> race::Hook {
+        race::on_checkpoint(slot, move |at, _| {
+            if at == checkpoint {
+                swap();
+            }
+        })
+    }
+
+    #[test]
+    fn a_read_does_not_follow_a_slot_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "read", move || swap_slot(&slot, &other));
+        let got = read(&open(&p.slot), "top.txt");
+        assert_eq!(hook.reached("read"), 1, "the swap was made");
+        assert_eq!(got, Ok(MINE_TOP.to_owned()), "the slot's own file");
+    }
+
+    #[test]
+    fn a_read_does_not_follow_a_directory_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "read", move || swap_sub(&slot, &other));
+        let got = read(&open(&p.slot), "sub/file.txt");
+        assert_eq!(hook.reached("read"), 1, "the swap was made");
+        assert!(!format!("{got:?}").contains(SECRET), "{got:?}");
+    }
+
+    #[test]
+    fn a_write_does_not_land_in_a_slot_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "write", move || swap_slot(&slot, &other));
+        let got = write(&open(&p.slot), "top.txt", "overwritten\n");
+        assert_eq!(hook.reached("write"), 1, "the swap was made");
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(
+            fs::read_to_string(away_of(&p.slot).join("top.txt")).unwrap(),
+            "overwritten\n",
+            "it went to the directory the slot was"
+        );
+    }
+
+    #[test]
+    fn a_write_does_not_land_in_a_directory_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "write", move || swap_sub(&slot, &other));
+        let _ = write(&open(&p.slot), "sub/new.txt", "written\n");
+        assert_eq!(hook.reached("write"), 1, "the swap was made");
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
+    }
+
+    #[test]
+    fn an_edit_does_not_read_a_slot_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "edit", move || swap_slot(&slot, &other));
+        // The text is in the slot's file and not in the other run's: an edit that read the other
+        // run's file would say what that file holds, to the model.
+        let got = edit(
+            &open(&p.slot),
+            "top.txt",
+            MINE_TOP,
+            "shared line\nchanged top\n",
+        );
+        assert_eq!(hook.reached("edit"), 1, "the swap was made");
+        assert!(!format!("{got:?}").contains(SECRET), "{got:?}");
+        assert_eq!(tree(&p.other), before);
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(
+            fs::read_to_string(away_of(&p.slot).join("top.txt")).unwrap(),
+            "shared line\nchanged top\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_does_not_write_into_a_slot_swapped_between_reading_and_writing() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "write", move || swap_slot(&slot, &other));
+        let got = edit(
+            &open(&p.slot),
+            "top.txt",
+            MINE_TOP,
+            "shared line\nchanged top\n",
+        );
+        assert_eq!(hook.reached("write"), 1, "the swap was made");
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(
+            fs::read_to_string(away_of(&p.slot).join("top.txt")).unwrap(),
+            "shared line\nchanged top\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_does_not_follow_a_directory_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "edit", move || swap_sub(&slot, &other));
+        let got = edit(
+            &open(&p.slot),
+            "sub/file.txt",
+            MINE_SUB,
+            "shared line\nchanged sub\n",
+        );
+        assert_eq!(hook.reached("edit"), 1, "the swap was made");
+        assert!(!format!("{got:?}").contains(SECRET), "{got:?}");
+        assert_eq!(tree(&p.other), before);
+    }
+
+    /// Where the kernel has no `openat2` the same refusals are made by a walk of one component at a
+    /// time (`Backend::Walk`): the tests above run on whatever the system has, this one on the walk.
+    #[test]
+    fn the_fallback_walk_does_not_follow_a_slot_or_a_directory_swapped_after_the_check_either() {
+        use adam_workspace::safe_fs::Backend;
+
+        let walk = |path: &Path| SlotDir::open_using(path, Backend::Walk).unwrap();
+
+        // A read, with the slot swapped.
+        let p = pair();
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "read", move || swap_slot(&slot, &other));
+        assert_eq!(read(&walk(&p.slot), "top.txt"), Ok(MINE_TOP.to_owned()));
+        assert_eq!(hook.reached("read"), 1, "the swap was made");
+
+        // A read, with a directory swapped.
+        let p = pair();
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "read", move || swap_sub(&slot, &other));
+        let got = read(&walk(&p.slot), "sub/file.txt");
+        assert_eq!(hook.reached("read"), 1, "the swap was made");
+        assert!(!format!("{got:?}").contains(SECRET), "{got:?}");
+
+        // A write, with a directory swapped.
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "write", move || swap_sub(&slot, &other));
+        let _ = write(&walk(&p.slot), "sub/new.txt", "written\n");
+        assert_eq!(hook.reached("write"), 1, "the swap was made");
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
+    }
+
+    /// The slot flips between a directory and a link to another run's files while the coder
+    /// writes: nothing it writes shows in the other run's files. (Extra to the deterministic tests
+    /// above, which are the evidence: this one only needs to never fail.)
+    #[test]
+    fn files_written_while_the_slot_flips_never_reach_another_runs_files() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let p = pair();
+        let before = tree(&p.other);
+        // The slot is opened once, before it starts to flip: every write goes to that directory,
+        // whatever its name is at the moment.
+        let root = open(&p.slot);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let (slot, other, stop) = (p.slot.clone(), p.other.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if fs::rename(&slot, away_of(&slot)).is_err() {
+                        continue;
+                    }
+                    let _ = std::os::unix::fs::symlink(&other, &slot);
+                    let _ = fs::remove_file(&slot);
+                    let _ = fs::rename(away_of(&slot), &slot);
+                }
+            })
+        };
+        for i in 0..500 {
+            write(&root, &format!("sub/f{i}.txt"), "flip\n").unwrap();
+            write(&root, "top.txt", "flip\n").unwrap();
+            assert_eq!(read(&root, "sub/file.txt").unwrap(), MINE_SUB);
+        }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
+        // All of it is in the directory that was opened, wherever its name led meanwhile.
+        assert_eq!(read(&root, "sub/f499.txt").unwrap(), "flip\n");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The slot at `root`, opened as the tools open it: the check and the hold of a slot.
+    fn open(root: &Path) -> Result<SlotDir, String> {
+        SlotDir::open(root).map_err(|e| {
+            format!(
+                "the worktree's directory is not a plain directory (a command replaced it by a link or a file): {e}"
+            )
+        })
+    }
+
+    fn confine(root: &Path, rel: &str, access: Access) -> Result<Confined, String> {
+        super::confine(&open(root)?, rel, access)
+    }
+
+    fn read_in(
+        root: &Path,
+        rel: &str,
+        start: Option<u32>,
+        end: Option<u32>,
+    ) -> Result<String, String> {
+        super::read_in(&open(root)?, rel, start, end)
+    }
+
+    fn write_in(root: &Path, rel: &str, content: &str) -> Result<Written, String> {
+        super::write_in(&open(root)?, rel, content)
+    }
+
+    fn edit_in(
+        root: &Path,
+        rel: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> Result<Edited, String> {
+        super::edit_in(&open(root)?, rel, old, new, replace_all)
+    }
 
     fn root() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1154,24 +1621,26 @@ mod tests {
     #[test]
     fn a_path_inside_the_worktree_is_accepted_for_both() {
         let dir = root();
-        let canonical = dir.path().canonicalize().unwrap();
+        let accepted = |rel: &str, access| confine(dir.path(), rel, access).unwrap().rel();
         assert_eq!(
-            confine(dir.path(), "src/main.rs", Access::Read).unwrap(),
-            canonical.join("src/main.rs")
+            accepted("src/main.rs", Access::Read),
+            Path::new("src/main.rs")
         );
         assert_eq!(
-            confine(dir.path(), "./src//main.rs", Access::Read).unwrap(),
-            canonical.join("src/main.rs")
+            accepted("./src//main.rs", Access::Read),
+            Path::new("src/main.rs")
         );
         // A file that is not there yet, in a directory that is not there yet.
         assert_eq!(
-            confine(dir.path(), "new/deep/file.txt", Access::Write).unwrap(),
-            canonical.join("new/deep/file.txt")
+            accepted("new/deep/file.txt", Access::Write),
+            Path::new("new/deep/file.txt")
         );
         assert_eq!(
-            confine(dir.path(), "src/main.rs", Access::Write).unwrap(),
-            canonical.join("src/main.rs")
+            accepted("src/main.rs", Access::Write),
+            Path::new("src/main.rs")
         );
+        // Nothing was made by asking.
+        assert!(!dir.path().join("new").exists());
     }
 
     #[test]
@@ -1301,9 +1770,32 @@ mod tests {
     fn a_link_to_dot_git_is_not_read_either() {
         let dir = root();
         fs::create_dir_all(dir.path().join("sub")).unwrap();
-        std::os::unix::fs::symlink(dir.path().join(".git"), dir.path().join("sub/g")).unwrap();
+        std::os::unix::fs::symlink("../.git", dir.path().join("sub/g")).unwrap();
         let why = refused(dir.path(), "sub/g", Access::Read);
         assert!(why.contains(".git"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_is_absolute_is_refused_even_when_it_leads_into_the_worktree() {
+        let dir = root();
+        std::os::unix::fs::symlink(dir.path().join("README.md"), dir.path().join("abs")).unwrap();
+        let why = refused(dir.path(), "abs", Access::Read);
+        assert!(why.contains("outside the worktree"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_goes_up_past_the_root_is_refused_and_one_that_comes_back_is_not() {
+        let dir = root();
+        std::os::unix::fs::symlink("../x", dir.path().join("up")).unwrap();
+        std::os::unix::fs::symlink("src/../README.md", dir.path().join("around")).unwrap();
+        let why = refused(dir.path(), "up", Access::Read);
+        assert!(why.contains("outside the worktree"), "{why}");
+        assert_eq!(
+            confine(dir.path(), "around", Access::Read).unwrap().rel(),
+            Path::new("README.md")
+        );
     }
 
     #[test]

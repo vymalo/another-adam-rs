@@ -393,7 +393,9 @@ make them hold:
 * **The file tools stay in the worktree.** `read_file`, `write_file` and `apply_patch` check every path with `confine`
   (no `..`, no absolute path, nothing inside `.git`, no write through a symlink, no read that leaves the worktree) and
   `apply_patch` checks the paths git itself reads from the patch, so a hostile path is a refusal the model is told, never a
-  file outside the worktree (see [above](#reading-and-changing-files-itself)). `run_command` stays read-only beside them.
+  file outside the worktree (see [above](#reading-and-changing-files-itself)). They work **relative to the slot's directory as the
+  coder opened it**, never by its name, so a slot (or a directory below it) that a command renames and replaces by a link, even
+  while a tool runs, is not followed. `run_command` stays read-only beside them.
 * **Looking around is not checking.** `run_command` exists so that exploring a repository does not look like
   verifying it: in the owner's live thread the model explored with `run_checks` (`ls`, `cat README.md
   CLAUDE.md` with exit 1 because `CLAUDE.md` was missing, `mvn package`, `ls /usr/lib/jvm`) and every
@@ -484,17 +486,25 @@ fix. `read_file`, `write_file`, `edit_file` and `apply_patch` (`src/tools/files.
 process, and the instructions say when to use which: small, well-located changes yourself (`edit_file` for a few lines,
 `apply_patch` for several changes at once), broad multi-file changes through `delegate_to_opencode`. The model chooses every path, so the paths are the point.
 
-**The confinement rule** (`confine(slot_root, rel, Access)`, public):
+**The confinement rule** (`confine(root: &SlotDir, rel, Access) -> Result<Confined, String>`, public):
 
 * an empty path, an absolute path, any `..` component and any component equal to `.git` (compared without regard to case)
   are refused;
-* to **read**, the path is canonicalised (symlinks followed) and the result must be inside the canonical root, and not
-  inside a `.git`: a symlink that stays inside the worktree is read, one that leads out is refused;
-* to **write**, the deepest part of the path that exists is looked at one component at a time: **any symlink on the way,
-  the file itself included, is refused** (also one that stays inside: a write through a link is a write to a place the
-  model did not name), and what exists must be inside the canonical root;
-* the **root** is looked at first, without following a link (`lstat`): the slot's directory is the run's to rename, and a link in
-  its place (to another run's slot) would be canonicalised into the root. A root that is not a directory itself is refused.
+* to **read**, the path is resolved inside the worktree and the result must not be inside a `.git`: a symlink that stays inside
+  the worktree is read, one that leads out is refused, whether it is absolute or goes up past the root. (An absolute link is refused
+  even when it points into the worktree: that is the one change from the rule's first form, which canonicalised the path and followed it);
+* to **write**, every component of the path that exists is looked at: **any symlink on the way, the file itself included, is refused**
+  (also one that stays inside: a write through a link is a write to a place the model did not name);
+* the **root** is the slot's directory *as the coder opened it* (`Slot::root()`, an `adam_workspace::SlotDir`): the directory is the
+  run's to rename, and a link in its place (to another run's slot) would be followed by anything that uses the name. The slot is opened
+  without following a link where it is checked (a link or a file there is not a slot), and **everything below is relative to that
+  descriptor**: a path is resolved over held directories, a file is opened by the path the resolution found with no link allowed in it
+  (`openat2` with `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`; one component at a time with `O_NOFOLLOW` where the kernel has no `openat2`),
+  directories are made with `mkdirat`, and a write is a new file (`O_EXCL`) in the directory's own descriptor renamed over its target. A
+  swap of the slot or of a directory below it between the check and the use is not followed: the tool goes on in the directory it
+  opened, or fails. `confine` itself only **checks** (it opens nothing the caller can use); `read_file`, `share_file` and `edit_file` look
+  at the path again as they open it. **Public API changed** (vymalo/another-adam-rs#125): `confine` took the slot's path and returned a
+  `PathBuf`; it takes the slot's `&SlotDir` and returns `Confined` (`rel()`, the path below the root), and `GitAt` holds the slot's directory.
 
 Every refusal is a tool **result** that names its reason, not a failed run. `apply_patch` does not trust its own reading
 of the patch: it asks `git apply --numstat -z` which paths git would touch (a rename names both ends, however the patch
@@ -558,8 +568,9 @@ A reply holds text, cards and diagrams; a picture, an export or a report is a fi
 which the A2A server serves as one `raw` part with `mediaType` and `filename`. A plain A2A client gets a standard
 artifact; the orchestration layer keeps the bytes in its artifact store and shows them.
 
-* **The path** is confined by the rule of `read_file` (`confine(.., Access::Read)`): relative to the root of the slot, no
-  `..`, nothing inside `.git` (any case), and a symlink is followed only while it stays inside the worktree. A directory, a
+* **The path** is confined by the rule of `read_file` (`confine(.., Access::Read)`), and opened relative to the slot's directory as the
+  coder opened it: relative to the root of the slot, no `..`, nothing inside `.git` (any case), and a symlink is followed only while it
+  stays inside the worktree. A directory, a
   file that is not a regular file (a pipe), a missing file and a file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`) are results
   for the model, which can shrink the file or tell the person. The bytes are read up to the cap plus one, so a file that grows
   under the call is refused, not cut. The workspace is one directory whatever environment the commands run in, so a file a
@@ -1340,7 +1351,7 @@ a link or a pipe at it, or a link at `.git/info`, makes the state unknown and no
 unless the pod mounts it read-only): when `HEAD` is not on that branch before the command, `run_command` and `run` run nothing and say why, and a restore from such a
 record writes nothing, so no other run's branch is reset. `HEAD` is written back only when it differs.
 The restore holds the mirror lock, refuses to touch anything if the worktree's `.git` no longer points at this
-run's git directory (and puts that file back first, written beside it and renamed over it, so that a link a command put there is replaced and never written through), and deletes and sets refs with `--no-deref`. **Every `git` the coder
+run's git directory (and puts that file back first, written beside it and renamed over it **in the directory the coder opened as the slot**, so that a link a command put there is replaced and never written through, and a slot swapped for a link meanwhile is not followed), and deletes and sets refs with `--no-deref`. **Every `git` the coder
 runs on a slot here is pinned to the repository the coder's own metadata names** (`GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`:
 `GitAt` in `tools/gitcli.rs`, `adam_workspace::GitPin`), so the `.git` file and the `commondir` and `gitdir` of the worktree's
 directory in the mirror, which a command can rewrite, steer nothing ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md)); a
@@ -2477,6 +2488,12 @@ database of its own, so the role needs `CREATEDB`):
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
   embedded copy logged as `source=embedded`.
 * `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1`, `text-stream/v1` and `usage/v1` on the card. The tests' models stream too (the agent calls `stream`): a model that does its work in `complete` only is not asked for it any more, so `HangingModel` of `tests/e2e.rs` and the greeting model of `tests/agent_files.rs` do it in `stream` as well.
+* A slot swapped between the check and the use (vymalo/another-adam-rs#125): `files.rs` (`swap_tests`: `read_file`, `write_file` and
+  `edit_file`, each with the slot and with a directory below it swapped for a link to another run's files at the checkpoint
+  between the check and the use, and a bounded flip-flop of the slot while files are written), `share.rs` (`share_file`, both swaps),
+  `gitcli.rs` (the `.git` file and a scratch project's `info/exclude` put back after the slot was swapped, and `git` not started on a
+  slot replaced after the check). The tests use `adam_workspace::safe_fs::race` (the `test-util` feature of `adam-workspace`, which the
+  crate enables for its own tests); the seam does nothing in the binary.
 * `src/tools/files.rs` (unit) and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
   `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that
   stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a range with numbers, a

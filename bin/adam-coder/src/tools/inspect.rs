@@ -168,14 +168,9 @@ impl Snapshot {
     /// (a repository's worktree; `None` for a scratch project).
     pub(super) async fn take(at: &GitAt, own: Option<&str>) -> Option<Self> {
         let git_dir = git_stdout(at, &["rev-parse", "--absolute-git-dir"]).await?;
-        // The file is in the slot, which a command can have replaced: read as a regular file and
-        // not through a link.
-        let dot_git = adam_workspace::safe_fs::read_regular_text(
-            &at.path().join(".git"),
-            adam_workspace::safe_fs::MAX_SMALL_FILE,
-        )
-        .await
-        .ok();
+        // The file is in the slot, which a command can have replaced: read as a regular file, in
+        // the directory the coder opened as the slot, and not through a link.
+        let dot_git = at.dot_git().await;
         let branch = head_ref(at).await;
         let head = head_sha(at).await?;
         let head_is_foreign =
@@ -251,22 +246,15 @@ impl Snapshot {
             );
             return false;
         }
-        let dir = slot.path();
         let at = GitAt::slot(slot);
         if let Some(text) = &self.dot_git
-            && adam_workspace::safe_fs::read_regular_text(
-                &dir.join(".git"),
-                adam_workspace::safe_fs::MAX_SMALL_FILE,
-            )
-            .await
-            .ok()
-            .as_deref()
-                != Some(text)
-            && at.is_plain_directory().await
+            && at.dot_git().await.as_deref() != Some(text)
         {
-            // Written next to it and renamed over it: a link or a pipe a command put at `.git` is
-            // replaced, never written through.
-            let _ = adam_workspace::safe_fs::replace_file(&dir.join(".git"), text.as_bytes()).await;
+            adam_workspace::safe_fs::race::checkpoint(at.path(), "restore-git");
+            // Written next to it and renamed over it, in the directory the coder opened as the
+            // slot: a link or a pipe a command put at `.git` is replaced, never written through,
+            // and a slot that was swapped for a link meanwhile is not followed.
+            let _ = at.put_dot_git(text.clone()).await;
         }
         // Still this run's git directory? Otherwise git would act on another repository.
         if git_stdout(&at, &["rev-parse", "--absolute-git-dir"])

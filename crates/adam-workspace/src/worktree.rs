@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{GitCmd, GitPin};
 use crate::repo::RepoRef;
-use crate::safe_fs;
+use crate::safe_fs::{self, SlotDir};
 use crate::workspace::{Inner, Meta, REMOTE_TRACKING_PREFIX};
 
 /// A run's isolated working tree on its own branch.
@@ -23,6 +23,8 @@ pub struct Worktree {
     dir: String,
     repo: RepoRef,
     path: PathBuf,
+    /// The slot's directory, opened where the slot was checked and held from then on.
+    root: Arc<SlotDir>,
     /// The name the work ends up under: the run's own branch, or the pushed branch this worktree
     /// continues (which only [`Worktree::publish`] moves).
     branch: String,
@@ -124,12 +126,12 @@ pub struct ChangedFile {
 }
 
 impl Worktree {
-    /// The worktree that `meta` describes, in the slot `dir`, at `path`.
+    /// The worktree that `meta` describes, in the slot `dir`, at `path`, whose directory is `root`.
     pub(crate) fn new(
         ws: Arc<Inner>,
         meta: &Meta,
         dir: String,
-        path: PathBuf,
+        root: Arc<SlotDir>,
         mirror: PathBuf,
     ) -> Self {
         Self {
@@ -137,7 +139,8 @@ impl Worktree {
             run: meta.run.clone(),
             dir,
             repo: RepoRef::new(&meta.url, &meta.base_branch),
-            path,
+            path: root.path().to_path_buf(),
+            root,
             branch: meta
                 .remote_branch
                 .clone()
@@ -164,6 +167,13 @@ impl Worktree {
     /// [`Workspaces::prepare`](crate::Workspaces::prepare).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The worktree's directory, held open: what the coder's own file operations in the worktree
+    /// are relative to, so that a command which renames the directory and puts a link at its name
+    /// leads them nowhere ([`SlotDir`]).
+    pub fn root(&self) -> &Arc<SlotDir> {
+        &self.root
     }
 
     /// The shared bare mirror this worktree is linked to: `<root>/git/<host>/<owner>/<repo>.git`.
@@ -250,7 +260,7 @@ impl Worktree {
     pub fn git_pin(&self) -> Option<GitPin> {
         self.admin
             .as_deref()
-            .map(|admin| GitPin::worktree(admin, &self.mirror, &self.path))
+            .map(|admin| GitPin::worktree(admin, &self.mirror, &self.path, Arc::clone(&self.root)))
     }
 
     /// Changed files: staged, unstaged and untracked (each untracked file
