@@ -378,7 +378,8 @@ impl Workspaces {
     /// plumbing, `worktree`, `config`, ...) in the **git sandbox** whose server listens on `socket`
     /// (`adam-git-sandbox`), instead of in this process's container. The commands that talk to a
     /// remote (`fetch`, `push`, `ls-remote`) and everything that carries a token stay here, on the
-    /// bare mirror, after its configuration has been checked (`mirror_config`).
+    /// bare mirror, after its configuration has been put back to what the workspace writes
+    /// (`mirror_config`).
     ///
     /// Why: `git` runs what a repository's configuration names (a `filter.*.clean`), and a
     /// repository can be one a run wrote (a scratch project, an embedded repository in a worktree).
@@ -1070,6 +1071,20 @@ fn parse_symref_head(output: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The `(key, value)` entries of the configuration file at `path`, as git lists them
+/// (`git config --file <path> --no-includes --list -z`, in this container: it reads one file and runs
+/// no program).
+async fn list_config(path: &Path) -> WorkspaceResult<Vec<(String, String)>> {
+    let listed = GitCmd::new()
+        .in_coder()
+        .args(["config", "--file"])
+        .arg(path)
+        .args(["--no-includes", "--list", "-z"])
+        .run()
+        .await?;
+    Ok(mirror_config::parse_list(&listed.stdout))
+}
+
 impl Inner {
     /// The workspace root.
     pub(crate) fn root(&self) -> &Path {
@@ -1367,8 +1382,8 @@ impl Inner {
     /// Create the bare mirror if it is not there, and give it the two remote keys the workspace
     /// writes (`remote.origin.url`, the URL git is given for this repository, and
     /// `remote.origin.fetch`). **Nothing of a mirror that exists is rewritten**: what is in its
-    /// configuration is judged by [`check_mirror`](Self::check_mirror) right before each command that
-    /// carries a token, and a key that is not the workspace's makes that command refuse, not fix it.
+    /// configuration is put back by [`repair_mirror`](Self::repair_mirror) right before each command that
+    /// carries a token.
     ///
     /// The three commands that make the mirror run in this container and not in the git sandbox: a
     /// mirror that has just been made holds no repository code that could be a program, and its first
@@ -1408,10 +1423,18 @@ impl Inner {
         Ok(())
     }
 
-    /// Refuse the mirror unless everything git will read of it is what the workspace wrote: its
-    /// `HEAD`, `packed-refs` and `commondir` as files, and every key of its `config` (see
-    /// `mirror_config` for the list and for why it is refused and not
-    /// repaired). `expected_url` is what `remote.origin.url` must say.
+    /// Put the mirror's configuration back to what the workspace writes, and refuse what git itself
+    /// never makes. See `mirror_config` for the list of keys, for how the file is rebuilt and why it
+    /// is put back and not refused: a harmless key a person's command left in the shared file must
+    /// not stop the repository. `expected_url` is what `remote.origin.url` must say.
+    ///
+    /// * Every key of `config` that is not the workspace's is removed, and `remote.origin.url` and
+    ///   `remote.origin.fetch` are reset to what they must be. The new file is built from the entries
+    ///   that stay in a private directory (git is run on that new, empty file and never on the hostile
+    ///   one) and replaces `config` atomically; a configuration that is already right is not written. One
+    ///   warning names the keys removed and reset, never a value.
+    /// * A `config` that is not a regular file, is over the size limit or that git cannot parse, a `HEAD`
+    ///   or `packed-refs` that is not a regular file, and a `commondir` are refused.
     ///
     /// Call it **under the mirror lock, as near as possible to every command that carries a token**
     /// ([`run_network`](Self::run_network) does): the git sandbox can write the mirror, so the guard is
@@ -1419,8 +1442,9 @@ impl Inner {
     ///
     /// # Errors
     ///
-    /// [`WorkspaceError::Corrupt`] naming the mirror and the keys (not their values).
-    pub(crate) async fn check_mirror(
+    /// [`WorkspaceError::Corrupt`] naming the mirror and what is wrong (a file, never a value), for what is
+    /// refused; I/O errors when the configuration cannot be put back.
+    pub(crate) async fn repair_mirror(
         &self,
         mirror: &Path,
         expected_url: &str,
@@ -1429,7 +1453,7 @@ impl Inner {
             tracing::error!(
                 mirror = %mirror.display(),
                 %why,
-                "a mirror is refused: what git would read of it is not what the workspace wrote"
+                "a mirror is refused: a file of it is not one git makes"
             );
             WorkspaceError::Corrupt(format!(
                 "the mirror {} is not used: {why}. No credential is sent through it; look at it and put it right by hand",
@@ -1437,59 +1461,72 @@ impl Inner {
             ))
         };
         mirror_config::check_files(mirror).await.map_err(refuse)?;
-        let bytes = safe_fs::read_regular_file(&mirror.join("config"), mirror_config::MAX_CONFIG)
+        let config = mirror.join("config");
+        let bytes = safe_fs::read_regular_file(&config, mirror_config::MAX_CONFIG)
             .await
             .map_err(|e| refuse(format!("its config cannot be read as a regular file ({e})")))?;
         // git parses a private copy of the bytes that were read, so what is judged is what was read.
         // `--no-includes`: nothing the file names is read, and parsing runs no program.
-        let dir = tempfile::tempdir().map_err(|e| {
-            WorkspaceError::io(
-                "cannot make a directory to check the mirror's configuration in",
-                e,
-            )
+        let io_error = |what: &'static str| move |e| WorkspaceError::io(what, e);
+        let dir = tempfile::tempdir().map_err(io_error(
+            "cannot make a directory to check the mirror's configuration in",
+        ))?;
+        let found = dir.path().join("found");
+        tokio::fs::write(&found, &bytes)
+            .await
+            .map_err(io_error("cannot copy the mirror's configuration"))?;
+        let listed = list_config(&found).await.map_err(|e| {
+            refuse(format!(
+                "git cannot read its configuration ({})",
+                adam_error::report(&e)
+            ))
         })?;
-        let copy = dir.path().join("config");
-        tokio::fs::write(&copy, &bytes)
-            .await
-            .map_err(|e| WorkspaceError::io("cannot copy the mirror's configuration", e))?;
-        let listed = GitCmd::new()
-            .in_coder()
-            .args(["config", "--file"])
-            .arg(&copy)
-            .args(["--no-includes", "--list", "-z"])
-            .run()
-            .await
-            .map_err(|e| {
-                refuse(format!(
-                    "git cannot read its configuration ({})",
-                    adam_error::report(&e)
-                ))
-            })?;
-        let violations =
-            mirror_config::judge(&mirror_config::parse_list(&listed.stdout), expected_url);
-        if violations.is_empty() {
+        let repair = mirror_config::repair(&listed, expected_url);
+        if !repair.changes_something() {
             return Ok(());
         }
-        for violation in &violations {
-            tracing::error!(key = %violation.key, why = violation.why, "a key of a mirror's configuration is not the workspace's");
+
+        // A new file, from the entries that stay, made by git on an empty file of ours; then read
+        // back, to be sure it says what was decided.
+        let built = dir.path().join("config");
+        for (key, value) in &repair.entries {
+            GitCmd::new()
+                .in_coder()
+                .args(["config", "--file"])
+                .arg(&built)
+                .args(["--add", "--"])
+                .arg(key)
+                .arg(value)
+                .run()
+                .await?;
         }
-        const NAMED: usize = 10;
-        let mut named = violations
-            .iter()
-            .take(NAMED)
-            .map(|v| v.key.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if violations.len() > NAMED {
-            named.push_str(&format!(" and {} more", violations.len() - NAMED));
+        let rebuilt = list_config(&built).await?;
+        if rebuilt != repair.entries {
+            return Err(WorkspaceError::Corrupt(format!(
+                "the configuration of the mirror {} could not be rebuilt as decided",
+                mirror.display()
+            )));
         }
-        Err(refuse(format!(
-            "its configuration has keys the workspace does not write ({named})"
-        )))
+        let built_bytes = tokio::fs::read(&built)
+            .await
+            .map_err(io_error("cannot read the rebuilt configuration"))?;
+        // A new regular file next to `config`, renamed over it: nothing is written through whatever
+        // was there.
+        safe_fs::replace_file(&config, &built_bytes)
+            .await
+            .map_err(io_error("cannot put the mirror's configuration back"))?;
+        tracing::warn!(
+            mirror = %mirror.display(),
+            removed = %repair.removed.join(", "),
+            reset = %repair.reset.join(", "),
+            "the configuration of a mirror was put back to what the workspace writes: these keys \
+             were removed or reset"
+        );
+        Ok(())
     }
 
-    /// Run a command that talks to a remote on the bare mirror, in this container: the mirror is
-    /// [checked](Self::check_mirror) first, and the command is built by `build` on a `git` that
+    /// Run a command that talks to a remote on the bare mirror, in this container: the mirror's
+    /// configuration is [put back](Self::repair_mirror) first, and the command is built by `build` on a `git` that
     /// addresses the mirror explicitly. The only place a command that carries `auth` is made for a
     /// mirror, so that none can be started without the check.
     pub(crate) async fn run_network(
@@ -1499,7 +1536,7 @@ impl Inner {
         auth: Option<Auth>,
         build: impl FnOnce(GitCmd) -> GitCmd,
     ) -> WorkspaceResult<GitOutput> {
-        self.check_mirror(mirror, expected_url).await?;
+        self.repair_mirror(mirror, expected_url).await?;
         build(self.mirror_git(mirror).in_coder())
             .maybe_auth(auth)
             .run()

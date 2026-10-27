@@ -44,6 +44,7 @@ proptest.workspace = true
 # Enables the `test-util` feature for this crate's own tests.
 adam-workspace = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["fs", "process", "sync", "time", "macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
 wiremock.workspace = true
 
 [lints]

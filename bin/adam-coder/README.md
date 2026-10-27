@@ -1344,7 +1344,7 @@ namespaces (`refs/heads/agent/*` and `refs/remotes/*` are other runs' and fetche
 command runs) and the local git configuration (without `branch.*`, which `prepare` writes), so a
 `core.fsmonitor`, a `remote.origin.pushurl`, a `url.*.insteadOf`, an alias, a new branch or tag is undone too.
 **This is a guard against accidents, not isolation**, and not what the credentials rely on (the workspace
-checks the mirror's configuration itself, under its lock, before every credentialed command, and refuses the command when it holds a key the workspace did not write). A command can
+puts the mirror's configuration back to what it writes itself, under its lock, before every credentialed command: a key the workspace did not write is removed, the remote's two keys are reset, and the command then runs). A command can
 still read everything the process can, use the network and write outside the worktree. The refs and the
 configuration are shared by every run on the mirror and other runs change them while a command runs, so
 these are **not** compared, and a command can change them unseen: `refs/heads/agent/*` (another run's
@@ -1781,13 +1781,13 @@ shipped files stay in the binary and cannot disagree with it.
     git sandbox** ([`adam-git-sandbox`](../../crates/adam-git-sandbox/README.md)), a container with no secret, no secret variable, no
     service-account token and a PID namespace of its own (the chart's part), so the program a repository's configuration names
     (`filter.*`, `textconv`) runs where nothing is readable that the environment hid. The `fetch`, `push` and `ls-remote` that carry the
-    token stay in the coder, on the bare mirror, and the mirror's configuration is checked before each. Without the variable
+    token stay in the coder, on the bare mirror, and the mirror's configuration is put back to what the workspace writes before each. Without the variable
     (local mode, Podman, run pods off) git runs in the coder's container and **this is not protected**. [The split](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox).
   * The process is **non-dumpable** at startup (`harden::make_non_dumpable`, which lives in `adam-service` and is re-exported here,
     and which `adam-agent` calls too; `prctl(PR_SET_DUMPABLE, 0)` through `rustix`'s safe call), so a child of the same user without `CAP_SYS_PTRACE` cannot read `/proc/<coder pid>/environ`.
   * **Remaining**: the one invocation that carries the token (fetch, ls-remote, push) has it in its environment, and the
-    mirror check that refuses the configuration keys which would run a program there is a list, not a proof (a writer in the sandbox
-    can still change the file between the check and the command's read of it); a proxy URL with a password in `HTTPS_PROXY` is inherited by git; a process with `CAP_SYS_PTRACE`, or root,
+    mirror repair that removes the configuration keys which would run a program there is a list, not a proof (a writer in the sandbox
+    can still change the file between the repair and the command's read of it); a proxy URL with a password in `HTTPS_PROXY` is inherited by git; a process with `CAP_SYS_PTRACE`, or root,
     reads everything (the chart drops all capabilities); a value shorter than four characters is not redacted; and a secret
     a run's code is *given* on purpose (the model key OpenCode reads, a file the model reads) is as exposed as that act.
 * Tests: `tests/environment.rs` (`a_variable_a_mcp_json_names_is_*`, `the_names_the_coders_own_processes_need_*`), `src/config.rs`, `src/redact.rs`, `src/harden.rs`, `src/tools/gitcli.rs` (a malicious filter);

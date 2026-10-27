@@ -30,8 +30,8 @@
 //! sandbox ([`GitSandbox`]) when the deployment has one: another container, with no secret, that
 //! executes only `git`. The commands that talk to a remote (`fetch`, `push`, `ls-remote`, a
 //! first `init` of a mirror) and everything that carries a token always run in this process's
-//! container, on the bare mirror, after its configuration has been checked
-//! (`mirror_config`). The choice is made in [`GitCmd::route`] and nowhere
+//! container, on the bare mirror, after its configuration has been put back to what the workspace
+//! writes (`mirror_config`). The choice is made in [`GitCmd::route`] and nowhere
 //! else; a command with a credential is never sent to the sandbox, and the sandbox drops the
 //! variables a credential travels in even if one were.
 

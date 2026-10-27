@@ -515,7 +515,7 @@ async fn a_filter_in_an_embedded_repository_runs_in_the_servers_tree_and_without
 // ------------------------------------------------------- what the sandbox can write: the mirror
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_filter_that_rewrites_the_mirror_makes_the_next_fetch_and_push_refuse() {
+async fn a_filter_that_rewrites_the_mirror_is_undone_before_the_next_fetch_and_push() {
     let fx = Fx::sandboxed();
     let wt = fx.worktree("run-first-00001").await;
     let mirror = fx.mirror();
@@ -551,39 +551,74 @@ async fn a_filter_that_rewrites_the_mirror_makes_the_next_fetch_and_push_refuse(
         "the filter did write the mirror's configuration"
     );
 
-    // The coder's own network commands refuse, and say which keys.
+    // The coder's own network commands put the file back to what the workspace writes, then run: the
+    // push reaches the real remote and nothing reaches the other URL.
     std::fs::write(wt.path().join("f.txt"), "f\n").unwrap();
     wt.commit_all("f", &me()).await.unwrap().unwrap();
-    let error = wt.push().await.unwrap_err();
-    assert!(matches!(error, WorkspaceError::Corrupt(_)), "{error:?}");
-    let said = error.to_string();
+    wt.push().await.unwrap();
+    let config = std::fs::read_to_string(mirror.join("config"))
+        .unwrap()
+        .to_lowercase();
     assert!(
-        said.contains("http.extraheader") && said.contains("insteadof"),
-        "{said}"
+        !config.contains("insteadof") && !config.contains("extraheader"),
+        "{config}"
     );
-    assert!(!said.contains("VALUE-THAT-MUST-NOT-BE-NAMED"), "{said}");
+    assert!(
+        std::fs::symlink_metadata(mirror.join("config"))
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
     assert_eq!(
         git(&fx.remote, &["for-each-ref", "refs/heads/"])
             .lines()
             .count(),
-        1,
-        "nothing was pushed"
+        2,
+        "the branch reached the real remote"
     );
     assert_eq!(
         git(&evil, &["for-each-ref"]),
         "",
         "nothing reached the other URL"
     );
-    let error = fx
+
+    // And again for a fetch and for `ls-remote`: armed once more, undone once more.
+    scratch_rearm(&fx, &scratch).await;
+    let second = fx
         .ws
         .run("run-second-0002")
         .unwrap()
         .add_repository(&fx.repo)
         .await
-        .unwrap_err();
-    assert!(matches!(error, WorkspaceError::Corrupt(_)), "{error:?}");
-    let error = fx.ws.default_branch(&fx.repo.url).await.unwrap_err();
-    assert!(matches!(error, WorkspaceError::Corrupt(_)), "{error:?}");
+        .unwrap();
+    assert!(second.worktree().is_some());
+    scratch_rearm(&fx, &scratch).await;
+    assert_eq!(fx.ws.default_branch(&fx.repo.url).await.unwrap(), "main");
+    assert_eq!(
+        git(&evil, &["for-each-ref"]),
+        "",
+        "nothing reached the other URL"
+    );
+}
+
+/// Arm the filter again: a commit in the scratch project whose content changes, so the filter runs.
+async fn scratch_rearm(fx: &Fx, scratch: &Scratch) {
+    let n = fx.tmp.path().join("rearm-count");
+    let count: u32 = std::fs::read_to_string(&n)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+        + 1;
+    std::fs::write(&n, count.to_string()).unwrap();
+    std::fs::write(scratch.path().join("tracked.txt"), format!("arm {count}\n")).unwrap();
+    scratch.commit_all("rearm", &me()).await.unwrap().unwrap();
+    assert!(
+        std::fs::read_to_string(fx.mirror().join("config"))
+            .unwrap()
+            .to_lowercase()
+            .contains("insteadof"),
+        "the filter wrote the mirror's configuration again"
+    );
 }
 
 // ------------------------------------------------------------------------- LocalGit

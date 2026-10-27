@@ -1,42 +1,56 @@
-//! The configuration of a mirror, judged before a command that carries a token uses it.
+//! The configuration of a mirror, put back to what the workspace writes before a command that carries
+//! a token uses it.
 //!
 //! A mirror is bare, and shared by every run. The commands that carry a token (`fetch`, `ls-remote`,
 //! `push`) read its `config`, and **others can write it**: a `filter` that runs in the git sandbox is
-//! a process of the coder's user on the work volume, and the mirror is on it. A `url.<x>.insteadOf`
-//! rewrites the URL a command is given, an `http.extraHeader` or a `remote.origin.proxy` changes where
-//! and how the request goes, a `credential.helper` or `core.sshCommand` is a program, an `include`
-//! reads another file: each would turn the request that carries the token into one the workspace
-//! never asked for.
+//! a process of the coder's user on the work volume, and the mirror is on it; so is a run's command in
+//! local mode, which writes `user.email` with `git config` inside a worktree and lands in the mirror's
+//! shared file. A `url.<x>.insteadOf` rewrites the URL a command is given, an `http.extraHeader` or a
+//! `remote.origin.proxy` changes where and how the request goes, a `credential.helper` or
+//! `core.sshCommand` is a program, an `include` reads another file: each would turn the request that
+//! carries the token into one the workspace never asked for.
 //!
-//! So the configuration is **checked, key by key, against what the workspace itself writes**, and a
-//! mirror with any other key is refused: the command is not started, the error names the keys (never
-//! their values) and the mirror, and the refusal is logged. It is **not repaired**: rewriting the
-//! file would hide that something wrote it, and the next run would meet the same writer again. The
-//! mirror is the operator's to look at.
+//! So before every such command the configuration is **read, judged key by key against what the
+//! workspace itself writes, and written back with only those entries** ([`repair`]). A list of what
+//! stays, not of what goes, so a key nobody thought of goes too; and a mirror with a harmless key
+//! (`user.name`, `gc.auto`) is put right rather than stopped: a refusal would block the repository
+//! for every run until somebody edited the file by hand.
 //!
-//! What the workspace writes (everything else is refused):
+//! What is kept (everything else is removed):
 //!
 //! | Key | Value |
 //! |---|---|
-//! | `core.repositoryformatversion` | `0` |
-//! | `core.bare` | `true` |
+//! | `core.repositoryformatversion` | `0` (anything else is reset to `0`) |
+//! | `core.bare` | `true` (anything else is reset to `true`) |
 //! | `core.filemode`, `core.ignorecase`, `core.precomposeunicode`, `core.symlinks` | `true` or `false` |
 //! | `core.logallrefupdates` | `true`, `false` or `always` |
-//! | `remote.origin.url` | the URL the workspace gives git for this repository, exactly |
-//! | `remote.origin.fetch` | `+refs/heads/*:refs/remotes/origin/*`, exactly |
+//! | `remote.origin.url` | the URL the workspace gives git for this repository (reset to it; always present) |
+//! | `remote.origin.fetch` | `+refs/heads/*:refs/remotes/origin/*` (reset to it; always present) |
 //! | `branch.agent/<name>.adam-run` | a run id |
 //! | `branch.agent/<name>.remote` | `origin` |
 //! | `branch.agent/<name>.merge` | `refs/heads/agent/<name>` |
 //!
-//! Each key once. `include.*`, `includeIf.*`, `url.*`, `http.*`, `credential.*` and `core.sshCommand`
-//! are refused first, whatever else this table gets in the future ([`ALWAYS_REFUSED`]).
+//! Each key once (the first valid one). `include.*`, `includeIf.*`, `url.*`, `http.*`, `credential.*`
+//! and `core.sshCommand` are removed first, whatever else this table gets in the future
+//! ([`ALWAYS_REFUSED`]).
 //!
-//! The file is read as a regular file and not through a link ([`safe_fs`](crate::safe_fs)), parsed
-//! by `git config --file --no-includes --list` on a private copy of the bytes that were read (so what is
-//! judged is what was read, and parsing runs no program), and `HEAD`, `packed-refs` and `commondir`
-//! are looked at as files too. **What this does not close**: a writer that changes the file between
-//! the check and the command's read of it. The window is the time between two statements of one task,
-//! under the mirror's lock, and the writer must be a process already running in the sandbox.
+//! **How it is done.** The file is read as a regular file and not through a link
+//! ([`safe_fs`](crate::safe_fs)), and parsed by `git config --file --no-includes --list` on a private
+//! copy of the bytes that were read (parsing runs no program). When the entries to keep differ from
+//! the ones found, a **new** file is built from them in a private directory, with `git config --file
+//! <new> --add` on that new, empty file (git is never run on the hostile one), and it replaces
+//! `config` atomically: a new regular file made next to it and renamed over it
+//! ([`safe_fs::replace_file`](crate::safe_fs::replace_file)). A mirror that is already right is not
+//! written. One warning per repair names the keys removed and reset, never a value.
+//!
+//! **What is still refused**, because git itself never makes it and only a planted file explains it:
+//! a `config` that is not a regular file or is longer than [`MAX_CONFIG`], one git cannot parse, a
+//! `HEAD` or `packed-refs` that is not a regular file, and a `commondir` in a bare mirror (git would
+//! follow it to another repository's configuration).
+//!
+//! **What this does not close**: a writer in the sandbox that changes the file between the repair and
+//! the network command's read of it. The window is the time between two statements of one task, under
+//! the mirror's lock.
 
 use std::path::Path;
 
@@ -45,7 +59,7 @@ use crate::workspace::{REMOTE_TRACKING_PREFIX, validate_run};
 /// The most bytes of a mirror's `config` that are read.
 pub(crate) const MAX_CONFIG: u64 = 1024 * 1024;
 
-/// The keys that are refused whatever the table of allowed ones says.
+/// The keys that are removed whatever the table of kept ones says.
 pub(crate) const ALWAYS_REFUSED: &[&str] = &[
     "include.",
     "includeif.",
@@ -55,11 +69,24 @@ pub(crate) const ALWAYS_REFUSED: &[&str] = &[
     "core.sshcommand",
 ];
 
-/// A key that is not allowed, and why, in words that hold no value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Violation {
-    pub(crate) key: String,
-    pub(crate) why: &'static str,
+/// What [`repair`] decided: the entries the configuration is to have, and which keys were removed
+/// or reset to get there. The keys are names, never values.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Repair {
+    /// The entries to keep, in the order they were found, each key once; the two `remote.origin`
+    /// keys at the end when they were missing.
+    pub(crate) entries: Vec<(String, String)>,
+    /// The keys that are not the workspace's, or occur again, once each.
+    pub(crate) removed: Vec<String>,
+    /// The keys that are the workspace's with a value it did not write, or were missing, once each.
+    pub(crate) reset: Vec<String>,
+}
+
+impl Repair {
+    /// Whether the configuration found is not the one to keep.
+    pub(crate) fn changes_something(&self) -> bool {
+        !self.removed.is_empty() || !self.reset.is_empty()
+    }
 }
 
 /// The refspec the workspace writes as `remote.origin.fetch`.
@@ -83,57 +110,90 @@ pub(crate) fn parse_list(stdout: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The entries of `entries` that the workspace did not write, once per key, in the order they come.
-/// `expected_url` is what `remote.origin.url` must be.
-pub(crate) fn judge(entries: &[(String, String)], expected_url: &str) -> Vec<Violation> {
-    let mut found: Vec<Violation> = Vec::new();
-    let mut note = |key: &str, why: &'static str| {
-        if !found.iter().any(|v| v.key == key) {
-            found.push(Violation {
-                key: key.to_owned(),
-                why,
-            });
+/// What a key found in the configuration is.
+enum Verdict {
+    /// The workspace's, with a value it writes.
+    Keep,
+    /// The workspace's, with a value it did not write: the entry is kept with this value instead.
+    Reset(String),
+    /// Not the workspace's, or its value is none it could have written.
+    Drop,
+}
+
+/// Judge one entry. `expected_url` is what `remote.origin.url` must be.
+fn judge(key: &str, value: &str, expected_url: &str) -> Verdict {
+    if ALWAYS_REFUSED
+        .iter()
+        .any(|refused| key.starts_with(refused) || key == *refused)
+    {
+        return Verdict::Drop;
+    }
+    let reset_unless = |valid: bool, to: String| {
+        if valid {
+            Verdict::Keep
+        } else {
+            Verdict::Reset(to)
         }
     };
-    let refspec = fetch_refspec();
-    for (key, value) in entries {
-        if ALWAYS_REFUSED
-            .iter()
-            .any(|refused| key.starts_with(refused) || key == refused)
+    let keep_if = |valid: bool| if valid { Verdict::Keep } else { Verdict::Drop };
+    match key {
+        "core.repositoryformatversion" => reset_unless(value == "0", "0".to_owned()),
+        "core.bare" => reset_unless(value == "true", "true".to_owned()),
+        "core.filemode" | "core.ignorecase" | "core.precomposeunicode" | "core.symlinks" => {
+            keep_if(matches!(value, "true" | "false"))
+        }
+        "core.logallrefupdates" => keep_if(matches!(value, "true" | "false" | "always")),
+        "remote.origin.url" => {
+            reset_unless(same_remote(value, expected_url), expected_url.to_owned())
+        }
+        "remote.origin.fetch" => reset_unless(value == fetch_refspec(), fetch_refspec()),
+        other => match other
+            .strip_prefix("branch.")
+            .and_then(|k| k.rsplit_once('.'))
         {
-            note(key, "a key that can redirect or run a credentialed command");
+            Some((name, variable)) if branch_key_is_ours(name, variable) => {
+                keep_if(branch_value_is_ours(name, variable, value))
+            }
+            _ => Verdict::Drop,
+        },
+    }
+}
+
+/// What the configuration is to be, given what was found in it: only the entries the workspace
+/// writes, with valid values, each key once; `remote.origin.url` and `remote.origin.fetch` as they
+/// must be, and present. `expected_url` is what `remote.origin.url` must be.
+pub(crate) fn repair(entries: &[(String, String)], expected_url: &str) -> Repair {
+    let mut out = Repair::default();
+    let note = |list: &mut Vec<String>, key: &str| {
+        if !list.iter().any(|k| k == key) {
+            list.push(key.to_owned());
+        }
+    };
+    for (key, value) in entries {
+        if out.entries.iter().any(|(k, _)| k == key) {
+            // The key is already kept: this is a second value.
+            note(&mut out.removed, key);
             continue;
         }
-        let times = entries.iter().filter(|(k, _)| k == key).count();
-        let allowed = match key.as_str() {
-            "core.repositoryformatversion" => value == "0",
-            "core.bare" => value == "true",
-            "core.filemode" | "core.ignorecase" | "core.precomposeunicode" | "core.symlinks" => {
-                matches!(value.as_str(), "true" | "false")
+        match judge(key, value, expected_url) {
+            Verdict::Keep => out.entries.push((key.clone(), value.clone())),
+            Verdict::Reset(to) => {
+                out.entries.push((key.clone(), to));
+                note(&mut out.reset, key);
             }
-            "core.logallrefupdates" => matches!(value.as_str(), "true" | "false" | "always"),
-            "remote.origin.url" => same_remote(value, expected_url),
-            "remote.origin.fetch" => *value == refspec,
-            other => match other
-                .strip_prefix("branch.")
-                .and_then(|k| k.rsplit_once('.'))
-            {
-                Some((name, variable)) if branch_key_is_ours(name, variable) => {
-                    branch_value_is_ours(name, variable, value)
-                }
-                _ => {
-                    note(key, "a key the workspace does not write");
-                    continue;
-                }
-            },
-        };
-        if !allowed {
-            note(key, "a value the workspace did not write");
-        } else if times > 1 {
-            note(key, "a key that occurs more than once");
+            Verdict::Drop => note(&mut out.removed, key),
         }
     }
-    found
+    for (key, value) in [
+        ("remote.origin.url", expected_url.to_owned()),
+        ("remote.origin.fetch", fetch_refspec()),
+    ] {
+        if !out.entries.iter().any(|(k, _)| k == key) {
+            out.entries.push((key.to_owned(), value));
+            note(&mut out.reset, key);
+        }
+    }
+    out
 }
 
 /// Whether `branch.<name>.<variable>` is one of the three keys the workspace writes for a run's
@@ -216,10 +276,6 @@ mod tests {
             .collect()
     }
 
-    fn keys(violations: &[Violation]) -> Vec<&str> {
-        violations.iter().map(|v| v.key.as_str()).collect()
-    }
-
     /// What `git init --bare` and the workspace leave.
     fn ours() -> Vec<(String, String)> {
         pairs(&[
@@ -231,21 +287,34 @@ mod tests {
             ("branch.agent/0190aaaa.adam-run", "0190aaaa-run-id"),
             ("branch.agent/0190aaaa.remote", "origin"),
             ("branch.agent/0190aaaa.merge", "refs/heads/agent/0190aaaa"),
+            ("core.logallrefupdates", "true"),
         ])
     }
 
     #[test]
-    fn what_the_workspace_writes_passes() {
-        assert_eq!(judge(&ours(), URL), []);
-        assert_eq!(
-            judge(&[], URL),
-            [],
-            "a mirror with no keys at all is not a mirror to refuse"
-        );
+    fn what_the_workspace_writes_is_left_exactly_as_it_is() {
+        let repair = repair(&ours(), URL);
+        assert_eq!(repair.entries, ours(), "same entries, same order");
+        assert!(!repair.changes_something(), "{repair:?}");
     }
 
     #[test]
-    fn every_key_that_can_redirect_a_credentialed_command_is_refused() {
+    fn a_mirror_with_no_keys_gets_the_two_remote_keys() {
+        let repair = repair(&[], URL);
+        assert_eq!(
+            repair.entries,
+            pairs(&[
+                ("remote.origin.url", URL),
+                ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ])
+        );
+        assert_eq!(repair.reset, ["remote.origin.url", "remote.origin.fetch"]);
+        assert!(repair.removed.is_empty());
+        assert!(repair.changes_something());
+    }
+
+    #[test]
+    fn every_key_that_can_redirect_or_run_a_credentialed_command_is_removed() {
         for key in [
             "url.https://evil.example/.insteadof",
             "url.file:///evil.git.pushinsteadof",
@@ -272,26 +341,73 @@ mod tests {
             "filter.x.clean",
             "diff.x.textconv",
             "alias.s",
-            "user.name",
             "branch.main.remote",
             "branch.agent/x.pushremote",
             "branch.agent/x.rebase",
         ] {
             let mut entries = ours();
-            entries.push((key.to_owned(), "x".to_owned()));
-            assert_eq!(keys(&judge(&entries, URL)), [key], "{key}");
+            entries.insert(2, (key.to_owned(), "x".to_owned()));
+            entries.push((key.to_owned(), "y".to_owned()));
+            let repair = repair(&entries, URL);
+            assert_eq!(
+                repair.entries,
+                ours(),
+                "{key}: only the workspace's keys are left"
+            );
+            assert_eq!(repair.removed, [key], "{key}");
+            assert!(repair.reset.is_empty(), "{key}");
         }
     }
 
+    /// What a person's command writes with `git config` in a worktree (it lands in the mirror's
+    /// shared file), and what an earlier version left: harmless, and not the workspace's.
     #[test]
-    fn a_key_that_is_ours_with_a_value_that_is_not_is_refused() {
+    fn a_harmless_key_is_removed_and_the_runs_branch_entries_stay() {
+        let mut entries = ours();
+        entries.insert(3, ("user.email".to_owned(), "ada@example.com".to_owned()));
+        entries.insert(3, ("user.name".to_owned(), "Ada".to_owned()));
+        entries.push(("gc.auto".to_owned(), "0".to_owned()));
+        let repair = repair(&entries, URL);
+        assert_eq!(repair.entries, ours());
+        assert_eq!(repair.removed, ["user.name", "user.email", "gc.auto"]);
+    }
+
+    #[test]
+    fn a_key_that_is_ours_with_a_value_that_is_not_is_reset_or_removed() {
+        // The two remote keys and the two that decide what kind of repository git thinks it has:
+        // put back, in place.
+        for (key, value, to) in [
+            (
+                "remote.origin.url",
+                "https://evil.example/acme/app.git",
+                URL,
+            ),
+            ("remote.origin.url", "https://github.com/acme/app", URL),
+            (
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/heads/*",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ),
+            (
+                "remote.origin.fetch",
+                "+refs/*:refs/*",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ),
+            ("core.bare", "false", "true"),
+            ("core.repositoryformatversion", "1", "0"),
+        ] {
+            let mut entries = ours();
+            let at = entries.iter().position(|(k, _)| k == key).unwrap();
+            entries[at].1 = value.to_owned();
+            let repair = repair(&entries, URL);
+            let mut want = ours();
+            want[at].1 = to.to_owned();
+            assert_eq!(repair.entries, want, "{key} = {value}");
+            assert_eq!(repair.reset, [key], "{key} = {value}");
+            assert!(repair.removed.is_empty(), "{key}");
+        }
+        // The others have no value to be put back to: they go.
         for (key, value) in [
-            ("remote.origin.url", "https://evil.example/acme/app.git"),
-            ("remote.origin.url", "https://github.com/acme/app"),
-            ("remote.origin.fetch", "+refs/heads/*:refs/heads/*"),
-            ("remote.origin.fetch", "+refs/*:refs/*"),
-            ("core.bare", "false"),
-            ("core.repositoryformatversion", "1"),
             ("core.filemode", "$(touch /x)"),
             ("core.logallrefupdates", "sometimes"),
             ("branch.agent/0190aaaa.remote", "https://evil.example/x.git"),
@@ -300,9 +416,15 @@ mod tests {
             ("branch.agent/0190aaaa.adam-run", "../../etc"),
             ("branch.agent/0190aaaa.adam-run", ""),
         ] {
-            let mut entries: Vec<_> = ours().into_iter().filter(|(k, _)| k != key).collect();
-            entries.push((key.to_owned(), value.to_owned()));
-            assert_eq!(keys(&judge(&entries, URL)), [key], "{key} = {value}");
+            let mut entries = ours();
+            let at = entries.iter().position(|(k, _)| k == key).unwrap();
+            entries[at].1 = value.to_owned();
+            let repair = repair(&entries, URL);
+            let mut want = ours();
+            want.remove(at);
+            assert_eq!(repair.entries, want, "{key} = {value}");
+            assert_eq!(repair.removed, [key], "{key} = {value}");
+            assert!(repair.reset.is_empty(), "{key}");
         }
     }
 
@@ -336,16 +458,32 @@ mod tests {
         ] {
             assert_eq!(same_remote(value, expected), same, "{value} vs {expected}");
         }
+        // The spelling the mirror was made with is kept.
+        let mut entries = ours();
+        entries[3].1 = "file:///srv/git/app.git".to_owned();
+        let repair = repair(&entries, "/srv/git/app.git");
+        assert_eq!(repair.entries, entries);
+        assert!(!repair.changes_something());
     }
 
     #[test]
-    fn a_key_that_occurs_twice_is_refused() {
+    fn a_key_that_occurs_twice_is_kept_once() {
         for key in ["remote.origin.url", "remote.origin.fetch", "core.bare"] {
             let mut entries = ours();
             let again = entries.iter().find(|(k, _)| k == key).unwrap().clone();
             entries.push(again);
-            assert_eq!(keys(&judge(&entries, URL)), [key], "{key}");
+            let repair = repair(&entries, URL);
+            assert_eq!(repair.entries, ours(), "{key}");
+            assert_eq!(repair.removed, [key], "{key}");
         }
+        // The first value that is valid is the one kept: a wrong one first does not shadow it.
+        let entries = pairs(&[("core.filemode", "maybe"), ("core.filemode", "false")]);
+        let repair = repair(&entries, URL);
+        assert_eq!(
+            repair.entries[0],
+            ("core.filemode".to_owned(), "false".to_owned())
+        );
+        assert_eq!(repair.removed, ["core.filemode"]);
     }
 
     #[test]
@@ -357,25 +495,32 @@ mod tests {
             "branch.agent/x y.adam-run",
         ] {
             let entries = pairs(&[(key, "origin")]);
-            assert_eq!(keys(&judge(&entries, URL)), [key], "{key}");
+            let repair = repair(&entries, URL);
+            assert_eq!(repair.removed, [key], "{key}");
         }
         // A branch name with dots in it is still read from its last dot.
-        let entries = pairs(&[
+        let mut entries = pairs(&[
             ("branch.agent/a.b.adam-run", "run-1"),
             ("branch.agent/a.b.merge", "refs/heads/agent/a.b"),
         ]);
-        assert_eq!(judge(&entries, URL), []);
+        let repair = repair(&entries, URL);
+        entries.extend(pairs(&[
+            ("remote.origin.url", URL),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+        ]));
+        assert_eq!(repair.entries, entries);
+        assert!(repair.removed.is_empty());
     }
 
     #[test]
-    fn the_refused_keys_win_over_the_table_and_are_named_once() {
+    fn the_removed_keys_win_over_the_table_and_are_named_once() {
         let entries = pairs(&[
             ("http.extraheader", "a"),
             ("http.extraheader", "b"),
             ("url.x.insteadof", "c"),
         ]);
-        let found = judge(&entries, URL);
-        assert_eq!(keys(&found), ["http.extraheader", "url.x.insteadof"]);
+        let repair = repair(&entries, URL);
+        assert_eq!(repair.removed, ["http.extraheader", "url.x.insteadof"]);
         // None of the table's own keys could be one of them.
         for refused in ALWAYS_REFUSED {
             for allowed in [
@@ -388,6 +533,18 @@ mod tests {
                 assert!(!allowed.starts_with(refused), "{allowed} vs {refused}");
             }
         }
+    }
+
+    #[test]
+    fn repairing_what_was_repaired_changes_nothing() {
+        let mut entries = ours();
+        entries.push(("http.extraheader".to_owned(), "x".to_owned()));
+        entries.push(("core.bare".to_owned(), "false".to_owned()));
+        let first = repair(&entries, URL);
+        assert!(first.changes_something());
+        let second = repair(&first.entries, URL);
+        assert_eq!(second.entries, first.entries);
+        assert!(!second.changes_something(), "{second:?}");
     }
 
     #[test]

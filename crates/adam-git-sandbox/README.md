@@ -215,8 +215,8 @@ The coder's own code paths (`RunWorkspace`, `Worktree::commit_all`, the tools' q
   `/tmp`. The chart does not run the server yet; a kind check that the sidecar has no token, no Secret and no view of the coder's
   processes, and that a commit made through it works, comes with it.
 * **A filter in the sandbox still sees the whole work volume**: every run's files, as the coder's `git` does today, and it can **write
-  the shared mirrors** (which is why the coder checks a mirror's configuration before every network command,
-  [`adam-workspace`](../adam-workspace/README.md#the-mirrors-configuration-is-checked-not-repaired)). Closing that needs git per run in
+  the shared mirrors** (which is why the coder puts a mirror's configuration back to what it writes before every network command,
+  [`adam-workspace`](../adam-workspace/README.md#the-mirrors-configuration-is-put-back-not-trusted)). Closing that needs git per run in
   the run's pod, which needs a different commit path. Other people's branches in the shared mirror stay as exposed as before, until a
   mirror per person ([#122](https://github.com/vymalo/another-adam-rs/issues/122)).
 * **It does not authenticate.** Whoever can connect to the socket runs `git` in the sandbox. The mode `0600` and the directory decide who

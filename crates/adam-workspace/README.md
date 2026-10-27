@@ -98,47 +98,62 @@ operator chose is theirs; `$HOME/.gitconfig` is not read, since code in a worktr
 URLs given on the command line too, and the mirror's configuration is shared by every run and
 written by more than this crate (a model's command, OpenCode and a repository's scripts all run in
 a worktree of it; and, with a git sandbox, a repository's own `filter` can write it). So **the guard is at the
-credentialed call**: under the mirror lock, right before each of those commands, the crate **checks** the mirror's files
-and every key of its configuration against what it writes itself, and refuses the command when anything else is there
-([below](#the-mirrors-configuration-is-checked-not-repaired)). Who wrote the key does not matter. (A tool such as the coder's
+credentialed call**: under the mirror lock, right before each of those commands, the crate **puts the mirror's configuration back to what
+it writes itself**: every key it did not write is removed and the remote's two keys are reset
+([below](#the-mirrors-configuration-is-put-back-not-trusted)). Who wrote the key does not matter. (A tool such as the coder's
 `run_command` also undoes such writes when it sees them, but nothing relies on that.) The token reaches `git` only through the environment of one
 invocation: never in a remote URL, `.git/config`, logs or error messages.
 URLs with embedded credentials and ssh/scp forms are refused.
 
-### The mirror's configuration is checked, not repaired
+### The mirror's configuration is put back, not trusted
 
-`Workspaces::check_mirror` (private; every command that carries a token goes through `Inner::run_network`, the only place
-one is made for a mirror, so none starts without it) looks at `HEAD`, `packed-refs` and `commondir` of the mirror without
-following a link (`HEAD` and `packed-refs` must be regular files, and there is no `commondir`: git would follow it to another
-repository's configuration), reads `config` as a regular file of at most 1 MiB and not through a link, parses a **private copy
-of the bytes it read** with `git config --file --no-includes --list -z` (so what is judged is what was read, and parsing runs no
-program), and refuses unless every key is one the workspace writes:
+`Workspaces::repair_mirror` (private; every command that carries a token goes through `Inner::run_network`, the only place
+one is made for a mirror, so none starts without it) works on the mirror, under its lock, in this order:
+
+1. **Structure.** `HEAD` and `packed-refs` must be regular files (not followed through a link), `config` must be a regular file of at
+   most 1 MiB, and there must be no `commondir` (git would follow it to another repository's configuration). Git itself never makes
+   any of these, so none is put back: the command is refused with a `WorkspaceError::Corrupt` that names the mirror and the file, and one
+   `error` log line.
+2. **Read.** The `config` bytes are read once and parsed from a **private copy** with `git config --file --no-includes --list -z` (so what
+   is judged is what was read, and parsing runs no program).
+3. **Judge.** Only these keys stay, and only with these values:
 
 | Key | Value |
 |---|---|
-| `core.repositoryformatversion` | `0` |
-| `core.bare` | `true` |
+| `core.repositoryformatversion` | `0` (anything else is reset to `0`) |
+| `core.bare` | `true` (anything else is reset to `true`) |
 | `core.filemode`, `core.ignorecase`, `core.precomposeunicode`, `core.symlinks` | `true` or `false` |
 | `core.logallrefupdates` | `true`, `false` or `always` |
-| `remote.origin.url` | the URL git is given for this repository (the canonical one for http(s); a filesystem remote in either spelling) |
-| `remote.origin.fetch` | `+refs/heads/*:refs/remotes/origin/*` |
+| `remote.origin.url` | the URL git is given for this repository (the canonical one for http(s); a filesystem remote in either spelling, and the spelling the mirror was made with stays); anything else, or none, is reset to it |
+| `remote.origin.fetch` | `+refs/heads/*:refs/remotes/origin/*`; anything else, or none, is reset to it |
 | `branch.agent/<name>.adam-run`, `.remote`, `.merge` | a run id, `origin`, `refs/heads/agent/<name>` |
 
-Each key once. `include.*`, `includeIf.*`, `url.*`, `http.*`, `credential.*` and `core.sshCommand` are refused first,
-whatever the table says. The refusal is a `WorkspaceError::Corrupt` that names the mirror and the **keys, never their values**,
-and one `error` log line each. A missing `remote.origin.*` is not refused (the commands name the URL and the refspec themselves).
+   Each key once. Everything else is removed: `include.*`, `includeIf.*`, `url.*`, `http.*`, `credential.*` and `core.sshCommand`
+   first, whatever the table says, then `user.*`, `gc.*`, `alias.*`, `filter.*`, `core.fsmonitor`, `extensions.*`, a second remote, a
+   `pushurl`, and any other key a person's command (a `git config` inside a worktree writes the shared file) or an earlier version left.
+   A harmless key is no reason to stop a repository, so it is removed, not refused.
+4. **Write.** When something was removed or reset, a **new** file is built: `git config --file <new> --add` for each kept entry, on an
+   empty file in a private directory (git never runs on the hostile file), read back and compared with what was decided, then
+   `safe_fs::replace_file` makes a new regular file next to `config` and renames it over `config` (nothing is written through whatever was
+   there, a link included). A configuration that is already right is **not written**. One `warn` log line per repair names the keys
+   removed and the keys reset, **never their values**.
 
-**Refused, not repaired**, because a repair hides an attack (the writer is still there, and the next run meets it again) and
-because the operator has to look at what wrote the file. The cost is that one writer can stop a mirror (every run of that repository
-fails with `Corrupt`) until the key is removed by hand: the commands that read the mirror's files, not the ones that carry a token, still
-work. An older version of this crate removed such keys itself; none does now. `ensure_mirror` writes `remote.origin.*` once, when it
-makes the mirror (three commands that run in the coder, in a mirror that holds no repository code yet), and never rewrites a mirror
-that is there.
+The command then runs, as the caller asked. `ensure_mirror` writes `remote.origin.*` once, when it makes the mirror (three commands that run
+in the coder, in a mirror that holds no repository code yet), and never rewrites a mirror that is there.
 
-**What the check does not close**: a writer that changes the file between the check and the command's read of it. The window is the
-time between two statements of one task, under the mirror lock, and the writer must be a process already running in the sandbox;
-shortening it further needs the network commands to read a configuration of the coder's own, which is a follow-up. A mirror per
+**What the repair does not close**: a writer in the sandbox that changes the file between the repair and the network command's read of
+it. The window is the time between two statements of one task, under the mirror lock, and the writer must be a process already running in the
+sandbox; shortening it further needs the network commands to read a configuration of the coder's own, which is a follow-up. A mirror per
 person is [#122](https://github.com/vymalo/another-adam-rs/issues/122).
+
+Tests: `workspace.rs`, `a_mirror_with_configuration_the_workspace_did_not_write_is_put_back_before_any_credentialed_command` (sixteen kinds of
+planted key, each before a fetch, a push and an `ls-remote`, and a publication after one: the command runs and reaches the real remote only, the file is a
+regular file that holds only the workspace's entries, the one warning names the key and no value, and a second command rewrites nothing, byte or
+inode), `a_mirror_with_harmless_keys_is_put_right_and_not_stopped` (an upgrade: `user.email`, `user.name` and `gc.auto` beside a run's
+`branch.agent/*` entries; those entries survive), `a_mirror_whose_files_are_not_the_files_git_makes_is_refused` (a link or a directory for `config`,
+`HEAD` or `packed-refs`, an oversized `config`, a `commondir`), `both_spellings_of_a_filesystem_remote_share_a_mirror_and_leave_its_configuration_alone`,
+`a_worktree_configuration_file_is_never_read_because_the_coder_never_turns_it_on`; `git_sandbox.rs`,
+`a_filter_that_rewrites_the_mirror_is_undone_before_the_next_fetch_and_push`; unit tests in `mirror_config.rs`.
 
 ### Where `git` runs: the git sandbox
 
@@ -210,7 +225,7 @@ has the **one** `worktrees/*/gitdir` that names its `.git` among the directories
 `git_dir()` is `None`, no `git` runs on it (`WorkspaceError::Corrupt`) and `adam-env-kubernetes` mounts no git directories for it.
 A scratch project is pinned to its own `.git`, which must be a directory, and which must not hold a `commondir`.
 `extensions.worktreeConfig` (which would make git read `config.worktree`, also writable by a command) is never set by the workspace, and a mirror that
-has it is refused ([the check](#the-mirrors-configuration-is-checked-not-repaired)). What stays: an embedded repository in the working tree is entered by `status`, `add -A` and
+has it gets it removed again before the next command that carries a credential ([the repair](#the-mirrors-configuration-is-put-back-not-trusted)). What stays: an embedded repository in the working tree is entered by `status`, `add -A` and
 `diff` with its own configuration ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md), "Known limits"). Tests:
 `workspace.rs`, `a_commondir_or_a_git_file_a_run_rewrites_steers_nothing_of_the_coders_git` (a planted filter and monitor leave no marker, and
 the control without the pin does), `a_run_that_points_its_git_file_at_another_runs_directory_does_not_get_it`,
@@ -722,14 +737,14 @@ Offline. The `git` CLI must be on `PATH`.
   own configuration does, asked by `status`, `diff_stat` and `commit_all`: the program writes its ancestors and what it can read of
   their environment, and the marker shows the server among the ancestors and the server's environment and not the test's
   (`CARGO_PKG_NAME`, which stands for a secret of the coder); **the control**, the same without the socket, shows the program under
-  the test and the secret readable. A filter in the sandbox that rewrites the mirror's configuration makes the next push, fetch
-  and `ls-remote` refuse, naming the keys. A sandbox that cannot be reached: the commands that need it fail as transient, and the
+  the test and the secret readable. A filter in the sandbox that rewrites the mirror's configuration is undone before the next push, fetch
+  and `ls-remote`, which then run: the file is a regular file that holds only the workspace's entries and nothing reached the other URL. A sandbox that cannot be reached: the commands that need it fail as transient, and the
   program a scratch project names did not run here. `LocalGit` (the coder's tools' questions): where it runs, a patch on its input,
   a credential refused before anything is sent. The isolation itself (another container, no secret, another PID namespace) is not
   here: the server of these tests is a process of the same user on the same machine.
   Unit tests: the route of every kind of command, the token in the environment of the command that carries it and in no argument,
-  a credential never sent (a header, a helper, the environment), a command with no directory (`git.rs`); the allow-list of the
-  mirror's keys (`mirror_config.rs`).
+  a credential never sent (a header, a helper, the environment), a command with no directory (`git.rs`); the repair of the
+  mirror's keys (`mirror_config.rs`: what stays, what is reset, what goes, what is left alone).
 * A slot swapped between a check and the use that follows it (the seam `safe_fs::race`): see
   [A slot's directory is held, not named](#a-slots-directory-is-held-not-named). The tests are in `tests/workspace.rs` and
   `src/safe_fs/slot_dir.rs`, and in `adam-coder` for its file tools.

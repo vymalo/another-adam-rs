@@ -282,8 +282,10 @@ not run or its conversation failed: 78 `GIT_SANDBOX_SOCKET` is unset or not an a
 the protocol, 141 its output could not be written. A command that could not go through the sandbox is a
 `WorkspaceError` of the coder, never a command run in its own container instead: `Transient` when the sandbox cannot be
 reached (the step is retried), `Corrupt` when it refuses the directory, and `Corrupt` for a command that carries a credential.
-A mirror whose configuration the workspace did not write is a `WorkspaceError::Corrupt` that names the keys and not their
-values ([the check](../../crates/adam-workspace/README.md#the-mirrors-configuration-is-checked-not-repaired)).
+A mirror whose configuration holds keys the workspace did not write is not an error: they are removed before the next
+command that carries a credential, and one warning names the keys and not their values ([the repair](../../crates/adam-workspace/README.md#the-mirrors-configuration-is-put-back-not-trusted)).
+A mirror whose `config`, `HEAD` or `packed-refs` is not a regular file (or whose `config` is over 1 MiB), or that has a `commondir`, is
+a `WorkspaceError::Corrupt` that names the file; git never makes any of them, so nothing is put back and no credential is sent.
 
 ## Rules for an error enum
 
