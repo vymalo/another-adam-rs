@@ -2,7 +2,8 @@
 
 Configuration of both agents is environment variables only. Problems are reported all at once at startup
 (`invalid configuration`, exit 78). Sources of truth: `crates/adam-service/src/config.rs` (the common ones),
-`bin/adam-coder/src/config.rs`, `bin/adam-agent/src/config.rs`, `crates/adam-env-kubernetes/src/settings.rs`.
+`bin/adam-coder/src/config.rs`, `bin/adam-agent/src/config.rs`, `crates/adam-env-kubernetes/src/settings.rs`,
+`bin/adam-egress/src/config.rs`.
 The chart sets these from its values: [chart README](../../deploy/coder/README.md). Secrets are never in
 files or logs; they are `SecretString`s and absent from `Debug`.
 
@@ -107,6 +108,22 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
 | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client | `devcontainer`, `podman-remote` |
 | `OPENCODE_BINARY` | with `podman`: the native OpenCode executable mounted into containers | `OPENCODE_COMMAND`'s program |
+
+## Egress proxy (`adam-egress`)
+
+The HTTPS-only proxy of the coder image (`bin/adam-egress`, [its README](../../bin/adam-egress/README.md)). It reads
+nothing of the rows above. Source: `bin/adam-egress/src/config.rs`. Problems are reported all at once (exit 78).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `EGRESS_LISTEN` | the address to listen on | `0.0.0.0:3128` |
+| `EGRESS_ALLOW_FILE` | a file of allowed hosts, one per line; `#` starts a comment; blank lines are ignored; must be a readable file | unset |
+| `EGRESS_ALLOW` | allowed hosts, comma-separated; added to the file's. `example.com` is that host, `.example.com` every subdomain of it and not the apex. An entry that is neither (`*.example.com`, a URL, an IP address) is exit 78, and so is an empty list: **at least one host is required** | unset |
+| `EGRESS_PORTS` | the ports a `CONNECT` may name, comma-separated | `443` |
+| `EGRESS_DENY_CIDRS` | IPv4 ranges (`10.96.0.0/12`) never connected to, on top of the built-in private, loopback, link-local, shared, multicast, documentation and reserved ranges: the cluster's own. A bad range is exit 78; an IPv6 range is accepted and has no effect, since every IPv6 address is dropped | unset |
+| `EGRESS_IDLE_SECS` | a tunnel that moves no byte for this long is closed (1 to 86400) | `300` |
+| `EGRESS_MAX_CONNECTIONS` | connections served at once; the next gets `503` (1 to 1000000) | `1024` |
+| `RUST_LOG` | log filter; JSON logs on stdout | `info` |
 
 ## Local stack (`compose.yaml`)
 

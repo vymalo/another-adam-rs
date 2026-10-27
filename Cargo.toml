@@ -68,6 +68,8 @@ futures = "0.3"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
+# Parses the request head of the egress proxy (adam-egress); already in the tree under hyper.
+httparse = "1"
 httpdate = "1"
 # Reads a repository's devcontainer.json (JSON with comments and trailing commas), as serde_json values
 # (adam-devcontainer).

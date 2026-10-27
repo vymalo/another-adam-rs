@@ -366,6 +366,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-egress"
+version = "0.1.0"
+dependencies = [
+ "adam-error",
+ "async-trait",
+ "httparse",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "adam-env-kubernetes"
 version = "0.1.0"
 dependencies = [
