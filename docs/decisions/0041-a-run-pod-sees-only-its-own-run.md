@@ -267,7 +267,8 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   so the pod's commands, and the processes they left running, cannot rename, move, remove or exchange a slot's directory and
   the name `git` finds its work tree by is safe (*verified* with `deploy/coder/tests/git-in-run-pod.sh`, real bind mounts: `mv`,
   `rmdir` and an exchange of the slot fail with `EBUSY`, a sibling that is not a slot still renames, and git works; the same checks
-  in a real run pod are in the `run-pods` job, *unverified* until CI has run it). **Not covered:**
+  in a real run pod are in the `run-pods` job, *verified 2026-10-27* in the `run-pods` job of run 40456829784 (job 122032008830), where the
+  cluster test's slot checks passed). **Not covered:**
   * **The window before the mount.** A pod made before a slot was added lacks its mount until `Environment::seal` (right after the
     slot is added) or the next `ensure` makes the pod again, which needs that no command runs in it. While a command runs, the
     directory can still be renamed; the tool that added the slot says so in its result. A pod of the run a scratch project was
@@ -425,3 +426,8 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   mount of its own in the run pod, with the slot's generation in the annotation line (decisions 1 and 3), and the coder calls
   `Environment::seal` right after it adds a slot so that a stale idle pod is deleted at once and the next command makes the new one
   (Known limits: *a swap between a check and the use* lists what stays open).
+* **2026-10-27, [#124](https://github.com/vymalo/another-adam-rs/issues/124) ([ADR 0042](0042-run-pods-reach-the-internet-through-an-egress-proxy.md)).**
+  The run pods' network policy, which this ADR does not describe and ADR 0019 does, no longer opens the internet: a run pod reaches DNS, the
+  egress proxy and `runPods.networkPolicy.extraEgress`, and nothing else, and the pod template (decision 2's template) sets `HTTPS_PROXY`,
+  `HTTP_PROXY` and `NO_PROXY` (lower case too) to the proxy. The mounts, the admission policy and the rest of the template are as above; the policy
+  allows plain values for these variables and still allows no Secret reference but the model key.

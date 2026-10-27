@@ -227,8 +227,12 @@ one line); none carries a secret, and the API server never echoes one in a refus
   `ADAM_TEST_KUBE_WORKER`, `ADAM_TEST_KUBE_MODEL_KEY`, `ADAM_TEST_KUBE_ISOLATION_MIRROR`, `ADAM_TEST_KUBE_ISOLATION_ADMIN`) are in
   the header of the file, and the script that sets a `kind` cluster up and seeds the volume is
   [`deploy/coder/tests/kind-run-pods.sh`](../../deploy/coder/tests/kind-run-pods.sh). The isolation scenario and the nested
-  read-only and read-write `subPath` mounts it relies on are *unverified* until CI has run that job. The `NetworkPolicy` is not exercised: it
-  needs a CNI that enforces it.
+  read-only and read-write `subPath` mounts it relies on are *unverified* until CI has run that job. The cluster test does not exercise the
+  `NetworkPolicy`; the script does, after it ([ADR 0042](../../docs/decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)): on
+  kind's own network plugin, which enforces it, a run pod made from the chart's template reaches the internet only through the chart's egress
+  proxy (`curl` and `npm view` succeed, a host that is not allowed is `403`, a direct connection and a connection to the API server or another
+  pod are refused) and the script fails where a policy is not enforced (`ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1` names a cluster known not to).
+  *Unverified* until CI has run it.
 * **Git under the pod's mounts, no cluster** ([`deploy/coder/tests/git-in-run-pod.sh`](../../deploy/coder/tests/git-in-run-pod.sh)): real
   git as uid 10001 in a private mount namespace with the pod's mounts as bind mounts (each slot too); what works, what is refused and
   what is not there; that `mv`, `rmdir` and an exchange of a slot fail with `EBUSY` while a sibling that is not a slot renames, is
