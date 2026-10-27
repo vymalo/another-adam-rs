@@ -1,7 +1,7 @@
 //! [`LlmAgent`]: the durable model <-> tools loop.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use adam_core::{RunId, RunStatus};
@@ -12,8 +12,8 @@ use adam_model::{
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Emitter, Inbound,
-    MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, StepState, Transition, UsageEvent,
-    UsageTotals,
+    MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, SandboxUsage, StepState, Transition,
+    UsageEvent, UsageTotals,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1075,8 +1075,9 @@ impl LlmAgent {
     }
 
     /// Count the model calls of the child run `child`, which has just answered, in this run's
-    /// totals: the totals its state keeps (`usage_totals`, its own children's included). A child
-    /// whose state says none (another kind of agent, or one purged) adds nothing.
+    /// totals: the totals its state keeps (`usage_totals`, its own children's included), and the
+    /// sandbox usage its state keeps (`sandbox_usage`, likewise). A child whose state says none
+    /// (another kind of agent, or one purged) adds nothing.
     async fn count_child(
         ctx: &Ctx,
         state: &mut Conversation,
@@ -1091,6 +1092,14 @@ impl LlmAgent {
             .and_then(|totals| serde_json::from_value::<UsageTotals>(totals).ok());
         if let Some(totals) = totals {
             state.usage_totals.merge(&totals);
+        }
+        // The child's commands ran in the root run's sandbox: they are the task's.
+        let sandbox = child_state
+            .get("sandbox_usage")
+            .cloned()
+            .and_then(|usage| serde_json::from_value::<SandboxUsage>(usage).ok());
+        if let Some(sandbox) = sandbox {
+            state.sandbox_usage.merge(&sandbox);
         }
         Ok(())
     }
@@ -1111,7 +1120,7 @@ impl LlmAgent {
                 return Ok(Flow::Fail(CANCELLED.into()));
             }
             let used = files_kept(&state.artifacts);
-            let (message, artifacts) = match self
+            let (result, reported) = self
                 .run_tool(
                     ctx,
                     &state.context,
@@ -1120,8 +1129,9 @@ impl LlmAgent {
                     &call,
                     used,
                 )
-                .await?
-            {
+                .await?;
+            state.sandbox_usage.merge(&reported);
+            let (message, artifacts) = match result {
                 ToolResult::Answered {
                     message,
                     artifacts,
@@ -1231,7 +1241,7 @@ impl LlmAgent {
         notes: &[ToolNote],
         call: &ToolCall,
         files_used: u64,
-    ) -> Result<ToolResult, AgentError> {
+    ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
         // What the listing that offered this tool said about it. Only a source's tool has a note: the
         // agent's own tools win a name clash.
@@ -1267,8 +1277,12 @@ impl LlmAgent {
                 call.name.clone(),
             )
         });
+        // What the call reported as sandbox usage rides in its result, which the step journals; a
+        // call that ends in an error has no result to carry it, and leaves it here.
+        let unjournaled = Arc::new(Mutex::new(SandboxUsage::new()));
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
             Some(tool) => {
+                let unjournaled = unjournaled.clone();
                 ctx.step(&format!("tool:{}", call.id), move || async move {
                     if let Some((sources, source_ctx, name)) = &holding
                         && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
@@ -1278,7 +1292,7 @@ impl LlmAgent {
                     {
                         return Ok(ToolOutput::error(held.reason));
                     }
-                    tool.call(&tool_ctx, args).await
+                    with_reported_sandbox(&tool_ctx, &unjournaled, tool.call(&tool_ctx, args).await)
                 })
                 .await?
             }
@@ -1298,16 +1312,18 @@ impl LlmAgent {
                     ),
                 )
                 .await;
-                return Ok(ToolResult::Answered {
+                let answered = ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), unknown),
                     artifacts: Vec::new(),
                     answer: None,
-                });
+                };
+                return Ok((answered, SandboxUsage::new()));
             }
             None => {
                 let sources = self.sources.clone();
                 let name = call.name.clone();
                 let unknown = self.unknown_tool(&call.name);
+                let unjournaled = unjournaled.clone();
                 ctx.step(&format!("tool:{}", call.id), move || async move {
                     if let Some((sources, source_ctx, name)) = &holding
                         && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
@@ -1319,7 +1335,7 @@ impl LlmAgent {
                     }
                     for source in &sources {
                         if let Some(answer) = source.call(&tool_ctx, &name, args.clone()).await {
-                            return answer;
+                            return with_reported_sandbox(&tool_ctx, &unjournaled, answer);
                         }
                     }
                     Ok(ToolOutput::error(unknown))
@@ -1328,7 +1344,16 @@ impl LlmAgent {
             }
         };
 
-        match outcome {
+        let reported = match &outcome {
+            Ok(output) => output.sandbox.clone(),
+            // Tried again: only the try that is kept counts.
+            Err(ToolError::Transient(_)) => SandboxUsage::new(),
+            Err(_) => unjournaled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        };
+        let answered = match outcome {
             Ok(output) => {
                 let (message, artifacts, answer, outcome) =
                     output_message(ctx, &call.id, output, files_used).await;
@@ -1345,11 +1370,11 @@ impl LlmAgent {
                     self.step_end(&call.name, &call.id, outcome, said, notes),
                 )
                 .await;
-                Ok(ToolResult::Answered {
+                ToolResult::Answered {
                     message,
                     artifacts,
                     answer,
-                })
+                }
             }
             Err(ToolError::Permanent(reason)) => {
                 say(
@@ -1364,11 +1389,11 @@ impl LlmAgent {
                     ),
                 )
                 .await;
-                Ok(ToolResult::Answered {
+                ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), reason),
                     artifacts: Vec::new(),
                     answer: None,
-                })
+                }
             }
             Err(ToolError::Transient(reason)) => {
                 say(
@@ -1383,22 +1408,23 @@ impl LlmAgent {
                     ),
                 )
                 .await;
-                Err(AgentError::transient(format!(
+                return Err(AgentError::transient(format!(
                     "tool `{}` failed: {reason}",
                     call.name
-                )))
+                )));
             }
             Err(ToolError::NeedsInput { question, ui }) => {
                 say(ctx, silent, end(StepState::Waiting)).await;
-                Ok(ToolResult::NeedsInput { question, ui })
+                ToolResult::NeedsInput { question, ui }
             }
             // No end event yet: `run_pending` says "waiting", or the final state when the
             // child's message is already here.
-            Err(ToolError::AwaitRun { run }) => Ok(ToolResult::AwaitRun(run)),
+            Err(ToolError::AwaitRun { run }) => ToolResult::AwaitRun(run),
             Err(ToolError::AwaitRemote { task, timeout_ms }) => {
-                Ok(ToolResult::AwaitRemote { task, timeout_ms })
+                ToolResult::AwaitRemote { task, timeout_ms }
             }
-        }
+        };
+        Ok((answered, reported))
     }
 
     /// The note the listing that offered tool `name` made about it, if the tool is a source's (the
@@ -1787,6 +1813,29 @@ impl Conversation {
     fn announce(&mut self, announcement: Announcement) {
         self.announced = Some(announcement.text);
         self.announced_final = announcement.ends_turn;
+    }
+}
+
+/// The result of a call with what the call reported as sandbox usage: in the result of a call that
+/// returned one, which the step journals, and else in `unjournaled`.
+fn with_reported_sandbox(
+    tool_ctx: &ToolCtx,
+    unjournaled: &Mutex<SandboxUsage>,
+    result: Result<ToolOutput, ToolError>,
+) -> Result<ToolOutput, ToolError> {
+    let reported = tool_ctx.reported_sandbox();
+    match result {
+        Ok(mut output) => {
+            output.sandbox.merge(&reported);
+            Ok(output)
+        }
+        Err(error) => {
+            unjournaled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .merge(&reported);
+            Err(error)
+        }
     }
 }
 

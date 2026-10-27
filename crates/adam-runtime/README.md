@@ -28,6 +28,7 @@ over A2A).
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `UsageEvent`, `UsageTotals`, `UsageTotal`, `Usage`, `MAX_USAGE_CALL_BYTES`, `MAX_USAGE_LABEL_BYTES`, `MAX_USAGE_TOTALS` | `RunEvent::Usage`: one model call completed, its tokens (`Usage`, re-exported from `adam-model`), its model, provider and context window, and the step of the task it ran under; and a task's totals, one entry per provider and model; see *Usage*. `Emitter::emit_for(run, event)` sends an event as another run's (a child's call is its root's) |
+| `SandboxUsage`, `SandboxEntry`, `SandboxEnvironment`, `MAX_SANDBOX_ENTRIES` | the time a run's commands ran in a sandbox (a run pod), one `SandboxEntry` per shape (`cpu_millis`, `memory_bytes`, `commands`, `milliseconds`), at most 8, and the environment they ran in; what a tool reports (`ToolCtx::report_sandbox` in `adam-llm-agent`), what the agent keeps in its state next to the totals, and what the A2A server writes as `sandbox`; see *Usage* |
 | `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`) |
 | `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `ReasoningDelta`, `Usage`, `Custom`, `Artifact`. `BroadcastSink::subscribe_run(run)` starts with the run's recent events: see *A late subscriber* |
 | `REPLAY_EVENTS_PER_RUN`, `REPLAY_MAX_AGE`, `REPLAY_MAX_RUNS` | the bounds of `BroadcastSink`'s replay: 64 events per run, none older than 30 s, 64 runs |
@@ -271,6 +272,15 @@ and model (at most `MAX_USAGE_TOTALS` = 32; a 33rd is not counted and is logged)
 child's totals when it answers; `Ctx::child_state(run)` reads them). Live and best effort like every event; the totals
 are the record. A new variant of `RunEvent`: an exhaustive `match` needs an arm, and a process that predates it
 ignores the event. **This crate now depends on `adam-model`** for the data type of the tokens (no client).
+
+`SandboxUsage` is the other cost of a run, the time its commands ran in a sandbox
+([ADR 0043](../../docs/decisions/0043-sandbox-time-as-usage.md)): `SandboxUsage::in_environment(env)` says the run asked for an
+environment, `SandboxUsage::ran_command(cpu_millis, memory_bytes, milliseconds)` that one command ran in a metered one (a run
+pod; a request the pod does not make is `None`, not zero), and `merge` adds one to another (a call's report to the run's, a child's
+to its parent's): one entry per shape, at most `MAX_SANDBOX_ENTRIES` = 8 (a 9th is not counted and is logged), saturating adds, and the
+environment that measures wins. `SandboxEnvironment` is `Local`, `Devcontainer` or `Kubernetes`; only the last is measured
+(`is_measured`), and an unmeasured one never has an entry, which reads as *not measured* and not as zero. Serialized as
+`{"environment": ..., "usage": [...]}`, each member left out while empty, so a state from before reads.
 
 ## Several processes
 

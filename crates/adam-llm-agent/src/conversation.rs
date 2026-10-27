@@ -2,7 +2,7 @@
 
 use adam_core::RunId;
 use adam_model::{Message, ToolCall, Usage};
-use adam_runtime::{Inbound, UsageTotals};
+use adam_runtime::{Inbound, SandboxUsage, UsageTotals};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -234,6 +234,14 @@ pub struct Conversation {
     /// another starts with none (a new task).
     #[serde(default, skip_serializing_if = "UsageTotals::is_empty")]
     pub usage_totals: UsageTotals,
+    /// The time the commands of the task ran in a sandbox (a run pod), one entry per shape of sandbox,
+    /// and the environment they ran in: what the tools reported ([`ToolCtx::report_sandbox`](crate::ToolCtx::report_sandbox))
+    /// in the calls of this run and, once each child run has answered, the children's. What the A2A
+    /// server writes on the task as the `sandbox` member of the `usage/v1` totals when it ends or waits
+    /// (ADR 0043). Absent from state written before it existed, and not written while empty; a run
+    /// that continues another starts with none (a new task).
+    #[serde(default, skip_serializing_if = "SandboxUsage::is_empty")]
+    pub sandbox_usage: SandboxUsage,
     /// Calls of the last assistant message that have no result yet, in order.
     /// Only non-empty while a step is in flight or the run is parked on
     /// [`pending_wait`](Self::pending_wait).

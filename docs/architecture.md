@@ -420,6 +420,14 @@ sequenceDiagram
 Nothing new is stored: the totals are the agent's state, which every store keeps. A call of a try that is retried, of a
 turn a cancel drops, of a remote subagent or of OpenCode is in no total (the ADR says why).
 
+The same object carries the compute a run's commands used. A tool reports how long a command ran in a run pod
+(`ToolCtx::report_sandbox`); the loop journals it with the call's result, adds it to `Conversation::sandbox_usage` in the
+same commit, and a parent adds its child's, as it does the tokens. `totals_metadata` writes it as the `sandbox` member beside
+`totals` when the task ends or waits: one entry per pod shape (the template's CPU and memory requests) with the commands and
+their milliseconds, and for a run in the coder's own container or a dev container only the environment, which reads as *not
+measured* and never as zero ([ADR 0043](decisions/0043-sandbox-time-as-usage.md), `bin/adam-coder/src/tools/sandbox.rs`,
+`crates/adam-a2a-runtime/src/usage.rs`).
+
 ### Swagger UI and the REST binding
 
 Every agent serves A2A 1.0 twice over the same `BackendHandler`: JSON-RPC at `POST /` and HTTP+JSON at the paths of

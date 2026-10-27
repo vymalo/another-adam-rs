@@ -97,12 +97,13 @@ use adam_model::ToolSpec;
 use adam_ui::Ui;
 use adam_workspace::{
     DynCodeHost, DynEnvironment, EnvError, EnvProgress, EnvSession, EnvStep, EnvStepState,
-    GitIdentity, Local, RunWorkspace, Slot, WorkspaceError, Workspaces,
+    ExecSpec, GitIdentity, Local, RunWorkspace, Slot, WorkspaceError, Workspaces,
 };
 use serde_json::Value;
 
 use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
+use sandbox::Meter;
 
 /// What the description of `ask_user` opens with: the coder's own words about when to ask.
 const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.";
@@ -122,6 +123,7 @@ pub mod notes;
 mod preexisting;
 pub mod prepare;
 pub mod publish;
+mod sandbox;
 pub mod scratch;
 pub mod share;
 pub mod shell;
@@ -410,6 +412,10 @@ impl ToolEnv {
                         self.show_slot(ctx, &run, StepState::Completed, "a slot is free")
                             .await;
                     }
+                    // The run asked for its environment: its usage says where its commands run.
+                    if let Some(meter) = Meter::of(&*session) {
+                        meter.report_session(ctx);
+                    }
                     return Ok(session);
                 }
                 Err(Ensure::Cancelled(e)) => return Err(e),
@@ -447,6 +453,25 @@ impl ToolEnv {
                 }
             }
         }
+    }
+
+    /// [`run_in`](shell::run_in) for a tool: the command runs in `session`, stopped when the run is
+    /// cancelled, and in a pod the time it ran is reported as the call's sandbox usage whatever its
+    /// end was (it exited, or a timeout or a cancel stopped it): ADR 0043.
+    pub(crate) async fn run(
+        &self,
+        ctx: &ToolCtx,
+        session: &dyn EnvSession,
+        spec: ExecSpec,
+        timeout: Duration,
+        tail_cap: usize,
+    ) -> Result<shell::ShellOutcome, shell::RunError> {
+        let (outcome, ran) =
+            shell::run_timed(session, spec, timeout, tail_cap, &ctx.cancel_token()).await;
+        if let (Some(meter), Some(ran)) = (Meter::of(session), ran) {
+            meter.report_command(ctx, ran);
+        }
+        outcome
     }
 
     /// One `ensure`, with the steps it reports shown as it goes. A cancel of the run stops the wait.

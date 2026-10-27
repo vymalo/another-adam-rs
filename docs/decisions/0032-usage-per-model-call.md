@@ -16,6 +16,11 @@ known, which the coder never sets); adam-acp drops both, and neither is a count 
 *Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md), not built yet):* the coder no longer
 delegates to OpenCode, so its totals have no unreported calls; the notes on OpenCode below are history.
 
+*Amended 2026-10-27 ([ADR 0043](0043-sandbox-time-as-usage.md)):* the totals object gains a `sandbox` member beside `totals`, the time
+the run's commands ran in a run pod weighted by the pod's shape, kept in the run's state next to `usage_totals` and written on the
+task under the same rules. The URI is the same and the card does not change; `totals` is always present when the object is written.
+Decision 5 and the Consequences below read with that member.
+
 ## Context
 
 *Verified 2026-10-08 by reading the code at `61d2ade`:* `adam_model::Usage` held the prompt and completion tokens only, the

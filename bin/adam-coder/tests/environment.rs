@@ -19,7 +19,9 @@ use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_llm_agent::{Tool, ToolCtx, ToolError};
-use adam_runtime::{CancelToken, CollectingSink, RunEvent, StepKind, StepState};
+use adam_runtime::{
+    CancelToken, CollectingSink, RunEvent, SandboxEnvironment, StepKind, StepState,
+};
 use adam_workspace::{EnvError, EnvStep, EnvStepState, Program};
 use common::{FakeEnvironment, Fixture};
 use serde_json::json;
@@ -1375,4 +1377,229 @@ async fn a_variable_a_mcp_json_names_is_really_absent_from_a_check_and_redacted_
         assert!(!echoed.content.contains(&home), "{}", echoed.content);
         assert!(echoed.content.contains("leaked="), "{}", echoed.content);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The time commands run in a sandbox is reported as usage (ADR 0043)
+// ---------------------------------------------------------------------------------------------
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// A command in a pod is reported with the pod's shape and the time it ran; the same shape is one
+/// entry, and the checks, `run_command` and `run` all count.
+#[tokio::test]
+async fn a_command_in_a_pod_reports_the_time_it_ran_and_the_pods_shape() {
+    let rig = Rig::new().await;
+    rig.fake.session.as_pod(Some(250), Some(GIB / 2));
+    rig.prepare().await;
+    assert!(
+        rig.ctx.reported_sandbox().is_empty(),
+        "preparing a workspace asks nothing of the environment"
+    );
+
+    let looked = RunCommand
+        .call(&rig.ctx, json!({"command": "sleep 0.3; echo looking"}))
+        .await
+        .unwrap();
+    assert!(!looked.is_error, "{}", looked.content);
+    let usage = rig.ctx.reported_sandbox();
+    assert_eq!(usage.environment(), Some(SandboxEnvironment::Kubernetes));
+    let [entry] = usage.entries() else {
+        panic!("one shape: {usage:?}");
+    };
+    assert_eq!(
+        (entry.cpu_millis, entry.memory_bytes),
+        (Some(250), Some(GIB / 2))
+    );
+    assert_eq!(entry.commands, 1);
+    assert!(
+        (300..30_000).contains(&entry.milliseconds),
+        "the wall time of the command: {entry:?}"
+    );
+
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "sleep 0.2; echo checking"}))
+        .await
+        .unwrap();
+    assert!(!checked.is_error, "{}", checked.content);
+    let usage = rig.ctx.reported_sandbox();
+    let [entry] = usage.entries() else {
+        panic!("still one shape: {usage:?}");
+    };
+    assert_eq!(entry.commands, 2);
+    assert!(entry.milliseconds >= 500, "{entry:?}");
+}
+
+/// A pod whose template makes no request has none in the entry: absent, not zero.
+#[tokio::test]
+async fn a_request_the_pod_does_not_make_is_absent_from_the_entry() {
+    let rig = Rig::new().await;
+    rig.fake.session.as_pod(Some(1000), None);
+    rig.prepare().await;
+    RunCommand
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap();
+    let usage = rig.ctx.reported_sandbox();
+    assert_eq!(usage.entries()[0].cpu_millis, Some(1000));
+    assert_eq!(usage.entries()[0].memory_bytes, None);
+}
+
+/// A command a timeout stopped still counts, until it was stopped.
+#[tokio::test]
+async fn a_command_a_timeout_stopped_still_counts() {
+    let fx = Fixture::with("hello\n", |s| {
+        s.check_timeout = Duration::from_millis(500);
+    })
+    .await;
+    let rig = Rig::from(fx).await;
+    rig.fake.session.as_pod(Some(250), Some(GIB / 2));
+    rig.prepare().await;
+
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": "sleep 30"}))
+        .await
+        .unwrap();
+    assert!(
+        out.is_error && out.content.contains("TIMED OUT"),
+        "{}",
+        out.content
+    );
+    let usage = rig.ctx.reported_sandbox();
+    let [entry] = usage.entries() else {
+        panic!("{usage:?}");
+    };
+    assert_eq!(entry.commands, 1);
+    assert!(
+        (500..25_000).contains(&entry.milliseconds),
+        "from the start to the kill, not the 30 s it would have run: {entry:?}"
+    );
+}
+
+/// A command a cancel stopped counts too, though its call ends in an error.
+#[tokio::test]
+async fn a_command_a_cancel_stopped_still_counts() {
+    let (rig, token) = Rig::new().await.cancellable();
+    rig.fake.session.as_pod(Some(250), Some(GIB / 2));
+    rig.prepare().await;
+
+    let cancel_when_running = async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        token.cancel();
+    };
+    let (out, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            RunCommand.call(&rig.ctx, json!({"command": "sleep 30"})),
+            cancel_when_running
+        )
+    })
+    .await
+    .expect("the tool returns after a cancel");
+    assert!(
+        matches!(&out, Err(ToolError::Permanent(m)) if m.contains("cancelled")),
+        "{out:?}"
+    );
+    let usage = rig.ctx.reported_sandbox();
+    let [entry] = usage.entries() else {
+        panic!("{usage:?}");
+    };
+    assert_eq!(entry.commands, 1);
+    assert!(
+        (300..25_000).contains(&entry.milliseconds),
+        "until the cancel stopped it: {entry:?}"
+    );
+}
+
+/// OpenCode is a process of the pod for as long as its call lasts: a cancel that stops it counts the
+/// time it ran.
+#[tokio::test]
+async fn opencode_in_a_pod_counts_from_its_spawn_to_its_end_a_cancel_included() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let pid_file = agent_dir.path().join("agent.pid");
+    let child_file = agent_dir.path().join("child.pid");
+    let fx = Fixture::with("hello\n", |s| {
+        s.opencode = OpenCodeLaunch::program(common::fake_agent())
+            .env("FAKE_ACP_SCENARIO", "stubborn")
+            .env("FAKE_ACP_PID_FILE", pid_file.to_string_lossy())
+            .env("FAKE_ACP_CHILD_PID_FILE", child_file.to_string_lossy());
+    })
+    .await;
+    let (rig, token) = Rig::from(fx).await.cancellable();
+    rig.fake.session.as_pod(Some(250), Some(GIB / 2));
+    rig.prepare().await;
+
+    let cancel_when_running = async {
+        let grandchild = common::wait_for_pid(&child_file).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        token.cancel();
+        grandchild
+    };
+    let (out, grandchild) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            DelegateToOpenCode.call(&rig.ctx, json!({"instructions": "never finish"})),
+            cancel_when_running
+        )
+    })
+    .await
+    .expect("the tool returns after a cancel");
+    assert!(out.is_err(), "{out:?}");
+    assert!(common::wait_gone(grandchild, false, Duration::from_secs(5)).await);
+
+    let usage = rig.ctx.reported_sandbox();
+    let [entry] = usage.entries() else {
+        panic!("one shape: {usage:?}");
+    };
+    // The launcher here is not OpenCode, so there is no version probe: OpenCode is the one command.
+    assert_eq!(entry.commands, 1, "{entry:?}");
+    assert!(entry.milliseconds >= 300, "{entry:?}");
+}
+
+/// The coder's own container and a dev container are not metered: the usage says where the commands
+/// ran and nothing else, which reads as not measured and never as zero.
+#[tokio::test]
+async fn an_environment_that_is_not_metered_reports_where_and_no_time() {
+    for (kind, want) in [
+        (EnvKind::Local, SandboxEnvironment::Local),
+        (
+            EnvKind::DevContainer {
+                source: None,
+                image: "fake".to_owned(),
+            },
+            SandboxEnvironment::Devcontainer,
+        ),
+    ] {
+        let rig = Rig::new().await;
+        *rig.fake.session.kind.lock().unwrap() = Some(kind);
+        rig.prepare().await;
+        RunCommand
+            .call(&rig.ctx, json!({"command": "sleep 0.2"}))
+            .await
+            .unwrap();
+        let usage = rig.ctx.reported_sandbox();
+        assert_eq!(usage.environment(), Some(want));
+        assert!(usage.entries().is_empty(), "not measured: {usage:?}");
+    }
+}
+
+/// A pod that was asked for and ran nothing is a measured zero; an environment that could not be had
+/// reports nothing at all.
+#[tokio::test]
+async fn a_pod_asked_for_and_not_used_is_a_measured_zero_and_none_made_is_nothing() {
+    let rig = Rig::new().await;
+    rig.fake.session.as_pod(Some(250), Some(GIB / 2));
+    rig.prepare().await;
+    // `rebuild_environment` asks for the run's session and runs no command.
+    RebuildEnvironment.call(&rig.ctx, json!({})).await.unwrap();
+    let usage = rig.ctx.reported_sandbox();
+    assert_eq!(usage.environment(), Some(SandboxEnvironment::Kubernetes));
+    assert!(usage.entries().is_empty(), "{usage:?}");
+
+    let rig = Rig::new().await;
+    *rig.fake.ensure_fails.lock().unwrap() = Some(broken_file);
+    rig.prepare().await;
+    RunCommand
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap_err();
+    assert!(rig.ctx.reported_sandbox().is_empty());
 }

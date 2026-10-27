@@ -19,12 +19,16 @@ coder `prepare`s a command and spawns it. The files, the paths and all git work 
 **a path means the same in the pod as in the coder**, because the pod mounts the parts of the coder's workspace volume it needs at the same paths.
 **A run pod sees only its own run** ([below](#what-a-run-pod-mounts)). **No GitHub credential, database URL or bearer token is ever in a run pod.**
 
+**The session says what its pod reserves**: `EnvSession::sandbox_shape()` is the template's requests, which the coder weights each
+command's time by when it reports the run's sandbox usage ([ADR 0043](../../docs/decisions/0043-sandbox-time-as-usage.md)). This crate
+only says the shape; the coder spawns the commands and times them.
+
 ## API at a glance
 
 | Item | What |
 |---|---|
 | `KubeEnvironment` | the `Environment`: `connect(Settings, PodTemplate)` (the cluster this process runs in, or `KUBECONFIG`'s), `new(Client, Settings, PodTemplate)`, `reap_idle()` (one sweep of idle pods), `reap_loop()` and `spawn_reaper()` (the sweep, for as long as the runtime lives), `pod_name(run)`. `rebuild(run, _)` deletes the pod and answers `true`; the next `ensure` makes another. `seal(workspace)` ([below](#seal)) deletes a pod that lacks a mount the workspace needs now, when nothing runs in it, and never makes one |
-| `PodTemplate` | the deployment's pod: `from_file(path, container, workspace_root)` or `parse(text, source, container, workspace_root)` (a Pod, or a bare PodSpec, in YAML or JSON), checked at startup, which includes finding the one mount of the workspace volume at `workspace_root` (the coder's `WORKSPACE_ROOT`, or the worker's folder under it); `mounts_for(&RunWorkspace)` (the mounts the run's workspace needs now); `render(run, name, Placement, &WorkspaceMounts)` fills in the name, namespace, labels and annotations, and replaces that one mount by the mounts, and nothing else; `image()`, `workspace_path()` |
+| `PodTemplate` | the deployment's pod: `from_file(path, container, workspace_root)` or `parse(text, source, container, workspace_root)` (a Pod, or a bare PodSpec, in YAML or JSON), checked at startup, which includes finding the one mount of the workspace volume at `workspace_root` (the coder's `WORKSPACE_ROOT`, or the worker's folder under it); `mounts_for(&RunWorkspace)` (the mounts the run's workspace needs now); `render(run, name, Placement, &WorkspaceMounts)` fills in the name, namespace, labels and annotations, and replaces that one mount by the mounts, and nothing else; `image()`, `workspace_path()` `sandbox_shape()` is the run container's **requests** as an `adam_workspace::SandboxShape` (`cpu_millis`, `memory_bytes`; a resource with a limit and no request takes its limit, as Kubernetes does at admission; one with neither is `None`), parsed at startup by a small exact quantity reader (`250m`, `1.5`, `512Mi`, `2Gi`, `1G`, `129e6`; a fraction rounds up as Kubernetes does) |
 | `WorkspaceMounts`, `Mount`, `SlotMount`, `WorktreeDirs` | what a run pod mounts of the workspace volume ([below](#what-a-run-pod-mounts)): `plan(base, run_dir, &[SlotMount { path, generation }], &[WorktreeDirs { mirror, admin, generation }])` (pure; a slot is a direct child of `run_dir`), `iter()` (a `Mount` has `path()`, `sub_path()`, `read_only()`, `generation()`), `encode()` (the annotation's value), `missing_from(recorded)`. `plan` took the slots as a new third argument when each slot became a mount of its own |
 | `Settings` | the namespace, the release's instance label, the worker, the container the commands run in (`run`), the exec client program, where `adam-exec` and the tools are in the pod, the time to be ready, the idle timeout, the sweep interval and the environment `adam-kube-exec` is started with; `Settings::new(namespace, instance, worker)` has the defaults |
 | `Invocation` | the command line of `adam-kube-exec`: `to_args()`, `parse(args)`, `remote_argv()` (the command run in the pod); `Mode::{Run, Shell}`, `UsageError` |
@@ -77,7 +81,7 @@ checked at startup, so that a template that cannot work stops the coder and not 
 (`RUN_POD_CONTAINER`, `run`); it must mount a volume in that container **once, whole and writable, at the workspace root or the
 closest directory above it** (the mount the code replaces), and no other container may mount that volume; and it may not ask for
 what the chart's admission policy refuses (`hostNetwork`, `hostPID`, `hostIPC`, a `hostPath` volume, a privileged container,
-privilege escalation, a pinned `nodeName`, or an `automountServiceAccountToken` that is not `false`). The chart renders it
+privilege escalation, a pinned `nodeName`, or an `automountServiceAccountToken` that is not `false`), and a request of the run container that is not a Kubernetes quantity (the cluster would refuse every pod, and the time of the commands is weighted by it). The chart renders it
 (`runPods` in [`deploy/coder`](../../deploy/coder/README.md)); `src/template.rs` has the shape in its tests.
 
 The commands run in the container named `run`, which must mount `/opt/adam/bin` read-only from an `emptyDir` that an init
@@ -202,14 +206,16 @@ one line); none carries a secret, and the API server never echoes one in a refus
   cannot be pulled). Commands in a pod are another seam (`PodExec`) with a fake. They cover `ensure` (the pod, its labels, its
   steps, idempotency, concurrent calls, a create that races), the refusals above, `release`, `held_runs` (this release's pods
   only), the idle sweep (idle, busy, cannot be asked, another worker's, off), `prepare` and the quoting of the words, `kill`,
-  and `tool_path` and `secret_ref`; the mounts (a run with no worktree, one, several and a scratch project, the legacy worktree,
+  and `tool_path` and `secret_ref`; `sandbox_shape` (the template's requests, and the pod that was made reserves them); the mounts (a run with no worktree, one, several and a scratch project, the legacy worktree,
   a run that rewrites its `.git` to another run's directory, a slot whose directory in the mirror is ambiguous or absent, a directory whose `HEAD`, `commondir`, `gitdir` or `logs` is a link (no git mounts) and a missing `logs` (made), a workspace outside the volume, with real `git` worktrees), the pod made again for a worktree
   added later (no command running), waited for (a command running, or a pod that cannot be asked), left alone (nothing new, a
   spare mount) and replaced (no annotation or no slot lines; a slot, a worktree or a scratch project, made again under the same
   name; a scratch project from before generations is kept); `seal` (a stale idle pod deleted and none made, a pod with a command
   or that cannot be asked left with `Unavailable`, no pod, a pod with every mount, a pod that is not ready, a pod of another run,
   the cluster down); and the template's startup refusals (no mount at the workspace root, a `subPath`,
-  read-only, no such volume, the volume mounted twice or by another container).
+  read-only, no such volume, the volume mounted twice or by another container, a request that is not a quantity); the shape (the run
+  container's requests, its limit where it has no request, never an init container's, a resource with neither absent), and the quantity reader in `src/quantity.rs`
+  (CPU and memory forms, rounding up, what is not a quantity, what is too large to hold).
 * **Tests that need a cluster** (`tests/cluster.rs`): one test, gated on **`ADAM_TEST_KUBECONFIG`**, that makes a pod from the
   chart's own template, runs commands in it through `adam-kube-exec` (both streams, the exit code, the working directory,
   variables, every word its own argument, stdin and `/dev/null`, 3 MB of output, what a spec hides, that the coder's secrets are

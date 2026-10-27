@@ -87,7 +87,7 @@ pub use credentials::{DynGitCredentials, GitCredentials, HostScoped, ScopedToken
 pub use environment::{
     DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress, EnvSession, EnvStep,
     EnvStepState, Environment, ExecId, ExecSpec, HidingEnvironment, Local, LocalSession,
-    NoProgress, PreparedCommand, Program, SecretRef, login_shell,
+    NoProgress, PreparedCommand, Program, SandboxShape, SecretRef, login_shell,
 };
 pub use error::{WorkspaceError, WorkspaceResult};
 pub use git::{GitPin, GitSandbox, LocalGit, LocalOutput};

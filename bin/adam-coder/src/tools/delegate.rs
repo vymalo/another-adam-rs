@@ -16,7 +16,7 @@ use crate::opencode::acp_command;
 use crate::redact::Redactor;
 
 use super::notes::OpenCodeCheck;
-use super::shell::run_in;
+use super::sandbox::Meter;
 use super::{Outcome, ToolEnv, cancelled, environment_error, non_empty, notes_error, run_error};
 
 /// Most of the agent's reply kept for the summary.
@@ -85,15 +85,16 @@ async fn opencode_refusal(
     let check = match notes.environment.opencode.clone() {
         Some(check) => check,
         None => {
-            let outcome = run_in(
-                session,
-                env.settings.opencode.version_spec(dir, session),
-                VERSION_TIMEOUT,
-                1024,
-                &ctx.cancel_token(),
-            )
-            .await
-            .map_err(|e| run_error(&env.redactor, &e))?;
+            let outcome = env
+                .run(
+                    ctx,
+                    session,
+                    env.settings.opencode.version_spec(dir, session),
+                    VERSION_TIMEOUT,
+                    1024,
+                )
+                .await
+                .map_err(|e| run_error(&env.redactor, &e))?;
             let check = OpenCodeCheck {
                 works: outcome.passed(),
                 detail: if outcome.passed() {
@@ -239,6 +240,8 @@ pub async fn delegate_to_opencode(
         client = AcpClient::spawn(command, ClientPolicy::new(&dir)) => client,
     }
     .map_err(|e| acp_error(&e))?;
+    // OpenCode is a process of the pod for as long as this call lasts: its time is a command's.
+    let _clock = Meter::of(&*environment).map(|meter| meter.clock(ctx));
     let session = tokio::select! {
         biased;
         () = ctx.cancelled() => {

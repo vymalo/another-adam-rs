@@ -20,8 +20,8 @@ use adam_workspace::{
     CodeHost, CreatedRepository, DynCodeHost, DynEnvironment, DynGitCredentials, EnvDescription,
     EnvError, EnvKind, EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec,
     GitCredentials, GitHub, LocalSession, MergePullRequest, MergedPullRequest, NewPullRequest,
-    NewRepository, OwnerKind, PreparedCommand, PullRequest, RepoRef, RunWorkspace, ScopedToken,
-    SecretRef, WorkspaceError, Workspaces,
+    NewRepository, OwnerKind, PreparedCommand, PullRequest, RepoRef, RunWorkspace, SandboxShape,
+    ScopedToken, SecretRef, WorkspaceError, Workspaces,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -1576,6 +1576,20 @@ pub struct FakeSession {
     pub kind: Mutex<Option<EnvKind>>,
     /// Where the session says the coder's OpenCode is (`EnvSession::tool_path`).
     pub opencode_at: Mutex<Option<PathBuf>>,
+    /// What the session says its processes reserve (`EnvSession::sandbox_shape`); `None`: it is not
+    /// metered.
+    pub shape: Mutex<Option<SandboxShape>>,
+}
+
+impl FakeSession {
+    /// Make the session a pod of the given requests: metered, as a run pod is.
+    pub fn as_pod(&self, cpu_millis: Option<u64>, memory_bytes: Option<u64>) {
+        *self.kind.lock().unwrap() = Some(EnvKind::Kubernetes {
+            pod: "adam-run-fake".to_owned(),
+            image: None,
+        });
+        *self.shape.lock().unwrap() = Some(SandboxShape::new(cpu_millis, memory_bytes));
+    }
 }
 
 impl FakeEnvironment {
@@ -1708,6 +1722,10 @@ impl EnvSession for FakeSession {
         } else {
             None
         }
+    }
+
+    fn sandbox_shape(&self) -> Option<SandboxShape> {
+        *self.shape.lock().unwrap()
     }
 
     fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {

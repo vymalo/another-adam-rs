@@ -28,7 +28,7 @@ use super::gitcli::{
     GitAt, RepoState, git_stdout, head_ref, head_sha, point_head, repo_state, restore_repo_state,
     restore_worktree, status_text, working_tree_id,
 };
-use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_in, shell_spec};
+use super::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
 use super::{Outcome, ToolEnv, non_empty, run_error};
 
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
@@ -80,15 +80,16 @@ pub async fn run_command(
     let redactor = &env.redactor;
     let shown = redactor.scrub(command).into_owned();
     ctx.emit_progress(format!("running: {shown}")).await;
-    let mut outcome = run_in(
-        &*environment,
-        shell_spec(&dir, command),
-        env.settings.check_timeout,
-        env.settings.check_output_tail,
-        &ctx.cancel_token(),
-    )
-    .await
-    .map_err(|e| run_error(redactor, &e))?;
+    let mut outcome = env
+        .run(
+            ctx,
+            &*environment,
+            shell_spec(&dir, command),
+            env.settings.check_timeout,
+            env.settings.check_output_tail,
+        )
+        .await
+        .map_err(|e| run_error(redactor, &e))?;
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
 
     // Did it change anything it should not have?

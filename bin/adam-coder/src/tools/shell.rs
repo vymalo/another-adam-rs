@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adam_runtime::CancelToken;
 use adam_workspace::{EnvError, EnvSession, ExecSpec, safe_fs};
@@ -317,7 +317,6 @@ pub enum RunError {
 ///
 /// [`RunError::Prepare`] when the environment refuses the spec, [`RunError::Spawn`] when the process
 /// cannot be started, [`RunError::Cancelled`] when `cancel` fired.
-#[tracing::instrument(skip(session, spec), fields(dir = %spec.cwd.display()))]
 pub async fn run_in(
     session: &dyn EnvSession,
     spec: ExecSpec,
@@ -325,10 +324,28 @@ pub async fn run_in(
     tail_cap: usize,
     cancel: &CancelToken,
 ) -> Result<ShellOutcome, RunError> {
+    run_timed(session, spec, timeout, tail_cap, cancel).await.0
+}
+
+/// [`run_in`], and how long the process ran: from the moment it was spawned to its exit, or, for a
+/// command stopped by a timeout or a cancel, until it was stopped. `None` when no process ran (the
+/// environment refused the spec, the process could not be started, the run was cancelled first).
+/// A pod's commands are metered by it (ADR 0043).
+#[tracing::instrument(skip(session, spec), fields(dir = %spec.cwd.display()))]
+pub async fn run_timed(
+    session: &dyn EnvSession,
+    spec: ExecSpec,
+    timeout: Duration,
+    tail_cap: usize,
+    cancel: &CancelToken,
+) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
     if cancel.is_cancelled() {
-        return Err(RunError::Cancelled);
+        return (Err(RunError::Cancelled), None);
     }
-    let prepared = session.prepare(&spec).map_err(RunError::Prepare)?;
+    let prepared = match session.prepare(&spec) {
+        Ok(prepared) => prepared,
+        Err(e) => return (Err(RunError::Prepare(e)), None),
+    };
     let mut cmd = prepared.command();
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -336,7 +353,11 @@ pub async fn run_in(
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd.spawn().map_err(RunError::Spawn)?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return (Err(RunError::Spawn(e)), None),
+    };
+    let started = Instant::now();
     let pid = child.id();
 
     let tail = Arc::new(Mutex::new(Tail {
@@ -358,7 +379,8 @@ pub async fn run_in(
         waited = tokio::time::timeout(timeout, child.wait()) => Some(waited),
     };
     let (exit_code, timed_out) = match waited {
-        Some(Ok(status)) => (status.map_err(RunError::Spawn)?.code(), false),
+        Some(Ok(Ok(status))) => (status.code(), false),
+        Some(Ok(Err(e))) => return (Err(RunError::Spawn(e)), Some(started.elapsed())),
         Some(Err(_)) => {
             kill_group(pid).await;
             let _ = child.kill().await;
@@ -372,9 +394,11 @@ pub async fn run_in(
             for reader in &readers {
                 reader.abort();
             }
-            return Err(RunError::Cancelled);
+            return (Err(RunError::Cancelled), Some(started.elapsed()));
         }
     };
+    // The process is gone: what is left is waiting for the pipes a grandchild may hold open.
+    let ran = started.elapsed();
 
     let drained = tokio::time::timeout(PIPE_GRACE, async {
         for reader in &mut readers {
@@ -389,12 +413,15 @@ pub async fn run_in(
     }
 
     let (tail, truncated) = tail.lock().unwrap_or_else(PoisonError::into_inner).finish();
-    Ok(ShellOutcome {
-        exit_code,
-        timed_out,
-        tail,
-        truncated,
-    })
+    (
+        Ok(ShellOutcome {
+            exit_code,
+            timed_out,
+            tail,
+            truncated,
+        }),
+        Some(ran),
+    )
 }
 
 /// SIGKILL the process group led by `pid` (it was started with

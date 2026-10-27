@@ -1954,6 +1954,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_session_says_the_shape_of_its_pod_which_is_the_templates_requests() {
+        let fx = fixture(settings());
+        let session = fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
+        assert_eq!(
+            session.sandbox_shape(),
+            Some(adam_workspace::SandboxShape::new(
+                Some(250),
+                Some(512 * 1024 * 1024)
+            )),
+            "250m and 512Mi, the requests of the template's run container"
+        );
+        // The pod that was made is the one that reserves it.
+        let pod = fx.api.lock().unwrap().pods.values().next().unwrap().clone();
+        let requests = pod.spec.unwrap().containers[0]
+            .resources
+            .clone()
+            .unwrap()
+            .requests
+            .unwrap();
+        assert_eq!(requests["cpu"].0, "250m");
+        assert_eq!(requests["memory"].0, "512Mi");
+    }
+
+    #[tokio::test]
     async fn opencode_and_the_model_key_are_where_the_template_puts_them() {
         let fx = fixture(settings());
         let session = fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();

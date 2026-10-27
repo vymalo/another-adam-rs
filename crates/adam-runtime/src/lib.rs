@@ -122,6 +122,6 @@ pub use step::{
 };
 pub use text::{AGENT_TEXT_KIND, MAX_STREAM_ID_BYTES, MAX_TEXT_DELTA_BYTES, floor_boundary};
 pub use usage::{
-    MAX_USAGE_CALL_BYTES, MAX_USAGE_LABEL_BYTES, MAX_USAGE_TOTALS, UsageEvent, UsageTotal,
-    UsageTotals,
+    MAX_SANDBOX_ENTRIES, MAX_USAGE_CALL_BYTES, MAX_USAGE_LABEL_BYTES, MAX_USAGE_TOTALS,
+    SandboxEntry, SandboxEnvironment, SandboxUsage, UsageEvent, UsageTotal, UsageTotals,
 };
