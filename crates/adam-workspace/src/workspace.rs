@@ -1073,16 +1073,24 @@ fn parse_symref_head(output: &str) -> Option<String> {
 
 /// The `(key, value)` entries of the configuration file at `path`, as git lists them
 /// (`git config --file <path> --no-includes --list -z`, in this container: it reads one file and runs
-/// no program).
+/// no program). git runs in the file's own directory, a private one: it looks at its working
+/// directory even with `--file`, and the process's may be one it cannot read.
 async fn list_config(path: &Path) -> WorkspaceResult<Vec<(String, String)>> {
-    let listed = GitCmd::new()
-        .in_coder()
+    let listed = in_own_dir(GitCmd::new().in_coder(), path)
         .args(["config", "--file"])
         .arg(path)
         .args(["--no-includes", "--list", "-z"])
         .run()
         .await?;
     Ok(mirror_config::parse_list(&listed.stdout))
+}
+
+/// `cmd` run in the directory of the file at `path`, and not discovering a repository above it.
+fn in_own_dir(cmd: GitCmd, path: &Path) -> GitCmd {
+    match path.parent() {
+        Some(dir) => cmd.cwd(dir).ceiling(dir),
+        None => cmd,
+    }
 }
 
 impl Inner {
@@ -1490,8 +1498,7 @@ impl Inner {
         // back, to be sure it says what was decided.
         let built = dir.path().join("config");
         for (key, value) in &repair.entries {
-            GitCmd::new()
-                .in_coder()
+            in_own_dir(GitCmd::new().in_coder(), &built)
                 .args(["config", "--file"])
                 .arg(&built)
                 .args(["--add", "--"])
