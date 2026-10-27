@@ -991,7 +991,7 @@ rdoc() {
 rhas() { rdoc "$1" "$2" | grep -Eq -- "$3"; }
 rlacks() { ! rdoc "$1" "$2" | grep -Eq -- "$3"; }
 helm_rp() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set runPods.enabled=true "$@"; }
-run_pod_template() { doc ConfigMap | awk '/^  pod.yaml: \|$/ { on = 1; next } on { sub(/^    /, ""); print }'; }
+run_pod_template() { rdoc ConfigMap coder-run-pod | awk '/^  pod.yaml: \|$/ { on = 1; next } on { sub(/^    /, ""); print }'; }
 tpl() { run_pod_template | grep -Eq -- "$1"; }
 notpl() { ! run_pod_template | grep -Eq -- "$1"; }
 sts_of() { doc StatefulSet | grep -Eq -- "$1"; }
@@ -1004,6 +1004,11 @@ check "run pods off: no run pod template, ServiceAccount, Role, PriorityClass, q
 check "run pods off: none of RUN_ENVIRONMENT, RUN_POD_*, a service account or a mounted token" \
   lacks 'RUN_ENVIRONMENT|RUN_POD_|serviceAccountName|automountServiceAccountToken: true'
 check "run pods off: the coder keeps its 6Gi limit" has 'memory: 6Gi'
+check "run pods off: nothing of the egress proxy: no object, no allow-list, no proxy variable" \
+  lacks 'coder-egress|adam-egress|EGRESS_|HTTPS_PROXY|https_proxy|HTTP_PROXY|http_proxy|NO_PROXY|no_proxy|egress-proxy'
+check "run pods off: ... no Deployment, PodDisruptionBudget or second NetworkPolicy" \
+  lacks '^kind: (Deployment|PodDisruptionBudget)$'
+check "run pods off: ... and the one NetworkPolicy is the coder's, ingress only" count '^kind: NetworkPolicy$' 1
 helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set runPods.enabled=false > "$out"
 check "run pods off, set explicitly: the render equals the golden" cmp -s "$out" "$golden"
 
@@ -1015,10 +1020,15 @@ check "run pods on: the render equals tests/golden/run-pods.yaml" cmp -s "$out" 
 check "run pods: one PriorityClass" count '^kind: PriorityClass$' 1
 check "run pods: one ResourceQuota" count '^kind: ResourceQuota$' 1
 check "run pods: one Role and one RoleBinding" count '^kind: (Role|RoleBinding)$' 2
-check "run pods: one ServiceAccount" count '^kind: ServiceAccount$' 1
-check "run pods: one ConfigMap (the pod template)" count '^kind: ConfigMap$' 1
+check "run pods: two ServiceAccounts, the coder's and the egress proxy's" count '^kind: ServiceAccount$' 2
+check "run pods: two ConfigMaps, the pod template and the egress proxy's allow-list" count '^kind: ConfigMap$' 2
 check "run pods: one ValidatingAdmissionPolicy and its binding" count '^kind: ValidatingAdmissionPolicy(Binding)?$' 2
-check "run pods: two NetworkPolicies, the coder's and the run pods'" count '^kind: NetworkPolicy$' 2
+check "run pods: three NetworkPolicies, the coder's, the run pods' and the egress proxy's" count '^kind: NetworkPolicy$' 3
+check "run pods: one Deployment, the egress proxy (the combined topology has none else)" count '^kind: Deployment$' 1
+check "run pods: one PodDisruptionBudget, the egress proxy's (two replicas)" count '^kind: PodDisruptionBudget$' 1
+check "run pods: two Services, the coder's and the egress proxy's, both ClusterIP" \
+  count '^kind: Service$' 2
+check "run pods: ... ClusterIP both" count '^  type: ClusterIP$' 2
 check "run pods: no Secret object (the model key stays in the ExternalSecret's Secret)" lacks '^kind: Secret$'
 
 # The pod template: what a run pod is.
@@ -1034,6 +1044,13 @@ check "template: memory: 2Gi" tpl '^          memory: 2Gi$'
 check "template: requests 250m and 512Mi" tpl '^          cpu: 250m$'
 check "template: requests memory 512Mi" tpl '^          memory: 512Mi$'
 check "template: CARGO_BUILD_JOBS=2" tpl 'name: CARGO_BUILD_JOBS'
+tplenv() { run_pod_template | grep -A1 -- "- name: $1\$" | grep -Fq -- "value: \"$2\""; } # tplenv <name> <value>
+for v in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy; do
+  check "template: $v is the egress proxy's Service (ADR 0042)" tplenv "$v" 'http://coder-egress.coder-ns.svc:3128'
+done
+for v in NO_PROXY no_proxy; do
+  check "template: $v is the loopback names only" tplenv "$v" 'localhost,127.0.0.1'
+done
 check "template: ... with the value 2" tpl 'value: "2"'
 check "template: the priority class is the chart's own, <release>-run" tpl '^  priorityClassName: coder-run$'
 check "template: no service account token" tpl '^  automountServiceAccountToken: false$'
@@ -1121,25 +1138,130 @@ check "policy: nine rules" [ "$(rdoc ValidatingAdmissionPolicy "$pn" | grep -c -
 check "policy: the binding denies" rhas ValidatingAdmissionPolicyBinding "$pn" 'validationActions: \["Deny"\]'
 check "policy: ... for this namespace only" rhas ValidatingAdmissionPolicyBinding "$pn" 'kubernetes.io/metadata.name: coder-ns'
 
-# The network policy of the run pods.
+# The network policy of the run pods: deny by default (ADR 0042). DNS, the egress proxy's pods on its port, extraEgress, nothing else.
 rn=coder-run-pods
+en=coder-egress
+rcount() { [ "$(rdoc "$1" "$2" | grep -Ec -- "$3")" -eq "$4" ]; } # rcount <Kind> <name> <pattern> <count>
 check "netpol: selects the coder's run pods by label" rhas NetworkPolicy "$rn" 'app.kubernetes.io/managed-by: adam-coder'
 check "netpol: ... of this release" rhas NetworkPolicy "$rn" 'app.kubernetes.io/instance: coder'
+check "netpol: ... that carry the run label" rhas NetworkPolicy "$rn" 'key: adam.vymalo.com/run'
 check "netpol: restricts ingress and egress" rhas NetworkPolicy "$rn" '^    - Egress$'
 check "netpol: no ingress at all" rhas NetworkPolicy "$rn" '^  ingress: \[\]$'
-check "netpol: DNS on 53, UDP and TCP" rhas NetworkPolicy "$rn" 'port: 53'
-check "netpol: the internet, 0.0.0.0/0 ..." rhas NetworkPolicy "$rn" 'cidr: 0.0.0.0/0'
-check "netpol: ... except RFC 1918" rhas NetworkPolicy "$rn" '^              - 10.0.0.0/8$'
-check "netpol: ... and link-local (cloud metadata)" rhas NetworkPolicy "$rn" '^              - 169.254.0.0/16$'
+check "netpol: DNS on 53, UDP and TCP" rcount NetworkPolicy "$rn" '^          port: 53$' 2
+check "netpol: DNS only to the DNS pods of kube-system" rhas NetworkPolicy "$rn" 'k8s-app: kube-dns'
+check "netpol: the egress proxy's pods, by their labels ..." rhas NetworkPolicy "$rn" 'app.kubernetes.io/component: egress-proxy'
+check "netpol: ... on TCP 3128" rhas NetworkPolicy "$rn" '^          port: 3128$'
+check "netpol: ... in the policy's own namespace (the only namespaceSelector is DNS's)" \
+  rcount NetworkPolicy "$rn" 'namespaceSelector' 1
+check "netpol: two egress rules and no more: DNS and the proxy" rcount NetworkPolicy "$rn" '^    - to:$' 2
+check "netpol: no rule for the internet: no ipBlock, no 0.0.0.0/0 (deny by default)" rlacks NetworkPolicy "$rn" 'ipBlock|0\.0\.0\.0/0'
+check "netpol: no rule names an IPv6 range (IPv6 is denied)" rlacks NetworkPolicy "$rn" 'cidr: .*:|::'
 check "the coder's own NetworkPolicy still restricts ingress only" rlacks NetworkPolicy coder '^    - Egress$'
+
+# The egress proxy's own policy (ADR 0042).
+egress_ports() { rdoc NetworkPolicy "$en" | awk '/cidr: 0\.0\.0\.0\/0/ { on = 1 } on && /^ +port: / { printf "%s ", $2 }'; }
+check "proxy netpol: selects the proxy's pods, and only them" rhas NetworkPolicy "$en" '^      app.kubernetes.io/component: egress-proxy$'
+check "proxy netpol: restricts ingress and egress" rhas NetworkPolicy "$en" '^    - Egress$'
+check "proxy netpol: ingress from the run pods ..." rhas NetworkPolicy "$en" 'app.kubernetes.io/managed-by: adam-coder'
+check "proxy netpol: ... that carry the run label" rhas NetworkPolicy "$en" 'key: adam.vymalo.com/run'
+check "proxy netpol: ... one ingress rule, on TCP 3128" rcount NetworkPolicy "$en" '^    - from:$' 1
+check "proxy netpol: ... the port is 3128" rhas NetworkPolicy "$en" '^          port: 3128$'
+check "proxy netpol: ... from pods only: no ipBlock before the egress, no namespaceSelector but DNS's" \
+  rcount NetworkPolicy "$en" 'namespaceSelector' 1
+check "proxy netpol: egress to DNS on 53, UDP and TCP" rcount NetworkPolicy "$en" '^          port: 53$' 2
+check "proxy netpol: ... to the DNS pods of kube-system" rhas NetworkPolicy "$en" 'k8s-app: kube-dns'
+check "proxy netpol: egress to the internet, 0.0.0.0/0 ..." rhas NetworkPolicy "$en" 'cidr: 0\.0\.0\.0/0'
+check "proxy netpol: ... except RFC 1918" rhas NetworkPolicy "$en" '^              - 10.0.0.0/8$'
+check "proxy netpol: ... and link-local (cloud metadata)" rhas NetworkPolicy "$en" '^              - 169.254.0.0/16$'
+check "proxy netpol: ... on TCP 443 and nothing else" [ "$(egress_ports)" = "443 " ]
+check "proxy netpol: two egress rules and no more: DNS and the internet" rcount NetworkPolicy "$en" '^    - to:$' 2
+check "proxy netpol: no rule names an IPv6 range (IPv6 is denied)" rlacks NetworkPolicy "$en" 'cidr: .*:|::'
 
 # Values drive it.
 helm_rp --set 'runPods.networkPolicy.clusterCIDRs={10.42.0.0/16,10.43.0.0/16}' > "$out"
-check "netpol: the pod and service CIDRs are values-driven" rhas NetworkPolicy "$rn" '^              - 10.43.0.0/16$'
-helm_rp --set runPods.networkPolicy.enabled=false > "$out"
-check "netpol: off: only the coder's own NetworkPolicy" count '^kind: NetworkPolicy$' 1
+check "proxy netpol: the pod and service CIDRs are values-driven: out of the internet rule" rhas NetworkPolicy "$en" '^              - 10.43.0.0/16$'
+check "proxy: ... and refused by the proxy itself (EGRESS_DENY_CIDRS)" \
+  dhas Deployment 'value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,10.42.0.0/16,10.43.0.0/16"'
+check "netpol: the CIDRs open nothing for the run pods" rlacks NetworkPolicy "$rn" '10.43.0.0/16'
+printf 'runPods:\n  networkPolicy:\n    blockedCIDRs: []\n    clusterCIDRs: []\n' > "$vals"
+helm_rp -f "$vals" > "$out"
+check "proxy netpol: no CIDR to leave out: no except list" rlacks NetworkPolicy "$en" '^            except:$'
+check "proxy: ... and no EGRESS_DENY_CIDRS (the proxy keeps its built-in ranges)" dlacks Deployment 'EGRESS_DENY_CIDRS'
+helm_rp --set 'runPods.egressProxy.ports={443,8443}' > "$out"
+check "proxy: more ports are values-driven: EGRESS_PORTS" dhas Deployment 'value: "443,8443"'
+check "proxy netpol: ... and the ports of the internet rule" [ "$(egress_ports)" = "443 8443 " ]
 helm_rp --set 'runPods.networkPolicy.extraEgress[0].to[0].ipBlock.cidr=10.9.9.9/32' > "$out"
 check "netpol: extra egress rules are appended (a model gateway in the cluster)" rhas NetworkPolicy "$rn" 'cidr: 10.9.9.9/32'
+check "netpol: ... to the run pods' policy only, not the proxy's" rlacks NetworkPolicy "$en" '10.9.9.9'
+check "netpol: ... after DNS and the proxy" rcount NetworkPolicy "$rn" '^    - to:$' 3
+
+# The egress proxy itself (ADR 0042): a Deployment of the coder's image, a Service, its allow-list.
+helm_rp > "$out"
+check "proxy: the Deployment runs adam-egress from the coder's own image" \
+  dhas Deployment 'command: \["tini", "--", "adam-egress"\]'
+check "proxy: ... image.repository:image.tag, no other image" dhas Deployment 'image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"'
+check "proxy: two replicas by default" dhas Deployment '^  replicas: 2$'
+check "proxy: a rolling update that never takes the last pod away" dhas Deployment '^      maxUnavailable: 0$'
+check "proxy: non-root, uid 10001" dhas Deployment 'runAsUser: 10001'
+check "proxy: ... runAsNonRoot" dhas Deployment 'runAsNonRoot: true'
+check "proxy: ... a read-only root file system" dhas Deployment 'readOnlyRootFilesystem: true'
+check "proxy: ... no privilege escalation" dhas Deployment 'allowPrivilegeEscalation: false'
+check "proxy: ... every capability dropped" dhas Deployment 'drop: \["ALL"\]'
+check "proxy: ... the runtime's default seccomp profile" dhas Deployment 'type: RuntimeDefault'
+check "proxy: ... no service account token" dhas Deployment 'automountServiceAccountToken: false'
+check "proxy: ... its own ServiceAccount, with no token either" rhas ServiceAccount coder-egress 'automountServiceAccountToken: false'
+check "proxy: no host network, PID or IPC, no privileged container, no hostPath" dlacks Deployment 'hostNetwork|hostPID|hostIPC|privileged: true|hostPath'
+check "proxy: the allow-list is a file ..." dhas Deployment 'name: EGRESS_ALLOW_FILE'
+check "proxy: ... mounted at /etc/adam-egress ..." dhas Deployment 'mountPath: /etc/adam-egress'
+check "proxy: ... read-only ..." dhas Deployment '^              readOnly: true$'
+check "proxy: ... from the chart's ConfigMap" dhas Deployment 'name: coder-egress-allow'
+check "proxy: a changed list is a deploy (checksum annotation)" dhas Deployment 'checksum/egress-allow: [0-9a-f]{64}'
+check "proxy: EGRESS_PORTS is 443" dhas Deployment 'value: "443"'
+check "proxy: the private ranges are refused by the proxy itself (EGRESS_DENY_CIDRS)" \
+  dhas Deployment 'value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10"'
+check "proxy: readiness and liveness on /healthz" dcount Deployment 'path: /healthz' 2
+check "proxy: ... a readiness probe ..." dhas Deployment '^          readinessProbe:$'
+check "proxy: ... and a liveness probe" dhas Deployment '^          livenessProbe:$'
+check "proxy: it listens on 3128" dhas Deployment 'containerPort: 3128'
+check "proxy: the memory limit is a value" dhas Deployment '^              memory: 256Mi$'
+check "proxy: the Service is ClusterIP on 3128 ..." rhas Service coder-egress '^      port: 3128$'
+check "proxy: ... selecting the proxy's pods" rhas Service coder-egress '^    app.kubernetes.io/component: egress-proxy$'
+check "proxy: the PodDisruptionBudget keeps one pod" rhas PodDisruptionBudget coder-egress 'minAvailable: 1'
+helm_rp --set runPods.egressProxy.replicas=1 > "$out"
+check "proxy: replicas is a value" dhas Deployment '^  replicas: 1$'
+check "proxy: one replica: no PodDisruptionBudget (it would block every drain)" lacks '^kind: PodDisruptionBudget$'
+helm_rp --set runPods.egressProxy.resources.limits.memory=512Mi --set runPods.egressProxy.nodeSelector.pool=infra \
+  --set 'runPods.egressProxy.tolerations[0].key=infra' > "$out"
+check "proxy: values drive the memory limit ..." dhas Deployment '^              memory: 512Mi$'
+check "proxy: ... the node selector ..." dhas Deployment 'pool: infra'
+check "proxy: ... and the tolerations" dhas Deployment 'key: infra'
+
+# The allow-list (ADR 0042): the default hosts, once each, lower case, and nothing broad.
+allow_file() { rdoc ConfigMap coder-egress-allow | awk '/^  allow.txt: \|$/ { on = 1; next } on { sub(/^    /, ""); print }'; }
+allows() { allow_file | grep -Fxq -- "$1"; }
+odd_entries() { allow_file | grep -v '^#' | grep -Ev '^[a-z0-9][a-z0-9.-]*[a-z0-9]$'; }
+helm_rp > "$out"
+for host in registry.npmjs.org pypi.org files.pythonhosted.org crates.io static.crates.io index.crates.io \
+  proxy.golang.org sum.golang.org github.com codeload.github.com objects.githubusercontent.com \
+  release-assets.githubusercontent.com pub.dev; do
+  check "allow-list: $host by default" allows "$host"
+done
+check "allow-list: only plain host names by default (no wildcard, no suffix, no scheme)" fails odd_entries
+check "allow-list: storage.googleapis.com is not on it (it serves every bucket of Google Cloud Storage)" fails allows storage.googleapis.com
+helm_rp --set 'runPods.egressProxy.extraAllow={Models.Example.com,.internal.example.org,github.com}' > "$out"
+check "allow-list: extraAllow is added, in lower case ..." allows models.example.com
+check "allow-list: ... a suffix entry as written ..." allows .internal.example.org
+check "allow-list: ... the defaults stay ..." allows registry.npmjs.org
+check "allow-list: ... and a host in both lists is once in the file" [ "$(allow_file | grep -Fxc github.com)" -eq 1 ]
+helm_rp --set 'runPods.egressProxy.allow={only.example.com}' > "$out"
+check "allow-list: allow replaces the defaults ..." allows only.example.com
+check "allow-list: ... all of them" fails allows registry.npmjs.org
+helm_rp --set 'runPods.egressProxy.extraNoProxy={gateway.models.svc,.internal.example.org}' > "$out"
+check "NO_PROXY: extraNoProxy follows the loopback names" tplenv NO_PROXY 'localhost,127.0.0.1,gateway.models.svc,.internal.example.org'
+check "NO_PROXY: ... in the lower-case variable too" tplenv no_proxy 'localhost,127.0.0.1,gateway.models.svc,.internal.example.org'
+helm_rp --set topology=split > "$out"
+check "split: the proxy is rendered once, beside the front" dcount Deployment '^  name: coder-egress$' 1
+check "split: ... and the front is still there" dhas Deployment '^  name: coder-front$'
 
 helm_rp --set runPods.resources.limits.memory=3Gi --set runPods.resources.requests.memory=1Gi \
   --set runPods.cargoBuildJobs=4 --set runPods.extraEnv.RUSTFLAGS=-Cdebuginfo=0 > "$out"
@@ -1162,7 +1284,8 @@ check "priority class named: the template" tpl '^  priorityClassName: my-class$'
 check "priority class named: the quota" rhas ResourceQuota coder-run-pods '^          - my-class$'
 check "priority class named: the policy" policy_has "$pn" "object.spec.priorityClassName == 'my-class'"
 helm_rp --set runPods.serviceAccount.name=my-sa > "$out"
-check "service account named: the chart renders none" lacks '^kind: ServiceAccount$'
+check "service account named: the chart renders none of the coder's (the proxy's own stays)" count '^kind: ServiceAccount$' 1
+check "service account named: ... the one that stays is the proxy's" rhas ServiceAccount coder-egress 'automountServiceAccountToken: false'
 check "service account named: the coder pod uses it" sts_of '^      serviceAccountName: my-sa$'
 check "service account named: the binding is to it" rhas RoleBinding coder-run-pods 'name: my-sa$'
 check "service account named: the policy is matched to it" policy_has "$pn" "system:serviceaccount:coder-ns:my-sa"
@@ -1192,7 +1315,7 @@ check "shared volume: no pod affinity (every node can mount a ReadWriteMany volu
 check "shared volume: the policy allows that claim" policy_has "$pn" "v.persistentVolumeClaim.claimName == 'coder-work'"
 # shellcheck disable=SC2086
 helm_rp --set workspace.placement=affinity --set workspace.sharedVolume.storageClass=rwx --set replicaCount=2 > "$out"
-check "affinity placement: two replicas are fine with run pods" count '^  replicas: 2$' 1
+check "affinity placement: two replicas are fine with run pods" dcount StatefulSet '^  replicas: 2$' 1
 helm_rp --set workspace.placement=shared --set workspace.sharedVolume.existingClaim=mine > "$out"
 check "an existing claim is the one the run pod mounts" tpl 'claimName: mine'
 
@@ -1200,10 +1323,11 @@ check "an existing claim is the one the run pod mounts" tpl 'claimName: mine'
 helm_rp --set config.role=control-plane > "$out"
 check "control plane: no run pod objects" lacks '^kind: (ConfigMap|ServiceAccount|Role|RoleBinding|PriorityClass|ResourceQuota|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding)$'
 check "control plane: no RUN_ENVIRONMENT and no service account" lacks 'RUN_ENVIRONMENT|serviceAccountName'
+check "control plane: nothing of the egress proxy (it starts no commands)" lacks 'coder-egress|adam-egress|EGRESS_|_PROXY|_proxy|^kind: (Deployment|PodDisruptionBudget)$'
 helm_rp --set topology=split > "$out"
 check "split: the worker has the service account" sts_of '^      serviceAccountName: coder$'
-check "split: the front has none and mounts no token" [ "$(doc Deployment | grep -c 'serviceAccountName')" -eq 0 ]
-check "split: ... automountServiceAccountToken false on the front" dhas Deployment 'automountServiceAccountToken: false'
+check "split: the front has none and mounts no token" [ "$(rdoc Deployment coder-front | grep -c 'serviceAccountName')" -eq 0 ]
+check "split: ... automountServiceAccountToken false on the front" rhas Deployment coder-front 'automountServiceAccountToken: false'
 
 # Refusals.
 check "refused: runPods.enabled that is not a boolean" fails helm_rp --set-string runPods.enabled=maybe
@@ -1232,6 +1356,35 @@ check "refused: no pods in the quota" fails helm_rp --set runPods.quota.pods=0
 check "refused: an idle timeout that is not a number" fails helm_rp --set-string runPods.idleSecs=soon
 check "refused: a bad container name" fails helm_rp --set runPods.container=Run_Container
 check "refused: a CIDR that is not one" fails helm_rp --set 'runPods.networkPolicy.clusterCIDRs={everything}'
+check "refused: an IPv6 range (IPv6 is denied, never allowed)" fails helm_rp --set 'runPods.networkPolicy.clusterCIDRs={fd00::/8}'
+message=$(helm_rp --set runPods.networkPolicy.enabled=false 2>&1 || true)
+check "refused: no network policy for the run pods (the old switch would be open egress)" fails helm_rp --set runPods.networkPolicy.enabled=false
+check "... the error says what to use instead" says "$message" 'extraEgress'
+check "... and names the ADR" says "$message" 'ADR 0042'
+check "the old switch set to true is harmless" helm_rp --set runPods.networkPolicy.enabled=true
+check "refused: proxy variables in runPods.extraEnv" fails helm_rp --set runPods.extraEnv.HTTPS_PROXY=http://elsewhere:3128
+check "refused: ... the lower-case ones too" fails helm_rp --set runPods.extraEnv.no_proxy=example.com
+message=$(helm_rp --set runPods.extraEnv.NO_PROXY=example.com 2>&1 || true)
+check "... the error points at extraNoProxy" says "$message" 'extraNoProxy'
+printf 'runPods:\n  egressProxy:\n    allow: []\n    extraAllow: []\n' > "$vals"
+message=$(helm_rp -f "$vals" 2>&1 || true)
+check "refused: an empty allow-list (adam-egress would exit 78 and a run pod would reach nothing)" fails helm_rp -f "$vals"
+check "... the error says no host is allowed" says "$message" 'hold no host'
+printf 'runPods:\n  egressProxy:\n    allow: []\n    extraAllow: [models.example.com]\n' > "$vals"
+check "an allow-list of extraAllow alone is fine" helm_rp -f "$vals"
+for bad in '*.example.com' 'https://example.com' 'example.com:443' 'example.com/path' 'user@example.com' '1.2.3.4' '2130706433' '.com' 'exa mple.com' 'example..com' '-a.com' 'a-.com' ''; do
+  printf 'runPods:\n  egressProxy:\n    extraAllow: ["%s"]\n' "$bad" > "$vals"
+  check "refused: the allow-list entry '$bad'" fails helm_rp -f "$vals"
+done
+check "refused: an allow-list that is not a list" fails helm_rp --set runPods.egressProxy.allow=example.com
+check "refused: no replicas" fails helm_rp --set runPods.egressProxy.replicas=0
+check "refused: replicas that are not a number" fails helm_rp --set-string runPods.egressProxy.replicas=two
+printf 'runPods:\n  egressProxy:\n    ports: []\n' > "$vals"
+check "refused: no port (the proxy would allow no CONNECT)" fails helm_rp -f "$vals"
+check "refused: a port out of range" fails helm_rp --set 'runPods.egressProxy.ports={70000}'
+check "refused: a port that is not a number" fails helm_rp --set 'runPods.egressProxy.ports={https}'
+check "refused: a NO_PROXY name with a space" fails helm_rp --set 'runPods.egressProxy.extraNoProxy={a b}'
+check "refused: a NO_PROXY name with a comma (it would be two)" fails helm_rp --set-string 'runPods.egressProxy.extraNoProxy[0]=a.example.com\,b.example.com'
 
 # Optional A2A features (a2a.*, ADR 0030 of adam-rs): push notifications and the signature of the agent card.
 # Both are off by default and then invisible (the golden above, byte for byte); each belongs to the pod that
@@ -1480,7 +1633,9 @@ check "production: the example does not accept the risk (the value is never true
   fails grep -Eq '^[[:space:]]*allowCommandsNextToSecrets:[[:space:]]*true' "$prod"
 check "production: RUN_ENVIRONMENT=kubernetes, the commands run in a pod of their own" sts_of 'value: kubernetes'
 check "production: the run pod template and its admission policy exist" \
-  count '^kind: (ConfigMap|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding)$' 3
+  count '^kind: (ConfigMap|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding)$' 4
+check "production: ... and the egress proxy, the only way out of a run pod: its Deployment ..." rhas Deployment coder-egress 'adam-egress'
+check "production: ... and the policy of the run pods that makes it so (no rule for the internet)" rlacks NetworkPolicy coder-run-pods 'ipBlock'
 check "production: the run pod template holds no key, App setting or mount of the key" notpl 'github-app|private-key|PRIVATE KEY|GITHUB_APP'
 key_mount_readonly() { doc StatefulSet | grep -A1 -- 'mountPath: /var/run/secrets/github-app$' | grep -q 'readOnly: true'; }
 check "production: the key is mounted once, in the coder's container, read-only" \

@@ -1,0 +1,3 @@
+# The build needs one file of the repository: adam-exec. Everything else, `target/` above all, stays out of the context.
+*
+!crates/adam-devcontainer/src/adam-exec.sh

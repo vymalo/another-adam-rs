@@ -81,6 +81,67 @@ sets it and the admission policy allows exactly this reference, by the Secret's 
 {{- end -}}
 
 {{/*
+The selector of the run pods, by the labels the coder puts on every pod it makes (ADR 0019): used by their NetworkPolicy and,
+as the only ingress, by the egress proxy's. Indent it to the selector's level.
+*/}}
+{{- define "coder.runPodSelector" -}}
+matchLabels:
+  app.kubernetes.io/managed-by: adam-coder
+  app.kubernetes.io/instance: {{ .Release.Name }}
+matchExpressions:
+  - key: adam.vymalo.com/run
+    operator: Exists
+{{- end -}}
+
+{{/*
+The egress proxy (values runPods.egressProxy, ADR 0042): the only way out of a run pod to the internet. Its name (the
+Deployment, Service, ServiceAccount, PodDisruptionBudget and NetworkPolicy), its port, the labels of its pods (not the
+coder's, not the run pods', and not the front's: no selector of another object matches them), where its allow-list is
+mounted, and the URL the run pods' environment names.
+*/}}
+{{- define "coder.egressProxyName" -}}
+{{- printf "%s-egress" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- define "coder.egressProxyAllowName" -}}
+{{- printf "%s-egress-allow" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- define "coder.egressProxyPort" -}}3128{{- end -}}
+{{- define "coder.egressProxyAllowDir" -}}/etc/adam-egress{{- end -}}
+{{- define "coder.egressProxySelectorLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-egress" (include "coder.name" .) | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: egress-proxy
+{{- end -}}
+{{- define "coder.egressProxyLabels" -}}
+{{ include "coder.egressProxySelectorLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end -}}
+{{- define "coder.egressProxyURL" -}}
+{{ printf "http://%s.%s.svc:%s" (include "coder.egressProxyName" .) .Release.Namespace (include "coder.egressProxyPort" .) }}
+{{- end -}}
+
+{{/* The hosts the proxy allows, lower case, once each, one per line: `allow`, then `extraAllow`. Empty when there is none. */}}
+{{- define "coder.egressProxyAllowList" -}}
+{{- $hosts := list -}}
+{{- range concat (default (list) .Values.runPods.egressProxy.allow) (default (list) .Values.runPods.egressProxy.extraAllow) -}}
+{{- $hosts = append $hosts (lower (trim (toString .))) -}}
+{{- end -}}
+{{- join "\n" ($hosts | uniq) -}}
+{{- end -}}
+
+{{/* NO_PROXY of a run pod: the loopback names, then runPods.egressProxy.extraNoProxy. */}}
+{{- define "coder.egressProxyNoProxy" -}}
+{{- join "," (concat (list "localhost" "127.0.0.1") (default (list) .Values.runPods.egressProxy.extraNoProxy)) -}}
+{{- end -}}
+
+{{/* The IPv4 ranges the proxy never connects to and its policy leaves out: networkPolicy.blockedCIDRs and clusterCIDRs, once each. */}}
+{{- define "coder.egressDenyCIDRs" -}}
+{{- join "," (concat (default (list) .Values.runPods.networkPolicy.blockedCIDRs) (default (list) .Values.runPods.networkPolicy.clusterCIDRs) | uniq) -}}
+{{- end -}}
+
+{{/*
 The pod every run pod is made from: a Pod, as YAML, with no name, namespace or owner (the coder fills in a name, the
 namespace, the labels app.kubernetes.io/managed-by, app.kubernetes.io/instance and adam.vymalo.com/run, and the
 annotations adam.vymalo.com/run-id, adam.vymalo.com/worker and adam.vymalo.com/workspace-mounts) and replaces the run
@@ -163,6 +224,15 @@ spec:
       env:
         - name: CARGO_BUILD_JOBS
           value: {{ .Values.runPods.cargoBuildJobs | quote }}
+        {{- /* The only way out to the internet (ADR 0042): the egress proxy. The pod's NetworkPolicy allows nothing else, so a tool that ignores these gets no connection. */}}
+        {{- range $name := list "HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy" }}
+        - name: {{ $name }}
+          value: {{ include "coder.egressProxyURL" $ | quote }}
+        {{- end }}
+        {{- range $name := list "NO_PROXY" "no_proxy" }}
+        - name: {{ $name }}
+          value: {{ include "coder.egressProxyNoProxy" $ | quote }}
+        {{- end }}
         {{- range $name, $value := .Values.runPods.extraEnv }}
         - name: {{ $name }}
           value: {{ $value | quote }}

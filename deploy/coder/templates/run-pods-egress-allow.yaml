@@ -1,0 +1,14 @@
+{{- if include "coder.runPods" . }}
+# runPods.enabled: the hosts the egress proxy allows (ADR 0042): runPods.egressProxy.allow, then extraAllow. The proxy
+# reads the file at startup only, so a change is a deploy (the proxy's checksum annotation).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coder.egressProxyAllowName" . }}
+  labels:
+    {{- include "coder.egressProxyLabels" . | nindent 4 }}
+data:
+  allow.txt: |
+    # The hosts a run pod may reach through the egress proxy: runPods.egressProxy.allow and extraAllow.
+    {{- include "coder.egressProxyAllowList" . | nindent 4 }}
+{{- end }}

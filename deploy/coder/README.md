@@ -16,7 +16,7 @@ cluster.
 | `Cluster` (CNPG) | `database.enabled` (the default) only: the coder's database; `DATABASE_URL` is the `uri` key of the `<release>-db-app` Secret CNPG creates. With `database.enabled: false` no Cluster is rendered and `DATABASE_URL` is read from `database.existingSecret`, see [Database](#database) |
 | `ExternalSecret` | `ssegning-aws` / `prod/meta/test-app`; the property of each value is in `externalSecrets.properties` |
 | `PersistentVolumeClaim` | `cache.create` only: `<release>-coder-cache`, ReadWriteMany, deleted with the release, see [The package cache](#the-package-cache) |
-| `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy` | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
+| `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy`, and the egress proxy (a `Deployment`, a `Service`, a `PodDisruptionBudget`, a `ServiceAccount`, a `ConfigMap` and a third `NetworkPolicy`) | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
 | `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 
 ```sh
@@ -658,7 +658,8 @@ What it renders, and why each is there:
 | `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot. `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
 | `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is mounted in the coder pod alone; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
 | `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references a Secret key other than `MODEL_API_KEY` of the ExternalSecret's Secret (by name **and** key), or any Secret by `envFrom`, is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
-| `NetworkPolicy` `<release>-coder-run-pods` | no ingress; egress to DNS and to the internet **except** `networkPolicy.blockedCIDRs` (RFC 1918, link-local, which holds the cloud metadata address, and the shared address space) and `networkPolicy.clusterCIDRs` (the pod and service CIDRs: yours to name), so builds reach registries and the model gateway and not the services of the cluster. A gateway inside the cluster needs `networkPolicy.extraEgress`. IPv4 only |
+| `NetworkPolicy` `<release>-coder-run-pods` | **deny by default** ([ADR 0042](../../docs/decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)): no ingress; egress to DNS, to the egress proxy's pods on TCP 3128 and to `networkPolicy.extraEgress` (an in-cluster target such as a model gateway), and nothing else. There is no rule for the internet and no value that adds one: `networkPolicy.enabled: false` is refused. No rule names an IPv6 range, so IPv6 egress is denied |
+| `Deployment`, `Service`, `ServiceAccount`, `ConfigMap`, `PodDisruptionBudget`, `NetworkPolicy` `<release>-coder-egress` | **the egress proxy**, the one way out of a run pod: [below](#the-egress-proxy) |
 
 The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_POD_NAMESPACE` (its own, by the downward API), `RUN_POD_INSTANCE` (the release),
 `RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.92 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (600), a
@@ -698,11 +699,47 @@ cache](#the-package-cache) is writable by every run; the model key is a variable
 `tests/golden/run-pods.yaml`), kubeconform on the renders (`.github/workflows/coder.yml`), and the `run-pods` job of `.github/workflows/ci.yml`, which applies the
 objects to a `kind` cluster and runs the environment against it as the coder's ServiceAccount (`tests/kind-run-pods.sh`): a pod from the template, commands
 in it, a kill, the idle sweep, the policy refusing sixteen changes to the pod, the quota refusing the fifth, and a run pod that sees only its own run on a volume the script
-seeds with two runs of one mirror, and whose slot it cannot rename, remove or replace (*unverified* until CI has run it). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `HEAD`, `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid, and the slots as mounts of their own: it renames, removes and exchanges them and gets `EBUSY`) as bind mounts in a private mount
-namespace (needs root; CI runs it before the kind job). It does not run the coder over a model, and it
-does not check the NetworkPolicy (kind's network plugin may not enforce one). **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
-sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy, and the HTTP status of an admission refusal (the
+seeds with two runs of one mirror, and whose slot it cannot rename, remove or replace (*verified 2026-10-27*: run 40456829784, job 122032008830), and, new with the egress proxy, the network policies: [below](#the-egress-proxy). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `HEAD`, `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid, and the slots as mounts of their own: it renames, removes and exchanges them and gets `EBUSY`) as bind mounts in a private mount
+namespace (needs root; CI runs it before the kind job). It does not run the coder over a model. **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
+sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy (kind's, kindnet, does, and the job fails when it does not), and the HTTP status of an admission refusal (the
 coder treats 403, 422 and 400 as the deployment's mistake).
+
+### The egress proxy
+
+A run pod has **no way to the internet but one**: `adam-egress`, an HTTPS-only forward proxy ([`bin/adam-egress`](../../bin/adam-egress/README.md), [ADR 0042](../../docs/decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)),
+which the chart runs from the coder's own image (`image.*`: no other image to pin) whenever `runPods.enabled` is on. It accepts `CONNECT host:443` to the hosts on its
+allow-list and nothing else, resolves the name itself, and connects only to public IPv4 addresses. The template sets `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY` and `http_proxy`
+to its Service (`http://<release>-coder-egress.<namespace>.svc:3128`, or the chart's full name and `-egress`) and `NO_PROXY` and `no_proxy` to `localhost,127.0.0.1`; curl and npm
+read them (tried by the kind job), git, cargo, pip and go are documented to (*unverified* here). **A tool that ignores them gets no connection**, because the run pods' policy has
+no rule for the internet. Plain `http://` through the proxy is answered `403` "only HTTPS through CONNECT". There is no switch to turn it off.
+
+| Value (`runPods.egressProxy.`) | |
+|---|---|
+| `allow` | the hosts a run pod may reach. Default: `registry.npmjs.org`; `pypi.org`, `files.pythonhosted.org`; `crates.io`, `index.crates.io`, `static.crates.io`; `proxy.golang.org`, `sum.golang.org`; `github.com`, `codeload.github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com` (where a release asset redirects to: *verified 2026-10-27*); `pub.dev` (it serves its archives itself: *verified 2026-10-27*, so `storage.googleapis.com`, which serves every bucket, is not on it). `example.com` is that host, `.example.com` every subdomain and not the apex |
+| `extraAllow` | **how a deployment extends the list**: added to `allow`, lower-cased, once each. Put a model gateway outside the cluster here. The chart refuses an entry that is not a host name (a wildcard, a URL, a port, an IP address) or is a bare suffix such as `.com`, and refuses a list that ends up empty (`adam-egress` would exit 78). A change is a rollout of the proxy (a checksum annotation) |
+| `extraNoProxy` | names added to `NO_PROXY`: the host of an in-cluster target that a rule of `networkPolicy.extraEgress` reaches directly. Without it the tools would send that request to the proxy, which refuses it |
+| `ports` | the ports a `CONNECT` may name and the only TCP ports the proxy's pods may reach (`[443]`) |
+| `replicas`, `resources`, `nodeSelector`, `tolerations`, `affinity` | two replicas (with a `PodDisruptionBudget` of `minAvailable: 1`), `25m`/`32Mi` requested and `256Mi` as the limit |
+
+The proxy's pods run as uid 10001 with a read-only root file system, no privilege escalation, no capability, the default seccomp profile and no service account token, and log one
+line per decision (`decision`, `reason`, `host`, `port`; never a path, a query or a header). Their policy (`<release>-coder-egress`) admits **only the run pods, on 3128**, and lets them
+reach DNS and `0.0.0.0/0` **on TCP 443 only, except `networkPolicy.blockedCIDRs` and `clusterCIDRs`** (the proxy refuses the same ranges itself: two layers). The kubelet's probes need
+no rule: a policy does not block the node's access to its own pods (*verified 2026-10-27* in the Kubernetes documentation). **IPv6 is denied**: no policy has an IPv6 rule and the proxy
+connects over IPv4 only.
+
+**Upgrading** a deployment that has run pods on: the coder rolls once (the template changed), and run pods made before it have no proxy variables, and so no way out, until the idle sweep
+(`runPods.idleSecs`) or the end of their run replaces them. `runPods.networkPolicy.enabled` is removed and `false` is refused. A deployment that had an `extraEgress` rule for an
+in-cluster gateway adds its host to `extraNoProxy`; one that fetched from a host outside the list adds it to `extraAllow`.
+
+**Not covered** (ADR 0042): domain fronting (a client names an allowed host and sends another SNI: seeing it needs TLS interception); what an allowed host accepts (a hostile prompt can bring
+its own credential for an allowed registry or for GitHub and publish a repository there: this removes the open internet, it does not make exfiltration impossible); DNS, which carries data to a
+name server the attacker runs; the coder's own egress and that of agent folders (the chart's own `NetworkPolicy` is still ingress only).
+
+**Checked by** `tests/render-check.sh` (the three policies, the template's variables, `extraAllow` in the ConfigMap, the refusals, nothing of it with run pods off) and the `run-pods` job
+(`tests/kind-run-pods.sh`, on `kindest/node:v1.35.8`, whose kindnet enforces `NetworkPolicy`): a direct connection from a run pod to a public address, to the API server and to another pod's IP
+is refused after a control that the proxy's own pod reaches the public address, while DNS works; `curl` and `npm view` through the proxy succeed; `example.com` is answered 403 and the log has
+the refusal and nothing of a `Proxy-Authorization` header or a query sent to it; no policy names an IPv6 range. The script **fails** where a policy is not enforced
+(`ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1` says a cluster is known not to), and retries a refusal for 60 s. *Unverified* until CI has run it.
 
 ## The package cache
 

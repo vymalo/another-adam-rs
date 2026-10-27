@@ -437,14 +437,18 @@ runPods:
     disableAcknowledged: false
     # Images a run pod may use besides runPods.image and the tools image (references as the pod spells them).
     extraAllowedImages: []
-  # No ingress; egress to DNS and to the internet, but not to private ranges, so builds reach registries and the
-  # model gateway but not the services of the cluster. The pod and service CIDRs of the cluster are the owner's to
-  # name (*unverified* here): the private ranges below already cover most clusters.
+  # What a run pod may reach (ADR 0042): no ingress, and egress to DNS, to the egress proxy below on its port, and
+  # to `extraEgress`. Nothing else: the old rule that let a run pod reach the whole internet is gone, and there is no
+  # value that brings it back (deny by default). The ranges below no longer open anything for the run pods: they are
+  # what the PROXY will not connect to (EGRESS_DENY_CIDRS) and what the proxy's own policy leaves out of its egress.
+  # The policy is only as real as the cluster's CNI enforces NetworkPolicy (*unverified* for the owner's cluster; the
+  # `run-pods` CI job shows that kindnet does). `runPods.networkPolicy.enabled: false` is refused. IPv4 only: no rule
+  # of any policy here names an IPv6 range, so IPv6 egress is denied.
   networkPolicy:
-    enabled: true
-    # The pod and service CIDRs of the cluster, besides the ranges below.
+    # The pod and service CIDRs of the cluster, besides the ranges below. Name them: they are yours to know.
     clusterCIDRs: []
-    # Never reachable: RFC 1918, the link-local range (cloud metadata) and the shared address space.
+    # Never reachable through the proxy: RFC 1918, the link-local range (cloud metadata) and the shared address space.
+    # The proxy refuses these on its own (it also refuses loopback, multicast, documentation and reserved ranges).
     blockedCIDRs:
       - 10.0.0.0/8
       - 172.16.0.0/12
@@ -455,9 +459,64 @@ runPods:
     dnsNamespace: kube-system
     dnsPodLabels:
       k8s-app: kube-dns
-    # More egress rules, as NetworkPolicy `egress` entries (for example the model gateway when it is in the
-    # cluster, which the blocked ranges would otherwise cut off).
+    # More egress rules for a run pod, as NetworkPolicy `egress` entries: an in-cluster target the proxy cannot serve
+    # (it connects to public IPv4 addresses only), such as a model gateway in the cluster. Add its host to
+    # `egressProxy.extraNoProxy` too, or the tools send the request to the proxy, which refuses it.
     extraEgress: []
+  # The only way out of a run pod to the internet (ADR 0042): `adam-egress`, an HTTPS-only forward proxy, from the
+  # coder's own image (`image.*`; no other image to pin). It accepts `CONNECT host:443` to the hosts below and nothing
+  # else, resolves the name itself and connects to public IPv4 addresses only. The run pod template sets HTTPS_PROXY,
+  # HTTP_PROXY (lower case too) to its Service and NO_PROXY to `localhost,127.0.0.1` plus `extraNoProxy`; curl, git,
+  # npm, cargo, pip and go read them (the `run-pods` job tries curl and npm, *unverified* until CI has run it; the others
+  # are *unverified*).
+  # A tool that ignores them gets no connection at all. There is no switch to turn it off: it is on with
+  # `runPods.enabled`. Plain HTTP is refused (run pods are not root, so there is no apt).
+  egressProxy:
+    # Pods of the proxy. With more than one, a PodDisruptionBudget keeps one up through a drain.
+    replicas: 2
+    # The ports a CONNECT may name, and the only TCP ports the proxy's pods may reach: 443 is HTTPS.
+    ports: [443]
+    # The hosts a run pod may reach: `example.com` is that host, `.example.com` every subdomain of it and NOT the apex.
+    # A suffix covers everything below it: name the registrable domain, never a bare `.com`. Keep this list and add
+    # yours to `extraAllow`, which survives a change of the defaults.
+    allow:
+      # npm
+      - registry.npmjs.org
+      # PyPI
+      - pypi.org
+      - files.pythonhosted.org
+      # crates.io: the API, the sparse index and the crate files
+      - crates.io
+      - index.crates.io
+      - static.crates.io
+      # Go modules
+      - proxy.golang.org
+      - sum.golang.org
+      # GitHub: git over HTTPS, archives, and the hosts a release asset or an object is served from. A release asset
+      # redirects to release-assets.githubusercontent.com (*verified 2026-10-27*: a request for a release asset of
+      # github.com/cli/cli answered 302 to that host); objects.githubusercontent.com served them before.
+      - github.com
+      - codeload.github.com
+      - objects.githubusercontent.com
+      - release-assets.githubusercontent.com
+      # pub.dev (Dart): the package archives are served by pub.dev itself (*verified 2026-10-27*: archive_url is
+      # https://pub.dev/api/archives/..., which answered 200 with no redirect), so storage.googleapis.com, which
+      # serves every bucket of Google Cloud Storage, is NOT allowed.
+      - pub.dev
+    # More hosts, added to `allow`. For a model gateway outside the cluster that run pods still call, list it here.
+    extraAllow: []
+    # More names the tools reach without the proxy (NO_PROXY), after `localhost,127.0.0.1`: the host of an in-cluster
+    # target of `networkPolicy.extraEgress`. Names or suffixes, no comma or space.
+    extraNoProxy: []
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        memory: 256Mi
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
 
 # The coder's Postgres: its own CloudNativePG Cluster (enabled: true, the default), or an
 # existing database (enabled: false and existingSecret.name, see the README, "Database").

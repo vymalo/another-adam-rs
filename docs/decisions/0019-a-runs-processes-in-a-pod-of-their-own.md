@@ -18,6 +18,11 @@ mirror read-only and the worktree's own directory in it (decision 3, OD-K1 and t
 decision 2's "nothing else" now includes those mounts; the admission policy lets a run pod reference the model key and no other
 Secret key, mount no Secret (decision 7). A new repository needs a pod made again (waited for like a slot, decision 6).
 
+*Amended 2026-10-27 ([ADR 0042](0042-run-pods-reach-the-internet-through-an-egress-proxy.md)):* a run pod's network is deny by default.
+Decision 7's NetworkPolicy allows DNS, the egress proxy (an HTTPS-only `CONNECT` proxy of the coder's image, deployed by the chart with
+the run pods) and `extraEgress`, and no longer the internet; the template sets `HTTPS_PROXY` and the other proxy variables; OD-K6 is
+resolved the other way; `runPods.networkPolicy.enabled` is gone.
+
 ## Context
 
 The coder runs every command of every run in its own container: `run_command`, `run_checks`, OpenCode and every command
@@ -129,7 +134,7 @@ The facts, each with how it is known:
    than the allowed one, that is privileged or may escalate, runs as root, uses the host's network, PID or IPC namespace, or
    does not set `automountServiceAccountToken: false` (this policy is what lets the coder create pods without being able to
    read the namespace's other Secrets); and a **NetworkPolicy** for run pods with no ingress and egress to DNS and to the
-   internet except the private ranges and the pod and service CIDRs that the values name. The coder's own resources are
+   internet except the private ranges and the pod and service CIDRs that the values name *(amended 2026-10-27, [ADR 0042](0042-run-pods-reach-the-internet-through-an-egress-proxy.md): egress to DNS, to the egress proxy and to `extraEgress` only, deny by default; the ranges are the proxy's)*. The coder's own resources are
    `runPods.coderResources` (a limit of 1Gi) while run pods are on, and `resources` is untouched when they are off.
 8. **Tests.** The environment is tested against a fake API server behind a real `kube::Client` (a `tower-test` mock service):
    `ensure`, idempotency and races, the quota, admission and unschedulable refusals, `release`, `held_runs`, the idle sweep,
@@ -216,7 +221,7 @@ commands are gone, which the coder sees as a command that ended with a non-zero 
 | OD-K3 | Time to be ready | 600 seconds in the chart (300 in the binary): the first pull of 2.85 GB on a node | Pre-pull the image on the nodes (a DaemonSet), and a shorter wait |
 | OD-K4 | A quota | Wait with backoff up to `RUN_POD_WAIT_SECS` (600) | Fail at once, or fall back to the coder's container (rejected: see below) |
 | OD-K5 | The model key | `MODEL_API_KEY` from the deployment's Secret in the run container's environment, readable by every command of the run, as it is in the coder's own today | A key per run, which needs a proxy in the coder |
-| OD-K6 | Egress | The internet except the private ranges and the CIDRs named; DNS | Allow only named hosts (`ALLOWED_REPO_HOSTS`, the gateway, registries): breaks builds that fetch from anywhere |
+| OD-K6 | Egress | The internet except the private ranges and the CIDRs named; DNS *(amended 2026-10-27, [ADR 0042](0042-run-pods-reach-the-internet-through-an-egress-proxy.md): the alternative is now the default, through an HTTPS-only proxy that allows named hosts)* | Allow only named hosts (`ALLOWED_REPO_HOSTS`, the gateway, registries): breaks builds that fetch from anywhere |
 | OD-K7 | A repository's devcontainer | Not used in a run pod: the template's image is the environment | Run the repository's image in the pod, which needs the policy of ADR 0010 on a pod |
 
 ## Consequences
@@ -238,7 +243,7 @@ commands are gone, which the coder sees as a command that ended with a non-zero 
 * Processes a command left running in the background (a dev server) stop when the pod is deleted for being idle. A command
   that is running keeps the pod.
 * The `NetworkPolicy` is only as real as the cluster's CNI enforces it (*unverified* for the owner's cluster), and it blocks
-  in-cluster services: a model gateway inside the cluster needs `runPods.networkPolicy.extraEgress`.
+  in-cluster services: a model gateway inside the cluster needs `runPods.networkPolicy.extraEgress` *(and, since [ADR 0042](0042-run-pods-reach-the-internet-through-an-egress-proxy.md), its host in `runPods.egressProxy.extraNoProxy`)*.
 * **TLS needs a named provider.** `kube` builds its TLS configuration with rustls' process default, and rustls refuses to guess one when
   a binary's tree enables two (the coder's does: sqlx's rustls enables `ring` beside `aws-lc-rs`), so the first `kube::Client` of the
   coder, and of `adam-kube-exec` when it is built with the coder, would panic. `install_crypto_provider` names aws-lc-rs and both call it

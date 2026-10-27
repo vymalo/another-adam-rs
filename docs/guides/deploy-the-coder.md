@@ -173,7 +173,12 @@ run's checks, commands and OpenCode in **a pod of its own**, so a build is bound
 not the coder's (about 1Gi). Off by default, and then invisible. It renders the pod template (a ConfigMap), a
 `PriorityClass` and a `ResourceQuota` scoped to it, a ServiceAccount with a Role for `pods` and `pods/exec`, a
 `ValidatingAdmissionPolicy` that refuses any pod of that ServiceAccount but the intended one, and a
-`NetworkPolicy`. Needs Kubernetes 1.30+. A run pod mounts only its own run's directory, each slot's directory on its own (so the pod cannot rename it), the mirror of each of its
+`NetworkPolicy` that is **deny by default** ([ADR 0042](../decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)):
+a run pod reaches DNS, the **egress proxy** the chart runs beside it (`adam-egress`, from the coder's own image) and
+`runPods.networkPolicy.extraEgress`, and nothing else. The proxy lets a run pod reach the package registries and git hosts
+of its allow-list over HTTPS (`CONNECT` to port 443, public IPv4 addresses only) and refuses every other host; the pod's
+`HTTPS_PROXY` names it. Add a host with `runPods.egressProxy.extraAllow`; there is no switch for open egress. Details:
+[chart README, "The egress proxy"](../../deploy/coder/README.md#the-egress-proxy). Needs Kubernetes 1.30+. A run pod mounts only its own run's directory, each slot's directory on its own (so the pod cannot rename it), the mirror of each of its
 repositories **read-only** and each worktree's own directory in it, and no Secret but the model key
 ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), proposed): `git commit` and anything else that writes the
 mirror fails in the pod, the coder commits. The template must mount the work claim once, whole, at `WORKSPACE_ROOT` (the
@@ -275,7 +280,8 @@ deployment at it.
   scale in, keep the volumes.
 * **`flock` on network volumes is unverified** for `shared` on NFS and Longhorn RWX.
 * **The chart has not been applied with more than one worker**; the renders are checked, a live rollout is not.
-* The `NetworkPolicy` is inert unless the cluster's CNI enforces policies.
+* The `NetworkPolicy` is inert unless the cluster's CNI enforces policies. With run pods that means the egress proxy is there and nothing forces a run pod through it (kind's kindnet enforces them: the `run-pods` CI job fails where they are not).
+* **Run pods reach only the hosts of `runPods.egressProxy.allow`** (HTTPS). A tool that ignores `HTTPS_PROXY`, or fetches over plain HTTP or from a host that is not listed, fails; an allowed host still accepts what a run sends it with its own credential, and domain fronting is not seen ([ADR 0042](../decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)).
 * The model gateway's URL is not a credential: kept out of git, it is still in the pod's environment and the
   startup log.
 
