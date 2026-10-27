@@ -150,8 +150,9 @@ impl PodTemplate {
     }
 
     /// What the pod reserves: the **requests** of the container the processes run in, which is
-    /// what the scheduler reserves and the namespace's quota counts (limits are not read). A request
-    /// the template does not make is `None`, not zero. A command's time in the pod is weighted by this
+    /// what the scheduler reserves and the namespace's quota counts. A resource with a limit and no
+    /// request is its limit, which Kubernetes copies into the request when it admits the pod. A
+    /// resource with neither is `None`, not zero. A command's time in the pod is weighted by this
     /// ([`EnvSession::sandbox_shape`](adam_workspace::EnvSession::sandbox_shape)).
     pub fn sandbox_shape(&self) -> SandboxShape {
         self.shape
@@ -316,23 +317,29 @@ fn check(pod: &Pod, container: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The requests of the run container as a shape. A request that is not a quantity is an error, so
-/// that it fails the coder's start (the cluster would refuse the pod, run after run).
+/// The requests of the run container as a shape, a missing request taking the limit as Kubernetes
+/// does. A quantity that is not one is an error, so that it fails the coder's start (the cluster
+/// would refuse the pod, run after run).
 fn requests_of(pod: &Pod, container: &str) -> Result<SandboxShape, String> {
-    let requests = pod
+    let resources = pod
         .spec
         .iter()
         .flat_map(|spec| &spec.containers)
         .find(|c| c.name == container)
-        .and_then(|c| c.resources.as_ref())
-        .and_then(|resources| resources.requests.as_ref());
+        .and_then(|c| c.resources.as_ref());
     let read = |name: &str, parse: fn(&str) -> Option<u64>| -> Result<Option<u64>, String> {
-        requests
-            .and_then(|requests| requests.get(name))
+        let request = resources
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|requests| requests.get(name));
+        let limit = resources
+            .and_then(|r| r.limits.as_ref())
+            .and_then(|limits| limits.get(name));
+        request
+            .or(limit)
             .map(|quantity| {
                 parse(&quantity.0).ok_or_else(|| {
                     format!(
-                        "the container {container:?} requests {name} {:?}, which is not a Kubernetes quantity",
+                        "the container {container:?} asks for {name} {:?}, which is not a Kubernetes quantity",
                         quantity.0
                     )
                 })
@@ -562,18 +569,20 @@ spec:
     }
 
     #[test]
-    fn the_shape_is_the_run_containers_requests_and_never_its_limits_or_a_sidecars() {
+    fn the_shape_is_the_run_containers_requests_or_their_limits_and_never_a_sidecars() {
         // 250m and 512Mi are the requests; the limit of 2Gi is not a cost.
         assert_eq!(
             template().sandbox_shape(),
             SandboxShape::new(Some(250), Some(512 * 1024 * 1024))
         );
 
-        // A request the template does not make is absent, not zero.
-        let cpu_only = template_text("/work").replace(
-            "requests: {cpu: 250m, memory: 512Mi}",
-            "requests: {cpu: '1.5'}",
-        );
+        // A resource with neither a request nor a limit is absent, not zero; a request wins over a limit.
+        let cpu_only = template_text("/work")
+            .replace(
+                "requests: {cpu: 250m, memory: 512Mi}",
+                "requests: {cpu: '1.5'}",
+            )
+            .replace("limits: {memory: 2Gi}", "limits: {cpu: '2'}");
         let t = PodTemplate::parse(&cpu_only, Path::new("pod.yaml"), "run", Path::new("/work"))
             .unwrap();
         assert_eq!(t.sandbox_shape(), SandboxShape::new(Some(1500), None));
@@ -584,8 +593,8 @@ spec:
             PodTemplate::parse(&bare, Path::new("pod.yaml"), "run", Path::new("/work")).unwrap();
         assert_eq!(
             t.sandbox_shape(),
-            SandboxShape::new(None, None),
-            "only limits: no request"
+            SandboxShape::new(Some(4000), Some(2 * 1024 * 1024 * 1024)),
+            "only limits: Kubernetes copies each limit into the missing request"
         );
 
         // The init container's requests are not the run container's.
@@ -611,7 +620,7 @@ spec:
             let text = template_text("/work").replace("{cpu: 250m, memory: 512Mi}", wrong);
             let reason = refused(&text);
             assert!(
-                reason.contains(&format!("requests {name}"))
+                reason.contains(&format!("asks for {name}"))
                     && reason.contains("not a Kubernetes quantity"),
                 "{reason}"
             );

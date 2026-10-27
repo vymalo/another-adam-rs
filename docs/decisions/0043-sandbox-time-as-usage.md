@@ -36,8 +36,9 @@ on the record next to the tokens. What the code knows today, *verified 2026-10-2
    This also answers what counts for a reused pod: the time between commands does not. OpenCode is a process of the pod for the
    length of its call, and its time is a command's.
 2. **Each count is weighted by the pod's shape: the run container's requests.** `cpuMillis` and `memoryBytes` are what the scheduler
-   reserves and the namespace's quota counts; limits are not a cost. A request the template does not make is **left out of the
-   entry, not reported as zero**. A request that is not a Kubernetes quantity fails the coder's start, like the other faults of the
+   reserves and the namespace's quota counts; limits are not a cost. A resource with a limit and no request counts its limit,
+   which Kubernetes copies into the request when it admits the pod; a resource with neither is **left out of the entry, not
+   reported as zero**. A request that is not a Kubernetes quantity fails the coder's start, like the other faults of the
    template, since the cluster would refuse every pod.
 3. **A subagent's commands are counted with its parent's**, as its tokens are: they run in the root run's pod, and the parent adds
    the child's `sandbox_usage` when the child answers (`LlmAgent::count_child`). Commands that run at the same time are summed, so
@@ -147,8 +148,8 @@ stateDiagram-v2
 * **The command of a call that failed `Transient`** and was tried again: the retry reports its own, and the first try's pod time is in
   no total. A `Permanent` failure whose live report was lost by a crash between the journal write and the commit is lost the same
   way (a result is journaled with its time; an error is not).
-* **A Kubernetes template with only limits.** Kubernetes copies a limit to a missing request when it admits the pod, so the pod
-  reserves it; the entry follows decision 2 literally and leaves the request out. The chart sets requests.
+* **A request set by the namespace.** A `LimitRange` can give a container a default request at admission; the coder reads the
+  template, not the admitted pod, so such a request is not in the entry. The chart sets requests.
 * **Rounding**: a command is counted in whole milliseconds, truncated, and a fraction of a core or of a byte in a request is rounded up,
   as Kubernetes does.
 

@@ -180,7 +180,7 @@ of the protocol that is not on), so the OpenCode step has no report and its call
 **Sandbox time, beside the tokens** ([ADR 0043](../../docs/decisions/0043-sandbox-time-as-usage.md)). The task's `usage/v1` object also
 carries a `sandbox` member, for the compute a run pod holds: the wall time of each command of the run, from the moment the coder
 spawns the process to its exit (a timeout or a cancel kill included), weighted by the pod's **requests** in the template
-(`cpuMillis`, `memoryBytes`; a request the template does not make is left out). One entry per shape, at most 8; commands of a subagent
+(`cpuMillis`, `memoryBytes`; a resource with a limit and no request counts its limit, as Kubernetes does, and one with neither is left out). One entry per shape, at most 8; commands of a subagent
 are added to its parent's, and commands that ran at the same time are summed. Every command of a pod passes `ToolEnv::run` (`run_command`,
 `run`, `run_checks`, the re-run of a failing check on the base, the OpenCode probe) and OpenCode's own process is timed from its
 spawn to the end of its call (`CommandClock`); both report to the call's `ToolCtx`, and the loop keeps the sum in the run's state with the
