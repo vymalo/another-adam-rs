@@ -10,6 +10,10 @@
 //!
 //! Like every [`RunEvent`](crate::RunEvent) a usage event is best effort and not durable; the totals
 //! are the record.
+//!
+//! [`SandboxUsage`] is the other cost of a run: the time its commands ran in a sandbox, weighted by the
+//! shape of the sandbox. A tool reports it through the tool context, the loop keeps it in the run's state
+//! beside the totals, and the A2A server writes it on the task beside them (ADR 0043).
 
 use adam_model::Usage;
 use serde::{Deserialize, Serialize};
@@ -23,6 +27,9 @@ pub const MAX_USAGE_LABEL_BYTES: usize = 128;
 
 /// The most entries [`UsageTotals`] keeps: the contract's limit, one per provider and model.
 pub const MAX_USAGE_TOTALS: usize = 32;
+
+/// The most entries [`SandboxUsage`] keeps: the contract's limit, one per shape.
+pub const MAX_SANDBOX_ENTRIES: usize = 8;
 
 /// One model call completed: what it cost and where it ran.
 ///
@@ -164,6 +171,149 @@ impl UsageTotals {
     }
 }
 
+/// Where a run's commands ran, as far as a report says.
+///
+/// Ordered by how much is known: when two reports of one run disagree (a deployment that changed its
+/// environment between two turns), the one that measures wins, so measured time is never hidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum SandboxEnvironment {
+    /// The coder's own container: nothing is measured.
+    Local,
+    /// A dev container made from a repository's `devcontainer.json` or a default image: nothing is
+    /// measured.
+    Devcontainer,
+    /// A pod of the run's own: the time of its commands is measured.
+    Kubernetes,
+}
+
+impl SandboxEnvironment {
+    /// The word the contract uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Devcontainer => "devcontainer",
+            Self::Kubernetes => "kubernetes",
+        }
+    }
+
+    /// Whether the time of commands is measured in this environment. When it is not, a report says
+    /// where the run was and nothing else: *not measured*, which is not zero.
+    pub fn is_measured(self) -> bool {
+        match self {
+            Self::Local | Self::Devcontainer => false,
+            Self::Kubernetes => true,
+        }
+    }
+}
+
+/// The commands that ran in sandboxes of one shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SandboxEntry {
+    /// What the sandbox reserved for CPU, in thousandths of a core (`250` is `250m`). `None`: the
+    /// sandbox's template requests none, which is not zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_millis: Option<u64>,
+    /// What the sandbox reserved for memory, in bytes. `None`: it requests none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    /// How many commands ran.
+    pub commands: u64,
+    /// The sum of their wall times, in milliseconds, from the start of each command to its exit
+    /// (a command stopped by a timeout or a cancel counts until it was stopped). Commands that ran at
+    /// the same time are summed, so this can be more than the time the run took.
+    pub milliseconds: u64,
+}
+
+/// The time the commands of a run ran in a sandbox, one entry per shape of sandbox, at most
+/// [`MAX_SANDBOX_ENTRIES`], in the order each first appeared; and the environment they ran in.
+///
+/// It is empty until something asks for an environment. A **measured** environment
+/// ([`SandboxEnvironment::Kubernetes`]) with no entry is a run that asked for its pod and ran no
+/// command: a measured zero. An environment that is not measured has no entry ever.
+///
+/// Like [`UsageTotals`] it is kept in an agent's state, so it is as durable as the state, and it is
+/// merged into the parent's when a child run answers. Serialized as `{"environment": ..., "usage": [...]}`,
+/// each member left out while it is empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment: Option<SandboxEnvironment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    usage: Vec<SandboxEntry>,
+}
+
+impl SandboxUsage {
+    /// Nothing asked of an environment yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The run asked for its environment, `environment`, and ran nothing in it (yet).
+    pub fn in_environment(environment: SandboxEnvironment) -> Self {
+        Self {
+            environment: Some(environment),
+            usage: Vec::new(),
+        }
+    }
+
+    /// One command of `milliseconds` ran in a sandbox of the given shape, in a measured environment.
+    pub fn ran_command(
+        cpu_millis: Option<u64>,
+        memory_bytes: Option<u64>,
+        milliseconds: u64,
+    ) -> Self {
+        Self {
+            environment: Some(SandboxEnvironment::Kubernetes),
+            usage: vec![SandboxEntry {
+                cpu_millis,
+                memory_bytes,
+                commands: 1,
+                milliseconds,
+            }],
+        }
+    }
+
+    /// Whether nothing was reported: no environment asked for, no command.
+    pub fn is_empty(&self) -> bool {
+        self.environment.is_none() && self.usage.is_empty()
+    }
+
+    /// The environment the run's commands ran in, when it asked for one.
+    pub fn environment(&self) -> Option<SandboxEnvironment> {
+        self.environment
+    }
+
+    /// The entries, in the order each shape first appeared.
+    pub fn entries(&self) -> &[SandboxEntry] {
+        &self.usage
+    }
+
+    /// Count everything `other` says (a call's report, a child run's). A shape that would be a 9th
+    /// entry is not counted (and logged): the contract keeps 8, and a deployment has one template.
+    pub fn merge(&mut self, other: &SandboxUsage) {
+        self.environment = self.environment.max(other.environment);
+        for entry in &other.usage {
+            if let Some(mine) = self
+                .usage
+                .iter_mut()
+                .find(|e| e.cpu_millis == entry.cpu_millis && e.memory_bytes == entry.memory_bytes)
+            {
+                mine.commands = mine.commands.saturating_add(entry.commands);
+                mine.milliseconds = mine.milliseconds.saturating_add(entry.milliseconds);
+            } else if self.usage.len() >= MAX_SANDBOX_ENTRIES {
+                tracing::warn!(
+                    "a task's sandbox usage keeps {MAX_SANDBOX_ENTRIES} shapes; these commands are not in it"
+                );
+            } else {
+                self.usage.push(*entry);
+            }
+        }
+    }
+}
+
 /// `text` cut to at most `max` bytes, on a character boundary.
 fn cut(text: &str, max: usize) -> String {
     let mut end = text.len().min(max);
@@ -253,5 +403,100 @@ mod tests {
         // One already there still counts.
         totals.add(Some("openai"), "m0", Usage::new(1, 1));
         assert_eq!(totals.entries()[0].usage, Usage::new(2, 2));
+    }
+
+    #[test]
+    fn sandbox_commands_of_one_shape_are_one_entry_and_a_shape_that_differs_is_another() {
+        let mut usage = SandboxUsage::new();
+        assert!(usage.is_empty() && usage.environment().is_none());
+        usage.merge(&SandboxUsage::ran_command(
+            Some(250),
+            Some(536_870_912),
+            1_000,
+        ));
+        usage.merge(&SandboxUsage::ran_command(
+            Some(250),
+            Some(536_870_912),
+            2_500,
+        ));
+        usage.merge(&SandboxUsage::ran_command(Some(500), None, 40));
+        assert_eq!(usage.environment(), Some(SandboxEnvironment::Kubernetes));
+        let [first, second] = usage.entries() else {
+            panic!("two shapes: {usage:?}");
+        };
+        assert_eq!((first.commands, first.milliseconds), (2, 3_500));
+        assert_eq!((second.cpu_millis, second.memory_bytes), (Some(500), None));
+        assert_eq!((second.commands, second.milliseconds), (1, 40));
+    }
+
+    #[test]
+    fn a_childs_sandbox_usage_is_added_to_its_parents() {
+        let mut parent = SandboxUsage::ran_command(Some(250), Some(1), 100);
+        let mut child = SandboxUsage::ran_command(Some(250), Some(1), 50);
+        child.merge(&SandboxUsage::ran_command(Some(1000), Some(2), 7));
+        parent.merge(&child);
+        assert_eq!(parent.entries().len(), 2);
+        assert_eq!(parent.entries()[0].commands, 2);
+        assert_eq!(parent.entries()[0].milliseconds, 150);
+    }
+
+    #[test]
+    fn the_environment_that_measures_wins_and_asking_for_one_is_not_a_command() {
+        let mut usage = SandboxUsage::in_environment(SandboxEnvironment::Kubernetes);
+        assert!(!usage.is_empty());
+        assert!(
+            usage.entries().is_empty(),
+            "a pod asked for, no command: a measured zero"
+        );
+        usage.merge(&SandboxUsage::in_environment(SandboxEnvironment::Local));
+        assert_eq!(usage.environment(), Some(SandboxEnvironment::Kubernetes));
+
+        let mut local = SandboxUsage::in_environment(SandboxEnvironment::Local);
+        local.merge(&SandboxUsage::in_environment(
+            SandboxEnvironment::Devcontainer,
+        ));
+        assert_eq!(local.environment(), Some(SandboxEnvironment::Devcontainer));
+        assert!(!SandboxEnvironment::Local.is_measured());
+        assert!(!SandboxEnvironment::Devcontainer.is_measured());
+        assert!(SandboxEnvironment::Kubernetes.is_measured());
+    }
+
+    #[test]
+    fn sandbox_usage_keeps_at_most_8_shapes_and_saturates() {
+        let mut usage = SandboxUsage::new();
+        for n in 0..MAX_SANDBOX_ENTRIES as u64 + 3 {
+            usage.merge(&SandboxUsage::ran_command(Some(n), None, 1));
+        }
+        assert_eq!(usage.entries().len(), MAX_SANDBOX_ENTRIES);
+        // A shape already there still counts, and the counts never wrap.
+        usage.merge(&SandboxUsage::ran_command(Some(0), None, u64::MAX));
+        usage.merge(&SandboxUsage::ran_command(Some(0), None, 5));
+        assert_eq!(usage.entries()[0].milliseconds, u64::MAX);
+        assert_eq!(usage.entries()[0].commands, 3);
+    }
+
+    #[test]
+    fn sandbox_usage_serializes_what_it_knows_and_state_without_it_loads() {
+        assert_eq!(
+            serde_json::to_value(SandboxUsage::new()).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(SandboxUsage::in_environment(SandboxEnvironment::Local)).unwrap(),
+            json!({"environment": "local"})
+        );
+        let usage = SandboxUsage::ran_command(Some(250), None, 9);
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(
+            json,
+            json!({"environment": "kubernetes",
+                   "usage": [{"cpu_millis": 250, "commands": 1, "milliseconds": 9}]})
+        );
+        assert_eq!(serde_json::from_value::<SandboxUsage>(json).unwrap(), usage);
+        // State written before the member existed has no key at all.
+        assert_eq!(
+            serde_json::from_value::<SandboxUsage>(json!({})).unwrap(),
+            SandboxUsage::new()
+        );
     }
 }
