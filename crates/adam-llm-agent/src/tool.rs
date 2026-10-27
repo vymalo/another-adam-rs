@@ -1,13 +1,13 @@
 //! The [`Tool`] trait and the values that flow through it.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
 use adam_model::ToolSpec;
 use adam_runtime::{
     Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, MAX_RUN_FILE_BYTES, RunEvent,
-    StepEvent, StepIcon, StepKind, StepState,
+    SandboxUsage, StepEvent, StepIcon, StepKind, StepState,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -200,6 +200,13 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while it is `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ends_turn: bool,
+    /// The time the call's commands ran in a sandbox, as the call reported it
+    /// ([`ToolCtx::report_sandbox`]); the agent loop fills it in from what the call reported. Journaled
+    /// with the result, so the run counts it once, and a replay counts the same.
+    ///
+    /// Absent from a journal written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "SandboxUsage::is_empty")]
+    pub sandbox: SandboxUsage,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -215,6 +222,7 @@ impl ToolOutput {
             artifacts: Vec::new(),
             answer: None,
             ends_turn: false,
+            sandbox: SandboxUsage::new(),
         }
     }
 
@@ -227,6 +235,7 @@ impl ToolOutput {
             artifacts: Vec::new(),
             answer: None,
             ends_turn: false,
+            sandbox: SandboxUsage::new(),
         }
     }
 
@@ -433,6 +442,9 @@ pub struct ToolCtx {
     note: Option<ToolNote>,
     /// The bytes of files the run may still share ([`files_left`](Self::files_left)).
     files_left: u64,
+    /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
+    /// the context, so a tool may hand one to a task it spawns.
+    sandbox: Arc<Mutex<SandboxUsage>>,
 }
 
 impl ToolCtx {
@@ -468,6 +480,7 @@ impl ToolCtx {
             step,
             note: None,
             files_left: MAX_RUN_FILE_BYTES as u64,
+            sandbox: Arc::default(),
         }
     }
 
@@ -758,6 +771,30 @@ impl ToolCtx {
     pub async fn emit_progress(&self, message: impl Into<String>) {
         let update = self.step.clone().with_detail(message.into());
         self.emitter.emit(RunEvent::Step(update)).await;
+    }
+
+    /// Report that this call's commands ran in a sandbox (or that the run's environment was asked
+    /// for): the usage is added to what the call has reported so far.
+    ///
+    /// The loop takes it when the call returns and adds it to the run's
+    /// [`sandbox_usage`](crate::Conversation::sandbox_usage), in the same commit as the result: a
+    /// result it journaled carries it ([`ToolOutput::sandbox`]), so it is counted once and kept
+    /// across a restart. A call that returns [`ToolError::Permanent`] (a cancel, for one) is counted
+    /// too; one that fails with [`ToolError::Transient`] is tried again and counts only the try that
+    /// is kept.
+    pub fn report_sandbox(&self, usage: &SandboxUsage) {
+        self.sandbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .merge(usage);
+    }
+
+    /// What the call has reported with [`report_sandbox`](Self::report_sandbox) so far.
+    pub fn reported_sandbox(&self) -> SandboxUsage {
+        self.sandbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The id of this call's own step: `tool:<call id>`. The agent reports its start before the
