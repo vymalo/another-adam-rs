@@ -4273,3 +4273,201 @@ async fn a_slot_made_again_under_the_same_name_has_another_generation_of_its_git
         "and it is what the metadata says now"
     );
 }
+
+// ------------------------------------------------------------ the generation of a slot's directory
+
+/// The metadata file of the scratch slot `dir` of `run`, under `root`.
+fn scratch_meta_path(root: &Path, run: &str, dir: &str) -> PathBuf {
+    root.join("meta").join(run).join(format!("{dir}.json"))
+}
+
+/// Rewrite the metadata of a scratch slot with `edit`.
+fn edit_scratch_meta(
+    path: &Path,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    edit(meta.as_object_mut().unwrap());
+    std::fs::write(path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn a_repository_slot_has_the_generation_of_its_git_directory_and_a_new_one_when_made_again() {
+    let env = Env::new();
+    let run = env.ws.run("run-aaaaaaaa-1").unwrap();
+    let slot = run.add_repository(&env.repo).await.unwrap();
+    let generation = slot.generation().expect("recorded").to_owned();
+    assert_eq!(
+        slot.worktree().unwrap().git_dir_generation(),
+        Some(generation.as_str()),
+        "the directory is made with the git directory, so one token serves both"
+    );
+    // Listed again, by another handle: the same directory and the same token.
+    let again = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let listed = again
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .slot(slot.dir())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(listed.generation(), Some(generation.as_str()));
+
+    std::fs::remove_dir_all(slot.path()).unwrap();
+    let remade = run.add_repository(&env.repo).await.unwrap();
+    assert_ne!(remade.generation(), Some(generation.as_str()));
+    assert!(remade.generation().is_some());
+}
+
+#[tokio::test]
+async fn a_scratch_project_has_a_generation_and_the_same_one_for_as_long_as_it_is_the_same_directory()
+ {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_scratch("fib", &me()).await.unwrap();
+    let generation = slot.generation().expect("a new project has one").to_owned();
+    assert_eq!(
+        slot.scratch().unwrap().generation(),
+        Some(generation.as_str())
+    );
+    // A token a pod's annotation can hold: lowercase hex and a dash.
+    assert!(
+        generation
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-'),
+        "{generation}"
+    );
+    // Found again, also by another handle, and added again: the same directory, the same token.
+    let other = workspaces(tmp.path());
+    let listed = other.run(RUN).unwrap().slot("fib").await.unwrap().unwrap();
+    assert_eq!(listed.generation(), Some(generation.as_str()));
+    let added = run.add_scratch("fib", &me()).await.unwrap();
+    assert_eq!(added.generation(), Some(generation.as_str()));
+    // The file says it, so that it survives a restart.
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(scratch_meta_path(&tmp.path().join("root"), RUN, "fib")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["dir_gen"], generation.as_str());
+}
+
+#[tokio::test]
+async fn a_scratch_project_made_again_under_the_same_name_has_another_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = workspaces(tmp.path()).run(RUN).unwrap();
+    let slot = run.add_scratch("fib", &me()).await.unwrap();
+    let first = slot.generation().unwrap().to_owned();
+
+    // A lost volume: the metadata is there, the directory is not. Adding the project makes it again.
+    std::fs::remove_dir_all(slot.path()).unwrap();
+    assert!(run.slot("fib").await.unwrap().is_none(), "not listed");
+    let remade = run.add_scratch("fib", &me()).await.unwrap();
+    let second = remade.generation().expect("recorded").to_owned();
+    assert_ne!(
+        second, first,
+        "a pod made for the first mounts a directory that is gone"
+    );
+    assert_eq!(
+        run.slot("fib").await.unwrap().unwrap().generation(),
+        Some(second.as_str()),
+        "and the file says the new one"
+    );
+}
+
+#[tokio::test]
+async fn a_scratch_project_from_before_generations_has_none_until_it_is_made_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let run = workspaces(tmp.path()).run(RUN).unwrap();
+    let slot = run.add_scratch("fib", &me()).await.unwrap();
+    let meta = scratch_meta_path(&root, RUN, "fib");
+    edit_scratch_meta(&meta, |m| {
+        m.remove("dir_gen").expect("written");
+    });
+
+    // Metadata without the field reads, the project has none, and finding it again writes none: the
+    // lines of a pod made for it stay what they were, and the pod is not made again for nothing.
+    let listed = run.slot("fib").await.unwrap().unwrap();
+    assert_eq!(listed.generation(), None);
+    assert_eq!(
+        run.add_scratch("fib", &me()).await.unwrap().generation(),
+        None
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+    assert!(json.get("dir_gen").is_none(), "{json}");
+
+    // Made again, it is another directory and has one.
+    std::fs::remove_dir_all(slot.path()).unwrap();
+    let remade = run.add_scratch("fib", &me()).await.unwrap();
+    assert!(remade.generation().is_some());
+}
+
+#[tokio::test]
+async fn a_generation_in_the_metadata_that_is_not_a_token_is_not_believed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let run = workspaces(tmp.path()).run(RUN).unwrap();
+    run.add_scratch("fib", &me()).await.unwrap();
+    let meta = scratch_meta_path(&root, RUN, "fib");
+    // The metadata is the coder's, and no pod mounts it, but its text goes into a line of an
+    // annotation: a value that could end the line, or add one, is no token.
+    for bad in [
+        "",
+        "AB-1",
+        "1a\nrw /work/git",
+        "a".repeat(65).as_str(),
+        "../1",
+    ] {
+        edit_scratch_meta(&meta, |m| {
+            m.insert("dir_gen".to_owned(), bad.into());
+        });
+        let listed = run.slot("fib").await.unwrap().unwrap();
+        assert_eq!(listed.generation(), None, "{bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_scratch_project_taken_over_by_another_run_has_a_generation_of_its_own_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let first = ws.run("run-1").unwrap();
+    let site = first
+        .add_scratch_for("site", &me(), Some("c1"))
+        .await
+        .unwrap();
+    let before = site.generation().unwrap().to_owned();
+
+    let second = ws.run("run-2").unwrap();
+    assert_eq!(second.adopt_scratch("c1").await.unwrap(), ["site"]);
+    let taken = second.slot("site").await.unwrap().unwrap();
+    let after = taken.generation().expect("the project has one here");
+    // A pod of either run mounts the path it has: what the second run's pod made for an earlier
+    // `site` of its own mounted is not this directory.
+    assert_ne!(after, before);
+
+    // A project from before generations that is taken over gets one too: it is a new path.
+    edit_scratch_meta(
+        &scratch_meta_path(&tmp.path().join("root"), "run-2", "site"),
+        |m| {
+            m.remove("dir_gen");
+        },
+    );
+    assert_eq!(
+        second.slot("site").await.unwrap().unwrap().generation(),
+        None
+    );
+    let third = ws.run("run-3").unwrap();
+    assert_eq!(third.adopt_scratch("c1").await.unwrap(), ["site"]);
+    assert!(
+        third
+            .slot("site")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation()
+            .is_some()
+    );
+}

@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adam_env_kubernetes::{
-    KubeEnvironment, Placement, PodTemplate, Settings, WorkspaceMounts, WorktreeDirs, pod_name,
-    run_hash,
+    KubeEnvironment, Placement, PodTemplate, Settings, SlotMount, WorkspaceMounts, WorktreeDirs,
+    pod_name, run_hash,
 };
 use adam_workspace::{
     EnvError, EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec, NoProgress,
@@ -546,7 +546,7 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
     // The pod `ensure` makes for a run that has no worktree: the template with the run's own mount.
     let good = |run: &str| {
         let run_dir = PathBuf::from(format!("/work/workspaces/{run}"));
-        let mounts = WorkspaceMounts::plan(template.workspace_path(), &run_dir, &[]).unwrap();
+        let mounts = WorkspaceMounts::plan(template.workspace_path(), &run_dir, &[], &[]).unwrap();
         template.render(run, &pod_name(run), placement, &mounts)
     };
     let accepted = c.run_id("adm-ok");
@@ -792,6 +792,10 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
     let mounts = WorkspaceMounts::plan(
         template.workspace_path(),
         Path::new("/work/workspaces/kind-iso-a"),
+        &[SlotMount {
+            path: PathBuf::from("/work/workspaces/kind-iso-a/r"),
+            generation: Some("1a-0".to_owned()),
+        }],
         &[WorktreeDirs {
             mirror: PathBuf::from(&mirror),
             admin: PathBuf::from(&admin),
@@ -875,6 +879,36 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
     ))
     .await;
     assert_eq!(code, 0, "the run's own directories are writable: {out}");
+
+    // The slot is a mount point of its own: the pod cannot rename it, move it, remove it or exchange it,
+    // which is what lets the coder's `git`, that finds its work tree by name, rely on the name. A
+    // directory of the run that is not a slot is the pod's to rename (the control: the refusals are
+    // the mount's doing).
+    for change in [
+        "mv /work/workspaces/kind-iso-a/r /work/workspaces/kind-iso-a/r.moved",
+        "mv /work/workspaces/kind-iso-a/r /work/workspaces/kind-iso-a/elsewhere",
+        "rmdir /work/workspaces/kind-iso-a/r",
+    ] {
+        let (code, out) = sh(&format!("{change} 2>&1")).await;
+        assert_ne!(code, 0, "`{change}` changed the slot's directory: {out}");
+        assert!(
+            out.contains("busy"),
+            "`{change}` was refused for another reason: {out}"
+        );
+    }
+    let (code, out) = sh(
+        "cd /work/workspaces/kind-iso-a && mv r r.moved && ln -s ../kind-iso-b/r r; test -f r/README.md && test ! -L r",
+    )
+    .await;
+    assert_eq!(code, 0, "the slot is still the directory it was: {out}");
+    let (code, out) = sh("cd /work/workspaces/kind-iso-a && mkdir sibling && mv sibling sibling.moved && ln -s ../kind-iso-b sibling && rm sibling && rmdir sibling.moved").await;
+    assert_eq!(
+        code, 0,
+        "a directory that is not a slot renames and is replaced: {out}"
+    );
+    let (code, out) = sh("cd /work/workspaces/kind-iso-a/r && git status --short --branch").await;
+    assert_eq!(code, 0, "git works in the slot that is a mount: {out}");
+    assert!(out.contains("agent/kind-iso-a"), "{out}");
 
     // The mirror is read-only: its configuration, its hooks, its refs and its objects are the coder's.
     for write in [

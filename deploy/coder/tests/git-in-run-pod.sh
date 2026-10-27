@@ -18,7 +18,12 @@
 #   * the four read-only entries cannot be written, appended to, renamed over, replaced by a link or removed (the
 #     coder's git would follow a rewritten commondir to another repository, appends to a reflog that is a link,
 #     and resets the branch a rewritten HEAD names, which could be another run's), the files owned by the very uid
-#     that tries, and git still works with them: nothing git does for what a check needs writes HEAD.
+#     that tries, and git still works with them: nothing git does for what a check needs writes HEAD;
+#   * every slot (the worktree and the scratch project) is a mount point of its own on top of the run's directory:
+#     the pod cannot rename it, move it, remove it or exchange it with a sibling, which is what lets the coder's
+#     git, which finds its work tree by name, rely on the name (EBUSY); a directory of the run that is not a slot
+#     still renames, is replaced and is exchanged (the control: the refusals are the mounts' doing), the slot keeps
+#     its inode, and git works in it.
 #
 #   sudo sh deploy/coder/tests/git-in-run-pod.sh        (from the repository root; needs root, unshare and setpriv)
 #
@@ -39,8 +44,9 @@ fi
 
 fail=0
 volume=$(mktemp -d)
+exchange=$(mktemp)
 mkdir -p /work
-trap 'umount -R /work 2>/dev/null || true; rmdir /work 2>/dev/null || true; rm -rf "$volume"' EXIT
+trap 'umount -R /work 2>/dev/null || true; rmdir /work 2>/dev/null || true; rm -rf "$volume" "$exchange"' EXIT
 chmod 755 "$volume"
 chown 10001:10001 "$volume"
 
@@ -60,6 +66,7 @@ as_pod '
 set -eu
 mirror=/work/git/example.test/o/r.git
 mkdir -p /work/git/example.test/o /work/git/example.test/p /work/workspaces/a /work/workspaces/b /work/meta/b
+mkdir /work/workspaces/a/sibling /work/workspaces/a/sibling2
 git init -q --bare -b main "$mirror"
 git init -q --bare -b main /work/git/example.test/p/other.git
 git init -q -b main /tmp/git-in-run-pod-seed
@@ -85,11 +92,19 @@ mirror=/work/git/example.test/o/r.git
 admin=$(sed -n 's/^gitdir: //p' /work/workspaces/a/r/.git)
 case "$admin" in "$mirror"/worktrees/?*) ;; *) echo "FAIL the worktree's directory in the mirror is $admin"; exit 1 ;; esac
 
-# --- the run pod's view of run a: a tmpfs for the image's /work and the three mounts, parents first
+# --- the run pod's view of run a: a tmpfs for the image's /work and the mounts, parents first
 umount /work
 mount -t tmpfs tmpfs /work
 mkdir -p /work/workspaces/a "$mirror"
 mount --bind "$volume/workspaces/a" /work/workspaces/a
+# What the slot mounts below close: with only the run's directory mounted, the pod renames a slot and puts what it likes
+# at its name (this is the pod as it was before: `mv` and back leaves the volume as it was).
+ok "without a mount of its own a slot can be renamed and replaced by a link (what the slot mounts close)" \
+  "mv /work/workspaces/a/scratch /work/workspaces/a/scratch.moved && ln -s /work/workspaces/b/r /work/workspaces/a/scratch && rm /work/workspaces/a/scratch && mv /work/workspaces/a/scratch.moved /work/workspaces/a/scratch"
+# Each slot is a mount of its own on top of the run's directory (the pod's subPath mounts of workspaces/a/r and
+# workspaces/a/scratch): a mount point cannot be renamed, moved, removed or replaced from inside the pod.
+mount --bind "$volume/workspaces/a/r" /work/workspaces/a/r
+mount --bind "$volume/workspaces/a/scratch" /work/workspaces/a/scratch
 mount --bind "$volume/git/example.test/o/r.git" "$mirror"
 mount -o remount,bind,ro "$mirror"
 mount --bind "$volume/git/example.test/o/r.git/worktrees/${admin##*/}" "$admin"
@@ -158,6 +173,52 @@ else
 fi
 ok "git still works with them in place" "cd $w && git status --short && git log --oneline | grep -q seed && git diff --stat"
 ok "the other entries of the directory are writable (the index, a lock, a probe)" "touch $admin/probe2 && cd $w && touch README.md && git status --short && test -f $admin/index"
+
+echo "-- what the pod cannot do to a slot's directory"
+slots="/work/workspaces/a/r /work/workspaces/a/scratch"
+inodes=$(as_pod "stat -c '%i' $slots" | tr '\n' ' ')
+# renameat2(RENAME_EXCHANGE) of two paths, by hand: coreutils' mv has no --exchange on the runner. Prints the error.
+cat > "$exchange" <<'PY'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+AT_FDCWD, RENAME_EXCHANGE = -100, 2
+if libc.renameat2(AT_FDCWD, os.fsencode(sys.argv[1]), AT_FDCWD, os.fsencode(sys.argv[2]), RENAME_EXCHANGE) != 0:
+    err = ctypes.get_errno()
+    print(os.strerror(err))
+    sys.exit(err)
+PY
+chmod 644 "$exchange"
+if command -v python3 >/dev/null; then
+  have_exchange=1
+elif [ "${ADAM_TEST_REQUIRE_MOUNTS:-}" = 1 ]; then
+  echo "FAIL python3 is needed for the exchange of two directories, and ADAM_TEST_REQUIRE_MOUNTS=1"; fail=1; have_exchange=0
+else
+  echo "skipped the exchange of two directories: no python3"; have_exchange=0
+fi
+for slot in $slots; do
+  name=${slot##*/}
+  no "the slot $name cannot be renamed" "mv $slot $slot.moved"
+  says "and the reason is that it is a mount point ($name)" "mv $slot $slot.moved" 'busy'
+  no "the slot $name cannot be moved to another name of the run's directory" "mv $slot /work/workspaces/a/elsewhere"
+  no "the slot $name cannot be removed" "rmdir $slot"
+  says "and the reason is that it is a mount point (rmdir of $name)" "rmdir $slot" 'busy'
+  no "the slot $name cannot be replaced by a link to another run's slot" "mv $slot $slot.moved && ln -s /work/workspaces/b/r $slot"
+  if [ "$have_exchange" -eq 1 ]; then
+    no "the slot $name cannot be exchanged with a sibling" "python3 $exchange $slot /work/workspaces/a/sibling"
+    says "and the reason is that it is a mount point (exchange of $name)" "python3 $exchange $slot /work/workspaces/a/sibling" 'busy'
+  fi
+done
+no "the run's own directory cannot be renamed either" "mv /work/workspaces/a /work/workspaces/a2"
+equals "the slots are the very directories they were" "stat -c '%i' $slots" "$inodes"
+ok "the slots are what they were: a worktree's .git file, a scratch project's .git directory" "test -f /work/workspaces/a/r/.git && test -d /work/workspaces/a/scratch/.git"
+echo "-- the control: what is not a slot is the pod's to rename, replace and exchange"
+ok "a directory of the run that is not a slot renames" "mv /work/workspaces/a/sibling /work/workspaces/a/sibling.moved && mv /work/workspaces/a/sibling.moved /work/workspaces/a/sibling"
+ok "and can be replaced by a link" "mv /work/workspaces/a/sibling /work/workspaces/a/sibling.moved && ln -s /work/workspaces/b /work/workspaces/a/sibling && rm /work/workspaces/a/sibling && mv /work/workspaces/a/sibling.moved /work/workspaces/a/sibling"
+if [ "$have_exchange" -eq 1 ]; then
+  ok "and exchanged with another" "python3 $exchange /work/workspaces/a/sibling /work/workspaces/a/sibling2 && python3 $exchange /work/workspaces/a/sibling /work/workspaces/a/sibling2"
+fi
+ok "git works in the slots that are mounts" "cd $w && git status --short --branch | grep -q agent/a && cd /work/workspaces/a/scratch && git status --short"
+ok "and the slot is written in, as before" "echo z > $w/z.txt && echo z > /work/workspaces/a/scratch/z.txt && rm $w/z.txt /work/workspaces/a/scratch/z.txt"
 
 echo "-- what is refused"
 no "add" "cd $w && echo z > z.txt && git add z.txt"

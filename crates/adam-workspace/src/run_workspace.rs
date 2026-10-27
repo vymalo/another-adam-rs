@@ -112,6 +112,20 @@ impl Slot {
         }
     }
 
+    /// Which making of the slot's directory this is: a token that is new each time the coder makes
+    /// the directory (or moves a project into a run's workspace), and the same for as long as it is
+    /// the same directory. A run pod mounts a directory, not the name it has, so a pod made for a
+    /// slot that was removed and added again under the same name mounts the old one: a caller that
+    /// records what a pod mounted records this with the slot's path, and makes the pod again when it
+    /// changes. A repository slot's directory is made together with its git directory, so this is
+    /// [`Worktree::git_dir_generation`]. `None` for a slot made before it was recorded.
+    pub fn generation(&self) -> Option<&str> {
+        match &self.kind {
+            SlotKind::Repository(wt) => wt.git_dir_generation(),
+            SlotKind::Scratch(s) => s.generation(),
+        }
+    }
+
     /// The worktree, for a repository slot.
     pub fn worktree(&self) -> Option<&Worktree> {
         match &self.kind {
@@ -179,6 +193,11 @@ impl Scratch {
     /// The slot's directory name.
     pub fn dir(&self) -> &str {
         &self.dir
+    }
+
+    /// Which making of the project's directory this is ([`Slot::generation`]).
+    pub fn generation(&self) -> Option<&str> {
+        None
     }
 
     /// The conversation of the run that made the project (see [`RunWorkspace::add_scratch_for`]), as

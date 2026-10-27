@@ -107,6 +107,17 @@ pub struct WorktreeDirs {
     pub generation: Option<String>,
 }
 
+/// A slot's directory, which the pod mounts on its own on top of the run's directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotMount {
+    /// The slot's directory: `<run_dir>/<slot>`.
+    pub path: PathBuf,
+    /// Which making of that directory this is (`Slot::generation`): recorded with the mounts of a
+    /// pod, so that a slot removed and added again under the same name makes the pod again.
+    /// `None` for a slot made before it was recorded.
+    pub generation: Option<String>,
+}
+
 /// The mounts of the workspace volume a run pod gets, for one run's workspace as it is now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceMounts {
@@ -122,7 +133,13 @@ impl WorkspaceMounts {
     ///
     /// [`EnvError::Refused`] for a path that is not absolute and plain text, is not below `base`, or a
     /// worktree directory that is not inside its mirror's `worktrees/`.
-    pub fn plan(base: &Path, run_dir: &Path, worktrees: &[WorktreeDirs]) -> Result<Self, EnvError> {
+    pub fn plan(
+        base: &Path,
+        run_dir: &Path,
+        slots: &[SlotMount],
+        worktrees: &[WorktreeDirs],
+    ) -> Result<Self, EnvError> {
+        let _ = slots;
         let mut wanted: BTreeMap<PathBuf, (bool, Option<String>)> = BTreeMap::new();
         wanted.insert(run_dir.to_owned(), (false, None));
         for dirs in worktrees {
@@ -233,7 +250,7 @@ impl WorkspaceMounts {
                 ),
             }
         }
-        Self::plan(base, run_dir, &dirs)
+        Self::plan(base, run_dir, &[], &dirs)
     }
 }
 
@@ -303,7 +320,18 @@ mod tests {
     }
 
     fn plan(worktrees: &[WorktreeDirs]) -> WorkspaceMounts {
-        WorkspaceMounts::plan(Path::new(BASE), Path::new(RUN), worktrees).unwrap()
+        plan_with(&[], worktrees)
+    }
+
+    fn plan_with(slots: &[SlotMount], worktrees: &[WorktreeDirs]) -> WorkspaceMounts {
+        WorkspaceMounts::plan(Path::new(BASE), Path::new(RUN), slots, worktrees).unwrap()
+    }
+
+    fn slot(name: &str, generation: Option<&str>) -> SlotMount {
+        SlotMount {
+            path: PathBuf::from(format!("{RUN}/{name}")),
+            generation: generation.map(str::to_owned),
+        }
     }
 
     fn lines(mounts: &WorkspaceMounts) -> Vec<String> {
@@ -454,6 +482,7 @@ mod tests {
         let refused = |run: &str, worktrees: &[WorktreeDirs]| match WorkspaceMounts::plan(
             Path::new(BASE),
             Path::new(run),
+            &[],
             worktrees,
         )
         .unwrap_err()
@@ -477,5 +506,119 @@ mod tests {
             generation: None,
         };
         assert!(refused(RUN, &[deep]).contains("not a worktree directory"));
+    }
+
+    #[test]
+    fn every_slot_is_a_mount_of_its_own_on_top_of_the_runs_directory() {
+        let mounts = plan_with(
+            &[slot("notes", Some("2b-1")), slot("app", Some("1a-0"))],
+            &[dirs("/work/git/github.com/o/r.git", "r1")],
+        );
+        let all = lines(&mounts);
+        // By path: the mirror and what is in it, then the run's directory, then each slot in it.
+        assert_eq!(
+            all[all.len() - 3..],
+            [
+                "rw /work/workspaces/r1",
+                "rw /work/workspaces/r1/app @1a-0",
+                "rw /work/workspaces/r1/notes @2b-1",
+            ]
+        );
+        let slots: Vec<_> = mounts
+            .iter()
+            .filter(|m| m.path().starts_with("/work/workspaces/r1/"))
+            .map(|m| (m.sub_path(), m.read_only(), m.generation()))
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                ("workspaces/r1/app", false, Some("1a-0")),
+                ("workspaces/r1/notes", false, Some("2b-1")),
+            ],
+            "read-write, relative to where the template mounts the volume"
+        );
+        assert_eq!(all.len(), 1 + (1 + 1 + 4) + 2, "{all:?}");
+    }
+
+    #[test]
+    fn a_slot_comes_after_the_directory_it_is_mounted_in_whatever_order_it_is_given() {
+        let mounts = plan_with(&[slot("zeta", None), slot("alpha", None)], &[]);
+        assert_eq!(
+            lines(&mounts),
+            [
+                "rw /work/workspaces/r1",
+                "rw /work/workspaces/r1/alpha",
+                "rw /work/workspaces/r1/zeta",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_slot_removed_and_added_again_under_the_same_name_is_missing_from_the_pod_of_the_earlier_one()
+     {
+        let first = plan_with(&[slot("notes", Some("1a-0"))], &[]);
+        let again = plan_with(&[slot("notes", Some("2b-1"))], &[]);
+        assert!(first.missing_from(Some(&first.encode())).is_none());
+        let missing = again.missing_from(Some(&first.encode())).unwrap();
+        assert_eq!(missing.path(), Path::new("/work/workspaces/r1/notes"));
+        assert_eq!(missing.generation(), Some("2b-1"));
+        // A slot that went away leaves the pod with a mount it does not need: not a reason to make it again.
+        assert!(
+            plan_with(&[], &[])
+                .missing_from(Some(&first.encode()))
+                .is_none()
+        );
+        // And a slot added since is one the pod lacks.
+        let two = plan_with(
+            &[slot("notes", Some("1a-0")), slot("site", Some("3c-2"))],
+            &[],
+        );
+        let missing = two.missing_from(Some(&first.encode())).unwrap();
+        assert_eq!(missing.path(), Path::new("/work/workspaces/r1/site"));
+    }
+
+    #[test]
+    fn a_slot_made_before_generations_keeps_the_line_it_always_had() {
+        let old = plan_with(&[slot("notes", None)], &[]);
+        assert_eq!(
+            lines(&old),
+            ["rw /work/workspaces/r1", "rw /work/workspaces/r1/notes"]
+        );
+        // A pod made for it is not made again for nothing.
+        assert!(old.missing_from(Some(&old.encode())).is_none());
+        // One made again has a generation, and the pod made for the earlier one lacks it.
+        let remade = plan_with(&[slot("notes", Some("2b-1"))], &[]);
+        assert!(remade.missing_from(Some(&old.encode())).is_some());
+    }
+
+    #[test]
+    fn a_pod_made_before_slots_were_mounted_lacks_every_slot_it_has() {
+        let before = plan(&[dirs("/work/git/github.com/o/a.git", "a")]);
+        let now = plan_with(
+            &[slot("a", Some("1a-0")), slot("notes", None)],
+            &[dirs("/work/git/github.com/o/a.git", "a")],
+        );
+        let missing = now.missing_from(Some(&before.encode())).unwrap();
+        assert_eq!(missing.path(), Path::new("/work/workspaces/r1/a"));
+    }
+
+    #[test]
+    fn a_slot_that_is_not_a_direct_child_of_the_runs_directory_is_refused() {
+        let refused = |path: &str| {
+            let slot = SlotMount {
+                path: PathBuf::from(path),
+                generation: None,
+            };
+            match WorkspaceMounts::plan(Path::new(BASE), Path::new(RUN), &[slot], &[]).unwrap_err()
+            {
+                EnvError::Refused(why) => why,
+                other => panic!("{other}"),
+            }
+        };
+        assert!(refused("/work/workspaces/r2/app").contains("not a slot of"));
+        assert!(refused("/work/workspaces/r1/a/b").contains("not a slot of"));
+        assert!(refused(RUN).contains("not a slot of"));
+        assert!(refused("/work/workspaces/r1/..").contains("not a slot of"));
+        assert!(refused("/work/workspaces/r1/a\nb").contains("plain text"));
     }
 }

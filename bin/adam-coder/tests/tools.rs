@@ -24,6 +24,7 @@ use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
 use adam_runtime::{
     CancelToken, CollectingSink, RunEvent, StepEvent, StepIcon, StepKind, StepState,
 };
+use adam_workspace::EnvError;
 use common::{Fixture, PR_URL};
 use serde_json::{Value, json};
 
@@ -6052,4 +6053,151 @@ async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
         2,
         "each call keeps its own record"
     );
+}
+
+// ------------------------------------------------------------------ sealing the environment
+
+/// A rig whose environment records what it is asked to seal, and the environment.
+async fn sealing_rig() -> (Rig, Arc<common::FakeEnvironment>) {
+    let fx = Fixture::new("hello\n").await;
+    let fake = common::FakeEnvironment::new(Some(&fx.root));
+    (Rig::from(fx.using(fake.clone())), fake)
+}
+
+/// What the environment was asked to seal: the run, and the slots the workspace had by then.
+fn sealed(fake: &common::FakeEnvironment) -> Vec<(String, Vec<String>)> {
+    fake.sealed.lock().unwrap().clone()
+}
+
+/// The directory name of the slot a repository added by `prepare` gets.
+fn repository_slot(rig: &Rig) -> String {
+    common::slot_dir(&rig.fx.root, &rig.ctx.run_id().to_string())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[tokio::test]
+async fn prepare_workspace_seals_the_environment_right_after_it_adds_the_worktree() {
+    let (rig, fake) = sealing_rig().await;
+    let run = rig.ctx.run_id().to_string();
+    let out = rig.prepare().await;
+    assert!(!out.is_error, "{}", out.content);
+    let slot = repository_slot(&rig);
+    assert_eq!(
+        sealed(&fake),
+        [(run.clone(), vec![slot.clone()])],
+        "once, and by then the slot was there"
+    );
+    assert!(!out.content.contains("environment"), "{}", out.content);
+
+    // Asking again for what the run has is harmless, and seals again: a call that died after it added
+    // the slot and before it sealed is repaired by the retry.
+    let again = rig.prepare().await;
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(sealed(&fake).len(), 2);
+}
+
+#[tokio::test]
+async fn start_scratch_seals_the_environment_right_after_it_starts_the_project() {
+    let (rig, fake) = sealing_rig().await;
+    let run = rig.ctx.run_id().to_string();
+    let out = start_scratch(&rig, "fib").await;
+    assert!(!out.content.contains("environment"), "{}", out.content);
+    assert_eq!(sealed(&fake), [(run.clone(), vec!["fib".to_owned()])]);
+    start_scratch(&rig, "fib").await;
+    assert_eq!(
+        sealed(&fake).len(),
+        2,
+        "also for a project that is already there"
+    );
+    start_scratch(&rig, "site").await;
+    assert_eq!(
+        sealed(&fake).last().unwrap(),
+        &(run, vec!["fib".to_owned(), "site".to_owned()])
+    );
+}
+
+#[tokio::test]
+async fn publish_scratch_seals_the_environment_after_it_adds_the_repositorys_slot() {
+    let (rig, fake) = sealing_rig().await;
+    let run = rig.ctx.run_id().to_string();
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    let before = sealed(&fake).len();
+    let empty = rig.fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let calls = sealed(&fake);
+    assert_eq!(calls.len(), before + 1, "{calls:?}");
+    let (sealed_run, slots) = calls.last().unwrap();
+    assert_eq!(sealed_run, &run);
+    assert!(
+        slots.contains(&"fibonacci".to_owned()) && slots.contains(&"fib".to_owned()),
+        "by then the repository's slot was there: {slots:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_seal_that_cannot_be_done_now_is_told_in_the_result_and_the_slot_stays() {
+    let (rig, fake) = sealing_rig().await;
+    *fake.seal_fails.lock().unwrap() = Some(|| {
+        EnvError::Unavailable(format!(
+            "the run's workspace has a slot its pod does not mount, and a command is running in the pod; key {}",
+            common::MODEL_KEY
+        ))
+    });
+
+    let out = rig.prepare().await;
+    assert!(!out.is_error, "the worktree was made: {}", out.content);
+    assert!(
+        out.content.starts_with("Worktree ready."),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("a command is running in the pod"),
+        "the model is told why: {}",
+        out.content
+    );
+    assert!(
+        !out.content.contains(common::MODEL_KEY),
+        "scrubbed like every environment error: {}",
+        out.content
+    );
+    assert!(repository_slot_exists(&rig), "the slot stays");
+
+    let out = start_scratch(&rig, "fib").await;
+    assert!(
+        out.content.starts_with("Scratch project ready.")
+            && out.content.contains("a command is running in the pod"),
+        "{}",
+        out.content
+    );
+    assert!(
+        slot_of(&rig, "fib").join(".git").is_dir(),
+        "and so does the project"
+    );
+}
+
+fn repository_slot_exists(rig: &Rig) -> bool {
+    common::slot_dir(&rig.fx.root, &rig.ctx.run_id().to_string())
+        .join(".git")
+        .exists()
+}
+
+#[tokio::test]
+async fn the_default_environment_has_nothing_to_seal_and_the_results_say_nothing_of_it() {
+    // `Local`: the default of every other test.
+    let rig = Rig::new().await;
+    let out = rig.prepare().await;
+    assert!(!out.content.contains("environment"), "{}", out.content);
+    let out = start_scratch(&rig, "fib").await;
+    assert!(!out.content.contains("environment"), "{}", out.content);
 }

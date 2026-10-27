@@ -70,7 +70,7 @@ mod fake;
 pub use environment::{KubeEnvironment, install_crypto_provider};
 pub use exec::{ExecError, ExitStatus, Target, exit_status, stdin_is_null, stream};
 pub use invocation::{DEFAULT_ADAM_EXEC, Invocation, Mode, UsageError, is_env_name, is_exec_id};
-pub use mounts::{Mount, WorkspaceMounts, WorktreeDirs};
+pub use mounts::{Mount, SlotMount, WorkspaceMounts, WorktreeDirs};
 pub use names::{
     INSTANCE_LABEL, MANAGED_BY, MANAGED_BY_LABEL, MOUNTS_ANNOTATION, RUN_ID_ANNOTATION, RUN_LABEL,
     WORKER_ANNOTATION, is_label_value, pod_name, run_hash, selector,

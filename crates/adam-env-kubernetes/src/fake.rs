@@ -976,13 +976,16 @@ mod tests {
         mounts
     }
 
-    /// The mounts of a run pod with the given worktrees (`(mirror, admin)`).
+    /// The mounts of a run pod with the given slots (each a mount of its own, read-write) and
+    /// worktrees (`(mirror, admin)`).
     fn expected_with(
         fx: &Fixture,
         run: &Path,
+        slots: &[&Path],
         worktrees: &[(&Path, &Path)],
     ) -> Vec<(String, String, bool)> {
         let mut all: Vec<(PathBuf, bool)> = vec![(run.to_owned(), false)];
+        all.extend(slots.iter().map(|slot| ((*slot).to_owned(), false)));
         let mut mirrors = std::collections::BTreeSet::new();
         for (mirror, admin) in worktrees {
             if mirrors.insert(mirror.to_owned()) {
@@ -1049,7 +1052,7 @@ mod tests {
         fx.env.ensure(&ws, &Steps::default()).await.unwrap();
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected_with(&fx, ws.path(), &[(&mirror, &admin)])
+            expected_with(&fx, ws.path(), &[slot.path()], &[(&mirror, &admin)])
         );
         // What git follows out of the worktree's directory is read-only in it.
         let mounts = fx.work_mounts(&pod_name(RUN));
@@ -1074,12 +1077,13 @@ mod tests {
         let ws = fx.ws(RUN);
         let a = ws.add_repository(&fx.remote("alpha")).await.unwrap();
         let b = ws.add_repository(&fx.remote("beta")).await.unwrap();
-        ws.add_scratch(
-            "notes",
-            &adam_workspace::GitIdentity::new("Adam", "a@example.com"),
-        )
-        .await
-        .unwrap();
+        let notes = ws
+            .add_scratch(
+                "notes",
+                &adam_workspace::GitIdentity::new("Adam", "a@example.com"),
+            )
+            .await
+            .unwrap();
         // Another run's worktree of the same repository: its directory in the mirror is not this run's.
         let other = fx.ws(OTHER);
         let theirs = other.add_repository(&fx.remote("alpha")).await.unwrap();
@@ -1093,8 +1097,13 @@ mod tests {
         let (aa, ab) = (admin_of(&a), admin_of(&b));
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected_with(&fx, ws.path(), &[(&ma, &aa), (&mb, &ab)]),
-            "the scratch project is inside the run's directory and needs nothing of its own"
+            expected_with(
+                &fx,
+                ws.path(),
+                &[a.path(), b.path(), notes.path()],
+                &[(&ma, &aa), (&mb, &ab)]
+            ),
+            "each slot is a mount of its own, the scratch project too, and it needs no git directory"
         );
         assert!(
             !fx.work_mounts(&pod_name(RUN))
@@ -1136,7 +1145,7 @@ mod tests {
         let mirror = mine.worktree().unwrap().mirror().to_owned();
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected_with(&fx, ws.path(), &[(&mirror, &my_dir)]),
+            expected_with(&fx, ws.path(), &[mine.path()], &[(&mirror, &my_dir)]),
             "the mounts come from the coder's metadata"
         );
         assert!(
@@ -1167,7 +1176,8 @@ mod tests {
             json.as_object_mut().unwrap().remove("admin");
             std::fs::write(&meta, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
         };
-        let only_the_run = expected(&fx, &[(ws.path(), false)]);
+        // The slot is its own mount whatever git can be told of it; its git directories are not.
+        let only_the_run = expected(&fx, &[(ws.path(), false), (slot.path(), false)]);
 
         // A slot from before the directory was recorded, with two directories that name it.
         forget();
@@ -1198,7 +1208,7 @@ mod tests {
         fx.env.ensure(&ws, &Steps::default()).await.unwrap();
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected_with(&fx, ws.path(), &[(&mirror, &admin)]),
+            expected_with(&fx, ws.path(), &[slot.path()], &[(&mirror, &admin)]),
             "unambiguous"
         );
     }
@@ -1210,8 +1220,8 @@ mod tests {
         let slot = ws.add_repository(&fx.remote("app")).await.unwrap();
         let mirror = slot.worktree().unwrap().mirror().to_owned();
         let admin = admin_of(&slot);
-        let only_the_run = expected(&fx, &[(ws.path(), false)]);
-        let whole = expected_with(&fx, ws.path(), &[(&mirror, &admin)]);
+        let only_the_run = expected(&fx, &[(ws.path(), false), (slot.path(), false)]);
+        let whole = expected_with(&fx, ws.path(), &[slot.path()], &[(&mirror, &admin)]);
 
         // A link where a read-only file would be mounted: the mount would follow it to a place
         // the coder did not name.
@@ -1300,7 +1310,12 @@ mod tests {
         let (aa, ab) = (admin_of(&a), admin_of(&b));
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected_with(&fx, ws.path(), &[(&ma, &aa), (&mb, &ab)])
+            expected_with(
+                &fx,
+                ws.path(),
+                &[a.path(), b.path()],
+                &[(&ma, &aa), (&mb, &ab)]
+            )
         );
         // It asked the old pod whether a command ran before it was deleted, and said why.
         let commands = fx.exec.lock().unwrap().commands.clone();
@@ -1338,6 +1353,10 @@ mod tests {
             mounted.contains(&format!("rw {} @", admin.display())),
             "the directory is recorded with its generation: {mounted}"
         );
+        assert!(
+            mounted.contains(&format!("rw {} @", slot.path().display())),
+            "and so is the slot's own: {mounted}"
+        );
         // Nothing changed: the pod is the pod.
         fx.env.ensure(&ws, &Steps::default()).await.unwrap();
         assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (1, 0));
@@ -1369,6 +1388,153 @@ mod tests {
         // And that pod is the pod now.
         fx.env.ensure(&ws, &Steps::default()).await.unwrap();
         assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+    }
+
+    fn me() -> adam_workspace::GitIdentity {
+        adam_workspace::GitIdentity::new("Adam", "a@example.com")
+    }
+
+    #[tokio::test]
+    async fn a_scratch_project_added_after_the_pod_exists_is_mounted_by_making_the_pod_again() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (1, 0));
+
+        let notes = ws.add_scratch("notes", &me()).await.unwrap();
+        let steps = Steps::default();
+        fx.env.ensure(&ws, &steps).await.unwrap();
+        assert_eq!(
+            (fx.requests("POST"), fx.requests("DELETE")),
+            (2, 1),
+            "made again"
+        );
+        assert_eq!(
+            fx.work_mounts(&pod_name(RUN)),
+            expected(&fx, &[(ws.path(), false), (notes.path(), false)])
+        );
+        assert!(steps.0.lock().unwrap().iter().any(|s| {
+            s.detail.as_deref().is_some_and(|d| {
+                d.contains("making the pod again")
+                    && d.contains(&notes.path().display().to_string())
+            })
+        }));
+        let recorded = fx
+            .annotation(&pod_name(RUN), "adam.vymalo.com/workspace-mounts")
+            .unwrap();
+        assert!(
+            recorded.contains(&format!("rw {} @", notes.path().display())),
+            "{recorded}"
+        );
+        // And that pod is the pod now.
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_scratch_project_made_again_under_the_same_name_has_the_pod_made_again() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        let notes = ws.add_scratch("notes", &me()).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        let before = fx
+            .annotation(&pod_name(RUN), "adam.vymalo.com/workspace-mounts")
+            .unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (1, 0));
+
+        // The directory is lost and the project is started again: the same name, another directory,
+        // which the pod's mount of the old one does not follow.
+        std::fs::remove_dir_all(notes.path()).unwrap();
+        ws.add_scratch("notes", &me()).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+        let after = fx
+            .annotation(&pod_name(RUN), "adam.vymalo.com/workspace-mounts")
+            .unwrap();
+        assert_ne!(after, before, "the new pod records the new directory");
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_scratch_project_from_before_generations_keeps_the_pod_made_for_it() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        let notes = ws.add_scratch("notes", &me()).await.unwrap();
+        // Metadata written before the generation was recorded.
+        let meta = fx
+            .workspaces
+            .root()
+            .join("meta")
+            .join(RUN)
+            .join("notes.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("dir_gen");
+        std::fs::write(&meta, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        let recorded = fx
+            .annotation(&pod_name(RUN), "adam.vymalo.com/workspace-mounts")
+            .unwrap();
+        assert!(
+            recorded
+                .lines()
+                .any(|line| line == format!("rw {}", notes.path().display())),
+            "the line it always had: {recorded}"
+        );
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(
+            (fx.requests("POST"), fx.requests("DELETE")),
+            (1, 0),
+            "not made again for nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pod_made_before_slots_were_mounted_is_made_again_for_them() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        let slot = ws.add_repository(&fx.remote("alpha")).await.unwrap();
+        let notes = ws.add_scratch("notes", &me()).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        // What an earlier version recorded: the run's directory and the git directories, no slot.
+        let pod = pod_name(RUN);
+        {
+            let mut st = lock(&fx.api);
+            let annotations = st
+                .pods
+                .get_mut(&pod)
+                .unwrap()
+                .metadata
+                .annotations
+                .as_mut()
+                .unwrap();
+            let kept: Vec<String> = annotations["adam.vymalo.com/workspace-mounts"]
+                .lines()
+                .filter(|line| {
+                    !line.contains(&slot.path().display().to_string())
+                        && !line.contains(&notes.path().display().to_string())
+                })
+                .map(str::to_owned)
+                .collect();
+            annotations.insert(
+                "adam.vymalo.com/workspace-mounts".to_owned(),
+                kept.join("\n"),
+            );
+        }
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+        assert!(
+            fx.work_mounts(&pod)
+                .iter()
+                .any(|(path, _, _)| Path::new(path) == slot.path())
+        );
     }
 
     #[tokio::test]
@@ -1447,6 +1613,185 @@ mod tests {
             fx.annotation(&pod, "adam.vymalo.com/workspace-mounts")
                 .is_some()
         );
+    }
+
+    // ----- seal ---------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn seal_deletes_a_pod_that_lacks_a_slot_when_no_command_runs_in_it() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        ws.add_repository(&fx.remote("alpha")).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        let pod = pod_name(RUN);
+
+        // Each kind of slot, right after it was added.
+        for slot in ["worktree", "scratch"] {
+            if slot == "worktree" {
+                ws.add_repository(&fx.remote("beta")).await.unwrap();
+            } else {
+                ws.add_scratch("notes", &me()).await.unwrap();
+            }
+            let (posts, deletes) = (fx.requests("POST"), fx.requests("DELETE"));
+            fx.env.seal(&ws).await.unwrap();
+            assert_eq!(
+                fx.requests("DELETE"),
+                deletes + 1,
+                "{slot}: the stale pod is deleted"
+            );
+            assert_eq!(fx.requests("POST"), posts, "{slot}: and none is made");
+            assert!(fx.pod_names().is_empty(), "{slot}");
+            // The next command makes the pod, with the slot mounted.
+            fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+            assert_eq!(fx.requests("POST"), posts + 1, "{slot}");
+            assert!(fx.pod_names().contains(&pod));
+        }
+        // The pod that was made has every slot: sealing again deletes nothing.
+        let deletes = fx.requests("DELETE");
+        fx.env.seal(&ws).await.unwrap();
+        assert_eq!(fx.requests("DELETE"), deletes);
+        assert_eq!(
+            fx.work_mounts(&pod)
+                .iter()
+                .filter(|(path, _, ro)| !ro && path.starts_with(&ws.path().display().to_string()))
+                .count(),
+            1 + 3,
+            "the run's directory and its three slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_leaves_a_pod_alone_while_a_command_runs_in_it_and_says_why() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        let notes = ws.add_scratch("notes", &me()).await.unwrap();
+
+        fx.exec.lock().unwrap().active = Some(1);
+        let error = fx.env.seal(&ws).await.expect_err("a command runs");
+        assert!(matches!(error, EnvError::Unavailable(_)), "{error}");
+        assert_eq!(
+            error.class(),
+            ErrorClass::Transient,
+            "it ends, and the pod is made again"
+        );
+        let said = error.to_string();
+        assert!(said.contains("command is running"), "{said}");
+        assert!(said.contains(&notes.path().display().to_string()), "{said}");
+        assert_eq!(fx.requests("DELETE"), 0, "the command is not killed");
+        assert_eq!(fx.pod_names().len(), 1);
+
+        // A pod that cannot be asked is left too.
+        fx.exec.lock().unwrap().active = None;
+        let error = fx.env.seal(&ws).await.expect_err("cannot ask");
+        assert!(matches!(error, EnvError::Unavailable(_)), "{error}");
+        assert_eq!(fx.requests("DELETE"), 0);
+
+        // The command ends; the next ensure makes the pod again, and sealing finds nothing to do.
+        fx.exec.lock().unwrap().active = Some(0);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+        fx.env.seal(&ws).await.unwrap();
+        assert_eq!(fx.requests("DELETE"), 1);
+    }
+
+    #[tokio::test]
+    async fn seal_with_no_pod_does_nothing_and_never_makes_one() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        ws.add_repository(&fx.remote("alpha")).await.unwrap();
+        ws.add_scratch("notes", &me()).await.unwrap();
+        fx.env.seal(&ws).await.unwrap();
+        assert!(fx.pod_names().is_empty());
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (0, 0));
+        assert!(
+            fx.exec.lock().unwrap().commands.is_empty(),
+            "nothing is asked of a pod that is not there"
+        );
+        // The run's directory was not made for a pod that is not made either.
+        let fresh = fx.ws(OTHER);
+        fx.env.seal(&fresh).await.unwrap();
+        assert!(!fresh.path().exists());
+    }
+
+    #[tokio::test]
+    async fn seal_leaves_a_pod_that_has_every_mount_and_asks_nothing_of_it() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        ws.add_repository(&fx.remote("alpha")).await.unwrap();
+        ws.add_scratch("notes", &me()).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(1);
+        fx.env.seal(&ws).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (1, 0));
+        assert!(
+            fx.exec.lock().unwrap().commands.is_empty(),
+            "a pod that needs nothing is not asked whether it is busy"
+        );
+        // A mount the pod has and the run no longer needs is no reason either.
+        lock(&fx.api)
+            .pods
+            .get_mut(&pod_name(RUN))
+            .unwrap()
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .entry("adam.vymalo.com/workspace-mounts".to_owned())
+            .and_modify(|v| v.push_str("\nrw /work/workspaces/gone"));
+        fx.env.seal(&ws).await.unwrap();
+        assert_eq!(fx.requests("DELETE"), 0);
+    }
+
+    #[tokio::test]
+    async fn seal_deletes_a_pod_that_is_not_ready_without_asking_it() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        // The pod is up and then goes back to waiting (a restart of its container).
+        {
+            let mut st = lock(&fx.api);
+            st.stuck = Some(pull_failure());
+            st.pods.get_mut(&pod_name(RUN)).unwrap().status = Some(pull_failure());
+        }
+        ws.add_scratch("notes", &me()).await.unwrap();
+        fx.env.seal(&ws).await.unwrap();
+        assert_eq!(fx.requests("DELETE"), 1);
+        assert!(fx.exec.lock().unwrap().commands.is_empty());
+        assert_eq!(fx.requests("POST"), 1, "and none is made");
+    }
+
+    #[tokio::test]
+    async fn seal_leaves_the_pod_of_another_run_alone() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        fx.exec.lock().unwrap().active = Some(0);
+        ws.add_scratch("notes", &me()).await.unwrap();
+        // The name of the run's pod is another run's (a collision of the names).
+        lock(&fx.api)
+            .pods
+            .get_mut(&pod_name(RUN))
+            .unwrap()
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert("adam.vymalo.com/run-id".to_owned(), OTHER.to_owned());
+        fx.env.seal(&ws).await.unwrap();
+        assert_eq!(fx.requests("DELETE"), 0, "it is not this run's to delete");
+    }
+
+    #[tokio::test]
+    async fn seal_with_the_cluster_down_is_unavailable_and_transient() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        lock(&fx.api).down = true;
+        let error = fx.env.seal(&ws).await.expect_err("down");
+        assert!(matches!(error, EnvError::Unavailable(_)), "{error}");
+        assert_eq!(error.class(), ErrorClass::Transient);
     }
 
     // ----- the session ----------------------------------------------------------------------------
