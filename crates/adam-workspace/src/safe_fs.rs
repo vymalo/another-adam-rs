@@ -120,25 +120,33 @@ fn not_regular(path: &Path) -> io::Error {
 /// device or a directory, and for a file longer than `max`; the errors of `open` and `read`.
 pub async fn read_regular_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     let path = path.to_owned();
-    blocking(move || {
-        let (file, meta) = open_regular(&path)?;
-        if meta.len() > max {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is longer than {max} bytes", path.display()),
-            ));
-        }
-        let mut bytes = Vec::new();
-        file.take(max + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > max {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is longer than {max} bytes", path.display()),
-            ));
-        }
-        Ok(bytes)
-    })
-    .await
+    blocking(move || read_regular_file_blocking(&path, max)).await
+}
+
+/// [`read_regular_file`] for code that is not async: the same rules, on the calling thread. The
+/// open does not wait for a writer and the read stops after `max` bytes, so it is meant for a
+/// small file; an async caller uses [`read_regular_file`].
+///
+/// # Errors
+///
+/// As [`read_regular_file`].
+pub fn read_regular_file_blocking(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let (file, meta) = open_regular(path)?;
+    if meta.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is longer than {max} bytes", path.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is longer than {max} bytes", path.display()),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// [`read_regular_file`] as text: lossy, for a file that holds a path or a line.
@@ -150,6 +158,15 @@ pub async fn read_regular_text(path: &Path, max: u64) -> io::Result<String> {
     read_regular_file(path, max)
         .await
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// [`read_regular_text`] for code that is not async: see [`read_regular_file_blocking`].
+///
+/// # Errors
+///
+/// As [`read_regular_file`].
+pub fn read_regular_text_blocking(path: &Path, max: u64) -> io::Result<String> {
+    read_regular_file_blocking(path, max).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Whether `path` is a directory itself, not a link to one (`lstat`).
@@ -374,6 +391,46 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_blocking_read_has_the_same_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f");
+        std::fs::write(&file, "../..\n").unwrap();
+        assert_eq!(read_regular_text_blocking(&file, 64).unwrap(), "../..\n");
+        assert_eq!(read_regular_file_blocking(&file, 6).unwrap(), b"../..\n");
+
+        let link = tmp.path().join("l");
+        symlink(&file, &link).unwrap();
+        let refused = read_regular_file_blocking(&link, 64).unwrap_err();
+        assert!(
+            refused.to_string().contains("not a regular file"),
+            "{refused}"
+        );
+
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(read_regular_file_blocking(&dir, 64).is_err());
+
+        let fifo = tmp.path().join("p");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // No writer: an open that waited would never return.
+        let refused = read_regular_file_blocking(&fifo, 64).unwrap_err();
+        assert!(
+            refused.to_string().contains("not a regular file"),
+            "{refused}"
+        );
+
+        let refused = read_regular_file_blocking(&file, 5).unwrap_err();
+        assert!(refused.to_string().contains("longer than 5"), "{refused}");
+        assert!(read_regular_file_blocking(&tmp.path().join("missing"), 64).is_err());
     }
 
     #[tokio::test]

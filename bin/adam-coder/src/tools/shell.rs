@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use adam_runtime::CancelToken;
-use adam_workspace::{EnvError, EnvSession, ExecSpec};
+use adam_workspace::{EnvError, EnvSession, ExecSpec, safe_fs};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -199,11 +199,17 @@ fn command_words(command: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
+/// The most of a `package.json` that is read for a hint: 1 MiB, as for `info/exclude`, far above a
+/// real one.
+const MAX_PACKAGE_JSON: u64 = 1024 * 1024;
+
 /// What the workspace is missing, if the project brings it itself: the tool `name` is one the
 /// project's own dependencies provide (`jest` under `node_modules/.bin`, `pytest` in a virtual
 /// environment), which is not a system toolchain the workspace lacks but a dependency nobody
 /// installed yet. The project's own install command is the way on. Looks in `dirs` (the directory
-/// the command ran in, then the worktree root) for the files that say so.
+/// the command ran in, then the worktree root) for the files that say so. A `package.json` is read
+/// as [`safe_fs`] reads what a run can write: a link, a pipe or a file over `MAX_PACKAGE_JSON` is not
+/// one.
 pub fn project_dependency_hint(dirs: &[&Path], name: &str) -> Option<String> {
     const NODE_TOOLS: &[&str] = &[
         "jest",
@@ -232,7 +238,11 @@ pub fn project_dependency_hint(dirs: &[&Path], name: &str) -> Option<String> {
         "pytest", "tox", "flake8", "black", "mypy", "ruff", "nox", "isort",
     ];
     for dir in dirs {
-        if let Ok(text) = std::fs::read_to_string(dir.join("package.json")) {
+        // The repository chose what is at this name: a link, a pipe, a device or a file over the cap
+        // is no `package.json`.
+        if let Ok(text) =
+            safe_fs::read_regular_text_blocking(&dir.join("package.json"), MAX_PACKAGE_JSON)
+        {
             let declared = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .is_some_and(|json| {
@@ -979,13 +989,21 @@ mod tests {
     #[test]
     fn a_package_json_over_the_cap_is_not_read_in_full() {
         let dir = tempfile::tempdir().unwrap();
-        let padding = " ".repeat(4 * 1024 * 1024);
-        std::fs::write(
-            dir.path().join("package.json"),
-            format!(r#"{{"devDependencies": {{"left-pad": "1"}}}}{padding}"#),
-        )
-        .unwrap();
+        let head = r#"{"devDependencies": {"left-pad": "1"}}"#;
+        let of_size = |size: u64| {
+            let size = usize::try_from(size).unwrap();
+            format!("{head}{}", " ".repeat(size - head.len()))
+        };
+        let package = dir.path().join("package.json");
         let here = [dir.path()];
+        // At the cap it is read as any other.
+        std::fs::write(&package, of_size(MAX_PACKAGE_JSON)).unwrap();
+        assert_eq!(
+            project_dependency_hint(&here, "left-pad").as_deref(),
+            Some("npm install")
+        );
+        // One byte over, it is no package.json: not its dependencies, not a well-known tool.
+        std::fs::write(&package, of_size(MAX_PACKAGE_JSON + 1)).unwrap();
         assert_eq!(project_dependency_hint(&here, "left-pad"), None);
         assert_eq!(project_dependency_hint(&here, "jest"), None);
     }
