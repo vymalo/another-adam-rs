@@ -264,6 +264,7 @@ impl Snapshot {
                 != Some(text)
             && at.is_plain_directory().await
         {
+            adam_workspace::safe_fs::race::checkpoint(dir, "restore-git");
             // Written next to it and renamed over it: a link or a pipe a command put at `.git` is
             // replaced, never written through.
             let _ = adam_workspace::safe_fs::replace_file(&dir.join(".git"), text.as_bytes()).await;

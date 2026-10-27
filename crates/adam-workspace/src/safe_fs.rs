@@ -17,6 +17,8 @@
 //! directory the coder made (the mirror, the run's directory) or the mount point of the run's pod,
 //! which the run cannot replace.
 
+pub mod race;
+
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};

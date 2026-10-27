@@ -241,6 +241,7 @@ fn read_in(root: &Path, rel: &str, start: Option<u32>, end: Option<u32>) -> Resu
         ));
     }
     let path = confine(root, rel, Access::Read)?;
+    adam_workspace::safe_fs::race::checkpoint(root, "read");
     let shown = rel.trim();
     let meta = fs::metadata(&path).map_err(|e| format!("cannot read `{shown}`: {e}"))?;
     if meta.is_dir() {
@@ -377,6 +378,7 @@ fn write_in(root: &Path, rel: &str, content: &str) -> Result<Written, String> {
     }
     let shown = rel.trim();
     let path = confine(root, rel, Access::Write)?;
+    adam_workspace::safe_fs::race::checkpoint(root, "write");
     let existing = fs::symlink_metadata(&path).ok();
     let parent = path
         .parent()
@@ -830,6 +832,7 @@ fn edit_in(
         return Err("old and new are the same text: there is nothing to change".into());
     }
     let path = confine(root, rel, Access::Write)?;
+    adam_workspace::safe_fs::race::checkpoint(root, "edit");
     let meta = match fs::metadata(&path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1130,6 +1133,272 @@ pub async fn edit_file(
             Ok(ToolOutput::text(text))
         }
         Err(reason) => Ok(ToolOutput::error(reason)),
+    }
+}
+
+/// A slot and another run's directory of the same shape, and what a command of the run can do
+/// to the slot between the coder's check of a path and its use of it
+/// (vymalo/another-adam-rs#125).
+#[cfg(test)]
+pub(super) mod swapped {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// What the other run's files say; nothing of the slot's may ever show it.
+    pub(crate) const SECRET: &str = "ANOTHER RUN'S SECRET";
+    /// The files of the slot and of the other run share their first line, so that an edit of the
+    /// one that is read in the place of the other says, in its error, what the other holds.
+    pub(crate) const MINE_TOP: &str = "shared line\noriginal top\n";
+    pub(crate) const MINE_SUB: &str = "shared line\noriginal sub\n";
+    const THEIRS_TOP: &str = "shared line\nANOTHER RUN'S SECRET\n";
+    const THEIRS_SUB: &str = "shared line\nANOTHER RUN'S SECRET\n";
+
+    pub(crate) struct Pair {
+        pub(crate) _tmp: tempfile::TempDir,
+        /// `top.txt`, `sub/file.txt` and a `.git` file.
+        pub(crate) slot: PathBuf,
+        /// The same files, saying [`SECRET`] on their second line.
+        pub(crate) other: PathBuf,
+    }
+
+    pub(crate) fn pair() -> Pair {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = tmp.path().join("slot");
+        let other = tmp.path().join("other");
+        for (dir, top, sub) in [
+            (&slot, MINE_TOP, MINE_SUB),
+            (&other, THEIRS_TOP, THEIRS_SUB),
+        ] {
+            fs::create_dir_all(dir.join("sub")).unwrap();
+            fs::write(dir.join("top.txt"), top).unwrap();
+            fs::write(dir.join("sub/file.txt"), sub).unwrap();
+            fs::write(dir.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        }
+        Pair {
+            _tmp: tmp,
+            slot,
+            other,
+        }
+    }
+
+    /// Where a swapped directory is moved to.
+    pub(crate) fn away_of(dir: &Path) -> PathBuf {
+        dir.with_file_name(format!(
+            "{}.away",
+            dir.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    /// The slot's directory moved away and a link to `other` at its name.
+    pub(crate) fn swap_slot(slot: &Path, other: &Path) {
+        fs::rename(slot, away_of(slot)).unwrap();
+        std::os::unix::fs::symlink(other, slot).unwrap();
+    }
+
+    /// `sub` of the slot moved away and a link to `sub` of `other` at its name.
+    pub(crate) fn swap_sub(slot: &Path, other: &Path) {
+        fs::rename(slot.join("sub"), away_of(&slot.join("sub"))).unwrap();
+        std::os::unix::fs::symlink(other.join("sub"), slot.join("sub")).unwrap();
+    }
+
+    /// Every file below `dir`, by relative path.
+    pub(crate) fn tree(dir: &Path) -> BTreeMap<String, String> {
+        fn walk(dir: &Path, at: &Path, out: &mut BTreeMap<String, String>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if fs::symlink_metadata(&path).unwrap().is_dir() {
+                    walk(&path, at, out);
+                } else {
+                    out.insert(
+                        path.strip_prefix(at).unwrap().display().to_string(),
+                        fs::read_to_string(&path).unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use adam_workspace::safe_fs::race;
+
+    use super::swapped::*;
+    use super::*;
+
+    fn read(root: &Path, rel: &str) -> Result<String, String> {
+        read_in(root, rel, None, None)
+    }
+
+    fn write(root: &Path, rel: &str, content: &str) -> Result<Written, String> {
+        write_in(root, rel, content)
+    }
+
+    fn edit(root: &Path, rel: &str, old: &str, new: &str) -> Result<Edited, String> {
+        edit_in(root, rel, old, new, false)
+    }
+
+    /// Run `swap` when the checkpoint `at` is reached for `slot`.
+    fn at(slot: &Path, checkpoint: &'static str, swap: impl Fn() + Send + 'static) -> race::Hook {
+        race::on_checkpoint(slot, move |at, _| {
+            if at == checkpoint {
+                swap();
+            }
+        })
+    }
+
+    #[test]
+    fn a_read_does_not_follow_a_slot_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "read", move || swap_slot(&slot, &other));
+        let got = read(&p.slot, "top.txt");
+        assert_eq!(hook.reached("read"), 1, "the swap was made");
+        assert_eq!(got, Ok(MINE_TOP.to_owned()), "the slot's own file");
+    }
+
+    #[test]
+    fn a_read_does_not_follow_a_directory_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "read", move || swap_sub(&slot, &other));
+        let got = read(&p.slot, "sub/file.txt");
+        assert_eq!(hook.reached("read"), 1, "the swap was made");
+        assert!(!format!("{got:?}").contains(SECRET), "{got:?}");
+    }
+
+    #[test]
+    fn a_write_does_not_land_in_a_slot_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "write", move || swap_slot(&slot, &other));
+        let got = write(&p.slot, "top.txt", "overwritten\n");
+        assert_eq!(hook.reached("write"), 1, "the swap was made");
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(
+            fs::read_to_string(away_of(&p.slot).join("top.txt")).unwrap(),
+            "overwritten\n",
+            "it went to the directory the slot was"
+        );
+    }
+
+    #[test]
+    fn a_write_does_not_land_in_a_directory_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "write", move || swap_sub(&slot, &other));
+        let _ = write(&p.slot, "sub/new.txt", "written\n");
+        assert_eq!(hook.reached("write"), 1, "the swap was made");
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
+    }
+
+    #[test]
+    fn an_edit_does_not_read_a_slot_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "edit", move || swap_slot(&slot, &other));
+        // The text is in the slot's file and not in the other run's: an edit that read the other
+        // run's file would say what that file holds, to the model.
+        let got = edit(&p.slot, "top.txt", MINE_TOP, "shared line\nchanged top\n");
+        assert_eq!(hook.reached("edit"), 1, "the swap was made");
+        assert!(!format!("{got:?}").contains(SECRET), "{got:?}");
+        assert_eq!(tree(&p.other), before);
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(
+            fs::read_to_string(away_of(&p.slot).join("top.txt")).unwrap(),
+            "shared line\nchanged top\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_does_not_write_into_a_slot_swapped_between_reading_and_writing() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "write", move || swap_slot(&slot, &other));
+        let got = edit(&p.slot, "top.txt", MINE_TOP, "shared line\nchanged top\n");
+        assert_eq!(hook.reached("write"), 1, "the swap was made");
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(
+            fs::read_to_string(away_of(&p.slot).join("top.txt")).unwrap(),
+            "shared line\nchanged top\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_does_not_follow_a_directory_swapped_after_the_path_was_checked() {
+        let p = pair();
+        let before = tree(&p.other);
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        let hook = at(&p.slot, "edit", move || swap_sub(&slot, &other));
+        let got = edit(
+            &p.slot,
+            "sub/file.txt",
+            MINE_SUB,
+            "shared line\nchanged sub\n",
+        );
+        assert_eq!(hook.reached("edit"), 1, "the swap was made");
+        assert!(!format!("{got:?}").contains(SECRET), "{got:?}");
+        assert_eq!(tree(&p.other), before);
+    }
+
+    /// The slot flips between a directory and a link to another run's files while the coder
+    /// writes: nothing it writes shows in the other run's files. (Extra to the deterministic tests
+    /// above, which are the evidence: this one only needs to never fail.)
+    #[test]
+    fn files_written_while_the_slot_flips_never_reach_another_runs_files() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let p = pair();
+        let before = tree(&p.other);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let (slot, other, stop) = (p.slot.clone(), p.other.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if fs::rename(&slot, away_of(&slot)).is_err() {
+                        continue;
+                    }
+                    let _ = std::os::unix::fs::symlink(&other, &slot);
+                    let _ = fs::remove_file(&slot);
+                    let _ = fs::rename(away_of(&slot), &slot);
+                }
+            })
+        };
+        for i in 0..500 {
+            let _ = write(&p.slot, &format!("sub/f{i}.txt"), "flip\n");
+            let _ = write(&p.slot, "top.txt", "flip\n");
+            let _ = read(&p.slot, "sub/file.txt");
+        }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+        assert_eq!(
+            tree(&p.other),
+            before,
+            "the other run's files are as they were"
+        );
     }
 }
 

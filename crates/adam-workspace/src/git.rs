@@ -478,6 +478,7 @@ impl GitCmd {
         }
         if let Some(pin) = &self.pin {
             pin.check().await.map_err(WorkspaceError::Corrupt)?;
+            safe_fs::race::checkpoint(pin.work_tree(), "git");
         }
         let timeout = if self.auth.is_some() {
             NETWORK_TIMEOUT

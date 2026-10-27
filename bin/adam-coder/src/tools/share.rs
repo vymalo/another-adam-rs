@@ -154,6 +154,7 @@ fn with_picture_hint(artifact: &Artifact) -> String {
 fn share_in(root: &Path, rel: &str, name: Option<&str>) -> Result<Shared, String> {
     let shown = rel.trim();
     let path = confine(root, rel, Access::Read)?;
+    adam_workspace::safe_fs::race::checkpoint(root, "read");
     let meta = fs::metadata(&path).map_err(|e| format!("cannot read `{shown}`: {e}"))?;
     if meta.is_dir() {
         return Err(format!(
@@ -442,6 +443,46 @@ mod tests {
         if made.is_ok_and(|s| s.success()) {
             let refused = share_in(dir.path(), "pipe", None).unwrap_err();
             assert!(refused.contains("not a regular file"), "{refused}");
+        }
+    }
+
+    mod swapped_tests {
+        use adam_workspace::safe_fs::race;
+
+        use super::*;
+        use crate::tools::files::swapped::*;
+
+        #[test]
+        fn a_share_does_not_follow_a_slot_swapped_after_the_path_was_checked() {
+            let p = pair();
+            let (slot, other) = (p.slot.clone(), p.other.clone());
+            let hook = race::on_checkpoint(&p.slot, move |at, _| {
+                if at == "read" {
+                    swap_slot(&slot, &other);
+                }
+            });
+            let got = share_in(&p.slot, "top.txt", None);
+            assert_eq!(hook.reached("read"), 1, "the swap was made");
+            let shared = got.unwrap();
+            assert_eq!(shared.bytes, MINE_TOP.as_bytes(), "the slot's own file");
+        }
+
+        #[test]
+        fn a_share_does_not_follow_a_directory_swapped_after_the_path_was_checked() {
+            let p = pair();
+            let (slot, other) = (p.slot.clone(), p.other.clone());
+            let hook = race::on_checkpoint(&p.slot, move |at, _| {
+                if at == "read" {
+                    swap_sub(&slot, &other);
+                }
+            });
+            let got = share_in(&p.slot, "sub/file.txt", None);
+            assert_eq!(hook.reached("read"), 1, "the swap was made");
+            let leaked = match &got {
+                Ok(shared) => String::from_utf8_lossy(&shared.bytes).contains(SECRET),
+                Err(why) => why.contains(SECRET),
+            };
+            assert!(!leaked, "{got:?}");
         }
     }
 }

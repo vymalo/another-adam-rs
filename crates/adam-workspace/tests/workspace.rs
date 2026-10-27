@@ -3614,6 +3614,229 @@ async fn a_slot_that_is_a_link_to_another_runs_slot_is_not_a_slot() {
     assert!(run.add_repository(&env.repo).await.is_err());
 }
 
+// ---- A slot swapped between a check and the use that follows it (vymalo/another-adam-rs#125)
+//
+// A command in the run's pod can rename a slot's directory and put a link at its name at any
+// moment. Each of these tests makes the swap happen at a `race::checkpoint`: where the coder has
+// checked the slot and has not yet used it.
+
+use adam_workspace::safe_fs::race;
+
+/// Where a swapped slot's directory is moved to.
+fn away_of(slot: &Path) -> PathBuf {
+    slot.with_file_name(format!(
+        "{}.away",
+        slot.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+/// What a command of a run can do between a check and a use: move the slot's directory away and
+/// put a link to another directory at its name.
+fn swap_for_a_link(slot: &Path, other: &Path) {
+    std::fs::rename(slot, away_of(slot)).unwrap();
+    std::os::unix::fs::symlink(other, slot).unwrap();
+}
+
+/// … or a directory of the same name, which is not a link.
+fn swap_for_a_directory(slot: &Path) {
+    std::fs::rename(slot, away_of(slot)).unwrap();
+    std::fs::create_dir(slot).unwrap();
+}
+
+/// The files below `dir`, relative and sorted.
+fn files_under(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, at: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk(&path, at, out);
+            } else {
+                out.push(path.strip_prefix(at).unwrap().display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn copy_into_does_not_write_through_a_destination_slot_swapped_after_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scratch, wt) = scratch_and_worktree(tmp.path()).await;
+    put(scratch.path(), "fib.sh", "echo 1\n");
+    put(scratch.path(), "docs/notes.md", "notes\n");
+    // Another run's slot: the coder holds the whole volume, so it can write there.
+    let other = tmp.path().join("another-runs-slot");
+    put(&other, "SENTINEL", "theirs\n");
+
+    let dest = wt.path().to_path_buf();
+    let hook = race::on_checkpoint(&dest, {
+        let (dest, other) = (dest.clone(), other.clone());
+        move |at, _| {
+            if at == "copy-dest" {
+                swap_for_a_link(&dest, &other);
+            }
+        }
+    });
+    let report = copy_into(&scratch, &wt, ".", false).await;
+
+    assert_eq!(hook.reached("copy-dest"), 1, "the swap was made");
+    assert_eq!(
+        files_under(&other),
+        ["SENTINEL"],
+        "nothing was written in the other run's slot"
+    );
+    // The copy went to the directory the coder had opened, which is now at the new name.
+    let report = report.unwrap();
+    assert_eq!(paths(&report.copied), ["docs/notes.md", "fib.sh"]);
+    let away = away_of(&dest);
+    assert_eq!(
+        std::fs::read_to_string(away.join("fib.sh")).unwrap(),
+        "echo 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(away.join("docs/notes.md")).unwrap(),
+        "notes\n"
+    );
+}
+
+#[tokio::test]
+async fn copy_into_does_not_copy_a_source_file_swapped_for_a_link_after_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scratch, wt) = scratch_and_worktree(tmp.path()).await;
+    put(scratch.path(), "fib.sh", "echo 1\n");
+    put(scratch.path(), "docs/notes.md", "notes\n");
+    let other = tmp.path().join("another-runs-slot");
+    put(&other, "secret.txt", "TOP SECRET\n");
+
+    let source = scratch.path().to_path_buf();
+    let hook = race::on_checkpoint(&source, {
+        let (source, secret) = (source.clone(), other.join("secret.txt"));
+        move |at, _| {
+            if at == "copy-source" {
+                std::fs::remove_file(source.join("fib.sh")).unwrap();
+                std::os::unix::fs::symlink(&secret, source.join("fib.sh")).unwrap();
+            }
+        }
+    });
+    let result = copy_into(&scratch, &wt, ".", false).await;
+
+    assert_eq!(hook.reached("copy-source"), 1, "the swap was made");
+    // Whatever the copy did with it, the repository got neither the secret nor a link to it.
+    let landed = wt.path().join("fib.sh");
+    if let Ok(meta) = std::fs::symlink_metadata(&landed) {
+        assert!(
+            !meta.file_type().is_symlink(),
+            "a link to {}",
+            std::fs::read_link(&landed).unwrap().display()
+        );
+        assert!(
+            !std::fs::read_to_string(&landed)
+                .unwrap()
+                .contains("TOP SECRET")
+        );
+    }
+    assert!(
+        result.is_err(),
+        "the file changed under the copy: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn copy_into_does_not_read_a_source_slot_swapped_after_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scratch, wt) = scratch_and_worktree(tmp.path()).await;
+    put(scratch.path(), "fib.sh", "echo 1\n");
+    let other = tmp.path().join("another-runs-project");
+    put(&other, "fib.sh", "THEIRS\n");
+
+    let source = scratch.path().to_path_buf();
+    let hook = race::on_checkpoint(&source, {
+        let (source, other) = (source.clone(), other.clone());
+        move |at, _| {
+            if at == "copy-source" {
+                swap_for_a_link(&source, &other);
+            }
+        }
+    });
+    let result = copy_into(&scratch, &wt, ".", false).await;
+
+    assert_eq!(hook.reached("copy-source"), 1, "the swap was made");
+    // The project's own file is copied, or nothing is: never the other run's.
+    if let Ok(copied) = std::fs::read_to_string(wt.path().join("fib.sh")) {
+        assert_eq!(copied, "echo 1\n");
+    }
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("fib.sh")).unwrap(),
+        "echo 1\n"
+    );
+}
+
+#[tokio::test]
+async fn git_is_not_run_on_a_slot_replaced_by_a_directory_after_the_coder_opened_it() {
+    let env = Env::new();
+    let slot = env
+        .ws
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let wt = slot.worktree().unwrap().clone();
+    let pin = slot.git_pin().unwrap();
+    let branch = format!("refs/heads/{}", wt.branch());
+    let tip = git(&env.mirror(), &["rev-parse", &branch]);
+
+    // The slot's directory is moved away and a directory (not a link: that one is refused by
+    // looking at the name) is made at its name, empty: to `git add -A` it is a worktree in which
+    // every file was deleted.
+    swap_for_a_directory(slot.path());
+
+    let refused = pin.check().await.expect_err("the slot was replaced");
+    assert!(refused.contains("replaced"), "{refused}");
+    let refused = wt.commit_all("delete everything", &me()).await.unwrap_err();
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    assert_eq!(git(&env.mirror(), &["rev-parse", &branch]), tip);
+}
+
+#[tokio::test]
+async fn git_is_not_started_on_a_slot_replaced_between_the_check_and_the_start() {
+    let env = Env::new();
+    let slot = env
+        .ws
+        .run("run-aaaaaaaa-1")
+        .unwrap()
+        .add_repository(&env.repo)
+        .await
+        .unwrap();
+    let wt = slot.worktree().unwrap().clone();
+    let branch = format!("refs/heads/{}", wt.branch());
+    let tip = git(&env.mirror(), &["rev-parse", &branch]);
+
+    let path = slot.path().to_path_buf();
+    let hook = race::on_checkpoint(&path, {
+        let path = path.clone();
+        move |at, n| {
+            if at == "git" && n == 0 {
+                swap_for_a_directory(&path);
+            }
+        }
+    });
+    let refused = wt.commit_all("delete everything", &me()).await.unwrap_err();
+
+    assert!(hook.reached("git") >= 1, "the swap was made");
+    assert!(matches!(refused, WorkspaceError::Corrupt(_)), "{refused}");
+    assert_eq!(
+        git(&env.mirror(), &["rev-parse", &branch]),
+        tip,
+        "the run's branch did not move"
+    );
+}
+
 #[tokio::test]
 async fn a_worktree_directory_of_the_mirror_is_never_taken_over_by_another_run() {
     let env = Env::new();

@@ -98,6 +98,7 @@ impl GitAt {
                     tracing::warn!(dir = %self.dir.display(), %why, "git is not run here");
                     return None;
                 }
+                adam_workspace::safe_fs::race::checkpoint(&self.dir, "git");
                 pin.apply(&mut cmd);
             }
             Pin::Refused => {
@@ -292,13 +293,14 @@ async fn read_exclude(path: &Path) -> Option<Option<String>> {
 /// Put the exclude file at `path` back as `content` (`None`: no file). The file is replaced and not
 /// written through: a link at `path` is replaced by the file, and `info`, when it is not a
 /// directory itself, is not written in at all. `true` when it is done.
-async fn put_exclude(path: &Path, content: Option<&str>) -> bool {
+async fn put_exclude(at: &GitAt, path: &Path, content: Option<&str>) -> bool {
     let Some(info) = path.parent() else {
         return false;
     };
     if !adam_workspace::safe_fs::is_real_directory(info).await {
         return false;
     }
+    adam_workspace::safe_fs::race::checkpoint(at.path(), "exclude");
     match content {
         Some(text) => adam_workspace::safe_fs::replace_file(path, text.as_bytes())
             .await
@@ -400,7 +402,7 @@ pub(crate) async fn restore_repo_state(at: &GitAt, before: &RepoState) -> bool {
         let Some(path) = exclude_path(at).await else {
             return false;
         };
-        ok &= put_exclude(&path, before.exclude.as_deref()).await;
+        ok &= put_exclude(at, &path, before.exclude.as_deref()).await;
     }
     ok && repo_state(at).await.as_ref() == Some(before)
 }
@@ -845,6 +847,76 @@ pub(super) mod pinned_tests {
     }
 
     #[tokio::test]
+    async fn a_dot_git_put_back_after_the_slot_was_swapped_goes_to_the_slot_and_not_to_another_run()
+    {
+        use adam_workspace::safe_fs::race;
+
+        use super::super::inspect::Snapshot;
+
+        let f = fixture().await;
+        let other = f
+            .workspaces
+            .run("run-bbbbbbbb-2")
+            .unwrap()
+            .add_repository(&f.repo)
+            .await
+            .unwrap();
+        let theirs = std::fs::read_to_string(other.path().join(".git")).unwrap();
+        let before = Snapshot::of_slot(&f.slot).await.unwrap();
+        let mine = std::fs::read_to_string(f.slot.path().join(".git")).unwrap();
+        assert_ne!(mine, theirs);
+
+        // A command rewrites the slot's `.git` file, so that the restore puts it back; and the
+        // slot is swapped for a link to the other run's slot just before that.
+        std::fs::write(f.slot.path().join(".git"), "gitdir: /nowhere\n").unwrap();
+        let (slot, target) = (f.slot.path().to_path_buf(), other.path().to_path_buf());
+        let away = slot.with_file_name("slot.away");
+        let hook = race::on_checkpoint(&slot, {
+            let (slot, away) = (slot.clone(), away.clone());
+            move |at, _| {
+                if at == "restore-git" {
+                    std::fs::rename(&slot, &away).unwrap();
+                    std::os::unix::fs::symlink(&target, &slot).unwrap();
+                }
+            }
+        });
+        before.restore(&f.slot).await;
+
+        assert_eq!(hook.reached("restore-git"), 1, "the swap was made");
+        assert_eq!(
+            std::fs::read_to_string(other.path().join(".git")).unwrap(),
+            theirs,
+            "the other run's .git file is as it was"
+        );
+        assert_eq!(
+            std::fs::read_to_string(away.join(".git")).unwrap(),
+            mine,
+            "the slot's was put back"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_is_not_started_when_the_slot_was_replaced_between_the_check_and_the_start() {
+        use adam_workspace::safe_fs::race;
+
+        let f = fixture().await;
+        let at = GitAt::slot(&f.slot);
+        let slot = f.slot.path().to_path_buf();
+        let hook = race::on_checkpoint(&slot, {
+            let slot = slot.clone();
+            move |at, n| {
+                if at == "git" && n == 0 {
+                    std::fs::rename(&slot, slot.with_file_name("slot.away")).unwrap();
+                    std::fs::create_dir(&slot).unwrap();
+                }
+            }
+        });
+        let command = at.command().await;
+        assert_eq!(hook.reached("git"), 1, "the swap was made");
+        assert!(command.is_none(), "git is not started on the replaced slot");
+    }
+
+    #[tokio::test]
     async fn a_worktree_whose_directory_in_the_mirror_is_not_known_is_not_asked_at_all() {
         let f = fixture().await;
         let at = GitAt::slot(&f.slot);
@@ -1081,7 +1153,7 @@ mod exclude_tests {
 
         // A link at the file is replaced by a regular file with the content, and the target is left.
         std::os::unix::fs::symlink(&secret, &exclude).unwrap();
-        assert!(put_exclude(&exclude, Some("target/\n")).await);
+        assert!(put_exclude(&GitAt::slot(&slot), &exclude, Some("target/\n")).await);
         assert_eq!(std::fs::read_to_string(&exclude).unwrap(), "target/\n");
         assert!(
             !std::fs::symlink_metadata(&exclude)
@@ -1094,7 +1166,7 @@ mod exclude_tests {
         // Removing is removing the link, not what it leads to.
         std::fs::remove_file(&exclude).unwrap();
         std::os::unix::fs::symlink(&secret, &exclude).unwrap();
-        assert!(put_exclude(&exclude, None).await);
+        assert!(put_exclude(&GitAt::slot(&slot), &exclude, None).await);
         assert!(!exclude.exists() && std::fs::symlink_metadata(&exclude).is_err());
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
 
@@ -1104,11 +1176,59 @@ mod exclude_tests {
         std::fs::write(elsewhere.join("exclude"), "theirs\n").unwrap();
         std::fs::remove_dir_all(&info).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &info).unwrap();
-        assert!(!put_exclude(&exclude, Some("target/\n")).await);
-        assert!(!put_exclude(&exclude, None).await);
+        assert!(!put_exclude(&GitAt::slot(&slot), &exclude, Some("target/\n")).await);
+        assert!(!put_exclude(&GitAt::slot(&slot), &exclude, None).await);
         assert_eq!(
             std::fs::read_to_string(elsewhere.join("exclude")).unwrap(),
             "theirs\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exclude_swap_tests {
+    use adam_workspace::safe_fs::race;
+
+    use super::pinned_tests::fixture;
+    use super::*;
+
+    #[tokio::test]
+    async fn an_exclude_file_put_back_after_the_slot_was_swapped_goes_to_the_slot_and_not_to_another_run()
+     {
+        let f = fixture().await;
+        let run = f.workspaces.run("run-aaaaaaaa-1").unwrap();
+        let identity = adam_workspace::GitIdentity::new("A", "a@example.com");
+        let mine = run.add_scratch("fib", &identity).await.unwrap();
+        let theirs = run.add_scratch("other", &identity).await.unwrap();
+        for slot in [&mine, &theirs] {
+            std::fs::create_dir_all(slot.path().join(".git/info")).unwrap();
+        }
+        let exclude = mine.path().join(".git/info/exclude");
+        std::fs::write(theirs.path().join(".git/info/exclude"), "theirs\n").unwrap();
+
+        let (slot, target) = (mine.path().to_path_buf(), theirs.path().to_path_buf());
+        let away = slot.with_file_name("fib.away");
+        let hook = race::on_checkpoint(&slot, {
+            let (slot, away) = (slot.clone(), away.clone());
+            move |at, _| {
+                if at == "exclude" {
+                    std::fs::rename(&slot, &away).unwrap();
+                    std::os::unix::fs::symlink(&target, &slot).unwrap();
+                }
+            }
+        });
+        let put = put_exclude(&GitAt::slot(&mine), &exclude, Some("target/\n")).await;
+
+        assert_eq!(hook.reached("exclude"), 1, "the swap was made");
+        assert_eq!(
+            std::fs::read_to_string(theirs.path().join(".git/info/exclude")).unwrap(),
+            "theirs\n",
+            "the other project's exclude file is as it was"
+        );
+        assert!(put);
+        assert_eq!(
+            std::fs::read_to_string(away.join(".git/info/exclude")).unwrap(),
+            "target/\n"
         );
     }
 }

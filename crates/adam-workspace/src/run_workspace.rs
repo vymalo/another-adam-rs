@@ -1203,6 +1203,8 @@ fn copy_files(
     if !report.collisions.is_empty() {
         return Ok(report);
     }
+    safe_fs::race::checkpoint(source, "copy-source");
+    safe_fs::race::checkpoint(dest, "copy-dest");
     for rel in to_write {
         let from = source.join(rel);
         let to = dest.join(base).join(rel);
