@@ -140,8 +140,10 @@ flowchart TB
 `adam-env-kubernetes` also ships the `adam-kube-exec` binary. `adam-git-sandbox` ships the server `adam-git-sandbox` and
 the relay `adam-git`, and its client is what `adam-workspace` sends the coder's local `git` through: the git commands that
 carry no credential run in a container that holds no secret, because git runs what a repository's configuration names
-(see [its README](../crates/adam-git-sandbox/README.md); built, and off unless `GIT_SANDBOX_SOCKET` is set, for
-[ADR 0041](decisions/0041-a-run-pod-sees-only-its-own-run.md)'s open decision 6). The workspace is `crates/*` and `bin/*`
+(see [its README](../crates/adam-git-sandbox/README.md); off unless `GIT_SANDBOX_SOCKET` is set, which the chart does for the
+coder pod with run pods, running the server as a second container of that pod with the same work volume, the same user and no
+secret, for [ADR 0041](decisions/0041-a-run-pod-sees-only-its-own-run.md)'s open decision 6: [the chart's
+section](../deploy/coder/README.md#the-git-sandbox)). The workspace is `crates/*` and `bin/*`
 (root `Cargo.toml`): a new crate joins by adding a directory with a `README.md`.
 
 ## Ports and implementations

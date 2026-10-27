@@ -23,9 +23,10 @@ reach on the volume, *verified 2026-10-18 by reading `crates/adam-workspace/src/
 | `git/<host>/<owner>/<repo>.git`, a bare mirror shared by every run of that repository | read every repository the coder ever mirrored, **and write the mirror**: its `config`, `hooks/`, `info/attributes`, refs and objects |
 
 The write is worse than the read. The coder's own `git` runs in every run's worktree of that mirror. It starts from an
-empty environment, never runs hooks or an fsmonitor, and removes some configuration keys (`url.*`, `remote.*`, `http.*`,
-`credential.*`, `core.sshCommand`, ...) before a credentialed command (`Inner::sanitize_mirror_config`); it does not stop a
-`filter.*` or `diff.*` command in the mirror's configuration, a rewritten ref (another person's unpushed `agent/*`
+empty environment, never runs hooks or an fsmonitor, and removed some configuration keys (`url.*`, `remote.*`, `http.*`,
+`credential.*`, `core.sshCommand`, ...) before a credentialed command (the first version's `Inner::sanitize_mirror_config`,
+which is gone: the mirror's configuration is now put back to what the workspace writes, `crates/adam-workspace/src/mirror_config.rs`);
+it did not stop a `filter.*` or `diff.*` command in the mirror's configuration, a rewritten ref (another person's unpushed `agent/*`
 branch) or a poisoned object. A run that writes the mirror reaches the coder and every other run of that repository.
 
 `KubeSession::prepare` refuses a working directory outside `workspaces/<run>`, which is a check on the caller's
@@ -240,6 +241,11 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   coder's container, which holds the GitHub App key. Closing it needs the coder's git to run apart from the coder's secrets
   (another user, or a sandbox), or to refuse a worktree with an embedded repository (racy, since the run writes the index
   and the directory at any time). Open decision 6.
+  *Amended (2026-10-27, [#118](https://github.com/vymalo/another-adam-rs/issues/118)):* **with run pods the program a repository's
+  configuration names no longer runs where a secret is readable.** The coder's git commands that carry no credential run in the
+  `git-sandbox` container of the coder pod (open decision 6 below, closed by the last amendment), so the `filter.*.clean` of the embedded repository still runs, in a
+  container that has no token, no Secret and no view of the coder's processes. What it can still do there is read and write the work
+  volume (the item on the sandbox's reach, below). Local mode, Podman and run pods off stay as described.
 * **A run's commands can still write the index of their own directory in the mirror.** The index is the content of the next
   commit, which is the run's own work. (`HEAD`, `commondir`, `gitdir` and `logs` cannot be written from a pod, decisions 1 and 11;
   in local mode and Podman `HEAD` can, and the coder's commit and restore do not follow it.)
@@ -292,10 +298,18 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   `info/attributes` and `packed-refs` there with a plain `open`: a link or a pipe at one of them would be followed or waited on by the
   coder's `git add -A` (*unverified*: not tried). The remedy is the one for the
   embedded repository below: the coder's git apart from the coder's secrets.
+  *Amended (2026-10-27, [#118](https://github.com/vymalo/another-adam-rs/issues/118)):* with run pods that remedy is built. The scratch
+  project's `config` (a `filter.*.clean`, a `core.fsmonitor`) runs in the git sandbox, where the key, the token and the coder's
+  environment are not readable: the `run-pods` job makes such a project and shows its program running as the child of the
+  sandbox's `tini`, reading nothing of the canaries that the same program, run by plain git in the coder container, reads. A link or a pipe
+  at `info/exclude`, `info/attributes` or `packed-refs` is now followed or waited on by the sandbox's `git`, not the coder's; the
+  coder gives each local command a time limit (five minutes) and a command never outlives its connection (the sandbox kills the process
+  group), so a pipe holds a command and not the coder. That last point is still *unverified*: it is not tried.
 * **Slots made before decision 9 keep git's own names** (`worktrees/<repo>`, no run in them). They are found by the one `gitdir`
   that names the slot among the directories that carry no run, as before; a run that owns another such directory can make that
   answer ambiguous (none), and, if the slot's own directory is gone, name its own as the only candidate. They age out with their runs.
-* **Local mode and Podman** share the coder's container or bind the mirror read-write: none of this protects them.
+* **Local mode and Podman** share the coder's container or bind the mirror read-write: none of this protects them. This covers the git sandbox
+  too (open decision 6 below): without run pods the chart renders none, `GIT_SANDBOX_SOCKET` is unset, and the coder's git runs in its own container.
 * **Git in a base checkout does not work in a run pod.** `add_base_checkout` makes a second worktree for the check on the
   base (`.adam-base/<slot>` in the run's directory); its directory in the mirror is made after the pod and is not mounted, so
   `git` there says it is not a repository. The commands that do not use git run as before.
@@ -386,6 +400,8 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
 6. **The embedded-repository vector above.** Run the coder's git apart from its secrets (a user of its own or a sandbox), or
    accept it while every run is a person who may be trusted with the coder's container. (The pin and the explicit commit
    are decided and built; whether the Podman devcontainer should get a read-only mirror too is still open.)
+   **Closed 2026-10-27 for run pods** ([#118](https://github.com/vymalo/another-adam-rs/issues/118), the amendment below): a sandbox.
+   What stays open is whether the Podman devcontainer should get a read-only mirror, and git per run.
 
 ## Consequences
 
@@ -431,3 +447,57 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   egress proxy and `runPods.networkPolicy.extraEgress`, and nothing else, and the pod template (decision 2's template) sets `HTTPS_PROXY`,
   `HTTP_PROXY` and `NO_PROXY` (lower case too) to the proxy. The mounts, the admission policy and the rest of the template are as above; the policy
   allows plain values for these variables and still allows no Secret reference but the model key.
+* **2026-10-27, [#118](https://github.com/vymalo/another-adam-rs/issues/118) (open decision 6 closed for run pods).** The coder's local
+  git runs in a `git-sandbox` container of the coder pod, and the git commands that carry a token stay in the coder after the
+  mirror's configuration has been put back to an allow-list. Two changes (the sandbox server, its relay and the coder's routing:
+  [`adam-git-sandbox`](../../crates/adam-git-sandbox/README.md) and [`adam-workspace`](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox);
+  the chart and its proof, here).
+  * **Why a sandbox.** Git always reads the configuration of the repository it works on and has no switch that turns off the
+    `filter.*`, `diff.*.textconv` or `core.fsmonitor` programs defined there; driver names are arbitrary, so they cannot be overridden one by
+    one; and a scratch project's `.git` and an embedded repository are written by the run. So the program has to run where nothing
+    secret is readable. The alternatives: the key held only in memory (a Secret volume's file stays readable by the container's user,
+    and the other secrets are in the environment of processes of that user); git in the run pod (the commit writes objects and the
+    branch into the mirror, which the run pod mounts read-only: decision 1).
+  * **The container.** With `runPods.enabled` the coder pod has a second container, `git-sandbox`, from the coder's own image,
+    running `adam-git-sandbox` (a native sidecar: it starts before the coder, after a startup probe that runs `adam-git --version`
+    through the relay, and stops after it). It has **no Secret volume, no `envFrom`, no variable from a Secret, none of the coder's other
+    volumes, and no service-account token**: the pod sets `automountServiceAccountToken: false` and the token is a projected volume
+    mounted in the **coder container alone**, at the path the in-cluster client reads; nor does the GitHub MCP sidecar have it any
+    more (it had, before). The pod does **not** share a process namespace, so the sandbox cannot read the `/proc` of the coder's
+    processes (`/proc/<pid>/environ` of a process of the same user is readable otherwise). It has a read-only root file system, an
+    `emptyDir` `/tmp` of its own (in memory and sized: a program that fills it gets `ENOSPC`, where a disk-backed volume would get the
+    pod evicted), the default seccomp profile, no capability and no escalation, and a memory limit of its own. It mounts the work
+    volume **at the same path** as the coder (the commands carry paths) and runs as **the same user** (one writes the files the other
+    reads); the two share the socket's directory and nothing else. There is no switch to turn it off: it is on with run pods.
+  * **The routing** (decided and built in the first change; recorded here for the whole). The `git` commands that carry no credential
+    (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, `apply`, ...) go over the socket (`GIT_SANDBOX_SOCKET`, set by the
+    chart) to the sandbox; a sandbox that cannot be reached is an error, never a fallback. `fetch`, `push` and `ls-remote`, which need the
+    token, stay in the coder, on the bare mirror, after its configuration has been put back to what the workspace writes (the Context's list
+    of keys that were removed is now a list of keys that stay: `mirror_config.rs`), so a `url.*.insteadOf` or an `http.*` key that a filter in the sandbox planted cannot
+    redirect the request that carries the token.
+  * **What the `run-pods` job proves** (`deploy/coder/tests/kind-run-pods.sh`; **unverified until CI has run it**: no cluster exists
+    where this was written). On a pod made from the chart's own StatefulSet (the coder container sleeps, because the real coder needs a
+    database and a model; its environment, mounts, projected token and security contexts are the chart's, with the App's key a Secret volume
+    and canaries for the key, the model key, a bearer token and the database URL): the sandbox has no token file, no key, no mount of a
+    secret or a projected volume, none of the coder's variables or of the canaries in its environment, and its process 1 is its own
+    `tini -- adam-git-sandbox` with none of the coder's processes in sight, while the coder container has all of them and its token is
+    accepted by the API server; a commit made through the socket works and is the same commit in both containers; and **the vector**: a scratch
+    project whose own `.git/config` names a `filter.x.clean` and a `core.fsmonitor`, applied by a `.gitattributes`, that write what they can read
+    (the token, the key, `/proc/*/environ`, their own environment) to a marker. `adam-git add -A` (and `status`, `diff`) through the socket runs
+    them **in the sandbox** (the marker's first process is the sandbox's `tini`) and the marker holds none of the secrets: the token and the key
+    are `No such file or directory`. The control: the same project added by plain git in the coder container writes a marker that holds all
+    five, so the check can fail. `tests/render-check.sh` holds the render's half (no Secret, `envFrom` or secret variable in the sandbox, the token
+    mounted in the coder alone, no `shareProcessNamespace`, the same work path and user, the socket variable), each broken on purpose once.
+  * **Not covered.**
+    * **A filter in the sandbox can still read and write the whole work volume**: every run's files, every mirror, as the coder's git could.
+      Closing that needs git per run, in the run pod, which needs a different commit path (the mirror is read-only there). A follow-up.
+      Integrity of other people's branches in the shared mirror stays as exposed as before until a mirror for each person
+      ([#122](https://github.com/vymalo/another-adam-rs/issues/122), open decision 3).
+    * **The race between the repair of the mirror's configuration and a network command's read of it**: a writer already running in the
+      sandbox can change `config` between the two statements of one task, under the mirror lock. Shortening it further needs the network commands to
+      read a configuration of the coder's own.
+    * **Local mode, Podman and run pods off**, where the coder's git runs in its own container, unprotected, as before. Without run pods
+      the commands of a run run in that container anyway.
+    * The sandbox is a container of the coder's pod, not a user or a machine: a flaw in the container runtime's isolation or a capability the
+      deployment adds back would reach the coder's. It is the same boundary the run pods rely on.
+    * The sandbox's output is untrusted by design and the coder treats it as data; nothing here makes `git`'s answers true.

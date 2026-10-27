@@ -77,10 +77,10 @@ flowchart LR
 `docker/coder/Dockerfile`, built from the **repository root**, has three stages: it compiles `adam-coder`,
 `adam-agent`, `adam-kube-exec`, `adam-egress` and the two binaries of `adam-git-sandbox` on a pinned `rust:1.94-trixie` (tag and digest, so glibc matches the
 runtime image; `adam-egress` is the HTTPS-only proxy for run pods, [`bin/adam-egress`](../../bin/adam-egress/README.md),
-smoke-tested in the image and not deployed by the chart yet; `adam-git-sandbox` is the server that runs the coder's git
+smoke-tested in the image and run by the chart with run pods; `adam-git-sandbox` is the server that runs the coder's git
 where no secret is readable and `adam-git` the relay that stands in for git, [`crates/adam-git-sandbox`](../../crates/adam-git-sandbox/README.md),
-smoke-tested in the image and **not deployed by the chart yet**: a deployment that sets `GIT_SANDBOX_SOCKET` runs the server
-itself, as a container of the coder's pod that mounts the same work volume and holds no secret); it takes the official `github-mcp-server` binary (pinned by tag and digest); and the runtime is the
+smoke-tested in the image and run by the chart, with run pods, as a container of the coder's pod that mounts the same work volume and holds no secret;
+a deployment without run pods that sets `GIT_SANDBOX_SOCKET` runs the server itself); it takes the official `github-mcp-server` binary (pinned by tag and digest); and the runtime is the
 `workspace` image of `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini, OpenCode, the obscura
 headless browser), pinned by an immutable tag, with those binaries, the devcontainer CLI and Podman's remote client
 added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is
@@ -97,7 +97,7 @@ against `EXPECT_REVISION`, which CI sets to the commit.
 
 | You need | Why |
 |---|---|
-| Kubernetes 1.29+ (1.30+ for run pods) | the GitHub MCP server is a native sidecar; run pods use a `ValidatingAdmissionPolicy` (*unverified*, from memory) |
+| Kubernetes 1.29+ (1.30+ for run pods) | the GitHub MCP server and, with run pods, the git sandbox are native sidecars; run pods use a `ValidatingAdmissionPolicy` (*unverified*, from memory) |
 | the CloudNativePG operator, **or** an existing Postgres | the run store; `database.enabled: false` + `database.existingSecret.name` for your own |
 | External Secrets (`ExternalSecret`, `external-secrets.io/v1`) | the three secrets below; the defaults point at one owner's `secretStoreRef` and `key`, override them |
 | a StorageClass | the PVC at `/work` (a ReadWriteMany one for `shared` or `affinity` placement) |
@@ -185,7 +185,20 @@ of its allow-list over HTTPS (`CONNECT` to port 443, public IPv4 addresses only)
 repositories **read-only** and each worktree's own directory in it, and no Secret but the model key
 ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), proposed): `git commit` and anything else that writes the
 mirror fails in the pod, the coder commits. The template must mount the work claim once, whole, at `WORKSPACE_ROOT` (the
-chart's does; a hand-written one that does not stops the coder, exit 78). Details and what is unverified on the owner's cluster:
+chart's does; a hand-written one that does not stops the coder, exit 78).
+
+**The coder's own git runs in a sandbox container.** `git` runs the programs a repository's configuration names (a clean
+filter, an fsmonitor), and some repositories are a run's own, so with run pods the chart adds a second container to the coder
+pod, `git-sandbox`, in which the `git status`, `git add`, `git diff` and `git commit` of the coder run
+([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), open decision 6; issue
+[#118](https://github.com/vymalo/another-adam-rs/issues/118)). It has the work volume and the coder's user and nothing secret: no
+Secret volume or variable, no service-account token (the token is a projected volume of the coder container alone), a process
+namespace of its own and a read-only root file system. `fetch`, `push` and `ls-remote`, which need the token, stay in the coder.
+There is nothing to configure but its memory (`runPods.gitSandbox.resources`, 1Gi) and no switch to turn it off; the coder rolls once on the upgrade.
+**Without run pods git runs in the coder's container, next to the secrets, and is not protected.** What it does not cover (a program in the
+sandbox still reads and writes the whole work volume) and how it is checked: [chart README, "The git sandbox"](../../deploy/coder/README.md#the-git-sandbox).
+
+Details and what is unverified on the owner's cluster:
 [chart README, "Run pods"](../../deploy/coder/README.md#run-pods). The repository's devcontainer is **not** used
 on Kubernetes ([why](../../deploy/coder/README.md#devcontainers-are-off-here)).
 

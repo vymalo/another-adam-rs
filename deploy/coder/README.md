@@ -7,7 +7,7 @@ cluster.
 
 | Object | What |
 |---|---|
-| `StatefulSet` | `replicaCount` replicas (1 by default; the worker with `topology: split`), `work` at `/work`: a PVC per pod on `longhorn` by default (mirrors and worktrees persist), or one shared claim, see [Workspace placement](#workspace-placement); `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz`; on the roles that run workers, the GitHub MCP server as a native sidecar, see [The GitHub MCP server](#the-github-mcp-server-a-sidecar) |
+| `StatefulSet` | `replicaCount` replicas (1 by default; the worker with `topology: split`), `work` at `/work`: a PVC per pod on `longhorn` by default (mirrors and worktrees persist), or one shared claim, see [Workspace placement](#workspace-placement); `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz`; on the roles that run workers, the GitHub MCP server as a native sidecar, see [The GitHub MCP server](#the-github-mcp-server-a-sidecar), and, with `runPods.enabled`, the git sandbox as another, see [The git sandbox](#the-git-sandbox) |
 | `PersistentVolumeClaim` | `workspace.placement` `shared` or `affinity` without `workspace.sharedVolume.existingClaim` only: `<release>-coder-work`, ReadWriteMany, kept on `helm uninstall` |
 | `Deployment` | `topology: split` only: the front (`<release>-coder-front`), `ROLE=control-plane`, no volume, `front.replicas` replicas |
 | `PodDisruptionBudget` | `topology: split` with `front.replicas` above 1: `minAvailable: 1` for the front |
@@ -16,7 +16,7 @@ cluster.
 | `Cluster` (CNPG) | `database.enabled` (the default) only: the coder's database; `DATABASE_URL` is the `uri` key of the `<release>-db-app` Secret CNPG creates. With `database.enabled: false` no Cluster is rendered and `DATABASE_URL` is read from `database.existingSecret`, see [Database](#database) |
 | `ExternalSecret` | `ssegning-aws` / `prod/meta/test-app`; the property of each value is in `externalSecrets.properties` |
 | `PersistentVolumeClaim` | `cache.create` only: `<release>-coder-cache`, ReadWriteMany, deleted with the release, see [The package cache](#the-package-cache) |
-| `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy`, and the egress proxy (a `Deployment`, a `Service`, a `PodDisruptionBudget`, a `ServiceAccount`, a `ConfigMap` and a third `NetworkPolicy`) | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
+| `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy`, the egress proxy (a `Deployment`, a `Service`, a `PodDisruptionBudget`, a `ServiceAccount`, a `ConfigMap` and a third `NetworkPolicy`), and, in the coder pod, the `git-sandbox` container | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
 | `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 
 ```sh
@@ -656,15 +656,17 @@ What it renders, and why each is there:
 |---|---|
 | `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, `MODEL_API_KEY` from the ExternalSecret's Secret, the coder's workspace claim at `/work` **whole, which the coder replaces by the run's own mounts** ([below](#what-a-run-pod-sees)), and an init container that copies `adam-exec` and OpenCode out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations and narrows the `/work` mount; it refuses to start when the run container does not mount a volume at its `WORKSPACE_ROOT` once and whole; a changed template is a deploy (a checksum annotation) |
 | `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot. `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
-| `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is mounted in the coder pod alone; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
+| `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is a projected volume mounted in the coder container alone: the pod automounts none, so neither the git sandbox nor the GitHub MCP sidecar has it; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
 | `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references a Secret key other than `MODEL_API_KEY` of the ExternalSecret's Secret (by name **and** key), or any Secret by `envFrom`, is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
 | `NetworkPolicy` `<release>-coder-run-pods` | **deny by default** ([ADR 0042](../../docs/decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)): no ingress; egress to DNS, to the egress proxy's pods on TCP 3128 and to `networkPolicy.extraEgress` (an in-cluster target such as a model gateway), and nothing else. There is no rule for the internet and no value that adds one: `networkPolicy.enabled: false` is refused. No rule names an IPv6 range, so IPv6 egress is denied |
+| a `git-sandbox` container in the coder pod, and a projected token volume | **the git sandbox**, where the coder's local git runs because a repository's configuration can name a program: [below](#the-git-sandbox) |
 | `Deployment`, `Service`, `ServiceAccount`, `ConfigMap`, `PodDisruptionBudget`, `NetworkPolicy` `<release>-coder-egress` | **the egress proxy**, the one way out of a run pod: [below](#the-egress-proxy) |
 
 The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_POD_NAMESPACE` (its own, by the downward API), `RUN_POD_INSTANCE` (the release),
 `RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.92 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (600), a
-`WORKER_ID` from the pod name (a worker sweeps only its own idle pods), the ServiceAccount, and **`runPods.coderResources`
-(a 1Gi memory limit) instead of `resources`** (6Gi), which is untouched while run pods are off. Set `runPods.coderResources: null` to keep `resources`.
+`WORKER_ID` from the pod name (a worker sweeps only its own idle pods), the ServiceAccount, `GIT_SANDBOX_SOCKET` (the socket of [the git sandbox](#the-git-sandbox)), and **`runPods.coderResources`
+(a 1Gi memory limit) instead of `resources`** (6Gi), which is untouched while run pods are off. Set `runPods.coderResources: null` to keep `resources`. The git that
+used to run in the coder's memory runs in the sandbox now, which has a memory limit of its own (`runPods.gitSandbox.resources`, 1Gi).
 
 **Where `/work` comes from.** The run pod mounts the parts of the coder's workspace volume it needs at the same paths ([below](#what-a-run-pod-sees)), so a path means the same in both; the template names the claim:
 
@@ -703,6 +705,75 @@ seeds with two runs of one mirror, and whose slot it cannot rename, remove or re
 namespace (needs root; CI runs it before the kind job). It does not run the coder over a model. **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
 sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy (kind's, kindnet, does, and the job fails when it does not), and the HTTP status of an admission refusal (the
 coder treats 403, 422 and 400 as the deployment's mistake).
+
+### The git sandbox
+
+`git` runs what a repository's configuration names: a `filter.<x>.clean`, a `core.fsmonitor`, a `diff.<x>.textconv`. Some repositories are the run's own (a scratch
+project's `.git/config`, an embedded repository in a worktree), and git has no switch that turns the programs off or a way to override them by name. So the
+coder's own `git status`, `git add -A` and `git diff` would run a person's program in the coder's container, as the user that can read the GitHub App's key and, in the
+environment of its other processes, the model key and the database URL. With run pods on, **those commands run in a second container of the coder pod where none of that
+is readable** ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md), open decision 6, closed 2026-10-27; issue
+[#118](https://github.com/vymalo/another-adam-rs/issues/118); the server and the relay are [`crates/adam-git-sandbox`](../../crates/adam-git-sandbox/README.md)).
+
+```mermaid
+flowchart LR
+    subgraph pod["the coder pod (no shareProcessNamespace: two PID namespaces)"]
+        subgraph coder["coder container"]
+            c["adam-coder<br/>holds: the App's key file, MODEL_API_KEY, DATABASE_URL,<br/>A2A_BEARER_TOKENS, the service-account token"]
+        end
+        subgraph sandbox["git-sandbox container (native sidecar)"]
+            s["adam-git-sandbox, then git<br/>holds: nothing secret. Read-only root file system"]
+        end
+        work[("work volume<br/>/work in both")]
+        sock[("emptyDir<br/>/run/git-sandbox/git.sock")]
+    end
+    c -- "status, add, diff, commit, worktree, config, apply" --> sock
+    sock --> s
+    c --- work
+    s --- work
+    c -- "fetch, push, ls-remote (carry the token)" --> remote["the git host"]
+```
+
+| | coder container | `git-sandbox` container |
+|---|---|---|
+| Image | `image.*` | the same (`adam-git-sandbox` and `adam-git` are in it) |
+| User | the pod's `runAsUser` | the same: the pod's setting applies to both, the container sets none of its own |
+| Work volume | `/work` | `/work`, the same path (the commands carry paths) |
+| Secrets | the App's key file, `MODEL_API_KEY`, `A2A_BEARER_TOKENS`, `DATABASE_URL` | **none**: no Secret volume, no `envFrom`, no variable from a Secret |
+| Service-account token | a projected volume (`kube-api-access`: token, the cluster's CA, the namespace) at `/var/run/secrets/kubernetes.io/serviceaccount` | **none**: the pod sets `automountServiceAccountToken: false` |
+| Other volumes | the pod template, the cache when it is on, the extra MCP file, the card-signing key | **none**; its `/tmp` is its own `emptyDir` in memory (`runPods.gitSandbox.tmpSize`) |
+| Socket | `GIT_SANDBOX_SOCKET=/run/git-sandbox/git.sock` | `GIT_SANDBOX_LISTEN`, the same `emptyDir`, mode `0600` |
+| Root file system | writable | read-only; no escalation, no capability, the default seccomp profile |
+| Memory | `runPods.coderResources` | `runPods.gitSandbox.resources` (1Gi limit, required) |
+
+* **A native sidecar** (an init container with `restartPolicy: Always`, the first of them): it starts before the coder after a startup probe that runs `adam-git --version`
+  through the relay in the work volume's root, so the coder never starts to a sandbox that does not answer, and it stops after the coder, so a step the coder finishes on SIGTERM
+  still finds it. A liveness probe asks the same every 30 s (six failures restart it: a sandbox saturated by hung commands is restarted, which kills them). Kubernetes 1.29 or later, as for
+  the GitHub MCP sidecar.
+* **Which commands go where** is the coder's ([`adam-workspace`](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox)): everything that carries no credential goes to
+  the sandbox, and a sandbox that cannot be reached is an error and never a fallback; `fetch`, `push` and `ls-remote` stay in the coder, on the bare mirror, after the mirror's
+  configuration has been put back to what the workspace writes.
+* **Values** (`runPods.gitSandbox`): `resources` (a memory limit is required), `tmpSize` (`64Mi`), `maxCommands` (`GIT_SANDBOX_MAX_COMMANDS`, 64). There is **no switch to turn it off**: it is on with
+  `runPods.enabled`, the mode where a run's commands leave the coder's container too. `config.extraEnv` may not set `GIT_SANDBOX_SOCKET` while it is on.
+* **Without run pods nothing changes and nothing is protected**: no sandbox container, no `GIT_SANDBOX_SOCKET`, the pod automounts no token (as it did not), and git runs in the coder's
+  container next to the secrets, as the run's commands do. Local mode and Podman are the same. A deployment that runs its own sandbox sets `GIT_SANDBOX_SOCKET` in `config.extraEnv` itself.
+* **Upgrading** a deployment that has run pods on: the coder rolls once. The GitHub MCP sidecar no longer has the service-account token (it never needed it), and the coder container
+  reads its token from the projected volume (`kube-client` 4.2.0 reads `/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}` and re-reads the token file at
+  most every 60 s, so the kubelet's rotation reaches it: *verified 2026-10-27* in its source, `config/incluster_config.rs` and `client/auth/mod.rs`; `adam-kube-exec` reads the same files). A `GIT_CONFIG_GLOBAL` file that the deployment names must exist in the sandbox too (the same image).
+
+**Not covered** (ADR 0041): a program the sandbox runs can still **read and write the whole work volume**, every run's files and every mirror, as the coder's git could (closing that needs
+git per run, in the run pod, with another commit path), and the integrity of other people's branches in a shared mirror waits for a mirror per person
+([#122](https://github.com/vymalo/another-adam-rs/issues/122)); a writer already in the sandbox can change the mirror's configuration between the repair and a network command's read of it
+(a window inside one task, under the mirror lock); local mode, Podman and run pods off.
+
+**Checked by** `tests/render-check.sh` (the sandbox exists with run pods and not without, in no role that starts no commands; no Secret volume, `envFrom` or variable from a Secret; the
+work volume at the same path; no user of its own, the pod's applies to both; a read-only root file system; the token a projected volume of the coder container alone and the pod automounting
+none; no `shareProcessNamespace`; the coder's `GIT_SANDBOX_SOCKET`; the refusals; each broken on purpose once) and the `run-pods` job (`tests/kind-run-pods.sh`, with
+`tests/git-sandbox-vector.sh`): on a pod made from this chart's StatefulSet, with canaries for the App's key, the model key, a bearer token and the database URL, the sandbox has no token,
+no key, no mount of a secret, none of the canaries in its environment and no view of the coder's processes (its process 1 is its own `tini -- adam-git-sandbox`); the coder container
+has them, and its token is accepted by the API server; a commit through the socket is the same commit in both; and a scratch project whose `.git/config` names a clean filter and an
+`core.fsmonitor` that write what they can read to a marker runs them **in the sandbox** under `adam-git add -A`, with a marker that holds none of the canaries, where the same
+program run by plain git in the coder container (the control) reads all of them. *Unverified* until CI has run it: no cluster exists where this was written.
 
 ### The egress proxy
 
@@ -808,3 +879,9 @@ that the pods can write to it, and a hit across two pods.
   operator version on the cluster.
 * Rendered with Helm v3.19.0 (`helm lint`, `helm template`); not applied to a
   cluster and not validated against the CRD schemas.
+* The git sandbox ([above](#the-git-sandbox)): the render's guarantees are asserted by `tests/render-check.sh`; that the sandbox container of a pod made from
+  this chart has no token, no Secret and no view of the coder's processes, and runs the program a repository's configuration names without exposing a
+  canary, is what `tests/kind-run-pods.sh` shows and is *unverified* until the `run-pods` job has run it (its assertions were walked on one machine with
+  Linux namespaces standing in for the two containers, the real `adam-git-sandbox`, `adam-git`, git and this chart's rendered StatefulSet, and each leak the
+  script is meant to catch, a mounted token, a variable of a secret and a shared process namespace, was introduced on purpose and caught: that is not a cluster).
+  `kube-client` 4.2.0 reads the service-account files from the standard path and re-reads the token: *verified 2026-10-27*, in its source.
