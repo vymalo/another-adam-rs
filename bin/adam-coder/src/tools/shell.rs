@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use adam_runtime::CancelToken;
-use adam_workspace::{EnvError, EnvSession, ExecSpec};
+use adam_workspace::{EnvError, EnvSession, ExecSpec, safe_fs};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -199,11 +199,17 @@ fn command_words(command: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
+/// The most of a `package.json` that is read for a hint: 1 MiB, as for `info/exclude`, far above a
+/// real one.
+const MAX_PACKAGE_JSON: u64 = 1024 * 1024;
+
 /// What the workspace is missing, if the project brings it itself: the tool `name` is one the
 /// project's own dependencies provide (`jest` under `node_modules/.bin`, `pytest` in a virtual
 /// environment), which is not a system toolchain the workspace lacks but a dependency nobody
 /// installed yet. The project's own install command is the way on. Looks in `dirs` (the directory
-/// the command ran in, then the worktree root) for the files that say so.
+/// the command ran in, then the worktree root) for the files that say so. A `package.json` is read
+/// as [`safe_fs`] reads what a run can write: a link, a pipe or a file over `MAX_PACKAGE_JSON` is not
+/// one.
 pub fn project_dependency_hint(dirs: &[&Path], name: &str) -> Option<String> {
     const NODE_TOOLS: &[&str] = &[
         "jest",
@@ -232,7 +238,11 @@ pub fn project_dependency_hint(dirs: &[&Path], name: &str) -> Option<String> {
         "pytest", "tox", "flake8", "black", "mypy", "ruff", "nox", "isort",
     ];
     for dir in dirs {
-        if let Ok(text) = std::fs::read_to_string(dir.join("package.json")) {
+        // The repository chose what is at this name: a link, a pipe, a device or a file over the cap
+        // is no `package.json`.
+        if let Ok(text) =
+            safe_fs::read_regular_text_blocking(&dir.join("package.json"), MAX_PACKAGE_JSON)
+        {
             let declared = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .is_some_and(|json| {
@@ -923,6 +933,79 @@ mod tests {
             project_dependency_hint(&[sub.as_path(), dir.path()], "eslint").as_deref(),
             Some("npm ci")
         );
+    }
+
+    /// The `package.json` a repository can make into anything: the hint comes from a regular file
+    /// and from nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_json_that_is_a_link_is_no_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("deps.json");
+        std::fs::write(&target, r#"{"devDependencies": {"left-pad": "1"}}"#).unwrap();
+        let package = dir.path().join("package.json");
+        std::os::unix::fs::symlink(&target, &package).unwrap();
+        let here = [dir.path()];
+        assert_eq!(project_dependency_hint(&here, "left-pad"), None);
+        // Not even a well-known node tool: a link is not a project file at all.
+        assert_eq!(project_dependency_hint(&here, "jest"), None);
+        // The same content as the file itself gives the hint, so the link is what was refused.
+        std::fs::remove_file(&package).unwrap();
+        std::fs::copy(&target, &package).unwrap();
+        assert_eq!(
+            project_dependency_hint(&here, "left-pad").as_deref(),
+            Some("npm install")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_json_that_is_a_pipe_is_not_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(dir.path().join("package.json"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = dir.path().to_owned();
+        let (done, answer) = std::sync::mpsc::channel();
+        // A thread, so that a read that waits for a writer fails this test instead of hanging it.
+        std::thread::spawn(move || {
+            let hint = (
+                project_dependency_hint(&[path.as_path()], "left-pad"),
+                project_dependency_hint(&[path.as_path()], "jest"),
+            );
+            let _ = done.send(hint);
+        });
+        let hint = answer
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a pipe in place of package.json is not waited on");
+        assert_eq!(hint, (None, None));
+    }
+
+    #[test]
+    fn a_package_json_over_the_cap_is_not_read_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = r#"{"devDependencies": {"left-pad": "1"}}"#;
+        let of_size = |size: u64| {
+            let size = usize::try_from(size).unwrap();
+            format!("{head}{}", " ".repeat(size - head.len()))
+        };
+        let package = dir.path().join("package.json");
+        let here = [dir.path()];
+        // At the cap it is read as any other.
+        std::fs::write(&package, of_size(MAX_PACKAGE_JSON)).unwrap();
+        assert_eq!(
+            project_dependency_hint(&here, "left-pad").as_deref(),
+            Some("npm install")
+        );
+        // One byte over, it is no package.json: not its dependencies, not a well-known tool.
+        std::fs::write(&package, of_size(MAX_PACKAGE_JSON + 1)).unwrap();
+        assert_eq!(project_dependency_hint(&here, "left-pad"), None);
+        assert_eq!(project_dependency_hint(&here, "jest"), None);
     }
 
     #[test]

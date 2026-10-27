@@ -411,7 +411,8 @@ make them hold:
   and not to install a system toolchain, but to tell the person which toolchain is missing with `ask_user` and
   wait (the owner's decision: the workspace image carries the toolchains it carries, no Java for now). A tool
   that **the project brings itself** (`jest`, `vitest`, `tsc` with a `package.json` that declares it or is
-  one of the well-known node tools, `pytest` with a Python project file; `project_dependency_hint`) is a
+  one of the well-known node tools, `pytest` with a Python project file; `project_dependency_hint`, which reads
+  `package.json` with `safe_fs` (a link, a pipe or a file over 1 MiB is no `package.json`)) is a
   dependency that is not installed yet, and the answer says to install the project's dependencies with its own
   command (`pnpm install`, `npm ci`, `pip install -r requirements.txt`, picked from the lock files) through
   `delegate_to_opencode` **only** (an install that passes under `run_checks` would be a green check on code
