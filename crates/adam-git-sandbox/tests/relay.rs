@@ -31,6 +31,7 @@ impl Sandbox {
         let log = tmp.path().join("server.log");
         let server = Command::new(SERVER)
             .env_clear()
+            .envs(coverage())
             .env("PATH", std::env::var_os("PATH").unwrap())
             .env("GIT_SANDBOX_LISTEN", &socket)
             .env("GIT_SANDBOX_ROOT", &root)
@@ -59,6 +60,7 @@ impl Sandbox {
         command
             .current_dir(cwd)
             .env_clear()
+            .envs(coverage())
             .env("PATH", std::env::var_os("PATH").unwrap())
             .env("GIT_SANDBOX_SOCKET", &self.socket)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -94,6 +96,7 @@ fn direct(cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
             .current_dir(cwd)
             .args(args)
             .env_clear()
+            .envs(coverage())
             .env("PATH", std::env::var_os("PATH").unwrap())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -120,6 +123,13 @@ fn run(command: &mut Command, stdin: &[u8]) -> Output {
     let output = child.wait_with_output().unwrap();
     feeder.join().unwrap();
     output
+}
+
+/// The profile path of a coverage run (`cargo llvm-cov` sets it), kept for the programs these tests
+/// start with a cleared environment: without it an instrumented relay writes its profile into its
+/// working directory, a repository whose `status` the tests compare.
+fn coverage() -> Option<(&'static str, std::ffi::OsString)> {
+    std::env::var_os("LLVM_PROFILE_FILE").map(|path| ("LLVM_PROFILE_FILE", path))
 }
 
 fn through(sandbox: &Sandbox, cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
@@ -220,7 +230,11 @@ fn without_a_socket_the_relay_says_so_and_runs_no_git() {
     ];
     for (what, socket) in cases {
         let mut relay = Command::new(RELAY);
-        relay.current_dir(tmp.path()).env_clear().env("PATH", &bin);
+        relay
+            .current_dir(tmp.path())
+            .env_clear()
+            .envs(coverage())
+            .env("PATH", &bin);
         if let Some(socket) = &socket {
             relay.env("GIT_SANDBOX_SOCKET", socket);
         }
@@ -407,6 +421,7 @@ fn the_server_ends_with_the_codes_it_documents() {
     // No variables: the configuration, every problem at once.
     let out = Command::new(SERVER)
         .env_clear()
+        .envs(coverage())
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();
@@ -425,6 +440,7 @@ fn the_server_ends_with_the_codes_it_documents() {
     std::fs::write(&taken, "mine").unwrap();
     let out = Command::new(SERVER)
         .env_clear()
+        .envs(coverage())
         .env("PATH", std::env::var_os("PATH").unwrap())
         .env("GIT_SANDBOX_LISTEN", &taken)
         .env("GIT_SANDBOX_ROOT", &root)
@@ -479,6 +495,7 @@ fn caller_running(program: &str, repo: &Path, sandbox: &Sandbox) -> Output {
     caller
         .current_dir(repo)
         .env_clear()
+        .envs(coverage())
         .env("PATH", std::env::var_os("PATH").unwrap())
         .env("CALLERS_SECRET", "the-callers-secret-value")
         .env("GIT_SANDBOX_SOCKET", &sandbox.socket)
