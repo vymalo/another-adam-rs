@@ -170,6 +170,8 @@ pub async fn prepare_workspace(
             slot.dir()
         )));
     };
+    // The file and git tools never ask the environment for anything: the slot is told to it now.
+    let sealed = env.seal(ctx, &workspace).await;
     if let Some(line) = wt.continues() {
         // What the verdict of a run that ends without a pull request says was not updated.
         let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
@@ -195,6 +197,10 @@ pub async fn prepare_workspace(
              request.",
             wt.branch()
         ));
+    }
+    if let Some(note) = sealed {
+        text.push('\n');
+        text.push_str(&note);
     }
     Ok(ToolOutput::text(text))
 }

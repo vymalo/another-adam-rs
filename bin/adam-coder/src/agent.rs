@@ -458,10 +458,21 @@ impl CoderAgent {
         if notes.scratch_adopted {
             return false;
         }
-        let taken = match self.env.workspaces.run(run) {
-            Ok(workspace) => workspace.adopt_scratch(conversation).await,
-            Err(e) => Err(e),
+        let workspace = match self.env.workspaces.run(run) {
+            Ok(workspace) => workspace,
+            Err(e) => {
+                tracing::warn!(%run, error = %report(&e), "cannot take over the scratch projects of the conversation");
+                return false;
+            }
         };
+        let taken = workspace.adopt_scratch(conversation).await;
+        // A project that came in is a slot like any other: the environment is told, so that a pod
+        // of the run, if there is one, mounts it. A failed take-over may have moved some first.
+        if !matches!(&taken, Ok(names) if names.is_empty())
+            && let Err(e) = self.env.environment.seal(&workspace).await
+        {
+            tracing::warn!(%run, error = %report(&e), "cannot seal the run's environment for the scratch projects it took over; the next command makes its pod again");
+        }
         match taken {
             Ok(names) => {
                 if !names.is_empty() {

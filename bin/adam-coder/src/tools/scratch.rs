@@ -83,6 +83,8 @@ pub async fn start_scratch(
         }
         Err(e) => return Err(workspace_error(&e)),
     };
+    // The file and git tools never ask the environment for anything: the project is told to it now.
+    let sealed = env.seal(ctx, &workspace).await;
     ctx.emit_progress(format!("started the scratch project {}", slot.dir()))
         .await;
     let mut text = format!(
@@ -118,6 +120,10 @@ pub async fn start_scratch(
         ));
     }
     if let Some(note) = published_note(&slot) {
+        text.push('\n');
+        text.push_str(&note);
+    }
+    if let Some(note) = sealed {
         text.push('\n');
         text.push_str(&note);
     }
@@ -212,6 +218,9 @@ pub async fn publish_scratch(
         Ok(found) => found,
         Err(outcome) => return outcome,
     };
+    // The repository's slot is told to the environment (also when it was found: a retry of a call
+    // that died between the slot and the seal), before anything is copied into it.
+    let sealed = env.seal(ctx, &workspace).await;
     let Some(wt) = slot.worktree() else {
         return Ok(ToolOutput::error(format!(
             "`{}` is a scratch project, not a repository",
@@ -280,7 +289,7 @@ pub async fn publish_scratch(
             slot.dir()
         ),
     };
-    Ok(ToolOutput::text(published_text(&Published {
+    let mut text = published_text(&Published {
         project: source.dir(),
         slot: slot.dir(),
         url: &wt.repo().url,
@@ -289,7 +298,12 @@ pub async fn publish_scratch(
         initialized,
         report: &report,
         verdict: &verdict,
-    })))
+    });
+    if let Some(note) = sealed {
+        text.push('\n');
+        text.push_str(&note);
+    }
+    Ok(ToolOutput::text(text))
 }
 
 /// What a successful `publish_scratch` says.

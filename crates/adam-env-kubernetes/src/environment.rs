@@ -10,7 +10,8 @@
 //!                  ▼            ▼
 //!              Unavailable    Deleted (unschedulable, image refused) ─▶ Requested   (the next ensure)
 //! Ready ─▶ Deleted     the pod ended (OOM, eviction), or no command used it for `idle`
-//! Ready ─▶ Deleted     a worktree was added and the pod lacks its mounts, with no command running (else: wait)
+//! Ready ─▶ Deleted     a slot was added and the pod lacks its mount, with no command running (else: wait); `ensure`
+//!                      does it for the next command, `seal` right after the slot is added
 //! Ready, Starting ─▶ Deleted   the run ended: the janitor's `release`
 //! ```
 
@@ -280,7 +281,7 @@ impl KubeEnvironment {
 
     /// A ready pod for `run`: the one that is there, or a new one, mounting what `mounts` says.
     ///
-    /// A pod whose mounts lack one of `mounts` (a worktree added since it was made, or a pod made before
+    /// A pod whose mounts lack one of `mounts` (a slot added since it was made, or a pod made before
     /// mounts were recorded) is made again, because the mounts of a pod are fixed when it is made. The files
     /// are on the volume, so only what is running in it is lost: a pod that runs a command (or cannot be
     /// asked) is waited for instead, as a quota is ([`EnvError::Unavailable`]).
@@ -661,6 +662,48 @@ impl Environment for KubeEnvironment {
         let _ = use_default;
         self.release(run).await?;
         Ok(true)
+    }
+
+    /// Delete the run's pod when it lacks a mount the workspace needs now (a slot added since it was
+    /// made) and no command runs in it; the next `ensure` makes a new one. The files are on the volume,
+    /// so only what is running in the pod is lost, and nothing is. While a command runs, or when the
+    /// pod cannot be asked, this is [`EnvError::Unavailable`], as it is for `ensure`.
+    ///
+    /// It never makes a pod: a run with no pod, a pod that is going away or is over, a pod that has
+    /// every mount, and a pod of another run (the names of two runs collided; `ensure` refuses that) are
+    /// left as they are, and the run's directory is not made for a pod that is not there.
+    async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
+        let run = workspace.run();
+        let name = pod_name(run);
+        // The lock of `ensure` and `release`: a pod that is being made is not looked at half made.
+        let lock = self.inner.lock_of(run);
+        let _held = lock.lock().await;
+        let found = self
+            .inner
+            .pods
+            .get_opt(&name)
+            .await
+            .map_err(|e| env_error(&e, "looking for the run pod"))?;
+        let Some(pod) = found else {
+            return Ok(());
+        };
+        if annotation(&pod, RUN_ID_ANNOTATION) != Some(run)
+            || pod.metadata.deletion_timestamp.is_some()
+            || ended(&pod)
+        {
+            return Ok(());
+        }
+        let mounts = self.inner.template.mounts_for(workspace).await?;
+        let Some(mount) = mounts.missing_from(annotation(&pod, MOUNTS_ANNOTATION)) else {
+            return Ok(());
+        };
+        let missing = mount.path().display().to_string();
+        if is_ready(&pod) {
+            self.free_for_new_mount(&name, &missing).await?;
+        }
+        self.inner.delete(&name).await?;
+        tracing::info!(%run, pod = %name, mount = %missing, "deleted a run pod that lacks a mount of the workspace; the next command makes another");
+        Ok(())
     }
 }
 

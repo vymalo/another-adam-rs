@@ -7,6 +7,7 @@
 //! | Mount | Mode | Why |
 //! |---|---|---|
 //! | `workspaces/<run>` | read-write | the run's slots: its worktrees and scratch projects |
+//! | `workspaces/<run>/<slot>` for each slot, worktree or scratch project | read-write, on top | so that **the slot's directory is a mount point**: a name the pod cannot rename, move, remove or exchange (`EBUSY`), which is what the coder's `git`, that finds its work tree by name, relies on |
 //! | `git/<host>/<owner>/<repo>.git` for each worktree slot | **read-only** | a worktree's `.git` file points into its mirror: git reads objects, refs and configuration there |
 //! | `git/<host>/<owner>/<repo>.git/worktrees/<name>` for each worktree slot | read-write, on top | the worktree's own `HEAD` and `index`, which `git status` refreshes |
 //! | `.../worktrees/<name>/HEAD`, `commondir`, `gitdir` and `logs` | **read-only**, on top of that | the branch the coder's `git` resets and commits (`HEAD`), what it follows into the mirror (`commondir`), what ties the directory to its slot (`gitdir`), and the reflog it appends to (`logs/HEAD`) |
@@ -28,9 +29,17 @@
 //! all: the coder refuses git on it too.
 //!
 //! A bind mount follows a **directory**, and not the name it had: a slot removed and added again has the
-//! same name and a new directory, which the pod's mounts would not follow. So each of these lines in the
-//! annotation carries the *generation* of the worktree's directory (`Worktree::git_dir_generation`, new each
-//! time the coder makes it) after the path, and a pod made for the earlier directory is made again.
+//! same name and a new directory, which the pod's mounts would not follow. So the line of a slot and the
+//! lines of a worktree's directory in the mirror carry the *generation* of the directory
+//! (`Slot::generation` and `Worktree::git_dir_generation`, new each time the coder makes it) after the path,
+//! and a pod made for the earlier directory is made again. A slot made before generations were recorded
+//! has none, and its line is what it always was, so a pod made for it is not made again for nothing.
+//!
+//! What the slot mounts protect is the slot's **directory**: a command of the run cannot rename it and put a
+//! link at its name between the coder's look at it and `git`'s read of it. They do not protect what is
+//! below it (the coder's file tools open those relative to the directory they hold, `SlotDir`), the
+//! creation of a slot (the run's directory is the run's to write until the slot is there),
+//! `.adam-base/`, or the entries of a worktree's directory in the mirror that are not sealed (the index).
 //!
 //! The worktree's directory in the mirror is taken from **the coder's own metadata** (`Worktree::git_dir`),
 //! never from the slot's `.git` file: the run's commands can write that file, and a name read from it could
@@ -38,8 +47,10 @@
 //!
 //! The mounts of a pod are fixed when it is made, so the set it was made with is an annotation
 //! ([`MOUNTS_ANNOTATION`](crate::MOUNTS_ANNOTATION)) and [`ensure`](adam_workspace::Environment::ensure)
-//! compares it with the run's workspace each time: a worktree slot added since needs mounts the pod does
-//! not have.
+//! compares it with the run's workspace each time: a slot added since needs mounts the pod does not have.
+//! The coder's file and git tools do not call `ensure`, so it calls
+//! [`seal`](adam_workspace::Environment::seal) right after it adds a slot, which makes the same comparison
+//! and deletes a stale pod when nothing runs in it.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -52,7 +63,7 @@ pub struct Mount {
     path: PathBuf,
     sub_path: String,
     read_only: bool,
-    /// Which making of the directory this is, for a mount of a worktree's directory in the mirror.
+    /// Which making of the directory this is, for a mount of a slot or of a worktree's directory in the mirror.
     generation: Option<String>,
 }
 
@@ -72,7 +83,9 @@ impl Mount {
         self.read_only
     }
 
-    /// The generation of the worktree's directory the mount shows ([`WorktreeDirs::generation`]).
+    /// The generation of the directory the mount shows ([`SlotMount::generation`],
+    /// [`WorktreeDirs::generation`]); `None` for a mount of neither, and for a directory made before it
+    /// was recorded.
     pub fn generation(&self) -> Option<&str> {
         self.generation.as_deref()
     }
@@ -126,22 +139,36 @@ pub struct WorkspaceMounts {
 }
 
 impl WorkspaceMounts {
-    /// The mounts for `run_dir` (read-write) and the git directories of its worktree slots. `base` is where
-    /// the template mounts the volume: every path is inside it, and a mount's sub path is relative to it.
+    /// The mounts for `run_dir` (read-write), each of its `slots` (read-write, on top: a slot is a direct
+    /// child of `run_dir`) and the git directories of its worktree slots. `base` is where the template
+    /// mounts the volume: every path is inside it, and a mount's sub path is relative to it.
     ///
     /// # Errors
     ///
-    /// [`EnvError::Refused`] for a path that is not absolute and plain text, is not below `base`, or a
-    /// worktree directory that is not inside its mirror's `worktrees/`.
+    /// [`EnvError::Refused`] for a path that is not absolute and plain text, is not below `base`, a slot
+    /// that is not a direct child of `run_dir`, or a worktree directory that is not inside its mirror's
+    /// `worktrees/`.
     pub fn plan(
         base: &Path,
         run_dir: &Path,
         slots: &[SlotMount],
         worktrees: &[WorktreeDirs],
     ) -> Result<Self, EnvError> {
-        let _ = slots;
         let mut wanted: BTreeMap<PathBuf, (bool, Option<String>)> = BTreeMap::new();
         wanted.insert(run_dir.to_owned(), (false, None));
+        for slot in slots {
+            let direct = slot.path.parent() == Some(run_dir) && slot.path.file_name().is_some();
+            if !direct {
+                return Err(EnvError::Refused(format!(
+                    "{} is not a slot of {}",
+                    slot.path.display(),
+                    run_dir.display()
+                )));
+            }
+            wanted
+                .entry(slot.path.clone())
+                .or_insert((false, slot.generation.clone()));
+        }
         for dirs in worktrees {
             let inside = dirs
                 .admin
@@ -204,8 +231,9 @@ impl WorkspaceMounts {
     /// The mounts of `workspace` as it is on disk now, for a template that mounts the volume at `base`.
     ///
     /// The run's directory is made first (by the coder, which owns the volume: a missing directory is made
-    /// by the kubelet as root). Only a worktree slot inside the run's directory gets git directories: the
-    /// legacy worktree of a run (`<root>/worktrees/<run>`) is outside it, where no command may run.
+    /// by the kubelet as root). Every slot inside the run's directory is a mount of its own, and a worktree
+    /// slot gets its git directories too: the legacy worktree of a run (`<root>/worktrees/<run>`) is outside
+    /// the run's directory, where no command may run, and gets nothing.
     /// A worktree whose directory in the mirror the coder's metadata cannot tell (a slot made before it was
     /// recorded, with no or several candidates in the mirror) gets no git mounts and is logged: less access
     /// is safe, and the next `ensure` tries again.
@@ -225,14 +253,20 @@ impl WorkspaceMounts {
                 adam_error::report(&e)
             ))
         })?;
+        let mut slot_mounts = Vec::new();
         let mut dirs = Vec::new();
         for slot in &slots {
-            let Some(worktree) = slot.worktree() else {
-                continue;
-            };
+            // The legacy worktree of a run is outside its directory, where no command may run.
             if !slot.path().starts_with(run_dir) {
                 continue;
             }
+            slot_mounts.push(SlotMount {
+                path: slot.path().to_owned(),
+                generation: slot.generation().map(str::to_owned),
+            });
+            let Some(worktree) = slot.worktree() else {
+                continue;
+            };
             match worktree.git_dir() {
                 Some(admin) if sealable(admin).await => dirs.push(WorktreeDirs {
                     mirror: worktree.mirror().to_owned(),
@@ -250,7 +284,7 @@ impl WorkspaceMounts {
                 ),
             }
         }
-        Self::plan(base, run_dir, &[], &dirs)
+        Self::plan(base, run_dir, &slot_mounts, &dirs)
     }
 }
 
@@ -526,7 +560,7 @@ mod tests {
         );
         let slots: Vec<_> = mounts
             .iter()
-            .filter(|m| m.path().starts_with("/work/workspaces/r1/"))
+            .filter(|m| m.path() != Path::new(RUN) && m.path().starts_with(RUN))
             .map(|m| (m.sub_path(), m.read_only(), m.generation()))
             .collect();
         assert_eq!(

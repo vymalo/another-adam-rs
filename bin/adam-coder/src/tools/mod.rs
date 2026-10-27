@@ -50,6 +50,10 @@
 //!   changes nothing.
 //! * `request_repository { repo_url, reason }`: it only asks. A repeat after the person's yes finds the
 //!   repository granted and says so; after a no it says so; with no answer yet it asks again.
+//! * The seal that ends `prepare_workspace`, `start_scratch` and `publish_scratch`, and the agent's
+//!   adoption of a conversation's scratch projects (`ToolEnv::seal`), is made every time and not only
+//!   when a slot was made: a retry of a call that died between the slot and the seal seals, and an
+//!   environment that has nothing to do does nothing.
 //! * `merge_pull_request`: the host reports a pull request merged already as it is.
 //! * `rename_repository`, `delete_repository`: noted in the run's notes once the host answered, and a
 //!   repeat after that is the same answer ([`admin`]).
@@ -93,7 +97,7 @@ use adam_model::ToolSpec;
 use adam_ui::Ui;
 use adam_workspace::{
     DynCodeHost, DynEnvironment, EnvError, EnvProgress, EnvSession, EnvStep, EnvStepState,
-    GitIdentity, Local, Slot, WorkspaceError, Workspaces,
+    GitIdentity, Local, RunWorkspace, Slot, WorkspaceError, Workspaces,
 };
 use serde_json::Value;
 
@@ -345,6 +349,34 @@ impl ToolEnv {
             }
         }
         workspace_error(e)
+    }
+
+    /// Tell the run's environment about a slot the caller has just added or found
+    /// ([`Environment::seal`](adam_workspace::Environment::seal)).
+    ///
+    /// The file and git tools act on a slot by name and never call
+    /// [`session`](Self::session), so an environment that shows the run its slots as places the run
+    /// cannot rename (a run pod mounts each slot on its own) must learn of a new one now and not at
+    /// the next command. The slot stays whatever the answer. A seal that cannot be done now (a
+    /// command runs in the pod) is logged and returned as a line for the tool's result, scrubbed like
+    /// every environment error: the next command waits for that command to end and makes the pod
+    /// again. `None` when it is done, and when the run was cancelled meanwhile.
+    pub(crate) async fn seal(&self, ctx: &ToolCtx, workspace: &RunWorkspace) -> Option<String> {
+        let sealed = tokio::select! {
+            biased;
+            () = ctx.cancelled() => return None,
+            sealed = self.environment.seal(workspace) => sealed,
+        };
+        let e = sealed.err()?;
+        tracing::warn!(run = %workspace.run(), error = %report(&e), "cannot seal the run's environment for a slot that was added");
+        let said = match environment_error(&self.redactor, &e) {
+            ToolError::Transient(text) | ToolError::Permanent(text) => text,
+            other => report(&other),
+        };
+        Some(format!(
+            "Note: the slot is made, but the run's pod does not mount it yet ({said}). The next \
+             command waits for the commands running in the pod to end and makes the pod again."
+        ))
     }
 
     /// The session of the run's environment, for a tool that runs a process: made on the first

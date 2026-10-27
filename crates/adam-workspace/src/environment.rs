@@ -647,6 +647,10 @@ impl Environment for HidingEnvironment {
     async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
         self.inner.rebuild(run, use_default).await
     }
+
+    async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
+        self.inner.seal(workspace).await
+    }
 }
 
 struct HidingSession {

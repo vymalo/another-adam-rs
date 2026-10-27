@@ -17,9 +17,13 @@
 //!   labels and annotations, and narrows the one mount of the workspace volume to the run
 //!   ([`PodTemplate::render`]). No GitHub credential is ever in a pod, and the cluster's admission policy
 //!   (the chart's) refuses a pod that is anything else.
-//! * **A new repository needs a new pod.** The mounts of a pod are fixed when it is made and recorded in an
-//!   annotation; `ensure` compares them with the run's workspace, and a worktree added since is mounted by
-//!   making the pod again when no command runs in it, and by waiting when one does.
+//! * **Every slot is a mount of its own, and a new slot needs a new pod.** The pod mounts the run's directory
+//!   and, on top of it, each slot (a worktree or a scratch project), so that a slot's directory is a name
+//!   the run's commands cannot rename or replace. The mounts of a pod are fixed when it is made and recorded
+//!   in an annotation; `ensure` compares them with the run's workspace, and a slot added since is mounted by
+//!   making the pod again when no command runs in it, and by waiting when one does. The coder's file and git
+//!   tools never call `ensure`, so it calls `seal` right after it adds a slot, which deletes a stale idle pod
+//!   at once (and never makes one).
 //! * **A command** is the program `adam-kube-exec`, which runs `adam-exec run|shell` in the pod
 //!   (`pods/exec`) and ends with its exit code. [`Invocation`] is its command line.
 //! * **Nothing is held for ever.** `release` deletes the pod; `held_runs` lists them for the janitor's
