@@ -1,0 +1,58 @@
+{{- if include "coder.runPods" . }}
+{{- $np := .Values.runPods.networkPolicy }}
+{{- $p := .Values.runPods.egressProxy }}
+{{- $except := concat (default (list) $np.blockedCIDRs) (default (list) $np.clusterCIDRs) | uniq }}
+# runPods.enabled: what the egress proxy may reach (ADR 0042). Ingress only from the run pods, on the proxy's port: no
+# other pod of the cluster is a client. (The kubelet's probes come from the node, which needs no rule: the Kubernetes
+# documentation says "traffic to and from the node where a Pod is running is always allowed", *verified 2026-10-27*.)
+# Egress to DNS and to the internet on the proxy's ports only (443 by default), except blockedCIDRs and clusterCIDRs, so
+# that even a bug of the proxy cannot open a connection to the cluster. IPv4 only: no rule names an IPv6 range, so
+# IPv6 egress is denied. Only as real as the CNI that enforces it (*unverified* for the owner's cluster).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "coder.egressProxyName" . }}
+  labels:
+    {{- include "coder.egressProxyLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "coder.egressProxySelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            {{- include "coder.runPodSelector" . | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ include "coder.egressProxyPort" . }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.dnsNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.dnsPodLabels | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            {{- with $except }}
+            except:
+              {{- range . }}
+              - {{ . }}
+              {{- end }}
+            {{- end }}
+      ports:
+        {{- range $port := $p.ports }}
+        - protocol: TCP
+          port: {{ $port }}
+        {{- end }}
+{{- end }}

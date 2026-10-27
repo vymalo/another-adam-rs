@@ -252,11 +252,67 @@ from service.yaml, which every render contains, so they always run.
 {{- if hasKey $rp.extraEnv "MODEL_API_KEY" -}}
 {{- fail "runPods.extraEnv sets MODEL_API_KEY: the chart sets it from the ExternalSecret, and a secret is never a chart value" -}}
 {{- end -}}
-{{- if not (eq (toString $rp.networkPolicy.enabled) "false") -}}
-{{- range concat $rp.networkPolicy.blockedCIDRs $rp.networkPolicy.clusterCIDRs -}}
-{{- if not (regexMatch "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}$" (toString .)) -}}
-{{- fail (printf "runPods.networkPolicy.blockedCIDRs and clusterCIDRs take IPv4 CIDRs such as 10.0.0.0/8, got %q" (toString .)) -}}
+{{- /* The run pods' network policy is deny by default (ADR 0042): its switch is gone, and turning it off would be open egress. */ -}}
+{{- if and (hasKey $rp.networkPolicy "enabled") (not (eq (toString $rp.networkPolicy.enabled) "true")) -}}
+{{- fail "runPods.networkPolicy.enabled is no longer a choice: run pods reach the internet only through the egress proxy, and the policy that makes it the one way out is always rendered (ADR 0042). Remove the value. To let a run pod reach an in-cluster target, add a rule to runPods.networkPolicy.extraEgress and its host to runPods.egressProxy.extraNoProxy; to let it reach a host on the internet, add the host to runPods.egressProxy.extraAllow" -}}
 {{- end -}}
+{{- range $name, $list := dict "blockedCIDRs" $rp.networkPolicy.blockedCIDRs "clusterCIDRs" $rp.networkPolicy.clusterCIDRs -}}
+{{- if not (kindIs "slice" $list) -}}
+{{- fail (printf "runPods.networkPolicy.%s must be a list of IPv4 CIDRs such as 10.0.0.0/8, got %q" $name (toString $list)) -}}
+{{- end -}}
+{{- range $list -}}
+{{- if not (regexMatch "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}$" (toString .)) -}}
+{{- fail (printf "runPods.networkPolicy.blockedCIDRs and clusterCIDRs take IPv4 CIDRs such as 10.0.0.0/8 (IPv6 is denied, not allowed), got %q" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /* The egress proxy (ADR 0042): on with run pods, and the only way out. */ -}}
+{{- $ep := $rp.egressProxy -}}
+{{- if not (kindIs "map" $ep) -}}
+{{- fail "runPods.egressProxy must be a map (replicas, ports, allow, extraAllow, extraNoProxy, resources)" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString $ep.replicas))) (lt (int64 $ep.replicas) 1) -}}
+{{- fail (printf "runPods.egressProxy.replicas must be a whole number of at least 1, got %q" (toString $ep.replicas)) -}}
+{{- end -}}
+{{- if or (not (kindIs "slice" $ep.ports)) (not $ep.ports) -}}
+{{- fail "runPods.egressProxy.ports must be a non-empty list of port numbers (443 by default)" -}}
+{{- end -}}
+{{- range $ep.ports -}}
+{{- if or (not (regexMatch "^[0-9]+$" (toString .))) (lt (int64 .) 1) (gt (int64 .) 65535) -}}
+{{- fail (printf "runPods.egressProxy.ports entries must be port numbers from 1 to 65535, got %q" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- range $name, $list := dict "allow" $ep.allow "extraAllow" $ep.extraAllow -}}
+{{- if not (kindIs "slice" $list) -}}
+{{- fail (printf "runPods.egressProxy.%s must be a list of host names, got %q" $name (toString $list)) -}}
+{{- end -}}
+{{- range $list -}}
+{{- $host := lower (trim (toString .)) -}}
+{{- if not (regexMatch "^[.]?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$" $host) -}}
+{{- fail (printf "runPods.egressProxy.%s entry %q is not a host name: write example.com for one host and .example.com for every subdomain of it (no scheme, port, path, wildcard or IP address)" $name (toString .)) -}}
+{{- end -}}
+{{- if regexMatch "(^|[.])[0-9]+$" $host -}}
+{{- fail (printf "runPods.egressProxy.%s entry %q ends in digits only, which reads as an IP address, and the proxy refuses IP literals" $name (toString .)) -}}
+{{- end -}}
+{{- if regexMatch "^[.][^.]+$" $host -}}
+{{- fail (printf "runPods.egressProxy.%s entry %q is a bare suffix, which would allow every host of a top-level domain: name the registrable domain, such as .example.com" $name (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not (include "coder.egressProxyAllowList" .) -}}
+{{- fail "runPods.egressProxy.allow and extraAllow hold no host: the proxy refuses an empty allow-list (exit 78) and a run pod would reach nothing. Keep the defaults of allow, or list the hosts it needs" -}}
+{{- end -}}
+{{- if not (kindIs "slice" $ep.extraNoProxy) -}}
+{{- fail (printf "runPods.egressProxy.extraNoProxy must be a list of names, got %q" (toString $ep.extraNoProxy)) -}}
+{{- end -}}
+{{- range $ep.extraNoProxy -}}
+{{- if not (regexMatch "^[A-Za-z0-9.*:/_-]+$" (toString .)) -}}
+{{- fail (printf "runPods.egressProxy.extraNoProxy entries are names for NO_PROXY, with no comma or space, got %q" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- range $name := list "HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy" "NO_PROXY" "no_proxy" -}}
+{{- if hasKey $rp.extraEnv $name -}}
+{{- fail (printf "runPods.extraEnv sets %s: the chart sets the proxy variables of a run pod from runPods.egressProxy (the egress proxy is the only way out, ADR 0042); to add names that bypass it, use runPods.egressProxy.extraNoProxy" $name) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

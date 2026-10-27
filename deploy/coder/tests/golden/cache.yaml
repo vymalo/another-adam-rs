@@ -47,11 +47,78 @@ spec:
         - protocol: TCP
           port: 8080
 ---
+# Source: coder/templates/run-pods-egress-networkpolicy.yaml
+# runPods.enabled: what the egress proxy may reach (ADR 0042). Ingress only from the run pods, on the proxy's port: no
+# other pod of the cluster is a client. (The kubelet's probes come from the node, which needs no rule: the Kubernetes
+# documentation says "traffic to and from the node where a Pod is running is always allowed", *verified 2026-10-27*.)
+# Egress to DNS and to the internet on the proxy's ports only (443 by default), except blockedCIDRs and clusterCIDRs, so
+# that even a bug of the proxy cannot open a connection to the cluster. IPv4 only: no rule names an IPv6 range, so
+# IPv6 egress is denied. Only as real as the CNI that enforces it (*unverified* for the owner's cluster).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: coder-egress
+  labels:
+    app.kubernetes.io/name: coder-egress
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: egress-proxy
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: coder-egress
+      app.kubernetes.io/instance: coder
+      app.kubernetes.io/component: egress-proxy
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: adam-coder
+              app.kubernetes.io/instance: coder
+            matchExpressions:
+              - key: adam.vymalo.com/run
+                operator: Exists
+      ports:
+        - protocol: TCP
+          port: 3128
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+---
 # Source: coder/templates/run-pods-networkpolicy.yaml
-# runPods.enabled: what a run pod may reach. No ingress at all (nothing connects to a run pod: the coder execs in it
-# through the API server). Egress to DNS and to the internet, but not to private ranges, so a build reaches the
-# registries and the model gateway and not the services of the cluster. Only as real as the CNI that enforces it
-# (*unverified* for the owner's cluster). IPv4 only.
+# runPods.enabled: what a run pod may reach, deny by default (ADR 0042). No ingress at all (nothing connects to a run pod:
+# the coder execs in it through the API server). Egress to DNS, to the egress proxy's pods on its port, and to
+# runPods.networkPolicy.extraEgress (an in-cluster target such as a model gateway), and to nothing else: there is no rule
+# for the internet, so the proxy (which allows only the hosts of runPods.egressProxy, and connects to public IPv4
+# addresses only) is the one way out, and a tool that ignores HTTPS_PROXY gets no connection. IPv4 only: no rule names an
+# IPv6 range, so IPv6 egress is denied. Only as real as the CNI that enforces it (*unverified* for the owner's cluster).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -88,14 +155,14 @@ spec:
         - protocol: TCP
           port: 53
     - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
-              - 169.254.0.0/16
-              - 100.64.0.0/10
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: coder-egress
+              app.kubernetes.io/instance: coder
+              app.kubernetes.io/component: egress-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
 ---
 # Source: coder/templates/run-pods-quota.yaml
 # What the run pods may use in all. A pod beyond it is refused with 403 "exceeded quota", which the coder waits out.
@@ -119,6 +186,46 @@ spec:
         operator: In
         values:
           - coder-run
+---
+# Source: coder/templates/run-pods-egress-proxy.yaml
+# Keeps one proxy pod up through node drains. Not rendered for one replica: minAvailable 1 of 1 would block every drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: coder-egress
+  labels:
+    app.kubernetes.io/name: coder-egress
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: egress-proxy
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coder-egress
+      app.kubernetes.io/instance: coder
+      app.kubernetes.io/component: egress-proxy
+---
+# Source: coder/templates/run-pods-egress-proxy.yaml
+# runPods.enabled: the egress proxy (ADR 0042), the one way out of a run pod to the internet: `adam-egress`, from the
+# coder's own image. It accepts CONNECT host:443 to the allow-listed hosts and nothing else, resolves the name itself
+# and connects to public IPv4 addresses only (never to runPods.networkPolicy.blockedCIDRs or clusterCIDRs). It holds no
+# credential and no token, writes nothing (a read-only root file system) and logs one line per decision, never a path,
+# a query or a header. There is no value to turn it off.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coder-egress
+  labels:
+    app.kubernetes.io/name: coder-egress
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: egress-proxy
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+automountServiceAccountToken: false
 ---
 # Source: coder/templates/run-pods-rbac.yaml
 # runPods.enabled: the coder pod's ServiceAccount. Its token is mounted in the coder pod alone (the front Deployment
@@ -214,6 +321,18 @@ data:
           env:
             - name: CARGO_BUILD_JOBS
               value: "2"
+            - name: HTTPS_PROXY
+              value: "http://coder-egress.coder-ns.svc:3128"
+            - name: https_proxy
+              value: "http://coder-egress.coder-ns.svc:3128"
+            - name: HTTP_PROXY
+              value: "http://coder-egress.coder-ns.svc:3128"
+            - name: http_proxy
+              value: "http://coder-egress.coder-ns.svc:3128"
+            - name: NO_PROXY
+              value: "localhost,127.0.0.1"
+            - name: no_proxy
+              value: "localhost,127.0.0.1"
             - name: MODEL_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -242,6 +361,37 @@ data:
             claimName: coder-cache
         - name: tools
           emptyDir: {}
+---
+# Source: coder/templates/run-pods-egress-allow.yaml
+# runPods.enabled: the hosts the egress proxy allows (ADR 0042): runPods.egressProxy.allow, then extraAllow. The proxy
+# reads the file at startup only, so a change is a deploy (the proxy's checksum annotation).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coder-egress-allow
+  labels:
+    app.kubernetes.io/name: coder-egress
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: egress-proxy
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+data:
+  allow.txt: |
+    # The hosts a run pod may reach through the egress proxy: runPods.egressProxy.allow and extraAllow.
+    registry.npmjs.org
+    pypi.org
+    files.pythonhosted.org
+    crates.io
+    index.crates.io
+    static.crates.io
+    proxy.golang.org
+    sum.golang.org
+    github.com
+    codeload.github.com
+    objects.githubusercontent.com
+    release-assets.githubusercontent.com
+    pub.dev
 ---
 # Source: coder/templates/cache-pvc.yaml
 # cache.create: the claim behind /cache (ADR 0040), for this release alone. A cache, not state: it goes with the
@@ -306,6 +456,32 @@ subjects:
     name: coder
     namespace: coder-ns
 ---
+# Source: coder/templates/run-pods-egress-proxy.yaml
+# The run pods' HTTPS_PROXY names this Service (<name>.<namespace>.svc:3128). ClusterIP only: nothing outside the
+# cluster connects to it, and the proxy's NetworkPolicy admits the run pods alone.
+apiVersion: v1
+kind: Service
+metadata:
+  name: coder-egress
+  labels:
+    app.kubernetes.io/name: coder-egress
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: egress-proxy
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: coder-egress
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: egress-proxy
+  ports:
+    - name: proxy
+      port: 3128
+      targetPort: proxy
+      protocol: TCP
+---
 # Source: coder/templates/service.yaml
 # ClusterIP only, never exposed: the orchestrator reaches it in-cluster over A2A
 # with a bearer token. This is also the StatefulSet's governing service.
@@ -329,6 +505,106 @@ spec:
       port: 8080
       targetPort: http
       protocol: TCP
+---
+# Source: coder/templates/run-pods-egress-proxy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coder-egress
+  labels:
+    app.kubernetes.io/name: coder-egress
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: egress-proxy
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coder-egress
+      app.kubernetes.io/instance: coder
+      app.kubernetes.io/component: egress-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coder-egress
+        app.kubernetes.io/instance: coder
+        app.kubernetes.io/component: egress-proxy
+      annotations:
+        checksum/egress-allow: ba5975945ecb43910efc70a5baeb639782fc7010b975a6aa4b889a62c51934d6
+    spec:
+      serviceAccountName: coder-egress
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # The proxy drains its open tunnels for up to 25 s after SIGTERM, after the preStop sleep that lets the Service
+      # stop sending it connections.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: egress
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          command: ["tini", "--", "adam-egress"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: proxy
+              containerPort: 3128
+              protocol: TCP
+          env:
+            - name: EGRESS_LISTEN
+              value: "0.0.0.0:3128"
+            - name: EGRESS_ALLOW_FILE
+              value: "/etc/adam-egress/allow.txt"
+            - name: EGRESS_PORTS
+              value: "443"
+            - name: EGRESS_DENY_CIDRS
+              value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10"
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              cpu: 25m
+              memory: 32Mi
+          volumeMounts:
+            - name: allow
+              mountPath: /etc/adam-egress
+              readOnly: true
+      volumes:
+        - name: allow
+          configMap:
+            name: coder-egress-allow
 ---
 # Source: coder/templates/statefulset.yaml
 apiVersion: apps/v1
@@ -357,7 +633,7 @@ spec:
         app.kubernetes.io/name: coder
         app.kubernetes.io/instance: coder
       annotations:
-        checksum/run-pod: 414fb0d51894d8551b1bd0185fcbf306f4713a4dcbaac5a90df663fa3b7cfeca
+        checksum/run-pod: e9ef0ea52208cdbb2fddcf963429e33d92570fd9ba7aa859e69ff574a9690b8f
     spec:
       serviceAccountName: coder
       automountServiceAccountToken: true

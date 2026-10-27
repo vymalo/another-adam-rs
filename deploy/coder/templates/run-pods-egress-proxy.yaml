@@ -1,0 +1,154 @@
+{{- if include "coder.runPods" . }}
+{{- $p := .Values.runPods.egressProxy }}
+{{- $port := include "coder.egressProxyPort" . }}
+# runPods.enabled: the egress proxy (ADR 0042), the one way out of a run pod to the internet: `adam-egress`, from the
+# coder's own image. It accepts CONNECT host:443 to the allow-listed hosts and nothing else, resolves the name itself
+# and connects to public IPv4 addresses only (never to runPods.networkPolicy.blockedCIDRs or clusterCIDRs). It holds no
+# credential and no token, writes nothing (a read-only root file system) and logs one line per decision, never a path,
+# a query or a header. There is no value to turn it off.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "coder.egressProxyName" . }}
+  labels:
+    {{- include "coder.egressProxyLabels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "coder.egressProxyName" . }}
+  labels:
+    {{- include "coder.egressProxyLabels" . | nindent 4 }}
+spec:
+  replicas: {{ $p.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "coder.egressProxySelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "coder.egressProxySelectorLabels" . | nindent 8 }}
+      annotations:
+        {{- /* The allow-list is read at startup only: a changed list is a deploy. */}}
+        checksum/egress-allow: {{ include (print $.Template.BasePath "/run-pods-egress-allow.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "coder.egressProxyName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # The proxy drains its open tunnels for up to 25 s after SIGTERM, after the preStop sleep that lets the Service
+      # stop sending it connections.
+      terminationGracePeriodSeconds: 45
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: egress
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["tini", "--", "adam-egress"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: proxy
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            - name: EGRESS_LISTEN
+              value: {{ printf "0.0.0.0:%s" $port | quote }}
+            - name: EGRESS_ALLOW_FILE
+              value: {{ printf "%s/allow.txt" (include "coder.egressProxyAllowDir" .) | quote }}
+            - name: EGRESS_PORTS
+              value: {{ join "," (default (list) $p.ports | toStrings) | quote }}
+            {{- with include "coder.egressDenyCIDRs" . }}
+            - name: EGRESS_DENY_CIDRS
+              value: {{ . | quote }}
+            {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          resources:
+            {{- toYaml $p.resources | nindent 12 }}
+          volumeMounts:
+            - name: allow
+              mountPath: {{ include "coder.egressProxyAllowDir" . }}
+              readOnly: true
+      volumes:
+        - name: allow
+          configMap:
+            name: {{ include "coder.egressProxyAllowName" . }}
+      {{- with $p.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $p.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $p.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# The run pods' HTTPS_PROXY names this Service (<name>.<namespace>.svc:3128). ClusterIP only: nothing outside the
+# cluster connects to it, and the proxy's NetworkPolicy admits the run pods alone.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "coder.egressProxyName" . }}
+  labels:
+    {{- include "coder.egressProxyLabels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "coder.egressProxySelectorLabels" . | nindent 4 }}
+  ports:
+    - name: proxy
+      port: {{ $port }}
+      targetPort: proxy
+      protocol: TCP
+{{- if gt (int $p.replicas) 1 }}
+---
+# Keeps one proxy pod up through node drains. Not rendered for one replica: minAvailable 1 of 1 would block every drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "coder.egressProxyName" . }}
+  labels:
+    {{- include "coder.egressProxyLabels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "coder.egressProxySelectorLabels" . | nindent 6 }}
+{{- end }}
+{{- end }}

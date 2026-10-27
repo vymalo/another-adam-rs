@@ -1,9 +1,11 @@
-{{- if and (include "coder.runPods" .) (eq (toString .Values.runPods.networkPolicy.enabled) "true") }}
+{{- if include "coder.runPods" . }}
 {{- $np := .Values.runPods.networkPolicy }}
-# runPods.enabled: what a run pod may reach. No ingress at all (nothing connects to a run pod: the coder execs in it
-# through the API server). Egress to DNS and to the internet, but not to private ranges, so a build reaches the
-# registries and the model gateway and not the services of the cluster. Only as real as the CNI that enforces it
-# (*unverified* for the owner's cluster). IPv4 only.
+# runPods.enabled: what a run pod may reach, deny by default (ADR 0042). No ingress at all (nothing connects to a run pod:
+# the coder execs in it through the API server). Egress to DNS, to the egress proxy's pods on its port, and to
+# runPods.networkPolicy.extraEgress (an in-cluster target such as a model gateway), and to nothing else: there is no rule
+# for the internet, so the proxy (which allows only the hosts of runPods.egressProxy, and connects to public IPv4
+# addresses only) is the one way out, and a tool that ignores HTTPS_PROXY gets no connection. IPv4 only: no rule names an
+# IPv6 range, so IPv6 egress is denied. Only as real as the CNI that enforces it (*unverified* for the owner's cluster).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -12,12 +14,7 @@ metadata:
     {{- include "coder.labels" . | nindent 4 }}
 spec:
   podSelector:
-    matchLabels:
-      app.kubernetes.io/managed-by: adam-coder
-      app.kubernetes.io/instance: {{ .Release.Name }}
-    matchExpressions:
-      - key: adam.vymalo.com/run
-        operator: Exists
+    {{- include "coder.runPodSelector" . | nindent 4 }}
   policyTypes:
     - Ingress
     - Egress
@@ -36,12 +33,12 @@ spec:
         - protocol: TCP
           port: 53
     - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              {{- range (concat $np.blockedCIDRs $np.clusterCIDRs | uniq) }}
-              - {{ . }}
-              {{- end }}
+        - podSelector:
+            matchLabels:
+              {{- include "coder.egressProxySelectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ include "coder.egressProxyPort" . }}
     {{- with $np.extraEgress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

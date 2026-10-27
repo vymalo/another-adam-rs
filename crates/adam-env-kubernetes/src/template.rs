@@ -415,6 +415,10 @@ spec:
       env:
         - name: CARGO_BUILD_JOBS
           value: '2'
+        - name: HTTPS_PROXY
+          value: 'http://coder-egress.coder-ns.svc:3128'
+        - name: NO_PROXY
+          value: 'localhost,127.0.0.1'
       resources:
         requests: {cpu: 250m, memory: 512Mi}
         limits: {memory: 2Gi}
@@ -569,6 +573,26 @@ spec:
             .unwrap()
             .volume_mounts = None;
         assert_eq!(got, expected);
+        // The environment is the template's, the chart's proxy variables among it (ADR 0042): a command in the pod reaches the
+        // internet through the egress proxy or not at all, and only the template says where the proxy is.
+        let env: Vec<(&str, &str)> = got
+            .containers
+            .iter()
+            .find(|c| c.name == "run")
+            .unwrap()
+            .env
+            .iter()
+            .flatten()
+            .map(|e| (e.name.as_str(), e.value.as_deref().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("CARGO_BUILD_JOBS", "2"),
+                ("HTTPS_PROXY", "http://coder-egress.coder-ns.svc:3128"),
+                ("NO_PROXY", "localhost,127.0.0.1"),
+            ]
+        );
         assert_eq!(
             pod.spec.unwrap().priority_class_name.as_deref(),
             Some("coder-run")
