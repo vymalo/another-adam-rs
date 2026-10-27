@@ -1554,6 +1554,11 @@ pub struct FakeEnvironment {
     pub rebuild_says: AtomicBool,
     /// `ensure` fails with this after a `rebuild` (a build that goes wrong again).
     pub ensure_fails_after_rebuild: Mutex<Option<fn() -> EnvError>>,
+    /// The runs `seal` was called for, each with the directory names of the slots the run's
+    /// workspace had at that moment (so a test can tell the call came after the slot was added).
+    pub sealed: Mutex<Vec<(String, Vec<String>)>>,
+    /// `seal` fails with this, once set.
+    pub seal_fails: Mutex<Option<fn() -> EnvError>>,
 }
 
 /// The session of a [`FakeEnvironment`].
@@ -1597,6 +1602,8 @@ impl FakeEnvironment {
             rebuilt: Mutex::new(Vec::new()),
             rebuild_says: AtomicBool::new(true),
             ensure_fails_after_rebuild: Mutex::new(None),
+            sealed: Mutex::new(Vec::new()),
+            seal_fails: Mutex::new(None),
         })
     }
 }
@@ -1659,6 +1666,22 @@ impl Environment for FakeEnvironment {
         // What a rebuild clears: a broken environment is made again at the next `ensure`.
         *self.ensure_fails.lock().unwrap() = self.ensure_fails_after_rebuild.lock().unwrap().take();
         Ok(self.rebuild_says.load(Ordering::SeqCst))
+    }
+
+    async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
+        let slots = workspace
+            .slots()
+            .await
+            .map(|slots| slots.iter().map(|slot| slot.dir().to_owned()).collect())
+            .unwrap_or_default();
+        self.sealed
+            .lock()
+            .unwrap()
+            .push((workspace.run().to_owned(), slots));
+        match *self.seal_fails.lock().unwrap() {
+            Some(fail) => Err(fail()),
+            None => Ok(()),
+        }
     }
 }
 

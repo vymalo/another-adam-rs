@@ -26,8 +26,9 @@ use crate::git::{GitCmd, GitPin};
 use crate::repo::RepoRef;
 use crate::safe_fs::{self, Dir, SlotDir, WalkError};
 use crate::workspace::{
-    Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists, open_scratch_root,
-    open_worktree_root, remove_dir_if_exists, remove_file_if_exists, slot_name,
+    Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists, is_generation,
+    new_generation, open_scratch_root, open_worktree_root, remove_dir_if_exists,
+    remove_file_if_exists, slot_name,
 };
 use crate::worktree::{ChangedFile, GitIdentity, Worktree, commit_all_in, parse_porcelain};
 
@@ -112,6 +113,20 @@ impl Slot {
         }
     }
 
+    /// Which making of the slot's directory this is: a token that is new each time the coder makes
+    /// the directory (or moves a project into a run's workspace), and the same for as long as it is
+    /// the same directory. A run pod mounts a directory, not the name it has, so a pod made for a
+    /// slot that was removed and added again under the same name mounts the old one: a caller that
+    /// records what a pod mounted records this with the slot's path, and makes the pod again when it
+    /// changes. A repository slot's directory is made together with its git directory, so this is
+    /// [`Worktree::git_dir_generation`]. `None` for a slot made before it was recorded.
+    pub fn generation(&self) -> Option<&str> {
+        match &self.kind {
+            SlotKind::Repository(wt) => wt.git_dir_generation(),
+            SlotKind::Scratch(s) => s.generation(),
+        }
+    }
+
     /// The worktree, for a repository slot.
     pub fn worktree(&self) -> Option<&Worktree> {
         match &self.kind {
@@ -152,6 +167,8 @@ pub struct Scratch {
     root: Arc<SlotDir>,
     published_to: Option<String>,
     conversation: Option<String>,
+    /// Which making of the directory this is ([`Slot::generation`]).
+    generation: Option<String>,
 }
 
 impl fmt::Debug for Scratch {
@@ -179,6 +196,14 @@ impl Scratch {
     /// The slot's directory name.
     pub fn dir(&self) -> &str {
         &self.dir
+    }
+
+    /// Which making of the project's directory this is ([`Slot::generation`]): new each time the
+    /// coder makes the directory, or moves the project into a run's workspace
+    /// ([`RunWorkspace::adopt_scratch`]), and kept while it is the same directory. `None` for a
+    /// project made before it was recorded, until its directory is made again.
+    pub fn generation(&self) -> Option<&str> {
+        self.generation.as_deref()
     }
 
     /// The conversation of the run that made the project (see [`RunWorkspace::add_scratch_for`]), as
@@ -386,6 +411,8 @@ impl RunWorkspace {
                         root,
                         published_to: m.published_to.clone(),
                         conversation: m.conversation.clone(),
+                        // Its text goes into a line of a pod's annotation: only a token is believed.
+                        generation: m.dir_gen.clone().filter(|token| is_generation(token)),
                     }),
                     path,
                 }))
@@ -614,73 +641,57 @@ impl RunWorkspace {
         let _run = inner.lock_path(&self.path).await?;
         let metas = inner.read_slot_metas(&self.run).await?;
         let legacy = inner.read_meta(&self.run).await?;
+        let meta_path = inner.slot_meta_path(&self.run, dir);
         let known = metas.iter().find(|m| m.dir() == dir);
-        let (seq, kept_conversation) = if let Some(known) = known {
-            match known {
-                SlotMeta::Scratch(m) => {
-                    if m.conversation.is_none()
-                        && let Some(conversation) = conversation
-                    {
-                        let mut meta = m.clone();
-                        meta.conversation = Some(conversation.to_owned());
-                        inner
-                            .write_meta_at(&inner.slot_meta_path(&self.run, dir), &meta)
-                            .await?;
-                        (m.seq, Some(conversation.to_owned()))
-                    } else {
-                        (m.seq, m.conversation.clone())
-                    }
-                }
-                SlotMeta::Repo(_) => {
-                    return Err(WorkspaceError::Conflict(format!(
-                        "a repository of this workspace is already called {dir}"
-                    )));
-                }
-            }
-        } else {
-            if self
-                .taken_names(&metas, legacy.as_ref())
-                .await?
-                .contains(dir)
-            {
+        let (mut meta, fresh) = match known {
+            Some(SlotMeta::Repo(_)) => {
                 return Err(WorkspaceError::Conflict(format!(
-                    "{dir} is already in use in this workspace"
+                    "a repository of this workspace is already called {dir}"
                 )));
             }
-            let seq = metas.iter().map(SlotMeta::seq).max().unwrap_or(0) + 1;
-            let meta = ScratchMeta {
-                version: SLOT_META_VERSION,
-                run: self.run.clone(),
-                dir: dir.to_owned(),
-                seq,
-                kind: "scratch".to_owned(),
-                published_to: None,
-                conversation: conversation.map(str::to_owned),
-            };
-            inner
-                .write_meta_at(&inner.slot_meta_path(&self.run, dir), &meta)
-                .await?;
-            (seq, meta.conversation)
+            Some(SlotMeta::Scratch(m)) => {
+                let mut meta = m.clone();
+                if meta.conversation.is_none()
+                    && let Some(conversation) = conversation
+                {
+                    meta.conversation = Some(conversation.to_owned());
+                    inner.write_meta_at(&meta_path, &meta).await?;
+                }
+                (meta, false)
+            }
+            None => {
+                if self
+                    .taken_names(&metas, legacy.as_ref())
+                    .await?
+                    .contains(dir)
+                {
+                    return Err(WorkspaceError::Conflict(format!(
+                        "{dir} is already in use in this workspace"
+                    )));
+                }
+                let meta = ScratchMeta {
+                    version: SLOT_META_VERSION,
+                    run: self.run.clone(),
+                    dir: dir.to_owned(),
+                    seq: metas.iter().map(SlotMeta::seq).max().unwrap_or(0) + 1,
+                    kind: "scratch".to_owned(),
+                    published_to: None,
+                    conversation: conversation.map(str::to_owned),
+                    dir_gen: Some(new_generation()),
+                };
+                inner.write_meta_at(&meta_path, &meta).await?;
+                (meta, true)
+            }
         };
         let path = inner.slot_path(&self.run, dir);
-        let published_to = metas.iter().find_map(|m| match m {
-            SlotMeta::Scratch(m) if m.dir == dir => m.published_to.clone(),
-            _ => None,
-        });
         let scratch = Scratch::create(
-            inner,
-            &self.run,
-            dir,
-            &path,
-            published_to,
-            kept_conversation,
-            identity,
+            inner, &self.run, &path, &mut meta, &meta_path, fresh, identity,
         )
         .await?;
         Ok(Slot {
             dir: dir.to_owned(),
             path,
-            seq,
+            seq: meta.seq,
             kind: SlotKind::Scratch(scratch),
         })
     }
@@ -753,9 +764,12 @@ impl RunWorkspace {
                 continue;
             }
             seq += 1;
+            // The project is a directory at a path of its own in this workspace, which no pod of
+            // this run has mounted: another token than the one it had.
             let new_meta = ScratchMeta {
                 run: self.run.clone(),
                 seq,
+                dir_gen: Some(new_generation()),
                 ..m.clone()
             };
             let new_meta_path = inner.slot_meta_path(&self.run, &m.dir);
@@ -948,15 +962,20 @@ impl Scratch {
     /// make a repository where the link leads. So the directory and its `.git` are looked at
     /// without following a link first (`lstat`), and nothing is made through one. The directory
     /// is then opened as a plain directory and held ([`SlotDir`]).
+    ///
+    /// A project that `meta` already knew (`!fresh`) and whose repository is made again is another
+    /// directory than the one a pod may have mounted: it gets a new generation, written before the
+    /// directory is made so that a crash in between cannot leave the old token on the new directory.
     async fn create(
         inner: &Arc<Inner>,
         run: &str,
-        dir: &str,
         path: &Path,
-        published_to: Option<String>,
-        conversation: Option<String>,
+        meta: &mut ScratchMeta,
+        meta_path: &Path,
+        fresh: bool,
         author: &GitIdentity,
     ) -> WorkspaceResult<Self> {
+        let dir = meta.dir.clone();
         let refuse = |what: &Path, is: &str| {
             WorkspaceError::Corrupt(format!(
                 "{} is {is}, not a directory of its own: the scratch project {dir} cannot be used; remove the run first",
@@ -964,14 +983,18 @@ impl Scratch {
             ))
         };
         match lstat_if_exists(path).await? {
-            Some(meta) if !meta.is_dir() => return Err(refuse(path, "a link or a file")),
+            Some(found) if !found.is_dir() => return Err(refuse(path, "a link or a file")),
             _ => {}
         }
         let dot_git = path.join(".git");
         match lstat_if_exists(&dot_git).await? {
-            Some(meta) if !meta.is_dir() => return Err(refuse(&dot_git, "a link or a file")),
+            Some(found) if !found.is_dir() => return Err(refuse(&dot_git, "a link or a file")),
             Some(_) => {}
             None => {
+                if !fresh {
+                    meta.dir_gen = Some(new_generation());
+                    inner.write_meta_at(meta_path, meta).await?;
+                }
                 tokio::fs::create_dir_all(path)
                     .await
                     .map_err(|e| WorkspaceError::io("cannot create the scratch directory", e))?;
@@ -995,11 +1018,12 @@ impl Scratch {
         let scratch = Self {
             ws: Arc::clone(inner),
             run: run.to_owned(),
-            dir: dir.to_owned(),
+            dir: dir.clone(),
             path: path.to_owned(),
             root,
-            published_to,
-            conversation,
+            published_to: meta.published_to.clone(),
+            conversation: meta.conversation.clone(),
+            generation: meta.dir_gen.clone().filter(|token| is_generation(token)),
         };
         scratch.ensure_root_commit(author).await?;
         Ok(scratch)

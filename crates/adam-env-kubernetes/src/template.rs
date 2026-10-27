@@ -389,7 +389,7 @@ fn first_line(message: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::mounts::WorktreeDirs;
+    use crate::mounts::{SlotMount, WorktreeDirs};
 
     /// A template as the chart renders it, cut to what the checks look at. `{ROOT}` is the workspace
     /// root the volume `work` is mounted at.
@@ -492,6 +492,10 @@ spec:
         WorkspaceMounts::plan(
             Path::new("/work"),
             Path::new("/work/workspaces/r1"),
+            &[SlotMount {
+                path: "/work/workspaces/r1/r".into(),
+                generation: Some("1a-0".to_owned()),
+            }],
             &[WorktreeDirs {
                 mirror: "/work/git/github.com/o/r.git".into(),
                 admin: "/work/git/github.com/o/r.git/worktrees/r".into(),
@@ -623,6 +627,12 @@ spec:
                     Some(true)
                 ),
                 ("work", "/work/workspaces/r1", Some("workspaces/r1"), None),
+                (
+                    "work",
+                    "/work/workspaces/r1/r",
+                    Some("workspaces/r1/r"),
+                    None
+                ),
                 ("cache", "/cache", None, None),
                 ("tools", "/opt/adam/bin", None, Some(true)),
             ]
@@ -638,9 +648,13 @@ spec:
     #[test]
     fn a_run_without_worktrees_mounts_only_its_own_directory() {
         let t = template();
-        let mounts =
-            WorkspaceMounts::plan(t.workspace_path(), Path::new("/work/workspaces/r1"), &[])
-                .unwrap();
+        let mounts = WorkspaceMounts::plan(
+            t.workspace_path(),
+            Path::new("/work/workspaces/r1"),
+            &[],
+            &[],
+        )
+        .unwrap();
         let pod = t.render("r1", "adam-run-r1", placement(), &mounts);
         let work: Vec<_> = mounts_of(&pod)
             .into_iter()
@@ -671,6 +685,7 @@ spec:
         let mounts = WorkspaceMounts::plan(
             t.workspace_path(),
             Path::new("/work/coder-1/workspaces/r1"),
+            &[],
             &[],
         )
         .unwrap();

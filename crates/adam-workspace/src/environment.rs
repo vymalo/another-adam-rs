@@ -345,6 +345,31 @@ pub trait Environment: Send + Sync + 'static {
         let _ = (run, use_default);
         Ok(false)
     }
+
+    /// Make what is held for `workspace`'s run fit the slots it has **now**, right after the caller
+    /// added one (a worktree, a scratch project, a project taken over from another run).
+    ///
+    /// The caller's file and git tools act on a slot by name and never call
+    /// [`ensure`](Self::ensure), so an environment that shows the run its slots as places the run
+    /// cannot rename or replace (a run pod mounts each slot on its own) must not wait for the next
+    /// command to learn of the new one: until it does, a process of the run can still rename the
+    /// slot's directory. `seal` throws away what is held when it lacks the new slot **and nothing
+    /// runs in it**; the next `ensure` makes it again from the run's files.
+    ///
+    /// It never makes anything: a run that holds nothing has nothing to seal. The default does
+    /// nothing, which is right for an environment that is the caller's own container or that sees
+    /// the whole workspace ([`Local`], a devcontainer).
+    ///
+    /// # Errors
+    ///
+    /// [`EnvError::Unavailable`] when something is held that lacks the slot and a command runs in it
+    /// (or it cannot be asked): the slot is added and stays, the caller tells whoever is waiting,
+    /// and the next `ensure` makes the environment again once the command ends. Other errors as
+    /// [`ensure`](Self::ensure).
+    async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
+        let _ = workspace;
+        Ok(())
+    }
 }
 
 /// A run's view of its environment.
@@ -622,6 +647,10 @@ impl Environment for HidingEnvironment {
     async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
         self.inner.rebuild(run, use_default).await
     }
+
+    async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
+        self.inner.seal(workspace).await
+    }
 }
 
 struct HidingSession {
@@ -799,6 +828,68 @@ mod tests {
         assert!(!Local.rebuild("any-run", false).await.unwrap());
         assert!(!Local.rebuild("any-run", true).await.unwrap());
         assert_eq!(LocalSession.tool_path("opencode"), None);
+    }
+
+    fn a_run(dir: &std::path::Path) -> RunWorkspace {
+        crate::Workspaces::new(dir.join("root"), Arc::new(crate::StaticToken::new("t")))
+            .run("run-1")
+            .unwrap()
+    }
+
+    /// An environment that holds nothing and records the runs it was asked to seal.
+    #[derive(Default)]
+    struct Sealing {
+        sealed: std::sync::Mutex<Vec<String>>,
+        refuses: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl Environment for Sealing {
+        async fn ensure(
+            &self,
+            _workspace: &RunWorkspace,
+            _progress: &dyn EnvProgress,
+        ) -> Result<Arc<dyn EnvSession>, EnvError> {
+            Err(EnvError::Lost)
+        }
+
+        async fn release(&self, _run: &str) -> Result<(), EnvError> {
+            Ok(())
+        }
+
+        async fn held_runs(&self) -> Result<Vec<String>, EnvError> {
+            Ok(Vec::new())
+        }
+
+        async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
+            self.sealed.lock().unwrap().push(workspace.run().to_owned());
+            if self.refuses.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(EnvError::Unavailable("a command runs".to_owned()));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn local_has_nothing_to_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        Local.seal(&a_run(dir.path())).await.unwrap();
+        assert!(Local.held_runs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hiding_environment_seals_what_the_environment_it_wraps_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(Sealing::default());
+        let env = HidingEnvironment::new(inner.clone(), ["MCP_SECRET"]);
+        env.seal(&a_run(dir.path())).await.unwrap();
+        assert_eq!(*inner.sealed.lock().unwrap(), ["run-1"]);
+        // What the wrapped environment says is what the caller hears.
+        inner
+            .refuses
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = env.seal(&a_run(dir.path())).await.unwrap_err();
+        assert!(matches!(refused, EnvError::Unavailable(_)), "{refused}");
     }
 
     #[tokio::test]

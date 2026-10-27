@@ -1371,6 +1371,66 @@ async fn a_scratch_project_is_found_again_by_the_next_task_of_the_conversation(s
     assert!(!home(&third.task_id).exists());
 }
 
+/// The run's environment is told about every slot as it is added, the project a later task takes
+/// over included: the task's first step adopts it before the model acts, and the file tools never
+/// call `ensure`, so nothing else would make a run pod that lacks the project mount it.
+async fn the_environment_is_sealed_when_a_project_is_started_and_when_one_is_taken_over(
+    store: DynStore,
+) {
+    let fx = Fixture::new("never used\n").await;
+    let fake = common::FakeEnvironment::new(Some(&fx.root));
+    let fx = fx.using(fake.clone());
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call("t1", "start_scratch", json!({"name": "site"}))])
+        .push_tool_calls(vec![call(
+            "t2",
+            "write_file",
+            json!({"path": "index.html", "content": "<p>hi</p>\n"}),
+        )])
+        .push_text("The site is started.")
+        // The second task starts no project: the one it reads is the first task's.
+        .push_tool_calls(vec![call("t3", "read_file", json!({"path": "index.html"}))])
+        .push_text("It is still there.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let mut first_message = user("Build me a one-page site.");
+    first_message.context_id = Some("ctx-site".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    assert_eq!(
+        fake.sealed.lock().unwrap().clone(),
+        [(first.task_id.clone(), vec!["site".to_owned()])],
+        "the task that started the project sealed once; it had nothing to take over, so nothing else"
+    );
+
+    let second = run_message(
+        &server,
+        follow_up("Is the page still there?", "ctx-site", &first.task_id),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        second.labels
+    );
+    assert_eq!(
+        fake.sealed.lock().unwrap().clone(),
+        [
+            (first.task_id.clone(), vec!["site".to_owned()]),
+            (second.task_id.clone(), vec!["site".to_owned()]),
+        ],
+        "the next task sealed when it took the project over, before the model did anything"
+    );
+}
+
 /// What the person is owed is not a statement: a worktree with changes nobody committed or pushed
 /// keeps the run waiting, whatever the last reply says or does not ask.
 async fn work_left_in_a_worktree_is_not_finished_by_a_statement(store: DynStore) {
@@ -5205,6 +5265,7 @@ macro_rules! coder_suite {
                 an_answer_that_asks_nothing_completes_the_task,
                 work_left_in_a_worktree_is_not_finished_by_a_statement,
                 a_scratch_project_is_found_again_by_the_next_task_of_the_conversation,
+                the_environment_is_sealed_when_a_project_is_started_and_when_one_is_taken_over,
                 a_stop_without_text_asks_what_to_do,
                 an_empty_stop_after_work_does_not_ask_for_the_repository,
                 red_checks_with_cycles_left_then_text_is_a_question,

@@ -48,11 +48,19 @@
 //! time where `openat2` is missing), and the write is a new file renamed over its target, which
 //! replaces a symlink that appeared meanwhile instead of following it.
 //!
-//! What is **not** covered: `git apply` (the paths of a patch are checked here, then `git` writes
-//! them by name, and `git` finds its work tree by name inside its own process: the slot's directory
-//! being looked at again just before is a tripwire, not a lock), and everything a command itself
-//! does. Making the slot's directory a mount point of the run's pod, which cannot be renamed, is
-//! what closes that.
+//! What these tools cannot do alone is `git`: `git apply` writes the paths of a patch by name (they
+//! are checked here first), and `git` finds its work tree by name inside its own process. A name is
+//! safe only if the run cannot rename it, so **in a run pod the slot's directory is a mount point of
+//! its own** (ADR 0041, decision 3): the pod's commands, and the processes they left running, cannot
+//! rename, move, remove or exchange it, and the coder's `git` can rely on its name. The coder tells
+//! the environment of each slot it adds (`ToolEnv::seal`), because these tools never ask for the pod
+//! and a pod made before the slot lacks the mount.
+//!
+//! What is **not** covered: while a command runs in a pod that lacks the new slot's mount (the seal
+//! waits for it to end, and the result of the tool that added the slot says so), the directory can be
+//! renamed; the creation of a slot; the files below the slot, which these tools open relative to the
+//! descriptor they hold; `git`'s own handling of what is below the slot; and everything a command
+//! itself does. Local mode and Podman have no mounts: the slot's directory is a name there.
 
 use std::ffi::OsString;
 use std::fs;

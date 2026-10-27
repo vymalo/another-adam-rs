@@ -243,6 +243,13 @@ pub(crate) struct ScratchMeta {
     /// stays with its run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) conversation: Option<String>,
+    /// A token that is new each time the coder makes the project's directory, or moves it into a
+    /// run's workspace (the same for a worktree is [`Meta::admin_gen`]). A run pod mounts a
+    /// directory and not its name, so what a pod mounted of a slot is told apart from what is
+    /// there now by this ([`Slot::generation`](crate::Slot::generation)). Absent from metadata
+    /// written before it existed, and then absent until the directory is made again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dir_gen: Option<String>,
 }
 
 /// What one metadata file of a slot says.

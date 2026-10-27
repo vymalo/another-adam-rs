@@ -181,7 +181,7 @@ sequenceDiagram
     participant P as adam-exec in the run pod
     participant J as janitor
     T->>E: ensure(workspace of the run, progress)
-    E->>E: the mounts the run's slots need (its directory, each mirror, each worktree's directory)
+    E->>E: the mounts the run's slots need (its directory, each slot, each mirror, each worktree's directory)
     E->>A: GET the pod adam-run-hash, POST it from the template when it is not there
     opt the pod lacks a mount the slots need now
         E->>A: pods/exec adam-exec active, then DELETE the pod and POST another (EnvError::Unavailable while a command runs)
@@ -205,6 +205,10 @@ sequenceDiagram
     opt no command used the pod for RUN_POD_IDLE_SECS
         E->>A: pods/exec adam-exec active, then DELETE the pod when none runs
     end
+    T->>E: seal(workspace), right after a slot was added
+    opt the pod lacks the new slot's mount and no command runs in it
+        E->>A: pods/exec adam-exec active, then DELETE the pod (none is made: the next ensure does)
+    end
     J->>E: release(run), and held_runs for what a crash left
     E->>A: DELETE the pod
 ```
@@ -219,7 +223,8 @@ stateDiagram-v2
     Ready --> Ready: exec, ensure reuses the pod
     Ready --> Deleted: idle with no command running, or released
     Ready --> Deleted: the pod ended and ensure replaces it
-    Ready --> Deleted: a worktree was added, no command runs, and ensure makes the pod again
+    Ready --> Deleted: a slot was added, no command runs, and ensure makes the pod again
+    Ready --> Deleted: a slot was added, no command runs, and seal deletes it (the next ensure makes the pod)
     Starting --> Deleted: released
     Deleted --> Absent
     Absent --> [*]: the run ended
