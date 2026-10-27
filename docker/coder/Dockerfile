@@ -2,7 +2,8 @@
 #
 # ghcr.io/vymalo/another-adam-rs/coder: the coder agent (bin/adam-coder) on
 # the workspace toolchain image, and beside it the general agent binary
-# (bin/adam-agent, which serves any agent folder). Build from the REPOSITORY ROOT:
+# (bin/adam-agent, which serves any agent folder) and the egress proxy for run pods
+# (bin/adam-egress, entrypoint `tini -- adam-egress`). Build from the REPOSITORY ROOT:
 #
 #   docker buildx build -f docker/coder/Dockerfile .
 #
@@ -12,7 +13,8 @@
 # there is nothing else to publish or to make public.
 #
 # Stage 1 compiles the binaries (and `adam-kube-exec`, the client a run's commands use to run in a pod of
-# their own, ADR 0019) on a Debian trixie Rust image, so their glibc
+# their own, ADR 0019, and `adam-egress`, the HTTPS-only proxy those pods reach the internet through)
+# on a Debian trixie Rust image, so their glibc
 # matches the runtime image (debian:trixie-slim). Stage 2 is the workspace
 # image (Rust, Flutter/Dart, Node, git, tini, OpenCode) with the binaries added.
 
@@ -60,10 +62,11 @@ ARG ADAM_BUILD_REVISION=
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p adam-coder --bin adam-coder -p adam-agent --bin adam-agent \
-      -p adam-env-kubernetes --bin adam-kube-exec \
+      -p adam-env-kubernetes --bin adam-kube-exec -p adam-egress --bin adam-egress \
  && install -D -m 0755 target/release/adam-coder /out/adam-coder \
  && install -D -m 0755 target/release/adam-agent /out/adam-agent \
- && install -D -m 0755 target/release/adam-kube-exec /out/adam-kube-exec
+ && install -D -m 0755 target/release/adam-kube-exec /out/adam-kube-exec \
+ && install -D -m 0755 target/release/adam-egress /out/adam-egress
 
 FROM ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6 AS github-mcp
 
@@ -88,7 +91,7 @@ LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs
 
 # hadolint ignore=DL3066
 USER root
-COPY --from=build /out/adam-coder /out/adam-agent /out/adam-kube-exec /usr/local/bin/
+COPY --from=build /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-egress /usr/local/bin/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
 # The tools a run pod gets (ADR 0019): the chart's init container copies /opt/adam/bin/* into an emptyDir that the
 # run container mounts read-only at the same path, the layout of a devcontainer's tools directory. `adam-exec` is
@@ -132,7 +135,8 @@ EXPOSE 8080
 
 # Smoke test in a login shell as uid 10001: both binaries start and reject an
 # empty environment (they fail closed) instead of crashing, adam-agent names the
-# folder it needs, and the tools the agent shells out to are on PATH. The GitHub MCP server
+# folder it needs, adam-egress exits 78 for want of an allow-list, and the tools the agent
+# shells out to are on PATH. The GitHub MCP server
 # is there, runs, and lists the twelve read tools of the coder's allow-list over stdio with no
 # credential (a missing name would stop the coder at startup). The devcontainer CLI and Podman's client
 # run, and the OpenCode that is mounted into every devcontainer is a native executable (an ELF file, not
@@ -142,7 +146,7 @@ EXPOSE 8080
 RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/github-mcp-tools.sh \
     bash -lc 'set -e; \
       test "$(id -u)" = 10001; \
-      command -v adam-coder adam-agent adam-kube-exec git opencode tini github-mcp-server devcontainer podman-remote obscura; \
+      command -v adam-coder adam-agent adam-kube-exec adam-egress git opencode tini github-mcp-server devcontainer podman-remote obscura; \
       test "$(devcontainer --version)" = "0.89.0"; \
       podman-remote --version | grep -q "5\.8\.7"; \
       test "$(head -c 4 "$(readlink -f "$(command -v opencode)")" | tail -c 3)" = ELF; \
@@ -155,7 +159,10 @@ RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/g
       out="$(env -i PATH="$PATH" adam-coder 2>&1 || true)"; \
       echo "$out" | grep -q "invalid configuration"; \
       out="$(env -i PATH="$PATH" adam-agent 2>&1 || true)"; \
-      echo "$out" | grep -q "ADAM_AGENT_DIR is required"'
+      echo "$out" | grep -q "ADAM_AGENT_DIR is required"; \
+      code=0; out="$(env -i PATH="$PATH" adam-egress 2>&1)" || code=$?; \
+      test "$code" = 78; \
+      echo "$out" | grep -q "invalid configuration"'
 
 # tini as PID 1 reaps the shells and git processes the agent spawns and
 # forwards SIGTERM, which starts a graceful shutdown. `adam-agent` is run with
