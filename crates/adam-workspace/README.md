@@ -29,8 +29,10 @@ authentication behave like the real tool.
 | `EnvProgress` (trait), `EnvStep`, `EnvStepState`, `NoProgress`, `EnvKind`, `EnvDescription` | the steps of a slow `ensure`, and what an environment says it is (`EnvKind::{Local, DevContainer { source, image }, Kubernetes { pod, image }}`, `#[non_exhaustive]`: a `match` over it needs a wildcard) |
 | `EnvError` | `Unavailable`, `Config { file, reason }`, `Refused`, `Build { reason, log_tail }`, `Timeout { phase, secs }`, `Lost`, `Io`; `#[non_exhaustive]`, see *Errors* |
 | `GitPin` | where `git` works for a slot, from the coder's metadata: `git_dir()`, `common_dir()`, `work_tree()`, `apply(&mut Command)` (sets `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE`), `check().await` (**only checks**: the work tree and the git directory are plain directories, a worktree's `commondir` is a regular file that says `../..`, its `HEAD`, `index` and reflog are regular files, a scratch project has no `commondir`; it never rewrites anything), **`still_here().await`** (the work tree's name still leads to the directory the coder opened as the slot, [`SlotDir::is_still_here`](#a-slots-directory-is-held-not-named): not moved away, not replaced by another directory or a link; `check()` asks it first and last, and `GitCmd` once more as `git` starts; a tripwire, which narrows the window and does not close it). A `GitPin` now holds the slot's `Arc<SlotDir>` (its `Eq` compares the directory too). `Worktree::git_pin()`, `Scratch::git_pin()` and `Slot::git_pin()` give it ([below](#git-is-pinned-to-the-slots-repository)) |
-| `safe_fs` (module) | how the coder opens what a run's commands can write, without being led anywhere by it: `read_regular_file(path, max)` / `read_regular_text` (`O_NOFOLLOW | O_NONBLOCK`, `fstat`: not a link, not a pipe, not longer than `max`), `private_copy_of(path, max)` (a copy, mtime kept, in a `0700` directory of the process's own temporary directory, made with `O_EXCL`; removed when the `PrivateCopy` is dropped), `replace_file(path, bytes)` (written next to it and renamed over it), `is_real_directory`, `is_real_file`, `is_plain_path(below, path)` (`lstat`, so a link is not a directory) and the constants `MAX_SMALL_FILE`, `MAX_INDEX_COPY` ([below](#what-the-coder-opens-in-a-directory-a-run-writes)); and, for a slot's directory, **`SlotDir`** (opened once, without following a link, and held: everything in the slot is relative to it), its `Dir` (an open directory: `lstat`, `open_dir`, `open_regular`, `create_new`, `mkdir`, `rename`, `unlink`, `symlink`, `read_link`, `replace_file`), `Meta`, `Backend`, `WalkError`, `BeneathError`, and **`safe_fs::race`**, the seam the tests swap a directory with ([below](#a-slots-directory-is-held-not-named)) |
+| `safe_fs` (module) | how the coder opens what a run's commands can write, without being led anywhere by it: `read_regular_file(path, max)` / `read_regular_text` (`O_NOFOLLOW | O_NONBLOCK`, `fstat`: not a link, not a pipe, not longer than `max`), `private_copy_of(path, max)` (a copy, mtime kept, in a `0700` directory of the process's own temporary directory, made with `O_EXCL`; removed when the `PrivateCopy` is dropped; `private_copy_in(base, ..)` makes it in a directory of `base` instead: the work volume's, when git runs in the sandbox), `replace_file(path, bytes)` (written next to it and renamed over it), `is_real_directory`, `is_real_file`, `is_plain_path(below, path)` (`lstat`, so a link is not a directory) and the constants `MAX_SMALL_FILE`, `MAX_INDEX_COPY` ([below](#what-the-coder-opens-in-a-directory-a-run-writes)); and, for a slot's directory, **`SlotDir`** (opened once, without following a link, and held: everything in the slot is relative to it), its `Dir` (an open directory: `lstat`, `open_dir`, `open_regular`, `create_new`, `mkdir`, `rename`, `unlink`, `symlink`, `read_link`, `replace_file`), `Meta`, `Backend`, `WalkError`, `BeneathError`, and **`safe_fs::race`**, the seam the tests swap a directory with ([below](#a-slots-directory-is-held-not-named)) |
 | `confine_git_env(&mut tokio::process::Command)`, `GIT_INHERITED_ENV` | the environment of a `git` a caller starts itself: empty, plus only the variables of `GIT_INHERITED_ENV` (`PATH`, `HOME`, the locale and temp dirs, certificate and proxy settings, `GIT_CONFIG_GLOBAL`). Every `git` this crate runs starts this way, and the coder's own (`git apply`, the tree-id probes) too ([below](#git-starts-from-an-empty-environment)) |
+| `Workspaces::with_git_sandbox(socket)`, `git_sandbox()`, `GitSandbox` | run the `git` commands that carry no credential in the **git sandbox** ([`adam-git-sandbox`](../adam-git-sandbox/README.md)) instead of here: `GitSandbox::socket()`, and `private_dir()`, the directory of the work volume where the copy of an index is made. Off unless called; a sandbox that cannot be reached is an error and never a fallback ([below](#where-git-runs-the-git-sandbox)) |
+| `LocalGit`, `LocalOutput` | the questions a tool asks of a repository (`new(cwd, sandbox)`, `pinned(&GitPin)`, `arg`/`args`/`env`/`stdin`, `output().await`): a `git` from the confined environment with hooks and the file system monitor off, in the sandbox when there is one, else a child of this process. A command that carries a credential is refused. `GitPin::sandbox()` says which |
 | `login_shell()` | `bash` where the image has one, else `sh` (the shell of a `Program::Shell`) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
 | `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `mirror` (the bare mirror the worktree is linked to: an environment that runs `git` in the worktree has to read it), `dir` (the slot's name), **`git_dir`** (the worktree's directory in the mirror, from the coder's metadata; `None` when it cannot be told), **`git_dir_generation`** (a token that is new each time the coder makes that directory: the name is the same when a slot is made again, the directory is not, and a pod's mounts follow the directory; `None` for a worktree made before it was recorded), **`git_pin`**, `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)` (committed onto the run's own branch explicitly, whatever `HEAD` says), `push` (the run's own branch), `publish` (moves the continued branch), `base_commit` (what `origin/<base>` is at), `add_base_checkout` / `remove_base_checkout` (a temporary detached checkout of it, a `BaseCheckout`, below) |
@@ -95,14 +97,79 @@ operator named. The commands that carry the token (`fetch`, `ls-remote`, `push`,
 operator chose is theirs; `$HOME/.gitconfig` is not read, since code in a worktree can write it). That is not enough alone: `url.<base>.insteadOf` and `pushInsteadOf` rewrite the
 URLs given on the command line too, and the mirror's configuration is shared by every run and
 written by more than this crate (a model's command, OpenCode and a repository's scripts all run in
-a worktree of it). So **the guard is at the credentialed call**: under the mirror lock, right before
-each of those commands, the crate removes from the mirror's configuration every `url.*`, every
-`remote.*` key but the two it writes, `include`s, `http.*`, `credential.*`, `core.sshCommand`,
-`core.gitProxy`, `core.fsmonitor`, `core.hooksPath` and `core.askPass`, and puts `remote.origin.url` and
-`remote.origin.fetch` back to what was approved. Who wrote the key does not matter. (A tool such as the coder's
+a worktree of it; and, with a git sandbox, a repository's own `filter` can write it). So **the guard is at the
+credentialed call**: under the mirror lock, right before each of those commands, the crate **checks** the mirror's files
+and every key of its configuration against what it writes itself, and refuses the command when anything else is there
+([below](#the-mirrors-configuration-is-checked-not-repaired)). Who wrote the key does not matter. (A tool such as the coder's
 `run_command` also undoes such writes when it sees them, but nothing relies on that.) The token reaches `git` only through the environment of one
 invocation: never in a remote URL, `.git/config`, logs or error messages.
 URLs with embedded credentials and ssh/scp forms are refused.
+
+### The mirror's configuration is checked, not repaired
+
+`Workspaces::check_mirror` (private; every command that carries a token goes through `Inner::run_network`, the only place
+one is made for a mirror, so none starts without it) looks at `HEAD`, `packed-refs` and `commondir` of the mirror without
+following a link (`HEAD` and `packed-refs` must be regular files, and there is no `commondir`: git would follow it to another
+repository's configuration), reads `config` as a regular file of at most 1 MiB and not through a link, parses a **private copy
+of the bytes it read** with `git config --file --no-includes --list -z` (so what is judged is what was read, and parsing runs no
+program), and refuses unless every key is one the workspace writes:
+
+| Key | Value |
+|---|---|
+| `core.repositoryformatversion` | `0` |
+| `core.bare` | `true` |
+| `core.filemode`, `core.ignorecase`, `core.precomposeunicode`, `core.symlinks` | `true` or `false` |
+| `core.logallrefupdates` | `true`, `false` or `always` |
+| `remote.origin.url` | the URL git is given for this repository (the canonical one for http(s); a filesystem remote in either spelling) |
+| `remote.origin.fetch` | `+refs/heads/*:refs/remotes/origin/*` |
+| `branch.agent/<name>.adam-run`, `.remote`, `.merge` | a run id, `origin`, `refs/heads/agent/<name>` |
+
+Each key once. `include.*`, `includeIf.*`, `url.*`, `http.*`, `credential.*` and `core.sshCommand` are refused first,
+whatever the table says. The refusal is a `WorkspaceError::Corrupt` that names the mirror and the **keys, never their values**,
+and one `error` log line each. A missing `remote.origin.*` is not refused (the commands name the URL and the refspec themselves).
+
+**Refused, not repaired**, because a repair hides an attack (the writer is still there, and the next run meets it again) and
+because the operator has to look at what wrote the file. The cost is that one writer can stop a mirror (every run of that repository
+fails with `Corrupt`) until the key is removed by hand: the commands that read the mirror's files, not the ones that carry a token, still
+work. An older version of this crate removed such keys itself; none does now. `ensure_mirror` writes `remote.origin.*` once, when it
+makes the mirror (three commands that run in the coder, in a mirror that holds no repository code yet), and never rewrites a mirror
+that is there.
+
+**What the check does not close**: a writer that changes the file between the check and the command's read of it. The window is the
+time between two statements of one task, under the mirror lock, and the writer must be a process already running in the sandbox;
+shortening it further needs the network commands to read a configuration of the coder's own, which is a follow-up. A mirror per
+person is [#122](https://github.com/vymalo/another-adam-rs/issues/122).
+
+### Where `git` runs: the git sandbox
+
+`git` runs what a repository's configuration names (a `filter.*.clean`, a `textconv`), and some repositories are the run's own: a
+scratch project's `.git/config`, an embedded repository in a worktree. With
+`Workspaces::with_git_sandbox(socket)` (the coder: `GIT_SANDBOX_SOCKET`) **the `git` commands that carry no credential run in the
+git sandbox**, a server in another container that holds no secret and executes only `git`
+([`adam-git-sandbox`](../adam-git-sandbox/README.md)); the ones that talk to a remote stay here.
+
+| Command | Where |
+|---|---|
+| `status`, `add`, `diff`, `commit` and its plumbing (`write-tree`, `commit-tree`, `update-ref`), `rev-parse`, `rev-list`, `ls-files`, `for-each-ref`, `show-ref`, `worktree add/move/remove`, `config` (reads and the branch bookkeeping), `check-ref-format`, `mktree`, `init` of a scratch project, `apply` | the sandbox |
+| `fetch`, `push`, `ls-remote`, `pull`, `clone`, `remote`, `fetch-pack`, `send-pack`, `submodule`; **anything that carries a token**; the `init --bare` and the two `config` writes that make a mirror; the `git config --file` that parses a mirror's configuration | here |
+
+The choice is made in one place, `GitCmd::route` (the `LocalGit` the coder's tools use takes the same road): a command goes to the
+sandbox when there is one, it has no token, its subcommand is not a network one and it was not asked to stay. **A command with a
+credential is never sent**: the check is in the code (`Invocation::carries_credentials`: `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, or a `-c http.*` or a `-c credential.*` with a value), and the sandbox drops those
+variables if one were. **A sandbox that cannot be reached is an error, not a fallback**: `Transient` for an unreachable or
+restarting server, `Corrupt` when it refuses the directory; git is not run here instead.
+
+What the sandbox needs of the deployment: **the work volume at the same path in both containers** (the commands carry paths), and
+the same user (the files are written by one and read by the other). The copy of an index that `diff_stat` and `working_tree_id`
+work on is made in `<root>/staging/private/` instead of the process's `/tmp`, because the sandbox does not see this container's `/tmp`
+(`GitSandbox::private_dir`; mode `0700`, removed with its owner). A `GIT_CONFIG_GLOBAL` file the operator names is read in the
+sandbox too: it has to exist there, or git reads none.
+
+**Local mode, Podman and run pods off stay unprotected**: without `with_git_sandbox` every command runs here, as before, and a
+repository's configuration can run a program next to the coder's secrets (there the run's own commands run in this container
+anyway). What this protects, and what it does not (a filter in the sandbox still sees the whole volume, every run's files), is
+[ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md)'s "Known limits" and the README of the sandbox.
 
 ### `git` starts from an empty environment
 
@@ -142,8 +209,8 @@ has no git directory: no `git` runs on it, and no pod mounts it. A slot made bef
 has the **one** `worktrees/*/gitdir` that names its `.git` among the directories that carry no run or this run; none or several, and
 `git_dir()` is `None`, no `git` runs on it (`WorkspaceError::Corrupt`) and `adam-env-kubernetes` mounts no git directories for it.
 A scratch project is pinned to its own `.git`, which must be a directory, and which must not hold a `commondir`.
-`extensions.worktreeConfig` (which would make git read `config.worktree`, also writable by a command) is never set by the workspace and is among the
-keys it removes from the mirror's configuration. What stays: an embedded repository in the working tree is entered by `status`, `add -A` and
+`extensions.worktreeConfig` (which would make git read `config.worktree`, also writable by a command) is never set by the workspace, and a mirror that
+has it is refused ([the check](#the-mirrors-configuration-is-checked-not-repaired)). What stays: an embedded repository in the working tree is entered by `status`, `add -A` and
 `diff` with its own configuration ([ADR 0041](../../docs/decisions/0041-a-run-pod-sees-only-its-own-run.md), "Known limits"). Tests:
 `workspace.rs`, `a_commondir_or_a_git_file_a_run_rewrites_steers_nothing_of_the_coders_git` (a planted filter and monitor leave no marker, and
 the control without the pin does), `a_run_that_points_its_git_file_at_another_runs_directory_does_not_get_it`,
@@ -619,7 +686,7 @@ token, and a message does not repeat its source.
 | Feature | Default | Effect |
 |---|---|---|
 | `github` | yes | the `GitHub` code host and the `GitHubApp` credentials (pull in `reqwest`, and `aws-lc-rs`, `rustls-pki-types` and `chrono` to sign and read the App's JWT and key; `aws-lc-rs` and `rustls-pki-types` are already in the tree under `rustls`) |
-| `test-util` | no | `MemoryCodeHost` for downstream tests, and with `github` also `testing::TestAppKey`; and the seam that makes a slot's directory swap between a check and the use that follows it (`safe_fs::race::on_checkpoint`, `SlotDir::open_using`): without it `race::checkpoint` does nothing |
+| `test-util` | no | `MemoryCodeHost` for downstream tests, and with `github` also `testing::TestAppKey`; and the seam that makes a slot's directory swap between a check and the use that follows it (`safe_fs::race::on_checkpoint`, `SlotDir::open_using`): without it `race::checkpoint` does nothing; and `testing_sandbox::GitSandboxServer`, a real `adam-git-sandbox` process (built with `cargo build -p adam-git-sandbox` on first use) with its log, for tests of the commands that go through it |
 
 The only environment variable the crate reads is the one you name in
 `StaticToken::from_env` / `ScopedToken::from_env` (for example `GITHUB_TOKEN`).
@@ -629,8 +696,11 @@ The only environment variable the crate reads is the one you name in
 Offline. The `git` CLI must be on `PATH`.
 
 * `tests/workspace.rs`: worktrees against local bare repositories (including the configuration planted in the
-  mirror, `insteadOf`, `pushInsteadOf`, `pushurl`, a second remote, a proxy and an fsmonitor, which neither the
-  push, the fetch of a later run, the default branch nor `publish` follows, and which is removed; a run that continues a pushed
+  mirror: fifteen kinds of key, `insteadOf`, an include, a credential helper, a request header, a changed
+  `remote.origin.url`, a second remote, a proxy and an fsmonitor among them, each of which makes the fetch of a later run,
+  the default branch, the emptiness test, the push and `publish` refuse before they start, naming the key and not the value, leaves the
+  file as it was found and lets everything work again once it is put right; a `packed-refs`, `HEAD` or `config` that is a link and a
+  `commondir`; the two spellings of a filesystem remote; a run that continues a pushed
   branch: its files, its pushes to its own branch and the separate, fast-forward-only `publish` to the continued
   one, the names it refuses, idempotency and a restart, a branch that moved; the default branch of the remote
   and the list of branches in the error for a missing one), the host
@@ -641,6 +711,25 @@ Offline. The `git` CLI must be on `PATH`.
   lock it fails with "could not lock" in 5 of 5 runs) and
   `a_mirror_locked_by_another_process_makes_prepare_wait` (a lock held on the lock file blocks
   `prepare` until it is released).
+* `tests/git_sandbox.rs`: **a real `adam-git-sandbox` process** (built by the test with `cargo build`, started by
+  `testing_sandbox::GitSandboxServer` under an environment of its own) and the coder's own code paths on temporary
+  directories with local bare repositories as remotes. The split: a worktree's `status`, `diff_stat` (the copy of the index in
+  `staging/private/`), `commit_all`, `push`, `default_branch` and `remote_is_empty` leave the subcommands of the commands that
+  carry no credential in the server's log and none of `fetch`, `push`, `ls-remote` or `init`; `prepare` of an http
+  repository on a `wiremock` server reaches it with the `Authorization` header (so `fetch` and `ls-remote` ran here, with the
+  token) and nothing of it is in the server's log; a scratch project is made and committed through the server. **The
+  vector**: a scratch project whose `.git/config` runs a program as a clean filter, and an embedded repository (a gitlink) whose
+  own configuration does, asked by `status`, `diff_stat` and `commit_all`: the program writes its ancestors and what it can read of
+  their environment, and the marker shows the server among the ancestors and the server's environment and not the test's
+  (`CARGO_PKG_NAME`, which stands for a secret of the coder); **the control**, the same without the socket, shows the program under
+  the test and the secret readable. A filter in the sandbox that rewrites the mirror's configuration makes the next push, fetch
+  and `ls-remote` refuse, naming the keys. A sandbox that cannot be reached: the commands that need it fail as transient, and the
+  program a scratch project names did not run here. `LocalGit` (the coder's tools' questions): where it runs, a patch on its input,
+  a credential refused before anything is sent. The isolation itself (another container, no secret, another PID namespace) is not
+  here: the server of these tests is a process of the same user on the same machine.
+  Unit tests: the route of every kind of command, the token in the environment of the command that carries it and in no argument,
+  a credential never sent (a header, a helper, the environment), a command with no directory (`git.rs`); the allow-list of the
+  mirror's keys (`mirror_config.rs`).
 * A slot swapped between a check and the use that follows it (the seam `safe_fs::race`): see
   [A slot's directory is held, not named](#a-slots-directory-is-held-not-named). The tests are in `tests/workspace.rs` and
   `src/safe_fs/slot_dir.rs`, and in `adam-coder` for its file tools.

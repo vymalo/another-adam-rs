@@ -3,7 +3,7 @@
 Configuration of both agents is environment variables only. Problems are reported all at once at startup
 (`invalid configuration`, exit 78). Sources of truth: `crates/adam-service/src/config.rs` (the common ones),
 `bin/adam-coder/src/config.rs`, `bin/adam-agent/src/config.rs`, `crates/adam-env-kubernetes/src/settings.rs`,
-`bin/adam-egress/src/config.rs`.
+`bin/adam-egress/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`.
 The chart sets these from its values: [chart README](../../deploy/coder/README.md). Secrets are never in
 files or logs; they are `SecretString`s and absent from `Debug`.
 
@@ -77,6 +77,7 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass`. The card lists the tiers up to it, a higher one is refused, the tools check it again. `bypass` (rename and delete repositories, no consent form) is opt-in. Read by every role; a word that is not a tier is exit 78 | `auto` |
 | `ALLOW_LOCAL_REPOS` | accept local paths, `file://`, plain `http://`; development and tests only | `false` |
 | `WORKSPACE_ROOT` | mirrors, run workspaces, run notes | `/work` |
+| `GIT_SANDBOX_SOCKET` | the Unix socket of an `adam-git-sandbox` server (an absolute path; a relative one is exit 78). When it is set, the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, ...) run **there**, where no secret is readable, instead of in the coder's container; `fetch`, `push` and `ls-remote` stay in the coder, on the bare mirror, after its configuration has been checked. The sandbox's container must mount `WORKSPACE_ROOT` at the same path. A sandbox that cannot be reached makes those commands fail (retried as a transient failure): **they are never run in the coder's container instead**. Unset (the default, local mode, Podman, run pods off): git runs in the coder's container, which is **not** protected from the repositories a run controls ([the git sandbox](../../crates/adam-git-sandbox/README.md)) | unset |
 | `WORKSPACE_PLACEMENT` | `shared`, `affinity` or `isolated` ([placement](workspace-and-environments.md#placement-which-worker-holds-a-runs-files)) | `shared` |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes finished runs' workspaces; `0` is off | `300` |
 | `SCRATCH_IDLE_DAYS` | days a scratch project is kept after the last task of its conversation; `0`: it goes with its run ([thread-long scratch](workspace-and-environments.md#a-runs-workspace)) | `7` |
@@ -124,6 +125,22 @@ nothing of the rows above. Source: `bin/adam-egress/src/config.rs`. Problems are
 | `EGRESS_IDLE_SECS` | a tunnel that moves no byte for this long is closed (1 to 86400) | `300` |
 | `EGRESS_MAX_CONNECTIONS` | connections served at once; the next gets `503` (1 to 1000000) | `1024` |
 | `RUST_LOG` | log filter; JSON logs on stdout | `info` |
+
+## Git sandbox (`adam-git-sandbox`, `adam-git`)
+
+The server that runs the coder's local `git` where no secret is readable, and the relay that stands in for `git`
+(`crates/adam-git-sandbox`, [its README](../../crates/adam-git-sandbox/README.md)). Both ship in the coder image. The
+server reads nothing of the rows above; the coder reads `GIT_SANDBOX_SOCKET` (above). Source:
+`crates/adam-git-sandbox/src/config.rs`. Problems are reported all at once (exit 78).
+
+| Variable | Read by | Meaning | Default |
+|---|---|---|---|
+| `GIT_SANDBOX_LISTEN` | the server | the Unix socket to listen on: an absolute path, made with mode `0600`. A path that exists and is not a socket, or a socket a server answers on, is exit 71; a socket nobody answers on is replaced | required |
+| `GIT_SANDBOX_ROOT` | the server | the work volume: an absolute path of an existing directory. A command runs in a directory below it (no link at any component) and nowhere else. It is the coder's `WORKSPACE_ROOT`, at the same path | required |
+| `GIT_SANDBOX_GIT` | the server | the `git` to run: an absolute path of an executable file. The server runs this program and no other | the first `git` on `PATH`, found once at startup |
+| `GIT_SANDBOX_MAX_COMMANDS` | the server | commands run at once (1 to 4096); the next waits | `64` |
+| `RUST_LOG` | the server | log filter; JSON logs on stdout | `info` |
+| `GIT_SANDBOX_SOCKET` | the relay `adam-git` | the server's socket (an absolute path). Unset: `adam-git` says so and ends with 78; it never runs git itself | required by the relay |
 
 ## Local stack (`compose.yaml`)
 

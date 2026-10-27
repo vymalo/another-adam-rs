@@ -4,11 +4,9 @@
 //! No credentials are involved.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 
-use adam_workspace::{GitPin, Slot, SlotDir, Worktree};
-use tokio::process::Command;
+use adam_workspace::{GitPin, LocalGit, Slot, SlotDir, Worktree};
 
 /// Where a git question is asked: a directory, and the repository `git` works on there.
 ///
@@ -66,6 +64,15 @@ impl GitAt {
         self.root.path()
     }
 
+    /// Where a copy of the index is made: a directory of the work volume when git runs in the
+    /// sandbox, `None` (the process's temporary directory) when it runs here.
+    fn private_dir(&self) -> Option<&Path> {
+        match &self.pin {
+            Pin::Pinned(pin) => pin.sandbox().map(adam_workspace::GitSandbox::private_dir),
+            _ => None,
+        }
+    }
+
     /// The slot's directory, held open.
     pub(crate) fn root(&self) -> &Arc<SlotDir> {
         &self.root
@@ -120,14 +127,14 @@ impl GitAt {
     }
 
     /// `git`, from an empty environment ([`adam_workspace::confine_git_env`]: a filter the
-    /// repository configures runs in it), in the directory and pinned. `None` when the repository
-    /// is refused or its pin cannot be trusted (see [`GitPin::check`]).
-    pub(crate) async fn command(&self) -> Option<Command> {
-        let mut cmd = Command::new("git");
-        adam_workspace::confine_git_env(&mut cmd);
-        match &self.pin {
+    /// repository configures runs in it), in the directory and pinned. It runs in the git sandbox
+    /// when the deployment has one (`GIT_SANDBOX_SOCKET`; a filter then runs where no secret is
+    /// readable), else in this container. `None` when the repository is refused or its pin cannot be
+    /// trusted (see [`GitPin::check`]).
+    pub(crate) async fn command(&self) -> Option<LocalGit> {
+        let cmd = match &self.pin {
             #[cfg(test)]
-            Pin::Plain => {}
+            Pin::Plain => LocalGit::new(self.path(), None),
             Pin::Pinned(pin) => {
                 if let Err(why) = pin.check().await {
                     tracing::warn!(dir = %self.path().display(), %why, "git is not run here");
@@ -140,7 +147,7 @@ impl GitAt {
                     tracing::warn!(dir = %self.path().display(), %why, "git is not run here");
                     return None;
                 }
-                pin.apply(&mut cmd);
+                LocalGit::new(self.path(), pin.sandbox()).pinned(pin)
             }
             Pin::Refused => {
                 tracing::warn!(
@@ -149,30 +156,15 @@ impl GitAt {
                 );
                 return None;
             }
-        }
-        cmd.args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-        ])
-        .current_dir(self.path())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        };
         Some(cmd)
     }
 }
 
 /// Run `git <args>` where `at` says; `Some(stdout)` (trimmed) on exit 0.
 pub(crate) async fn git_stdout(at: &GitAt, args: &[&str]) -> Option<String> {
-    let mut cmd = at.command().await?;
-    let out = cmd.args(args).output().await.ok()?;
-    out.status
-        .success()
+    let out = at.command().await?.args(args).output().await.ok()?;
+    out.success
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
@@ -499,7 +491,9 @@ pub(crate) async fn head_tree(at: &GitAt) -> Option<String> {
 /// of the index copies nothing.
 pub(crate) async fn working_tree_id(at: &GitAt) -> Option<String> {
     let index = at.index_path().await?;
-    let copy = match adam_workspace::safe_fs::private_copy_of(
+    // In the git sandbox's reach: it does not see this container's temporary directory.
+    let copy = match adam_workspace::safe_fs::private_copy_in(
+        at.private_dir(),
         &index,
         adam_workspace::safe_fs::MAX_INDEX_COPY,
     )
@@ -514,15 +508,15 @@ pub(crate) async fn working_tree_id(at: &GitAt) -> Option<String> {
     let run = |args: &'static [&'static str]| {
         let tmp = copy.path().to_owned();
         async move {
-            let mut cmd = at.command().await?;
-            let out = cmd
+            let out = at
+                .command()
+                .await?
                 .args(args)
                 .env("GIT_INDEX_FILE", &tmp)
                 .output()
                 .await
                 .ok()?;
-            out.status
-                .success()
+            out.success
                 .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
         }
     };
@@ -1343,5 +1337,225 @@ mod state_tests {
         ] {
             assert!(!written_per_run(key), "{key}");
         }
+    }
+}
+
+/// The questions go where the commands of the workspace go: through the git sandbox when the
+/// deployment has one (a real `adam-git-sandbox` process), and nowhere else when it cannot be reached.
+#[cfg(test)]
+mod sandboxed_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+
+    use adam_workspace::testing_sandbox::{GitSandboxServer, SANDBOX_MARKER};
+    use adam_workspace::{GitIdentity, RepoRef, StaticToken, Workspaces};
+
+    use super::pinned_tests::git;
+    use super::*;
+
+    /// `CARGO_PKG_NAME` is set by cargo in every test process: it stands for a secret of the coder.
+    const SECRET: &str = "environ CARGO_PKG_NAME=adam-coder";
+
+    struct Fx {
+        tmp: tempfile::TempDir,
+        root: PathBuf,
+        repo: RepoRef,
+        server: GitSandboxServer,
+        workspaces: Workspaces,
+    }
+
+    impl Fx {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let remote = tmp.path().join("remote.git");
+            let seed = tmp.path().join("seed");
+            std::fs::create_dir_all(&remote).unwrap();
+            std::fs::create_dir_all(&seed).unwrap();
+            git(
+                &remote,
+                &["init", "--bare", "--quiet", "--initial-branch=main"],
+            );
+            git(&seed, &["init", "--quiet", "--initial-branch=main"]);
+            std::fs::write(seed.join("README.md"), "widgets\n").unwrap();
+            git(&seed, &["add", "-A"]);
+            git(&seed, &["commit", "--quiet", "-m", "seed"]);
+            git(
+                &seed,
+                &["remote", "add", "origin", remote.to_str().unwrap()],
+            );
+            git(&seed, &["push", "--quiet", "origin", "main"]);
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let server = GitSandboxServer::start(tmp.path(), &root);
+            let workspaces = Workspaces::new(root.clone(), Arc::new(StaticToken::new("unused")))
+                .with_git_sandbox(server.socket());
+            Self {
+                repo: RepoRef::new(remote.to_str().unwrap(), "main"),
+                tmp,
+                root,
+                server,
+                workspaces,
+            }
+        }
+
+        /// A scratch project whose own configuration runs `spy` as a clean filter, as a run's command
+        /// could make it.
+        async fn armed_scratch(&self, run: &str, spy: &Path) -> adam_workspace::Slot {
+            let slot = self
+                .workspaces
+                .run(run)
+                .unwrap()
+                .add_scratch("proj", &GitIdentity::new("t", "t@example.com"))
+                .await
+                .unwrap();
+            // A tracked file first, then the filter, then a change of the same size: git has to read
+            // the file through the filter to tell that it changed.
+            std::fs::write(slot.path().join("a.txt"), "content\n").unwrap();
+            git(slot.path(), &["add", "a.txt"]);
+            git(slot.path(), &["commit", "--quiet", "-m", "a"]);
+            git(
+                slot.path(),
+                &["config", "filter.x.clean", spy.to_str().unwrap()],
+            );
+            std::fs::write(slot.path().join(".gitattributes"), "* filter=x\n").unwrap();
+            std::fs::write(slot.path().join("a.txt"), "CONTENT\n").unwrap();
+            slot
+        }
+    }
+
+    /// A filter that writes where it runs (its ancestors up to the sandbox's server) and what it can
+    /// read of each one's environment, and passes its input through.
+    fn spy(dir: &Path, marker: &Path) -> PathBuf {
+        let path = dir.join("spy.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\npid=$$; depth=0\nwhile [ \"$pid\" -gt 1 ] && [ $depth -lt 6 ]; do\n  comm=$(cat /proc/$pid/comm)\n  echo \"ancestor $pid $comm\" >> {m}\n  tr '\\0' '\\n' < /proc/$pid/environ | sed 's/^/environ /' >> {m} 2>/dev/null\n  case \"$comm\" in adam-git-sandb*) break;; esac\n  pid=$(sed 's/^[^)]*) . \\([0-9]*\\) .*/\\1/' /proc/$pid/stat)\n  depth=$((depth + 1))\ndone\ncat\n",
+                m = marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn ran_in_the_server(marker: &Path, server: &GitSandboxServer, what: &str) {
+        let text = std::fs::read_to_string(marker)
+            .unwrap_or_else(|_| panic!("{what}: the filter did not run"));
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with(&format!("ancestor {} adam-git-sandb", server.pid()))),
+            "{what}: the server is not among the filter's ancestors:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "environ {}={}",
+                SANDBOX_MARKER.0, SANDBOX_MARKER.1
+            )),
+            "{what}: {text}"
+        );
+        assert!(
+            !text.contains(SECRET),
+            "{what}: the coder's secret is readable:\n{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_questions_run_in_the_sandbox_and_what_a_repository_runs_runs_there() {
+        let fx = Fx::new();
+        let marker = fx.tmp.path().join("marker");
+        let slot = fx
+            .armed_scratch("run-aaaaaaaa-1", &spy(fx.tmp.path(), &marker))
+            .await;
+        let at = GitAt::slot(&slot);
+
+        // `git add -A` in a copy of the index: the filter runs under the server.
+        let tree = working_tree_id(&at).await.expect("the tree id is computed");
+        ran_in_the_server(&marker, &fx.server, "working_tree_id");
+        std::fs::remove_file(&marker).unwrap();
+
+        // `git status` reads the file through the filter again when its stat data is not enough.
+        let status = status_text(&at).await.expect("the status is read");
+        assert!(status.contains("a.txt"), "{status}");
+        ran_in_the_server(&marker, &fx.server, "status_text");
+
+        assert!(head_sha(&at).await.is_some());
+        assert_eq!(head_ref(&at).await.as_deref(), Some("refs/heads/main"));
+        assert!(repo_state(&at).await.is_some());
+        assert_eq!(
+            working_tree_id(&at).await.unwrap(),
+            tree,
+            "the same content, the same tree"
+        );
+
+        let ran = fx.server.subcommands();
+        for sub in [
+            "init",
+            "config",
+            "add",
+            "write-tree",
+            "status",
+            "rev-parse",
+            "for-each-ref",
+        ] {
+            assert!(
+                ran.iter().any(|s| s == sub),
+                "{sub} did not go through the server: {ran:?}"
+            );
+        }
+        // The copy of the index was made where the server sees it, and is gone.
+        let private = fx.root.join("staging").join("private");
+        assert!(private.is_dir(), "the copies are made in the volume");
+        assert_eq!(
+            std::fs::read_dir(&private).unwrap().count(),
+            0,
+            "and removed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_worktrees_questions_work_through_the_sandbox() {
+        let fx = Fx::new();
+        let slot = fx
+            .workspaces
+            .run("run-bbbbbbbb-2")
+            .unwrap()
+            .add_repository(&fx.repo)
+            .await
+            .unwrap();
+        std::fs::write(slot.path().join("README.md"), "changed by the run\n").unwrap();
+        let at = GitAt::slot(&slot);
+        assert!(working_tree_id(&at).await.is_some());
+        assert!(status_text(&at).await.unwrap().contains("README.md"));
+        assert_eq!(commits_ahead(&at, "main").await, Some(0));
+        assert!(head_tree(&at).await.is_some());
+        let ran = fx.server.subcommands();
+        assert!(ran.iter().any(|s| s == "rev-list"), "{ran:?}");
+        assert!(!ran.iter().any(|s| s == "fetch" || s == "push"), "{ran:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn with_the_sandbox_gone_the_questions_are_unknown_and_nothing_runs_here() {
+        let fx = Fx::new();
+        let marker = fx.tmp.path().join("marker");
+        let slot = fx
+            .armed_scratch("run-aaaaaaaa-1", &spy(fx.tmp.path(), &marker))
+            .await;
+
+        // The same workspace root, a deployment whose sandbox does not answer.
+        let down = Workspaces::new(fx.root.clone(), Arc::new(StaticToken::new("unused")))
+            .with_git_sandbox(fx.tmp.path().join("nobody.sock"));
+        let slots = down.run("run-aaaaaaaa-1").unwrap().slots().await.unwrap();
+        let at = GitAt::slot(&slots[0]);
+        assert_eq!(slots[0].path(), slot.path());
+        assert!(slots[0].git_pin().unwrap().sandbox().is_some());
+        assert_eq!(working_tree_id(&at).await, None);
+        assert_eq!(status_text(&at).await, None);
+        assert_eq!(head_sha(&at).await, None);
+        assert!(repo_state(&at).await.is_none());
+        assert!(
+            !marker.exists(),
+            "a filter ran in this container because the sandbox was down"
+        );
     }
 }

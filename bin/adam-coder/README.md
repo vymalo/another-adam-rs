@@ -1344,7 +1344,7 @@ namespaces (`refs/heads/agent/*` and `refs/remotes/*` are other runs' and fetche
 command runs) and the local git configuration (without `branch.*`, which `prepare` writes), so a
 `core.fsmonitor`, a `remote.origin.pushurl`, a `url.*.insteadOf`, an alias, a new branch or tag is undone too.
 **This is a guard against accidents, not isolation**, and not what the credentials rely on (the workspace
-cleans the mirror's configuration itself, under its lock, before every credentialed command). A command can
+checks the mirror's configuration itself, under its lock, before every credentialed command, and refuses the command when it holds a key the workspace did not write). A command can
 still read everything the process can, use the network and write outside the worktree. The refs and the
 configuration are shared by every run on the mirror and other runs change them while a command runs, so
 these are **not** compared, and a command can change them unseen: `refs/heads/agent/*` (another run's
@@ -1777,10 +1777,17 @@ shipped files stay in the binary and cannot disagree with it.
   * The coder's own `git` (`add`, `apply`, the tree-id probes) starts from an **empty environment** plus a short allow-list
     (`adam_workspace::confine_git_env`), because a `filter.<x>.clean` that a check script writes to `.git/config` and a
     committed `.gitattributes` would otherwise run in the coder's full environment on its next `git add -A`.
+  * With `GIT_SANDBOX_SOCKET` that `git` does not run in the coder's container at all: **the commands that carry no credential run in the
+    git sandbox** ([`adam-git-sandbox`](../../crates/adam-git-sandbox/README.md)), a container with no secret, no secret variable, no
+    service-account token and a PID namespace of its own (the chart's part), so the program a repository's configuration names
+    (`filter.*`, `textconv`) runs where nothing is readable that the environment hid. The `fetch`, `push` and `ls-remote` that carry the
+    token stay in the coder, on the bare mirror, and the mirror's configuration is checked before each. Without the variable
+    (local mode, Podman, run pods off) git runs in the coder's container and **this is not protected**. [The split](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox).
   * The process is **non-dumpable** at startup (`harden::make_non_dumpable`, which lives in `adam-service` and is re-exported here,
     and which `adam-agent` calls too; `prctl(PR_SET_DUMPABLE, 0)` through `rustix`'s safe call), so a child of the same user without `CAP_SYS_PTRACE` cannot read `/proc/<coder pid>/environ`.
   * **Remaining**: the one invocation that carries the token (fetch, ls-remote, push) has it in its environment, and the
-    mirror guard that removes the configuration keys which would run a program there is a list, not a proof; a proxy URL with a password in `HTTPS_PROXY` is inherited by git; a process with `CAP_SYS_PTRACE`, or root,
+    mirror check that refuses the configuration keys which would run a program there is a list, not a proof (a writer in the sandbox
+    can still change the file between the check and the command's read of it); a proxy URL with a password in `HTTPS_PROXY` is inherited by git; a process with `CAP_SYS_PTRACE`, or root,
     reads everything (the chart drops all capabilities); a value shorter than four characters is not redacted; and a secret
     a run's code is *given* on purpose (the model key OpenCode reads, a file the model reads) is as exposed as that act.
 * Tests: `tests/environment.rs` (`a_variable_a_mcp_json_names_is_*`, `the_names_the_coders_own_processes_need_*`), `src/config.rs`, `src/redact.rs`, `src/harden.rs`, `src/tools/gitcli.rs` (a malicious filter);
@@ -1854,6 +1861,7 @@ way; every problem is reported at once at startup):
 | `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass` (exactly, lower case; anything else is exit 78). The card lists the tiers up to it, the A2A backend refuses a higher one (every role), and the tools check it against the tier in the notes. `bypass` (rename and delete repositories, no consent form) is opt-in. The chart's `accessTiers.max`, the operator's `maxAccessTier` | `auto` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
+| `GIT_SANDBOX_SOCKET` | the Unix socket of an [`adam-git-sandbox`](../../crates/adam-git-sandbox/README.md) server, an absolute path (a relative one is exit 78). Set: the `git` commands that carry **no credential** (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, the questions the tools ask) run **there**, in a container with no secret, because git runs what a repository's configuration names and a run controls some repositories (a scratch project, an embedded repository); `fetch`, `push` and `ls-remote` stay here, on the bare mirror, after its configuration has been checked ([`adam-workspace`](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox)). The sandbox's container mounts `WORKSPACE_ROOT` at the same path and runs as the same user. A sandbox that cannot be reached makes those commands fail as transient; **they are not run here instead**. Unset (the default; local mode, Podman and run pods off): every `git` runs in this container, **unprotected** from the repositories a run controls. The chart does not run the server yet. Read by the roles that run workers | unset |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
 | `SCRATCH_IDLE_DAYS` | how many days a scratch project outlives the last task of its conversation before the janitor removes it ([Scratch projects](#scratch-projects)); `0`: it goes with its run | `7` |
 | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
@@ -1981,7 +1989,7 @@ By default any worker may lease any run at any step. Several workers therefore n
 | `DATABASE_URL` | yes | yes | yes |
 | `A2A_BEARER_TOKENS`, `PUBLIC_URL`, and the optional `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS` | yes (the optional ones if set) | yes (the optional ones if set) | not read |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, and `GITHUB_TOKEN` or the `GITHUB_APP_*` variables | yes | not read | yes |
-| the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `WORKSPACE_PLACEMENT`, `WORKER_ID`, `WORKERS`, `MAX_CHECK_CYCLES`, `SCRATCH_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
+| the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `GIT_SANDBOX_SOCKET`, `WORKSPACE_PLACEMENT`, `WORKER_ID`, `WORKERS`, `MAX_CHECK_CYCLES`, `SCRATCH_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
 
 A missing required value is a configuration error (exit 78) listed with every other problem.
 What a role does not read it does not validate either: a worker ignores `A2A_BEARER_TOKENS` and
@@ -2290,6 +2298,14 @@ once (`adam_error::report`) and then scrubbed.
 Everything is offline (`cargo test -p adam-coder`; with
 `ADAM_TEST_POSTGRES_URL` set the Postgres variants run too, each case in a
 database of its own, so the role needs `CREATEDB`):
+
+* The git sandbox, with a real `adam-git-sandbox` process (built by the test): `src/tools/gitcli.rs`
+  (`sandboxed_tests`) asks the questions the tools ask (`working_tree_id`, `status_text`, `head_sha`, `repo_state`,
+  `commits_ahead`) of a scratch project whose configuration runs a program as a clean filter and of a worktree: the program runs under
+  the server and reads the server's environment and not the coder's, the commands are in the server's log, the copy of the index is
+  made in `staging/private/` and removed, and with the sandbox gone the answers are unknown and the program did not run here;
+  `src/tools/files.rs` (`apply_sandbox_tests`) applies a patch through it (its input crosses; a patch that does not apply is git's
+  verdict); `src/config.rs` and `src/repos.rs` read `GIT_SANDBOX_SOCKET` (absolute, blank is unset) and hand it to the workspaces.
 
 * `tests/hearing.rs` (what the coder takes from the person's words, through a real `CoderAgent` on a `Runtime`): the repositories
   they named, a form whose ids and values are forged naming nothing, what they type into one counting, the bare names, and what

@@ -333,13 +333,14 @@ async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it_only_on_request(
     assert!(!first.path().join("second.txt").exists());
 }
 
-/// What carries the credentials goes where the workspace was prepared for, whatever was written in
-/// the shared mirror's configuration afterwards: a `remote.origin.url` or `pushurl`, and the URL
-/// rewrites (`insteadOf` and `pushInsteadOf` rewrite the URLs given on the command line too) that
-/// a model's command, OpenCode or a repository script could plant. The configuration is made safe
-/// under the mirror lock right before each credentialed command.
+/// The mirror is shared by every run, and what runs in the git sandbox can write it. A key the
+/// workspace does not write (a URL rewrite, an include, a credential helper, a request header, a
+/// changed `remote.origin.url`, a second remote, a proxy, an fsmonitor) makes every command that
+/// carries a credential **refuse before it starts**, naming the key and not its value; the file is
+/// not repaired, and the mirror works again when someone removes the key.
 #[tokio::test]
-async fn fetch_and_push_do_not_follow_the_mirrors_configuration() {
+async fn a_mirror_with_configuration_the_workspace_did_not_write_is_refused_before_any_credentialed_command()
+ {
     let env = Env::new();
     let first = env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
     let bogus = env._tmp.path().join("nowhere.git");
@@ -351,81 +352,178 @@ async fn fetch_and_push_do_not_follow_the_mirrors_configuration() {
     );
     let mirror = env.mirror();
     let remote = env.remote.to_str().unwrap().to_owned();
-    let plant = |mirror: &std::path::Path| {
-        for (key, value) in [
-            ("remote.origin.url", bogus.to_str().unwrap()),
-            ("remote.origin.pushurl", bogus.to_str().unwrap()),
-            ("remote.evil.url", evil.to_str().unwrap()),
-        ] {
-            git(mirror, &["config", key, value]);
-        }
+    let secret = "VALUE-THAT-MUST-NOT-BE-NAMED";
+
+    // (what it is, key, value)
+    let plants: Vec<(&str, String, String)> = vec![
+        (
+            "a URL rewrite",
+            format!("url.{}.insteadOf", evil.display()),
+            remote.clone(),
+        ),
+        (
+            "a push URL rewrite",
+            format!("url.{}.pushInsteadOf", evil.display()),
+            remote.clone(),
+        ),
+        ("an include", "include.path".into(), secret.into()),
+        (
+            "a conditional include",
+            "includeIf.gitdir:/work/.path".into(),
+            secret.into(),
+        ),
+        (
+            "a credential helper",
+            "credential.helper".into(),
+            format!("!echo {secret}"),
+        ),
+        (
+            "a request header",
+            "http.extraHeader".into(),
+            format!("Authorization: Basic {secret}"),
+        ),
+        ("a proxy", "http.proxy".into(), "http://127.0.0.1:9/".into()),
+        ("an ssh command", "core.sshCommand".into(), secret.into()),
+        (
+            "a changed remote.origin.url",
+            "remote.origin.url".into(),
+            bogus.to_str().unwrap().into(),
+        ),
+        (
+            "a changed refspec",
+            "remote.origin.fetch".into(),
+            "+refs/*:refs/*".into(),
+        ),
+        (
+            "a push url",
+            "remote.origin.pushurl".into(),
+            bogus.to_str().unwrap().into(),
+        ),
+        (
+            "a second remote",
+            "remote.evil.url".into(),
+            evil.to_str().unwrap().into(),
+        ),
+        (
+            "an fsmonitor",
+            "core.fsmonitor".into(),
+            format!("touch /nonexistent/{secret}"),
+        ),
+        ("an alias", "alias.fetch".into(), format!("!echo {secret}")),
+        ("a filter", "filter.x.clean".into(), secret.into()),
+    ];
+    let mut n = 0;
+    for (what, key, value) in plants {
+        n += 1;
+        let config_before = std::fs::read(mirror.join("config")).unwrap();
+        // The key is written the way a process that holds the file would write it; one the
+        // workspace itself writes (remote.origin.url) is changed.
+        git(&mirror, &["config", "--replace-all", &key, &value]);
+        let planted_config = std::fs::read(mirror.join("config")).unwrap();
+        env.advance_remote(&format!("later-{n}.txt"));
+        let tip_before = git(&mirror, &["rev-parse", "refs/remotes/origin/main"]);
+        let _ = std::fs::remove_file(mirror.join("FETCH_HEAD"));
+
+        // Fetch: a new run's workspace.
+        let error = env
+            .ws
+            .prepare(&env.repo, &format!("run-refused-{n:04}"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, WorkspaceError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        assert_eq!(error.class(), adam_error::ErrorClass::Corrupt, "{what}");
+        let said = error.to_string();
+        assert!(
+            said.to_lowercase().contains(&key.to_lowercase()),
+            "{what}: the key is named: {said}"
+        );
+        assert!(
+            said.contains(mirror.to_str().unwrap()),
+            "{what}: the mirror is named: {said}"
+        );
+        assert!(!said.contains(secret), "{what}: a value is named: {said}");
+        // A value is not named: the other URLs appear only where they are part of a key's name.
+        assert!(
+            !said.contains("nowhere.git") || key.contains("nowhere"),
+            "{what}: a value is named: {said}"
+        );
+        assert_eq!(
+            git(&mirror, &["rev-parse", "refs/remotes/origin/main"]),
+            tip_before,
+            "{what}: the fetch did not run"
+        );
+        assert!(
+            !mirror.join("FETCH_HEAD").exists(),
+            "{what}: the fetch did not start"
+        );
+
+        // ls-remote: the default branch, and whether the remote is empty.
+        let error = env.ws.default_branch(&env.repo.url).await.unwrap_err();
+        assert!(
+            matches!(error, WorkspaceError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        let error = env.ws.remote_is_empty(&env.repo.url).await.unwrap_err();
+        assert!(
+            matches!(error, WorkspaceError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+
+        // Push and publish of a run that is already prepared.
+        std::fs::write(first.path().join(format!("f-{n}.txt")), "f\n").unwrap();
+        first.commit_all("f", &me()).await.unwrap().unwrap();
+        let error = first.push().await.unwrap_err();
+        assert!(
+            matches!(error, WorkspaceError::Corrupt(_)),
+            "{what}: {error:?}"
+        );
+        assert_eq!(
+            remote_branches(&env),
+            ["main".to_owned()],
+            "{what}: nothing was pushed"
+        );
+        assert_eq!(
+            git(&evil, &["for-each-ref"]),
+            "",
+            "{what}: nothing reached the other URL"
+        );
+
+        // Not repaired: the file is what it was after the plant.
+        assert_eq!(
+            std::fs::read(mirror.join("config")).unwrap(),
+            planted_config,
+            "{what}: the configuration was rewritten"
+        );
+        // And put right by whoever put it wrong, the mirror works as before.
+        std::fs::write(mirror.join("config"), &config_before).unwrap();
+        first.push().await.unwrap();
+        assert_eq!(
+            remote_branches(&env),
+            [first.branch().to_owned(), "main".to_owned()],
+            "{what}: the push reached the real remote once the key was gone"
+        );
+        env.ws
+            .prepare(&env.repo, &format!("run-after-{n:04}"))
+            .await
+            .unwrap();
+        assert_eq!(env.ws.default_branch(&env.repo.url).await.unwrap(), "main");
+        // The pushed branch is the remote's now; start the next round from a clean remote.
+        git(&env.remote, &["branch", "-D", first.branch()]);
         git(
-            mirror,
+            &mirror,
             &[
-                "config",
-                &format!("url.{}.insteadOf", evil.display()),
-                &remote,
+                "update-ref",
+                "-d",
+                &format!("refs/remotes/origin/{}", first.branch()),
             ],
         );
-        git(
-            mirror,
-            &[
-                "config",
-                &format!("url.{}.pushInsteadOf", evil.display()),
-                &remote,
-            ],
-        );
-        git(mirror, &["config", "http.proxy", "http://127.0.0.1:9/"]);
-        git(
-            mirror,
-            &["config", "core.fsmonitor", "touch /nonexistent/ran"],
-        );
-    };
-    plant(&mirror);
-    std::fs::write(first.path().join("f.txt"), "f\n").unwrap();
-    first.commit_all("f", &me()).await.unwrap().unwrap();
-    first.push().await.unwrap();
-    assert_eq!(
-        remote_branches(&env),
-        [first.branch().to_owned(), "main".to_owned()],
-        "the push reached the real remote"
-    );
-    assert_eq!(
-        git(&evil, &["for-each-ref"]),
-        "",
-        "nothing was sent to the rewritten URL"
-    );
-    // The keys are gone, what the workspace itself writes stays.
-    let config = git(&mirror, &["config", "--local", "--list"]);
-    for gone in [
-        "insteadof",
-        "pushinsteadof",
-        "pushurl",
-        "remote.evil",
-        "http.proxy",
-        "fsmonitor",
-    ] {
-        assert!(!config.to_lowercase().contains(gone), "{gone} in {config}");
     }
-    assert!(
-        config.contains(&format!("remote.origin.url={remote}")),
-        "{config}"
-    );
-    assert!(config.contains("remote.origin.fetch="), "{config}");
-    assert!(
-        config.contains(&format!("branch.{}.remote=origin", first.branch())),
-        "{config}"
-    );
 
-    // A second run's fetch comes from the real remote too, and so does the default branch.
-    plant(&mirror);
-    env.advance_remote("later.txt");
-    let second = env.ws.prepare(&env.repo, "run-second-002").await.unwrap();
-    assert!(second.path().join("later.txt").exists());
-    plant(&mirror);
-    assert_eq!(env.ws.default_branch(&env.repo.url).await.unwrap(), "main");
-
-    // And a continuing run's publish.
+    // `publish` of a run that continues a branch is refused the same way.
+    first.push().await.unwrap();
     let third = env
         .ws
         .prepare_continuing(&env.repo, "run-third-0003", first.branch())
@@ -434,13 +532,93 @@ async fn fetch_and_push_do_not_follow_the_mirrors_configuration() {
     std::fs::write(third.path().join("g.txt"), "g\n").unwrap();
     third.commit_all("g", &me()).await.unwrap().unwrap();
     third.push().await.unwrap();
-    plant(&mirror);
+    git(
+        &mirror,
+        &["config", "http.extraHeader", "Authorization: Basic x"],
+    );
+    let error = third.publish().await.unwrap_err();
+    assert!(matches!(error, WorkspaceError::Corrupt(_)), "{error:?}");
+    git(&mirror, &["config", "--unset-all", "http.extraHeader"]);
     third.publish().await.unwrap();
     assert_eq!(
         git(&env.remote, &["show", &format!("{}:g.txt", first.branch())]),
         "g"
     );
     assert_eq!(git(&evil, &["for-each-ref"]), "");
+}
+
+/// What the check reads is the file as a regular file, and the files git reads beside it:
+/// a `packed-refs` or a `HEAD` that is a link, and a `commondir`, are refused as keys are.
+#[tokio::test]
+async fn a_mirror_whose_files_are_links_is_refused_like_one_whose_keys_are_wrong() {
+    let env = Env::new();
+    env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
+    let mirror = env.mirror();
+    let elsewhere = env._tmp.path().join("elsewhere");
+    std::fs::write(&elsewhere, "ref: refs/heads/main\n").unwrap();
+
+    // A clean mirror, checked after every case.
+    let clean = |why: &str| {
+        let ws = env.ws.clone();
+        let repo = env.repo.clone();
+        let why = why.to_owned();
+        async move {
+            ws.default_branch(&repo.url)
+                .await
+                .unwrap_or_else(|e| panic!("{why}: {e}"))
+        }
+    };
+    clean("before").await;
+
+    for (file, plant) in [
+        ("packed-refs", Plant::Link),
+        ("HEAD", Plant::Link),
+        ("config", Plant::Link),
+        ("packed-refs", Plant::Directory),
+        ("commondir", Plant::File),
+    ] {
+        let path = mirror.join(file);
+        let kept = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        match plant {
+            Plant::Link => std::os::unix::fs::symlink(&elsewhere, &path).unwrap(),
+            Plant::Directory => std::fs::create_dir(&path).unwrap(),
+            Plant::File => std::fs::write(&path, "../elsewhere\n").unwrap(),
+        }
+        let error = env.ws.default_branch(&env.repo.url).await.unwrap_err();
+        assert!(
+            matches!(error, WorkspaceError::Corrupt(_)),
+            "{file}: {error:?}"
+        );
+        assert!(error.to_string().contains(file), "{file}: {error}");
+        if matches!(plant, Plant::Directory) {
+            std::fs::remove_dir(&path).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        if let Some(kept) = kept {
+            std::fs::write(&path, kept).unwrap();
+        }
+        clean(file).await;
+    }
+}
+
+enum Plant {
+    Link,
+    Directory,
+    File,
+}
+
+/// A filesystem remote has two spellings that share a mirror; the check accepts both, which it
+/// must since the mirror keeps the one it was made with.
+#[tokio::test]
+async fn both_spellings_of_a_filesystem_remote_pass_the_check() {
+    let env = Env::new();
+    env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
+    let file_url = RepoRef::new(format!("file://{}", env.remote.display()), "main");
+    env.ws.prepare(&file_url, "run-second-002").await.unwrap();
+    assert_eq!(env.ws.default_branch(&file_url.url).await.unwrap(), "main");
+    assert_eq!(env.ws.default_branch(&env.repo.url).await.unwrap(), "main");
 }
 
 #[tokio::test]
@@ -3278,21 +3456,26 @@ async fn a_worktree_configuration_file_is_never_read_because_the_coder_never_tur
         "config.worktree is not read"
     );
 
-    // Whoever turns it on (a command of a run that shares the coder's container, on a mirror it can
-    // write) is undone the next time the workspace works on the mirror: it asks for a worktree.
+    // Whoever turns it on (a command of a run that shares the coder's container, or a filter in the
+    // git sandbox, on a mirror it can write) is not obeyed and not undone either: the next command
+    // that carries a credential on the mirror is refused, and the keys are named.
     git(&mirror, &["config", "core.repositoryformatversion", "1"]);
     git(&mirror, &["config", "extensions.worktreeConfig", "true"]);
-    let other = env
+    let error = env
         .ws
         .run("run-bbbbbbbb-2")
         .unwrap()
         .add_repository(&env.repo)
         .await
-        .unwrap();
-    assert!(other.worktree().is_some());
-    assert!(
-        config("extensions.worktreeConfig").stdout.is_empty(),
-        "the extension is turned off again"
+        .unwrap_err();
+    assert!(matches!(error, WorkspaceError::Corrupt(_)), "{error:?}");
+    let said = error.to_string();
+    assert!(said.contains("extensions.worktreeconfig"), "{said}");
+    assert!(said.contains("core.repositoryformatversion"), "{said}");
+    assert_eq!(
+        String::from_utf8_lossy(&config("extensions.worktreeConfig").stdout).trim(),
+        "true",
+        "the file was left as it was found"
     );
 }
 

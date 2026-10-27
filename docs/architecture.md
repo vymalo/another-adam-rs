@@ -78,6 +78,7 @@ flowchart TB
         mongo["adam-store-mongodb"]
         openai["adam-model-openai"]
         ws["adam-workspace"]
+        gitsb["adam-git-sandbox"]
         devc["adam-devcontainer"]
         kube["adam-env-kubernetes"]
         acp["adam-acp"]
@@ -122,6 +123,7 @@ flowchart TB
     pg --> core
     mongo --> core
     openai --> model
+    ws --> gitsb
     devc --> ws
     kube --> ws
 ```
@@ -129,13 +131,17 @@ flowchart TB
 | Layer | Crates | Job |
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
-| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
+| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
 | Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Binaries | [`adam-coder`](../bin/adam-coder/README.md), [`adam-agent`](../bin/adam-agent/README.md), [`adam-egress`](../bin/adam-egress/README.md) | The two agents you can run, library and binary each, over `adam-service`; and the HTTPS-only egress proxy for run pods, which uses only `adam-error` and is in the same image; the chart deploys it with the run pods, whose network policy allows nothing else out ([ADR 0042](decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)). |
 | Operator | [`adam-operator-api`](../crates/adam-operator-api/README.md), [`adam-operator-domain`](../crates/adam-operator-domain/README.md), [`adam-operator-ports`](../crates/adam-operator-ports/README.md), [`adam-operator-controller`](../crates/adam-operator-controller/README.md), [`adam-operator-runtime-kubernetes`](../crates/adam-operator-runtime-kubernetes/README.md), [`adam-operator-store-cnpg`](../crates/adam-operator-store-cnpg/README.md), [`adam-operator-store-secret`](../crates/adam-operator-store-secret/README.md), [`adam-operator-registry`](../crates/adam-operator-registry/README.md), binary [`adam-operator`](../bin/adam-operator/README.md) | Runs agents on Kubernetes from `AgentService` and `AgentConfig`; it has its own ports (`RuntimeProvider`, `StoreProvisioner`, `AgentDirectory`) and is separate from the run path above. See [ADR 0029](decisions/0029-adam-rs-has-an-operator.md) and [Run agents with the operator](guides/run-agents-with-the-operator.md). |
 
-`adam-env-kubernetes` also ships the `adam-kube-exec` binary. The workspace is `crates/*` and `bin/*`
+`adam-env-kubernetes` also ships the `adam-kube-exec` binary. `adam-git-sandbox` ships the server `adam-git-sandbox` and
+the relay `adam-git`, and its client is what `adam-workspace` sends the coder's local `git` through: the git commands that
+carry no credential run in a container that holds no secret, because git runs what a repository's configuration names
+(see [its README](../crates/adam-git-sandbox/README.md); built, and off unless `GIT_SANDBOX_SOCKET` is set, for
+[ADR 0041](decisions/0041-a-run-pod-sees-only-its-own-run.md)'s open decision 6). The workspace is `crates/*` and `bin/*`
 (root `Cargo.toml`): a new crate joins by adding a directory with a `README.md`.
 
 ## Ports and implementations

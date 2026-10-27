@@ -9,6 +9,8 @@
 //! that pushes). The secrets of the coder (`GITHUB_TOKEN`, `MODEL_API_KEY`, the keys an MCP server
 //! reads) are not in that list and never reach a repository's filter.
 
+use std::ffi::OsString;
+
 use tokio::process::Command;
 
 /// The variables of this process that a `git` inherits: where to find programs and a home, the
@@ -41,15 +43,20 @@ pub const GIT_INHERITED_ENV: &[&str] = &[
     "GIT_CONFIG_GLOBAL",
 ];
 
+/// The variables of [`GIT_INHERITED_ENV`] as this process has them: what a `git` the coder starts
+/// begins with, as pairs (the commands that go to the git sandbox are sent as data).
+pub(crate) fn inherited_pairs() -> Vec<(OsString, OsString)> {
+    GIT_INHERITED_ENV
+        .iter()
+        .filter_map(|name| Some((OsString::from(name), std::env::var_os(name)?)))
+        .collect()
+}
+
 /// Start `cmd` from an empty environment and give it back [`GIT_INHERITED_ENV`] as this process has
 /// it. Call it **before** setting any variable of your own on `cmd`.
 pub fn confine_git_env(cmd: &mut Command) {
     cmd.env_clear();
-    for name in GIT_INHERITED_ENV {
-        if let Some(value) = std::env::var_os(name) {
-            cmd.env(name, value);
-        }
-    }
+    cmd.envs(inherited_pairs());
 }
 
 #[cfg(test)]

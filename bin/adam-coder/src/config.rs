@@ -29,6 +29,7 @@
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 //! | `GITHUB_MCP_URL` | where the GitHub MCP server (`github-mcp-server http`, a sidecar of the pod) listens, for the agent folder's `mcp.json`: only the origin counts, and the folder's `github` server must be at it. The coder gives that server the credentials of each call ([`GitHubReadBearer`](crate::GitHubReadBearer)); the server holds none | `http://127.0.0.1:8082` |
 //! | `WORKSPACE_ROOT` | mirrors and worktrees (persistent storage) | `/work` |
+//! | `GIT_SANDBOX_SOCKET` | the Unix socket of an `adam-git-sandbox` server (an absolute path). When set, the `git` commands that carry no credential (`status`, `add`, `diff`, `commit` and its plumbing, `worktree`, `config`, the `apply` of a patch, ...) run **there**, in a container with no secret, because git runs what a repository's configuration names and a run controls some repositories; the commands that talk to a remote (`fetch`, `push`, `ls-remote`) stay in this container, on the bare mirror, after its configuration has been checked. The sandbox's container must mount `WORKSPACE_ROOT` at the same path, and a sandbox that cannot be reached makes those commands fail: they are never run here instead. Unset (the default): every `git` runs in this container, which is **not** protected from the repositories a run controls. [`adam_workspace::Workspaces::with_git_sandbox`] | unset |
 //! | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` ([`adam_host::Placement`]); `a2a-only` is refused | `shared` |
 //! | `WORKER_ID` | stable identity of this worker: the lease identity and, with `affinity` or `isolated`, the run owner; letters, digits, `.`, `_`, `-` | random per process; required for `affinity` and `isolated` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
@@ -176,6 +177,9 @@ pub struct WorkerConfig {
     pub github_mcp_url: Url,
     /// `WORKSPACE_ROOT`. Use [`WorkerConfig::placed_root`] for the folder the worker works in.
     pub workspace_root: PathBuf,
+    /// `GIT_SANDBOX_SOCKET`: the git sandbox the commands that carry no credential run in, if the
+    /// deployment has one.
+    pub git_sandbox_socket: Option<PathBuf>,
     /// `WORKSPACE_PLACEMENT`. Never [`Placement::A2aOnly`]: the parser refuses it.
     pub placement: Placement,
     /// `WORKER_ID`. `Some` whenever [`Placement::pins_runs`].
@@ -920,6 +924,7 @@ impl std::fmt::Debug for WorkerConfig {
                 &endpoint_for_logs(self.github_mcp_url.as_str()),
             )
             .field("workspace_root", &self.workspace_root)
+            .field("git_sandbox_socket", &self.git_sandbox_socket)
             .field("placement", &self.placement)
             .field("worker_id", &self.worker_id)
             .field("workers", &self.workers)
@@ -1057,6 +1062,17 @@ impl WorkerConfig {
         let opencode_model = get("OPENCODE_MODEL").unwrap_or_else(|| model.alias.clone());
         let workspace_root =
             PathBuf::from(get("WORKSPACE_ROOT").unwrap_or_else(|| "/work".to_owned()));
+        let git_sandbox_socket = get("GIT_SANDBOX_SOCKET").and_then(|raw| {
+            let socket = PathBuf::from(&raw);
+            if socket.is_absolute() {
+                Some(socket)
+            } else {
+                problems.push(format!(
+                    "GIT_SANDBOX_SOCKET {raw:?} must be an absolute path (the socket of adam-git-sandbox)"
+                ));
+                None
+            }
+        });
 
         let placement = match Placement::from_optional(lookup("WORKSPACE_PLACEMENT").as_deref()) {
             Ok(Placement::A2aOnly) => {
@@ -1213,6 +1229,7 @@ impl WorkerConfig {
             github_api_url,
             github_mcp_url,
             workspace_root,
+            git_sandbox_socket,
             placement,
             worker_id: settings.worker_id.clone(),
             workers: settings.workers,
@@ -1384,6 +1401,30 @@ mod tests {
             c.workspace_sweep,
             Some(Duration::from_secs(300)),
             "the janitor sweeps every five minutes"
+        );
+    }
+
+    #[test]
+    fn the_git_sandbox_is_off_unless_its_socket_is_named_by_an_absolute_path() {
+        let socket = |value: Option<&'static str>| {
+            let mut vars = full();
+            if let Some(value) = value {
+                vars.insert("GIT_SANDBOX_SOCKET", value);
+            }
+            parse(&vars).map(|c| c.worker.unwrap().git_sandbox_socket)
+        };
+        assert_eq!(socket(None).unwrap(), None, "off by default");
+        assert_eq!(socket(Some("  ")).unwrap(), None, "blank is unset");
+        assert_eq!(
+            socket(Some("/run/git/git.sock")).unwrap(),
+            Some(PathBuf::from("/run/git/git.sock"))
+        );
+        let err = socket(Some("git.sock")).unwrap_err();
+        assert!(
+            err.problems
+                .iter()
+                .any(|p| p.contains("GIT_SANDBOX_SOCKET") && p.contains("absolute")),
+            "{err}"
         );
     }
 

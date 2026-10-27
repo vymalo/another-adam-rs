@@ -35,6 +35,15 @@ CI also runs the MSRV build (`rust-version` in `Cargo.toml`), `cargo deny`, line
 (`.github/workflows/nightly.yml`, needs secrets). The CI jobs are the reference:
 `.github/workflows/ci.yml` and `coder.yml`.
 
+## Tests that start a binary
+
+The git sandbox's tests start the real server (`adam-git-sandbox`) as a process and run `git` through it: the crate's own tests use
+`CARGO_BIN_EXE_*`; the tests of `adam-workspace` and `adam-coder` build the binary first with `cargo build --locked -p
+adam-git-sandbox` in the target directory and profile of the running test binary (`adam_workspace::testing_sandbox`, as
+`adam-coder`'s tests build the fake ACP agent), so the first of them takes a moment and a build in progress makes the others wait. They
+need `git`, a Unix socket and `/proc`, and nothing else; they prove that the commands go where they should and that what a repository
+runs runs under the server, **not** the container isolation, which is the chart's ([`adam-git-sandbox`](../../crates/adam-git-sandbox/README.md#what-it-does-not-do)).
+
 ## Suites that need a service of their own
 
 They are gated apart, so `ADAM_TEST_REQUIRE_DB=1` does not turn them on.
