@@ -177,6 +177,25 @@ totals per model when it ends or waits, whoever reads it. **OpenCode reports no 
 (its `usage_update` is the context used and its size, which `adam-acp` drops, and the turn's `usage` is an unstable feature
 of the protocol that is not on), so the OpenCode step has no report and its calls are in no total.
 
+**Sandbox time, beside the tokens** ([ADR 0043](../../docs/decisions/0043-sandbox-time-as-usage.md)). The task's `usage/v1` object also
+carries a `sandbox` member, for the compute a run pod holds: the wall time of each command of the run, from the moment the coder
+spawns the process to its exit (a timeout or a cancel kill included), weighted by the pod's **requests** in the template
+(`cpuMillis`, `memoryBytes`; a request the template does not make is left out). One entry per shape, at most 8; commands of a subagent
+are added to its parent's, and commands that ran at the same time are summed. Every command of a pod passes `ToolEnv::run` (`run_command`,
+`run`, `run_checks`, the re-run of a failing check on the base, the OpenCode probe) and OpenCode's own process is timed from its
+spawn to the end of its call (`CommandClock`); both report to the call's `ToolCtx`, and the loop keeps the sum in the run's state with the
+call's result. `ToolEnv::session` reports which environment the run asked for:
+
+| The run's commands ran in | The task says |
+|---|---|
+| a run pod (`RUN_ENVIRONMENT=kubernetes`) | `{"environment": "kubernetes", "usage": [{"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12, "milliseconds": 81234}]}`; `"usage": []` when the pod was asked for and no command ran |
+| the coder's own container | `{"environment": "local"}`: not measured, never zero |
+| a dev container (Podman) | `{"environment": "devcontainer"}`: likewise |
+| no environment at all (the run only read files or talked) | no `sandbox` |
+
+The pod's idle wait, its start-up and the janitor's tail are not command time and are not counted. Like the totals, it is on the task
+when it ends or waits, for every reader, and a request that did not activate the extension is sent nothing new.
+
 ### Asking with choices
 
 **Sending while it works** (`steer/v1`, on the card): when a request activates the extension, a message that names the running task
@@ -1204,7 +1223,7 @@ stateDiagram-v2
   that is down or too slow. Nothing ran, no check cycle was used, no `checks` artifact was emitted. A cancel of the run ends
   the wait for `ensure`.
 * **A timeout or a cancel** kills the process group here and then calls `EnvSession::kill` with the id of the command, for what
-  lives where this process cannot reach. `run_in` takes the run's `CancelToken`: a cancel ends `run_command`, `run` and
+  lives where this process cannot reach. `run_in` (and `run_timed`, which also says how long the process ran, from its spawn until it was stopped, for the sandbox usage) takes the run's `CancelToken`: a cancel ends `run_command`, `run` and
   `run_checks` at once with the `cancelled` tool error (`RunError::Cancelled`), whatever the command was doing (a `sleep 60`
   included), and a command of a run that is cancelled already is not started. For OpenCode the same call follows the stop (`session/cancel`, then the kill).
 * **An environment may start OpenCode from nothing.** A session whose `PreparedCommand` has `env_clear` (the devcontainer's: its
@@ -1329,6 +1348,9 @@ every other problem of the configuration (exit 78).
   environment", with the reason and what is left) that ends completed or failed, and a cancel of the run ends the wait (`ToolEnv::with_unavailable_wait`).
   After the wait the tool's result is the transient error. The devcontainer's behaviour is unchanged: without the setting the first `Unavailable` is the
   result at once.
+* **Its time is usage.** The template's run container requests (`resources.requests.cpu` and `memory`) are the pod's shape, read at
+  startup (a request that is not a Kubernetes quantity is exit 78), and `EnvSession::sandbox_shape()` of the pod's session says it: the
+  coder weights each command's time by it in the task's `sandbox` usage (see *Tokens*).
 * **OpenCode** is the coder's own native binary, copied by the pod's init container to `/opt/adam/bin/opencode` (`EnvSession::tool_path`), and is checked
   once per run with `opencode --version` in the pod, like in a devcontainer. `EnvKind::Kubernetes` is what the `checks` artifact's `environment` says
   (`kind: "kubernetes"`, the image).
@@ -1879,7 +1901,7 @@ way; every problem is reported at once at startup):
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `RUN_ENVIRONMENT` | where a run's commands and OpenCode run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` ([a pod for each run](#a-pod-of-its-own-for-each-run)). With `kubernetes`, `DEVCONTAINER_RUNTIME=podman` is refused. Anything else: exit 78 | `local` |
-| `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod (YAML or JSON) every run pod is made from; an existing file, read and checked at startup (the chart's `runPods` ConfigMap) | required with `kubernetes` |
+| `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod (YAML or JSON) every run pod is made from; an existing file, read and checked at startup (the chart's `runPods` ConfigMap; the run container's CPU and memory requests must be Kubernetes quantities, they are the pod's shape in the `sandbox` usage) | required with `kubernetes` |
 | `RUN_POD_NAMESPACE` | with `kubernetes`: the namespace the run pods are made in | the ServiceAccount's namespace file; required when there is none |
 | `RUN_POD_INSTANCE` | with `kubernetes`: the release's `app.kubernetes.io/instance`, which finds this deployment's pods; a label value | required with `kubernetes` |
 | `RUN_POD_CONTAINER` | with `kubernetes`: the container of the template the commands run in | `run` |
@@ -2658,6 +2680,13 @@ database of its own, so the role needs `CREATEDB`):
   cycle) and in `src/tools/shell.rs` (`missing_tool` for dash and bash lines, `login_shell`).
   The tests use a name no image has for the missing tool (`nosuchbuild`): a CI image that carries `mvn` would
   otherwise run it.
+* `tests/environment.rs`, **sandbox time** (ADR 0043), against the same fake made a pod (`FakeSession::as_pod`): a command in a pod reports
+  the time it ran and the pod's shape and the checks and `run_command` add to one entry; a request the pod does not make is absent; a
+  command a **timeout** stopped, and one a **cancel** stopped (a call that ends in an error), still count until they were stopped;
+  OpenCode counts from its spawn to its end, a cancel included; the coder's own container and a dev container report where and no
+  time; a pod asked for and not used is a measured zero and an environment that could not be made reports nothing. `tests/e2e.rs`
+  (`the_time_of_the_coders_commands_in_a_run_pod_is_the_tasks_sandbox_usage`,
+  `the_coders_commands_in_its_own_container_are_reported_as_not_measured`): over A2A, the task read after it ended carries `sandbox`.
 * `tests/environment.rs`: the three tools that run a process go through a fake `Environment`
   (`FakeEnvironment` in `tests/common/mod.rs`): the command that runs is the one its session prepared (a variable the session
   adds is seen by a check and by the fake OpenCode), the spec has the slot's path and hides the right names and carries no

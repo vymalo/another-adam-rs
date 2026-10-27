@@ -5246,6 +5246,92 @@ async fn the_tokens_of_the_coder_and_its_explorer_reach_an_activated_client() {
     );
 }
 
+/// What the task of a run that ran two commands (`sleep 0.3` and `sleep 0.2`) in the environment `fake`
+/// carries under `usage/v1`, whoever reads it.
+async fn usage_of_two_commands(fx: &Fixture) -> serde_json::Value {
+    use adam_a2a::USAGE_EXTENSION;
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "w1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c1",
+        "run_command",
+        json!({"command": "sleep 0.3; echo first"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c2",
+        "run_command",
+        json!({"command": "sleep 0.2; echo second"}),
+    )])
+    .push_text("Both commands printed.");
+    let coder = coder_with(fx, &mock, Arc::new(MemoryStore::new()));
+    // A caller that did not activate the extension: the totals are data on the task all the same.
+    let caller = Caller::new("token-0");
+    let task = coder
+        .backend
+        .submit(
+            caller.clone(),
+            user(&format!(
+                "In {} (base branch main), run two commands.",
+                fx.remote_url()
+            )),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut stream = coder.backend.subscribe(&caller, &task.id);
+    let worker = spawn_worker(&coder);
+    while tokio::time::timeout(Duration::from_secs(60), stream.next())
+        .await
+        .expect("the stream ends")
+        .is_some()
+    {}
+    worker.stop().await;
+    let ended = coder.backend.get(&caller, &task.id).await.unwrap().unwrap();
+    assert_eq!(ended.status.state, TaskState::Completed, "{ended:?}");
+    ended.metadata.expect("the usage")[USAGE_EXTENSION].clone()
+}
+
+/// `usage/v1`'s `sandbox` end to end, offline (ADR 0043): the coder over a run pod (a fake environment
+/// that says it is one, of 250m and 512Mi) runs two commands, and the task, read after it ended,
+/// carries the time they ran beside its totals, weighted by the pod's shape, as one entry.
+#[tokio::test]
+async fn the_time_of_the_coders_commands_in_a_run_pod_is_the_tasks_sandbox_usage() {
+    let fx = Fixture::new("hello\n").await;
+    let fake = common::FakeEnvironment::new(Some(&fx.root));
+    fake.session.as_pod(Some(250), Some(512 * 1024 * 1024));
+    let fx = fx.using(fake.clone());
+
+    let usage = usage_of_two_commands(&fx).await;
+    assert!(usage["totals"].is_array(), "{usage}");
+    let sandbox = &usage["sandbox"];
+    assert_eq!(sandbox["environment"], "kubernetes", "{usage}");
+    let entries = sandbox["usage"].as_array().expect("measured: a usage");
+    assert_eq!(entries.len(), 1, "one shape: {usage}");
+    assert_eq!(entries[0]["cpuMillis"], 250);
+    assert_eq!(entries[0]["memoryBytes"], 536_870_912);
+    assert_eq!(entries[0]["commands"], 2);
+    let milliseconds = entries[0]["milliseconds"].as_u64().unwrap();
+    assert!(
+        (500..60_000).contains(&milliseconds),
+        "the wall time of the two commands: {usage}"
+    );
+}
+
+/// The same run in the coder's own container: the task says where the commands ran and no time. That
+/// is *not measured*, which a reader must not take for zero.
+#[tokio::test]
+async fn the_coders_commands_in_its_own_container_are_reported_as_not_measured() {
+    let fx = Fixture::new("hello\n").await;
+    let usage = usage_of_two_commands(&fx).await;
+    assert_eq!(usage["sandbox"], json!({"environment": "local"}), "{usage}");
+}
+
 /// Every case runs once per store: in memory always, and on PostgreSQL when
 /// `ADAM_TEST_POSTGRES_URL` is set (each case gets a private database).
 macro_rules! coder_suite {

@@ -31,8 +31,7 @@ use crate::redact::Redactor;
 use super::notes::CheckRecord;
 use super::preexisting::{self, OnBase};
 use super::shell::{
-    MissingTool, ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, run_in,
-    shell_spec,
+    MissingTool, ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, shell_spec,
 };
 use super::{Outcome, ToolEnv, non_empty, notes_error, run_error};
 
@@ -612,15 +611,16 @@ pub async fn run_checks(
     let shown = redactor.scrub(command).into_owned();
     ctx.emit_progress(format!("running checks: {shown}")).await;
     let environment = env.session(ctx).await?;
-    let mut outcome = run_in(
-        &*environment,
-        shell_spec(&dir, command),
-        env.settings.check_timeout,
-        env.settings.check_output_tail,
-        &ctx.cancel_token(),
-    )
-    .await
-    .map_err(|e| run_error(redactor, &e))?;
+    let mut outcome = env
+        .run(
+            ctx,
+            &*environment,
+            shell_spec(&dir, command),
+            env.settings.check_timeout,
+            env.settings.check_output_tail,
+        )
+        .await
+        .map_err(|e| run_error(redactor, &e))?;
 
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
 

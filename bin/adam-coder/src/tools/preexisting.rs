@@ -13,7 +13,7 @@ use crate::redact::Redactor;
 
 use super::checks::cut_tail;
 use super::notes::{BaseResult, RunNotes};
-use super::shell::{RunError, ShellOutcome, missing_tool, resolve_cwd, run_in, shell_spec};
+use super::shell::{RunError, ShellOutcome, missing_tool, resolve_cwd, shell_spec};
 use super::{ToolEnv, notes_error};
 
 /// Most bytes of the base's output kept in the notes and shown to the model.
@@ -106,12 +106,12 @@ pub(super) async fn on_base(
     };
     let ran = match resolve_cwd(checkout.path(), Some(cwd_key)) {
         Ok(dir) => Some(
-            run_in(
+            env.run(
+                ctx,
                 session,
                 shell_spec(&dir, command),
                 env.settings.check_timeout,
                 env.settings.check_output_tail,
-                &ctx.cancel_token(),
             )
             .await,
         ),
