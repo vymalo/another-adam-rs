@@ -371,8 +371,8 @@ impl GitPin {
 /// (`<mirror>/worktrees/<name>`): the way up to the mirror.
 const COMMONDIR: &str = "../..";
 
-/// The git sandbox of a deployment: where the commands that carry no credential run (see the
-/// [module](self) documentation). It is a handle on the socket of an `adam-git-sandbox` server
+/// The git sandbox of a deployment: where the commands that carry no credential run (the crate
+/// README's "Where `git` runs: the git sandbox" says how). It is a handle on the socket of an `adam-git-sandbox` server
 /// (`GIT_SANDBOX_SOCKET`), whose container mounts the same work volume at the same path.
 ///
 /// Made by [`Workspaces::with_git_sandbox`](crate::Workspaces::with_git_sandbox); cheap to clone. A
@@ -867,7 +867,7 @@ fn sandbox_failed(sub: &str, failure: SandboxFailure) -> WorkspaceError {
 }
 
 /// A `git` command that carries no credential, for the questions a caller asks of a repository
-/// (what the coder's tools do: `status`, `diff`, `apply`). It runs where [`GitCmd`] would run a
+/// (what the coder's tools do: `status`, `diff`, `apply`). It runs where the workspace's own git would run a
 /// command of its kind: in the git sandbox when there is one, else a child of this process, from
 /// the confined environment ([`confine_git_env`](crate::confine_git_env)) and with hooks and the
 /// file system monitor off. A sandbox that cannot be reached is an error; git is not run here
