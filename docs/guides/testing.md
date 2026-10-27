@@ -43,7 +43,7 @@ They are gated apart, so `ADAM_TEST_REQUIRE_DB=1` does not turn them on.
 |---|---|---|
 | devcontainer | `ADAM_TEST_DEVCONTAINER=1` (`ADAM_TEST_REQUIRE_DEVCONTAINER=1` to fail instead of skip) | a rootless Podman service |
 | Kubernetes run pods (`adam-env-kubernetes`) | `ADAM_TEST_KUBECONFIG` (`ADAM_TEST_REQUIRE_KUBERNETES=1`) | a cluster; CI's `run-pods` job makes a `kind` cluster with `deploy/coder/tests/kind-run-pods.sh`, which you can run with `kind` |
-| git under a run pod's mounts (ADR 0041) | `ADAM_TEST_REQUIRE_MOUNTS=1` to fail instead of skip | root, `unshare` and `setpriv`: `sudo sh deploy/coder/tests/git-in-run-pod.sh` builds the pod's view with bind mounts (the read-only `HEAD`, `commondir`, `gitdir` and `logs` of the worktree's directory included: it tries to write, rename over, replace and remove them) and runs real git in it |
+| git under a run pod's mounts (ADR 0041) | `ADAM_TEST_REQUIRE_MOUNTS=1` to fail instead of skip | root, `unshare` and `setpriv`: `sudo sh deploy/coder/tests/git-in-run-pod.sh` builds the pod's view with bind mounts (the read-only `HEAD`, `commondir`, `gitdir` and `logs` of the worktree's directory included: it tries to write, rename over, replace and remove them; and each slot as a mount of its own: it tries to rename, remove and exchange it and expects `EBUSY`) and runs real git in it |
 | `#[tool]` compile errors worded by rustc | `ADAM_TRYBUILD=1` | the CI toolchain (the `ui` job); the errors the macro writes itself always run ([`adam` README](../../crates/adam/README.md#tests)) |
 | live model, live OpenCode | `ADAM_TEST_OPENAI_*`, `ADAM_TEST_OPENCODE=1` | secrets |
 

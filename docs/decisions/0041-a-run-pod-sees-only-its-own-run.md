@@ -43,12 +43,14 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    | `<root>/git/<host>/<owner>/<repo>.git`, for each worktree slot | **read-only** | the objects, refs and configuration a worktree's `.git` file points into |
    | `<root>/git/<host>/<owner>/<repo>.git/worktrees/<name>`, for each worktree slot | read-write, mounted on top | the worktree's `HEAD` and `index`, which `git status` refreshes |
    | `.../worktrees/<name>/HEAD`, `commondir`, `gitdir` and `logs` | **read-only**, mounted on top of that | the branch the coder's `reset` moves (decision 11), what its `git` follows out of the directory (decision 7), what ties it to its slot, and the reflog it appends to |
+   | `<root>/workspaces/<run>/<slot>`, for each slot, worktree or scratch project (*added 2026-10-27, [#125](https://github.com/vymalo/another-adam-rs/issues/125)*) | read-write, mounted on top of the run's directory | so that the slot's directory is a name the pod cannot rename, move, remove or exchange (`EBUSY`): the coder's `git` finds its work tree by name |
 
    Nothing of `meta/`, of another run, or of another repository's mirror is in the pod. `<name>` is `<run>+<slot>` (decision 9)
    and **comes from the coder's metadata, never from the slot's `.git` file** (decision 6). A bind mount of a file or of a
    directory cannot be written, renamed over, replaced by a link or removed from the pod (*verified*, decision 10), though the
    directory around it is writable and its files belong to the very uid that tries. A
-   scratch slot is a repository inside the run's directory and needs nothing more. The legacy worktree of a run
+   scratch slot is a repository inside the run's directory and needs nothing more. *(Amended 2026-10-27: it needs a mount of its
+   own like every slot, last row of the table; it still needs no git directories.)* The legacy worktree of a run
    (`<root>/worktrees/<run>`) is outside the run's directory, where `prepare` already refuses a working directory, and
    gets no mount. A worktree whose directory in the mirror is not known (decision 6), or whose `HEAD`, `commondir`, `gitdir` or
    `logs` is not what git wrote (a link, a pipe, a missing file; a missing `logs` is made by the coder), gets no git mounts and a
@@ -78,6 +80,16 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
    it waits for a slot (ADR 0019 decision 6, up to `RUN_POD_WAIT_SECS`). A command prepared a moment before is killed
    with the pod and fails; the model can run it again. Only a worktree needs a mount of its own: a scratch project, or a
    directory added inside the run's directory, is already visible.
+   *Amended (2026-10-27, [#125](https://github.com/vymalo/another-adam-rs/issues/125), second change):* every slot, a
+   scratch project too, is a mount of its own (decision 1), so a slot added later, a scratch project started or taken over
+   by a later task, needs a pod made again, and a scratch slot has a generation like a worktree's: `dir_gen` in its metadata
+   (`Slot::generation`; new when the coder makes the directory, when a lost one is made again, and when another run's project is
+   taken over; absent from metadata written before it, and then the line of the slot is the one it always had). The file and git
+   tools do not call `ensure`, so the coder calls the new provided method `Environment::seal` right after it adds a slot
+   (`prepare_workspace`, `start_scratch`, `publish_scratch`, the take-over of a conversation's projects): the Kubernetes
+   environment deletes a pod that lacks the mount when no command runs in it (the next command makes the new one) and never
+   makes a pod; while a command runs it answers `Unavailable`, the slot stays, the tool's result says so, and the next `ensure` makes
+   the pod when the command ends.
 4. **The run's directory is made by the coder before its pod is.** A `subPath` that does not exist is made by the
    kubelet, as root.
 5. **The admission policy allows exactly one Secret reference**: one `secretKeyRef` of the coder's Secret, by name
@@ -250,6 +262,27 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   and `GitAt::command` now look at the directory against the descriptor first and last (a slot moved away and replaced by a directory
   of the same name is refused), which narrows the window and does not close it, and `apply_patch` still has `git apply` write by name.
   Closing it is the second change: every slot a mount point of the run's pod (`subPath`), which the run cannot rename. Not built.
+  *Amended (2026-10-27, [#125](https://github.com/vymalo/another-adam-rs/issues/125), the second of two changes):* in a run pod
+  **every slot, worktree and scratch project, is a `subPath` mount of its own** on top of the run's directory (decisions 1 and 3),
+  so the pod's commands, and the processes they left running, cannot rename, move, remove or exchange a slot's directory and
+  the name `git` finds its work tree by is safe (*verified* with `deploy/coder/tests/git-in-run-pod.sh`, real bind mounts: `mv`,
+  `rmdir` and an exchange of the slot fail with `EBUSY`, a sibling that is not a slot still renames, and git works; the same checks
+  in a real run pod are in the `run-pods` job, *unverified* until CI has run it). **Not covered:**
+  * **The window before the mount.** A pod made before a slot was added lacks its mount until `Environment::seal` (right after the
+    slot is added) or the next `ensure` makes the pod again, which needs that no command runs in it. While a command runs, the
+    directory can still be renamed; the tool that added the slot says so in its result. A pod of the run a scratch project was
+    **taken over from**, if the janitor has not released it yet, keeps its mount of the project's directory, which now lives in
+    another run's workspace, until it is released (at most one sweep, `WORKSPACE_SWEEP_SECS`, after that run ended; a conversation
+    is one person's).
+  * **Slot creation.** The run's directory is the run's to write until the slot is there; the move of a new worktree into place is
+    detected afterwards and undone, as before (decision 9).
+  * **`.adam-base/`** (the base checkouts), which is not a slot and not mounted.
+  * **The index and the other entries of a worktree's directory in the mirror that are not sealed** (the item above).
+  * **What `git` does below the slot** (the files it reads there by name, as the embedded-repository and scratch-project items say);
+    the coder's own file tools open those relative to the slot's descriptor (first change).
+  * **Local mode and Podman**, which have no mounts: the slot's directory is a name there, and the first change's tripwires are all
+    they have.
+  No admission rule requires a `subPath` on every mount of the work volume, and the chart is unchanged.
 * **A scratch project is a repository the run controls entirely.** Its `.git` is a directory in the run's directory, with its own
   `config` (a `filter.*.clean` or a `core.fsmonitor` there runs in the coder's `git add -A`, decision 7's open decision 6), its
   own `logs` (the link-append of decision 7 reaches any file through `.git/logs/HEAD`), and its own hooks (off). The pin requires
@@ -388,3 +421,7 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
   directory open and does its own file work relative to it (Known limits: *a swap between a check and the use*); decision 10's
   "the coder's file tools (`confine`) look at the root without following a link" is now "open it without following a link, and use the
   descriptor". The second change, the slot as a mount point of the pod, is not built.
+* **2026-10-27, [#125](https://github.com/vymalo/another-adam-rs/issues/125) (second of two changes).** Every slot is a `subPath`
+  mount of its own in the run pod, with the slot's generation in the annotation line (decisions 1 and 3), and the coder calls
+  `Environment::seal` right after it adds a slot so that a stale idle pod is deleted at once and the next command makes the new one
+  (Known limits: *a swap between a check and the use* lists what stays open).

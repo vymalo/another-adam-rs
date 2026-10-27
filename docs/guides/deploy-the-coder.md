@@ -172,7 +172,7 @@ run's checks, commands and OpenCode in **a pod of its own**, so a build is bound
 not the coder's (about 1Gi). Off by default, and then invisible. It renders the pod template (a ConfigMap), a
 `PriorityClass` and a `ResourceQuota` scoped to it, a ServiceAccount with a Role for `pods` and `pods/exec`, a
 `ValidatingAdmissionPolicy` that refuses any pod of that ServiceAccount but the intended one, and a
-`NetworkPolicy`. Needs Kubernetes 1.30+. A run pod mounts only its own run's directory, the mirror of each of its
+`NetworkPolicy`. Needs Kubernetes 1.30+. A run pod mounts only its own run's directory, each slot's directory on its own (so the pod cannot rename it), the mirror of each of its
 repositories **read-only** and each worktree's own directory in it, and no Secret but the model key
 ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), proposed): `git commit` and anything else that writes the
 mirror fails in the pod, the coder commits. The template must mount the work claim once, whole, at `WORKSPACE_ROOT` (the
