@@ -925,6 +925,71 @@ mod tests {
         );
     }
 
+    /// The `package.json` a repository can make into anything: the hint comes from a regular file
+    /// and from nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_json_that_is_a_link_is_no_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("deps.json");
+        std::fs::write(&target, r#"{"devDependencies": {"left-pad": "1"}}"#).unwrap();
+        let package = dir.path().join("package.json");
+        std::os::unix::fs::symlink(&target, &package).unwrap();
+        let here = [dir.path()];
+        assert_eq!(project_dependency_hint(&here, "left-pad"), None);
+        // Not even a well-known node tool: a link is not a project file at all.
+        assert_eq!(project_dependency_hint(&here, "jest"), None);
+        // The same content as the file itself gives the hint, so the link is what was refused.
+        std::fs::remove_file(&package).unwrap();
+        std::fs::copy(&target, &package).unwrap();
+        assert_eq!(
+            project_dependency_hint(&here, "left-pad").as_deref(),
+            Some("npm install")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_json_that_is_a_pipe_is_not_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(dir.path().join("package.json"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = dir.path().to_owned();
+        let (done, answer) = std::sync::mpsc::channel();
+        // A thread, so that a read that waits for a writer fails this test instead of hanging it.
+        std::thread::spawn(move || {
+            let hint = (
+                project_dependency_hint(&[path.as_path()], "left-pad"),
+                project_dependency_hint(&[path.as_path()], "jest"),
+            );
+            let _ = done.send(hint);
+        });
+        let hint = answer
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a pipe in place of package.json is not waited on");
+        assert_eq!(hint, (None, None));
+    }
+
+    #[test]
+    fn a_package_json_over_the_cap_is_not_read_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let padding = " ".repeat(4 * 1024 * 1024);
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(r#"{{"devDependencies": {{"left-pad": "1"}}}}{padding}"#),
+        )
+        .unwrap();
+        let here = [dir.path()];
+        assert_eq!(project_dependency_hint(&here, "left-pad"), None);
+        assert_eq!(project_dependency_hint(&here, "jest"), None);
+    }
+
     #[test]
     fn cwd_escapes_are_rejected() {
         let root = tempfile::tempdir().unwrap();
