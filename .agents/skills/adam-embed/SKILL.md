@@ -95,7 +95,8 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
   **root** run (`Emitter::emit_for`), not of the child's, under the root's step it ran under. A model client of your own says
   its `provider()` and `context_window(alias)` (both default to none), and a hand-written agent that wants the task's totals
   on its A2A task keeps `usage_totals` (`adam_runtime::UsageTotals`) in its state
-  (`docs/decisions/0032-usage-per-model-call.md`).
+  (`docs/decisions/0032-usage-per-model-call.md`), and one whose tools run commands in a sandbox it meters keeps
+  `sandbox_usage` (`adam_runtime::SandboxUsage`) beside it (`docs/decisions/0043-sandbox-time-as-usage.md`).
 
 ## See also
 

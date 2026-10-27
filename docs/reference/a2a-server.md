@@ -278,6 +278,13 @@ per provider and model, the subagents' calls included, **whoever reads it** (`Ge
 working task carries none. Counts are at most 2^53 - 1 and written as whole numbers (the SDK writes them as floats:
 `41250.0`); labels at most 128 bytes. OpenCode reports no tokens. Details: `adam-a2a-runtime`'s README, *Usage*.
 
+The same object has a `sandbox` member beside `totals` ([ADR 0043](../decisions/0043-sandbox-time-as-usage.md)) when a tool reported the
+time its commands ran in a run pod: `{"environment": "kubernetes", "usage": [{"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12,
+"milliseconds": 81234}]}`, one entry per pod shape (the template's requests), at most 8, written under the same rules as the totals (when the
+task ends or waits, cumulative, whoever reads it, `totals` always present, `[]` for a run that made no model call). `{"environment": "local"}`
+and `{"environment": "devcontainer"}` have no `usage`: the commands were not measured, which is not zero. A run that never asked for an
+environment has no `sandbox`.
+
 ## Streamed text
 
 A model turn streams by default (`LlmAgentBuilder::stream_text`): the journaled step `model:<turn>` calls

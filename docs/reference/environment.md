@@ -92,7 +92,7 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | Variable | Meaning | Default |
 |---|---|---|
 | `RUN_ENVIRONMENT` | `local` or `kubernetes` (a pod for each run; refused with `DEVCONTAINER_RUNTIME=podman`). With a GitHub App key file, `local` and `DEVCONTAINER_RUNTIME=off` need `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` (above) | `local` |
-| `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod every run pod is made from (the chart's ConfigMap) | required |
+| `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod every run pod is made from (the chart's ConfigMap). Its run container's `resources.requests` are also the shape a command's time is weighted by in the task's `sandbox` usage ([ADR 0043](../decisions/0043-sandbox-time-as-usage.md)); a request that is not a Kubernetes quantity stops the start | required |
 | `RUN_POD_NAMESPACE` | the namespace of run pods | the ServiceAccount's namespace |
 | `RUN_POD_INSTANCE` | the release's `app.kubernetes.io/instance`, which finds this deployment's pods | required |
 | `RUN_POD_CONTAINER` | the template container commands run in | `run` |
