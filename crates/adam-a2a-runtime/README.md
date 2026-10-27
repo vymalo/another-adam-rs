@@ -328,6 +328,21 @@ a working task, and a task whose agent keeps none, carries none. Nothing is stor
 stream's last status update carries no totals: a client reads them from the task. The SDK writes a number of metadata as a
 float on both bindings, a whole one (`41250.0`). Unit tests in `src/usage.rs`; `tests/usage.rs`.
 
+**`sandbox`, beside `totals`** ([ADR 0043](../../docs/decisions/0043-sandbox-time-as-usage.md)): the time the run's commands ran in a
+sandbox, read from the `sandbox_usage` the agent keeps in its state (`adam_runtime::SandboxUsage`), written under the same rules as the
+totals (when the task ends or waits, cumulative, for every reader):
+
+```json
+{"totals": [], "sandbox": {"environment": "kubernetes", "usage": [
+  {"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12, "milliseconds": 81234}]}}
+```
+
+One entry per shape (at most 8), whole numbers of at most `MAX_TOKEN_COUNT`; a request the pod does not make is left out of the entry.
+`"environment": "local"` and `"devcontainer"` have **no `usage`**: the commands were not measured, which is not zero; `"usage": []` is a
+pod that was asked for and ran no command. The object is written when there are token totals **or** a sandbox report, and `totals` is
+always in it (`[]` for a run that made no model call), because the orchestrator rejects an object without it. A task whose agent keeps
+neither carries no metadata, and a task with tokens only carries the object it always did, byte for byte.
+
 ## The access tier
 
 `access-tier/v1` (the contract of `docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`, ADR 0036 of this repository). With
@@ -438,7 +453,7 @@ answer as the tool result the model reads), and `tests/steer.rs` (a real `Runtim
 on a `working` status with no message and the turn ends as before; one that did not reads none and the task still has its
 totals; a subagent's calls carry its step and are in the totals; a resubscribe hears a report again under the same id; a task
 that waits carries its totals, carries none once resumed and covers every call when it ends, in `GetTask` and `ListTasks`; a
-failed and a canceled task carry theirs; and over HTTP, JSON-RPC and REST, with and without the header: the reports reach only
+failed and a canceled task carry theirs; **the time of a tool's commands is the task's `sandbox` beside its totals, cumulative for a task that waits, and an environment that is not measured is named with no usage**; and over HTTP, JSON-RPC and REST, with and without the header: the reports reach only
 the client that named the extension, in whole numbers, and `GetTask` says the totals on both bindings), and `tests/steps.rs` (a real `Runtime` and an agent that reports a tool call, a command under it that waits and fails, and the end: an activated client reads each step as a report in the metadata beside its line, with the same state held back within a second and a change of state not, one that did not reads every step as a line and nothing else, and another extension activates nothing) with the unit tests of `src/convert.rs` (the state table, a claimed run is `working` before its first commit and a lapsed claim is not, a claim changes no other state and changes the status key), `src/steps.rs` (the metadata, the message, the line of each state) and of the throttle in `src/subscribe.rs` (once a second a state, every change, the end, a retry starting afresh, the bound on what is remembered).
 
 | Variable | Meaning |

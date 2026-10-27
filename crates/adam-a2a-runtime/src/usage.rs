@@ -21,6 +21,20 @@
 //!    "totalTokens": 521100, "reasoningTokens": 2400, "cachedInputTokens": 470000}]}}
 //! ```
 //!
+//! The same object carries a `sandbox` member beside `totals` when the run's tools reported the time
+//! their commands ran in a sandbox (`state.sandbox_usage`, [`SandboxUsage`]; ADR 0043), or only the
+//! environment they ran in when that is not measured:
+//!
+//! ```json
+//! {"https://agents.vymalo.com/a2a/extensions/usage/v1": {"totals": [],
+//!   "sandbox": {"environment": "kubernetes", "usage": [
+//!     {"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12, "milliseconds": 81234}]}}}
+//! ```
+//!
+//! `{"environment": "local"}` and `{"environment": "devcontainer"}` have no `usage`: *not measured*,
+//! which is not zero. `"usage": []` is a pod that was asked for and ran no command: a measured zero.
+//! `totals` is always there when the object is, `[]` for a run that made no model call.
+//!
 //! The counts are AG-UI 1.0's `TokenUsage` (parts never additions), each at most 2^53 - 1, and the
 //! labels at most 128 bytes (the contract is the orchestration layer's, `docs/api/usage-v1.md` of
 //! `vymalo/another-agentic-system`).
@@ -30,10 +44,10 @@ use std::collections::HashMap;
 use a2a::{TaskState, TaskStatus, TaskStatusUpdateEvent};
 use adam_a2a::{TaskEvent, USAGE_EXTENSION};
 use adam_runtime::{
-    MAX_USAGE_CALL_BYTES, MAX_USAGE_LABEL_BYTES, MAX_USAGE_TOTALS, RunView, Usage, UsageEvent,
-    UsageTotals,
+    MAX_SANDBOX_ENTRIES, MAX_USAGE_CALL_BYTES, MAX_USAGE_LABEL_BYTES, MAX_USAGE_TOTALS, RunView,
+    SandboxUsage, Usage, UsageEvent, UsageTotals,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 /// The largest count a report carries: 2^53 - 1, the largest integer a JSON number keeps exactly.
 pub const MAX_TOKEN_COUNT: u64 = 9_007_199_254_740_991;
@@ -75,12 +89,21 @@ pub(crate) fn report(call: &UsageEvent) -> Value {
 }
 
 /// The task's `metadata` for the totals its agent keeps (`state.usage_totals`, the shape of
-/// [`UsageTotals`]), at most 32 entries; `None` when the state keeps none (an agent that counts
-/// nothing, a task that made no model call).
+/// [`UsageTotals`]), at most 32 entries, and for the sandbox usage it keeps (`state.sandbox_usage`),
+/// as `sandbox`; `None` when the state keeps neither (an agent that counts nothing, a task that made
+/// no model call and asked for no environment). `totals` is written whenever the object is.
 pub(crate) fn totals_metadata(view: &RunView) -> Option<HashMap<String, Value>> {
-    let totals: UsageTotals =
-        serde_json::from_value(view.state.get("usage_totals")?.clone()).ok()?;
-    if totals.is_empty() {
+    let totals: UsageTotals = view
+        .state
+        .get("usage_totals")
+        .and_then(|totals| serde_json::from_value(totals.clone()).ok())
+        .unwrap_or_default();
+    let sandbox = view
+        .state
+        .get("sandbox_usage")
+        .and_then(|usage| serde_json::from_value::<SandboxUsage>(usage.clone()).ok())
+        .and_then(|usage| sandbox_report(&usage));
+    if totals.is_empty() && sandbox.is_none() {
         return None;
     }
     let entries: Vec<Value> = totals
@@ -98,10 +121,52 @@ pub(crate) fn totals_metadata(view: &RunView) -> Option<HashMap<String, Value>> 
             Value::Object(members)
         })
         .collect();
+    let mut members = Map::new();
+    members.insert("totals".into(), entries.into());
+    if let Some(sandbox) = sandbox {
+        members.insert("sandbox".into(), sandbox);
+    }
     Some(HashMap::from([(
         USAGE_EXTENSION.to_owned(),
-        json!({ "totals": entries }),
+        Value::Object(members),
     )]))
+}
+
+/// The `sandbox` member: the environment the run's commands ran in and, when that environment
+/// measures them, one entry per shape (at most 8) with the shape's requests (a request the template
+/// does not make is left out), the commands and their milliseconds. `None` while no environment was
+/// asked for.
+fn sandbox_report(usage: &SandboxUsage) -> Option<Value> {
+    let environment = usage.environment()?;
+    let mut report = Map::new();
+    report.insert("environment".into(), environment.as_str().into());
+    if environment.is_measured() {
+        let entries: Vec<Value> = usage
+            .entries()
+            .iter()
+            .take(MAX_SANDBOX_ENTRIES)
+            .map(|entry| {
+                let mut members = Map::new();
+                if let Some(cpu) = entry.cpu_millis {
+                    members.insert("cpuMillis".into(), cpu.min(MAX_TOKEN_COUNT).into());
+                }
+                if let Some(memory) = entry.memory_bytes {
+                    members.insert("memoryBytes".into(), memory.min(MAX_TOKEN_COUNT).into());
+                }
+                members.insert(
+                    "commands".into(),
+                    entry.commands.min(MAX_TOKEN_COUNT).into(),
+                );
+                members.insert(
+                    "milliseconds".into(),
+                    entry.milliseconds.min(MAX_TOKEN_COUNT).into(),
+                );
+                Value::Object(members)
+            })
+            .collect();
+        report.insert("usage".into(), entries.into());
+    }
+    Some(Value::Object(report))
 }
 
 /// The members of AG-UI's `TokenUsage` into `members`: the labels cut to 128 bytes and the counts
@@ -150,6 +215,8 @@ fn cut(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -229,5 +296,157 @@ mod tests {
         );
         assert_eq!(members["provider"].as_str().unwrap().len(), 128);
         assert_eq!(members["model"].as_str().unwrap().len(), 128);
+    }
+
+    fn view_with(state: Value) -> RunView {
+        let now = chrono::Utc::now();
+        RunView {
+            id: adam_core::RunId::new(),
+            agent: "a".into(),
+            conversation_id: None,
+            status: adam_core::RunStatus::Done,
+            wake_at: None,
+            waiting: false,
+            claimed: false,
+            output: None,
+            error: None,
+            attempt: 0,
+            pending_inbox: 0,
+            artifacts: Vec::new(),
+            state,
+            version: 2,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn written(state: Value) -> Option<Value> {
+        totals_metadata(&view_with(state)).map(|mut m| m.remove(USAGE_EXTENSION).unwrap())
+    }
+
+    const TOKENS: fn() -> Value = || {
+        json!([{"provider": "openai", "model": "m",
+                "usage": {"input_tokens": 10, "output_tokens": 1}}])
+    };
+
+    #[test]
+    fn tokens_only_is_the_object_it_always_was() {
+        // `json!({"totals": entries})`, which is what this wrote before the sandbox member existed.
+        let object = written(json!({"usage_totals": TOKENS()})).unwrap();
+        assert_eq!(
+            object,
+            json!({"totals": [{"provider": "openai", "model": "m", "inputTokens": 10,
+                               "outputTokens": 1, "totalTokens": 11}]})
+        );
+        assert_eq!(
+            object.as_object().unwrap().len(),
+            1,
+            "no other member: {object}"
+        );
+    }
+
+    #[test]
+    fn a_run_that_kept_neither_writes_nothing() {
+        assert_eq!(written(json!({})), None);
+        assert_eq!(written(json!({"usage_totals": []})), None);
+        assert_eq!(
+            written(json!({"usage_totals": [], "sandbox_usage": {}})),
+            None
+        );
+    }
+
+    #[test]
+    fn sandbox_only_is_written_with_totals_empty() {
+        let object = written(json!({
+            "sandbox_usage": {"environment": "kubernetes", "usage": [
+                {"cpu_millis": 250, "memory_bytes": 536_870_912, "commands": 12, "milliseconds": 81_234}]}
+        }))
+        .unwrap();
+        assert_eq!(
+            object,
+            json!({"totals": [],
+                   "sandbox": {"environment": "kubernetes", "usage": [
+                       {"cpuMillis": 250, "memoryBytes": 536_870_912,
+                        "commands": 12, "milliseconds": 81_234}]}})
+        );
+    }
+
+    #[test]
+    fn tokens_and_sandbox_are_two_members_of_one_object() {
+        let object = written(json!({
+            "usage_totals": TOKENS(),
+            "sandbox_usage": {"environment": "kubernetes", "usage": [
+                {"cpu_millis": 250, "commands": 1, "milliseconds": 5}]}
+        }))
+        .unwrap();
+        assert_eq!(object["totals"][0]["totalTokens"], json!(11));
+        assert_eq!(
+            object["sandbox"]["usage"],
+            json!([{"cpuMillis": 250, "commands": 1, "milliseconds": 5}]),
+            "a request the template does not make is absent, not zero"
+        );
+    }
+
+    #[test]
+    fn an_environment_that_is_not_measured_says_where_and_no_usage() {
+        for environment in ["local", "devcontainer"] {
+            let object = written(json!({"sandbox_usage": {"environment": environment}})).unwrap();
+            assert_eq!(
+                object,
+                json!({"totals": [], "sandbox": {"environment": environment}}),
+                "not measured is not zero: there is no `usage`"
+            );
+        }
+        // Whatever the state holds, an environment that is not measured has no entries.
+        let object = written(json!({
+            "sandbox_usage": {"environment": "local", "usage": [
+                {"commands": 1, "milliseconds": 5}]}
+        }))
+        .unwrap();
+        assert!(object["sandbox"].get("usage").is_none(), "{object}");
+    }
+
+    #[test]
+    fn a_pod_asked_for_and_never_used_is_a_measured_zero() {
+        let object = written(json!({"sandbox_usage": {"environment": "kubernetes"}})).unwrap();
+        assert_eq!(
+            object,
+            json!({"totals": [], "sandbox": {"environment": "kubernetes", "usage": []}})
+        );
+    }
+
+    #[test]
+    fn at_most_eight_entries_and_counts_within_2_to_the_53() {
+        let entries: Vec<Value> = (0..12)
+            .map(|n| json!({"cpu_millis": n, "commands": 1, "milliseconds": 1}))
+            .collect();
+        let object = written(json!({
+            "sandbox_usage": {"environment": "kubernetes", "usage": entries}
+        }))
+        .unwrap();
+        assert_eq!(object["sandbox"]["usage"].as_array().unwrap().len(), 8);
+
+        let object = written(json!({
+            "sandbox_usage": {"environment": "kubernetes", "usage": [
+                {"cpu_millis": u64::MAX, "memory_bytes": u64::MAX,
+                 "commands": u64::MAX, "milliseconds": u64::MAX}]}
+        }))
+        .unwrap();
+        for key in ["cpuMillis", "memoryBytes", "commands", "milliseconds"] {
+            assert_eq!(
+                object["sandbox"]["usage"][0][key].as_u64(),
+                Some(MAX_TOKEN_COUNT),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sandbox_member_that_cannot_be_read_does_not_spoil_the_tokens() {
+        let object =
+            written(json!({"usage_totals": TOKENS(), "sandbox_usage": {"environment": 7}}))
+                .unwrap();
+        assert_eq!(object["totals"].as_array().unwrap().len(), 1);
+        assert!(object.get("sandbox").is_none());
     }
 }

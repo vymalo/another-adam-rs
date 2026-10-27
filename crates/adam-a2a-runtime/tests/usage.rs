@@ -18,7 +18,7 @@ use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::MemoryStore;
 use adam_llm_agent::{LlmAgent, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::{DynModel, MockModel, ModelError, ModelResponse, ToolCall, ToolSpec, Usage};
-use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder};
+use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder, SandboxEnvironment, SandboxUsage};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -68,6 +68,38 @@ impl Tool for Noop {
         spec("noop")
     }
     async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+/// Runs a command for `ms` milliseconds in a sandbox of 250m and 512Mi, and says so.
+struct Sandboxed(u64);
+
+#[async_trait]
+impl Tool for Sandboxed {
+    fn spec(&self) -> ToolSpec {
+        spec("sandboxed")
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        ctx.report_sandbox(&SandboxUsage::ran_command(
+            Some(250),
+            Some(512 * 1024 * 1024),
+            self.0,
+        ));
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+/// Runs a command in the coder's own container, which measures nothing, and says where.
+struct Unmetered(SandboxEnvironment);
+
+#[async_trait]
+impl Tool for Unmetered {
+    fn spec(&self) -> ToolSpec {
+        spec("unmetered")
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        ctx.report_sandbox(&SandboxUsage::in_environment(self.0));
         Ok(ToolOutput::text("ok"))
     }
 }
@@ -244,6 +276,15 @@ fn totals(task: &Task) -> Option<Value> {
         .as_ref()
         .and_then(|m| m.get(USAGE_EXTENSION))
         .map(|u| u["totals"].clone())
+}
+
+/// The `sandbox` member of a task's `usage/v1` object.
+fn sandbox(task: &Task) -> Option<Value> {
+    task.metadata
+        .as_ref()
+        .and_then(|m| m.get(USAGE_EXTENSION))
+        .and_then(|u| u.get("sandbox"))
+        .cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +560,113 @@ async fn a_failed_or_canceled_task_carries_its_totals() {
         totals(&canceled),
         Some(json!([{"provider": "openai", "model": "m",
                       "inputTokens": 3, "outputTokens": 4, "totalTokens": 7}]))
+    );
+    worker.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox time (ADR 0043)
+// ---------------------------------------------------------------------------
+
+/// The time a tool's commands ran in a run pod is the task's `sandbox` member, beside the totals, for
+/// every reader and whether or not the client activated the extension; a run whose tools ran no
+/// command reports no `sandbox` at all.
+#[tokio::test]
+async fn the_time_of_a_runs_commands_is_the_tasks_sandbox_beside_its_totals() {
+    let model = model();
+    model
+        .push_response(calls_with(vec![call("c1", "sandboxed")], Usage::new(10, 1)))
+        .push_response(calls_with(vec![call("c2", "sandboxed")], Usage::new(20, 2)))
+        .push_response(text_with("done", Usage::new(30, 3)));
+    let rig = agent_rig(model, vec![Arc::new(Sandboxed(1_500))]);
+    let (id, _events) = read(&rig, plain(), "go").await;
+    let task = rig.backend.get(&plain(), &id).await.unwrap().unwrap();
+    assert_eq!(task.status.state, TaskState::Completed);
+    assert_eq!(
+        sandbox(&task),
+        Some(json!({"environment": "kubernetes", "usage": [
+            {"cpuMillis": 250, "memoryBytes": 536_870_912, "commands": 2, "milliseconds": 3_000}]}))
+    );
+    assert_eq!(
+        totals(&task),
+        Some(json!([{"provider": "openai", "model": "m",
+                      "inputTokens": 60, "outputTokens": 6, "totalTokens": 66}])),
+        "the tokens are what they were"
+    );
+
+    let nothing = agent_rig(model_text(), vec![]);
+    let (id, _events) = read(&nothing, plain(), "hi").await;
+    let task = nothing.backend.get(&plain(), &id).await.unwrap().unwrap();
+    assert_eq!(sandbox(&task), None, "no command, no environment asked for");
+}
+
+fn model_text() -> Arc<MockModel> {
+    let model = model();
+    model.push_response(text_with("hello", Usage::new(1, 1)));
+    model
+}
+
+/// Where the commands ran when that is not measured: the environment and nothing else.
+#[tokio::test]
+async fn an_environment_that_is_not_measured_is_named_and_has_no_usage() {
+    for environment in [SandboxEnvironment::Local, SandboxEnvironment::Devcontainer] {
+        let model = model();
+        model
+            .push_response(calls_with(vec![call("c1", "unmetered")], Usage::new(1, 1)))
+            .push_response(text_with("done", Usage::new(1, 1)));
+        let rig = agent_rig(model, vec![Arc::new(Unmetered(environment))]);
+        let (id, _events) = read(&rig, plain(), "go").await;
+        let task = rig.backend.get(&plain(), &id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox(&task),
+            Some(json!({"environment": environment.as_str()})),
+            "not measured is not zero"
+        );
+    }
+}
+
+/// A task that waits carries what its commands ran so far, and once answered the whole run's.
+#[tokio::test]
+async fn a_task_that_waits_carries_its_sandbox_so_far() {
+    let model = model();
+    model
+        .push_response(calls_with(vec![call("c1", "sandboxed")], Usage::new(10, 1)))
+        .push_response(calls_with(vec![call("c2", "ask")], Usage::new(10, 1)))
+        .push_response(calls_with(vec![call("c3", "sandboxed")], Usage::new(10, 1)))
+        .push_response(text_with("thanks", Usage::new(10, 1)));
+    let rig = agent_rig(model, vec![Arc::new(Sandboxed(400)), Arc::new(Ask)]);
+    let caller = plain();
+    let task = rig
+        .backend
+        .submit(caller.clone(), user("go"), None, None)
+        .await
+        .unwrap();
+    let worker = rig.worker();
+    let waiting = rig
+        .task_in(&caller, &task.id, TaskState::InputRequired)
+        .await;
+    assert_eq!(
+        sandbox(&waiting),
+        Some(json!({"environment": "kubernetes", "usage": [
+            {"cpuMillis": 250, "memoryBytes": 536_870_912, "commands": 1, "milliseconds": 400}]}))
+    );
+    let mut answer = user("the first");
+    answer.task_id = Some(task.id.clone());
+    rig.backend
+        .submit(
+            caller.clone(),
+            answer,
+            Some(task.id.clone()),
+            Some(task.context_id.clone()),
+        )
+        .await
+        .unwrap();
+    let done = rig.task_in(&caller, &task.id, TaskState::Completed).await;
+    assert_eq!(
+        sandbox(&done),
+        Some(json!({"environment": "kubernetes", "usage": [
+            {"cpuMillis": 250, "memoryBytes": 536_870_912, "commands": 2, "milliseconds": 800}]})),
+        "cumulative for the run so far"
     );
     worker.stop().await;
 }
