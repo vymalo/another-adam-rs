@@ -63,6 +63,11 @@ flowchart LR
             ConfigError
             StoppedUnexpectedly
         end
+        subgraph egress_e["adam-egress"]
+            EgressError
+            Refusal
+            EgressNames["ConfigError, NameError, AllowError, CidrError"]
+        end
     end
 
     subgraph classes["adam_error::ErrorClass"]
@@ -141,6 +146,12 @@ flowchart LR
 
     ConfigError --> Invalid
     StoppedUnexpectedly --> Internal
+
+    EgressError -->|Config| Invalid
+    EgressError -->|Bind| Transient
+    EgressNames --> Invalid
+    Refusal -->|"Malformed, HeadTooLarge, PlainHttp, IpLiteral, PortNotAllowed, HostNotAllowed, NoPublicAddress"| Invalid
+    Refusal -->|"HeadTimeout, ResolutionFailed, ResolutionTimeout, ConnectFailed, ConnectTimeout, AtCapacity"| Transient
 ```
 
 ## What each class decides
@@ -238,6 +249,11 @@ the coder's own errors in `bin/adam-coder/src/exit.rs`):
 
 The failure is one structured JSON log line (`adam-coder failed`, `adam-agent failed`) with the whole
 cause chain and none of the process's secrets.
+
+`adam-egress` (the egress proxy, [its README](../../bin/adam-egress/README.md)) ends with 0 after SIGTERM, 78 for its
+configuration and 71 when it cannot bind `EGRESS_LISTEN` (`bin/adam-egress/src/error.rs`); it logs `adam-egress failed`
+in the same way. What it refuses per request is an HTTP status, not an exit: the `Refusal` enum maps each reason to
+its status and class.
 
 ## Rules for an error enum
 
