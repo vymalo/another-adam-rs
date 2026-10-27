@@ -9,10 +9,12 @@
 //!
 //! # What is shared
 //!
-//! * The path is confined exactly as `read_file`'s is ([`confine`] with [`Access::Read`]): relative
-//!   to the root of the slot, no `..`, nothing inside `.git`, and a symlink is followed only while it
-//!   stays inside the worktree. The files are the workspace's, so what a command produced inside the
-//!   repository's devcontainer is there like any other file.
+//! * The path is confined exactly as `read_file`'s is (`open_for_read` of `files`): relative to the root of
+//!   the slot, no `..`, nothing inside `.git`, and a symlink is followed only while it stays inside
+//!   the worktree; the file is opened relative to the slot's directory as the coder opened it, so a
+//!   slot or a directory swapped for a link while the tool works is not followed. The files are the
+//!   workspace's, so what a command produced inside the repository's devcontainer is there like
+//!   any other file.
 //! * It must be a regular file of at most [`MAX_ARTIFACT_FILE_BYTES`] (4 MiB). A bigger one is a
 //!   result for the model, who can shrink it or say so. A run may also share only so many bytes in
 //!   all (`MAX_RUN_FILE_BYTES`): the agent loop enforces that.
@@ -41,14 +43,15 @@
 //! A repeat reads the file again and returns the same artifact (the artifact's id follows its
 //! bytes), which a subscriber sees once.
 
-use std::fs;
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::Arc;
 
 use adam::prelude::*;
 use adam_runtime::{Artifact, MAX_ARTIFACT_FILE_BYTES, checked_media_type};
+use adam_workspace::SlotDir;
 
-use super::files::{Access, confine};
+use super::files::open_for_read;
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// Longest name of a shared file's artifact, in characters.
@@ -93,7 +96,7 @@ pub async fn share_file(
     ctx.emit_progress(format!("sharing {path} ({})", slot.dir()))
         .await;
     let (root, rel, name) = (
-        slot.path().to_path_buf(),
+        Arc::clone(slot.root()),
         path.to_owned(),
         name.as_deref().and_then(non_empty).map(str::to_owned),
     );
@@ -151,11 +154,9 @@ fn with_picture_hint(artifact: &Artifact) -> String {
 }
 
 /// Read `rel` under `root` for sharing, or the reason the model is told.
-fn share_in(root: &Path, rel: &str, name: Option<&str>) -> Result<Shared, String> {
+fn share_in(root: &SlotDir, rel: &str, name: Option<&str>) -> Result<Shared, String> {
     let shown = rel.trim();
-    let path = confine(root, rel, Access::Read)?;
-    adam_workspace::safe_fs::race::checkpoint(root, "read");
-    let meta = fs::metadata(&path).map_err(|e| format!("cannot read `{shown}`: {e}"))?;
+    let (file, meta) = open_for_read(root, rel)?;
     if meta.is_dir() {
         return Err(format!(
             "`{shown}` is a directory: share one file (make an archive of it first, with a \
@@ -165,16 +166,13 @@ fn share_in(root: &Path, rel: &str, name: Option<&str>) -> Result<Shared, String
     if !meta.is_file() {
         return Err(format!("`{shown}` is not a regular file"));
     }
-    if meta.len() > MAX_ARTIFACT_FILE_BYTES as u64 {
-        return Err(too_large(shown, meta.len()));
+    if meta.size() > MAX_ARTIFACT_FILE_BYTES as u64 {
+        return Err(too_large(shown, meta.size()));
     }
-    // Read one byte more than the cap: a file that grew after `metadata` is refused, not cut.
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-    fs::File::open(&path)
-        .and_then(|file| {
-            file.take(MAX_ARTIFACT_FILE_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-        })
+    // Read one byte more than the cap: a file that grew after `fstat` is refused, not cut.
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.size()).unwrap_or(0));
+    file.take(MAX_ARTIFACT_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
     if bytes.len() > MAX_ARTIFACT_FILE_BYTES {
         return Err(too_large(shown, bytes.len() as u64));
@@ -252,7 +250,16 @@ fn by_extension(ext: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+
+    /// [`super::share_in`] for the slot at `root`, opened here: the check and the hold of the tool.
+    fn share_in(root: &Path, rel: &str, name: Option<&str>) -> Result<Shared, String> {
+        let root = SlotDir::open(root)
+            .map_err(|e| format!("the worktree's directory is not a plain directory: {e}"))?;
+        super::share_in(&root, rel, name)
+    }
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
     const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>";

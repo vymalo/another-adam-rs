@@ -16,8 +16,39 @@
 //! A link is refused in the **last component** of the path only: every component above it is a
 //! directory the coder made (the mirror, the run's directory) or the mount point of the run's pod,
 //! which the run cannot replace.
+//!
+//! # A slot's directory is held, not named
+//!
+//! The directories **below** that point are another matter: a slot's directory, and every directory
+//! in it, is the run's to rename at any moment, and a link put at a name the coder checked a moment
+//! ago leads the coder's next `open` of that name anywhere on the volume. For the slot the coder
+//! therefore opens the directory once, without following a link, and holds it ([`SlotDir`], kept by
+//! [`Slot`](crate::Slot), [`Worktree`](crate::Worktree) and [`Scratch`](crate::Scratch)); everything
+//! it does in the slot afterwards is relative to that descriptor: nothing in the slot is opened,
+//! made, written or removed by its path from the root. `SlotDir::open` is the check and the hold in
+//! one step, and a directory that is moved or replaced meanwhile is still the one the coder opened
+//! ([`SlotDir::is_still_here`] says whether its name still leads to it).
+//!
+//! * a path below the slot is opened with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`: a link
+//!   anywhere on the way is refused) where the kernel has it (Linux 5.6 or later), and by a walk of
+//!   one component at a time with `O_NOFOLLOW` where it does not ([`Backend`]);
+//! * a path that may go through a link that stays inside the slot (what `read_file` follows) is
+//!   resolved first, over held directories ([`SlotDir::resolve_inside`]), and opened by the path
+//!   that resolution found, which has no link in it ([`SlotDir::open_following`]);
+//! * a file is written by making a new one in the directory's own descriptor (`O_EXCL`) and renaming
+//!   it over the target; directories are made one at a time ([`SlotDir::walk`]).
+//!
+//! `git` cannot be given a descriptor: it finds its work tree by name inside its own process. What is
+//! done for it is a tripwire ([`SlotDir::is_still_here`], in [`GitPin::check`](crate::GitPin::check)),
+//! and what closes the window is a slot that cannot be renamed in the run's pod.
+//!
+//! [`race`] is the seam by which the tests of this are made to swap a directory between a check and
+//! the use that follows it.
 
 pub mod race;
+mod slot_dir;
+
+pub use slot_dir::{Backend, BeneathError, Dir, Meta, SlotDir, WalkError};
 
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read as _};

@@ -3777,6 +3777,32 @@ async fn copy_into_does_not_read_a_source_slot_swapped_after_the_plan() {
 }
 
 #[tokio::test]
+async fn a_file_behind_a_link_in_the_project_is_not_one_of_its_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scratch, _wt) = scratch_and_worktree(tmp.path()).await;
+    put(scratch.path(), "docs/notes.md", "notes\n");
+    put(scratch.path(), "fib.sh", "echo 1\n");
+    scratch.commit_all("notes", &me()).await.unwrap();
+    assert_eq!(
+        paths(&scratch.files().await.unwrap()),
+        ["docs/notes.md", "fib.sh"]
+    );
+
+    // A command replaces `docs` by a link to a directory that holds a file of the same name: git
+    // still lists the path from its index, and the file is not the project's.
+    let other = tmp.path().join("another-runs-project");
+    put(&other, "notes.md", "theirs\n");
+    std::fs::remove_dir_all(scratch.path().join("docs")).unwrap();
+    std::os::unix::fs::symlink(&other, scratch.path().join("docs")).unwrap();
+    let files = paths(&scratch.files().await.unwrap());
+    assert!(
+        !files.iter().any(|f| f == "docs/notes.md"),
+        "behind a link: {files:?}"
+    );
+    assert!(files.iter().any(|f| f == "fib.sh"), "{files:?}");
+}
+
+#[tokio::test]
 async fn git_is_not_run_on_a_slot_replaced_by_a_directory_after_the_coder_opened_it() {
     let env = Env::new();
     let slot = env
@@ -3834,6 +3860,13 @@ async fn git_is_not_started_on_a_slot_replaced_between_the_check_and_the_start()
         git(&env.mirror(), &["rev-parse", &branch]),
         tip,
         "the run's branch did not move"
+    );
+    // And the first `git` was not started either: `git add -A` on the empty directory would have
+    // staged the deletion of every file in the worktree's index.
+    assert_eq!(
+        git(&away_of(&path), &["diff", "--cached", "--name-only"]),
+        "",
+        "nothing was staged"
     );
 }
 

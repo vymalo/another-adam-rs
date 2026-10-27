@@ -13,7 +13,8 @@ default = ["github"]
 # The GitHub REST `CodeHost` and the GitHub App credentials (pull in `reqwest`, and `aws-lc-rs` and
 # `rustls-pki-types` to sign the App's JWT).
 github = ["dep:reqwest", "dep:aws-lc-rs", "dep:chrono", "dep:rustls-pki-types"]
-# Test doubles (`MemoryCodeHost`) for downstream crates' tests.
+# Test doubles (`MemoryCodeHost`) for downstream crates' tests, and the seam that swaps a slot's
+# directory between a check and the use that follows it (`safe_fs::race`).
 test-util = []
 
 [dependencies]
@@ -24,6 +25,9 @@ base64.workspace = true
 chrono = { workspace = true, optional = true }
 libc.workspace = true
 reqwest = { workspace = true, optional = true }
+# `openat2` and the `*at` calls, as safe functions: a slot is opened once and used by descriptor
+# (`safe_fs::SlotDir`). Already in the tree through `tempfile`.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 rustls-pki-types = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true

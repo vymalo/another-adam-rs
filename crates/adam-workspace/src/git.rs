@@ -26,6 +26,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -34,7 +35,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::process::Command;
 
 use crate::error::{WorkspaceError, WorkspaceResult};
-use crate::safe_fs;
+use crate::safe_fs::{self, SlotDir};
 
 /// Commands that talk to a remote may take long (first clone of a big repo).
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -147,27 +148,37 @@ pub struct GitPin {
     work_tree: PathBuf,
     /// The git directory is inside the work tree, so it has to be checked to be a directory there.
     inside: bool,
+    /// The work tree's directory as the coder opened it: `git` can only be given its name, and this
+    /// says whether the name still leads to it ([`SlotDir::is_still_here`]).
+    root: Arc<SlotDir>,
 }
 
 impl GitPin {
     /// The pin of a linked worktree: `admin` is its directory in `mirror`'s `worktrees/`.
-    pub(crate) fn worktree(admin: &Path, mirror: &Path, work_tree: &Path) -> Self {
+    pub(crate) fn worktree(
+        admin: &Path,
+        mirror: &Path,
+        work_tree: &Path,
+        root: Arc<SlotDir>,
+    ) -> Self {
         Self {
             git_dir: admin.to_owned(),
             common_dir: mirror.to_owned(),
             work_tree: work_tree.to_owned(),
             inside: false,
+            root,
         }
     }
 
     /// The pin of a repository that lives in its own work tree (a scratch project).
-    pub(crate) fn own_repository(work_tree: &Path) -> Self {
+    pub(crate) fn own_repository(work_tree: &Path, root: Arc<SlotDir>) -> Self {
         let git_dir = work_tree.join(".git");
         Self {
             common_dir: git_dir.clone(),
             git_dir,
             work_tree: work_tree.to_owned(),
             inside: true,
+            root,
         }
     }
 
@@ -213,13 +224,44 @@ impl GitPin {
     /// put where the slot was, to send the coder's `git add -A` into another run's files), a
     /// `HEAD`, `index` or reflog (`logs/HEAD`, which git appends to through a link: *verified* with
     /// git 2.43.0) that is not a regular file, and, for a scratch project, any `commondir` at all.
-    /// A command that swaps one of them again between this check and git's read is a race this does
-    /// not close; in a run pod the files that matter cannot be swapped (see the ADR).
+    /// A command that swaps one of those files again between this check and git's read is a race
+    /// this does not close; in a run pod the files that matter cannot be swapped (see the ADR).
+    ///
+    /// The slot's directory is also looked at against the descriptor the coder opened it with
+    /// ([`still_here`](Self::still_here)), first and last: a slot that was moved away and replaced
+    /// by another directory, or by a link, is refused. That is a **tripwire**, not a lock: `git`
+    /// finds its work tree by name inside its own process, whatever descriptor the coder holds, so
+    /// a swap in the instant between the last look and `git`'s first read of the name goes
+    /// unseen. What closes that window is a slot that cannot be renamed in the run's pod (a mount
+    /// point of its own), which is not built yet.
     ///
     /// # Errors
     ///
     /// What is wrong, in a sentence.
     pub async fn check(&self) -> Result<(), String> {
+        self.still_here().await?;
+        self.check_files().await?;
+        self.still_here().await
+    }
+
+    /// Whether the name of the work tree still leads to the directory the coder opened as the slot
+    /// ([`SlotDir::is_still_here`]): not moved, not replaced by another directory or a link.
+    ///
+    /// # Errors
+    ///
+    /// What is wrong, in a sentence.
+    pub async fn still_here(&self) -> Result<(), String> {
+        let root = Arc::clone(&self.root);
+        match tokio::task::spawn_blocking(move || root.is_still_here()).await {
+            Ok(true) => Ok(()),
+            _ => Err(format!(
+                "{} is not the directory the coder opened any more (a command moved it away, or replaced it by another directory or a link): git is not run on it",
+                self.work_tree.display()
+            )),
+        }
+    }
+
+    async fn check_files(&self) -> Result<(), String> {
         if !safe_fs::is_real_directory(&self.work_tree).await {
             return Err(format!(
                 "{} is not a plain directory (it is gone, or a command replaced it by a link or a file): git is not run on it",
@@ -479,6 +521,8 @@ impl GitCmd {
         if let Some(pin) = &self.pin {
             pin.check().await.map_err(WorkspaceError::Corrupt)?;
             safe_fs::race::checkpoint(pin.work_tree(), "git");
+            // Once more, as near to the start as the coder can look.
+            pin.still_here().await.map_err(WorkspaceError::Corrupt)?;
         }
         let timeout = if self.auth.is_some() {
             NETWORK_TIMEOUT

@@ -14,6 +14,7 @@
 //! crate README; the decision is [ADR 0008](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0008-a-workspace-holds-several-repositories.md).
 
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -23,10 +24,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{GitCmd, GitPin};
 use crate::repo::RepoRef;
-use crate::safe_fs;
+use crate::safe_fs::{self, Dir, SlotDir, WalkError};
 use crate::workspace::{
-    Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists,
-    remove_dir_if_exists, remove_file_if_exists, slot_name,
+    Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists, open_scratch_root,
+    open_worktree_root, remove_dir_if_exists, remove_file_if_exists, slot_name,
 };
 use crate::worktree::{ChangedFile, GitIdentity, Worktree, commit_all_in, parse_porcelain};
 
@@ -100,6 +101,17 @@ impl Slot {
         &self.kind
     }
 
+    /// The slot's directory, opened where the slot was checked and held from then on: what the
+    /// coder's own file operations in the slot are relative to ([`SlotDir`]). A command that
+    /// renames the directory and puts a link at its name leads them nowhere. `path` is the name
+    /// the directory had then.
+    pub fn root(&self) -> &Arc<SlotDir> {
+        match &self.kind {
+            SlotKind::Repository(wt) => wt.root(),
+            SlotKind::Scratch(s) => s.root(),
+        }
+    }
+
     /// The worktree, for a repository slot.
     pub fn worktree(&self) -> Option<&Worktree> {
         match &self.kind {
@@ -136,6 +148,8 @@ pub struct Scratch {
     run: String,
     dir: String,
     path: PathBuf,
+    /// The project's directory, opened where the slot was checked and held from then on.
+    root: Arc<SlotDir>,
     published_to: Option<String>,
     conversation: Option<String>,
 }
@@ -154,6 +168,12 @@ impl Scratch {
     /// The project's directory.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The project's directory, held open: what the coder's own file operations in the project
+    /// are relative to ([`SlotDir`]).
+    pub fn root(&self) -> &Arc<SlotDir> {
+        &self.root
     }
 
     /// The slot's directory name.
@@ -216,7 +236,7 @@ impl Scratch {
     /// common directory alike, and its directory for the work tree. A caller that starts `git`
     /// itself applies it ([`GitPin::apply`]) and checks it ([`GitPin::check`]).
     pub fn git_pin(&self) -> GitPin {
-        GitPin::own_repository(&self.path)
+        GitPin::own_repository(&self.path, Arc::clone(&self.root))
     }
 
     /// The files that differ from the last commit: staged, unstaged and untracked ones (each
@@ -271,15 +291,24 @@ impl Scratch {
             ])
             .run()
             .await?;
-        let mut files: Vec<PathBuf> = listed
+        let named: Vec<PathBuf> = listed
             .stdout
             .split(|b| *b == 0)
             .filter(|name| !name.is_empty())
             .map(|name| PathBuf::from(String::from_utf8_lossy(name).into_owned()))
-            .filter(|rel| {
-                std::fs::symlink_metadata(self.path.join(rel)).is_ok_and(|meta| !meta.is_dir())
-            })
             .collect();
+        // What each name is, without following a link and relative to the directory held: a name
+        // behind a link a command put in the project is not a file of it.
+        let mut files = self
+            .root
+            .blocking(move |root| {
+                Ok(named
+                    .into_iter()
+                    .filter(|rel| root.lstat_below(rel).is_ok_and(|meta| !meta.is_dir()))
+                    .collect::<Vec<PathBuf>>())
+            })
+            .await
+            .map_err(|e| WorkspaceError::io("cannot look at the project's files", e))?;
         files.sort();
         files.dedup();
         Ok(files)
@@ -318,15 +347,18 @@ impl RunWorkspace {
             SlotMeta::Repo(m) => {
                 let dir = m.dir.clone().unwrap_or_default();
                 let path = inner.slot_path(&self.run, &dir);
-                if !is_slot_name(&dir) || !looks_like_worktree(&path).await {
+                // The check and the hold are one step: the directory is opened, not looked at.
+                let Some(root) = (if is_slot_name(&dir) {
+                    open_worktree_root(&path).await
+                } else {
+                    None
+                }) else {
                     return Ok(None);
-                }
+                };
                 let loc = RepoRef::new(&m.url, &m.base_branch).locate()?;
                 let mirror = inner.root().join(loc.mirror_relative());
                 let meta_path = inner.slot_meta_path(&self.run, &dir);
-                let worktree = inner
-                    .open_worktree(m, &dir, path.clone(), mirror, &meta_path)
-                    .await;
+                let worktree = inner.open_worktree(m, &dir, root, mirror, &meta_path).await;
                 Ok(Some(Slot {
                     seq: m.seq.unwrap_or(0),
                     kind: SlotKind::Repository(worktree),
@@ -336,12 +368,13 @@ impl RunWorkspace {
             }
             SlotMeta::Scratch(m) => {
                 let path = inner.slot_path(&self.run, &m.dir);
-                if !is_slot_name(&m.dir)
-                    || !safe_fs::is_real_directory(&path).await
-                    || !safe_fs::is_real_directory(&path.join(".git")).await
-                {
+                let Some(root) = (if is_slot_name(&m.dir) {
+                    open_scratch_root(&path).await
+                } else {
+                    None
+                }) else {
                     return Ok(None);
-                }
+                };
                 Ok(Some(Slot {
                     dir: m.dir.clone(),
                     seq: m.seq,
@@ -350,6 +383,7 @@ impl RunWorkspace {
                         run: self.run.clone(),
                         dir: m.dir.clone(),
                         path: path.clone(),
+                        root,
                         published_to: m.published_to.clone(),
                         conversation: m.conversation.clone(),
                     }),
@@ -367,14 +401,14 @@ impl RunWorkspace {
         };
         let loc = RepoRef::new(&meta.url, &meta.base_branch).locate()?;
         let path = inner.legacy_target(&self.run, &loc).path;
-        if !looks_like_worktree(&path).await {
+        let Some(root) = open_worktree_root(&path).await else {
             return Ok(None);
-        }
+        };
         let dir = slot_name(&loc.name);
         let mirror = inner.root().join(loc.mirror_relative());
         let meta_path = inner.meta_path(&self.run);
         let worktree = inner
-            .open_worktree(&meta, &dir, path.clone(), mirror, &meta_path)
+            .open_worktree(&meta, &dir, root, mirror, &meta_path)
             .await;
         Ok(Some(Slot {
             seq: 0,
@@ -633,15 +667,16 @@ impl RunWorkspace {
             SlotMeta::Scratch(m) if m.dir == dir => m.published_to.clone(),
             _ => None,
         });
-        let scratch = Scratch {
-            ws: Arc::clone(inner),
-            run: self.run.clone(),
-            dir: dir.to_owned(),
-            path: path.clone(),
+        let scratch = Scratch::create(
+            inner,
+            &self.run,
+            dir,
+            &path,
             published_to,
-            conversation: kept_conversation,
-        };
-        scratch.init(identity).await?;
+            kept_conversation,
+            identity,
+        )
+        .await?;
         Ok(Slot {
             dir: dir.to_owned(),
             path,
@@ -843,12 +878,6 @@ fn repository_slot(wt: Worktree, seq: u32) -> Slot {
     }
 }
 
-/// `path` is a worktree's directory itself, not a link a run's commands put there (to send the
-/// coder's `git add -A` into another run's files), with the `.git` file a worktree has.
-async fn looks_like_worktree(path: &Path) -> bool {
-    safe_fs::is_real_directory(path).await && safe_fs::is_real_file(&path.join(".git")).await
-}
-
 /// `dir` is one plain component: the name of a direct child of a run's workspace.
 fn is_slot_name(dir: &str) -> bool {
     let mut parts = Path::new(dir).components();
@@ -911,47 +940,72 @@ async fn lstat_if_exists(path: &Path) -> WorkspaceResult<Option<std::fs::Metadat
 }
 
 impl Scratch {
-    /// Make the repository if it is not there, and give it its root commit if it has none: what a
-    /// crash in the middle leaves is finished by the next call.
+    /// Make the project's repository if it is not there, open its directory and give it its root
+    /// commit if it has none: what a crash in the middle leaves is finished by the next call.
     ///
     /// The project's directory is in the run's workspace, which the run's commands write: a link
     /// there (to another run's project, to a mirror) would have `create_dir_all` and `git init`
     /// make a repository where the link leads. So the directory and its `.git` are looked at
-    /// without following a link first (`lstat`), and nothing is made through one.
-    async fn init(&self, author: &GitIdentity) -> WorkspaceResult<()> {
+    /// without following a link first (`lstat`), and nothing is made through one. The directory
+    /// is then opened as a plain directory and held ([`SlotDir`]).
+    async fn create(
+        inner: &Arc<Inner>,
+        run: &str,
+        dir: &str,
+        path: &Path,
+        published_to: Option<String>,
+        conversation: Option<String>,
+        author: &GitIdentity,
+    ) -> WorkspaceResult<Self> {
         let refuse = |what: &Path, is: &str| {
             WorkspaceError::Corrupt(format!(
-                "{} is {is}, not a directory of its own: the scratch project {} cannot be used; remove the run first",
+                "{} is {is}, not a directory of its own: the scratch project {dir} cannot be used; remove the run first",
                 what.display(),
-                self.dir
             ))
         };
-        match lstat_if_exists(&self.path).await? {
-            Some(meta) if !meta.is_dir() => return Err(refuse(&self.path, "a link or a file")),
+        match lstat_if_exists(path).await? {
+            Some(meta) if !meta.is_dir() => return Err(refuse(path, "a link or a file")),
             _ => {}
         }
-        let dot_git = self.path.join(".git");
+        let dot_git = path.join(".git");
         match lstat_if_exists(&dot_git).await? {
             Some(meta) if !meta.is_dir() => return Err(refuse(&dot_git, "a link or a file")),
             Some(_) => {}
             None => {
-                tokio::fs::create_dir_all(&self.path)
+                tokio::fs::create_dir_all(path)
                     .await
                     .map_err(|e| WorkspaceError::io("cannot create the scratch directory", e))?;
                 // `--template=`: none of the system's sample hooks.
-                self.ws
+                inner
                     .git()
                     .args(["init", "--quiet", "--initial-branch=main", "--template="])
-                    .arg(&self.path)
+                    .arg(path)
                     .run()
                     .await?;
                 // A link put there while the repository was being made: the repository is where
                 // the link leads, and the project is not usable.
-                if !safe_fs::is_plain_path(&self.ws.run_dir(&self.run), &self.path).await {
-                    return Err(refuse(&self.path, "a link"));
+                if !safe_fs::is_plain_path(&inner.run_dir(run), path).await {
+                    return Err(refuse(path, "a link"));
                 }
             }
         }
+        let Some(root) = open_scratch_root(path).await else {
+            return Err(refuse(path, "a link or a file"));
+        };
+        let scratch = Self {
+            ws: Arc::clone(inner),
+            run: run.to_owned(),
+            dir: dir.to_owned(),
+            path: path.to_owned(),
+            root,
+            published_to,
+            conversation,
+        };
+        scratch.ensure_root_commit(author).await?;
+        Ok(scratch)
+    }
+
+    async fn ensure_root_commit(&self, author: &GitIdentity) -> WorkspaceResult<()> {
         let has_commit = self
             .git()
             .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
@@ -1002,12 +1056,19 @@ pub struct CopyReport {
 
 /// What to do with one file.
 enum Step {
-    Copy,
+    Copy(Source),
     Unchanged,
     /// There is a file or a link of another content: it is replaced when `overwrite` is on.
-    Differs(String),
+    Differs(String, Source),
     /// Never, whatever `overwrite` says.
     Refuse(String),
+}
+
+/// What the plan saw at the project's file, and what is written: a file is opened again for the
+/// copy and must still be a regular file; a link is written as the plan read it.
+enum Source {
+    File,
+    Link(PathBuf),
 }
 
 /// Copy the files of the scratch project `from` into the worktree `to`, under the directory `path`
@@ -1037,8 +1098,9 @@ pub async fn copy_into(
 ) -> WorkspaceResult<CopyReport> {
     let base = destination_base(path)?;
     let files = from.files().await?;
-    let source = from.path.clone();
-    let dest = to.path().to_path_buf();
+    // Both directories as they are held: the plan and the writes are relative to them, whatever
+    // happens to the names meanwhile.
+    let (source, dest) = (Arc::clone(&from.root), Arc::clone(to.root()));
     tokio::task::spawn_blocking(move || copy_files(&source, &dest, &base, &files, overwrite))
         .await
         .map_err(|e| WorkspaceError::io("the copy task failed", io::Error::other(e)))?
@@ -1084,117 +1146,142 @@ fn link_stays_inside(rel: &Path, target: &Path) -> bool {
         .any(|name| name.to_string_lossy().eq_ignore_ascii_case(".git"))
 }
 
-/// Whether two files have the same bytes.
-fn same_content(a: &Path, b: &Path) -> io::Result<bool> {
-    let (ma, mb) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
-    Ok(ma.len() == mb.len() && std::fs::read(a)? == std::fs::read(b)?)
+/// Whether the project's file `rel` and the repository's file `name` of `dir` have the same bytes.
+fn same_content(source: &SlotDir, rel: &Path, dir: &Dir, name: &OsStr) -> io::Result<bool> {
+    use std::io::Read as _;
+    let ((mut a, ma), (mut b, mb)) = (source.open_regular_below(rel)?, dir.open_regular(name)?);
+    if ma.size() != mb.size() {
+        return Ok(false);
+    }
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    a.read_to_end(&mut x)?;
+    b.read_to_end(&mut y)?;
+    Ok(x == y)
 }
 
-/// What to do with `rel` (a file of the project under `source`) in the worktree `dest` under
-/// `base`.
-fn plan_one(source: &Path, dest: &Path, base: &Path, rel: &Path) -> io::Result<Step> {
+/// What to do with `rel` (a file of the project `source`) in the worktree `dest` under `base`.
+fn plan_one(source: &SlotDir, dest: &SlotDir, base: &Path, rel: &Path) -> io::Result<Step> {
     if rel.components().any(
         |c| matches!(c, Component::Normal(n) if n.to_string_lossy().eq_ignore_ascii_case(".git")),
     ) {
         return Ok(Step::Refuse("nothing is copied into .git".to_owned()));
     }
-    let from = source.join(rel);
-    let from_meta = std::fs::symlink_metadata(&from)?;
+    let from_meta = source.lstat_below(rel)?;
+    let name = rel
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a file with no name"))?;
     // Anything on the way that is a symbolic link or a file leads somewhere the copy must not.
-    let mut at = dest.to_path_buf();
+    // `at` is the directory of the repository the file goes in; `None` once a directory on the
+    // way is not there: what is below it is new.
+    let mut at = Some(dest.try_clone()?);
+    let mut shown = PathBuf::new();
     let parent = base.join(rel.parent().unwrap_or(Path::new("")));
     for component in parent.components() {
-        at.push(component);
-        match std::fs::symlink_metadata(&at) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        shown.push(part);
+        let Some(dir) = at.as_ref() else { break };
+        match dir.lstat(part) {
+            Ok(meta) if meta.is_symlink() => {
                 return Ok(Step::Refuse(format!(
                     "the repository has a symbolic link at {}: nothing is written through it",
-                    at.strip_prefix(dest).unwrap_or(&at).display()
+                    shown.display()
                 )));
             }
             Ok(meta) if !meta.is_dir() => {
                 return Ok(Step::Refuse(format!(
                     "the repository has a file at {}, where a directory is needed",
-                    at.strip_prefix(dest).unwrap_or(&at).display()
+                    shown.display()
                 )));
             }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            Ok(_) => {
+                let next = dir.open_dir(part)?;
+                at = Some(next);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => at = None,
             Err(e) => return Err(e),
         }
     }
-    let to = dest.join(base).join(rel);
-    let existing = match std::fs::symlink_metadata(&to) {
-        Ok(meta) => Some(meta),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e),
+    let existing = match &at {
+        Some(dir) => match dir.lstat(name) {
+            Ok(meta) => Some(meta),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
     };
-    let kind = from_meta.file_type();
-    if kind.is_symlink() {
-        let target = std::fs::read_link(&from)?;
+    if from_meta.is_symlink() {
+        let target = source.read_link_below(rel)?;
         if !link_stays_inside(rel, &target) {
             return Ok(Step::Refuse(format!(
                 "the symbolic link points to {}, which is absolute or outside the project",
                 target.display()
             )));
         }
-        return Ok(match existing {
-            None => Step::Copy,
-            Some(meta) if meta.file_type().is_symlink() => {
-                if std::fs::read_link(&to)? == target {
-                    Step::Unchanged
-                } else {
-                    Step::Differs(
-                        "the repository has a symbolic link here with another target".to_owned(),
-                    )
-                }
-            }
-            Some(meta) if meta.is_dir() => {
-                Step::Refuse("the repository has a directory here".to_owned())
-            }
-            Some(_) => Step::Differs("the repository has a file here".to_owned()),
-        });
-    }
-    if !kind.is_file() {
-        return Ok(Step::Refuse("it is not a regular file".to_owned()));
-    }
-    Ok(match existing {
-        None => Step::Copy,
-        Some(meta) if meta.is_dir() => {
-            Step::Refuse("the repository has a directory here".to_owned())
-        }
-        Some(meta) if meta.file_type().is_symlink() => {
-            Step::Refuse("the repository has a symbolic link here".to_owned())
-        }
-        Some(_) => {
-            if same_content(&from, &to)? {
+        let (Some(meta), Some(dir)) = (existing, &at) else {
+            return Ok(Step::Copy(Source::Link(target)));
+        };
+        return Ok(if meta.is_symlink() {
+            if dir.read_link(name)? == target {
                 Step::Unchanged
             } else {
-                Step::Differs("the repository has a file here with other content".to_owned())
+                Step::Differs(
+                    "the repository has a symbolic link here with another target".to_owned(),
+                    Source::Link(target),
+                )
             }
-        }
+        } else if meta.is_dir() {
+            Step::Refuse("the repository has a directory here".to_owned())
+        } else {
+            Step::Differs(
+                "the repository has a file here".to_owned(),
+                Source::Link(target),
+            )
+        });
+    }
+    if !from_meta.is_file() {
+        return Ok(Step::Refuse("it is not a regular file".to_owned()));
+    }
+    let (Some(meta), Some(dir)) = (existing, &at) else {
+        return Ok(Step::Copy(Source::File));
+    };
+    Ok(if meta.is_dir() {
+        Step::Refuse("the repository has a directory here".to_owned())
+    } else if meta.is_symlink() {
+        Step::Refuse("the repository has a symbolic link here".to_owned())
+    } else if !meta.is_file() {
+        Step::Refuse("the repository has something here that is not a regular file".to_owned())
+    } else if same_content(source, rel, dir, name)? {
+        Step::Unchanged
+    } else {
+        Step::Differs(
+            "the repository has a file here with other content".to_owned(),
+            Source::File,
+        )
     })
 }
 
 fn copy_files(
-    source: &Path,
-    dest: &Path,
+    source: &SlotDir,
+    dest: &SlotDir,
     base: &Path,
     files: &[PathBuf],
     overwrite: bool,
 ) -> WorkspaceResult<CopyReport> {
+    use std::os::unix::fs::PermissionsExt as _;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let io_err = |what: &str, e: io::Error| WorkspaceError::io(what.to_owned(), e);
     let mut report = CopyReport::default();
-    let mut to_write: Vec<&PathBuf> = Vec::new();
+    let mut to_write: Vec<(&PathBuf, Source)> = Vec::new();
     for rel in files {
         match plan_one(source, dest, base, rel)
             .map_err(|e| io_err("cannot look at a file to copy", e))?
         {
-            Step::Copy => to_write.push(rel),
+            Step::Copy(how) => to_write.push((rel, how)),
             Step::Unchanged => report.unchanged.push(rel.clone()),
-            Step::Differs(_) if overwrite => to_write.push(rel),
-            Step::Differs(reason) | Step::Refuse(reason) => report.collisions.push(Collision {
+            Step::Differs(_, how) if overwrite => to_write.push((rel, how)),
+            Step::Differs(reason, _) | Step::Refuse(reason) => report.collisions.push(Collision {
                 path: rel.clone(),
                 reason,
             }),
@@ -1203,31 +1290,45 @@ fn copy_files(
     if !report.collisions.is_empty() {
         return Ok(report);
     }
-    safe_fs::race::checkpoint(source, "copy-source");
-    safe_fs::race::checkpoint(dest, "copy-dest");
-    for rel in to_write {
-        let from = source.join(rel);
-        let to = dest.join(base).join(rel);
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| io_err("cannot create a directory of the repository", e))?;
-        }
-        let tmp = to.with_file_name(format!(
+    safe_fs::race::checkpoint(source.path(), "copy-source");
+    safe_fs::race::checkpoint(dest.path(), "copy-dest");
+    for (rel, how) in to_write {
+        let Some(name) = rel.file_name() else {
+            continue;
+        };
+        let parent = base.join(rel.parent().unwrap_or(Path::new("")));
+        // Made one directory at a time, relative to the worktree's directory: nothing on the way
+        // may be a link (the plan said so, and a command may have made one since).
+        let dir = dest.walk(&parent, true).map_err(|e| {
+            io_err(
+                "cannot create a directory of the repository",
+                match e {
+                    WalkError::Io(e) => e,
+                    other => io::Error::other(other.to_string()),
+                },
+            )
+        })?;
+        let tmp = OsString::from(format!(
             ".adam-copy-{}-{}.tmp",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let made = (|| -> io::Result<()> {
-            if std::fs::symlink_metadata(&from)?.file_type().is_symlink() {
-                std::os::unix::fs::symlink(std::fs::read_link(&from)?, &tmp)?;
-            } else {
-                // `copy` keeps the permission bits: the executable bit stays.
-                std::fs::copy(&from, &tmp)?;
+            match &how {
+                Source::Link(target) => dir.symlink(target, &tmp)?,
+                Source::File => {
+                    // Opened without following a link, and it must still be a regular file.
+                    let (mut from, meta) = source.open_regular_below(rel)?;
+                    let mut to = dir.create_new(&tmp)?;
+                    io::copy(&mut from, &mut to)?;
+                    // The permission bits stay: the executable bit with them.
+                    to.set_permissions(std::fs::Permissions::from_mode(meta.permissions()))?;
+                }
             }
-            std::fs::rename(&tmp, &to)
+            dir.rename(&tmp, name)
         })();
         if let Err(e) = made {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = dir.unlink(&tmp);
             return Err(io_err("cannot copy a file", e));
         }
         report.copied.push(rel.clone());

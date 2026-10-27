@@ -95,5 +95,6 @@ pub use github::GitHub;
 pub use github_app::{AppKey, AppOwners, GitHubApp, Installation, MAX_CACHED_INSTALLATIONS};
 pub use repo::{RepoLocation, RepoRef};
 pub use run_workspace::{Collision, CopyReport, RunWorkspace, Scratch, Slot, SlotKind, copy_into};
+pub use safe_fs::SlotDir;
 pub use workspace::Workspaces;
 pub use worktree::{BaseCheckout, ChangedFile, FileStatus, GitIdentity, MirrorLock, Worktree};
