@@ -7,7 +7,8 @@ Status: **Accepted** (2026-11-14), an owner decision. Supersedes [ADR 0029](0029
 Two copies of the Kubernetes operator of `AgentService` and `AgentConfig` (`agents.vymalo.com/v1alpha1`) existed: this
 repository's (ADR 0029) and the one in `vymalo/another-agentic-platform`, where it was written first. Two copies drift
 (ADR 0029 records the first drift). The owner, 2026-11-14: "Destroy one if you see duplicates". No cluster runs either
-operator today.
+operator today (the owner's statement of the same day: the deployment repository no longer has it and its cluster is down;
+*unverified* otherwise).
 
 ## Decision
 
@@ -24,8 +25,8 @@ operator today.
 parity goldens, so that chart stays the contract.
 
 **Where the operator lives now:** `deploy/operator`, `deploy/operator-crds` and `crates/registry` of
-https://github.com/vymalo/another-agentic-platform. Its CRDs accept every adam-rs resource as of platform commit
-`736f2dc` (its pull request 45); a test, `crates/api/tests/superset.rs`, compares them with this repository's CRD and lists
+https://github.com/vymalo/another-agentic-platform. Its CRDs accept every adam-rs resource, except for the three differences below, as of platform
+commit `736f2dc` (the squash merge of its pull request 45 on its `main`, *verified 2026-11-14* from the merge); a test, `crates/api/tests/superset.rs`, compares them with this repository's CRD and lists
 the differences (*verified 2026-11-14*, read in the platform's checkout). There are three:
 
 1. `AgentConfig.spec.tools.mcpServers` accepts at most 32 servers.

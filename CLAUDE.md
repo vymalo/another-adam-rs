@@ -19,7 +19,7 @@ that integrate adam-rs.
 | `README.md`, `docs/` | the human docs: `docs/README.md` (index), `architecture.md`, `guides/`, `reference/`, `roadmap.md` (the library's own; the product roadmap is `ROADMAP.md` in another-agentic-system, https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md), `decisions/NNNN-*.md` (ADRs) |
 | `CONTRIBUTING.md`, `SECURITY.md` | how to contribute (claim an issue, build, test, open a pull request) and how to report a vulnerability privately; the front door for outside contributors |
 | `crates/`, `bin/adam-coder`, `bin/adam-agent` | libraries, one per concern, and the two agents (library and binary each); each has a `README.md` |
-| `deploy/coder/`, `docker/coder/` | the Helm chart (`bump-tag.sh`, `tests/`: renders, goldens, schemas) and the image with its smoke tests |
+| `deploy/coder/`, `docker/coder/` | the Helm chart (`bump-tag.sh`, `tests/`: renders, goldens, schemas) and the image with its smoke tests. **`deploy/coder` is read by another repository**: vymalo/another-agentic-platform renders its parity goldens from this chart at a pinned revision (its `tools/adam-parity/regen.sh`), so what the chart renders for a given value is a contract; say so in the pull request when it changes |
 | `dev/`, `compose.yaml` | local stack: databases, WireMock mocks, a git server, example agent folders `dev/agents/*/agent`, e2e scripts `dev/*-e2e.sh` |
 | `tools/docs-check/` | diagram, link, anchor, crate-README and skill checker (also in CI) |
 | `.agents/skills/` | first-party (`adam-*`, `update-vendored-skills`) and vendored skills (`skills-lock.json`); `.claude/skills`, `.goose/skills`, `.kiro/skills` are symlinks |

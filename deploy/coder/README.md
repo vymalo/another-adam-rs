@@ -821,7 +821,7 @@ default, and then invisible**: `/cache` is a directory of the container's file s
 
 | Value | |
 |---|---|
-| `cache.existingClaim` | the name of a ReadWriteMany claim in this namespace that you manage and may share with other releases and the operator's agents. The chart creates nothing |
+| `cache.existingClaim` | the name of a ReadWriteMany claim in this namespace that you manage and may share with other releases and the platform operator's agents. The chart creates nothing |
 | `cache.create` | `true`: the chart makes the claim `<release>-coder-cache` for this release (`cache.storageClass`, `cache.size`, `cache.accessModes`, ReadWriteMany by default). It goes with the release: a cache is not state |
 
 Neither: off. Both: refused. The volume is mounted in the **pods that run toolchains**: the `combined` pod, the `split`

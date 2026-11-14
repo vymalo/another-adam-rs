@@ -328,7 +328,7 @@ persistence:
 #
 # Exactly one of:
 #   existingClaim  the name of a ReadWriteMany claim in this namespace that you manage: the deployment-level volume
-#                  that several releases (and the operator's agents) share. The chart creates nothing.
+#                  that several releases (and the platform operator's agents) share. The chart creates nothing.
 #   create: true   the chart makes the claim <release>-cache for this release alone (storageClass, size, accessModes).
 #                  It is deleted with the release.
 # Neither: off. The volume's root must be writable by uid and gid 10001 (podSecurityContext.fsGroup does it where the
