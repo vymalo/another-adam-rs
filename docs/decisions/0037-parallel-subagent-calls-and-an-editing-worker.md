@@ -14,6 +14,8 @@ from the coder. The trial in the owner's answer 4 is moot, and workers are the p
 *Alternatives* is what led there. Decision 1's table and decision 10's list lose `delegate_to_opencode`, which no longer
 exists.
 
+*Amended 2026-11-14 ([ADR 0046](0046-the-operator-lives-in-the-platform-repository.md)):* `AgentConfig` `spec.workers` (decision on worker dependencies) was a field of the operator removed from this repository; it belongs to the operator of `vymalo/another-agentic-platform`.
+
 ## Context
 
 In a thread of 2026-10-11 the owner asked Adam to "create sub-agents to work faster" on a React rewrite. Adam said it

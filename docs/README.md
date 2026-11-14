@@ -66,7 +66,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0026](decisions/0026-a-failure-the-base-has-too-is-not-the-runs.md) | a failing check is also run on the base: a failure it has too is pre-existing and costs no cycle |
 | [0027](decisions/0027-every-tool-has-a-title-for-its-step.md) | every tool has a title for its step |
 | [0028](decisions/0028-the-card-says-which-build-answers.md) | the card says which build and which agent files answer |
-| [0029](decisions/0029-adam-rs-has-an-operator.md) | adam-rs ships the Kubernetes operator of `AgentService` and `AgentConfig`, moved from the platform repository |
+| [0029](decisions/0029-adam-rs-has-an-operator.md) | adam-rs ships the Kubernetes operator of `AgentService` and `AgentConfig`, moved from the platform repository (superseded by 0046) |
 | [0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md) | A2A push notifications, `ListTasks`, the extended card and card signatures |
 | [0031](decisions/0031-swagger-ui-and-the-a2a-rest-binding.md) | the A2A HTTP+JSON binding beside JSON-RPC, and Swagger UI at `/docs` |
 | [0032](decisions/0032-usage-per-model-call.md) | `usage/v1`: the tokens of each model call, a subagent's apart, and a task's totals |
@@ -83,6 +83,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0043](decisions/0043-sandbox-time-as-usage.md) | the time a run's commands use in a run pod is reported as `usage/v1` `sandbox`, beside `totals`: command time (spawn to exit, a timeout or cancel kill included), weighted by the pod template's requests, a subagent's merged into its parent's, kept in the run's state and journaled with the call's result; `local` and `devcontainer` say where and no time (not measured, never zero); no new URI, no live reports |
 | [0044](decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) | a request is the previous one plus what happened since, so the provider's cache holds; every read is paged (`read_file`, `list_files`, `find_files`, `search_files`, `read_output`); `plan_work`, skills, commands and project instructions are built in; web and image generation stay MCP servers |
 | [0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) | a subagent can run in the background as a session: `subagent_start` returns at once, the parent keeps working and reads reports, `subagent_send` continues it with its context, and "close when done" is chosen at creation; a kept-open session lives for the thread and is announced to clients by `child-sessions/v1` |
+| [0046](decisions/0046-the-operator-lives-in-the-platform-repository.md) | the operator lives only in the platform repository: adam-rs's copy, its charts, CRDs, image and skill are removed; `deploy/coder` stays the contract |
 
 ## Keeping these docs short and true
 

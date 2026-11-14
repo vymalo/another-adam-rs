@@ -6,6 +6,8 @@ now, a pull-through proxy later. Builds on [ADR 0019](0019-a-runs-processes-in-a
 [ADR 0029](0029-adam-rs-has-an-operator.md) (the operator), and on the workspace image of `vymalo/another-agentic-images`
 that keeps its package caches under `/cache` (its pull request 12).
 
+*Amended 2026-11-14 ([ADR 0046](0046-the-operator-lives-in-the-platform-repository.md)):* the operator named here was removed from this repository; the operator parts of this decision now belong to the operator of `vymalo/another-agentic-platform`.
+
 ## Context
 
 A pod starts with an empty home. Every `npm ci`, `pnpm install` and `cargo build` of a run downloads again what the run

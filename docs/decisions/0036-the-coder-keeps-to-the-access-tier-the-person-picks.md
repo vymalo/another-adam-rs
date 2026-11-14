@@ -16,6 +16,8 @@ leaves the `edits` row of decision 5; the coder no longer has it.
 enforcement becomes rules. The tiers are presets of rules generated from `needs`, `withhold` is derived from those rules, and
 `Gated` still checks the root's notes at each call. What each tier allows does not change.
 
+*Amended 2026-11-14 ([ADR 0046](0046-the-operator-lives-in-the-platform-repository.md)):* the operator this ADR mentions (decision 12, `maxAccessTier`; the upgrade note on run pods) was removed from this repository; those lines now describe the operator of `vymalo/another-agentic-platform`.
+
 ## Context
 
 The owner, 2026-10-11, about the coder: *"The goal is for the agent to be autonomous."* A person could not say how much the

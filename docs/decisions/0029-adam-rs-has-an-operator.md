@@ -1,6 +1,6 @@
 # 0029. adam-rs has an operator
 
-Status: **Accepted** (2026-10-07), on the owner's decisions of that day (below). **Built:** the crates, the binary, the
+Status: *Superseded 2026-11-14* by [ADR 0046](0046-the-operator-lives-in-the-platform-repository.md): the operator was removed from this repository and lives in `vymalo/another-agentic-platform`. Was: **Accepted** (2026-10-07), on the owner's decisions of that day (below). **Built:** the crates, the binary, the
 image, the two charts and the workflow named here. **Not built:** run pods (ADR 0019) in the operator, see *What is
 missing*. Builds on [ADR 0019](0019-a-runs-processes-in-a-pod-of-their-own.md), whose chart `runPods` block the operator
 does not yet reproduce.
