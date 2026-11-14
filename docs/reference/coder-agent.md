@@ -152,8 +152,9 @@ stateDiagram-v2
 
 `Exhausted` has no way out except failure: `run_checks`, `commit_and_push` and `open_pull_request` all
 refuse, and `accept_red_checks` never overrides it. `InputRequired` is the chat waiting for the person; a run
-with repository work to deliver ends only with a pull request, a failure, `CancelTask` or `max_turns`, and a run
-without any ends when the model answers and asks nothing.
+with repository work to deliver ends only with a pull request, a failure (a limit reached with the work undelivered
+among them: the run gets one closing turn without tools, and its answer is the failure's text), or `CancelTask`; a run
+without any ends when the model answers and asks nothing, and so does one that reached a limit with nothing owed.
 
 ## Rules in code
 

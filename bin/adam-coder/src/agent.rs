@@ -125,9 +125,14 @@ const REPOSITORY_CREATION_OFF: &str = "Creating a repository is switched off in 
 ///   starts the next task, which continues this conversation. What asks is read from the words
 ///   (`asks_the_person`): a sentence ending in `?` in the last paragraph.
 ///
+/// * **A run that reached `max_turns` or `max_tool_calls`** ends with the answer of its closing turn
+///   (`output.limited`), and that is never read as a question: with repository work undelivered
+///   it fails, naming the limit and carrying the answer (what was done, what is left); with nothing
+///   owed it completes.
+///
 /// So a run that has repository work to deliver does not complete on its own. It ends with a pull
-/// request, with a failure (the two rules above, a model or tool error that is not retried,
-/// `max_turns` or `max_tool_calls`), or when the caller cancels it (A2A `CancelTask`); until then
+/// request, with a failure (the rules above, a model or tool error that is not retried, a limit
+/// reached with work undelivered), or when the caller cancels it (A2A `CancelTask`); until then
 /// it waits for the person, who can say something else or stop it. There is no limit on how
 /// often it asks.
 ///
@@ -587,6 +592,33 @@ fn delivered_a_result(notes: &RunNotes, scratch_only: bool) -> bool {
         && notes.created_repos.is_empty()
         && notes.pushed_branches.is_empty()
         && notes.continues.is_none()
+}
+
+/// Whether the run's answer is the one of its closing turn, after it reached a limit.
+fn is_limited(output: &Value) -> bool {
+    output.get("limited").and_then(Value::as_bool) == Some(true)
+}
+
+/// How a run that ended at a limit (`is_limited`) is not delivered: `Some(error)` when it left
+/// repository work undelivered (`owes`), `None` when nothing was owed and the answer completes it.
+fn limited_ending(output: &Value, owes: bool, limits: &adam_llm_agent::Limits) -> Option<String> {
+    if !owes {
+        return None;
+    }
+    let text = output
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (what, bound) = match output.get("limit").and_then(Value::as_str) {
+        Some("max_tool_calls") => (
+            "tool call",
+            format!("max_tool_calls = {}", limits.max_tool_calls),
+        ),
+        _ => ("turn", format!("max_turns = {}", limits.max_turns)),
+    };
+    Some(format!(
+        "{what} limit reached before the work was delivered ({bound}): {text}"
+    ))
 }
 
 /// Whether the model's last words ask the person something: they are a question, and the run waits
@@ -1194,6 +1226,17 @@ impl Agent for CoderAgent {
                         if delivered_a_result(&notes, scratch_only) {
                             // Shared from scratch work: what was asked for is handed over.
                             Transition::Done { state, output }
+                        } else if is_limited(&output) {
+                            // The run ran out of turns or calls and said where it got to: that is
+                            // never a question for the person, whatever its words end with.
+                            let owes = owes_delivery(&notes, &slots).await;
+                            match limited_ending(&output, owes, &self.assembly.root().limits()) {
+                                Some(error) => Transition::Fail {
+                                    state,
+                                    error: redactor.failure_text(error),
+                                },
+                                None => Transition::Done { state, output },
+                            }
                         } else if asks_the_person(&output) || owes_delivery(&notes, &slots).await {
                             stop_as_question(ctx, state, output, !slots.is_empty()).await
                         } else {
@@ -1336,6 +1379,32 @@ mod tests {
 
     /// The runs are stored under `AGENT_NAME` and the starter registers that name; the assembled
     /// agent registers the `name` of its file. They must not drift apart.
+    #[test]
+    fn a_limited_answer_with_undelivered_work_fails() {
+        let limits = adam_llm_agent::Limits {
+            max_turns: 7,
+            ..Default::default()
+        };
+        // The words end with a question mark: still no question, the run did not finish.
+        let output = json!({"text": "Tests pass, branch pushed. Open the PR?", "limited": true, "limit": "max_turns"});
+        assert!(is_limited(&output));
+        let error = limited_ending(&output, true, &limits).expect("fails");
+        assert!(error.contains("max_turns = 7"), "{error}");
+        assert!(error.contains("before the work was delivered"), "{error}");
+        assert!(error.contains("branch pushed"), "{error}");
+        let calls = json!({"text": "half", "limited": true, "limit": "max_tool_calls"});
+        let error = limited_ending(&calls, true, &limits).expect("fails");
+        assert!(error.contains("max_tool_calls = 200"), "{error}");
+    }
+
+    #[test]
+    fn a_limited_answer_with_nothing_owed_completes() {
+        let limits = adam_llm_agent::Limits::default();
+        let output = json!({"text": "Read three files; the fourth is left.", "limited": true, "limit": "max_turns"});
+        assert_eq!(limited_ending(&output, false, &limits), None);
+        assert!(!is_limited(&json!({"text": "done"})));
+    }
+
     #[test]
     fn the_embedded_agent_is_named_like_the_constant() {
         assert_eq!(AGENT.name, AGENT_NAME);

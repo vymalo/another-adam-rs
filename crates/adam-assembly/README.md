@@ -153,7 +153,9 @@ the agents with `try_build`, so a tool whose `required_state` nobody gave is
 `Error::Build { origin, source: MissingState }`, naming the agent, before anything runs.
 
 **Limits.** The frontmatter `limits` (`max_turns`, `max_tool_calls`, `max_output_tokens`,
-`max_history_tokens`) replace the loop's default for the keys that are set. Each subagent has its own.
+`max_history_tokens`) replace the loop's default for the keys that are set. Each subagent has its own. A run that
+reaches `max_turns` or `max_tool_calls` gets one closing model call in which it may call no tool and ends `Done`
+with that answer marked `limited` (see `adam-llm-agent`).
 
 **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
 `adam_a2a::AgentCardConfig`: `card.name` (default: the agent's), `card.description` (default: the
@@ -719,7 +721,7 @@ place each:
   set: each model request's prompt, tool list and history asserted, the answers coming back as tool results,
   the runs recorded under their parents; the fixture's reviewer; a tool only the parent has is not offered
   to the child and is refused when the child calls it; limits apply per child (a child over its `max_turns`
-  fails and the parent is told; a child's turns are not the parent's); a call without a `message`; a runtime
+  answers from its closing turn, and the parent is told the answer may be incomplete; a child's turns are not the parent's); a call without a `message`; a runtime
   that does not know the child; a parent whose process goes away while it waits and is stepped by a new
   runtime that gets the child's answer; every name clash and the asks-user refusal.
 * `tests/remote.rs`: an in-process `adam-a2a` server (`InMemoryBackend` where it suffices, a scripted backend

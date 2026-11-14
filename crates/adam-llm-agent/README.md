@@ -21,7 +21,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
-| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
+| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to OpenCode", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`. A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
@@ -493,6 +493,20 @@ run: it is answered with an error result that says the JSON was invalid, quotes 
 the call did not run and, when the turn stopped at the output limit, that the reply was probably cut off. The
 answer is a function of the journaled model turn (no `tool:<id>` step), so a replay gives the same one, and the
 call counts against `max_tool_calls`. The call is echoed back to the model with `{}` as its arguments, never the raw text.
+
+## Limits and the closing turn
+
+A run that reaches `max_turns` (the model has been called that many times, each followed by tools) or
+`max_tool_calls` (a turn asks for calls that would go over it; none runs, each is answered `not run`) is not
+failed. Its next model call is the **closing turn**: the request keeps its system prompt and its tools, so the
+prefix is the one the provider has cached, but sets `tool_choice: none` and ends with a user message,
+`CLOSING_TURN`, that is sent for that call only and never stored in the history. A tool call the model sends
+anyway is dropped (the stored message has none). Its words end the run `Done` with the output
+`{"text", "artifacts", "limited": true, "limit": "max_turns" | "max_tool_calls"}` (plus `truncated` and `stream`
+as for any answer); a message that arrives afterwards, or a reply to a question, finishes the run again with the
+same answer, calling no model. A closing turn with no words fails the run with the `turn limit exceeded` or
+`tool call limit exceeded` message. The state remembers it in `Conversation::limit`. A child run that hits its limit
+is `Done`, and its parent's tool result ends with a note that the answer may be incomplete.
 
 ## Features and environment
 
