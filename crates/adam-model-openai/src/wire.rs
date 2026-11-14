@@ -1069,13 +1069,12 @@ mod tests {
 
     #[test]
     fn a_completion_cut_inside_its_json_is_transient() {
-        for body in [&br#"{"choices":[{"message":{"content":"x"#[..]] {
-            assert!(
-                matches!(parse_completion(body), Err(ModelError::Transient { .. })),
-                "{}",
-                String::from_utf8_lossy(body)
-            );
-        }
+        let body = &br#"{"choices":[{"message":{"content":"x"#[..];
+        assert!(
+            matches!(parse_completion(body), Err(ModelError::Transient { .. })),
+            "{}",
+            String::from_utf8_lossy(body)
+        );
     }
 
     #[test]
