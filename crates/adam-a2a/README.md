@@ -76,7 +76,7 @@ types derive no schema) and held to the code by the tests below. JSON-RPC is `PO
 method and a named example per method; streaming operations are `text/event-stream` and their descriptions give the
 `curl` (Swagger UI cannot show a stream as it arrives). The bearer scheme is declared exactly when the server requires
 one. The document is built once from the public card and the switches it shows: the same bytes for every caller, no
-token, nothing of the extended card. Swagger UI 5.32.6 (Apache-2.0) is bundled in the binary by `utoipa-swagger-ui` 10.0.1
+token, nothing of the extended card. Swagger UI 5.32.6 (Apache-2.0) is bundled in the binary by `utoipa-swagger-ui` 10.0.2
 with `vendored` (*verified 2026-10-07* by reading its `build.rs`: with that feature the zip comes from the
 `utoipa-swagger-ui-vendored` 0.2.0 crate, which ships it in `res/`, and nothing is downloaded; `minified` leaves the source
 maps out). Only the eight files `index.html` loads are served, under

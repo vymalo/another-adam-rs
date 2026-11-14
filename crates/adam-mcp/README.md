@@ -462,6 +462,9 @@ stateDiagram-v2
 Cargo registry), <https://docs.rs/rmcp/3.5.0> and <https://crates.io/api/v1/crates/rmcp>, unless a fact says it was
 found by running the tests:
 
+The workspace has required `rmcp` 3.9 or later since 2026-11-14 (`Cargo.lock`: 3.10.0), for RUSTSEC-2026-0457, 0461
+and 0462. The facts below were read at 3.5.0 and not read again; this crate's tests pass on 3.10.0.
+
 * `rmcp` 3.5.0, Apache-2.0, `rust-version` 1.88. Features used: `client`, `transport-child-process` and
   `transport-streamable-http-client-reqwest` with `default-features = false` (the `reqwest` feature is not used;
   the client is our own `reqwest::Client`, the workspace's 0.13). Its new dependencies are `process-wrap` 10.0.1
