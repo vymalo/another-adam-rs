@@ -60,7 +60,8 @@ id); a new `SendMessage` is `Runtime::start_with_id` (delivering to the context'
 `Runtime::start_with_id_continuing` when it references a finished task (see *Continuing a task*); a message with `taskId` is
 `Runtime::deliver`, while the task is `input-required` and, when the request activated `steer/v1`, while it is `submitted` or
 `working` (see *Steering a running task*); `CancelTask` is
-`Runtime::cancel`. Ownership is encoded in the run's durable conversation id
+`Runtime::cancel`, which also cancels the subagent runs the task is waiting for (`cancelled: the parent run ended`; a remote A2A
+subagent's task is not cancelled; `tests/cancel_cascade.rs`). Ownership is encoded in the run's durable conversation id
 (`<subject>:<context id>`), so it survives restarts with no side table, and a
 task owned by someone else looks like one that does not exist. Subscriptions
 are built from `Runtime::view` and polling, so they work for a task started by

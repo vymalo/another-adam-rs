@@ -415,7 +415,7 @@ and answers the call; if that message is lost, the timer wakes the parent and it
 child's `output.text` (or its output as JSON); a child that failed, was cancelled or was purged gives an error
 result (`the run failed: ..`) and the run goes on. The message is matched to the wait by the child's run id, so
 copies and strays are dropped; user messages that arrive meanwhile queue behind the result. Cancelling the parent
-does not cancel the child. Events: `awaiting_run`, the call's step `waiting`, then the step's end
+cancels the child (`cancelled: the parent run ended`). Events: `awaiting_run`, the call's step `waiting`, then the step's end
 (`completed` or `failed`). The design and the failure interleavings are in
 [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#failure-interleavings).
 
@@ -504,6 +504,20 @@ not `{}`: a binary that predates the field reads the state without it, and a typ
 call cannot run there with empty arguments (fail closed). Still, **roll every worker before relying on this**, as
 ADR 0037 says of its state: a worker that has not been rolled runs a tool whose schema accepts any JSON.
 
+## `doom_loop`, tool time limits
+
+* **`doom_loop`.** The third call in a row with the same tool, the same canonical arguments and the same result (`is_error`
+  included) as the previous two is not run: it is answered with an error result telling the model to change approach, and
+  after two refusals the run takes the closing turn with `limit: "repeated_call"`. A changed answer, or another call in
+  between, resets it. The decision reads only `Conversation::repeats` (two FNV-1a hashes and counters), so a replay decides
+  the same. A call that waits (a question, a child) resets it.
+* **`Tool::time_limit`** (default `None` = `DEFAULT_TOOL_TIME_LIMIT`, 300 s; `FnTool::with_time_limit`; a wrapper must forward
+  it). The timer runs inside the journaled `tool:<id>` step: the call gets a child `CancelToken`, which fires at the
+  limit; the tool has `TOOL_STOP_GRACE` (5 s) to stop and is then dropped; the model gets an error result that says the call
+  did not finish, and that is what the journal keeps. `ToolCtx::start_child_within` starts a child with a run limit.
+* **Breaking:** `LimitKind::RepeatedCall` is a new variant (every exhaustive match stops compiling until it handles it) and
+  `Conversation` gains `repeats` (struct literals).
+
 ## Limits and the closing turn
 
 A run that reaches `max_turns` (the model has been called that many times, each followed by tools) or
@@ -512,7 +526,7 @@ failed. Its next model call is the **closing turn**: the request keeps its syste
 prefix is the one the provider has cached, but sets `tool_choice: none` and ends with a user message,
 `CLOSING_TURN`, that is sent for that call only and never stored in the history. A tool call the model sends
 anyway is dropped (the stored message has none). Its words end the run `Done` with the output
-`{"text", "artifacts", "limited": true, "limit": "max_turns" | "max_tool_calls"}` (plus `truncated` and `stream`
+`{"text", "artifacts", "limited": true, "limit": "max_turns" | "max_tool_calls" | "repeated_call"}` (plus `truncated` and `stream`
 as for any answer). A message that arrives after the closing answer (or while it is written) is read by **one more
 closing turn**, whose answer replaces the old one (`steer/v1`: an accepted message is never lost). A reopen
 with nothing new in the history ends with exactly the stored output again (`Conversation::limit.answer`, its

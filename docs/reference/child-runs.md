@@ -52,7 +52,7 @@ MongoDB) and `crates/adam-llm-agent/tests/child_runs.rs`.
 | 1 | The child's terminal commit lands, then its process dies, or delivering to the parent fails | The parent stays parked on its timer. At the timer it reads the child, finds it terminal and answers. Nothing else knows anything is missing | `a_lost_notice_is_recovered_by_the_timer`, `a_lost_notice_is_recovered_when_the_timer_fires` |
 | 2 | The child's terminal commit is applied but its acknowledgement is lost | The worker treats the commit as failed and sends nothing (the run is `Done` in the store and nobody claims it again). Same recovery as 1 | `a_lost_terminal_ack_sends_no_notice_and_the_timer_recovers`, `a_lost_terminal_ack_is_recovered_when_the_timer_fires` |
 | 3 | The message is delivered twice, or three times, or again after the answer is in, or after the run is over | The first match answers the call and clears the wait. Later copies match no wait and are dropped. On a finished parent `deliver` answers `Finished`, which the sender ignores. The model is not asked again | `a_duplicate_notice_is_ignored`, `only_the_awaited_childs_notice_answers` |
-| 4 | The parent is cancelled while it waits | **The child is not cancelled** (see below). It runs to its end within its own limits, its message finds a finished parent and is dropped, and the parent stays `Failed` with `cancelled: <reason>`, untouched | `cancelling_a_waiting_parent_does_not_cancel_its_child`, `cancelling_the_parent_leaves_the_child_running` |
+| 4 | The parent is cancelled while it waits | **The child is cancelled too** ([below](#cancel-cascades-and-time-limits)): its worker sees the parent is `Failed` within one poll, fails the child with `cancelled: the parent run ended` and fires its step's token. What the child would have answered is dropped, and the parent stays `Failed` with `cancelled: <reason>`, untouched | `cancelling_a_waiting_parent_cancels_its_child`, `cancelling_the_parent_cancels_the_child_too`, `a_running_child_and_its_child_are_told_within_one_poll`, `cancel_task_reaches_the_subagent_run` |
 | 5 | The child fails, is cancelled, or was purged | The parent gets `status: failed` and the reason (or, for a purged child, finds it gone) and the tool result is an error result. The run continues | `a_failed_or_cancelled_child_tells_its_parent_why`, `a_failing_child_is_an_error_result`, `a_cancelled_child_is_an_error_result`, `a_child_that_is_gone_is_an_error_result`, `a_purged_child_reads_as_gone` |
 | 6 | The parent's lease is lost while it waits, or while it starts the child | Fencing is the version compare-and-swap, not the lease. The worker that took over replays the step: the journal has the start, and `start_child` would answer `false` anyway, so there is one child. The first worker's late commit is refused. The message is delivered with the same compare-and-swap, so it lands on whichever version is current. The parent resumes once. The same holds for the step that answers the call: its consumption of the message commits with it, so a worker that takes over sees the message again and answers the same way | `a_parent_that_loses_its_lease_does_not_start_or_resume_twice`, `a_worker_that_loses_its_lease_while_answering_changes_nothing` |
 | 7 | The message arrives before the parent has parked | While the tool step runs: the message waits in the inbox, and the commit turns the park into a wake-up (the rule that already keeps a parked agent from sleeping through a message that arrived during its step). In a replay or a retry of that step: the snapshot the step starts from already holds the message but the wait is not recorded yet, so the agent matches it *after* the tool has returned `AwaitRun`, in the same transition, and never parks | `a_notice_that_beats_the_park_is_not_lost`, `a_notice_that_beats_the_park_is_used`, `a_retry_finds_the_notice_before_the_wait_is_recorded` |
@@ -63,21 +63,83 @@ MongoDB) and `crates/adam-llm-agent/tests/child_runs.rs`.
 | 12 | The process that finishes the child has never heard of the parent's agent | Delivering needs only the parent's run id: it does not have to register the parent's agent. The parent's own worker steps it | the split `front` and `back` runtimes of cases 1, 2, 5 and 6 |
 | 13 | The message races the timer: the parent reads the finished child at its timer, and the message lands while that step finishes (during the final model call, or before its commit) | The message answers nothing: the wait is settled. `Ctx::arrived` and the commit's reopen rule do not count a child's notice, so the parent finishes with its answer, as it would if the message came after the commit (then `deliver` answers `Finished`). The model is not asked again | `a_childs_notice_that_lands_while_a_run_finishes_does_not_reopen_it`, `a_notice_that_lands_while_the_parent_finishes_costs_no_model_turn` |
 
+| 14 | A child runs past its time limit | The runtime fails it with `cancelled: time limit: the run did not finish within 30 min`: before a step, within one poll for a step in flight (its token fires), and at the wake it set at the deadline for a parked one. The parent gets "the run failed: cancelled: time limit: ..." as the tool result and goes on | `a_child_past_its_deadline_fails_and_wakes_at_it`, `a_child_past_its_limit_is_an_error_result_for_its_parent` |
+| 15 | A child is created after its parent was cancelled, or for a parent that does not exist | It is cancelled when it is claimed, before it steps. A `Done` parent changes nothing | `a_child_created_after_the_cancel_never_steps`, `a_child_follows_a_parent_that_failed_but_not_one_that_is_done` |
+| 16 | The same cancel arrives twice | The second is a no-op: a terminal run is left as it is | `a_child_created_after_the_cancel_never_steps` |
+
+## Cancel cascades and time limits
+
+[ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 10,
+[ADR 0037](../decisions/0037-parallel-subagent-calls-and-an-editing-worker.md) decision 7. **No `Store` method was added**
+(a cascade over `list_runs` would scan every run, and a `Store::children` would be a new required method): each child looks
+at its **parent**, which it already knows (`RunRecord::parent_id`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Caller
+    participant R as Runtime
+    participant DB as Store
+    participant W as Worker holding a child
+    participant C as Child's step
+
+    U->>R: cancel(parent, reason)
+    R->>DB: commit the parent Failed, cancelled: reason (compare-and-swap)
+    loop before each transition of the child and on every poll of its cancel watch
+        W->>DB: load_run(parent)
+    end
+    DB-->>W: the parent is Failed, or gone
+    W->>DB: cancel_run(child, the parent run ended): commit Failed
+    W->>C: fire the step's CancelToken
+    Note over W,DB: the child's own children do the same when they next look at the child
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Working: start_child, with a deadline when started within a limit
+    Working --> Failed: the parent is Failed or gone (cancelled: the parent run ended)
+    Working --> Failed: the clock passes the deadline (cancelled: time limit)
+    Working --> Done: the child answers
+    Working --> Working: the parent is Done or still working
+    Failed --> [*]
+    Done --> [*]
+```
+
+* **The rule.** A run with a `parent_id` is cancelled (`cancelled: the parent run ended`) when its parent is `Failed`, for
+  any reason (a cancel included), or gone. A `Done` parent changes nothing: it has no working rounds, and a session kept
+  open stays usable. A parent that cannot be read is not a reason to cancel: the child goes on.
+* **Where it is checked** (`crates/adam-runtime/src/worker.rs`). Before a child's transition, with one `load_run(parent)`;
+  and on every poll of the cancel watch of a step in flight (`poll_interval`, 250 ms by default), one more read of the parent
+  per poll. The cancel is `Inner::cancel_run`, the body of `Runtime::cancel`: idempotent, a no-op for a run that is
+  already terminal.
+* **How fast.** `Runtime::cancel` commits the parent first, unchanged. A running child is told within one poll (its token
+  fires, and the coder's `shell.rs` kills its command); a runnable one when it is claimed; a parked one at its next
+  wake, which for a child waiting on its own child is at most `wait_poll` (60 s). Grandchildren follow one level at a
+  time. A child that the parent's last step created after the cancel never steps. The A2A `CancelTask` path is
+  unchanged and answers `Canceled` at once.
+* **A child that parks with no timer** (a session round waiting for a message) is not woken by its parent's cancel; a child
+  with a time limit is, at its deadline.
+* **Not cancelled: a remote A2A task.** A subagent on another agent (`a2a:`) is a task there, and the cascade does not
+  send it `CancelTask` ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) slice 5).
+  It keeps running until the remote end stops it. Cancelling the parent stops the wait and nothing else.
+* **Run pods** are keyed by the root's workspace, so the janitor removes the pod with the failed root.
+* **Time limit of a child.** `Runtime::start_child_within(parent, id, agent, input, Some(limit))` (also
+  `ChildStarter::start_within`, `ToolCtx::start_child_within` and, for a session round,
+  `start_child_continuing_within`) stores `deadline` in the run's envelope, set from the runtime's own `Clock`, not
+  from a transition. `wake_at` is clamped to it, so a parked child wakes at it. `SubagentTool` passes
+  `limits.max_minutes` of the subagent's file: **30 minutes** when it says nothing, `0` for none, at most 1,440
+  ([agent files](agent-files.md#the-subagent-tool)). The limit is per run: each round of a session has its own.
+* **Time limit of a tool call.** A call that runs past `Tool::time_limit` (300 s when it declares none) is stopped
+  inside its journaled step and answered with an error, so a replay never waits ([errors](errors.md#what-the-model-is-told)).
+
 What the design refuses to do, and why:
 
-* **No cascade on cancel (v1).** Cancelling a parent does not cancel its children. A cascade needs a way to
-  list children, which the `Store` port does not have (`parent_id` is stored and indexed, and nothing reads
-  it), so it is a new port method for three stores and the testkit, and it makes `cancel` more than one
-  compare-and-swap. What it costs: a child whose parent is gone runs on until it finishes or hits its limits
-  (`max_turns`, `max_tool_calls`), and its message is dropped. That is bounded and visible (the child is a
-  normal run, listed and cancellable by id), and `docs/reference/agent-files.md` records the same choice for subagents.
-  The seam is `Store::children(parent)` plus a loop in `Runtime::cancel`.
 * **No parallel fan-out yet.** An `LlmAgent` runs the calls of one model turn in order, and the first
   `AwaitRun` parks the run, so three subagent calls in one turn run one after the other. Starting all the
   children first and waiting for all of them needs `pending_wait` to hold several runs.
-* **No timeout on a child, and no asking tools in a subagent.** A parent waits as long as its child is open. A
-  child that parks with no timer, for instance because one of its tools asked the user something, waits for
-  an answer nobody is placed to give (`Limits` bound a running child, not a parked one). The subagent binding
+* **No asking tools in a subagent.** A child that parks with no timer, for instance because one of its tools asked the
+  user something, waits for an answer nobody is placed to give; the time limit above now ends it at its deadline
+  (30 minutes by default), and a cancel of the parent does not wake it. The subagent binding
   (`adam-assembly`) closes this at startup instead of at run time: a tool that can ask says so
   (`Tool::asks_user()`), and `bind` refuses a subagent that has one, so the situation cannot arise from an
   agent directory. A tool that returns `NeedsInput` without declaring it still parks its child, and a child
@@ -134,9 +196,13 @@ background as a session that is sent more messages. Only the runtime half exists
   only if the session's round 1 exists with a parent, so a top-level run in a session-shaped conversation is not
   listed, and a parent never sees another's (the prefix ends in `/s/`, so `ctx1` does not match `ctx10`).
 
+* A round takes the same time limit as any child (`start_child_continuing_within`, per round), and a cancelled or failed
+  parent fails the round that is open (`cancelled: the parent run ended`) while the session stays usable: a later parent
+  run continues it from that round (`a_cancelled_parent_fails_the_open_round_and_the_session_continues`).
+
 **What does not exist yet.** The tools (`subagent_start` and the others), `Conversation::session`, closing (so no
-`Closed` state), a reader of `adam.child.reported` in `LlmAgent` or the coder, `PendingWait::Session`, the limits,
-the cancel cascade, remote sessions and the A2A extension.
+`Closed` state), a reader of `adam.child.reported` in `LlmAgent` or the coder, `PendingWait::Session`, remote
+sessions and the A2A extension.
 
 ## Remote tasks: the same wait without a message
 

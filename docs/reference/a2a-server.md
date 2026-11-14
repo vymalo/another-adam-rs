@@ -120,7 +120,7 @@ vector); generate a key with `openssl genpkey -algorithm ed25519` (or `-algorith
 
 A run that reaches `max_turns` or `max_tool_calls` is not failed: it gets one closing model call with no tool and
 ends **`completed`**, its output (and the `artifact`-less final message) carrying `limited: true` and
-`limit: "max_turns" | "max_tool_calls"`. A client that must tell a finished task from a cut one reads
+`limit: "max_turns" | "max_tool_calls" | "repeated_call"`. A client that must tell a finished task from a cut one reads
 `output.limited`. A message sent afterwards is read by one more closing turn. The coder is stricter: see
 [its rules](coder-agent.md#limits-and-cancel).
 

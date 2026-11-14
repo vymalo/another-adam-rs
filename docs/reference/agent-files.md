@@ -85,6 +85,7 @@ skills: all                    # or a list; default: every skill in this agent's
 limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as limits.max_turns
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
+  max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 card:                          # root only: becomes adam_a2a::AgentCardConfig
   name: adam-coder
@@ -544,7 +545,17 @@ sees the parent's history. The sequence and the states of the wait are in
   (the top of the chain of parents; the run itself when it is nobody's child). The id travels in the child's first
   message and its stored state, so it survives a restart. A tool that keeps something for the whole task, such as
   `adam-coder`'s workspace and its check budget, keys it by the root: its subagents then share the worktree.
-* **Limits per child.** Its own `limits:` apply to its run; it does not count against the parent.
+* **Limits per child.** Its own `limits:` apply to its run; it does not count against the parent. A run also has a
+  **time limit**, `limits.max_minutes`: 30 minutes when the file says nothing, `0` for none, an error above 1,440, a
+  warning on a root agent (it has no parent to stop it). Past it the runtime fails the child (`cancelled: time limit: the
+  run did not finish within 30 min`) and the parent reads "the run failed: ..." as the tool result.
+* **Doom loop and tool limits.** In every agent, the third call in a row with the same tool, the same arguments (key order
+  does not matter) and the same result as the two before is not run and is answered with an error that tells the model to
+  change approach; after two such refusals the run takes the closing turn with `limit: "repeated_call"`. A poll whose
+  answer changes, or the same call with another call in between, runs. A call that runs past its tool's time limit
+  (300 s unless the tool declares one: the coder's command tools the deployment's command limit plus 30 s, MCP tools
+  their call timeout plus 10 s) is stopped and answered with an error. The texts are in
+  [errors](errors.md#what-the-model-is-told).
 * **Name clashes are build errors** (`Error::SubagentToolClash`): a subagent named like a tool of its parent, a
   skill tool, or another subagent.
 * **No asking tools in a subagent.** Nobody could answer, and the parent would wait for ever. A tool declares
@@ -552,7 +563,7 @@ sees the parent's history. The sequence and the states of the wait are in
   tools include one (`Error::SubagentAsksUser`), also through `*` or a pattern.
 * **Limits of the design.** The calls of one model turn run one after another. Only the child's text travels
   back (artifacts stay on the child's run). The child starts empty and cannot be continued. Cancelling the
-  parent does not cancel the child.
+  parent cancels the child (a remote A2A subagent's task is not cancelled).
 
 ### Remote subagents (`a2a:`)
 

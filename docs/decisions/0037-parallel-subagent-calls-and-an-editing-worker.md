@@ -7,6 +7,8 @@ refusals of [Child runs](../reference/child-runs.md): "No parallel fan-out yet" 
 [ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md) (access tiers), [ADR 0032](0032-usage-per-model-call.md)
 (usage per step) and [ADR 0016](0016-a-message-sent-to-a-working-task-is-steered-into-it.md) (steering).
 
+*Built 2026-11-14 ([ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 10):* decision 7's cascade, for a `Failed` or gone parent, checked before a child's transition and on every poll of its cancel watch; a parked child follows at its next wake; a `Done` parent changes nothing; remote tasks are still not cancelled.
+
 *Amended 2026-11-14 ([ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md)):* decision 7's cascade is for a cancelled or failed parent only (a parent's turn waits for the rounds it started, so a done parent has none); a worker that is kept open has its worktree keyed by its session, not by its run; background sessions give parallel children without the batches of slices 1 and 2.
 
 *Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md), not built yet):* the owner removed OpenCode

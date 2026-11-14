@@ -16,6 +16,7 @@
 | 8 | The A2A 1.0 server, complete | built, [ADR 0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md): push notifications (durable, at least once, off unless a webhook allow-list is set), `ListTasks`, `GetExtendedAgentCard`, signed cards. Not done: encrypted webhook credentials, signed notifications (the specification asks for none), per-caller extended cards |
 
 Known gaps recorded in the docs: a pinned run whose worker never returns is stranded
-([Architecture](architecture.md#where-a-runs-files-and-processes-live)); cancelling a parent does not cancel its
-children and subagent calls of one turn run one after the other ([Child runs](reference/child-runs.md)); the
+([Architecture](architecture.md#where-a-runs-files-and-processes-live)); subagent calls of one turn run one after the other
+([Child runs](reference/child-runs.md)); a cancel does not reach a remote A2A task a run started
+([Child runs](reference/child-runs.md#cancel-cascades-and-time-limits)); the
 chart has not been applied with more than one worker ([Deploy](guides/deploy-the-coder.md#known-risks)).

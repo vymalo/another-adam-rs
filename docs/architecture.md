@@ -587,7 +587,12 @@ sequenceDiagram
         DB-->>W: leases: due runs with no live lease, not in flight here (and, if pinned, not owned by another worker), earliest first
         W->>T: spawn advance(lease), at most concurrency at once
         T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every poll interval)
-        T->>T: decode the Envelope, build a Ctx<br/>with seq, inbox and attempt
+        opt the run has a parent_id
+            T->>DB: load_run(parent)
+            DB-->>T: Failed or gone: cancel_run(run), cancelled: the parent run ended, no step
+        end
+        T->>T: decode the Envelope, and cancel_run (cancelled: time limit) when its deadline has passed
+        T->>T: build a Ctx<br/>with seq, inbox and attempt
         T->>A: step(ctx, state)
         A->>X: take_inbox()
         A->>X: step("model:N", call the model)
@@ -603,16 +608,20 @@ sequenceDiagram
         X-->>A: the recorded outcome
         A->>K: emit Custom agent_text (with the stream's id for words before a tool call)
         loop each tool call of the turn
-            A->>K: emit Step tool:call id running
-            A->>X: step("tool:call id", run the tool)
-            X->>DB: journal_get(run, seq)
-            opt not recorded
-                X->>L: call(ctx, args)
-                L->>E: files, git, shell checks, pull request
-                L->>K: emit Step updates (emit_progress, report_step) and Artifact events
-                X->>DB: journal_put(run, entry)
+            alt the third call in a row with the same tool, arguments and result (doom_loop)
+                A->>K: emit Step tool:call id running, then failed: answered with an error, not run
+            else
+                A->>K: emit Step tool:call id running
+                A->>X: step("tool:call id", run the tool)
+                X->>DB: journal_get(run, seq)
+                opt not recorded
+                    X->>L: call(ctx, args), within the tool's time limit
+                    L->>E: files, git, shell checks, pull request
+                    L->>K: emit Step updates (emit_progress, report_step) and Artifact events
+                    X->>DB: journal_put(run, entry): the result, or the error for a call past its limit
+                end
+                A->>K: emit Step tool:call id completed, failed or waiting
             end
-            A->>K: emit Step tool:call id completed, failed or waiting
         end
         A-->>T: Transition (Continue, Park, Done, Fail) or AgentError
         T->>DB: commit_run(run, version, update), compare-and-swap
@@ -629,6 +638,9 @@ sequenceDiagram
   runs the tools it asked for (each a journaled step `tool:<call id>`) and returns `Continue`. A call whose
   arguments were not JSON is answered from the recorded turn with an error and has no step; a run that reaches
   `max_turns` or `max_tool_calls` makes one more model call with `tool_choice: none` and ends `Done`, marked `limited`.
+  So does a model that makes the same call a third time with the same result and again after the refusal
+  (`doom_loop`, `limit: "repeated_call"`). A call that runs past its tool's time limit (300 s unless it says otherwise)
+  is stopped inside its step and answered with an error, which the journal keeps.
 * **Replay is safe, effects are at-least-once.** The effect runs before its outcome is written, so a
   crash in between runs it again. Tools must be safe to repeat.
 * **Waking is polling plus hints.** An idle worker sleeps at most one poll interval; `start` and
@@ -976,6 +988,7 @@ sequenceDiagram
     J-->>P: Err(AwaitRun { run: child }), journaled
     P->>DB: commit Park, wake_at = now + 60 s, pending_wait = { c1, child }
     C->>DB: claim, step ... terminal commit, Done or Failed
+    Note over C,DB: before a step and on each poll of its cancel watch the child reads the parent.<br/>Parent Failed or gone, the child fails as cancelled by the parent run ending.<br/>Past its deadline, the child fails as cancelled by its time limit.
     C->>R: after the commit: notify_parent
     R->>DB: deliver to the parent: adam.run.finished, id = child id,<br/>payload { status, output or error }
     DB-->>P: parent is Runnable, inbox holds the message
@@ -993,14 +1006,16 @@ stateDiagram-v2
     Waiting --> Answered: timer wake, and the child no longer exists (an error result)
     Waiting --> Waiting: timer wake, the child is still working (one read, new timer)
     Waiting --> Waiting: a user message or a stray notice arrives (nothing answers, new timer)
-    Waiting --> Cancelled: the parent is cancelled (the child is not)
+    Waiting --> Cancelled: the parent is cancelled (its child follows when its worker next looks)
     Answered --> [*]: tool result is the child's text, or an error result
     Cancelled --> [*]
 ```
 
 The message is a hint; the parent's timer (`wait_poll`, 60 s) is the guarantee. The child id is derived
 (`child_run_id(parent, key)`), so a tool that runs again asks for the same child. Cancelling a parent does
-not cancel its children. A subagent on another A2A agent is the same wait with polling and no message.
+cancel its children: a child whose parent is `Failed` or gone is failed by its own worker, and a child started
+within a time limit is failed past it ([Cancel cascades](reference/child-runs.md#cancel-cascades-and-time-limits)). A
+subagent on another A2A agent is the same wait with polling and no message, and a cancel does not reach that task.
 The failure interleavings, their tests and what the design refuses are in
 [Child runs](reference/child-runs.md).
 

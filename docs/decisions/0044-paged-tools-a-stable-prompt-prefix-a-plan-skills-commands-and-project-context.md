@@ -9,6 +9,8 @@ the same day: see [The owner's answers](#the-owners-answers-2026-11-14). Slices 
 either (*verified 2026-11-14*: no `Plugin`, `Rule`, `doom_loop`, `Conversation::turns`, `step_all`, `compact:` step or
 `revert_to` in `crates/` or `bin/`; `delegate_to_opencode` is still registered, `bin/adam-coder/src/tools/mod.rs:765`).
 
+*Built 2026-11-14:* slice 10 (`doom_loop`, time limits, the cancel cascade; [child runs](../reference/child-runs.md#cancel-cascades-and-time-limits)), with these changes from the text: `doom_loop` denies the third call in a row **with the same result** (so a poll whose answer changes keeps working) and, after two refusals, takes the closing turn with `limit: "repeated_call"`; a tool's limit is decided inside its journaled step (300 s unless declared; the coder's command tools the deployment limit plus 30 s, MCP tools their call timeout plus 10 s); a local child's limit is `limits.max_minutes` (30, `0` none, at most 1,440); the cascade reads the parent (`Failed` or gone), adds no `Store` method, and does not reach a remote A2A task.
+
 *Built 2026-11-14:* slice 1 (the loop survives), with two changes from the text above: the closing turn keeps its tools and sends `tool_choice: none`, and a complete body without `finish_reason` stays a protocol error.
 
 *Built 2026-11-14:* slice 5 (ADR 0038's removal of OpenCode), with ADR 0038's slices 1, 2, 4 and 5 in one pull request; its operator slice (3) is void here, [ADR 0046](0046-the-operator-lives-in-the-platform-repository.md).

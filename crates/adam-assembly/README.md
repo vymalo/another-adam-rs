@@ -155,7 +155,9 @@ the agents with `try_build`, so a tool whose `required_state` nobody gave is
 **Limits.** The frontmatter `limits` (`max_turns`, `max_tool_calls`, `max_output_tokens`,
 `max_history_tokens`) replace the loop's default for the keys that are set. Each subagent has its own. A run that
 reaches `max_turns` or `max_tool_calls` gets one closing model call in which it may call no tool and ends `Done`
-with that answer marked `limited` (see `adam-llm-agent`).
+with that answer marked `limited` (see `adam-llm-agent`). `limits.max_minutes` is the time limit of a subagent's run
+(`SubagentTool::with_run_limit`; 30 by default, `0` none, at most 1,440; a warning on a root agent): past it the runtime
+fails the child and the parent reads "the run failed: cancelled: time limit: ...". `DEFAULT_SUBAGENT_MINUTES` is 30.
 
 **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
 `adam_a2a::AgentCardConfig`: `card.name` (default: the agent's), `card.description` (default: the

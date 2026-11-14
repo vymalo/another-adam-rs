@@ -11,6 +11,8 @@ resume" of [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-g
 [ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) decisions 1 and 2 for its
 tools. The orchestration layer's side is its own ADR in `vymalo/another-agentic-system`.
 
+*Built 2026-11-14 ([ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 10):* the runtime half of decision 6: a cancelled or failed parent fails the open round (`cancelled: the parent run ended`) and the session stays usable; `start_child_continuing_within` gives a round the same time limit. Remote sessions are not cancelled (slice 5).
+
 *Built 2026-11-14:* slice 1 (the runtime): `Runtime::start_child_continuing`, the kind `adam.child.reported`
 (`CHILD_REPORTED_KIND`, chosen by whether the child has a conversation) and `Runtime::list_sessions`, in
 `crates/adam-runtime`, with no change to a store or the testkit. Deviations: a listing over runs cannot tell a

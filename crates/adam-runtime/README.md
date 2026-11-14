@@ -165,7 +165,14 @@ A step that runs code which cannot hold the `Ctx` (a tool of an agent) starts ch
 possible parent is that run (`start(id, agent, input)` is `start_child` with the parent fixed). The agent has to
 be registered on that runtime, as an agent or as a starter.
 
-Cancelling a parent does not cancel its children. Take the inbox in every step that can park, including the
+**Cancelling a run cancels the runs that work for it**: a child whose parent is `Failed` (any reason) or gone is failed with
+`cancelled: the parent run ended` by its worker, before it steps (one `load_run(parent)`) and on every poll of the cancel
+watch of a step in flight (one more read per poll); a `Done` parent changes nothing; no `Store` method is involved. Remote A2A
+tasks are not cancelled. **Breaking:** a child started for a parent that does not exist is cancelled when claimed.
+`Runtime::start_child_within` (and `start_child_continuing_within`, `ChildStarter::start_within`) start a child with a time
+limit: the deadline is stored from the runtime's `Clock`, `wake_at` is clamped to it, and a child past it fails with
+`cancelled: time limit: the run did not finish within N min`. `CancelToken::child()` makes a token that fires with its
+parent. Take the inbox in every step that can park, including the
 step that starts the child: a message already in the inbox when a step starts is not "arrived during the step",
 and an agent that parks without reading it sleeps until its timer. The design, the failure interleavings and
 the tests that make each happen are in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#failure-interleavings).
