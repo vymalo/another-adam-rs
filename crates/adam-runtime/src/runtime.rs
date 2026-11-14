@@ -201,13 +201,21 @@ pub struct RunView {
 
 impl RunView {
     fn new(rec: RunRecord, env: Envelope, claimed: bool) -> Self {
+        // The wake the runtime set for a watched run (to look at its parent, ADR 0044 slice 10) is
+        // not the agent's: a view says when the agent asked to be woken, so a run waiting for a
+        // person or a message still reads as waiting.
+        let wake_at = if env.hb && rec.status == RunStatus::Parked {
+            env.agent_wake
+        } else {
+            rec.wake_at
+        };
         Self {
             id: rec.id,
             agent: rec.agent,
             conversation_id: rec.conversation_id,
             status: rec.status,
-            wake_at: rec.wake_at,
-            waiting: rec.status == RunStatus::Parked && rec.wake_at.is_none(),
+            wake_at,
+            waiting: rec.status == RunStatus::Parked && wake_at.is_none(),
             claimed,
             output: (rec.status == RunStatus::Done).then_some(env.output),
             error: env.error,
@@ -868,11 +876,11 @@ impl Runtime {
     /// instead of starting another.
     ///
     /// The child is an ordinary run: it has no conversation. **It does not outlive a parent that
-    /// failed**: when `parent` is `Failed` for any reason (a [`cancel`](Self::cancel) included) or is
-    /// gone, the worker that holds the child fails it with `cancelled: the parent run ended` before it
-    /// steps and on every poll of its cancel watch. `parent` is not checked when the child is
-    /// started, so a child started for a parent that does not exist is cancelled when it is first
-    /// claimed.
+    /// failed**: when `parent` is `Failed` for any reason (a [`cancel`](Self::cancel) included), the
+    /// worker that holds the child fails it with `cancelled: the parent run ended` before it steps and
+    /// on the poll of its cancel watch, and a parked child is looked at once a minute. `parent` is not
+    /// checked when the child is started, and a parent that is not in the store is unknown, not ended:
+    /// it cancels nothing.
     pub async fn start_child(
         &self,
         parent: RunId,
@@ -1259,12 +1267,15 @@ impl Runtime {
     /// either way).
     ///
     /// **Cancelling a run cancels the runs that work for it** (ADR 0044 slice 10): a child run, whose
-    /// parent is `Failed` for any reason (this cancel included) or gone, is failed with
-    /// `cancelled: the parent run ended` by the worker that holds it, before it steps and on every
-    /// poll of its cancel watch, and its own children after it in turn. A running child is told
-    /// within one poll interval, a runnable one when it is claimed, a parked one at its next wake
-    /// (a child waiting for its own child, at most its wait poll). A parent that is `Done` changes
-    /// nothing. Remote A2A tasks a run started are not cancelled by this. Asking twice, or for a
+    /// parent is `Failed` for any reason (this cancel included), is failed with
+    /// `cancelled: the parent run ended` by the worker that holds it, before it steps and on the
+    /// poll of its cancel watch (at most once a second), and its own children after it in turn. A
+    /// running child is told within a second or so, a runnable one when it is claimed, a parked one
+    /// within a minute: a parked child that works for a parent always carries a wake no later than a
+    /// minute away, and at it the runtime reads the parent **before** the agent is stepped, then parks
+    /// the run again without stepping the agent when nothing else is due. A parent that is `Done`
+    /// changes nothing, and one that cannot be loaded (purged by retention, or the store is down) is
+    /// unknown and cancels nothing. Remote A2A tasks a run started are not cancelled by this. Asking twice, or for a
     /// finished run, is a no-op.
     #[tracing::instrument(skip(self))]
     pub async fn cancel(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {

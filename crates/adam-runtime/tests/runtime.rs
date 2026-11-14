@@ -573,6 +573,30 @@ fn child_with_child(
     )
 }
 
+/// Two instants of a clock that is the wall clock plus an offset are the same within a second or two.
+fn near(a: chrono::DateTime<chrono::Utc>, b: chrono::DateTime<chrono::Utc>) {
+    assert!(
+        (a - b).num_milliseconds().abs() < 2_000,
+        "{a} is not near {b}"
+    );
+}
+
+/// A child that parks on a timer of `minutes` minutes, and does so again at each wake.
+fn child_parked_on_a_timer(name: &str, minutes: i64) -> FnAgent {
+    fn_agent(
+        name,
+        step_fn(move |ctx, state| {
+            async move {
+                Ok(Transition::Park {
+                    state,
+                    wake_at: Some(ctx.now() + chrono::Duration::minutes(minutes)),
+                })
+            }
+            .boxed()
+        }),
+    )
+}
+
 /// One runtime that holds a parent and its child, on a manual clock.
 fn family(
     store: &DynStore,
@@ -4503,7 +4527,7 @@ mod cases {
     }
 
     /// A parent that is `Done`, or still working, changes nothing for its child; one that failed for
-    /// another reason than a cancel does, as does one that is gone.
+    /// another reason than a cancel does; one that is not in the store is unknown and does not.
     pub async fn a_child_follows_a_parent_that_failed_but_not_one_that_is_done(store: DynStore) {
         let (name, child_name, failing_name) = (uniq("parent"), uniq("child"), uniq("failing"));
         let rt = builder(&store, &uniq("w"), &child_parked(&name))
@@ -4555,16 +4579,17 @@ mod cases {
             Some("it broke")
         );
 
-        // A parent that does not exist: the child is cancelled when it is claimed.
+        // A parent that cannot be loaded is unknown, and cancels nothing.
         let orphan = RunId::new();
         rt.start_child(RunId::new(), orphan, &child_name, inbound())
             .await
             .unwrap();
-        let ended = wait_failed(&rt, orphan).await;
+        wait_waiting(&rt, orphan).await;
         worker.stop().await;
         assert_eq!(
-            ended.error.as_deref(),
-            Some("cancelled: the parent run ended")
+            rt.view(orphan).await.unwrap().unwrap().status,
+            RunStatus::Parked,
+            "a parent that is not in the store is not a parent that ended"
         );
     }
 
@@ -4634,11 +4659,17 @@ mod cases {
     /// one, which would wait for a message that never comes, at the wake the runtime set at the
     /// deadline. A child with no limit parks with no wake.
     pub async fn a_child_past_its_deadline_fails_and_wakes_at_it(store: DynStore) {
-        let (name, parked_name, running_name) = (uniq("parent"), uniq("parked"), uniq("running"));
+        let (name, parked_name, running_name, free_name) = (
+            uniq("parent"),
+            uniq("parked"),
+            uniq("running"),
+            uniq("free"),
+        );
         let (started, saw) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
         let clock = ManualClock::new();
         let rt = builder(&store, &uniq("w"), &child_parked(&name))
-            .agent(child_parked(&parked_name))
+            .agent(child_parked_on_a_timer(&parked_name, 50))
+            .agent(child_parked(&free_name))
             .agent(child_listening(&running_name, &started, &saw))
             .clock(clock.clone())
             .build();
@@ -4652,16 +4683,28 @@ mod cases {
             .await
             .expect("parked child");
         let view = wait_for(&rt, parked, "the child parked", |v| {
-            v.status == RunStatus::Parked && v.wake_at.is_some()
+            v.status == RunStatus::Parked
         })
         .await;
-        assert_eq!(view.wake_at, Some(deadline), "it wakes at its deadline");
+        assert!(
+            view.wake_at.unwrap() > deadline,
+            "the view says what the agent asked for: 50 min"
+        );
+        let stored = store.load_run(parked).await.unwrap().unwrap();
+        near(
+            stored.wake_at.unwrap(),
+            clock.now() + chrono::Duration::seconds(60),
+        );
+        assert!(
+            deadline > stored.wake_at.unwrap(),
+            "the runtime looks at it within the poll"
+        );
         let free = child_run_id(parent, "free");
-        rt.start_child(parent, free, &parked_name, inbound())
+        rt.start_child(parent, free, &free_name, inbound())
             .await
             .expect("child with no limit");
         let view = wait_waiting(&rt, free).await;
-        assert_eq!(view.wake_at, None, "no limit, no wake");
+        assert_eq!(view.wake_at, None, "no limit, no wake of the agent's");
 
         let running = child_run_id(parent, "running");
         rt.start_child_within(parent, running, &running_name, inbound(), Some(limit))
@@ -4712,6 +4755,532 @@ mod cases {
         let done = wait_done(&rt, id).await;
         worker.stop().await;
         assert_eq!(done.output, Some(json!("ok")));
+    }
+
+    /// A child that waits with no timer (it asked a question) is looked at by the runtime once a
+    /// minute: when its parent has been cancelled it fails, without anyone answering.
+    pub async fn a_child_parked_on_a_question_is_cancelled_when_its_parent_is(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &child_parked(&name))
+            .agent(child_parked(&child_name))
+            .clock(clock.clone())
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.unwrap();
+        let child = child_run_id(parent, "q");
+        rt.start_child(parent, child, &child_name, inbound())
+            .await
+            .unwrap();
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, child).await;
+
+        rt.cancel(parent, "changed my mind").await.unwrap();
+        clock.advance(Duration::from_secs(61));
+        let ended = wait_failed(&rt, child).await;
+        worker.stop().await;
+        assert_eq!(
+            ended.error.as_deref(),
+            Some("cancelled: the parent run ended")
+        );
+    }
+
+    /// The runs under a parked child are reached one level at a time, each at its next look.
+    pub async fn a_grandchild_under_a_parked_child_follows(store: DynStore) {
+        let (name, mid_name, leaf_name) = (uniq("root"), uniq("mid"), uniq("leaf"));
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &child_parked(&name))
+            .agent(child_parked(&mid_name))
+            .agent(child_parked(&leaf_name))
+            .clock(clock.clone())
+            .build();
+        let root = rt.start(&name, inbound(), None).await.unwrap();
+        let (mid, leaf) = (child_run_id(root, "m"), RunId::new());
+        rt.start_child(root, mid, &mid_name, inbound())
+            .await
+            .unwrap();
+        rt.start_child(mid, leaf, &leaf_name, inbound())
+            .await
+            .unwrap();
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, mid).await;
+        wait_waiting(&rt, leaf).await;
+
+        rt.cancel(root, "stop").await.unwrap();
+        clock.advance(Duration::from_secs(61));
+        wait_failed(&rt, mid).await;
+        clock.advance(Duration::from_secs(61));
+        let ended = wait_failed(&rt, leaf).await;
+        worker.stop().await;
+        assert_eq!(
+            ended.error.as_deref(),
+            Some("cancelled: the parent run ended")
+        );
+    }
+
+    /// The look at the parent costs the agent nothing: a healthy parked child is woken again and
+    /// again, its agent is not stepped, nothing is journaled and no model would be called.
+    pub async fn a_healthy_parked_child_is_woken_without_stepping_the_agent(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let steps = Arc::new(AtomicUsize::new(0));
+        let child_agent = {
+            let steps = steps.clone();
+            fn_agent(
+                &child_name,
+                step_fn(move |ctx, state| {
+                    let steps = steps.clone();
+                    async move {
+                        steps.fetch_add(1, SeqCst);
+                        let _: Result<u32, String> = ctx.step("work", || async { Ok(1) }).await?;
+                        Ok(Transition::Park {
+                            state,
+                            wake_at: None,
+                        })
+                    }
+                    .boxed()
+                }),
+            )
+        };
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &child_parked(&name))
+            .agent(child_agent)
+            .clock(clock.clone())
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.unwrap();
+        let child = child_run_id(parent, "c");
+        rt.start_child(parent, child, &child_name, inbound())
+            .await
+            .unwrap();
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, child).await;
+        assert_eq!(count(&steps), 1);
+        let mut version = rt.view(child).await.unwrap().unwrap().version;
+
+        for _ in 0..5 {
+            clock.advance(Duration::from_secs(61));
+            let seen = version;
+            version = wait_for(&rt, child, "woken and parked again", |v| v.version > seen)
+                .await
+                .version;
+        }
+        worker.stop().await;
+        assert_eq!(count(&steps), 1, "the agent was not stepped");
+        assert!(store.journal_get(child, 0).await.unwrap().is_some());
+        assert!(
+            store.journal_get(child, 1).await.unwrap().is_none(),
+            "and nothing was journaled"
+        );
+        assert_eq!(
+            rt.view(child).await.unwrap().unwrap().status,
+            RunStatus::Parked
+        );
+    }
+
+    /// P starts a session round R and finishes `Done`; retention purges P; R still works and
+    /// finishes: a parent that is not in the store is unknown, not ended.
+    pub async fn a_done_parent_that_was_purged_leaves_its_open_child_running(store: DynStore) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let clock = ManualClock::new();
+        let rt = Runtime::builder(store.clone())
+            .agent(child_done(&parent_name, json!("done")))
+            .agent(RoundAgent {
+                name: agent.clone(),
+                waits: true,
+            })
+            .clock(clock.clone())
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        let round = child_run_id(parent, "call-1");
+        let conversation = session_conversation_id(&uniq("u:ctx"), round);
+        rt.start_child_continuing(parent, round, &agent, say("one"), &conversation, None)
+            .await
+            .unwrap();
+        wait_waiting(&rt, round).await;
+
+        let purged = store
+            .purge_finished(
+                &parent_name,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(purged, 1);
+        assert!(store.load_run(parent).await.unwrap().is_none());
+        // Several looks at the missing parent: the round is not cancelled.
+        for _ in 0..3 {
+            clock.advance(Duration::from_secs(61));
+            let seen = rt.view(round).await.unwrap().unwrap().version;
+            wait_for(&rt, round, "looked at", |v| v.version > seen).await;
+        }
+        assert_eq!(
+            rt.view(round).await.unwrap().unwrap().status,
+            RunStatus::Parked
+        );
+        rt.deliver(round, say("steer")).await.unwrap();
+        let done = wait_done(&rt, round).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!({"text": "one"})));
+    }
+
+    /// The limit is for runaway work: the time a child waits for a person is not counted. A child
+    /// with 30 minutes that waits 2 hours for an answer is not failed, and has what was left (all of
+    /// it) when it works again.
+    pub async fn a_child_waiting_for_a_person_keeps_its_time_for_when_it_works(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (started, saw) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let child_agent = {
+            let (started, saw) = (started.clone(), saw.clone());
+            fn_agent(
+                &child_name,
+                step_fn(move |ctx, state| {
+                    let (started, saw) = (started.clone(), saw.clone());
+                    async move {
+                        if ctx.take_inbox().is_empty() {
+                            return Ok(Transition::Park {
+                                state,
+                                wake_at: None,
+                            });
+                        }
+                        started.notify_one();
+                        ctx.cancelled().await;
+                        saw.store(true, SeqCst);
+                        Err(AgentError::permanent("stopped"))
+                    }
+                    .boxed()
+                }),
+            )
+        };
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &child_parked(&name))
+            .agent(child_agent)
+            .clock(clock.clone())
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        let child = child_run_id(parent, "q");
+        rt.start_child_within(
+            parent,
+            child,
+            &child_name,
+            inbound(),
+            Some(Duration::from_secs(30 * 60)),
+        )
+        .await
+        .unwrap();
+        wait_waiting(&rt, child).await;
+
+        // Two hours of waiting for the answer.
+        for _ in 0..2 {
+            clock.advance(Duration::from_secs(60 * 60));
+            let seen = rt.view(child).await.unwrap().unwrap().version;
+            wait_for(&rt, child, "looked at", |v| v.version > seen).await;
+        }
+        assert_eq!(
+            rt.view(child).await.unwrap().unwrap().status,
+            RunStatus::Parked,
+            "waiting for a person is not time against the limit"
+        );
+
+        // The answer comes: the child works, and has its 30 minutes from now.
+        rt.deliver(child, say("the answer")).await.unwrap();
+        notified(&started, "the child to work").await;
+        clock.advance(Duration::from_secs(20 * 60));
+        let seen = rt.view(child).await.unwrap().unwrap();
+        assert_eq!(
+            seen.status,
+            RunStatus::Runnable,
+            "twenty minutes of work is within the limit"
+        );
+        assert!(!saw.load(SeqCst));
+        clock.advance(Duration::from_secs(11 * 60));
+        let ended = wait_failed(&rt, child).await;
+        worker.stop().await;
+        assert_eq!(
+            ended.error.as_deref(),
+            Some("cancelled: time limit: the run did not finish within 30 min")
+        );
+        assert!(saw.load(SeqCst));
+    }
+
+    /// A wake that comes before the deadline (the clock of the store ahead of this one) parks the
+    /// child again, to the deadline plus a second, and does not step the agent or loop.
+    pub async fn a_wake_before_the_deadline_parks_again_without_stepping(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let steps = Arc::new(AtomicUsize::new(0));
+        let child_agent = {
+            let steps = steps.clone();
+            fn_agent(
+                &child_name,
+                step_fn(move |ctx, state| {
+                    let steps = steps.clone();
+                    async move {
+                        steps.fetch_add(1, SeqCst);
+                        Ok(Transition::Park {
+                            state,
+                            wake_at: Some(ctx.now() + chrono::Duration::minutes(50)),
+                        })
+                    }
+                    .boxed()
+                }),
+            )
+        };
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &child_parked(&name))
+            .agent(child_agent)
+            .clock(clock.clone())
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.unwrap();
+        let child = child_run_id(parent, "c");
+        let start = clock.now();
+        rt.start_child_within(
+            parent,
+            child,
+            &child_name,
+            inbound(),
+            Some(Duration::from_secs(1800)),
+        )
+        .await
+        .unwrap();
+        let worker = spawn_worker(&rt);
+        wait_for(&rt, child, "parked", |v| v.status == RunStatus::Parked).await;
+        let deadline = start + chrono::Duration::seconds(1800);
+
+        // Five seconds before the deadline a wake is due that the deadline did not set.
+        clock.advance(Duration::from_secs(1795));
+        let rec = store.load_run(child).await.unwrap().unwrap();
+        let version = rec.version;
+        let mut update = adam_core::RunUpdate::new(RunStatus::Parked, rec.state.clone());
+        update.wake_at = Some(clock.now());
+        store.commit_run(child, rec.version, update).await.unwrap();
+        let parked = wait_for(&rt, child, "parked again", |v| v.version >= version + 2).await;
+        assert_eq!(parked.status, RunStatus::Parked);
+        let rec = store.load_run(child).await.unwrap().unwrap();
+        near(
+            rec.wake_at.unwrap(),
+            deadline + chrono::Duration::seconds(1),
+        );
+        assert_eq!(count(&steps), 1, "the agent was not stepped");
+        assert_eq!(rec.version, version + 2, "and there was no loop");
+
+        clock.advance(Duration::from_secs(7));
+        let ended = wait_failed(&rt, child).await;
+        worker.stop().await;
+        assert_eq!(
+            ended.error.as_deref(),
+            Some("cancelled: time limit: the run did not finish within 30 min")
+        );
+    }
+
+    /// A child that retries with a wake an hour away and has 30 minutes is failed at 30 minutes:
+    /// the wake of a runnable run is clamped to the deadline too.
+    pub async fn a_runnable_wake_past_the_deadline_is_clamped_to_it(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let child_agent = fn_agent(
+            &child_name,
+            step_fn(|_ctx, _state| {
+                async move {
+                    Err(AgentError::transient_after(
+                        "later",
+                        Duration::from_secs(3600),
+                    ))
+                }
+                .boxed()
+            }),
+        );
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &child_parked(&name))
+            .agent(child_agent)
+            .clock(clock.clone())
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.unwrap();
+        let child = child_run_id(parent, "c");
+        let start = clock.now();
+        rt.start_child_within(
+            parent,
+            child,
+            &child_name,
+            inbound(),
+            Some(Duration::from_secs(1800)),
+        )
+        .await
+        .unwrap();
+        let worker = spawn_worker(&rt);
+        let retrying = wait_for(&rt, child, "retry scheduled", |v| v.attempt == 1).await;
+        near(
+            retrying.wake_at.unwrap(),
+            start + chrono::Duration::seconds(1800),
+        );
+        clock.advance(Duration::from_secs(31 * 60));
+        let ended = wait_failed(&rt, child).await;
+        worker.stop().await;
+        assert_eq!(
+            ended.error.as_deref(),
+            Some("cancelled: time limit: the run did not finish within 30 min")
+        );
+    }
+
+    /// The deadline is fixed when the child is made: a child that parks on a 20 minute timer again
+    /// and again still fails at 30 minutes, at its second wake.
+    pub async fn a_deadline_is_set_once_and_not_moved_by_later_commits(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let steps = Arc::new(AtomicUsize::new(0));
+        let child_agent = {
+            let steps = steps.clone();
+            fn_agent(
+                &child_name,
+                step_fn(move |ctx, state| {
+                    let steps = steps.clone();
+                    async move {
+                        steps.fetch_add(1, SeqCst);
+                        Ok(Transition::Park {
+                            state,
+                            wake_at: Some(ctx.now() + chrono::Duration::minutes(20)),
+                        })
+                    }
+                    .boxed()
+                }),
+            )
+        };
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &child_parked(&name))
+            .agent(child_agent)
+            .clock(clock.clone())
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.unwrap();
+        let child = child_run_id(parent, "c");
+        rt.start_child_within(
+            parent,
+            child,
+            &child_name,
+            inbound(),
+            Some(Duration::from_secs(1800)),
+        )
+        .await
+        .unwrap();
+        let worker = spawn_worker(&rt);
+        wait_for(&rt, child, "first park", |v| v.status == RunStatus::Parked).await;
+        clock.advance(Duration::from_secs(21 * 60));
+        wait_for(&rt, child, "second park", |v| {
+            count(&steps) == 2 && v.status == RunStatus::Parked
+        })
+        .await;
+        // 31 minutes in: past the first deadline, not past one recomputed at the second commit.
+        clock.advance(Duration::from_secs(10 * 60));
+        let ended = wait_failed(&rt, child).await;
+        worker.stop().await;
+        assert_eq!(
+            count(&steps),
+            2,
+            "the third wake failed the run, it did not step"
+        );
+        assert_eq!(
+            ended.error.as_deref(),
+            Some("cancelled: time limit: the run did not finish within 30 min")
+        );
+    }
+
+    /// A session round takes the time limit of `start_child_continuing_within`, and the session stays
+    /// usable: the next round continues from the failed one.
+    pub async fn a_round_with_a_limit_fails_past_it(store: DynStore) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let park = Arc::new(AtomicBool::new(true));
+        let clock = ManualClock::new();
+        let rt = Runtime::builder(store.clone())
+            .agent(child_parked(&parent_name))
+            .agent(TimedRound {
+                name: agent.clone(),
+                park: park.clone(),
+            })
+            .clock(clock.clone())
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        let session = child_run_id(parent, "call-1");
+        let conversation = session_conversation_id(&uniq("u:ctx"), session);
+        rt.start_child_continuing_within(
+            parent,
+            session,
+            &agent,
+            say("one"),
+            &conversation,
+            None,
+            Some(Duration::from_secs(600)),
+        )
+        .await
+        .unwrap();
+        wait_for(&rt, session, "parked", |v| v.status == RunStatus::Parked).await;
+        clock.advance(Duration::from_secs(601));
+        let ended = wait_failed(&rt, session).await;
+        assert_eq!(
+            ended.error.as_deref(),
+            Some("cancelled: time limit: the run did not finish within 10 min")
+        );
+        park.store(false, SeqCst);
+        let second = child_run_id(parent, "call-2");
+        rt.start_child_continuing(
+            parent,
+            second,
+            &agent,
+            say("two"),
+            &conversation,
+            Some(session),
+        )
+        .await
+        .unwrap();
+        let view = wait_done(&rt, second).await;
+        worker.stop().await;
+        assert_eq!(round_of(&view).before, vec!["one"]);
+    }
+
+    /// The cancel watch of a running child reads its parent about once a second, not on every poll.
+    pub async fn the_watch_reads_the_parent_about_once_a_second(store: DynStore) {
+        let (faulty, dynamic) = faulty(store);
+        let (name, child_name, alone_name) = (uniq("parent"), uniq("child"), uniq("alone"));
+        let (started, saw) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let (alone_started, alone_saw) =
+            (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let rt = builder(&dynamic, &uniq("w"), &child_parked(&name))
+            .agent(child_listening(&child_name, &started, &saw))
+            .agent(child_listening(&alone_name, &alone_started, &alone_saw))
+            .poll_interval(Duration::from_millis(10))
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, parent).await;
+
+        // The same running step, with a parent and with none: the reads that differ are the parent's.
+        let window = Duration::from_millis(2500);
+        let mut reads = Vec::new();
+        for with_parent in [false, true] {
+            let id = RunId::new();
+            if with_parent {
+                rt.start_child(parent, id, &child_name, inbound())
+                    .await
+                    .unwrap();
+                notified(&started, "the child").await;
+            } else {
+                rt.start_with_id(id, &alone_name, inbound(), None)
+                    .await
+                    .unwrap();
+                notified(&alone_started, "the run").await;
+            }
+            let before = faulty.calls(Method::LoadRun);
+            tokio::time::sleep(window).await;
+            reads.push(faulty.calls(Method::LoadRun) - before);
+            rt.cancel(id, "done measuring").await.unwrap();
+        }
+        worker.stop().await;
+        let extra = reads[1].saturating_sub(reads[0]);
+        // 250 polls of the window would each read the parent without the limit; about 3 do.
+        assert!(
+            extra <= 8,
+            "the parent was read {extra} times more than a run with none: {reads:?}"
+        );
     }
 
     /// Fencing. The worker that started the child loses its lease before it commits; another
@@ -6300,6 +6869,16 @@ macro_rules! runtime_suite {
                 a_cancelled_parent_fails_the_open_round_and_the_session_continues,
                 a_child_past_its_deadline_fails_and_wakes_at_it,
                 an_envelope_without_a_deadline_decodes,
+                a_child_parked_on_a_question_is_cancelled_when_its_parent_is,
+                a_grandchild_under_a_parked_child_follows,
+                a_healthy_parked_child_is_woken_without_stepping_the_agent,
+                a_done_parent_that_was_purged_leaves_its_open_child_running,
+                a_child_waiting_for_a_person_keeps_its_time_for_when_it_works,
+                a_wake_before_the_deadline_parks_again_without_stepping,
+                a_runnable_wake_past_the_deadline_is_clamped_to_it,
+                a_deadline_is_set_once_and_not_moved_by_later_commits,
+                a_round_with_a_limit_fails_past_it,
+                the_watch_reads_the_parent_about_once_a_second,
                 a_parent_that_loses_its_lease_does_not_start_or_resume_twice,
                 child_status_reads_only_the_callers_children,
                 a_purged_child_reads_as_gone,

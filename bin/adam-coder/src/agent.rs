@@ -616,21 +616,33 @@ fn limited_ending(
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let kind = output
-        .get("limit")
-        .and_then(|limit| serde_json::from_value::<adam_llm_agent::LimitKind>(limit.clone()).ok())
-        .unwrap_or(adam_llm_agent::LimitKind::MaxTurns);
+    // An output with no `limit` is the oldest shape, a turn limit. One that names a limit this binary
+    // does not know (a newer loop wrote it) is said neutrally and never as a turn limit.
+    let kind = match output.get("limit") {
+        None => Some(adam_llm_agent::LimitKind::MaxTurns),
+        Some(limit) => serde_json::from_value::<adam_llm_agent::LimitKind>(limit.clone()).ok(),
+    };
     let (what, bound) = match kind {
-        adam_llm_agent::LimitKind::MaxToolCalls => (
+        Some(adam_llm_agent::LimitKind::MaxToolCalls) => (
             "tool call",
             format!("max_tool_calls = {}", limits.max_tool_calls),
         ),
-        adam_llm_agent::LimitKind::MaxTurns => {
+        Some(adam_llm_agent::LimitKind::MaxTurns) => {
             ("turn", format!("max_turns = {}", limits.max_turns))
         }
-        adam_llm_agent::LimitKind::RepeatedCall => (
+        Some(adam_llm_agent::LimitKind::RepeatedCall) => (
             "repeated call",
             "the same call with the same result, three times in a row".to_owned(),
+        ),
+        None => (
+            "run",
+            format!(
+                "limit: {}",
+                output
+                    .get("limit")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            ),
         ),
     };
     Some(format!(
@@ -1415,6 +1427,17 @@ mod tests {
         let calls = json!({"text": "half", "limited": true, "limit": "max_tool_calls"});
         let error = limited_ending(&calls, true, &limits).expect("fails");
         assert!(error.contains("max_tool_calls = 200"), "{error}");
+        // The limit of the doom loop, and one this binary has never heard of.
+        let repeated = json!({"text": "stuck", "limited": true, "limit": "repeated_call"});
+        let error = limited_ending(&repeated, true, &limits).expect("fails");
+        assert!(error.starts_with("repeated call limit reached"), "{error}");
+        let unknown = json!({"text": "half", "limited": true, "limit": "max_budget"});
+        let error = limited_ending(&unknown, true, &limits).expect("fails");
+        assert!(error.contains("limit: max_budget"), "{error}");
+        assert!(
+            !error.contains("turn limit") && !error.contains("max_turns"),
+            "{error}"
+        );
     }
 
     #[test]

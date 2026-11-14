@@ -52,6 +52,20 @@ pub(crate) struct Envelope {
     /// The limit [`deadline`](Self::deadline) was set from, in seconds: what the failure says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_secs: Option<u64>,
+    /// What is left of the time limit while the run waits for a person (it parked with no timer):
+    /// the deadline is cleared and this is kept, and the next step that follows a message sets the
+    /// deadline again from it. Time spent on a timer or on a child still counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_secs: Option<u64>,
+    /// When the agent itself asked to be woken, as it parked (`None`: it waits for a message). The
+    /// stored `wake_at` of a watched run can be earlier, so that the runtime looks at the run's
+    /// parent and deadline in between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_wake: Option<DateTime<Utc>>,
+    /// The runtime set the wake of this parked run (it works for a parent or has a deadline): a claim
+    /// that is not the agent's own wake only looks at the parent and the deadline, and parks again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hb: bool,
 }
 
 impl Envelope {
@@ -68,6 +82,9 @@ impl Envelope {
             artifacts: Vec::new(),
             deadline: None,
             limit_secs: None,
+            remaining_secs: None,
+            agent_wake: None,
+            hb: false,
         }
     }
 

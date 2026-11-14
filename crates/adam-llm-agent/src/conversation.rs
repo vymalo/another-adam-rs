@@ -241,6 +241,9 @@ pub struct Repeats {
     /// How many times the call has been refused since.
     #[serde(default)]
     pub refused: u32,
+    /// How many calls in a row with this key ended in an error result, whatever the error said.
+    #[serde(default)]
+    pub failing: u32,
 }
 
 /// A [`Limits`](crate::Limits) bound a run reached.
@@ -840,6 +843,28 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_continued_run_starts_with_no_repeat_count_and_no_limit() {
+        let prior = Conversation {
+            repeats: Some(Repeats {
+                key: "k".into(),
+                answer: "a".into(),
+                count: 2,
+                refused: 1,
+                failing: 2,
+            }),
+            limit: Some(LimitHit {
+                limit: LimitKind::RepeatedCall,
+                answered: true,
+                answer: None,
+            }),
+            ..Conversation::default()
+        };
+        let next = prior.continued("again", RunId::new());
+        assert_eq!(next.repeats, None);
+        assert_eq!(next.limit, None);
+    }
 
     #[test]
     fn the_ids_a_run_remembers_are_bounded_and_the_oldest_is_given_up() {

@@ -319,3 +319,175 @@ async fn a_refusal_replays_the_same() {
     // next (FNV-1a over the name and the canonical arguments).
     assert_eq!(repeats.key, "a945aedd85bb19ef");
 }
+
+/// A tool named `flaky` that always fails, with a message that is never the same twice (a duration,
+/// a process id, a path in a temp directory).
+struct Flaky(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for Flaky {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "flaky".into(),
+            description: "always fails".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let n = self.0.fetch_add(1, SeqCst);
+        Ok(ToolOutput::error(format!(
+            "exit 1 after {}.{n} s in /tmp/run-{n}",
+            3 + n
+        )))
+    }
+}
+
+#[tokio::test]
+async fn a_call_that_fails_three_times_in_a_row_is_refused_whatever_the_errors_say() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let h = Harness::new(|b| b.tool(Flaky(calls.clone())));
+    for i in 1..=3 {
+        h.mock.push_tool_calls(vec![call(
+            &format!("c{i}"),
+            "flaky",
+            json!({"cmd": "make"}),
+        )]);
+    }
+    h.mock.push_text("I give up on make");
+    let view = h.run("go").await;
+    assert_eq!(calls.load(SeqCst), 2, "the third failure is not run");
+    let answers = tool_answers(&conversation(&view));
+    assert!(answers[0].1 && answers[1].1);
+    assert_ne!(answers[0].0, answers[1].0, "the errors differ");
+    assert!(
+        answers[2].0.starts_with("Not run: this is the third call"),
+        "{answers:?}"
+    );
+}
+
+#[tokio::test]
+async fn refusals_of_different_loops_do_not_add_up() {
+    let (a, _) = Scripted::new("a", &["same"]);
+    let (b, _) = Scripted::new("b", &["other"]);
+    let h = Harness::new(|builder| builder.tool(a).tool(b));
+    for (i, name) in ["a", "a", "a", "b", "b", "b"].into_iter().enumerate() {
+        h.mock
+            .push_tool_calls(vec![call(&format!("c{i}"), name, json!({}))]);
+    }
+    h.mock.push_text("done");
+    let view = h.run("go").await;
+    let answers = tool_answers(&conversation(&view));
+    assert!(
+        answers[2].1 && answers[5].1,
+        "each loop's third call is refused"
+    );
+    let output = view.output.expect("output");
+    assert!(output.get("limit").is_none(), "{output}");
+}
+
+/// Starts the agent `child` and waits for it.
+struct Delegate;
+
+#[async_trait]
+impl Tool for Delegate {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delegate".into(),
+            description: "delegates".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let run = ctx.start_child("child", "go").await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
+/// Asks the person.
+struct Ask;
+
+#[async_trait]
+impl Tool for Ask {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ask".into(),
+            description: "asks".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    fn asks_user(&self) -> bool {
+        true
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::needs_input("Which one?"))
+    }
+}
+
+#[tokio::test]
+async fn the_count_starts_over_when_the_run_waits_for_a_child() {
+    let (a, calls) = Scripted::new("a", &["same"]);
+    let mock = Arc::new(MockModel::new());
+    let child_mock = Arc::new(MockModel::new());
+    child_mock.push_text("child done");
+    let (model, child_model): (DynModel, DynModel) = (mock.clone(), child_mock);
+    let parent = LlmAgent::builder("llm", model, "m")
+        .tool(a)
+        .tool(Delegate)
+        .build();
+    let child = LlmAgent::builder("child", child_model, "m").build();
+    let rt = Runtime::builder(Arc::new(MemoryStore::new()) as DynStore)
+        .agent(parent)
+        .agent(child)
+        .event_sink(CollectingSink::new())
+        .worker_id("w")
+        .poll_interval(Duration::from_millis(20))
+        .build();
+    for (i, name) in ["a", "a", "delegate", "a"].into_iter().enumerate() {
+        mock.push_tool_calls(vec![call(&format!("c{i}"), name, json!({}))]);
+    }
+    mock.push_text("done");
+    let h = Harness { mock, rt };
+    let view = h.run("go").await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(calls.load(SeqCst), 3, "the call after the child runs");
+}
+
+#[tokio::test]
+async fn the_count_starts_over_when_the_run_asks_the_person() {
+    let (a, calls) = Scripted::new("a", &["same"]);
+    let h = Harness::new(|b| b.tool(a).tool(Ask));
+    for (i, name) in ["a", "a", "ask", "a"].into_iter().enumerate() {
+        h.mock
+            .push_tool_calls(vec![call(&format!("c{i}"), name, json!({}))]);
+    }
+    h.mock.push_text("done");
+    let run =
+        h.rt.start("llm", user_message("go"), None)
+            .await
+            .expect("start");
+    let (stop, rx) = oneshot::channel::<()>();
+    let rt = h.rt.clone();
+    let worker = tokio::spawn(async move {
+        rt.run_worker(async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let view = h.rt.view(run).await.unwrap().unwrap();
+        if view.waiting {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never asked: {view:#?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    h.rt.deliver(run, user_message("the first one"))
+        .await
+        .unwrap();
+    let view = wait_terminal(&h.rt, run).await;
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(calls.load(SeqCst), 3, "the call after the answer runs");
+}

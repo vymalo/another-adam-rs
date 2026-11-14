@@ -34,6 +34,33 @@ fn expected_names(server: &str) -> Vec<String> {
         .collect()
 }
 
+/// The agent's limit for a call is the call's timeout, the connection's and ten seconds: a call that
+/// has to dial again is not cut by the agent while it is still within its own bounds.
+#[tokio::test]
+async fn a_tool_declares_its_call_timeout_plus_its_connect_timeout_plus_ten_seconds() {
+    let server = TestHttpServer::start(None).await;
+    let config = http_config("t", &server.url(), "");
+    let default = McpServers::connect(&config, &Env::new(), &McpPolicy::default())
+        .await
+        .unwrap();
+    let tools = default.tools();
+    assert_eq!(
+        tools.get("t__echo").unwrap().time_limit(),
+        Some(Duration::from_secs(60 + 30 + 10)),
+        "the defaults: 60 s a call, 30 s a connection"
+    );
+    let policy = McpPolicy::default()
+        .call_timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(5));
+    let set = McpServers::connect(&config, &Env::new(), &policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        set.tools().get("t__echo").unwrap().time_limit(),
+        Some(Duration::from_secs(120 + 5 + 10))
+    );
+}
+
 #[tokio::test]
 async fn lists_and_calls_over_streamable_http() {
     let server = TestHttpServer::start(None).await;

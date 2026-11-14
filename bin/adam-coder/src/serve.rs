@@ -102,6 +102,7 @@ async fn build_agent(
     settings.create_for_installed_owners = worker.github.names_its_accounts();
     settings.max_access_tier = max_access_tier;
     settings.check_timeout = worker.check_timeout;
+    settings.environment_start = worker.run_environment.start_bound(&worker.devcontainer);
     settings.check_output_tail = worker.check_output_tail;
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);

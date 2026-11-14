@@ -240,6 +240,20 @@ pub enum RunEnvironment {
     Kubernetes(RunPodsConfig),
 }
 
+impl RunEnvironment {
+    /// The longest the environment of a run can take to be made ready: nothing in the coder's own
+    /// container, `DEVCONTAINER_UP_TIMEOUT_SECS` and `DEVCONTAINER_SETUP_TIMEOUT_SECS` for a
+    /// devcontainer, `RUN_POD_WAIT_SECS` and `RUN_POD_READY_TIMEOUT_SECS` for run pods. The time limit
+    /// of a tool that makes the environment ready is this and the work it does after.
+    pub fn start_bound(&self, devcontainer: &DevcontainerConfig) -> Duration {
+        match self {
+            Self::Local if devcontainer.runtime == Runtime::Off => Duration::ZERO,
+            Self::Local => devcontainer.up_timeout + devcontainer.setup_timeout,
+            Self::Kubernetes(pods) => pods.wait + pods.ready_timeout,
+        }
+    }
+}
+
 /// The run pod variables of a worker: see the table at the top of this module.
 #[derive(Debug, Clone)]
 pub struct RunPodsConfig {
@@ -2679,6 +2693,11 @@ mod tests {
         assert_eq!(dc.up_timeout, Duration::from_secs(60));
         assert_eq!(dc.setup_timeout, Duration::from_secs(30));
         assert!(!dc.prepull);
+        // Making the environment of a run takes at most the two phases together.
+        assert_eq!(
+            RunEnvironment::Local.start_bound(&dc),
+            Duration::from_secs(90)
+        );
         // The settings the environment is made with.
         let settings = dc.settings(PathBuf::from("/work"));
         assert_eq!(settings.runtime, Runtime::Podman);
@@ -2767,6 +2786,13 @@ mod tests {
         assert_eq!(pods.ready_timeout, Duration::from_secs(300));
         assert_eq!(pods.idle, Some(Duration::from_secs(900)));
         assert_eq!(pods.wait, Duration::from_secs(600));
+        // A pod is waited for (a slot) and then made ready.
+        let dc = devcontainer_of(&owned_full());
+        assert_eq!(
+            RunEnvironment::Kubernetes(pods.clone()).start_bound(&dc),
+            Duration::from_secs(900)
+        );
+        assert_eq!(RunEnvironment::Local.start_bound(&dc), Duration::ZERO);
         // The settings of the environment.
         let settings = pods.settings("coder-0");
         assert_eq!(settings.namespace, "coder-ns");

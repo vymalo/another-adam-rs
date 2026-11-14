@@ -150,6 +150,7 @@ impl McpServers {
             files,
         } = plan;
         let name = recipe.server.clone();
+        let connect_timeout = recipe.connect_timeout;
         let (target, listed) = match per_call {
             // A bound server is listed with the listing bearer, and dialled again per call.
             Some(per_call) => {
@@ -179,6 +180,7 @@ impl McpServers {
                     s.title,
                     target.clone(),
                     call_timeout,
+                    connect_timeout,
                     files,
                 ))
             })

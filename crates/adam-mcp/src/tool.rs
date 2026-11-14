@@ -57,6 +57,9 @@ pub(crate) struct McpTool {
     title: Option<String>,
     target: Target,
     call_timeout: Duration,
+    /// How long the connection may take to be made (made again, or made for this call alone), which
+    /// a call can wait for before it is sent.
+    connect_timeout: Duration,
     /// `files: true` on its server: the files of a result are shared, not described.
     files: bool,
 }
@@ -89,6 +92,7 @@ impl std::fmt::Debug for McpTool {
 }
 
 impl McpTool {
+    #[allow(clippy::too_many_arguments)] // built in one place, from the pieces of a plan
     pub(crate) fn new(
         spec: ToolSpec,
         server: String,
@@ -96,6 +100,7 @@ impl McpTool {
         title: Option<String>,
         target: Target,
         call_timeout: Duration,
+        connect_timeout: Duration,
         files: bool,
     ) -> Self {
         Self {
@@ -105,6 +110,7 @@ impl McpTool {
             title,
             target,
             call_timeout,
+            connect_timeout,
             files,
         }
     }
@@ -301,10 +307,11 @@ impl Tool for McpTool {
         self.spec.clone()
     }
 
-    /// The call's own timeout and a margin for the rest (the connection, closing it): the agent's
-    /// limit never fires before the tool's own, which says what happened.
+    /// The call's own timeout, the time a connection may take (a call dials again, or dials for
+    /// itself, before it is sent: `connect_timeout`, 30 s by default) and ten seconds to close it: the
+    /// agent's limit never fires before the tool's own, which says what happened. 100 s by default.
     fn time_limit(&self) -> Option<Duration> {
-        Some(self.call_timeout + Duration::from_secs(10))
+        Some(self.call_timeout + self.connect_timeout + Duration::from_secs(10))
     }
 
     /// The step of a call is labelled with the tool's `title` when its server gave one (`Search the

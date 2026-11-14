@@ -558,6 +558,11 @@ pub trait Store: Send + Sync + 'static {
 
     /// Delete finished (done or failed) runs of `agent` last updated before
     /// `before`, with their journals and push configurations. Returns the number of runs deleted.
+    ///
+    /// **Retention must be longer than a minute.** A child run looks at its parent at least once a
+    /// minute (`adam-runtime`), and fails when the parent is `Failed`; a parent that is missing is
+    /// treated as unknown and cancels nothing, so a failed parent purged before its children saw it
+    /// leaves them running to their own limits.
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64>;
 }
 

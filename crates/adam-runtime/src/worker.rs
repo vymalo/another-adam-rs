@@ -277,14 +277,29 @@ async fn recheck_in_flight(inner: &Inner) {
 /// Why a run is cancelled when the run it works for has ended.
 pub(crate) const PARENT_ENDED: &str = "the parent run ended";
 
-/// Whether the run `parent` ended in failure (any reason, a cancel included) or is gone: the runs
-/// that work for it have nobody to work for. A parent that is `Done` has not ended in that sense: it
-/// has no working rounds left, and a kept-open session stays usable. A store that cannot be read
-/// answers no: the run goes on.
+/// The longest a parked run that works for a parent goes without the runtime looking at the parent:
+/// its stored wake is never later than this from the commit. The agent is not stepped for it.
+pub(crate) const CHILD_WAIT_POLL: Duration = Duration::from_secs(60);
+
+/// The cancel watch of a step in flight reads the parent at most this often.
+const PARENT_CHECK_EVERY: Duration = Duration::from_secs(1);
+
+/// A wake that arrives before its deadline (the clock of the store and the clock of this runtime
+/// disagree) parks the run again to the deadline plus this, and does not step the agent.
+const DEADLINE_SKEW: Duration = Duration::from_secs(1);
+
+/// Whether the run `parent` is `Failed` (any reason, a cancel included): the runs that work for it
+/// have nobody to work for. Only a parent that was **loaded** and is `Failed` says so. A parent that
+/// is `Done` has no working rounds left and a kept-open session stays usable; one that cannot be
+/// loaded (the store is down, or retention purged a finished run) is unknown and cancels nothing, which
+/// assumes retention is longer than the time a failed parent takes to be seen (a minute).
 async fn parent_has_ended(inner: &Inner, parent: RunId) -> bool {
     match inner.store.load_run(parent).await {
         Ok(Some(rec)) => rec.status == RunStatus::Failed,
-        Ok(None) => true,
+        Ok(None) => {
+            tracing::debug!(%parent, "the parent run is not in the store; carrying on");
+            false
+        }
         Err(e) => {
             tracing::debug!(%parent, error = %e, "could not read the parent run; carrying on");
             false
@@ -349,6 +364,7 @@ fn spawn_cancel_watch(
 ) -> AbortOnDrop {
     let every = inner.cfg.poll_interval.max(Duration::from_millis(1));
     AbortOnDrop(tokio::spawn(async move {
+        let mut parent_read: Option<tokio::time::Instant> = None;
         loop {
             tokio::time::sleep(every).await;
             if let Some(deadline) = watched.deadline
@@ -360,8 +376,13 @@ fn spawn_cancel_watch(
             }
             match inner.store.load_run(run).await {
                 Ok(Some(rec)) if rec.status.is_open() => {
+                    let due = parent_read.is_none_or(|at| at.elapsed() >= PARENT_CHECK_EVERY);
                     if let Some(parent) = watched.parent
-                        && parent_has_ended(&inner, parent).await
+                        && due
+                        && {
+                            parent_read = Some(tokio::time::Instant::now());
+                            parent_has_ended(&inner, parent).await
+                        }
                     {
                         cancel_for_parent(&inner, run).await;
                         token.cancel();
@@ -405,9 +426,16 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
     let cancel = CancelToken::new();
     let tracked = inner.track(run, cancel.clone());
     let envelope = Envelope::decode(run, &lease.run.state).ok();
+    // A run that waited for a person and is stepped again has the rest of its time from now.
+    let restored = (lease.run.status == RunStatus::Runnable)
+        .then(|| envelope.as_ref().and_then(|e| e.remaining_secs))
+        .flatten()
+        .map(|secs| {
+            inner.clock.now() + chrono::Duration::seconds(secs.try_into().unwrap_or(i64::MAX))
+        });
     let watched = Watched {
         parent: lease.run.parent_id,
-        deadline: envelope.as_ref().and_then(|e| e.deadline),
+        deadline: envelope.as_ref().and_then(|e| e.deadline).or(restored),
         limit_secs: envelope.as_ref().and_then(|e| e.limit_secs),
     };
     let watch = spawn_cancel_watch(inner.clone(), run, watched, cancel.clone());
@@ -442,6 +470,10 @@ struct Next {
     /// The agent asked that a `Done` not end the run past a message that arrived while it stepped
     /// ([`Ctx::reopen_on_arrival`]).
     reopen: bool,
+    /// The deadline and what is left of the time limit to store (set once, when the run is made, or
+    /// restored from what was left after a wait for a person: never recomputed from the commit).
+    deadline: Option<DateTime<Utc>>,
+    remaining_secs: Option<u64>,
 }
 
 enum Plan {
@@ -476,12 +508,33 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
             return true;
         }
     };
+    let now = inner.clock.now();
     if let Some(deadline) = env.deadline
-        && inner.clock.now() >= deadline
+        && now >= deadline
     {
         cancel_for_deadline(inner, run, env.limit_secs).await;
         return true;
     }
+    // A watched run (it works for a parent or has a deadline) that is parked carries a wake the
+    // runtime set, no later than a minute away. When that wake, and not the agent's own, is what
+    // claimed it, the parent and the deadline have just been looked at: the run parks again, and the
+    // agent is not stepped, nothing is journaled and no model is called.
+    if rec.status == RunStatus::Parked
+        && env.hb
+        && env.inbox.is_empty()
+        && !env.agent_wake.is_some_and(|wake| wake <= now)
+    {
+        park_again(inner, &rec, &env, now).await;
+        return true;
+    }
+    // A run that waited for a person gets the rest of its time again from now.
+    let (deadline, remaining_secs) = match (env.deadline, env.remaining_secs) {
+        (None, Some(secs)) => (
+            Some(now + chrono::Duration::seconds(secs.try_into().unwrap_or(i64::MAX))),
+            None,
+        ),
+        both => both,
+    };
     let Some(agent) = inner
         .agents
         .get(&rec.agent)
@@ -518,10 +571,20 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
     let outcome = ctx.into_outcome();
 
     let plan = plan(inner, &env, outcome, result);
-    let Plan::Commit(next) = plan else {
+    let Plan::Commit(mut next) = plan else {
         return false;
     };
-    match commit(inner, &rec, &env, &next).await {
+    next.deadline = deadline;
+    next.remaining_secs = remaining_secs;
+    // Parked with no timer: the run waits for a person (or a message), whose time is not the run's.
+    if next.status == RunStatus::Parked
+        && next.wake_at.is_none()
+        && let Some(deadline) = next.deadline.take()
+    {
+        let left = (deadline - inner.clock.now()).num_seconds().max(0);
+        next.remaining_secs = Some(u64::try_from(left).unwrap_or(0));
+    }
+    match commit(inner, &rec, &env, &next, rec.parent_id.is_some()).await {
         Ok(Some(committed)) => {
             announce(inner, &committed, &next).await;
             // After the commit, never before: the parent's timer is the fallback for a crash here.
@@ -587,6 +650,8 @@ fn plan(
         artifacts: artifacts.clone(),
         retry_detail: None,
         reopen,
+        deadline: base.deadline,
+        remaining_secs: base.remaining_secs,
     };
     // Starting point for a failure that ends the run: state untouched.
     let failed = |error: String| Next {
@@ -601,6 +666,8 @@ fn plan(
         artifacts: artifacts.clone(),
         retry_detail: None,
         reopen: false,
+        deadline: base.deadline,
+        remaining_secs: base.remaining_secs,
     };
 
     // A transient failure: schedule the retry, or give up when the policy's
@@ -642,6 +709,8 @@ fn plan(
                     policy.max_attempts
                 )),
                 reopen: false,
+                deadline: base.deadline,
+                remaining_secs: base.remaining_secs,
             }
         }
     };
@@ -698,12 +767,40 @@ fn plan(
     Plan::Commit(Box::new(next))
 }
 
+fn chrono_of(d: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
+}
+
+/// Park a watched run again without stepping it: its parent and deadline were just looked at. The
+/// state is stored as it is; only the wake moves, to the earliest of the agent's own wake, the
+/// deadline (plus a second when this wake came early) and the next look at the parent. A message that
+/// lands meanwhile moves the version and this commit is dropped: the run is runnable and is claimed.
+async fn park_again(inner: &Inner, rec: &RunRecord, env: &Envelope, now: DateTime<Utc>) {
+    let mut wake = now + chrono_of(CHILD_WAIT_POLL);
+    if let Some(agent) = env.agent_wake {
+        wake = wake.min(agent);
+    }
+    if let Some(deadline) = env.deadline {
+        wake = wake.min(deadline + chrono_of(DEADLINE_SKEW));
+    }
+    let mut update = RunUpdate::new(RunStatus::Parked, rec.state.clone());
+    update.wake_at = Some(wake);
+    match inner.store.commit_run(rec.id, rec.version, update).await {
+        Ok(_) | Err(StoreError::Conflict { .. } | StoreError::NotFound(_)) => {}
+        Err(e) => {
+            tracing::warn!(run = %rec.id, error = %report(&e), "parking a watched run again failed; it is looked at again when its lease expires");
+        }
+    }
+}
+
 /// The record to write, built on the freshest envelope.
 fn build_update(
     next: &Next,
     cur: &Envelope,
     base_inbox_len: usize,
     base_rev: u64,
+    parent: bool,
+    now: DateTime<Utc>,
 ) -> StoreResult<RunUpdate> {
     // Messages that arrived while stepping sit after the ones we started
     // with. A parked agent must not sleep through them.
@@ -714,11 +811,25 @@ fn build_update(
     } else {
         (next.status, next.wake_at)
     };
-    // A run with a time limit wakes at its deadline at the latest, so that a parked one, which
-    // may wait for a message that never comes, is failed there and not left for ever.
-    let wake_at = match (cur.deadline, status) {
-        (Some(deadline), RunStatus::Parked) => Some(wake_at.map_or(deadline, |w| w.min(deadline))),
-        (Some(deadline), RunStatus::Runnable) => wake_at.map(|w| w.min(deadline)),
+    // A run that works for a parent or has a deadline wakes at the deadline and within the poll at
+    // the latest, so that a parked one, which may wait for a message that never comes, is looked at
+    // (its parent, its deadline) and not left for ever. The agent's own wake is kept in the envelope.
+    let agent_wake = (status == RunStatus::Parked).then_some(wake_at).flatten();
+    let heartbeat = status == RunStatus::Parked && (parent || next.deadline.is_some());
+    let wake_at = match status {
+        RunStatus::Parked if heartbeat => {
+            let mut wake = wake_at.map_or(now + chrono_of(CHILD_WAIT_POLL), |w| {
+                w.min(now + chrono_of(CHILD_WAIT_POLL))
+            });
+            if let Some(deadline) = next.deadline {
+                wake = wake.min(deadline);
+            }
+            Some(wake)
+        }
+        RunStatus::Runnable => match (wake_at, next.deadline) {
+            (Some(w), Some(deadline)) => Some(w.min(deadline)),
+            (w, _) => w,
+        },
         _ => wake_at,
     };
     let mut artifacts = cur.artifacts.clone();
@@ -737,8 +848,11 @@ fn build_update(
         },
         error: next.error.clone(),
         artifacts,
-        deadline: cur.deadline,
+        deadline: next.deadline,
         limit_secs: cur.limit_secs,
+        remaining_secs: next.remaining_secs,
+        agent_wake,
+        hb: heartbeat,
     };
     let mut update = RunUpdate::new(status, env.encode()?);
     update.wake_at = wake_at;
@@ -760,6 +874,7 @@ async fn commit(
     claimed: &RunRecord,
     base: &Envelope,
     next: &Next,
+    parent: bool,
 ) -> StoreResult<Option<RunRecord>> {
     let run = claimed.id;
     let mut cur_rec = claimed.clone();
@@ -784,7 +899,14 @@ async fn commit(
             cur_rec = rec;
             cur_env = env;
         }
-        let update = build_update(next, &cur_env, base.inbox.len(), base.rev)?;
+        let update = build_update(
+            next,
+            &cur_env,
+            base.inbox.len(),
+            base.rev,
+            parent,
+            inner.clock.now(),
+        )?;
         match inner.store.commit_run(run, cur_rec.version, update).await {
             Ok(rec) => {
                 if reopens(next, &cur_env, base.inbox.len()) {

@@ -54,9 +54,9 @@ use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::safe_fs::{self, SlotDir};
 
 /// Commands that talk to a remote may take long (first clone of a big repo).
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Purely local commands should be quick.
-const LOCAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Longest stderr excerpt kept in an error.
 const MAX_STDERR: usize = 4000;
 

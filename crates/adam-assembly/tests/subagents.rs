@@ -423,6 +423,45 @@ async fn a_child_that_goes_over_its_own_limit_answers_from_its_closing_turn() {
     worker.stop().await;
 }
 
+/// The subagent's `limits.max_minutes` reaches the runtime: the child run is created with the
+/// deadline (a minute here), 30 minutes when its file says nothing, and none for `0`.
+#[tokio::test]
+async fn a_subagents_max_minutes_becomes_the_deadline_of_its_run() {
+    for (frontmatter, limit) in [
+        ("tools: []\nlimits: { max_minutes: 1 }", Some(60)),
+        ("tools: []", Some(30 * 60)),
+        ("tools: []\nlimits: { max_minutes: 0 }", None),
+    ] {
+        let root = uniq("root");
+        let model = Arc::new(MockModel::new());
+        model
+            .push_tool_calls(vec![call("c1", "helper", json!({"message": "go"}))])
+            .push_text("the helper's answer")
+            .push_text("done");
+        let files = with_helper(&root, "tools: []", frontmatter);
+        let assembly = assemble(&files, tools(&[]), &model);
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let rt = runtime_on(&assembly, store.clone());
+        let worker = spawn_worker(&rt);
+        let run = rt.start(&root, user_message("go"), None).await.unwrap();
+        wait_done(&rt, run).await;
+        worker.stop().await;
+
+        let child = store
+            .load_run(child_run_id(run, "c1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.state.get("limit_secs").and_then(Value::as_u64),
+            limit,
+            "{frontmatter}: {}",
+            child.state
+        );
+        assert_eq!(child.state.get("deadline").is_some(), limit.is_some());
+    }
+}
+
 #[tokio::test]
 async fn the_turns_of_a_child_are_not_the_parents() {
     // The parent may make two model calls in all; the child makes two on its own account. Had the

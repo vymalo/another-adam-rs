@@ -1213,7 +1213,7 @@ impl LlmAgent {
             let key = call_key(&call);
             if let Some(repeats) = &mut state.repeats
                 && repeats.key == key
-                && repeats.count >= DOOM_LOOP_AFTER
+                && (repeats.count >= DOOM_LOOP_AFTER || repeats.failing >= DOOM_LOOP_AFTER)
             {
                 repeats.refused += 1;
                 let ending = repeats.refused >= DOOM_LOOP_REFUSALS;
@@ -2118,7 +2118,8 @@ fn timed_out(tool: &str, limit: Duration) -> String {
 
 /// Run a call of a tool within `limit`. The call gets a token of its own, a child of the run's: when
 /// the limit passes the token fires, the tool has [`TOOL_STOP_GRACE`] to stop, and then its future
-/// is dropped. The answer is an error result, whatever the tool did meanwhile. It runs inside the
+/// is dropped. The answer is an error result, unless the tool finished with a real (not an error)
+/// result before that, at the instant of the limit or while it was told to stop. It runs inside the
 /// journaled step, so a replay reads the recorded answer and never waits, and no clock is read in a
 /// transition.
 async fn within<F, Fut>(
@@ -2135,11 +2136,19 @@ where
     let fut = call(tool_ctx.clone().with_cancel_token(token.clone()));
     tokio::pin!(fut);
     tokio::select! {
+        // Biased toward the tool: a call that finishes at the very instant the timer fires has
+        // finished, and its result is the one that counts.
+        biased;
         out = &mut fut => out,
         () = tokio::time::sleep(limit) => {
             token.cancel();
-            let _ = tokio::time::timeout(TOOL_STOP_GRACE, &mut fut).await;
-            Ok(ToolOutput::error(timed_out(name, limit)))
+            match tokio::time::timeout(TOOL_STOP_GRACE, &mut fut).await {
+                // It finished by itself while it was being told to stop, with a result and not an
+                // error: that result is what happened (a pull request that was opened must not be
+                // reported as stopped, or the model may open another).
+                Ok(Ok(output)) if !output.is_error => Ok(output),
+                _ => Ok(ToolOutput::error(timed_out(name, limit))),
+            }
         }
     }
 }
@@ -2227,14 +2236,27 @@ fn record_answer(state: &mut Conversation, key: String, message: &Message) {
         return;
     };
     let answer = fnv_hex(&[if *is_error { "error" } else { "ok" }, content]);
+    let failed = u32::from(*is_error);
     match &mut state.repeats {
-        Some(repeats) if repeats.key == key && repeats.answer == answer => repeats.count += 1,
+        Some(repeats) if repeats.key == key => {
+            // Same call again: the same answer counts up; a different one starts the count over. A
+            // call that errs again counts as a failure in a row whatever the error says (a result
+            // that carries a duration or a path never repeats to the byte).
+            if repeats.answer == answer {
+                repeats.count += 1;
+            } else {
+                repeats.count = 1;
+                repeats.answer = answer;
+            }
+            repeats.failing = if *is_error { repeats.failing + 1 } else { 0 };
+        }
         slot => {
             *slot = Some(Repeats {
                 key,
                 answer,
                 count: 1,
                 refused: 0,
+                failing: failed,
             });
         }
     }
