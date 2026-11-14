@@ -8,7 +8,7 @@ use adam_core::{RunId, RunStatus};
 use adam_error::report;
 use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse, ToolCall,
-    ToolSpec,
+    ToolChoice, ToolSpec,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Emitter, Inbound,
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::conversation::{
-    ArtifactRef, Conversation, PendingQuestion, PendingRemote, PendingRun, PendingWait,
+    ArtifactRef, Conversation, LimitHit, PendingQuestion, PendingRemote, PendingRun, PendingWait,
     parse_context, parse_root_run, parse_root_step, parse_user_text,
 };
 use crate::history::fit_history;
@@ -34,17 +34,24 @@ use crate::text_stream;
 use crate::tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use crate::toolset::ToolSet;
 
-/// Bounds on one run. When a limit trips the run fails with a message naming
-/// it (`RunView::error`); a limit never silently degrades the run, except the
-/// history limit, which shortens old tool outputs (see
+/// What the model is asked in the closing turn, the last model call of a run that reached
+/// `max_turns` or `max_tool_calls`. Sent after the history, as a user message that is not kept in it.
+pub const CLOSING_TURN: &str = "You have used all the steps this run may take. Do not call any \
+tool. Reply in plain words: what you did, what is finished, and what is still left to do.";
+
+/// Bounds on one run. A run that reaches `max_turns` or `max_tool_calls` gets one closing model
+/// call in which it may call no tool, and ends with that answer marked `limited` (the output's
+/// `limited` and `limit`); if the closing call says nothing the run fails with a message naming the
+/// limit (`RunView::error`). The history limit shortens old tool outputs instead (see
 /// [`max_history_tokens`](Self::max_history_tokens)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Most model calls in one run. A run that needs one more fails.
+    /// Most model calls that may be followed by tools in one run. The call after them is the
+    /// closing turn: one more, with the tools offered but none callable.
     pub max_turns: u32,
     /// Most tool calls in one run, counted when the model requests them. A
-    /// model turn whose calls would go over the limit fails the run before
-    /// any of its tools runs.
+    /// model turn whose calls would go over the limit has none of them run (each is answered
+    /// "not run"), and the next call is the closing turn.
     pub max_tool_calls: u32,
     /// Passed to the model as `max_output_tokens`; `0` leaves it to the model.
     pub max_output_tokens: u32,
@@ -806,16 +813,39 @@ impl LlmAgent {
         if ctx.is_cancelled() {
             return Ok(Flow::Fail(CANCELLED.into()));
         }
-        if state.turns >= self.limits.max_turns {
-            return Ok(Flow::Fail(format!(
-                "turn limit exceeded: the model was called {} times (max_turns = {})",
-                state.turns, self.limits.max_turns
+        // A message that reaches a run after its closing answer, or a reply to a question, does not
+        // call the model again: the run finishes with that answer, marked limited.
+        if let Some(hit) = &state.limit
+            && hit.answered
+        {
+            let text = state
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m, Message::Assistant { .. }))
+                .map(Message::text)
+                .unwrap_or_default();
+            return Ok(Flow::Done(limited_output(
+                state, &hit.limit, text, false, None,
             )));
         }
+        if state.limit.is_none() && state.turns >= self.limits.max_turns {
+            state.limit = Some(LimitHit {
+                limit: "max_turns".into(),
+                answered: false,
+            });
+        }
+        let closing = state.limit.is_some();
         let mut request = ModelRequest::new(self.model_alias.clone());
         request.system = self.instructions.clone();
         request.messages = fit_history(&state.messages, self.limits.max_history_tokens);
         request.tools = self.specs.clone();
+        if closing {
+            // The tools stay, so the prefix of the request is the one the provider has cached and
+            // the calls in the history still have their tools; only the choice changes.
+            request.tool_choice = ToolChoice::None;
+            request.messages.push(Message::user_text(CLOSING_TURN));
+        }
         request.max_output_tokens =
             (self.limits.max_output_tokens > 0).then_some(self.limits.max_output_tokens);
 
@@ -949,7 +979,7 @@ impl LlmAgent {
         };
 
         let ModelResponse {
-            message,
+            mut message,
             finish,
             usage: _,
             reasoning: _,
@@ -968,11 +998,16 @@ impl LlmAgent {
         state.output_cut = finish == FinishReason::Length;
 
         let text = message.text();
+        // The closing turn may call nothing: a call the model sends anyway is dropped, so the history
+        // holds no call without a result.
+        if closing && let Message::Assistant { tool_calls, .. } = &mut message {
+            tool_calls.clear();
+        }
         let calls: Vec<ToolCall> = message.tool_calls().to_vec();
         // An answer that was recorded before a message this transition has read (the commit of the
         // transition that recorded it was lost, and the message arrived before this one began) did
         // not read it: it is dropped and the model answers again, with the message in front of it.
-        if calls.is_empty() && answered_stale {
+        if calls.is_empty() && answered_stale && !closing {
             tracing::debug!(
                 run = %ctx.run_id(),
                 turn,
@@ -984,7 +1019,7 @@ impl LlmAgent {
         // the answer is not the last word, and the run takes another turn instead of ending
         // (`steer/v1`: an accepted message is never lost). What arrives after this check is caught
         // by the commit (`Ctx::reopen_on_arrival`).
-        let unread = calls.is_empty() && ctx.arrived().await? > 0;
+        let unread = !closing && calls.is_empty() && ctx.arrived().await? > 0;
         if !text.is_empty() {
             let mut payload = json!({ "text": text, "turn": turn });
             // The words before a tool call are said whole, under the stream they were sent as, because
@@ -1013,6 +1048,26 @@ impl LlmAgent {
                 "a message arrived while the model answered: the run takes another turn"
             );
             return Ok(Flow::Next);
+        }
+        if closing {
+            let limit = state
+                .limit
+                .as_ref()
+                .map_or_else(|| "max_turns".to_owned(), |hit| hit.limit.clone());
+            let said = state.announced.clone().unwrap_or(text);
+            if said.trim().is_empty() {
+                return Ok(Flow::Fail(self.limit_message(state, &limit)));
+            }
+            if let Some(hit) = &mut state.limit {
+                hit.answered = true;
+            }
+            return Ok(Flow::Done(limited_output(
+                state,
+                &limit,
+                said,
+                finish == FinishReason::Length,
+                stream,
+            )));
         }
         if calls.is_empty() {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
@@ -1559,6 +1614,21 @@ impl LlmAgent {
         self.step_end(tool, call_id, state, result, &conversation.source_notes)
     }
 
+    /// Why a run that reached `limit` fails when its closing turn says nothing.
+    fn limit_message(&self, state: &Conversation, limit: &str) -> String {
+        if limit == "max_tool_calls" {
+            format!(
+                "tool call limit exceeded: {} calls already made (max_tool_calls = {})",
+                state.tool_calls, self.limits.max_tool_calls
+            )
+        } else {
+            format!(
+                "turn limit exceeded: the model was called {} times (max_turns = {})",
+                state.turns, self.limits.max_turns
+            )
+        }
+    }
+
     /// What the model is told when it calls a tool nobody has.
     fn unknown_tool(&self, name: &str) -> String {
         let known: Vec<&str> = self.specs.iter().map(|s| s.name.as_str()).collect();
@@ -1887,6 +1957,29 @@ enum ToolResult {
 /// A child's output as the text of the tool result. An `LlmAgent` child finishes with
 /// `{"text": ..., "artifacts": [...]}` and the parent's model gets the text (the same reading the
 /// A2A adapter has of an output); another string is passed as it is, and anything else as JSON.
+/// The output of a run that ended at a limit, with the answer of its closing turn.
+fn limited_output(
+    state: &Conversation,
+    limit: &str,
+    text: String,
+    truncated: bool,
+    stream: Option<String>,
+) -> Value {
+    let mut output = json!({
+        "text": text,
+        "artifacts": state.artifacts,
+        "limited": true,
+        "limit": limit,
+    });
+    if truncated {
+        output["truncated"] = json!(true);
+    }
+    if let Some(stream) = stream {
+        output["stream"] = json!(stream);
+    }
+    output
+}
+
 /// The longest part of the text of an invalid call that its error quotes.
 const INVALID_ARGUMENTS_QUOTE: usize = 2048;
 
@@ -1924,9 +2017,14 @@ fn render_output(output: Option<&Value>) -> String {
         Some(other) => other.to_string(),
     };
     if text.trim().is_empty() {
-        "(the run finished without output)".to_owned()
-    } else {
-        text
+        return "(the run finished without output)".to_owned();
+    }
+    // A child that ran out of turns or tool calls still answered, from its closing turn.
+    match output.and_then(|o| o.get("limited").and(o.get("limit"))) {
+        Some(Value::String(limit)) => format!(
+            "{text}\n\n(the run stopped at its `{limit}` limit; this answer may be incomplete)"
+        ),
+        _ => text,
     }
 }
 

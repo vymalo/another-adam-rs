@@ -203,6 +203,15 @@ pub struct ArtifactRef {
     pub bytes: Option<u64>,
 }
 
+/// A [`Limits`](crate::Limits) bound a run reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitHit {
+    /// The name of the bound: `max_turns` or `max_tool_calls`.
+    pub limit: String,
+    /// The closing turn has answered.
+    pub answered: bool,
+}
+
 /// The state of an [`LlmAgent`](crate::LlmAgent) run: the persisted history
 /// plus the bookkeeping the loop needs to resume from any commit.
 ///
@@ -277,6 +286,12 @@ pub struct Conversation {
     /// written before it existed, and not written while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub output_cut: bool,
+    /// The limit this run hit, once it has: the next model call is the closing turn (no tool may be
+    /// called), and once that has answered the run finishes with the answer marked limited. Absent
+    /// from state written before it existed, and not written while `None`; a run that continues
+    /// another starts without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<LimitHit>,
     /// What the tool sources said about the tools they offered on the latest model turn
     /// ([`ToolNote`](crate::ToolNote)): which calls the system behind a source reports as steps itself
     /// (the agent reports none) and how long a call may run. It is the notes of **that turn's

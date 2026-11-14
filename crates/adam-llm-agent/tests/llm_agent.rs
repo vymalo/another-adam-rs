@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter, MAX_CARRIED_BYTES,
-    OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo, StepStyle,
+    Artifact, CLOSING_TURN, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
+    MAX_CARRIED_BYTES, OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo, StepStyle,
     TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
     ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
-    ModelRequest, ModelResponse, ToolCall, ToolSpec,
+    ModelRequest, ModelResponse, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{
     Agent, AgentStarter, CancelToken, Clock, CollectingSink, Inbound, ManualClock, RetryPolicy,
@@ -1746,22 +1746,150 @@ async fn an_unreadable_message_does_not_answer_the_question() {
 // Limits
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn max_turns_fails_the_run() {
-    let h = Harness::new();
-    let (a, a_calls) = CountingTool::new("a");
-    let agent = h
-        .agent()
+/// A model that holds its `gate_on`-th call (0-based) after signalling, until released.
+struct GatedModel {
+    inner: Arc<MockModel>,
+    gate_on: usize,
+    calls: AtomicUsize,
+    reached: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl GatedModel {
+    async fn gate(&self) {
+        if self.calls.fetch_add(1, SeqCst) == self.gate_on {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
+#[async_trait]
+impl ModelClient for GatedModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.gate().await;
+        self.inner.complete(req).await
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        self.gate().await;
+        self.inner.stream(req).await
+    }
+}
+
+fn two_turns(h: &Harness, a: CountingTool) -> LlmAgent {
+    h.agent()
         .tool(a)
         .limits(Limits {
             max_turns: 2,
             ..Limits::default()
         })
-        .build();
-    for i in 0..5 {
+        .build()
+}
+
+fn looping(h: &Harness) {
+    for i in 0..2 {
         h.mock
             .push_tool_calls(vec![call(&format!("c{i}"), "a", json!({}))]);
     }
+}
+
+#[tokio::test]
+async fn a_run_at_max_turns_ends_with_a_limited_answer() {
+    let h = Harness::new();
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = two_turns(&h, a);
+    looping(&h);
+    h.mock.push_text("I got as far as two lookups");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("loop"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 3, "two turns with tools, one closing turn");
+    assert_eq!(requests[2].tool_choice, ToolChoice::None);
+    assert_eq!(requests[2].tools, requests[0].tools, "the tools stay");
+    assert_eq!(requests[2].system, requests[0].system);
+    assert_eq!(
+        requests[2].messages.last(),
+        Some(&Message::user_text(CLOSING_TURN))
+    );
+    assert_eq!(requests[0].tool_choice, ToolChoice::Auto);
+    assert_eq!(a_calls.load(SeqCst), 2);
+    assert_eq!(
+        output_of(&view),
+        Some(json!({
+            "text": "I got as far as two lookups",
+            "artifacts": [],
+            "limited": true,
+            "limit": "max_turns"
+        }))
+    );
+    let state = conversation(&view);
+    assert_eq!(state.turns, 3);
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|m| *m != Message::user_text(CLOSING_TURN)),
+        "the instruction is for that one request, not the history"
+    );
+}
+
+#[tokio::test]
+async fn a_closing_turn_that_calls_tools_anyway_keeps_only_its_text() {
+    let h = Harness::new();
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = two_turns(&h, a);
+    looping(&h);
+    h.mock.push_response(ModelResponse {
+        message: Message::Assistant {
+            content: vec![ContentPart::Text {
+                text: "summary".into(),
+            }],
+            tool_calls: vec![call("c9", "a", json!({}))],
+            reasoning: None,
+        },
+        finish: FinishReason::ToolCalls,
+        ..ModelResponse::text("")
+    });
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("loop"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    assert_eq!(a_calls.load(SeqCst), 2, "the stray call never runs");
+    assert_eq!(view.output.as_ref().expect("output")["text"], "summary");
+    let state = conversation(&view);
+    assert!(state.pending_calls.is_empty());
+    let Some(Message::Assistant { tool_calls, .. }) = state.messages.last() else {
+        panic!("{:?}", state.messages)
+    };
+    assert!(
+        tool_calls.is_empty(),
+        "no call without a result in the history"
+    );
+}
+
+#[tokio::test]
+async fn a_closing_turn_with_no_words_fails_naming_the_limit() {
+    let h = Harness::new();
+    let (a, _) = CountingTool::new("a");
+    let agent = two_turns(&h, a);
+    looping(&h);
+    h.mock.push_text("");
     let rt = h.runtime(&agent);
     let run = rt
         .start("llm", user_message("loop"), None)
@@ -1770,12 +1898,110 @@ async fn max_turns_fails_the_run() {
     let worker = spawn_worker(&rt);
     let view = wait_failed(&rt, run).await;
     worker.stop().await;
-
-    let error = view.error.clone().expect("error");
+    let error = view.error.expect("error");
+    assert!(error.contains("turn limit exceeded"), "{error}");
     assert!(error.contains("max_turns = 2"), "{error}");
-    assert_eq!(h.mock.requests().len(), 2, "no third model call");
+}
+
+#[tokio::test]
+async fn a_message_after_the_closing_answer_finishes_with_the_same_answer() {
+    let mock = Arc::new(MockModel::new());
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let model: DynModel = Arc::new(GatedModel {
+        inner: mock.clone(),
+        gate_on: 2,
+        calls: AtomicUsize::new(0),
+        reached: reached.clone(),
+        release: release.clone(),
+    });
+    let (a, _) = CountingTool::new("a");
+    let agent = LlmAgent::builder("llm", model, "m")
+        .tool(a)
+        .limits(Limits {
+            max_turns: 2,
+            ..Limits::default()
+        })
+        .build();
+    mock.push_tool_calls(vec![call("c0", "a", json!({}))])
+        .push_tool_calls(vec![call("c1", "a", json!({}))])
+        .push_text("closing words")
+        .push_text("must never be asked for");
+    let h = Harness::new();
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("loop"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    notified(&reached, "the closing turn").await;
+    rt.deliver(run, user_message("one more thing"))
+        .await
+        .expect("deliver");
+    release.notify_one();
+    let view = wait_for(&rt, run, "done after reading the message", |v| {
+        v.status == RunStatus::Done && v.pending_inbox == 0
+    })
+    .await;
+    worker.stop().await;
+
+    assert_eq!(mock.requests().len(), 3, "no fourth model call");
+    let output = view.output.as_ref().expect("output");
+    assert_eq!(output["text"], "closing words");
+    assert_eq!(output["limited"], true);
+}
+
+#[tokio::test]
+async fn crash_during_the_closing_turn_replays_its_answer() {
+    let mock = Arc::new(MockModel::new());
+    let reached = Arc::new(Notify::new());
+    let model: DynModel = Arc::new(HangingModel {
+        inner: mock.clone(),
+        hang_on: 2,
+        calls: AtomicUsize::new(0),
+        armed: AtomicBool::new(true),
+        reached: reached.clone(),
+    });
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = LlmAgent::builder("llm", model, "m")
+        .tool(a)
+        .limits(Limits {
+            max_turns: 2,
+            ..Limits::default()
+        })
+        .build();
+    mock.push_tool_calls(vec![call("c0", "a", json!({}))])
+        .push_tool_calls(vec![call("c1", "a", json!({}))])
+        .push_text("closing words");
+    let h = Harness::new();
+    let (rt_a, rt_b) = (
+        h.runtime_with(&agent, "crash-a", short_lease),
+        h.runtime_with(&agent, "crash-b", short_lease),
+    );
+    let run = rt_a
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let doomed = spawn_worker(&rt_a);
+    notified(&reached, "the closing turn").await;
+    doomed.handle.abort();
+    assert!(doomed.handle.await.expect_err("aborted").is_cancelled());
+
+    let survivor = spawn_worker(&rt_b);
+    let view = wait_done(&rt_b, run).await;
+    survivor.stop().await;
+
     assert_eq!(a_calls.load(SeqCst), 2);
-    assert_eq!(conversation(&view).turns, 2);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].tool_choice, ToolChoice::None);
+    assert_eq!(
+        requests[2].messages.last(),
+        Some(&Message::user_text(CLOSING_TURN))
+    );
+    let output = view.output.expect("output");
+    assert_eq!(output["text"], "closing words");
+    assert_eq!(output["limited"], true);
 }
 
 #[tokio::test]

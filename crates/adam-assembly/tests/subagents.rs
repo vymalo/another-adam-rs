@@ -376,16 +376,16 @@ fn a_subagent_does_not_inherit_a_tool_unless_it_lists_it() {
 // --- limits --------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_child_that_goes_over_its_own_limit_fails_and_the_parent_is_told() {
+async fn a_child_that_goes_over_its_own_limit_answers_from_its_closing_turn() {
     let root = uniq("root");
     let model = Arc::new(MockModel::new());
     model
         .push_tool_calls(vec![call("c1", "helper", json!({"message": "loop"}))])
         .push_tool_calls(vec![call("f1", "fetch", json!({}))])
         .push_tool_calls(vec![call("f2", "fetch", json!({}))])
-        // The child's third turn is over its limit: the model is not asked, and this is the
-        // parent's next answer.
-        .push_text("the helper failed, I will do it myself");
+        // The child's third call is its closing turn: no tool may be called, and this is its answer.
+        .push_text("two pages read, the third is left")
+        .push_text("the helper got part of it, I will do the rest");
     let files = with_helper(
         &root,
         "tools: [fetch]",
@@ -398,23 +398,28 @@ async fn a_child_that_goes_over_its_own_limit_fails_and_the_parent_is_told() {
     let view = wait_done(&rt, run).await;
     assert_eq!(
         view.output.as_ref().unwrap()["text"],
-        "the helper failed, I will do it myself"
+        "the helper got part of it, I will do the rest"
     );
 
     let requests = model.requests();
     assert_eq!(
         requests.len(),
-        4,
-        "the child's third turn never asked the model"
+        5,
+        "the child's closing turn asked the model"
     );
-    let (text, is_error) = last_tool_result(&requests[3], "c1");
-    assert!(is_error, "{text}");
-    assert!(text.starts_with("the run failed: "), "{text}");
-    assert!(text.contains("turn limit exceeded"), "{text}");
-    assert!(text.contains("max_turns = 2"), "{text}");
+    assert_eq!(requests[3].tool_choice, adam_model::ToolChoice::None);
+    let (text, is_error) = last_tool_result(&requests[4], "c1");
+    assert!(!is_error, "{text}");
+    assert!(
+        text.starts_with("two pages read, the third is left"),
+        "{text}"
+    );
+    assert!(text.contains("`max_turns` limit"), "{text}");
+    assert!(text.contains("may be incomplete"), "{text}");
 
     let child = rt.view(child_run_id(run, "c1")).await.unwrap().unwrap();
-    assert_eq!(child.status, RunStatus::Failed);
+    assert_eq!(child.status, RunStatus::Done);
+    assert_eq!(child.output.as_ref().unwrap()["limited"], true);
     worker.stop().await;
 }
 
