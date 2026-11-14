@@ -227,15 +227,18 @@ list and fails for a tool that has neither a limit nor a place on the `QUICK_TOO
 |---|---|
 | `run_command`, `run`, `run_checks` | making the environment ready (devcontainer: `DEVCONTAINER_UP_TIMEOUT_SECS` + `DEVCONTAINER_SETUP_TIMEOUT_SECS`; run pods: `RUN_POD_WAIT_SECS` + `RUN_POD_READY_TIMEOUT_SECS`; none in the coder's own container) + `CHECK_TIMEOUT_SECS` + 30 s |
 | `rebuild_environment` | making the environment ready + 30 s |
-| `delegate_to_opencode` | making the environment ready + 1 h + 30 s (OpenCode's turn has only an idle timeout) |
+| `read_file`, `list_files`, `find_files`, `search_files` | their own deadline, 30 s (`find::DEADLINE`) + 30 s |
 | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | one network git operation (30 min) and the local ones around it (5 min) + 30 s |
-| the rest (`read_file`, `write_file`, `apply_patch`, `edit_file`, `share_file`, `start_scratch`, `request_repository`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `delete_repository`, `ask_user`, `show`, `ui_catalog`) | quick by construction: the default 300 s |
+| the rest (`write_file`, `apply_patch`, `edit_file`, `share_file`, `start_scratch`, `request_repository`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `delete_repository`, `ask_user`, `show`, `ui_catalog`) | quick by construction: the default 300 s |
 
-The doom loop (a third call in a row of a tool with the same arguments, refused when the two before gave the same result or
-both were errors) reads a command's answer as text: **a failing command is a normal result with `exit code N: FAILED` and
-its output tail, not an error result**, so a failure whose tail has a duration or a temporary path is a different result each
-time and is not caught. A stable comparison would need the command tools to say a normalised key (the exit code and the
-tail with numbers and paths removed), which no tool does yet.
+The doom loop (a third call in a row of a tool with the same arguments) is refused when the two before gave the same
+result, were both error results, **or carried the same repeat key**. `run_command` and `run` return a failing command as normal text
+(`exit code N: FAILED` and the output tail), and the tail usually holds a duration or a temporary path, so no two failures
+are equal to the byte. The three command tools therefore attach a **repeat key** to a failure: `exit:<code>`, `timeout`
+or `signal` (the number of the signal is not known to the outcome); a command that passes carries none, so a poll that
+succeeds with a changing output keeps running. A model can still wait and retry by doing something else in between
+(`sleep`, a look at the logs): any other call resets the count. Nothing else sets a key; the command tools only set it, their
+text is unchanged.
 
 Where the workspace, the janitor and the environments are: [Workspace and environments](workspace-and-environments.md).
 Configuration: [Environment variables](environment.md).

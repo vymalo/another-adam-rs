@@ -510,8 +510,14 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
   two gave the same result (`is_error` included) **or were both error results** (an error that carries a duration or a path
   never repeats to the byte): it is answered with an error result telling the model to change approach, and after two
   refusals the run takes the closing turn with `limit: "repeated_call"`. A changed successful answer, or another call in
-  between, resets it. A command tool that fails returns normal text with an exit code, not an error result, so the rule
-  reads its text and a result with a volatile line is not repeated: see the coder's notes. The decision reads only `Conversation::repeats` (two FNV-1a hashes and counters), so a replay decides
+  between, resets it.
+* **`ToolOutput::repeat_key`** (`with_repeat_key`): a tool may say that two outputs of one call with the same key are the
+  same result for this rule. The rule is then: same tool and canonical arguments, and the two previous answers were equal,
+  **or** both were error results, **or** both carried the same repeat key. The coder's command tools set `exit:<code>`
+  (`timeout`, `signal`) on a failing command, whose normal-text answer carries a duration or a path that never repeats to the
+  byte, and none on success, so a successful poll whose text changes still runs. The key is journaled with the output, so a
+  replay decides the same; a journal without it decodes. A model can still wait and retry by doing something else between two
+  calls (`sleep`): any other call resets the count. The decision reads only `Conversation::repeats` (two FNV-1a hashes and counters), so a replay decides
   the same. A call that waits (a question, a child) resets it.
 * **`Tool::time_limit`** (default `None` = `DEFAULT_TOOL_TIME_LIMIT`, 300 s; `FnTool::with_time_limit`; a wrapper must forward
   it). The timer runs inside the journaled `tool:<id>` step: the call gets a child `CancelToken`, which fires at the
@@ -522,7 +528,7 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
 * **Rollback:** an older binary cannot decode a `Conversation` whose `limit` is `"repeated_call"` (the enum is closed, a new
   variant): a run that hit the new limit cannot be rolled back to a build that predates it.
 * **Breaking:** `LimitKind::RepeatedCall` is a new variant (every exhaustive match stops compiling until it handles it),
-  `Conversation` gains `repeats` (struct literals), **a tool that declares no bound of its own is stopped after 300 s**,
+  `Conversation` gains `repeats` and `ToolOutput` gains `repeat_key` (struct literals), **a tool that declares no bound of its own is stopped after 300 s**,
   and **cancelling a parent cancels its children** and **a subagent run stops after 30 minutes unless its file says
   otherwise** (`adam-runtime`, `adam-assembly`).
 

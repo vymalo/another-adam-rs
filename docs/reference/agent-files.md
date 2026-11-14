@@ -551,8 +551,9 @@ sees the parent's history. The sequence and the states of the wait are in
   Past it the runtime fails the child (`cancelled: time limit: the
   run did not finish within 30 min`) and the parent reads "the run failed: ..." as the tool result.
 * **Doom loop and tool limits.** In every agent, the third call in a row with the same tool and the same arguments (key
-  order does not matter) is not run when the two before gave the same result **or both were error results** (a failing
-  command whose message carries a duration or a path never repeats to the byte), and is answered with an error that tells
+  order does not matter) is not run when the two before gave the same result, **both were error results**, or **carried the
+  same repeat key** (a failing command's text carries a duration or a path, so the coder's command tools say `exit:<code>`),
+  and is answered with an error that tells
   the model to change approach; after two such refusals the run takes the closing turn with `limit: "repeated_call"`. A poll whose
   answer changes, or the same call with another call in between, runs. A call that runs past its tool's time limit
   (300 s unless the tool declares one: the coder's command tools the deployment's command limit plus 30 s, MCP tools
