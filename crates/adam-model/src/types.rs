@@ -192,7 +192,7 @@ pub struct ToolSpec {
 }
 
 /// A tool call requested by the model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Identifier the tool result must echo ([`Message::Tool::call_id`]).
     pub id: String,
@@ -200,6 +200,17 @@ pub struct ToolCall {
     pub name: String,
     /// Parsed JSON arguments.
     pub arguments: Value,
+}
+
+impl ToolCall {
+    /// A call with parsed arguments.
+    pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: Value) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
 }
 
 /// A finished model turn.
