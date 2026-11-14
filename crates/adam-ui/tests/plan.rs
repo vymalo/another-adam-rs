@@ -755,3 +755,30 @@ async fn the_specs_are_in_the_fixed_order_with_the_exact_schemas() {
         "Write the plan for this task as a short checklist the person sees, replacing any earlier plan. Use it when the work has three or more steps or the person asked for several things; not for a question or a one-step change. One action per item, in order, at most 50, each under 200 characters. Then mark progress with plan_check (one item `doing` at a time, `done` as soon as it is) and add what you discover with plan_add. Every call returns the whole plan. Example: {\"title\":\"Fix the date parser\",\"items\":[\"Reproduce the failing test\",\"Fix parse_date for time zones\",\"Run the checks\",\"Open the pull request\"]}"
     );
 }
+
+/// The biggest plan a model can write is far under the loop's backstop, so it is never cut.
+#[tokio::test]
+async fn the_largest_plan_is_under_the_backstop_and_is_not_cut() {
+    use adam_llm_agent::paging::{MAX_TOOL_RESULT_BYTES, backstop};
+    let items: Vec<String> = (1..=50)
+        .map(|n| format!("{n:02}{}", "é".repeat(198)))
+        .collect();
+    let out = call_bare("plan_work", None, json!({"title": "t", "items": items})).await;
+    assert!(!out.is_error, "{}", out.content);
+    let mut plan = plan_of(&out);
+    for item in plan.items.iter_mut() {
+        item.note = Some("n".repeat(200));
+    }
+    let checked = call_bare(
+        "plan_check",
+        Some(&plan),
+        json!({"id": 1, "status": "doing", "note": "n".repeat(200)}),
+    )
+    .await;
+    assert!(!checked.is_error, "{}", checked.content);
+    assert!(checked.content.len() < MAX_TOOL_RESULT_BYTES);
+    assert_eq!(
+        backstop(&checked.content, "plan_check", false),
+        checked.content.as_str()
+    );
+}

@@ -22,7 +22,7 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 25] = [
+const TOOLS: [&str; 28] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",

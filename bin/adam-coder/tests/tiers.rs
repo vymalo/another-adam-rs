@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 
 /// The tools of the coder in the order they are offered, with the two subagents, as the model is
 /// shown them at the highest tier.
-const ALL: [&str; 27] = [
+const ALL: [&str; 30] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
