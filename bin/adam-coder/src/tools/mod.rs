@@ -15,7 +15,7 @@
 //! | `rebuild_environment { use_default? }` | [`environment`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
 //! | `merge_pull_request { repo, number, method?, delete_branch? }` (tier `auto`), `rename_repository { repo, new_name }` and `delete_repository { repo, confirm }` (tier `bypass`) | [`admin`] |
-//! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}` | [`adam_ui`]: the person's screen as tools |
+//! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}`, `plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }` | [`adam_ui`]: the person's screen as tools, and the plan |
 //!
 //! # Retry safety
 //!
@@ -715,7 +715,8 @@ pub(crate) fn resolve_slot(
 }
 
 /// Every coder tool, in the order they are offered to the model: the twenty of the coding workflow,
-/// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
+/// then the screen's and the plan's (`ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check`,
+/// `plan_add`, from [`ToolEnv::ui`]).
 ///
 /// `create_repository` is offered only when the deployment lets it create repositories for someone
 /// ([`CoderSettings::can_create_repositories`]: `CREATE_REPO_OWNERS` names owners, or the credentials
@@ -896,6 +897,15 @@ impl Tool for Redacting {
         match self.inner.call(ctx, args).await {
             Ok(mut out) => {
                 out.content = r.scrub_string(out.content);
+                // The plan is state the loop keeps and the next plan call prints: it is scrubbed
+                // like the words that were printed from it.
+                if let Some(plan) = &mut out.plan {
+                    plan.title = plan.title.take().map(|t| r.scrub_string(t));
+                    for item in &mut plan.items {
+                        item.text = r.scrub_string(std::mem::take(&mut item.text));
+                        item.note = item.note.take().map(|n| r.scrub_string(n));
+                    }
+                }
                 for artifact in &mut out.artifacts {
                     r.scrub_value(&mut artifact.data);
                     // A text file may hold what the process knows to hide (a token a command

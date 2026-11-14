@@ -48,6 +48,9 @@ const TOOLS: [&str; 25] = [
     "ask_user",
     "show",
     "ui_catalog",
+    "plan_work",
+    "plan_check",
+    "plan_add",
 ];
 
 fn snapshot_path(name: &str) -> PathBuf {

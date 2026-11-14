@@ -135,7 +135,14 @@ async fn show_is_described_with_the_components_of_the_screen_it_draws_on() {
     // The names and the schemas are untouched, and so is every other tool.
     assert_eq!(
         specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-        ["ask_user", "show", "ui_catalog"]
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add"
+        ]
     );
     let plain = offered_with(Map::new()).await;
     assert_eq!(

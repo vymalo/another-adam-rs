@@ -64,6 +64,9 @@ const ALL: [&str; 27] = [
     "ask_user",
     "show",
     "ui_catalog",
+    "plan_work",
+    "plan_check",
+    "plan_add",
     "explorer",
     "reviewer",
 ];
@@ -172,6 +175,9 @@ async fn the_model_is_shown_only_the_tools_the_tier_of_the_message_allows() {
         "ask_user",
         "show",
         "ui_catalog",
+        "plan_work",
+        "plan_check",
+        "plan_add",
         "explorer",
         "reviewer",
     ];
@@ -211,6 +217,48 @@ async fn the_model_is_shown_only_the_tools_the_tier_of_the_message_allows() {
             None => assert!(!system.contains("## Access tier of this message")),
         }
     }
+}
+
+/// `plan_work`, `plan_check` and `plan_add` change nothing outside the conversation, so they are tier
+/// `plan`: shown at every tier and not refused at the lowest.
+#[tokio::test]
+async fn the_plan_tools_are_offered_at_the_plan_tier() {
+    use adam_coder::tier::{known, needs};
+    for tool in ["plan_work", "plan_check", "plan_add"] {
+        assert_eq!(known(tool), Some(AccessTier::Plan), "{tool}");
+        assert_eq!(needs(tool), AccessTier::Plan, "{tool}");
+    }
+    let fx = Fixture::new().await;
+    let (requests, _run) = drive(&fx, "do three things", Some(AccessTier::Plan), |m| {
+        m.push_tool_calls(vec![call(
+            "p1",
+            "plan_work",
+            json!({"title": "Three things", "items": ["one", "two", "three"]}),
+        )])
+        .push_tool_calls(vec![call(
+            "p2",
+            "plan_check",
+            json!({"id": 1, "status": "done"}),
+        )])
+        .push_text("Planned.");
+    })
+    .await;
+    for request in &requests {
+        let shown = names(request);
+        for tool in ["plan_work", "plan_check", "plan_add"] {
+            assert!(shown.contains(&tool), "{tool} is shown at plan: {shown:?}");
+        }
+    }
+    assert!(
+        result_of(&requests[1], "p1").starts_with("Plan saved (3 items).\nPlan: Three things\n"),
+        "{}",
+        result_of(&requests[1], "p1")
+    );
+    assert!(
+        result_of(&requests[2], "p2").starts_with("Item 1: done.\n"),
+        "not refused at the lowest tier: {}",
+        result_of(&requests[2], "p2")
+    );
 }
 
 #[tokio::test]

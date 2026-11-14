@@ -754,7 +754,17 @@ async fn ui_catalog_gives_each_component_with_its_description_and_schema() {
 #[test]
 fn the_tool_set_and_the_card_entries_are_the_documented_ones() {
     let ui = ui();
-    assert_eq!(ui.tools().names(), ["ask_user", "show", "ui_catalog"]);
+    assert_eq!(
+        ui.tools().names(),
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add"
+        ]
+    );
     let uris: Vec<String> = adam_ui::card_extensions()
         .into_iter()
         .map(|e| e.uri)

@@ -246,7 +246,17 @@ async fn the_agent_asks_three_questions_as_one_form_the_person_answers_and_it_go
     assert_eq!(requests.len(), 2);
     // What the model was offered: the three tools and nothing else. The endpoint lists
     // `get_ui_catalog` too, but the model has `ui_catalog` for that: two tools for one thing.
-    assert_eq!(names(&requests[0]), ["ask_user", "show", "ui_catalog"]);
+    assert_eq!(
+        names(&requests[0]),
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add"
+        ]
+    );
     // What it read as the person's answer.
     assert_eq!(
         requests[1].messages.last(),
@@ -297,7 +307,15 @@ async fn a_tool_the_endpoint_lists_is_offered_under_its_name_and_called_through_
     let requests = rig.model.requests();
     assert_eq!(
         names(&requests[0]),
-        ["ask_user", "show", "ui_catalog", "relay__search"]
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add",
+            "relay__search"
+        ]
     );
     assert_eq!(
         requests[1].messages.last(),
@@ -375,7 +393,14 @@ async fn with_an_expired_grant_the_agent_offers_no_thread_tools_and_asks_in_text
 
     assert_eq!(
         names(&rig.model.requests()[0]),
-        ["ask_user", "show", "ui_catalog"]
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add"
+        ]
     );
     let status = asked.status.message.as_ref().unwrap();
     assert_eq!(status.parts.len(), 1, "text only");

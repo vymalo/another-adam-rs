@@ -121,6 +121,9 @@ const TOOLS: [&str; 27] = [
     "ask_user",
     "show",
     "ui_catalog",
+    "plan_work",
+    "plan_check",
+    "plan_add",
     "explorer",
     "reviewer",
 ];
@@ -157,6 +160,9 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     assert_eq!(title("run_checks"), Some("Run the checks"));
     assert_eq!(title("start_scratch"), Some("Start a scratch project"));
     assert_eq!(title("ask_user"), Some("Ask you"));
+    assert_eq!(title("plan_work"), Some("Write the plan"));
+    assert_eq!(title("plan_check"), Some("Update the plan"));
+    assert_eq!(title("plan_add"), Some("Add to the plan"));
     let mut unique: Vec<&str> = titles.iter().map(|(_, l)| l.as_str()).collect();
     unique.sort_unstable();
     unique.dedup();
@@ -197,6 +203,9 @@ async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
         ("share_file", File),
         ("request_repository", Think),
         ("ask_user", Think),
+        ("plan_work", Think),
+        ("plan_check", Think),
+        ("plan_add", Think),
     ];
     let tools = coder_tools(&fx.env);
     let icons: Vec<(String, Option<adam_llm_agent::StepIcon>)> = tools
