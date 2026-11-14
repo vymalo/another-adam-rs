@@ -397,6 +397,26 @@ thread tool `turn_output` ([ADR 0014](../../docs/decisions/0014-a-turn-output-an
   starts with none.
 * With no tool announcing anything, nothing changes: the closing words are the answer, with their `stream`.
 
+## The plan
+
+A conversation has a plan: a short checklist the agent keeps for the person ([ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)
+decision 5). `adam-ui` has the three tools that write it (`plan_work`, `plan_check`, `plan_add`); this crate has the state.
+
+* **Types.** `Plan { title?, items }`, `PlanItem { id, text, status, note? }`, `PlanStatus` (`pending`, `doing`, `done`,
+  `dropped`) and `MAX_PLAN_ITEMS` (50). An item's `id` is its creation number, never reused or shifted; nothing is deleted, so
+  the ids are `1..=n`. `Plan::render()` is the plan as ASCII lines (the same bytes for the same plan).
+* **State.** `Conversation::plan: Option<Plan>` (serde default, not written while `None`: state written before it loads). A
+  tool reads the plan a call starts from with `ToolCtx::plan()` and returns **the whole new plan** with
+  `ToolOutput::with_plan` (`ToolOutput::plan: Option<Box<Plan>>`, journaled with the result, absent from older journals). The loop sets
+  `Conversation::plan` from it **only when the result is not an error**, in the commit of the result, so a replay takes the
+  journaled output and does not call the tool again. Calls run one after the other, so a second plan call in the same turn
+  reads the first one's plan. `ToolCtx::with_plan` gives a test of a tool a plan to start from.
+* **A task that continues another** (`Conversation::continued`) keeps the plan.
+* **The prefix (ADR 0044 decision 1).** The plan is never put in the system prompt and no earlier message is rewritten with it:
+  the model reads it in the result of each plan call, so the newest plan is the last one in the history.
+* **Breaking.** `Conversation` and `ToolOutput` gain a public field `plan`: a struct literal of either must name it (build a
+  `ToolOutput` with its constructors, a `Conversation` with `Conversation::new`).
+
 ## Child runs
 
 An `adam.child.reported` message (the end of a child *session* round, ADR 0045) is dropped by the loop, never shown to the model, until slice 2 reads it.
@@ -590,6 +610,11 @@ turns), a refused call changes nothing (and one after an announcement keeps it),
 the answer with their stream, a replay after a crash inside the next tool keeps the announced answer and does not call the
 tool again, a message that reaches the run clears it, a final answer ends the turn with no model call after it (and the calls
 of its model message are all answered first, and a refused one ends nothing), and the serde shapes of older journals.
+
+`tests/plan_state.rs` is the suite of *The plan* (real `Runtime`, scripted `MockModel`, `MemoryStore`): a plan a tool wrote is in
+the state, an error result changes none, two plan calls in one turn see each other, a replay after a crash keeps the journaled
+plan and does not call the tool again, a continued run starts with the plan before, state and journals without a plan load,
+and across the requests of a run the system prompt and tool specs are identical and each request starts with the one before.
 
 `tests/withheld_tools.rs` covers `withhold`: a held-back tool (own or a source's) is not shown and a call to it is refused with the reason while the others run, a limit a later message lifts holds no more from the next turn, and a source that holds nothing changes nothing. `tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
 the context of the start message reaching a tool, replace/delete/keep across messages, a continued run carrying the
