@@ -315,6 +315,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "kube",
+ "proptest",
  "rustls",
  "secrecy",
  "serde",

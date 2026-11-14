@@ -561,7 +561,10 @@ async fn the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request(stor
             })
             .unwrap_or_else(|| panic!("no result for {id}"))
     };
-    assert_eq!(result_of("f2"), "echo \"helo world\"\n");
+    assert_eq!(
+        result_of("f2"),
+        "     1\techo \"helo world\"\n[end: 1 lines]"
+    );
     assert!(
         result_of("f3").starts_with("Applied the patch to 1 file(s): greet.sh"),
         "{}",
@@ -1299,7 +1302,7 @@ async fn a_scratch_project_is_found_again_by_the_next_task_of_the_conversation(s
         !is_error && found.contains("already holds 1 file(s)") && found.contains("index.html"),
         "the next task finds the project and what it holds: {found}"
     );
-    assert_eq!(by_id("t4").1, "<p>hi</p>\n");
+    assert_eq!(by_id("t4").1, "     1\t<p>hi</p>\n[end: 1 lines]");
     let (_, other, _) = by_id("t5");
     assert!(
         !other.contains("already holds"),
@@ -4421,7 +4424,7 @@ async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_
     assert!(!is_error && added.contains("slot: library"), "{added}");
     assert_eq!(
         result_of(&mock, "r4"),
-        ("hello from library\n".into(), false)
+        ("     1\thello from library\n[end: 1 lines]".into(), false)
     );
     assert_eq!(mirrors(&fx.root), ["library.git", "remote.git"]);
     let notes = fx.env.notes.load(&run.to_string()).await.unwrap();

@@ -248,6 +248,78 @@ pub(crate) async fn status_text(at: &GitAt) -> Option<String> {
     .await
 }
 
+/// Most paths [`list_files`] gives, and most bytes of `git`'s answer it reads.
+pub(crate) const MAX_LISTED_PATHS: usize = 200_000;
+const MAX_LISTED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Why [`list_files`] has no list.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ListError {
+    /// `git` cannot be run for this slot (a refused repository, a pin that cannot be trusted, no
+    /// sandbox): which files are ignored is not known, and the caller must not guess.
+    Unavailable,
+    /// More than [`MAX_LISTED_PATHS`] paths or 16 MiB of them.
+    TooMany,
+    /// `git` ran and failed.
+    Failed(String),
+}
+
+/// The files of the slot below `dir` (a path relative to the slot; empty for all of it) that git
+/// shows: tracked ones and untracked ones that no ignore rule hides (`ls-files --cached --others
+/// --exclude-standard`), as paths from the slot's root, sorted by bytes and each once.
+///
+/// This is the **only** way the read tools enumerate files: it asks `git` through [`GitAt`], so the
+/// git sandbox applies when there is one, and nested `.gitignore` files, `info/exclude` and the
+/// global rules are `git`'s own and agree with what `commit_and_push` sees. It never walks the
+/// directory by its name. Left out: a path that is not UTF-8, one under a `.git`, and a directory
+/// (an embedded repository is listed by `git` with a trailing `/`). A tracked file that was deleted
+/// is still listed: the caller looks at each file it uses.
+pub(crate) async fn list_files(at: &GitAt, dir: &Path) -> Result<Vec<String>, ListError> {
+    let Some(git) = at.command().await else {
+        return Err(ListError::Unavailable);
+    };
+    let mut git = git.args([
+        "--literal-pathspecs",
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]);
+    if !dir.as_os_str().is_empty() {
+        git = git.arg("--").arg(dir);
+    }
+    let out = git
+        .output()
+        .await
+        .map_err(|e| ListError::Failed(e.to_string()))?;
+    if !out.success {
+        return Err(ListError::Failed(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        ));
+    }
+    if out.stdout.len() > MAX_LISTED_BYTES {
+        return Err(ListError::TooMany);
+    }
+    let mut paths: Vec<String> = out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty() && !p.ends_with(b"/"))
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .filter(|p| {
+            !p.split('/')
+                .any(|part| part.eq_ignore_ascii_case(".git"))
+        })
+        .map(str::to_owned)
+        .collect();
+    paths.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    paths.dedup();
+    if paths.len() > MAX_LISTED_PATHS {
+        return Err(ListError::TooMany);
+    }
+    Ok(paths)
+}
+
 /// The parts of the repository that are shared with every run and that a model's command could
 /// change without touching a file of the worktree: refs outside the namespaces that other runs
 /// and git itself move, the local configuration, and `info/exclude`.

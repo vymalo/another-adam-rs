@@ -60,6 +60,7 @@ adam-model-openai.workspace = true
 adam-store-postgres.workspace = true
 adam-workspace = { workspace = true, features = ["test-util"] }
 kube.workspace = true
+proptest.workspace = true
 rustls.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile.workspace = true

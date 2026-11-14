@@ -232,6 +232,8 @@ async fn only_the_optional_arguments_are_nullable() {
             "publish_scratch.path",
             "publish_scratch.scratch",
             "read_file.end_line",
+            "read_file.limit",
+            "read_file.offset",
             "read_file.repo",
             "read_file.start_line",
             "rebuild_environment.use_default",

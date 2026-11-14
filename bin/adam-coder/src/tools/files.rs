@@ -63,20 +63,18 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, Read, Write as _};
+use std::io::{self, Read, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use adam::prelude::*;
+use adam_llm_agent::paging;
 use adam_workspace::safe_fs::{BeneathError, Dir, Meta, SlotDir, WalkError, race};
 
 use super::gitcli::GitAt;
 use super::{Outcome, ToolEnv, non_empty};
-
-/// Most bytes `read_file` returns. A longer file is cut and the result says so.
-pub const READ_CAP: usize = 256 * 1024;
 
 /// Most bytes of `content` `write_file` accepts.
 pub const WRITE_CAP: usize = 1024 * 1024;
@@ -319,44 +317,89 @@ fn locate_for_write(
     })
 }
 
-/// The text of `rel` under `root`: the whole file up to [`READ_CAP`], or the lines `start..=end`
-/// with their numbers.
+/// Largest file `read_file` pages: counting its lines reads all of it.
+const READ_MAX_FILE: u64 = 512 * 1024 * 1024;
+
+/// What the model is told when `shown` is not there ([`closest_paths`] may add to it).
+fn does_not_exist(shown: &str) -> String {
+    format!("`{shown}` does not exist")
+}
+
+/// The `offset` and `limit` that `start_line` and `end_line`, the old names, and `offset` and
+/// `limit` ask for together.
+///
+/// `start_line` is `offset`; `end_line` is `limit = end_line - start_line + 1`. `offset` and
+/// `start_line` together are refused: which one counts would be a guess.
+fn range_args(
+    offset: Option<i64>,
+    limit: Option<i64>,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> Result<(Option<i64>, Option<i64>), String> {
+    if start_line == Some(0) || end_line == Some(0) {
+        return Err("lines are numbered from 1: start_line and end_line must be at least 1".into());
+    }
+    if offset.is_some() && start_line.is_some() {
+        return Err(
+            "give offset or start_line, not both (start_line is the old name of offset)".into(),
+        );
+    }
+    let offset = offset.or(start_line.map(i64::from));
+    let limit = match end_line {
+        None => limit,
+        Some(end) => {
+            let start = offset.unwrap_or(1);
+            if start < 1 {
+                return Err("end_line needs a first line from 1: give start_line, or use offset and limit".into());
+            }
+            let end = i64::from(end);
+            if end < start {
+                return Err(format!(
+                    "end_line ({end}) is before start_line ({start}): the range is empty"
+                ));
+            }
+            let from_end = end - start + 1;
+            Some(limit.map_or(from_end, |l| l.min(from_end)))
+        }
+    };
+    Ok((offset, limit))
+}
+
+/// One page of `rel` under `root`: its lines behind their numbers and the final line of
+/// [`paging`](adam_llm_agent::paging) (see the tool).
 fn read_in(
     root: &SlotDir,
     rel: &str,
-    start: Option<u32>,
-    end: Option<u32>,
+    offset: Option<i64>,
+    limit: Option<i64>,
 ) -> Result<String, String> {
-    if start == Some(0) || end == Some(0) {
-        return Err("lines are numbered from 1: start_line and end_line must be at least 1".into());
-    }
-    if let (Some(start), Some(end)) = (start, end)
-        && end < start
-    {
-        return Err(format!(
-            "end_line ({end}) is before start_line ({start}): the range is empty"
-        ));
-    }
+    let (offset, limit) = paging::window_args(offset, limit, paging::PAGE_LINES)?;
     let (file, meta) = open_for_read(root, rel)?;
     let shown = rel.trim();
     if meta.is_dir() {
         return Err(format!(
-            "`{shown}` is a directory: list it with run_command (`ls {shown}`)"
+            "`{shown}` is a directory: list it with list_files (`{{\"path\":\"{shown}\"}}`)"
         ));
     }
     if !meta.is_file() {
         return Err(format!("`{shown}` is not a regular file"));
     }
-    if start.is_none() && end.is_none() {
-        read_whole(file, meta.size(), shown)
-    } else {
-        read_range(
-            io::BufReader::new(file),
-            meta.size(),
-            shown,
-            start.unwrap_or(1),
-            end,
-        )
+    if meta.size() > READ_MAX_FILE {
+        return Err(format!(
+            "`{shown}` is {} bytes, too big to read by lines (the limit is {READ_MAX_FILE}): \
+             search it with search_files",
+            meta.size()
+        ));
+    }
+    match paging::page_lines(io::BufReader::new(file), offset, limit, true) {
+        Ok(page) if page.total == 0 => Ok(format!("`{shown}` is empty\n{}", page.render())),
+        Ok(page) => Ok(page.render()),
+        Err(paging::PageError::PastEnd { offset, total }) => Err(format!(
+            "`{shown}` has {total} lines: offset {offset} is past the end"
+        )),
+        Err(paging::PageError::Binary) => Err(binary_notice(shown, meta.size())),
+        Err(paging::PageError::Io(e)) => Err(format!("cannot read `{shown}`: {e}")),
+        Err(paging::PageError::Window(why)) => Err(why),
     }
 }
 
@@ -364,91 +407,26 @@ fn binary_notice(shown: &str, len: u64) -> String {
     format!("`{shown}` is a binary file, {len} bytes, not shown")
 }
 
-/// A file as it is, cut at [`READ_CAP`] bytes (on a character boundary).
-fn read_whole(file: fs::File, len: u64, shown: &str) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    file.take(READ_CAP as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
-    if bytes.contains(&0) {
-        return Err(binary_notice(shown, len));
-    }
-    let cut = bytes.len() > READ_CAP;
-    let mut slice = &bytes[..bytes.len().min(READ_CAP)];
-    if cut
-        && let Err(e) = std::str::from_utf8(slice)
-        && e.error_len().is_none()
-    {
-        // The cap fell inside a character: drop its start.
-        slice = &slice[..e.valid_up_to()];
-    }
-    let mut text = String::from_utf8_lossy(slice).into_owned();
-    if text.is_empty() && !cut {
-        return Ok(format!("`{shown}` is empty"));
-    }
-    if cut {
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&format!(
-            "[cut: `{shown}` is {len} bytes; the first {} are shown. Read the rest with \
-             start_line and end_line]\n",
-            slice.len()
-        ));
-    }
-    Ok(text)
-}
+/// Most paths [`closest_paths`] names.
+const CLOSEST_PATHS: usize = 3;
 
-/// The lines `start..=end` (`end` absent: to the end of the file), each behind its number, at
-/// most [`READ_CAP`] bytes of them.
-fn read_range(
-    mut reader: impl BufRead,
-    len: u64,
-    shown: &str,
-    start: u32,
-    end: Option<u32>,
-) -> Result<String, String> {
-    let mut out = String::new();
-    let mut line = Vec::new();
-    let mut number: u64 = 0;
-    let mut shown_any = false;
-    loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
-        if read == 0 {
-            break;
-        }
-        if line.contains(&0) {
-            return Err(binary_notice(shown, len));
-        }
-        number += 1;
-        if number < u64::from(start) {
-            continue;
-        }
-        if end.is_some_and(|end| number > u64::from(end)) {
-            break;
-        }
-        let text = String::from_utf8_lossy(&line);
-        let text = text.trim_end_matches(['\n', '\r']);
-        if out.len() + text.len() > READ_CAP {
-            out.push_str(&format!(
-                "[cut: the output is limited to {READ_CAP} bytes; the next line is {number}]\n"
-            ));
-            return Ok(out);
-        }
-        out.push_str(&format!("{number:>6}\t{text}\n"));
-        shown_any = true;
-    }
-    if !shown_any {
-        return Err(if number == 0 {
-            format!("`{shown}` is empty: it has no lines to show")
-        } else {
-            format!("`{shown}` has {number} lines: start_line {start} is past the end")
-        });
-    }
-    Ok(out)
+/// Below this ([`similarity`], 0 to 1000) a path is not like the one asked for.
+const CLOSEST_MIN: usize = 600;
+
+/// The paths of `candidates` that look most like `wanted`, best first and then by path, so the
+/// same files give the same answer.
+fn closest_paths(wanted: &str, candidates: &[String]) -> Vec<String> {
+    let mut scored: Vec<(usize, &String)> = candidates
+        .iter()
+        .map(|c| (similarity(wanted, c), c))
+        .filter(|(score, _)| *score >= CLOSEST_MIN)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.as_bytes().cmp(b.1.as_bytes())));
+    scored
+        .into_iter()
+        .take(CLOSEST_PATHS)
+        .map(|(_, path)| path.clone())
+        .collect()
 }
 
 /// What a write did.
@@ -756,25 +734,33 @@ pub(super) fn push_published_note(text: &mut String, slot: &adam_workspace::Slot
     }
 }
 
-/// Read a text file of your worktree. Give `path` relative to the root of the worktree. Without
-/// a range you get the whole file (cut at 256 KiB, and the cut is marked); with `start_line` and
-/// `end_line` you get just those lines, each behind its number. A binary file is not shown. Use it
-/// to read before you change something, and run_command (`ls`, `grep -rn`) to find where to look.
+/// Read a text file of your worktree, one page at a time (at most 2000 lines). Each line starts
+/// with its number. If the last line says `[more: ... offset=N]`, call again with offset N. A
+/// negative offset reads from the end. A binary file is not shown. Example:
+/// {"path":"src/main.rs","offset":2001}
 #[tool(label = "Read a file", icon = "read")]
 pub async fn read_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
-    /// Path of the file, relative to the root of the worktree (no `..`, nothing inside `.git`)
+    /// Path relative to the worktree root
     path: String,
-    /// First line to show, counting from 1. Leave out to read from the top.
+    /// First line, from 1; -50 = the last 50 lines
+    offset: Option<i64>,
+    /// Most lines (at most 2000)
+    limit: Option<i64>,
+    /// Old name of offset
     start_line: Option<u32>,
-    /// Last line to show. Leave out to read to the end of the file (or of what fits).
+    /// Last line; limit = end_line - start_line + 1
     end_line: Option<u32>,
     /// The slot to read in: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
 ) -> Outcome {
     let Some(path) = non_empty(&path) else {
         return Ok(ToolOutput::error("path is required"));
+    };
+    let (offset, limit) = match range_args(offset, limit, start_line, end_line) {
+        Ok(window) => window,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     let slot = match env.slot(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
@@ -783,11 +769,24 @@ pub async fn read_file(
     ctx.emit_progress(format!("read {path} ({})", slot.dir()))
         .await;
     let (root, rel) = (Arc::clone(slot.root()), path.to_owned());
-    let read = tokio::task::spawn_blocking(move || read_in(&root, &rel, start_line, end_line))
+    let read = tokio::task::spawn_blocking(move || read_in(&root, &rel, offset, limit))
         .await
         .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
     Ok(match read {
         Ok(text) => ToolOutput::text(text),
+        Err(reason) if reason == does_not_exist(path) => {
+            let at = GitAt::slot(&slot);
+            let near = match super::gitcli::list_files(&at, Path::new("")).await {
+                Ok(all) => closest_paths(path, &all),
+                Err(_) => Vec::new(),
+            };
+            let mut reason = reason;
+            if !near.is_empty() {
+                let near: Vec<String> = near.iter().map(|p| format!("`{p}`")).collect();
+                reason.push_str(&format!(". Closest paths: {}", near.join(", ")));
+            }
+            ToolOutput::error(reason)
+        }
         Err(reason) => ToolOutput::error(reason),
     })
 }
@@ -1331,8 +1330,16 @@ mod swap_tests {
         SlotDir::open(path).unwrap()
     }
 
+    /// The text of the file, with the numbers and the final line of its page taken off.
     fn read(root: &SlotDir, rel: &str) -> Result<String, String> {
-        read_in(root, rel, None, None)
+        read_in(root, rel, None, None).map(|page| {
+            let mut parts: Vec<&str> = page.split('\n').collect();
+            parts.pop();
+            parts
+                .iter()
+                .map(|line| format!("{}\n", line.split_once('\t').map_or("", |(_, text)| text)))
+                .collect()
+        })
     }
 
     fn write(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String> {
@@ -1575,10 +1582,27 @@ mod tests {
     fn read_in(
         root: &Path,
         rel: &str,
-        start: Option<u32>,
-        end: Option<u32>,
+        offset: Option<i64>,
+        limit: Option<i64>,
     ) -> Result<String, String> {
-        super::read_in(&open(root)?, rel, start, end)
+        super::read_in(&open(root)?, rel, offset, limit)
+    }
+
+    /// What the tool does with its arguments: the aliases first, then the page.
+    fn read_with(
+        root: &Path,
+        rel: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    ) -> Result<String, String> {
+        let (offset, limit) = range_args(None, None, start_line, end_line)?;
+        read_in(root, rel, offset, limit)
+    }
+
+    /// A file of `n` numbered lines, `line 1` ... `line n`.
+    fn numbered_file(dir: &Path, name: &str, n: usize) {
+        let text: String = (1..=n).map(|i| format!("line {i}\n")).collect();
+        fs::write(dir.join(name), text).unwrap();
     }
 
     fn write_in(root: &Path, rel: &str, content: &str) -> Result<Written, String> {
@@ -1803,81 +1827,228 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_file_is_returned_as_it_is() {
+    fn a_small_file_is_one_page_with_its_end_said() {
         let dir = root();
         assert_eq!(
             read_in(dir.path(), "src/main.rs", None, None).unwrap(),
-            "fn main() {}\n"
+            "     1\tfn main() {}\n[end: 1 lines]"
         );
         fs::write(dir.path().join("empty"), "").unwrap();
         assert_eq!(
             read_in(dir.path(), "empty", None, None).unwrap(),
-            "`empty` is empty"
+            "`empty` is empty\n[end: 0 lines]"
         );
     }
 
     #[test]
-    fn a_range_is_numbered_and_the_ends_are_reported() {
+    fn a_file_without_a_range_is_paged_at_2000_lines() {
+        let dir = root();
+        numbered_file(dir.path(), "big.txt", 5000);
+        let text = read_in(dir.path(), "big.txt", None, None).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2001, "2000 numbered lines and the final line");
+        assert_eq!(lines[0], "     1\tline 1");
+        assert_eq!(lines[1999], "  2000\tline 2000");
+        assert_eq!(
+            lines[2000],
+            "[more: 3000 lines left; next page: offset=2001]"
+        );
+        let next = read_in(dir.path(), "big.txt", Some(2001), None).unwrap();
+        assert!(next.starts_with("  2001\tline 2001\n"), "{next}");
+        let last = read_in(dir.path(), "big.txt", Some(4001), None).unwrap();
+        assert!(last.ends_with("[end: 5000 lines]"), "{last}");
+    }
+
+    #[test]
+    fn a_negative_offset_reads_the_end() {
+        let dir = root();
+        numbered_file(dir.path(), "big.txt", 5000);
+        let text = read_in(dir.path(), "big.txt", Some(-3), None).unwrap();
+        assert_eq!(
+            text,
+            "  4998\tline 4998\n  4999\tline 4999\n  5000\tline 5000\n[end: 5000 lines]"
+        );
+    }
+
+    #[test]
+    fn the_byte_cap_ends_a_page_before_2000_lines() {
+        let dir = root();
+        let line = format!("{}\n", "x".repeat(99));
+        fs::write(dir.path().join("wide.txt"), line.repeat(1000)).unwrap();
+        let text = read_in(dir.path(), "wide.txt", None, None).unwrap();
+        let shown = text.lines().count() - 1;
+        // 50 KiB of rendered lines of 107 bytes each.
+        assert_eq!(shown, 50 * 1024 / 107, "{shown}");
+        assert!(
+            text.ends_with(&format!(
+                "[more: {} lines left; next page: offset={}]",
+                1000 - shown,
+                shown + 1
+            )),
+            "{}",
+            &text[text.len() - 80..]
+        );
+    }
+
+    #[test]
+    fn a_long_line_is_cut_and_says_how_long() {
+        let dir = root();
+        fs::write(
+            dir.path().join("long.txt"),
+            format!("short\n{}\nafter\n", "é".repeat(18_234)),
+        )
+        .unwrap();
+        let text = read_in(dir.path(), "long.txt", None, None).unwrap();
+        let second = text.lines().nth(1).unwrap();
+        assert!(second.ends_with("… [line cut: 18234 chars]"), "{second}");
+        assert_eq!(
+            second.chars().filter(|c| *c == 'é').count(),
+            paging::MAX_LINE_CHARS
+        );
+        assert!(text.contains("     3\tafter\n"), "the next line is still there");
+    }
+
+    #[test]
+    fn start_line_and_end_line_still_work() {
         let dir = root();
         fs::write(dir.path().join("f.txt"), "one\ntwo\r\nthree\nfour").unwrap();
-        let text = read_in(dir.path(), "f.txt", Some(2), Some(3)).unwrap();
-        assert_eq!(text, "     2\ttwo\n     3\tthree\n");
-        // From a line to the end, and a range that runs past it.
-        let text = read_in(dir.path(), "f.txt", Some(3), None).unwrap();
-        assert_eq!(text, "     3\tthree\n     4\tfour\n");
-        let text = read_in(dir.path(), "f.txt", None, Some(1)).unwrap();
-        assert_eq!(text, "     1\tone\n");
-        let text = read_in(dir.path(), "f.txt", Some(4), Some(99)).unwrap();
-        assert_eq!(text, "     4\tfour\n");
-        // Past the end, back to front, zero.
+        assert_eq!(
+            read_with(dir.path(), "f.txt", Some(2), Some(3)).unwrap(),
+            "     2\ttwo\r\n     3\tthree\n[more: 1 lines left; next page: offset=4]"
+        );
+        assert_eq!(
+            read_with(dir.path(), "f.txt", Some(3), None).unwrap(),
+            "     3\tthree\n     4\tfour\n[end: 4 lines; no newline at the end of the file]"
+        );
+        assert_eq!(
+            read_with(dir.path(), "f.txt", None, Some(1)).unwrap(),
+            "     1\tone\n[more: 3 lines left; next page: offset=2]"
+        );
         assert!(
-            read_in(dir.path(), "f.txt", Some(9), None)
+            read_with(dir.path(), "f.txt", Some(4), Some(99))
+                .unwrap()
+                .starts_with("     4\tfour\n")
+        );
+        assert!(
+            read_with(dir.path(), "f.txt", Some(9), None)
                 .unwrap_err()
                 .contains("has 4 lines")
         );
         assert!(
-            read_in(dir.path(), "f.txt", Some(3), Some(2))
+            read_with(dir.path(), "f.txt", Some(3), Some(2))
                 .unwrap_err()
                 .contains("before start_line")
         );
         assert!(
-            read_in(dir.path(), "f.txt", Some(0), None)
+            read_with(dir.path(), "f.txt", Some(0), None)
                 .unwrap_err()
                 .contains("from 1")
+        );
+        assert!(
+            read_in(dir.path(), "f.txt", Some(0), None)
+                .unwrap_err()
+                .contains("counts from 1")
+        );
+        assert!(
+            read_in(dir.path(), "f.txt", None, Some(0))
+                .unwrap_err()
+                .contains("limit")
         );
     }
 
     #[test]
-    fn a_big_file_is_cut_and_the_cut_is_marked() {
+    fn offset_with_start_line_is_refused() {
+        let why = range_args(Some(3), None, Some(2), None).unwrap_err();
+        assert!(why.contains("not both"), "{why}");
+        // Either alone is fine, and `limit` and `end_line` meet at the smaller.
+        assert_eq!(range_args(Some(3), Some(10), None, None), Ok((Some(3), Some(10))));
+        assert_eq!(range_args(None, Some(10), Some(2), Some(4)), Ok((Some(2), Some(3))));
+    }
+
+    #[test]
+    fn no_trailing_newline_is_said_at_the_end() {
         let dir = root();
-        let line = format!("{}\n", "x".repeat(99));
-        let big = line.repeat(READ_CAP / 100 + 500);
-        fs::write(dir.path().join("big.txt"), &big).unwrap();
-        let text = read_in(dir.path(), "big.txt", None, None).unwrap();
-        assert!(text.len() < READ_CAP + 300, "{}", text.len());
-        assert!(
-            text.contains("[cut: `big.txt` is"),
-            "{}",
-            &text[text.len() - 200..]
+        fs::write(dir.path().join("a.txt"), "one\ntwo").unwrap();
+        assert_eq!(
+            read_in(dir.path(), "a.txt", None, None).unwrap(),
+            "     1\tone\n     2\ttwo\n[end: 2 lines; no newline at the end of the file]"
         );
-        assert!(text.starts_with(&line));
-        // A cut inside a multi-byte character does not leave half of it.
-        fs::write(
-            dir.path().join("wide.txt"),
-            format!("a{}", "é".repeat(READ_CAP)),
-        )
-        .unwrap();
-        let text = read_in(dir.path(), "wide.txt", None, None).unwrap();
-        assert!(!text.contains('\u{fffd}'), "no replacement character");
-        // A range is limited too.
-        let text = read_in(dir.path(), "big.txt", Some(1), None).unwrap();
-        assert!(
-            text.contains("[cut: the output is limited to"),
-            "{}",
-            &text[text.len() - 120..]
-        );
-        let tail = read_in(dir.path(), "big.txt", Some(10), Some(12)).unwrap();
-        assert_eq!(tail.lines().count(), 3);
+    }
+
+    #[test]
+    fn closest_paths_rank_by_likeness_then_by_path() {
+        let all: Vec<String> = ["src/main.rs", "README.md", "src/mian.rb", "src/mian.rc"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let near = closest_paths("src/mian.rs", &all);
+        // The two that differ by one letter tie, and go by path; the third is further.
+        assert_eq!(near, ["src/mian.rb", "src/mian.rc", "src/main.rs"], "{near:?}");
+        assert!(!near.contains(&"README.md".to_owned()), "{near:?}");
+        assert_eq!(near, closest_paths("src/mian.rs", &all), "the same answer twice");
+    }
+
+    /// The text of a file as `read_file` pages show it, with the numbers taken off: following
+    /// `offset` to the end rebuilds the file.
+    fn reassembled(dir: &Path, name: &str, limit: i64) -> String {
+        let mut out = String::new();
+        let mut offset = 1;
+        loop {
+            let page = read_in(dir, name, Some(offset), Some(limit)).unwrap();
+            let mut parts: Vec<&str> = page.split('\n').collect();
+            let last = parts.pop().unwrap();
+            for line in parts {
+                out.push_str(line.split_once('\t').unwrap().1);
+                out.push('\n');
+            }
+            if let Some(rest) = last.strip_prefix("[more: ") {
+                offset = rest.rsplit_once("offset=").unwrap().1.trim_end_matches(']').parse().unwrap();
+            } else {
+                if last.contains("no newline at the end") {
+                    assert!(out.ends_with('\n'));
+                    out.pop();
+                }
+                return out;
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Following `offset` until `[end` and taking the numbers off gives the file back, byte for
+        /// byte, the missing last newline included.
+        #[test]
+        fn prop_paging_reassembles_the_file(
+            lines in proptest::collection::vec("[ -~é\u{4e2d}\t]{0,40}", 0..60),
+            last_newline in proptest::bool::ANY,
+            limit in 1i64..=2000,
+        ) {
+            let dir = root();
+            let mut text = lines.join("\n");
+            if last_newline && !lines.is_empty() {
+                text.push('\n');
+            }
+            // A file of nothing, or of one empty line without its end, is an empty file.
+            proptest::prop_assume!(!text.is_empty());
+            fs::write(dir.path().join("p.txt"), &text).unwrap();
+            proptest::prop_assert_eq!(reassembled(dir.path(), "p.txt", limit), text);
+        }
+
+        /// The same call gives the same bytes, whatever the page.
+        #[test]
+        fn prop_same_call_same_bytes(
+            n in 1usize..300,
+            offset in -300i64..300,
+            limit in proptest::option::of(1i64..=2000),
+        ) {
+            proptest::prop_assume!(offset != 0);
+            let dir = root();
+            numbered_file(dir.path(), "p.txt", n);
+            let first = read_in(dir.path(), "p.txt", Some(offset), limit);
+            let second = read_in(dir.path(), "p.txt", Some(offset), limit);
+            proptest::prop_assert_eq!(first, second);
+        }
     }
 
     #[test]
@@ -1891,12 +2062,12 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_is_listed_with_run_command_not_read() {
+    fn a_directory_is_listed_with_list_files_not_read() {
         let dir = root();
         assert!(
             read_in(dir.path(), "src", None, None)
                 .unwrap_err()
-                .contains("run_command")
+                .contains("list_files")
         );
     }
 

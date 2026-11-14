@@ -2795,7 +2795,10 @@ async fn read_file_reads_the_worktree_and_numbers_a_range() {
         .await
         .unwrap();
     assert!(!whole.is_error, "{}", whole.content);
-    assert_eq!(whole.content, "widgets\n", "the file as it is");
+    assert_eq!(
+        whole.content, "     1\twidgets\n[end: 1 lines]",
+        "a page: numbered, and its end said"
+    );
     assert!(
         rig.progress()
             .contains(&"read README.md (remote)".to_owned()),
@@ -2810,7 +2813,11 @@ async fn read_file_reads_the_worktree_and_numbers_a_range() {
         )
         .await
         .unwrap();
-    assert_eq!(range.content, "     2\ttwo\n     3\tthree\n");
+    assert_eq!(
+        range.content,
+        "     2\ttwo\n     3\tthree\n[more: 1 lines left; next page: offset=4]",
+        "start_line and end_line are the old names of offset and limit"
+    );
 
     // Binary, a directory, a missing file, an empty range: results the model can act on.
     std::fs::write(wt.join("data.bin"), b"\x00\x01\x02 binary").unwrap();
@@ -2818,6 +2825,12 @@ async fn read_file_reads_the_worktree_and_numbers_a_range() {
         (json!({"path": "data.bin"}), "binary file, 10 bytes"),
         (json!({"path": "."}), "name a file"),
         (json!({"path": "nope.txt"}), "does not exist"),
+        (json!({"path": "lines.txt", "offset": 0}), "counts from 1"),
+        (json!({"path": "lines.txt", "limit": 0}), "limit must be"),
+        (
+            json!({"path": "lines.txt", "offset": 2, "start_line": 2}),
+            "not both",
+        ),
         (
             json!({"path": "lines.txt", "start_line": 9}),
             "past the end",
@@ -2832,26 +2845,61 @@ async fn read_file_reads_the_worktree_and_numbers_a_range() {
 }
 
 #[tokio::test]
-async fn read_file_cuts_a_big_file_and_says_so() {
+async fn read_file_pages_a_big_file_and_says_where_the_next_page_starts() {
     let rig = Rig::new().await;
     rig.prepare().await;
-    let big = "0123456789".repeat(40 * 1024); // 400 KiB
+    let big: String = (1..=5000).map(|i| format!("line {i}\n")).collect();
     std::fs::write(rig.worktree().join("big.txt"), &big).unwrap();
-    let out = ReadFile
+    let first = ReadFile
         .call(&rig.ctx, json!({"path": "big.txt"}))
         .await
         .unwrap();
-    assert!(!out.is_error);
+    assert!(!first.is_error);
     assert!(
-        out.content.len() < 256 * 1024 + 300,
+        first
+            .content
+            .ends_with("\n[more: 3000 lines left; next page: offset=2001]"),
         "{}",
-        out.content.len()
+        &first.content[first.content.len() - 80..]
     );
+    let again = ReadFile
+        .call(&rig.ctx, json!({"path": "big.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(first.content, again.content, "the same call, the same bytes");
+    let tail = ReadFile
+        .call(&rig.ctx, json!({"path": "big.txt", "offset": -2}))
+        .await
+        .unwrap();
+    assert_eq!(
+        tail.content,
+        "  4999\tline 4999\n  5000\tline 5000\n[end: 5000 lines]"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_file_names_the_closest_paths() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::create_dir_all(rig.worktree().join("src")).unwrap();
+    std::fs::write(rig.worktree().join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(rig.worktree().join("src/other.rs"), "\n").unwrap();
+    // Untracked and not ignored: git lists it, so it is a candidate.
+    let out = ReadFile
+        .call(&rig.ctx, json!({"path": "src/mian.rs"}))
+        .await;
+    assert!(is_error(&out), "{out:?}");
+    let message = text(out);
     assert!(
-        out.content.contains("[cut: `big.txt` is 409600 bytes"),
-        "{}",
-        &out.content[out.content.len() - 200..]
+        message.contains("`src/mian.rs` does not exist. Closest paths: `src/main.rs`"),
+        "{message}"
     );
+    assert!(!message.contains("other.rs"), "{message}");
+    // Nothing alike: just the plain refusal.
+    let out = ReadFile
+        .call(&rig.ctx, json!({"path": "zzzzzzzzzzzz"}))
+        .await;
+    assert_eq!(text(out), "`zzzzzzzzzzzz` does not exist");
 }
 
 /// Whatever the model passes, a path that leaves the worktree reads and writes nothing, and says
@@ -2910,7 +2958,7 @@ async fn the_file_tools_never_leave_the_worktree() {
         .call(&rig.ctx, json!({"path": "alias"}))
         .await
         .unwrap();
-    assert_eq!(out.content, "widgets\n");
+    assert_eq!(out.content, "     1\twidgets\n[end: 1 lines]");
 }
 
 /// A file written by the tool is a change of the worktree like any other: the checks see it, and
@@ -3293,12 +3341,12 @@ async fn a_second_repository_joins_the_workspace_and_repo_says_which_one() {
         )
         .await
         .unwrap();
-    assert_eq!(by_address.content, "lib\n");
+    assert_eq!(by_address.content, "     1\tlib\n[end: 1 lines]");
     let in_first = ReadFile
         .call(&rig.ctx, json!({"path": "README.md", "repo": "remote"}))
         .await
         .unwrap();
-    assert_eq!(in_first.content, "widgets\n");
+    assert_eq!(in_first.content, "     1\twidgets\n[end: 1 lines]");
     // A file of one slot is not in the other.
     let wrong = ReadFile
         .call(&rig.ctx, json!({"path": "lib.txt", "repo": "remote"}))
@@ -3600,7 +3648,7 @@ async fn a_run_that_began_in_the_old_layout_keeps_working() {
         .call(&rig.ctx, json!({"path": "wip.txt", "repo": "remote"}))
         .await
         .unwrap();
-    assert_eq!(in_old.content, "wip\n");
+    assert_eq!(in_old.content, "     1\twip\n[end: 1 lines]");
 }
 
 // ------------------------------------------------------------------ scratch projects
@@ -3673,7 +3721,7 @@ async fn a_scratch_project_is_built_checked_and_committed_locally() {
         .call(&rig.ctx, json!({"path": "fib.sh"}))
         .await
         .unwrap();
-    assert_eq!(read.content, "echo 0 1 1 2 3 5 8\n");
+    assert_eq!(read.content, "     1\techo 0 1 1 2 3 5 8\n[end: 1 lines]");
     WriteFile
         .call(&rig.ctx, json!({"path": "notes.txt", "content": "draft\n"}))
         .await
@@ -4405,7 +4453,7 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
     let read = || async { text(tool("read_file").call(&ctx, json!({"path": "t.txt"})).await) };
     assert_eq!(
         read().await,
-        "push with ghs_runtimeMinted0123456789 please\n",
+        "     1\tpush with ghs_runtimeMinted0123456789 please\n[end: 1 lines]",
         "not known yet: nothing to scrub"
     );
 
@@ -4417,7 +4465,10 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
         secrecy::ExposeSecret::expose_secret(&token),
         "ghs_runtimeMinted0123456789"
     );
-    assert_eq!(read().await, "push with [redacted] please\n");
+    assert_eq!(
+        read().await,
+        "     1\tpush with [redacted] please\n[end: 1 lines]"
+    );
 }
 
 // -------------------------------------------------------------- create_repository
@@ -5751,7 +5802,10 @@ async fn a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run() {
         .call(&child, json!({"path": "README.md"}))
         .await
         .unwrap();
-    assert_eq!(read.content, "widgets\n", "the root's worktree");
+    assert_eq!(
+        read.content, "     1\twidgets\n[end: 1 lines]",
+        "the root's worktree"
+    );
     let listed = RunCommand
         .call(&child, json!({"command": "cat README.md"}))
         .await

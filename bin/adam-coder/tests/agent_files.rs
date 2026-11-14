@@ -804,7 +804,7 @@ async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
         } => {
             assert_eq!(call_id, "e1");
             assert!(!is_error, "{content}");
-            assert_eq!(content, "widgets\n");
+            assert_eq!(content, "     1\twidgets\n[end: 1 lines]");
         }
         other => panic!("{other:?}"),
     }
