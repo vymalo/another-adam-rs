@@ -4,6 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use adam_model::ToolSpec;
 use async_trait::async_trait;
@@ -44,6 +45,7 @@ pub struct FnTool {
     spec: ToolSpec,
     handler: Arc<Handler>,
     asks_user: bool,
+    time_limit: Option<Duration>,
 }
 
 impl FnTool {
@@ -72,6 +74,7 @@ impl FnTool {
                 Box::pin(async move { fut.await.into_tool_result() })
             }),
             asks_user: false,
+            time_limit: None,
         }
     }
 
@@ -80,6 +83,13 @@ impl FnTool {
     #[must_use]
     pub fn asking_user(mut self) -> Self {
         self.asks_user = true;
+        self
+    }
+
+    /// Declare the longest one call may run, as [`Tool::time_limit`] says.
+    #[must_use]
+    pub fn with_time_limit(mut self, limit: Duration) -> Self {
+        self.time_limit = Some(limit);
         self
     }
 
@@ -110,6 +120,10 @@ impl Tool for FnTool {
 
     fn asks_user(&self) -> bool {
         self.asks_user
+    }
+
+    fn time_limit(&self) -> Option<Duration> {
+        self.time_limit
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
@@ -201,6 +215,7 @@ where
                 },
             ),
             asks_user: false,
+            time_limit: None,
         }
     }
 }

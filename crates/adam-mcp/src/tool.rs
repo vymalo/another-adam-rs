@@ -301,6 +301,12 @@ impl Tool for McpTool {
         self.spec.clone()
     }
 
+    /// The call's own timeout and a margin for the rest (the connection, closing it): the agent's
+    /// limit never fires before the tool's own, which says what happened.
+    fn time_limit(&self) -> Option<Duration> {
+        Some(self.call_timeout + Duration::from_secs(10))
+    }
+
     /// The step of a call is labelled with the tool's `title` when its server gave one (`Search the
     /// web`), and with `<server>__<tool>` otherwise, as the model knows it.
     fn step_style(&self) -> StepStyle {

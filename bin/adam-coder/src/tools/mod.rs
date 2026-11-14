@@ -829,6 +829,16 @@ impl Tool for Gated {
         self.inner.step_style()
     }
 
+    /// The tools that run a command declare the deployment's limit for one (`check_timeout`) and
+    /// half a minute more, so the command's own timeout, which says what ran, fires first.
+    fn time_limit(&self) -> Option<Duration> {
+        if COMMAND_TOOLS.contains(&self.name.as_str()) {
+            Some(self.env.settings.check_timeout + COMMAND_LIMIT_MARGIN)
+        } else {
+            self.inner.time_limit()
+        }
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         // Every tier allows what needs the lowest one: no read of the notes for a look.
         if self.needs > AccessTier::Plan {
@@ -850,6 +860,12 @@ impl Tool for Gated {
         self.inner.call(ctx, args).await
     }
 }
+
+/// The tools that run a command with the deployment's command limit (`CoderSettings::check_timeout`).
+const COMMAND_TOOLS: [&str; 3] = ["run_command", "run", "run_checks"];
+
+/// What the agent's time limit for a command tool adds to the command's own timeout.
+const COMMAND_LIMIT_MARGIN: Duration = Duration::from_secs(30);
 
 /// A tool whose results and errors are scrubbed by a [`Redactor`].
 struct Redacting {
@@ -889,6 +905,10 @@ impl Tool for Redacting {
 
     fn step_style(&self) -> StepStyle {
         self.inner.step_style()
+    }
+
+    fn time_limit(&self) -> Option<Duration> {
+        self.inner.time_limit()
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {

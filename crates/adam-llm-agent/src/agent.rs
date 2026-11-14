@@ -32,7 +32,10 @@ use crate::source::{
 use crate::state::Extensions;
 use crate::step_io::StepIo;
 use crate::text_stream;
-use crate::tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
+use crate::tool::{
+    DEFAULT_TOOL_TIME_LIMIT, DynTool, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx,
+    ToolError, ToolOutput,
+};
 use crate::toolset::ToolSet;
 
 /// What the run state says to the call it is about to run.
@@ -1456,6 +1459,7 @@ impl LlmAgent {
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
             Some(tool) => {
                 let unjournaled = unjournaled.clone();
+                let name = call.name.clone();
                 ctx.step(&format!("tool:{}", call.id), move || async move {
                     if let Some((sources, source_ctx, name)) = &holding
                         && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
@@ -1465,7 +1469,12 @@ impl LlmAgent {
                     {
                         return Ok(ToolOutput::error(held.reason));
                     }
-                    with_reported_sandbox(&tool_ctx, &unjournaled, tool.call(&tool_ctx, args).await)
+                    let limit = tool.time_limit().unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
+                    let called = within(&tool_ctx, &name, limit, |ctx| async move {
+                        tool.call(&ctx, args).await
+                    })
+                    .await;
+                    with_reported_sandbox(&tool_ctx, &unjournaled, called)
                 })
                 .await?
             }
@@ -1501,6 +1510,11 @@ impl LlmAgent {
                 let sources = self.sources.clone();
                 let name = call.name.clone();
                 let unknown = self.unknown_tool(&call.name);
+                let source_limit = note
+                    .and_then(|n| n.timeout_ms)
+                    .map_or(DEFAULT_TOOL_TIME_LIMIT, |ms| {
+                        Duration::from_millis(ms) + SOURCE_LIMIT_MARGIN
+                    });
                 let unjournaled = unjournaled.clone();
                 ctx.step(&format!("tool:{}", call.id), move || async move {
                     if let Some((sources, source_ctx, name)) = &holding
@@ -1511,12 +1525,18 @@ impl LlmAgent {
                     {
                         return Ok(ToolOutput::error(held.reason));
                     }
-                    for source in &sources {
-                        if let Some(answer) = source.call(&tool_ctx, &name, args.clone()).await {
-                            return with_reported_sandbox(&tool_ctx, &unjournaled, answer);
+                    let tool_name = name.clone();
+                    let called = within(&tool_ctx, &name, source_limit, |ctx| async move {
+                        for source in &sources {
+                            if let Some(answer) = source.call(&ctx, &tool_name, args.clone()).await
+                            {
+                                return answer;
+                            }
                         }
-                    }
-                    Ok(ToolOutput::error(unknown))
+                        Ok(ToolOutput::error(unknown))
+                    })
+                    .await;
+                    with_reported_sandbox(&tool_ctx, &unjournaled, called)
                 })
                 .await?
             }
@@ -2077,6 +2097,51 @@ enum ToolResult {
         task: String,
         timeout_ms: Option<u64>,
     },
+}
+
+/// What a source's call may run beyond the `timeout_ms` its listing gave the tool: the time the
+/// source itself needs to answer after its own limit.
+const SOURCE_LIMIT_MARGIN: Duration = Duration::from_secs(10);
+
+/// What the model is told when a call ran past its time limit.
+fn timed_out(tool: &str, limit: Duration) -> String {
+    format!(
+        "`{tool}` did not finish within {} and was stopped. What it had done is not undone: look \
+         at the state again before relying on it, and try a smaller step.",
+        if limit.subsec_nanos() == 0 {
+            format!("{} s", limit.as_secs())
+        } else {
+            format!("{} ms", limit.as_millis())
+        }
+    )
+}
+
+/// Run a call of a tool within `limit`. The call gets a token of its own, a child of the run's: when
+/// the limit passes the token fires, the tool has [`TOOL_STOP_GRACE`] to stop, and then its future
+/// is dropped. The answer is an error result, whatever the tool did meanwhile. It runs inside the
+/// journaled step, so a replay reads the recorded answer and never waits, and no clock is read in a
+/// transition.
+async fn within<F, Fut>(
+    tool_ctx: &ToolCtx,
+    name: &str,
+    limit: Duration,
+    call: F,
+) -> Result<ToolOutput, ToolError>
+where
+    F: FnOnce(ToolCtx) -> Fut,
+    Fut: std::future::Future<Output = Result<ToolOutput, ToolError>>,
+{
+    let token = tool_ctx.cancel_token().child();
+    let fut = call(tool_ctx.clone().with_cancel_token(token.clone()));
+    tokio::pin!(fut);
+    tokio::select! {
+        out = &mut fut => out,
+        () = tokio::time::sleep(limit) => {
+            token.cancel();
+            let _ = tokio::time::timeout(TOOL_STOP_GRACE, &mut fut).await;
+            Ok(ToolOutput::error(timed_out(name, limit)))
+        }
+    }
 }
 
 /// The call that is the third in a row with the same result is refused after this many that ran.

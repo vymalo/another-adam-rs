@@ -37,6 +37,8 @@ use tokio::sync::watch;
 #[derive(Clone, Debug)]
 pub struct CancelToken {
     tx: Arc<watch::Sender<bool>>,
+    /// The token this one was made from ([`child`](Self::child)): it fires when that one does.
+    parent: Option<Box<CancelToken>>,
 }
 
 impl Default for CancelToken {
@@ -50,6 +52,17 @@ impl CancelToken {
     pub fn new() -> Self {
         Self {
             tx: Arc::new(watch::channel(false).0),
+            parent: None,
+        }
+    }
+
+    /// A token that fires when this one does, and that can also be fired on its own without
+    /// touching this one: for a step that stops one piece of work (a tool past its time limit)
+    /// and goes on.
+    pub fn child(&self) -> Self {
+        Self {
+            tx: Arc::new(watch::channel(false).0),
+            parent: Some(Box::new(self.clone())),
         }
     }
 
@@ -64,7 +77,7 @@ impl CancelToken {
 
     /// Whether the token has fired.
     pub fn is_cancelled(&self) -> bool {
-        *self.tx.borrow()
+        *self.tx.borrow() || self.parent.as_ref().is_some_and(|p| p.is_cancelled())
     }
 
     /// Resolves once the token has fired (immediately if it already has).
@@ -72,7 +85,18 @@ impl CancelToken {
     pub async fn cancelled(&self) {
         let mut rx = self.tx.subscribe();
         // The sender lives in `self`, so `wait_for` cannot see it closed.
-        let _ = rx.wait_for(|fired| *fired).await;
+        let own = async {
+            let _ = rx.wait_for(|fired| *fired).await;
+        };
+        match &self.parent {
+            None => own.await,
+            Some(parent) => {
+                tokio::select! {
+                    () = own => {}
+                    () = Box::pin(parent.cancelled()) => {}
+                }
+            }
+        }
     }
 }
 
@@ -110,5 +134,32 @@ mod tests {
         // Already fired: resolves at once, for old and new clones alike.
         token.cancelled().await;
         token.clone().cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn a_child_fires_with_its_parent_but_not_the_other_way() {
+        let parent = CancelToken::new();
+        let child = parent.child();
+        let grandchild = child.child();
+        // Firing a child leaves its parent alone.
+        child.cancel();
+        assert!(child.is_cancelled() && grandchild.is_cancelled());
+        assert!(!parent.is_cancelled());
+        grandchild.cancelled().await;
+
+        // Firing the parent reaches a waiting child.
+        let parent = CancelToken::new();
+        let child = parent.child();
+        let waiting = {
+            let c = child.clone();
+            tokio::spawn(async move { c.cancelled().await })
+        };
+        assert!(!child.is_cancelled());
+        parent.cancel();
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("released")
+            .expect("task");
+        assert!(child.is_cancelled());
     }
 }

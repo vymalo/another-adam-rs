@@ -1,6 +1,7 @@
 //! The [`Tool`] trait and the values that flow through it.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
@@ -16,6 +17,13 @@ use serde_json::{Map, Value};
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
+
+/// The longest a call of a tool that declares no [`Tool::time_limit`] may run: 300 s.
+pub const DEFAULT_TOOL_TIME_LIMIT: Duration = Duration::from_secs(300);
+
+/// How long a call that is past its time limit has to stop by itself, once its
+/// [`ToolCtx::cancelled`] token has fired, before its future is dropped.
+pub const TOOL_STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// A capability the model may call.
 ///
@@ -78,6 +86,20 @@ pub trait Tool: Send + Sync + 'static {
     /// not paged. `#[tool(paged)]` sets it. A tool that wraps another must forward it.
     fn paged(&self) -> bool {
         false
+    }
+
+    /// The longest one call of this tool may run. Past it the agent fires the call's
+    /// [`ToolCtx::cancelled`] token, gives the tool [`TOOL_STOP_GRACE`] to stop, drops it, and
+    /// answers the model with an error result that says the call did not finish (the result is
+    /// journaled, so a replay never waits). `None`, the default, is [`DEFAULT_TOOL_TIME_LIMIT`].
+    ///
+    /// Declare it when a call can reasonably take longer (a build, a deployment's command limit) or
+    /// must be quicker. A tool that waits on something else, a question or a child run, returns at
+    /// once and is not affected. A tool that wraps another (see
+    /// [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it, as it forwards
+    /// [`required_state`](Self::required_state).
+    fn time_limit(&self) -> Option<Duration> {
+        None
     }
 
     /// How a call of this tool is drawn as a step ([`RunEvent::Step`]): its kind, the label (the

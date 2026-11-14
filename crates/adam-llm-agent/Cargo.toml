@@ -33,6 +33,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 schemars = { workspace = true, features = ["derive"] }
 proptest.workspace = true
 adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.1.0" }
