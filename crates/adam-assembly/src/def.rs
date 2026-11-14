@@ -561,6 +561,17 @@ impl Walk<'_> {
             refuse_asking_tools(&origin, &tools)?;
         }
         let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        // An agent that has an MCP tool can get a long result that is kept and paged: it reads the
+        // rest with `read_output` (a folder agent keeps it in the run's state, up to 4 MiB).
+        let has_mcp_tool = tools
+            .iter()
+            .any(|(n, _)| own_mcp.iter().any(|(m, _)| m == n));
+        if has_mcp_tool && !tools.iter().any(|(n, _)| n == adam_llm_agent::READ_OUTPUT) {
+            tools.push((
+                adam_llm_agent::READ_OUTPUT.to_owned(),
+                Arc::new(adam_llm_agent::ReadOutput),
+            ));
+        }
         let registered = tools.len();
         let (skills, preloaded) =
             add_skills(&origin, manifest, self.files, &mut prompt, &mut tools)?;

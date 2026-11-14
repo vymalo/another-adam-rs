@@ -38,7 +38,7 @@ own.
 | `Env` | values for `${VAR}`, taken before the process environment; held as secrets, `Debug` shows names only |
 | `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool`, `BearerBinding` (a bearer-per-call binding the file or the bearer does not fit) |
 | `VarProblem`, `UrlProblem` | closed enums inside `Error::Var` and `Error::Url` |
-| `MAX_RESULT_BYTES` | 64 KiB: the most of an answer that reaches the model |
+| `MAX_RESULT_BYTES` | 64 KiB: the most of an answer that reaches the model **whole**; a text over it is kept and paged (see *A call*) |
 | `Endpoint::new(url, &SecretString, &McpPolicy)`, `list_tools()`, `call_tool(name, args)`, `call_tool_with(name, args, CallOptions)`, `CallOptions`, `EndpointError`, `RemoteTool` (with the tool's own `title` and `meta`), `RemoteResult` | one MCP endpoint a **message** announced, with a bearer token known only at run time, one connection per request: see *An endpoint a message announces* |
 
 `Connect`, `Spawn` and `ListTools` are `ErrorClass::Transient` (the server may be up later); every other variant is
@@ -368,7 +368,7 @@ sequenceDiagram
     C-->>T: peer
     T->>S: tools/call, within call_timeout and ctx.cancelled()
     S-->>T: result
-    T-->>L: ToolOutput: the content as text, scrubbed of expanded values, cut at 64 KiB, isError kept (files: true: its files as artifacts)
+    T-->>L: ToolOutput: the content as text, scrubbed of expanded values, over 64 KiB it is kept and the first page and an output id are returned, isError kept (files: true: its files as artifacts)
     Note over L: the result is journaled, a replay returns it without calling again
 ```
 
@@ -391,8 +391,9 @@ stateDiagram-v2
   `[unsupported content not included]`. On a server with `files: true`, an image, an audio clip and a blob are
   shared instead, each a line `Shared <file> (<size>, <type>).`, which says how to show an image inline ([Files](#files-files-true)). No content falls back to `structuredContent` as JSON, then to `(the tool
   returned no content)`. It is **scrubbed of every value a `${VAR}` put into the server's text** (`[REDACTED]`;
-  success text and `isError` text alike) and then cut at 64 KiB on a character boundary with a note. `isError: true` is an error
+  success text and `isError` text alike). `isError: true` is an error
   *result* (the model reads it and the run goes on).
+* **A text over 64 KiB is kept and paged, never cut silently** ([ADR 0044](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), the owner's answer). After the scrub, a successful text over `MAX_RESULT_BYTES` is kept by `adam_llm_agent::keep_long` and the model is shown `[kept as o-...: N lines; read_output {"id":"o-..."} reads it]`, the first page (at most 2,000 lines or 50 KiB) and the page's last line, `[more: N lines left; next page: offset=K]`; it reads the rest with `read_output` (the tool [`adam-assembly`](../adam-assembly/README.md) adds to every agent whose tools include an MCP tool, and the coder has). Where it is kept: **in a `KeptStore` of the agent's state when there is one (the coder: files on its workspace volume, scrubbed with its own secrets too), otherwise in the run's durable state, 4 MiB for the run** (what an agent that is only a folder gets); a result that would go over that room is **not kept**: the first page and `[not kept: a run keeps at most 4 MiB of long results here, ...; the rest is lost]`. At most 16 MiB of a text is kept (the first page says `only the first N of M bytes are kept` and the last line of the kept text says the same); the text is scrubbed whole and cut 64 KiB past that (`cap_text`, with its note) so that the keeper, which scrubs with secrets of its own, sees a secret at the cut whole and cuts after. **Structured content** (no text blocks) over 64 KiB is serialised pretty-printed, so that it pages by lines; under 64 KiB it stays compact. **An `isError` result is not kept**: it is cut at 64 KiB with the `[cut here: ...]` note, as before. **Images, audio and blobs** are not paged and nothing changed for them: described (`[image not included: ...]`), or shared as files with `files: true`.
 * **Every failure of a call is an error result, never a `ToolError`** (the one exception is the deployment's own
   bearer saying `Transient` before anything is sent: see *A bearer per call*). In particular a server's failure is never
   `ToolError::Transient`: an MCP call has no idempotency key, so a call that failed on the way may or may not have
@@ -519,7 +520,7 @@ per test): none relies on another test's runtime to reap a process or to install
 * Unit: expansion (the `Env` before the process environment, defaults for unset and empty, a missing variable names
   only itself, malformed references stay literal), the URL rules and that credentials are refused and never shown,
   `sse` and stdio refusals, the names (`server__tool`, unmappable names skipped, allow-list order), the schema
-  pass-through, description fallbacks, the mapping of every content block, `isError`, the 64 KiB cut, the redactor
+  pass-through, description fallbacks, the mapping of every content block, `isError`, a result over 64 KiB kept and paged (`a_result_over_64_kib_is_kept_and_its_first_page_returned`: 212,000 bytes read back page by page with no byte lost; `without_a_store_it_goes_to_the_state_under_its_budget`; `what_is_kept_is_as_scrubbed_as_what_is_shown`; an error result still cut; long structured content pretty-printed), the redactor
   (longest first; expanded values, the whole expanded text and their encoded forms, not defaults; a short value is
   kept), errors scrubbed of expanded values (also the URL an error prints, with the opt-in), results scrubbed
   before the cut (a value that straddles it), header values marked sensitive (`is_sensitive`, and the transport

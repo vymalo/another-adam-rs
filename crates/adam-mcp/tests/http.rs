@@ -246,20 +246,58 @@ async fn a_server_with_files_true_shares_its_images_and_blobs_as_files() {
     plain.shutdown().await;
 }
 
+/// A result over 64 KiB is not cut: with no keeper in the agent's state and no room in the run's own
+/// state (a detached context has none) the model is shown the first page and is told the rest is lost.
 #[tokio::test]
-async fn big_result_capped() {
+async fn big_result_without_room_to_keep_it_shows_its_first_page_and_says_so() {
     let server = TestHttpServer::start(None).await;
     let servers = connect(&http_config("t", &server.url(), "")).await;
     let out = call(&servers.tools(), "t__big", json!({"bytes": 300_000})).await;
     assert!(!out.is_error);
     assert!(out.content.starts_with("xxxx"));
+    assert!(out.kept.is_none());
+    assert!(
+        out.content.contains("[not kept: a run keeps at most 4 MiB"),
+        "{}",
+        &out.content[out.content.len() - 200..]
+    );
+    assert!(out.content.len() < MAX_RESULT_BYTES);
+}
+
+/// With a keeper in the state, the same result is kept whole and read back page by page: the
+/// pages (one line of 300,000 characters, folded at 2,000) give the text back with no byte lost.
+#[tokio::test]
+async fn big_result_is_kept_and_paged_end_to_end() {
+    use adam_llm_agent::{KeptStore, MemoryKept};
+    let server = TestHttpServer::start(None).await;
+    let servers = connect(&http_config("t", &server.url(), "")).await;
+    let store = Arc::new(KeptStore(Arc::new(MemoryKept::new())));
+    let tools = servers.tools();
+    let tool = tools.get("t__big").unwrap();
+    let ctx = common::ctx("t__big").with_state(store.clone());
+    let out = tool.call(&ctx, json!({"bytes": 300_000})).await.unwrap();
+    assert!(!out.is_error && out.kept.is_none());
+    let id = adam_llm_agent::output_id_of(&ctx);
     assert!(
         out.content
-            .contains("[cut here: 65536 of 300000 bytes shown]"),
+            .starts_with(&format!("[kept as {id}: 150 lines;")),
         "{}",
-        &out.content[MAX_RESULT_BYTES..]
+        &out.content[..100]
     );
-    assert!(out.content.len() < MAX_RESULT_BYTES + 100);
+    let run = ctx.root_run_id().to_string();
+    let mut all = String::new();
+    let mut offset = 1i64;
+    loop {
+        let page = store.0.page(&run, &id, offset, 2000).await.unwrap();
+        let (body, last) = page.rsplit_once('\n').unwrap();
+        all.push_str(&body.replace('\n', ""));
+        match last.split("offset=").nth(1) {
+            Some(next) => offset = next.trim_end_matches(']').parse().unwrap(),
+            None => break,
+        }
+    }
+    assert_eq!(all.len(), 300_000);
+    assert!(all.bytes().all(|b| b == b'x'));
 }
 
 #[tokio::test]

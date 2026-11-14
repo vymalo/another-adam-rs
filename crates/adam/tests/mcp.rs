@@ -42,7 +42,7 @@ async fn the_facade_connects_an_agents_mcp_json() {
         .unwrap()
         .model(Arc::new(MockModel::new()), "my-model")
         .unwrap();
-    assert_eq!(assembly.info()[0].tools, ["tracker__echo"]);
+    assert_eq!(assembly.info()[0].tools, ["tracker__echo", "read_output"]);
 
     // The same client, by hand: the types are the ones `connect_mcp` uses.
     let config = package.agents[0].mcp.as_ref().unwrap();

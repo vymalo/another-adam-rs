@@ -121,6 +121,7 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
             "run_checks",
             "ask_user",
             "linear__list_issues",
+            "read_output",
             "load_skill",
             "read_skill_file",
             // One tool per subagent, named after it, after everything else: `billing` is the
@@ -241,6 +242,7 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
             "run_checks",
             "ask_user",
             "linear__list_issues",
+            "read_output",
             "load_skill",
             "read_skill_file",
             "billing",

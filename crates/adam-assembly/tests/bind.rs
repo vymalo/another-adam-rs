@@ -564,6 +564,8 @@ fn hand_supplied_mcp_tools_bind_like_connected() {
                     "linear__list".to_owned(),
                     "linear__get".to_owned(),
                     "ask_user".to_owned(),
+                    // After the tools it selected: a long MCP result is read with it.
+                    "read_output".to_owned(),
                     // The tool that calls the subagent, after the agent's own tools.
                     "researcher".to_owned()
                 ]
@@ -592,12 +594,13 @@ fn hand_supplied_mcp_tools_bind_like_connected() {
                 vec![
                     "ask_user".to_owned(),
                     "linear__list".to_owned(),
+                    "read_output".to_owned(),
                     "researcher".to_owned()
                 ]
             ),
             (
                 "coder/researcher".to_owned(),
-                vec!["search__web".to_owned()]
+                vec!["search__web".to_owned(), "read_output".to_owned()]
             ),
         ]
     );

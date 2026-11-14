@@ -171,10 +171,13 @@ async fn each_agent_gets_its_own_mcp_json() {
     let assembly = assemble(def, &model);
 
     // Each agent selected its own server's tools; the subagent inherited nothing.
-    assert_eq!(info_tools(&assembly, &root), ["linear__echo", "researcher"]);
+    assert_eq!(
+        info_tools(&assembly, &root),
+        ["linear__echo", "read_output", "researcher"]
+    );
     assert_eq!(
         info_tools(&assembly, &format!("{root}/researcher")),
-        ["linear__pid", "linear__echo"]
+        ["linear__pid", "linear__echo", "read_output"]
     );
     assert_eq!(root_server.initializations(), 1);
     assert_eq!(research_server.initializations(), 1);
@@ -234,7 +237,7 @@ async fn pattern_selects_mcp_tools() {
     // in the order the file lists them. (`a.b` cannot be shown to a model and was left out.)
     assert_eq!(
         info_tools(&assembly, &root),
-        ["linear__pid", "linear__echo"]
+        ["linear__pid", "linear__echo", "read_output"]
     );
 
     let rt = common::runtime_on(&assembly, Arc::new(MemoryStore::new()));
@@ -247,7 +250,7 @@ async fn pattern_selects_mcp_tools() {
         .iter()
         .map(|t| t.name.clone())
         .collect();
-    assert_eq!(offered, ["linear__pid", "linear__echo"]);
+    assert_eq!(offered, ["linear__pid", "linear__echo", "read_output"]);
     let echo = &model.requests()[0].tools[1];
     assert_eq!(echo.description, "Answers with the text it is given.");
     assert_eq!(echo.parameters["required"], json!(["text"]));
@@ -850,7 +853,7 @@ mod dev {
             .unwrap()
             .load()
             .unwrap();
-        assert_eq!(live.info()[0].tools, ["linear__echo"]);
+        assert_eq!(live.info()[0].tools, ["linear__echo", "read_output"]);
         assert_eq!(server.initializations(), 1);
 
         // An edit that is not about MCP reloads, and reuses the connection: no new session.
@@ -861,7 +864,7 @@ mod dev {
         let reloaded = live.reload().unwrap();
         assert_eq!(reloaded.generation, 2);
         assert_eq!(live.info()[0].prompt, "New prompt.");
-        assert_eq!(live.info()[0].tools, ["linear__echo"]);
+        assert_eq!(live.info()[0].tools, ["linear__echo", "read_output"]);
         assert_eq!(
             server.initializations(),
             1,
@@ -911,7 +914,7 @@ mod dev {
             live.last_error().as_deref(),
             Some(ReloadError::Load(Error::McpChanged { .. }))
         ));
-        assert_eq!(live.info()[0].tools, ["linear__echo"]);
+        assert_eq!(live.info()[0].tools, ["linear__echo", "read_output"]);
         assert_eq!(live.info()[0].prompt, "New prompt.");
         assert_eq!(server.initializations(), 1);
 

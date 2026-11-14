@@ -636,7 +636,8 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
             "plan_work",
             "plan_check",
             "plan_add",
-            "test__echo"
+            "test__echo",
+            "read_output"
         ]
     );
     match requests[1].messages.last().unwrap() {
@@ -972,7 +973,8 @@ async fn a_researcher_searches_a_stateless_mcp_server_and_answers_with_its_sourc
             "plan_work",
             "plan_check",
             "plan_add",
-            "search__web_search"
+            "search__web_search",
+            "read_output"
         ]
     );
     let spec = &requests[0].tools[6];
