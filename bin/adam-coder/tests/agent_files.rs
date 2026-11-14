@@ -95,7 +95,7 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 27] = [
+const TOOLS: [&str; 30] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
