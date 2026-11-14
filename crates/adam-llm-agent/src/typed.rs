@@ -161,6 +161,7 @@ impl<T: IntoToolOutput, E: Into<ToolError>> IntoToolResult for Result<T, E> {
 /// assert!(refusal.is_error);
 /// assert!(refusal.content.contains("missing field `question`"));
 /// ```
+#[allow(clippy::result_large_err)] // the refusal is a whole `ToolOutput`, as every tool returns it
 pub fn parse_args<A: DeserializeOwned>(tool: &str, args: Value) -> Result<A, ToolOutput> {
     let args = if args.is_null() {
         Value::Object(serde_json::Map::new())

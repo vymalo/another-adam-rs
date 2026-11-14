@@ -224,6 +224,7 @@ fn no_such_item(id: u32, plan: &Plan) -> ToolOutput {
 }
 
 /// What every plan tool checks first: the call is the root run's, and not a subagent's.
+#[allow(clippy::result_large_err)] // the refusal is a whole `ToolOutput`, as every tool returns it
 fn root_only(ctx: &ToolCtx) -> Result<(), ToolOutput> {
     if ctx.run_id() == ctx.root_run_id() {
         Ok(())
@@ -611,7 +612,7 @@ impl Tool for PlanCheck {
                 `dropped` when it is no longer needed (say why in `note`), `pending` to put it back. `id` is \
                 the number shown before the item. `note` replaces the item's note; an empty `note` clears it, \
                 and leaving it out keeps it. With no arguments the plan comes back unchanged, to read it \
-                again. Returns the whole plan."
+                again; do not call it again to re-read an unchanged plan. Returns the whole plan."
                 .to_owned(),
             parameters: json!({
                 "type": "object",

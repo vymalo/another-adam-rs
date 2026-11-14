@@ -875,7 +875,7 @@ const LIMIT_MARGIN: Duration = Duration::from_secs(30);
 /// and display tools. Any other tool of the coder must have a bound of its own and declare it in
 /// `own_limit`: a tool added later is not on this list, so it decides. A test walks the whole tool
 /// list (`tests/time_limits.rs`).
-pub const QUICK_TOOLS: [&str; 13] = [
+pub const QUICK_TOOLS: [&str; 16] = [
     // The run's own files: `apply_patch` runs `git apply` for at most 60 s. (The four read tools,
     // `read_file`, `list_files`, `find_files` and `search_files`, have a deadline of their own, 30 s:
     // they declare it, see `own_limit`.)
@@ -895,6 +895,10 @@ pub const QUICK_TOOLS: [&str; 13] = [
     "ask_user",
     "show",
     "ui_catalog",
+    // The plan: state the loop keeps, drawn on the screen of the catalog the message carried.
+    "plan_work",
+    "plan_check",
+    "plan_add",
 ];
 
 /// The time limit a coder tool declares: its own bound and [`LIMIT_MARGIN`], from the deployment's

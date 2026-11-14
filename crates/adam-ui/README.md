@@ -181,7 +181,7 @@ is not an error, a replay takes the journaled one, and a task that continues ano
 | Tool | Arguments | Result (ASCII, built only from the state, so the same plan gives the same bytes) |
 |---|---|---|
 | `plan_work` | `{title?: string (80), items: string[1..50]}` (each 1 to 200 characters) | `Plan saved (4 items).` or `Plan replaced (4 items).`, then the plan; replaces any earlier plan, ids start at 1 |
-| `plan_check` | `{id?: integer, status?: pending \| doing \| done \| dropped, note?: string (200)}` | `Item 2: doing.`, then the plan. `pending` puts an item back; `note` replaces the note, `""` clears it and leaving it out keeps it; **with no arguments** `Plan unchanged.` and the plan, to read it again after the history was shortened (a third identical call in a row is refused by the loop's repeated-call guard where that exists, and shows nothing new) |
+| `plan_check` | `{id?: integer, status?: pending \| doing \| done \| dropped, note?: string (200)}` | `Item 2: doing.`, then the plan. `pending` puts an item back; `note` replaces the note, `""` clears it and leaving it out keeps it; **with no arguments** `Plan unchanged.` and the plan, to read it again after the history was shortened (the doom-loop rule applies: the third identical call in a row with the same result is not run, so do not re-read an unchanged plan; an update in between is a different call and never a repeat) |
 | `plan_add` | `{items: string[1..50], after?: integer}` | `Added 2 items: 5, 6.`, then the plan |
 
 ```text

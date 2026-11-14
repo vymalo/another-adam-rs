@@ -32,7 +32,7 @@ async fn limits_with(environment_start: u64) -> BTreeMap<String, Option<Duration
 #[tokio::test]
 async fn every_tool_declares_its_own_bound_or_is_quick_by_construction() {
     let limits = limits_with(0).await;
-    assert_eq!(limits.len(), 25, "the whole list: {:?}", limits.keys());
+    assert_eq!(limits.len(), 28, "the whole list: {:?}", limits.keys());
     for (name, limit) in &limits {
         let quick = QUICK_TOOLS.contains(&name.as_str());
         match limit {

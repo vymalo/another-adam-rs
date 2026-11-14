@@ -1290,7 +1290,7 @@ async fn the_specs_are_in_the_fixed_order_with_the_exact_schemas() {
     );
     assert_eq!(
         spec("plan_check").description,
-        "Set one item of the plan: `doing` when you start it, `done` when it is finished, `dropped` when it is no longer needed (say why in `note`), `pending` to put it back. `id` is the number shown before the item. `note` replaces the item's note; an empty `note` clears it, and leaving it out keeps it. With no arguments the plan comes back unchanged, to read it again. Returns the whole plan."
+        "Set one item of the plan: `doing` when you start it, `done` when it is finished, `dropped` when it is no longer needed (say why in `note`), `pending` to put it back. `id` is the number shown before the item. `note` replaces the item's note; an empty `note` clears it, and leaving it out keeps it. With no arguments the plan comes back unchanged, to read it again; do not call it again to re-read an unchanged plan. Returns the whole plan."
     );
     assert_eq!(
         spec("plan_add").description,

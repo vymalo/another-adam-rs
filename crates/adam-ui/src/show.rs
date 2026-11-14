@@ -52,6 +52,7 @@ struct Args {
 }
 
 /// Why there is nothing to draw with, as the text the model reads.
+#[allow(clippy::result_large_err)] // the refusal is a whole `ToolOutput`, as every tool returns it
 fn unavailable(resolved: Resolved) -> Result<Arc<Catalog>, ToolOutput> {
     match resolved {
         Resolved::Found(catalog) => Ok(catalog),

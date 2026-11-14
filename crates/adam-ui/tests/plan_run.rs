@@ -277,6 +277,92 @@ async fn the_real_plan_tools_leave_one_artifact_a_continued_task_draws_on_the_sa
     }
 }
 
+/// What the model was told for each call: `(call id, content, is_error)`, from its last request.
+fn answers_of(rig: &Rig) -> Vec<(String, String, bool)> {
+    let requests = rig.model.requests();
+    requests
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            adam_model::Message::Tool {
+                call_id,
+                content,
+                is_error,
+            } => Some((call_id.clone(), content.clone(), *is_error)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The doom loop (the third identical call in a row with the same result is not run) and a plan:
+/// showing an unchanged plan three times in a row is refused the third time, with the plan intact
+/// and the next real update working; and a plan that changed between two identical reads is not a
+/// repeat, because the key of a call is its tool, its arguments and its result.
+#[tokio::test]
+async fn re_reading_an_unchanged_plan_three_times_is_refused_and_an_update_is_never_a_repeat() {
+    let rig = Rig::new();
+    let read = |id: &str| call(id, "plan_check", json!({}));
+    let set = |id: &str, item: u32, status: &str| {
+        call(id, "plan_check", json!({"id": item, "status": status}))
+    };
+    rig.model
+        .push_tool_calls(vec![call("c1", "plan_work", json!({"items": ["a", "b"]}))])
+        .push_tool_calls(vec![read("c2")])
+        .push_tool_calls(vec![read("c3")])
+        .push_tool_calls(vec![read("c4")])
+        .push_tool_calls(vec![set("c5", 1, "done")])
+        .push_tool_calls(vec![read("c6")])
+        .push_tool_calls(vec![read("c7")])
+        .push_tool_calls(vec![set("c8", 2, "doing")])
+        .push_tool_calls(vec![set("c9", 2, "done")])
+        .push_tool_calls(vec![read("c10")])
+        .push_tool_calls(vec![read("c11")])
+        .push_text("done");
+    let (stop, handle) = rig.worker();
+    let task = rig
+        .backend
+        .submit(
+            alice(),
+            from_the_screen("plan it", &[]),
+            None,
+            Some("ctx".into()),
+        )
+        .await
+        .unwrap();
+    let done = rig.wait(&task).await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
+
+    let answers = answers_of(&rig);
+    let of = |id: &str| answers.iter().find(|a| a.0 == id).unwrap().clone();
+    assert!(
+        of("c2").1.starts_with("Plan unchanged.\n"),
+        "{:?}",
+        of("c2")
+    );
+    assert!(of("c3").1.starts_with("Plan unchanged.\n"));
+    assert!(of("c4").2, "the third identical read is an error");
+    assert!(
+        of("c4").1.starts_with("Not run: this is the third call"),
+        "{}",
+        of("c4").1
+    );
+    // The plan is intact, and an update after the refusal works.
+    assert_eq!(of("c5").1.lines().next(), Some("Item 1: done."));
+    assert!(of("c5").1.contains("2. [ ] b"), "{}", of("c5").1);
+    // Two reads, an update, two reads: nothing is refused, however many reads there were in all.
+    assert!(!of("c7").2, "{:?}", of("c7"));
+    assert!(!of("c11").2, "{:?}", of("c11"));
+    assert!(of("c11").1.contains("2. [x] b"), "{}", of("c11").1);
+    assert_eq!(
+        plans_of(&done)[0].2,
+        ["done", "done"],
+        "the plan on the screen is the plan the updates made"
+    );
+}
+
 #[tokio::test]
 async fn another_conversation_draws_on_another_surface() {
     let rig = Rig::new();
