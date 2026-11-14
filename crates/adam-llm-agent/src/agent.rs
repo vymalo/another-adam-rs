@@ -581,7 +581,11 @@ impl LlmAgentBuilder {
 /// * [`ToolError::Permanent`], `ToolOutput { is_error: true }` and unknown
 ///   tool names: an error tool result for the model; the run goes on. So does
 ///   a child run that failed, was cancelled or no longer exists.
-/// * A tripped [`Limits`] entry: the run fails.
+/// * A call whose arguments were not JSON ([`ToolCall::invalid_arguments`]): an error tool result
+///   quoting what was sent; nothing runs; the run goes on.
+/// * A tripped `max_turns` or `max_tool_calls`: one closing model call in which no tool may be
+///   called ([`CLOSING_TURN`]), and the run ends `Done` with its answer marked `limited`; the run
+///   fails only if that answer has no words.
 #[derive(Clone)]
 pub struct LlmAgent {
     name: String,
@@ -1303,6 +1307,7 @@ impl LlmAgent {
     }
 
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), tool = %call.name, call_id = %call.id))]
+    #[allow(clippy::too_many_arguments)] // the pieces of the run state one call reads
     async fn run_tool(
         &self,
         ctx: &mut Ctx,

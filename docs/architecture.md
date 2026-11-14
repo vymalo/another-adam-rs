@@ -627,7 +627,9 @@ sequenceDiagram
 ```
 
 * **One step is one model turn.** `LlmAgent::step` calls the model once (journaled step `model:N`),
-  runs the tools it asked for (each a journaled step `tool:<call id>`) and returns `Continue`.
+  runs the tools it asked for (each a journaled step `tool:<call id>`) and returns `Continue`. A call whose
+  arguments were not JSON is answered from the recorded turn with an error and has no step; a run that reaches
+  `max_turns` or `max_tool_calls` makes one more model call with `tool_choice: none` and ends `Done`, marked `limited`.
 * **Replay is safe, effects are at-least-once.** The effect runs before its outcome is written, so a
   crash in between runs it again. Tools must be safe to repeat.
 * **Waking is polling plus hints.** An idle worker sleeps at most one poll interval; `start` and

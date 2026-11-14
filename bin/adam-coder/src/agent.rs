@@ -1230,7 +1230,7 @@ impl Agent for CoderAgent {
                             // The run ran out of turns or calls and said where it got to: that is
                             // never a question for the person, whatever its words end with.
                             let owes = owes_delivery(&notes, &slots).await;
-                            match limited_ending(&output, owes, &self.assembly.root().limits()) {
+                            match limited_ending(&output, owes, self.assembly.root().limits()) {
                                 Some(error) => Transition::Fail {
                                     state,
                                     error: redactor.failure_text(error),

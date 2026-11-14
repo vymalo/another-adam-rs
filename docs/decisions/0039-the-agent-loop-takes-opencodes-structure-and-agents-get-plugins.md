@@ -73,6 +73,13 @@ a crash, transitions committed to a store, and fail-closed composition.
      default.
    * The turn that would trip `max_turns` is offered no tools and told to answer. The run ends with that answer, marked as
      limited, instead of failing. This is OpenCode's last step.
+     *Amended 2026-11-14 (implemented in `adam-llm-agent`):* the closing turn **keeps the tools in the request** and sends
+     `tool_choice: none` with the closing instruction after the history (for that call only), so the request's prefix is
+     the cached one and a history that holds tool calls is valid for every provider; a call the model sends anyway is dropped.
+     It is the call that would trip `max_turns` (so a run has `max_turns` turns with tools plus one closing turn). The grace
+     also covers `max_tool_calls`: a turn whose calls would go over it has each call answered "not run", and the closing turn
+     follows. The coder never parks a limited answer as a question: it fails when repository work is undelivered, and completes
+     otherwise.
 3. **Rules per agent, with patterns** (`adam-llm-agent`).
    * **The rule.** `Rule {key, pattern, action: Allow | Ask | Deny}`, with globs for `key` and `pattern`. The last match wins,
      as in OpenCode.
