@@ -47,6 +47,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
 | `TRUNCATION_MARKER_PREFIX` | prefix of the marker left where history truncation shortened a tool output |
+| `paging` (`PAGE_LINES`, `PAGE_BYTES`, `MAX_LINE_CHARS`, `MAX_TOOL_RESULT_BYTES`, `page_lines`, `window`, `render_items`, `more_line`, `end_line`, `backstop`) | the paging convention of every tool that reads (ADR 0044): `offset` (from 1, negative from the end) and `limit` in, a page and **one last line** out (`[more: 3123 lines left; next page: offset=2001]` or `[end: 5123 lines]`), the same call giving the same bytes. `backstop` is the loop's own cap: **a tool result over 64 KiB is cut on a character boundary before it enters the history**, with `[cut by the loop: 65536 of N bytes shown]` and, only when the tool's schema has an `offset`, `. Call <tool> again with a later offset to read the rest`. It is a pure function applied after the step is journaled (the journal keeps the whole output), so a replay gives the same bytes; it covers tool results, a tool's refusal, a polled remote task and a child run's answer. A cap an MCP server's own result meets (`adam-mcp` cuts at 64 KiB too) stays as it is |
 
 ```rust
 use std::sync::Arc;

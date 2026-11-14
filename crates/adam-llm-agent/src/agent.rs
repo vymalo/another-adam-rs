@@ -25,6 +25,7 @@ use crate::conversation::{
     PendingWait, parse_context, parse_root_run, parse_root_step, parse_user_text,
 };
 use crate::history::fit_history;
+use crate::paging::backstop;
 use crate::source::{
     DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined, withheld,
 };
@@ -691,6 +692,14 @@ impl LlmAgent {
         self.index.get(name).map(|&i| &self.tools[i])
     }
 
+    /// Whether the tool `name` pages its results: its schema has an `offset`.
+    fn pages(&self, name: &str) -> bool {
+        self.specs
+            .iter()
+            .find(|s| s.name == name)
+            .is_some_and(|s| s.parameters.pointer("/properties/offset").is_some())
+    }
+
     /// Move inbound messages into the state; the first one answers a pending
     /// question. Returns `false` when the run must keep waiting for that answer.
     ///
@@ -779,10 +788,15 @@ impl LlmAgent {
             (_, error) => (
                 Message::tool_error(
                     wait.call_id.clone(),
-                    format!(
-                        "the run failed: {}",
-                        error.as_deref().unwrap_or("no reason given")
-                    ),
+                    backstop(
+                        &format!(
+                            "the run failed: {}",
+                            error.as_deref().unwrap_or("no reason given")
+                        ),
+                        "",
+                        false,
+                    )
+                    .into_owned(),
                 ),
                 StepState::Failed,
             ),
@@ -1466,7 +1480,8 @@ impl LlmAgent {
         let answered = match outcome {
             Ok(output) => {
                 let (message, artifacts, answer, outcome) =
-                    output_message(ctx, &call.id, output, files_used).await;
+                    output_message(ctx, &call.id, &call.name, self.pages(&call.name), output, files_used)
+                        .await;
                 // What the step says is what the model is told (the refusal of a file included).
                 let said = match &message {
                     Message::Tool {
@@ -1500,7 +1515,10 @@ impl LlmAgent {
                 )
                 .await;
                 ToolResult::Answered {
-                    message: Message::tool_error(call.id.clone(), reason),
+                    message: Message::tool_error(
+                        call.id.clone(),
+                        backstop(&reason, &call.name, false).into_owned(),
+                    ),
                     artifacts: Vec::new(),
                     answer: None,
                 }
@@ -1739,7 +1757,15 @@ impl LlmAgent {
             Ok(RemotePoll::Ready(output)) => {
                 let used = files_kept(&state.artifacts);
                 let (message, artifacts, answer, outcome) =
-                    output_message(ctx, &wait.call_id, output, used).await;
+                    output_message(
+                        ctx,
+                        &wait.call_id,
+                        &wait.tool,
+                        self.pages(&wait.tool),
+                        output,
+                        used,
+                    )
+                    .await;
                 state.artifacts.extend(artifacts);
                 if let Some(answer) = answer {
                     state.announce(answer);
@@ -1752,7 +1778,13 @@ impl LlmAgent {
                 wait.tool
             ))),
             Err(ToolError::Permanent(reason)) => {
-                owed(state, Message::tool_error(wait.call_id.clone(), reason));
+                owed(
+                    state,
+                    Message::tool_error(
+                        wait.call_id.clone(),
+                        backstop(&reason, &wait.tool, false).into_owned(),
+                    ),
+                );
                 Ok(Some(StepState::Failed))
             }
             Err(other) => {
@@ -1786,6 +1818,8 @@ fn files_kept(artifacts: &[ArtifactRef]) -> u64 {
 async fn output_message(
     ctx: &Ctx,
     call_id: &str,
+    tool: &str,
+    paged: bool,
     mut output: ToolOutput,
     files_used: u64,
 ) -> (Message, Vec<ArtifactRef>, Option<Announcement>, StepState) {
@@ -1838,7 +1872,8 @@ async fn output_message(
         .map(|text| Announcement { text, ends_turn });
     let message = Message::Tool {
         call_id: call_id.to_owned(),
-        content: output.content,
+        // After the journal: the step recorded the whole output, and the cut is a pure function of it.
+        content: backstop(&output.content, tool, paged).into_owned(),
         is_error: output.is_error,
     };
     (message, refs, answer, outcome)
@@ -2046,6 +2081,7 @@ fn render_output(output: Option<&Value>) -> String {
     if text.trim().is_empty() {
         return "(the run finished without output)".to_owned();
     }
+    let text = backstop(&text, "", false).into_owned();
     // A child that ran out of turns or tool calls still answered, from its closing turn.
     let limited = output.and_then(|o| {
         (o.get("limited") == Some(&Value::Bool(true)))

@@ -139,6 +139,7 @@ mod agent;
 mod conversation;
 mod fn_tool;
 mod history;
+pub mod paging;
 #[cfg(feature = "schema")]
 mod schema;
 mod source;
