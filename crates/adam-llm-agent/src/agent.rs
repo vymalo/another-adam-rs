@@ -26,6 +26,7 @@ use crate::conversation::{
 };
 use crate::history::fit_history;
 use crate::paging::backstop;
+use crate::plan::Plan;
 use crate::source::{
     DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined, withheld,
 };
@@ -1210,7 +1211,11 @@ impl LlmAgent {
                 .run_tool(
                     ctx,
                     &state.context,
-                    (state.root_run, state.root_step.as_deref()),
+                    (
+                        state.root_run,
+                        state.root_step.as_deref(),
+                        state.plan.as_ref(),
+                    ),
                     &state.source_notes,
                     &call,
                     CallFacts {
@@ -1225,9 +1230,13 @@ impl LlmAgent {
                     message,
                     artifacts,
                     answer,
+                    plan,
                 } => {
                     if let Some(answer) = answer {
                         state.announce(answer);
+                    }
+                    if let Some(plan) = plan {
+                        state.plan = Some(*plan);
                     }
                     (message, artifacts)
                 }
@@ -1326,7 +1335,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: &Map<String, Value>,
-        root: (Option<RunId>, Option<&str>),
+        root: (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
@@ -1371,6 +1380,7 @@ impl LlmAgent {
                 message: Message::tool_error(call.id.clone(), said),
                 artifacts: Vec::new(),
                 answer: None,
+                plan: None,
             };
             return Ok((answered, SandboxUsage::new()));
         }
@@ -1438,6 +1448,7 @@ impl LlmAgent {
                     message: Message::tool_error(call.id.clone(), unknown),
                     artifacts: Vec::new(),
                     answer: None,
+                    plan: None,
                 };
                 return Ok((answered, SandboxUsage::new()));
             }
@@ -1477,7 +1488,7 @@ impl LlmAgent {
         };
         let answered = match outcome {
             Ok(output) => {
-                let (message, artifacts, answer, outcome) = output_message(
+                let (message, artifacts, answer, plan, outcome) = output_message(
                     ctx,
                     &call.id,
                     &call.name,
@@ -1503,6 +1514,7 @@ impl LlmAgent {
                     message,
                     artifacts,
                     answer,
+                    plan,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -1525,6 +1537,7 @@ impl LlmAgent {
                     ),
                     artifacts: Vec::new(),
                     answer: None,
+                    plan: None,
                 }
             }
             Err(ToolError::Transient(reason)) => {
@@ -1574,7 +1587,7 @@ impl LlmAgent {
         &self,
         ctx: &Ctx,
         context: &Map<String, Value>,
-        (root_run, root_step): (Option<RunId>, Option<&str>),
+        (root_run, root_step, plan): (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call_id: &str,
         tool: &str,
@@ -1594,6 +1607,7 @@ impl LlmAgent {
             self.style_of(tool, notes)
                 .event(tool, call_id, StepState::Running),
         )
+        .with_plan(plan.cloned())
     }
 
     /// How a call of the tool `name` is drawn as a step: the tool's own [`Tool::step_style`]; for a
@@ -1742,7 +1756,11 @@ impl LlmAgent {
             .tool_ctx(
                 ctx,
                 &state.context,
-                (state.root_run, state.root_step.as_deref()),
+                (
+                    state.root_run,
+                    state.root_step.as_deref(),
+                    state.plan.as_ref(),
+                ),
                 &state.source_notes,
                 &wait.call_id,
                 &wait.tool,
@@ -1760,7 +1778,7 @@ impl LlmAgent {
             Ok(RemotePoll::Working) => Ok(None),
             Ok(RemotePoll::Ready(output)) => {
                 let used = files_kept(&state.artifacts);
-                let (message, artifacts, answer, outcome) = output_message(
+                let (message, artifacts, answer, plan, outcome) = output_message(
                     ctx,
                     &wait.call_id,
                     &wait.tool,
@@ -1772,6 +1790,9 @@ impl LlmAgent {
                 state.artifacts.extend(artifacts);
                 if let Some(answer) = answer {
                     state.announce(answer);
+                }
+                if let Some(plan) = plan {
+                    state.plan = Some(*plan);
                 }
                 owed(state, message);
                 Ok(Some(outcome))
@@ -1825,7 +1846,13 @@ async fn output_message(
     paged: bool,
     mut output: ToolOutput,
     files_used: u64,
-) -> (Message, Vec<ArtifactRef>, Option<Announcement>, StepState) {
+) -> (
+    Message,
+    Vec<ArtifactRef>,
+    Option<Announcement>,
+    Option<Box<Plan>>,
+    StepState,
+) {
     let mut used = files_used;
     let mut refused: Vec<String> = Vec::new();
     output.artifacts.retain(|a| {
@@ -1873,6 +1900,7 @@ async fn output_message(
         .take()
         .filter(|_| !output.is_error)
         .map(|text| Announcement { text, ends_turn });
+    let plan = output.plan.take().filter(|_| !output.is_error);
     let message = Message::Tool {
         call_id: call_id.to_owned(),
         // After the journal: the journal holds the whole output, and the cut (which the history, the
@@ -1880,7 +1908,7 @@ async fn output_message(
         content: backstop(&output.content, tool, paged).into_owned(),
         is_error: output.is_error,
     };
-    (message, refs, answer, outcome)
+    (message, refs, answer, plan, outcome)
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -2008,6 +2036,8 @@ enum ToolResult {
         artifacts: Vec<ArtifactRef>,
         /// What the tool announced as the run's answer, from a result that is not an error.
         answer: Option<Announcement>,
+        /// The plan the tool returned, from a result that is not an error.
+        plan: Option<Box<Plan>>,
     },
     NeedsInput {
         question: String,

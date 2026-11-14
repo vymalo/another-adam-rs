@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::plan::Plan;
 use crate::source::ToolNote;
 
 /// Recommended [`Inbound::kind`] of a user message. The agent does not inspect
@@ -305,6 +306,13 @@ pub struct Conversation {
     /// with it. Absent from state written before it existed, and not written while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub announced_final: bool,
+    /// The plan of the conversation ([`Plan`]): written by a tool with
+    /// [`ToolOutput::with_plan`](crate::ToolOutput::with_plan), applied only from a result that is not
+    /// an error, and carried into a run that continues this one. It is never put in the system
+    /// prompt, and no earlier message is rewritten with it. Absent from state written before it
+    /// existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Plan>,
     /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
     /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
     /// written before it existed, and not written while `false`.
@@ -807,6 +815,7 @@ impl Conversation {
             omitted_turns,
             continued_from: Some(from),
             context: self.context.clone(),
+            plan: self.plan.clone(),
             ..Self::default()
         }
     }

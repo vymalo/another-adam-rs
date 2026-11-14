@@ -140,6 +140,7 @@ mod conversation;
 mod fn_tool;
 mod history;
 pub mod paging;
+mod plan;
 #[cfg(feature = "schema")]
 mod schema;
 mod source;
@@ -164,6 +165,7 @@ pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
 pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};
 pub use history::TRUNCATION_MARKER_PREFIX;
+pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
 pub use source::{

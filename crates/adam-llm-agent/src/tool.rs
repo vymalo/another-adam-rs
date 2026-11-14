@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
+use crate::plan::Plan;
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
@@ -217,6 +218,14 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "SandboxUsage::is_empty")]
     pub sandbox: SandboxUsage,
+    /// The conversation's plan as it is after this call ([`Plan`]): the whole plan, not a change.
+    /// The loop makes it the run's plan when the result is not an error, in the same commit as the
+    /// result; a replay takes it from the journal. Read the plan a call starts from with
+    /// [`ToolCtx::plan`]. Never read from an error result.
+    ///
+    /// Absent from a journal written before it existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Box<Plan>>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -233,6 +242,7 @@ impl ToolOutput {
             answer: None,
             ends_turn: false,
             sandbox: SandboxUsage::new(),
+            plan: None,
         }
     }
 
@@ -246,6 +256,7 @@ impl ToolOutput {
             answer: None,
             ends_turn: false,
             sandbox: SandboxUsage::new(),
+            plan: None,
         }
     }
 
@@ -275,6 +286,14 @@ impl ToolOutput {
     pub fn final_answer(mut self, text: impl Into<String>) -> Self {
         self.answer = Some(text.into());
         self.ends_turn = true;
+        self
+    }
+
+    /// Make `plan` the conversation's plan, when this result is not an error: see
+    /// [`plan`](Self::plan).
+    #[must_use]
+    pub fn with_plan(mut self, plan: Plan) -> Self {
+        self.plan = Some(Box::new(plan));
         self
     }
 
@@ -455,6 +474,8 @@ pub struct ToolCtx {
     /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
     /// the context, so a tool may hand one to a task it spawns.
     sandbox: Arc<Mutex<SandboxUsage>>,
+    /// The conversation's plan as the call starts ([`plan`](Self::plan)).
+    plan: Option<Arc<Plan>>,
 }
 
 impl ToolCtx {
@@ -491,7 +512,25 @@ impl ToolCtx {
             note: None,
             files_left: MAX_RUN_FILE_BYTES as u64,
             sandbox: Arc::default(),
+            plan: None,
         }
+    }
+
+    /// Give the call the plan the conversation has when it starts: what [`plan`](Self::plan)
+    /// answers. The agent does it for every call; a test of a plan tool does it to say what the
+    /// plan was.
+    #[must_use]
+    pub fn with_plan(mut self, plan: impl Into<Option<Plan>>) -> Self {
+        self.plan = plan.into().map(Arc::new);
+        self
+    }
+
+    /// The conversation's plan as this call starts: the one a tool before it in the same turn left,
+    /// since calls run one after the other. `None` while there is none. Return the new plan with
+    /// [`ToolOutput::with_plan`]; this value is a copy, and changing nothing here changes nothing
+    /// there.
+    pub fn plan(&self) -> Option<&Plan> {
+        self.plan.as_deref()
     }
 
     /// Say how many bytes of files the run may still share: what [`files_left`](Self::files_left)
