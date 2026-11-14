@@ -222,6 +222,32 @@ async fn malformed_tool_call_json_is_a_protocol_error() {
 }
 
 #[tokio::test]
+async fn a_response_without_finish_reason_is_transient() {
+    let server = MockServer::start().await;
+    for body in [
+        json!({"choices": [{"message": {"content": "hi"}}]}),
+        json!({"choices": [{"message": {"content": "hi"}, "finish_reason": null}]}),
+    ] {
+        server.reset().await;
+        mount(&server, ResponseTemplate::new(200).set_body_json(body)).await;
+        let err = client(&server).complete(request()).await.unwrap_err();
+        assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_body_cut_short_is_transient() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_string(r#"{"choices":[{"message":{"content":"hi"#),
+    )
+    .await;
+    let err = client(&server).complete(request()).await.unwrap_err();
+    assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
+}
+
+#[tokio::test]
 async fn unparseable_body_is_a_protocol_error() {
     let server = MockServer::start().await;
     mount(
@@ -348,7 +374,7 @@ async fn stream_malformed_tool_arguments_is_a_protocol_error() {
 }
 
 #[tokio::test]
-async fn truncated_stream_is_a_protocol_error_not_a_fabricated_response() {
+async fn a_truncated_stream_is_transient_not_a_fabricated_response() {
     let server = MockServer::start().await;
     mount(
         &server,
@@ -358,7 +384,7 @@ async fn truncated_stream_is_a_protocol_error_not_a_fabricated_response() {
     let items = collect(client(&server).stream(request()).await.unwrap()).await;
     assert!(matches!(items[0], Ok(ModelDelta::Text(_))));
     assert!(
-        matches!(items.last(), Some(Err(ModelError::Protocol { .. }))),
+        matches!(items.last(), Some(Err(ModelError::Transient { .. }))),
         "{items:?}"
     );
     assert!(

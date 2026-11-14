@@ -261,8 +261,13 @@ fn wire_message(
 
 /// Parse a non-streaming response body.
 pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError> {
-    let value: Value = serde_json::from_slice(body)
-        .map_err(|e| ModelError::protocol("response is not JSON").with_source(e))?;
+    let value: Value = serde_json::from_slice(body).map_err(|e| {
+        if e.is_eof() {
+            ModelError::transient("response body ended early").with_source(e)
+        } else {
+            ModelError::protocol("response is not JSON").with_source(e)
+        }
+    })?;
     if value.get("choices").is_none() && value.get("error").is_some() {
         return Err(from_error_object(&value));
     }
@@ -279,7 +284,7 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         .ok_or_else(|| ModelError::protocol("choice has no message"))?;
     let finish = choice
         .finish_reason
-        .ok_or_else(|| ModelError::protocol("choice has no finish_reason"))?;
+        .ok_or_else(|| ModelError::transient("choice has no finish_reason"))?;
 
     let mut tool_calls = Vec::new();
     for call in message.tool_calls.unwrap_or_default() {
@@ -551,8 +556,23 @@ impl Assembler {
     /// Consume one SSE `data:` payload (not `[DONE]`), returning the deltas to
     /// forward to the caller.
     pub(crate) fn push(&mut self, data: &str) -> Result<Vec<ModelDelta>, ModelError> {
-        let value: Value = serde_json::from_str(data)
-            .map_err(|e| ModelError::protocol("stream chunk is not JSON").with_source(e))?;
+        self.push_event(data, false)
+    }
+
+    /// Like [`Assembler::push`] for the event handed over when the connection closed without its
+    /// terminator: a payload cut off mid-JSON is a truncated response, so it is transient.
+    pub(crate) fn push_last(&mut self, data: &str) -> Result<Vec<ModelDelta>, ModelError> {
+        self.push_event(data, true)
+    }
+
+    fn push_event(&mut self, data: &str, last: bool) -> Result<Vec<ModelDelta>, ModelError> {
+        let value: Value = serde_json::from_str(data).map_err(|e| {
+            if last && e.is_eof() {
+                ModelError::transient("stream ended inside a chunk").with_source(e)
+            } else {
+                ModelError::protocol("stream chunk is not JSON").with_source(e)
+            }
+        })?;
         if value.get("choices").is_none() && value.get("error").is_some() {
             return Err(from_error_object(&value));
         }
@@ -620,7 +640,7 @@ impl Assembler {
     pub(crate) fn finish(self) -> Result<ModelResponse, ModelError> {
         let reason = self
             .finish_reason
-            .ok_or_else(|| ModelError::protocol("stream ended without a finish_reason"))?;
+            .ok_or_else(|| ModelError::transient("stream ended without a finish_reason"))?;
         let mut tool_calls = Vec::with_capacity(self.calls.len());
         for call in self.calls.into_values() {
             check_name(&call.name)?;
@@ -974,13 +994,27 @@ mod tests {
         for body in [
             &b"not json"[..],
             br#"{"choices":[]}"#,
-            br#"{"choices":[{"message":{"content":"x"}}]}"#,
             br#"{"choices":[{"message":{"tool_calls":[{"id":"a","function":{"name":"w","arguments":"{oops"}}]},"finish_reason":"tool_calls"}]}"#,
             br#"{"choices":[{"message":{"tool_calls":[{"id":"a","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
             br#"{"choices":"nope"}"#,
         ] {
             assert!(
                 matches!(parse_completion(body), Err(ModelError::Protocol { .. })),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_completion_that_stops_short_is_transient() {
+        for body in [
+            &br#"{"choices":[{"message":{"content":"x"}}]}"#[..],
+            br#"{"choices":[{"message":{"content":"x"},"finish_reason":null}]}"#,
+            br#"{"choices":[{"message":{"content":"x"#,
+        ] {
+            assert!(
+                matches!(parse_completion(body), Err(ModelError::Transient { .. })),
                 "{}",
                 String::from_utf8_lossy(body)
             );
@@ -1226,13 +1260,13 @@ mod tests {
     }
 
     #[test]
-    fn finishing_without_a_reason_is_a_protocol_error() {
+    fn finishing_without_a_reason_is_transient() {
         let mut asm = Assembler::default();
         feed(
             &mut asm,
             &[r#"{"choices":[{"delta":{"content":"partial"}}]}"#],
         );
-        assert!(matches!(asm.finish(), Err(ModelError::Protocol { .. })));
+        assert!(matches!(asm.finish(), Err(ModelError::Transient { .. })));
     }
 
     #[test]

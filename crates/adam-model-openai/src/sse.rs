@@ -89,8 +89,9 @@ struct State<S> {
 impl<S> State<S> {
     /// Process complete SSE payloads. Deltas produced before a failure are
     /// still delivered ahead of it.
-    fn handle_events(&mut self, events: Vec<String>) {
-        for data in events {
+    fn handle_events(&mut self, events: Vec<String>, closed: bool) {
+        let count = events.len();
+        for (i, data) in events.into_iter().enumerate() {
             if self.done {
                 return;
             }
@@ -101,7 +102,12 @@ impl<S> State<S> {
                 self.finalize();
                 return;
             }
-            match assembler.push(&data) {
+            let pushed = if closed && i + 1 == count {
+                assembler.push_last(&data)
+            } else {
+                assembler.push(&data)
+            };
+            match pushed {
                 Ok(deltas) => self.pending.extend(deltas),
                 Err(e) => {
                     self.fail(e);
@@ -111,7 +117,7 @@ impl<S> State<S> {
         }
     }
 
-    /// End of stream (`[DONE]` or EOF): emit `Finished`, or a protocol error
+    /// End of stream (`[DONE]` or EOF): emit `Finished`, or a transient error
     /// when the server never said why it stopped.
     fn finalize(&mut self) {
         self.done = true;
@@ -173,11 +179,11 @@ where
                 }
                 Ok(Some(Ok(chunk))) => {
                     let events = st.parser.push(chunk.as_ref());
-                    st.handle_events(events);
+                    st.handle_events(events, false);
                 }
                 Ok(None) => {
                     let events = st.parser.finish();
-                    st.handle_events(events);
+                    st.handle_events(events, true);
                     // Some servers close without `[DONE]`; that is fine as long
                     // as they said why they stopped (checked by `finalize`).
                     if !st.done {
@@ -270,7 +276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eof_without_finish_reason_is_a_protocol_error() {
+    async fn eof_without_finish_reason_is_transient() {
         let items: Vec<_> = deltas(
             byte_stream(TEXT_STREAM[..1].to_vec()),
             Duration::from_secs(5),
@@ -279,7 +285,7 @@ mod tests {
         .await;
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0], Ok(ModelDelta::Text(_))));
-        assert!(matches!(items[1], Err(ModelError::Protocol { .. })));
+        assert!(matches!(items[1], Err(ModelError::Transient { .. })));
         // [DONE] with no finish_reason is just as truncated.
         let items: Vec<_> = deltas(
             byte_stream(vec!["data: [DONE]\n\n"]),
@@ -289,8 +295,33 @@ mod tests {
         .await;
         assert!(matches!(
             items.as_slice(),
-            [Err(ModelError::Protocol { .. })]
+            [Err(ModelError::Transient { .. })]
         ));
+    }
+
+    #[tokio::test]
+    async fn a_chunk_cut_by_eof_is_transient() {
+        let items: Vec<_> = deltas(
+            byte_stream(vec!["data: {\"choices\":[{\"delta\":{\"content\":\"Hel"]),
+            Duration::from_secs(5),
+        )
+        .collect()
+        .await;
+        assert!(
+            matches!(items.as_slice(), [Err(ModelError::Transient { .. })]),
+            "{items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_chunk_that_is_not_json_stays_protocol() {
+        let items: Vec<_> = deltas(byte_stream(vec!["data: {oops}"]), Duration::from_secs(5))
+            .collect()
+            .await;
+        assert!(
+            matches!(items.as_slice(), [Err(ModelError::Protocol { .. })]),
+            "{items:?}"
+        );
     }
 
     #[tokio::test]
