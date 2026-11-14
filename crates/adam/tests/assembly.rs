@@ -77,6 +77,7 @@ async fn a_bound_agent_runs_a_macro_tool_through_the_runtime() {
         id: "c1".into(),
         name: "get_weather".into(),
         arguments: json!({"city": "Paris"}),
+        ..Default::default()
     }]);
     model.push_text("It is 18 C.");
 

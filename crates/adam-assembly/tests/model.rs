@@ -231,6 +231,7 @@ async fn state_reaches_the_tools_of_a_running_agent() {
         id: "c1".into(),
         name: "needs_env".into(),
         arguments: json!({}),
+        ..Default::default()
     }]);
     model.push_text("done");
     let assembly = def(&[(INSTRUCTIONS, &instructions("name: coder", "Hi."))])
@@ -389,6 +390,7 @@ async fn a_tool_source_is_given_to_every_agent_and_the_model_is_offered_its_tool
             id: "c1".into(),
             name: "ping".into(),
             arguments: json!({}),
+            ..Default::default()
         }])
         .push_text("done");
     let assembly = def(&[(INSTRUCTIONS, &instructions("name: coder", "Root."))])

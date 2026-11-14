@@ -128,6 +128,7 @@ mod tests {
                 id: id.into(),
                 name: "t".into(),
                 arguments: json!({}),
+                ..Default::default()
             }],
             reasoning: None,
         }
@@ -252,6 +253,7 @@ mod tests {
                             id: format!("{id}{i}"),
                             name: "tool".into(),
                             arguments: json!({ "x": args }),
+                            ..Default::default()
                         })
                         .collect(),
                     reasoning: None,

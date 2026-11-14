@@ -545,6 +545,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             arguments: json!({}),
+            ..Default::default()
         }
     }
 

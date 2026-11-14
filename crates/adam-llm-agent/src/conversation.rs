@@ -272,6 +272,11 @@ pub struct Conversation {
     /// with it. Absent from state written before it existed, and not written while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub announced_final: bool,
+    /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
+    /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
+    /// written before it existed, and not written while `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_cut: bool,
     /// What the tool sources said about the tools they offered on the latest model turn
     /// ([`ToolNote`](crate::ToolNote)): which calls the system behind a source reports as steps itself
     /// (the agent reports none) and how long a call may run. It is the notes of **that turn's
@@ -994,6 +999,7 @@ mod tests {
             id: id.into(),
             name: "t".into(),
             arguments: json!({}),
+            ..Default::default()
         }
     }
 

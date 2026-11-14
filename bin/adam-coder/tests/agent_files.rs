@@ -429,6 +429,7 @@ async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
         id: "call-1".into(),
         name: "run_checks".into(),
         arguments: json!({"command": "true"}),
+        ..Default::default()
     }]);
     mock.push_text("There is nothing to do.");
     let model: DynModel = mock.clone();
@@ -742,17 +743,20 @@ async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
         id: "c1".into(),
         name: "prepare_workspace".into(),
         arguments: json!({"repo_url": url, "base_branch": "main"}),
+        ..Default::default()
     }])
     .push_tool_calls(vec![ToolCall {
         id: "c2".into(),
         name: "explorer".into(),
         arguments: json!({"message": "what does README.md say?"}),
+        ..Default::default()
     }])
     // The explorer's own turns.
     .push_tool_calls(vec![ToolCall {
         id: "e1".into(),
         name: "read_file".into(),
         arguments: json!({"path": "README.md"}),
+        ..Default::default()
     }])
     .push_text("README.md:1 says widgets.")
     // The coder, back from the explorer.
@@ -810,6 +814,7 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
         id: "c1".into(),
         name: "summariser".into(),
         arguments: json!({"message": "summarise the diff"}),
+        ..Default::default()
     }])
     .push_text("LGTM, nothing to fix.")
     .push_text("The summariser is happy.");
@@ -1051,6 +1056,7 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
         id: "m1".into(),
         name: "test__echo".into(),
         arguments: json!({"text": "ping"}),
+        ..Default::default()
     }])
     .push_text("The server said ping.");
     let model: DynModel = mock.clone();

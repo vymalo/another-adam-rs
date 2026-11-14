@@ -311,6 +311,7 @@ async fn a_question_with_an_interface_is_input_required_with_text_and_a_2ui_part
             id: "c1".into(),
             name: "ask_user".into(),
             arguments: json!({}),
+            ..Default::default()
         }])
         .push_text("Going with Postgres.");
     let (stop, handle) = rig.worker();

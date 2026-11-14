@@ -119,6 +119,7 @@ fn gate_call(id: &str) -> ToolCall {
         id: id.into(),
         name: "gate".into(),
         arguments: json!({}),
+        ..Default::default()
     }
 }
 

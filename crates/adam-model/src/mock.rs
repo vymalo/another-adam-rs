@@ -267,6 +267,7 @@ mod tests {
                     id: "c1".into(),
                     name: "search".into(),
                     arguments: json!({"q": "x"}),
+                    ..Default::default()
                 }],
                 reasoning: None,
             },

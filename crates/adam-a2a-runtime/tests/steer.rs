@@ -133,6 +133,7 @@ fn gate_call() -> ToolCall {
         id: "c1".into(),
         name: "gate".into(),
         arguments: json!({}),
+        ..Default::default()
     }
 }
 

@@ -965,6 +965,7 @@ impl LlmAgent {
             ));
         }
         state.turns += 1;
+        state.output_cut = finish == FinishReason::Length;
 
         let text = message.text();
         let calls: Vec<ToolCall> = message.tool_calls().to_vec();
@@ -1128,6 +1129,7 @@ impl LlmAgent {
                     &state.source_notes,
                     &call,
                     used,
+                    state.output_cut,
                 )
                 .await?;
             state.sandbox_usage.merge(&reported);
@@ -1241,6 +1243,7 @@ impl LlmAgent {
         notes: &[ToolNote],
         call: &ToolCall,
         files_used: u64,
+        output_cut: bool,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
         // What the listing that offered this tool said about it. Only a source's tool has a note: the
@@ -1257,6 +1260,30 @@ impl LlmAgent {
             start = start.with_input_within(input, max);
         }
         say(ctx, silent, RunEvent::Step(start)).await;
+
+        // Arguments that were not JSON: nothing runs, and the model is told what it sent. The
+        // answer comes from the recorded model turn alone, so a replay gives the same one.
+        if let Some(raw) = &call.invalid_arguments {
+            let said = invalid_arguments(&call.name, raw, output_cut);
+            say(
+                ctx,
+                silent,
+                self.step_end(
+                    &call.name,
+                    &call.id,
+                    StepState::Failed,
+                    Some((&said, true)),
+                    notes,
+                ),
+            )
+            .await;
+            let answered = ToolResult::Answered {
+                message: Message::tool_error(call.id.clone(), said),
+                artifacts: Vec::new(),
+                answer: None,
+            };
+            return Ok((answered, SandboxUsage::new()));
+        }
 
         let tool_ctx = self
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
@@ -1860,6 +1887,31 @@ enum ToolResult {
 /// A child's output as the text of the tool result. An `LlmAgent` child finishes with
 /// `{"text": ..., "artifacts": [...]}` and the parent's model gets the text (the same reading the
 /// A2A adapter has of an output); another string is passed as it is, and anything else as JSON.
+/// The longest part of the text of an invalid call that its error quotes.
+const INVALID_ARGUMENTS_QUOTE: usize = 2048;
+
+/// What the model is told when the arguments of its call were not JSON.
+fn invalid_arguments(name: &str, raw: &str, output_cut: bool) -> String {
+    let why = serde_json::from_str::<Value>(raw)
+        .err()
+        .map_or_else(String::new, |e| format!(": {e}"));
+    let mut end = raw.len().min(INVALID_ARGUMENTS_QUOTE);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let more = if end < raw.len() { " ..." } else { "" };
+    let cut = if output_cut {
+        " The reply was cut at the output limit, so the arguments are probably incomplete: send less in one call."
+    } else {
+        ""
+    };
+    format!(
+        "the arguments of `{name}` are not valid JSON{why}. The call did not run. \
+         What you sent: {}{more}{cut}",
+        &raw[..end]
+    )
+}
+
 fn render_output(output: Option<&Value>) -> String {
     let text = match output {
         None | Some(Value::Null) => String::new(),

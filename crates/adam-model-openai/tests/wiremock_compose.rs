@@ -163,6 +163,7 @@ async fn tool_call_by_keyword_and_by_header_then_final_answer() {
                 id: calls[0].id.clone(),
                 name: "get_weather".into(),
                 arguments: json!({"city": "Paris"}),
+                ..Default::default()
             }],
             reasoning: None,
         });
@@ -443,6 +444,7 @@ async fn the_scripted_models_stream_what_they_complete() {
                 id: "c1".into(),
                 name: "search__web_search".into(),
                 arguments: json!({}),
+                ..Default::default()
             }],
             reasoning: None,
         },
@@ -500,6 +502,7 @@ async fn the_scratch_script_asks_where_to_publish_and_goes_on_when_told() {
             id: "stop00004".into(),
             name: "ask_user".into(),
             arguments: json!({"question": question}),
+            ..Default::default()
         }],
         reasoning: None,
     });
@@ -758,6 +761,7 @@ async fn the_create_repo_script_publishes_to_the_new_repository_and_stops_when_t
                 id: "stop00004".into(),
                 name: "ask_user".into(),
                 arguments: json!({"question": question}),
+                ..Default::default()
             }],
             reasoning: None,
         });
@@ -839,6 +843,7 @@ async fn the_coders_last_answer_arrives_over_time() {
             id: "coder-call-5".into(),
             name: "open_pull_request".into(),
             arguments: json!({}),
+            ..Default::default()
         }],
         reasoning: None,
     });

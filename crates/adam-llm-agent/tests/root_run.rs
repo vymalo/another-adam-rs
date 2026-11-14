@@ -62,6 +62,7 @@ fn call(id: &str, name: &str) -> ToolCall {
         id: id.into(),
         name: name.into(),
         arguments: json!({}),
+        ..Default::default()
     }
 }
 

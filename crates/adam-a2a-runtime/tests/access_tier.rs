@@ -303,6 +303,7 @@ async fn a_tier_that_changes_while_the_task_works_is_said_on_the_stream() {
             id: "c1".into(),
             name: "gate".into(),
             arguments: json!({}),
+            ..Default::default()
         }])
         .push_text("done");
     let who = uniq("erin");

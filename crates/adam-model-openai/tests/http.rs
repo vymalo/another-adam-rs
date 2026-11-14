@@ -185,6 +185,7 @@ async fn tool_results_round_trip_into_the_next_request() {
             id: "call_9".into(),
             name: "weather".into(),
             arguments: json!({"city": "Paris"}),
+            ..Default::default()
         }],
         reasoning: None,
     });
@@ -204,7 +205,7 @@ async fn tool_results_round_trip_into_the_next_request() {
 }
 
 #[tokio::test]
-async fn malformed_tool_call_json_is_a_protocol_error() {
+async fn malformed_tool_call_json_is_kept_as_an_invalid_call() {
     let server = MockServer::start().await;
     mount(
         &server,
@@ -217,34 +218,41 @@ async fn malformed_tool_call_json_is_a_protocol_error() {
         })),
     )
     .await;
-    let err = client(&server).complete(request()).await.unwrap_err();
-    assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
+    let resp = client(&server).complete(request()).await.unwrap();
+    let call = &resp.message.tool_calls()[0];
+    assert_eq!(call.invalid_arguments.as_deref(), Some("{\"city\": "));
+    assert_eq!(call.arguments, json!({}));
+    assert_eq!(call.name, "weather");
 }
 
 #[tokio::test]
-async fn a_response_without_finish_reason_is_transient() {
-    let server = MockServer::start().await;
-    for body in [
-        json!({"choices": [{"message": {"content": "hi"}}]}),
-        json!({"choices": [{"message": {"content": "hi"}, "finish_reason": null}]}),
-    ] {
-        server.reset().await;
-        mount(&server, ResponseTemplate::new(200).set_body_json(body)).await;
-        let err = client(&server).complete(request()).await.unwrap_err();
-        assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
-    }
-}
-
-#[tokio::test]
-async fn a_body_cut_short_is_transient() {
+async fn an_invalid_call_is_echoed_with_empty_object_arguments() {
     let server = MockServer::start().await;
     mount(
         &server,
-        ResponseTemplate::new(200).set_body_string(r#"{"choices":[{"message":{"content":"hi"#),
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+        })),
     )
     .await;
-    let err = client(&server).complete(request()).await.unwrap_err();
-    assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
+    let mut req = request();
+    req.messages.push(Message::Assistant {
+        content: vec![],
+        tool_calls: vec![adam_model::ToolCall::with_invalid_arguments(
+            "c",
+            "weather",
+            "{\"city\": ",
+        )],
+        reasoning: None,
+    });
+    req.messages.push(Message::tool_error("c", "not JSON"));
+    client(&server).complete(req).await.unwrap();
+    let body = sent_body(&server).await;
+    assert_eq!(
+        body["messages"][2]["tool_calls"][0]["function"]["arguments"],
+        "{}"
+    );
+    assert!(!body["messages"].to_string().contains("city"));
 }
 
 #[tokio::test]
@@ -349,7 +357,7 @@ async fn stream_assembles_tool_calls_from_deltas() {
 }
 
 #[tokio::test]
-async fn stream_malformed_tool_arguments_is_a_protocol_error() {
+async fn stream_malformed_tool_arguments_are_kept_as_an_invalid_call() {
     let server = MockServer::start().await;
     mount(
         &server,
@@ -361,16 +369,12 @@ async fn stream_malformed_tool_arguments_is_a_protocol_error() {
     )
     .await;
     let items = collect(client(&server).stream(request()).await.unwrap()).await;
-    let last = items.last().expect("items");
-    assert!(
-        matches!(last, Err(ModelError::Protocol { .. })),
-        "{items:?}"
-    );
-    assert!(
-        !items
-            .iter()
-            .any(|i| matches!(i, Ok(ModelDelta::Finished(_))))
-    );
+    let Some(Ok(ModelDelta::Finished(resp))) = items.last() else {
+        panic!("{items:?}")
+    };
+    let call = &resp.message.tool_calls()[0];
+    assert_eq!(call.invalid_arguments.as_deref(), Some("{\"city\": "));
+    assert_eq!(call.arguments, json!({}));
 }
 
 #[tokio::test]
@@ -727,6 +731,7 @@ async fn reasoning_goes_back_only_through_a_client_set_to_echo_it() {
                 id: "call_1".into(),
                 name: "weather".into(),
                 arguments: json!({}),
+                ..Default::default()
             }],
             reasoning: Some("I should call the tool.".into()),
         });

@@ -176,6 +176,7 @@ fn three_questions_call() -> ToolCall {
                  "options": [{"value": "k8s", "label": "Kubernetes"}, {"value": "compose", "label": "Docker Compose"}]}
             ]
         }),
+        ..Default::default()
     }
 }
 
@@ -275,6 +276,7 @@ async fn a_tool_the_endpoint_lists_is_offered_under_its_name_and_called_through_
             id: "c1".into(),
             name: "relay__search".into(),
             arguments: json!({"query": "rust"}),
+            ..Default::default()
         }])
         .push_text("It says: found it.");
     let (stop, handle) = rig.worker();
@@ -404,6 +406,7 @@ async fn the_token_never_reaches_the_model_or_the_person() {
             id: "c1".into(),
             name: "relay__search".into(),
             arguments: json!({}),
+            ..Default::default()
         }])
         .push_tool_calls(vec![three_questions_call()]);
     let (stop, handle) = rig.worker();

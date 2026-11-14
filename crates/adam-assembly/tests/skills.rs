@@ -91,6 +91,7 @@ fn call(id: &str, tool: &str, args: Value) -> ToolCall {
         id: id.into(),
         name: tool.into(),
         arguments: args,
+        ..Default::default()
     }
 }
 

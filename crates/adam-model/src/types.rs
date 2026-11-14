@@ -198,8 +198,14 @@ pub struct ToolCall {
     pub id: String,
     /// Name of the tool to run.
     pub name: String,
-    /// Parsed JSON arguments.
+    /// Parsed JSON arguments; `{}` when the model's text was not JSON (see
+    /// [`ToolCall::invalid_arguments`]).
     pub arguments: Value,
+    /// The raw argument text, when it did not parse as JSON. A call with this set must not run:
+    /// the agent answers it with an error that quotes the text. It is never echoed back to the
+    /// model as `arguments` (which stay `{}`), and older journals, which lack it, decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_arguments: Option<String>,
 }
 
 impl ToolCall {
@@ -209,6 +215,19 @@ impl ToolCall {
             id: id.into(),
             name: name.into(),
             arguments,
+            invalid_arguments: None,
+        }
+    }
+
+    /// A call whose argument text was not JSON: `arguments` is `{}` and `raw` is kept.
+    pub fn with_invalid_arguments(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        raw: impl Into<String>,
+    ) -> Self {
+        Self {
+            invalid_arguments: Some(raw.into()),
+            ..Self::new(id, name, Value::Object(Default::default()))
         }
     }
 }
@@ -419,11 +438,27 @@ mod tests {
         assert_eq!(value, back, "via {json}");
     }
 
+    #[test]
+    fn an_invalid_call_roundtrips_and_a_valid_one_keeps_its_shape() {
+        let bad = ToolCall::with_invalid_arguments("c", "w", "{\"city\": ");
+        assert_eq!(bad.arguments, json!({}));
+        roundtrip(bad);
+        let good = ToolCall::new("c", "w", json!({"x": 1}));
+        assert_eq!(
+            serde_json::to_value(&good).unwrap(),
+            json!({"id": "c", "name": "w", "arguments": {"x": 1}})
+        );
+        let old: ToolCall =
+            serde_json::from_value(json!({"id": "c", "name": "w", "arguments": {}})).unwrap();
+        assert_eq!(old.invalid_arguments, None);
+    }
+
     fn tool_call() -> ToolCall {
         ToolCall {
             id: "call_1".into(),
             name: "weather".into(),
             arguments: json!({"city": "Paris", "days": [1, 2]}),
+            ..Default::default()
         }
     }
 

@@ -327,6 +327,7 @@ async fn the_words_before_a_tool_call_are_stated_as_a_working_status_with_the_st
                 id: "c1".into(),
                 name: "look".into(),
                 arguments: json!({}),
+                ..Default::default()
             }],
             reasoning: None,
         },

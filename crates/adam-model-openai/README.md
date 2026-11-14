@@ -53,7 +53,7 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   user messages) goes out as **one string**, the parts joined with a blank line (`\n\n`); the
   parts stay in the stored state. An array of typed parts is for a part that is not text
   (`ContentPart` has only `Text` today), so a chat template that wants a string content always gets one.
-* Malformed tool-call argument JSON is `ModelError::Protocol`.
+* Tool-call arguments that are not JSON do not fail the call: the response carries the call with `ToolCall::invalid_arguments` set to the raw text and `arguments` `{}`, and the agent answers it with an error. A call with no name is still `Protocol`.
 * A transport failure (timeout, connection error) is a `Transient` that keeps
   the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
   that keeps the parser's error. The message does not repeat the source.
@@ -128,7 +128,7 @@ Failures map onto `adam_model::ModelError`, which is classified (see
 | HTTP 401, 403 | `Auth` | `Unauthenticated` |
 | HTTP 400, 413, 422 naming the context window | `ContextLength` | `Invalid` |
 | any other 4xx; a request that cannot be built | `InvalidRequest` | `Invalid` |
-| 1xx/3xx (redirects are not followed); malformed (complete) JSON, tool arguments or stream | `Protocol` | `Corrupt` |
+| 1xx/3xx (redirects are not followed); malformed (complete) JSON, wrong shape, a tool call with no name | `Protocol` | `Corrupt` |
 
 An error object inside a `200` or a stream is `RateLimited` for a
 `rate_limit` type, `ContextLength` for a context-length code, `InvalidRequest`

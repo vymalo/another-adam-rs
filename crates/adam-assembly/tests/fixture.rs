@@ -190,6 +190,7 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
         id: "call-1".into(),
         name: "run_checks".into(),
         arguments: json!({}),
+        ..Default::default()
     }]);
     model.push_text("All checks pass.");
     model.push_text("LGTM");

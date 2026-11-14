@@ -296,15 +296,18 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         let arguments = match call.function.arguments {
             None | Some(Value::Null) => json!({}),
             // Some servers send the arguments as an object instead of a string.
-            Some(Value::String(raw)) => parse_arguments(&name, &raw)?,
+            Some(Value::String(raw)) => match parse_arguments(&raw) {
+                Ok(parsed) => parsed,
+                Err(raw) => {
+                    check_name(&name)?;
+                    tool_calls.push(ToolCall::with_invalid_arguments(id, name, raw));
+                    continue;
+                }
+            },
             Some(other) => other,
         };
         check_name(&name)?;
-        tool_calls.push(ToolCall {
-            id,
-            name,
-            arguments,
-        });
+        tool_calls.push(ToolCall::new(id, name, arguments));
     }
 
     let mut response = build_response(
@@ -435,18 +438,13 @@ fn check_name(name: &str) -> Result<(), ModelError> {
     Ok(())
 }
 
-/// Parse tool-call arguments. Empty means "no arguments"; anything else must
-/// be valid JSON.
-fn parse_arguments(name: &str, raw: &str) -> Result<Value, ModelError> {
+/// Parse tool-call arguments. Empty means "no arguments"; text that is not JSON comes back as
+/// `Err(raw)`, for the agent to answer the call with an error instead of failing the run.
+fn parse_arguments(raw: &str) -> Result<Value, String> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(raw).map_err(|e| {
-        ModelError::protocol(format!(
-            "arguments of tool call `{name}` are not valid JSON"
-        ))
-        .with_source(e)
-    })
+    serde_json::from_str(raw).map_err(|_| raw.to_owned())
 }
 
 fn map_finish(reason: &str) -> FinishReason {
@@ -644,11 +642,10 @@ impl Assembler {
         let mut tool_calls = Vec::with_capacity(self.calls.len());
         for call in self.calls.into_values() {
             check_name(&call.name)?;
-            let arguments = parse_arguments(&call.name, &call.arguments)?;
-            tool_calls.push(ToolCall {
-                id: call.id.unwrap_or_else(fallback_id),
-                name: call.name,
-                arguments,
+            let id = call.id.unwrap_or_else(fallback_id);
+            tool_calls.push(match parse_arguments(&call.arguments) {
+                Ok(arguments) => ToolCall::new(id, call.name, arguments),
+                Err(raw) => ToolCall::with_invalid_arguments(id, call.name, raw),
             });
         }
         let mut response = build_response(
@@ -679,6 +676,7 @@ mod tests {
                     id: "c1".into(),
                     name: "weather".into(),
                     arguments: json!({"city": "Paris"}),
+                    ..Default::default()
                 }],
                 reasoning: None,
             },
@@ -798,6 +796,7 @@ mod tests {
                 id: "c1".into(),
                 name: "weather".into(),
                 arguments: json!({"city": "Paris"}),
+                ..Default::default()
             }],
             reasoning: Some("I should look it up".into()),
         };
@@ -994,7 +993,6 @@ mod tests {
         for body in [
             &b"not json"[..],
             br#"{"choices":[]}"#,
-            br#"{"choices":[{"message":{"tool_calls":[{"id":"a","function":{"name":"w","arguments":"{oops"}}]},"finish_reason":"tool_calls"}]}"#,
             br#"{"choices":[{"message":{"tool_calls":[{"id":"a","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
             br#"{"choices":"nope"}"#,
         ] {
@@ -1247,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_streamed_arguments_are_a_protocol_error() {
+    fn malformed_streamed_arguments_are_kept_raw() {
         let mut asm = Assembler::default();
         feed(
             &mut asm,
@@ -1256,7 +1254,10 @@ mod tests {
                 r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
             ],
         );
-        assert!(matches!(asm.finish(), Err(ModelError::Protocol { .. })));
+        let response = asm.finish().unwrap();
+        let call = &response.message.tool_calls()[0];
+        assert_eq!(call.invalid_arguments.as_deref(), Some("{\"x\": "));
+        assert_eq!(call.arguments, json!({}));
     }
 
     #[test]

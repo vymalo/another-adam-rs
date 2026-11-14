@@ -30,6 +30,7 @@ fn call(id: &str, name: &str) -> ToolCall {
         id: id.into(),
         name: name.into(),
         arguments: json!({}),
+        ..Default::default()
     }
 }
 
@@ -105,6 +106,7 @@ fn command(id: &str, cpu: u64, memory: u64, ms: u64) -> ToolCall {
         id: id.into(),
         name: "command".into(),
         arguments: json!({"cpu": cpu, "memory": memory, "ms": ms}),
+        ..Default::default()
     }
 }
 

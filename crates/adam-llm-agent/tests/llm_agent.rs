@@ -40,6 +40,7 @@ fn call(id: &str, name: &str, args: Value) -> ToolCall {
         id: id.into(),
         name: name.into(),
         arguments: args,
+        ..Default::default()
     }
 }
 
@@ -1835,6 +1836,169 @@ async fn max_tool_calls_rejects_an_oversized_turn_before_running_any_tool() {
     worker.stop().await;
     assert!(view.error.expect("error").contains("asked for 3 more"));
     assert_eq!(a_calls.load(SeqCst), 0);
+}
+
+fn invalid_call_response(id: &str, name: &str, raw: &str, finish: FinishReason) -> ModelResponse {
+    ModelResponse {
+        message: Message::Assistant {
+            content: vec![],
+            tool_calls: vec![ToolCall::with_invalid_arguments(id, name, raw)],
+            reasoning: None,
+        },
+        finish,
+        ..ModelResponse::text("")
+    }
+}
+
+#[tokio::test]
+async fn a_stream_without_finish_reason_is_retried() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_error(ModelError::transient(
+            "stream ended without a finish_reason",
+        ))
+        .push_text("whole answer");
+    let rt = h.runtime_with(&agent, "w", quick_retry);
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.output.expect("output")["text"], "whole answer");
+    assert_eq!(h.mock.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_are_an_error_result_and_the_run_completes() {
+    let h = Harness::new();
+    let (a, a_calls) = CountingTool::new("a");
+    let agent = h.agent().tool(a).build();
+    h.mock
+        .push_response(invalid_call_response(
+            "c1",
+            "a",
+            "{\"city\": ",
+            FinishReason::Length,
+        ))
+        .push_text("fixed it");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    assert_eq!(
+        a_calls.load(SeqCst),
+        0,
+        "a call that is not JSON never runs"
+    );
+    let state = conversation(&view);
+    let Message::Tool {
+        call_id,
+        content,
+        is_error,
+    } = &state.messages[2]
+    else {
+        panic!("{:?}", state.messages)
+    };
+    assert_eq!(call_id, "c1");
+    assert!(*is_error);
+    for needle in [
+        "not valid JSON",
+        "{\"city\": ",
+        "did not run",
+        "output limit",
+    ] {
+        assert!(content.contains(needle), "{needle}: {content}");
+    }
+    // What goes back to the model as the call's arguments is `{}`, never the raw text.
+    let Message::Assistant { tool_calls, .. } = &h.mock.requests()[1].messages[1] else {
+        panic!("{:?}", h.mock.requests()[1].messages)
+    };
+    assert_eq!(tool_calls[0].arguments, json!({}));
+    assert_eq!(view.output.expect("output")["text"], "fixed it");
+    let journal = h.store.journal_list(run).await.expect("journal");
+    assert!(
+        journal.iter().all(|e| e.name != "tool:c1"),
+        "the answer comes from the journaled model turn alone"
+    );
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_count_against_max_tool_calls() {
+    let h = Harness::new();
+    let (a, _) = CountingTool::new("a");
+    let agent = h
+        .agent()
+        .tool(a)
+        .limits(Limits {
+            max_tool_calls: 2,
+            ..Limits::default()
+        })
+        .build();
+    for i in 0..5 {
+        h.mock.push_response(invalid_call_response(
+            &format!("c{i}"),
+            "a",
+            "{oops",
+            FinishReason::ToolCalls,
+        ));
+    }
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("loop"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+    assert!(
+        view.error
+            .clone()
+            .expect("error")
+            .contains("max_tool_calls = 2")
+    );
+    assert_eq!(conversation(&view).tool_calls, 2);
+}
+
+#[tokio::test]
+async fn a_replayed_invalid_call_calls_no_model_and_answers_the_same() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let recorded = json!({
+        "message": serde_json::to_value(Message::Assistant {
+            content: vec![],
+            tool_calls: vec![ToolCall::with_invalid_arguments("c1", "a", "{oops")],
+            reasoning: None,
+        })
+        .unwrap(),
+        "finish": "tool_calls",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    });
+    h.store
+        .journal_put(run, JournalEntry::ok(0, "model:0", recorded))
+        .await
+        .expect("seed the journal");
+    h.mock.push_text("after");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(h.mock.requests().len(), 1, "turn 0 was recorded");
+    let state = conversation(&view);
+    assert!(
+        matches!(&state.messages[2], Message::Tool { content, is_error: true, .. } if content.contains("{oops"))
+    );
 }
 
 #[tokio::test]

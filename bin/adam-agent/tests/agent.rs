@@ -389,6 +389,7 @@ async fn ask_user_parks_the_run_and_the_answer_resumes_it() {
         id: "q1".into(),
         name: "ask_user".into(),
         arguments: json!({"question": "Which city?"}),
+        ..Default::default()
     }])
     .push_text("Paris it is.");
     let model: DynModel = mock.clone();
@@ -516,6 +517,7 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
         id: "m1".into(),
         name: "test__echo".into(),
         arguments: json!({"text": "ping"}),
+        ..Default::default()
     }])
     .push_text("The server said ping.");
     let model: DynModel = mock.clone();
@@ -579,6 +581,7 @@ async fn a_screenshot_of_a_files_true_server_reaches_the_a2a_client_as_a_file() 
         id: "m1".into(),
         name: "browser__screenshot".into(),
         arguments: json!({}),
+        ..Default::default()
     }])
     .push_text("Here is the page.");
     let model: DynModel = mock.clone();
@@ -648,7 +651,7 @@ async fn an_mcp_tools_step_carries_its_title_input_and_output_without_the_proces
     mock.push_tool_calls(vec![ToolCall {
         id: "m1".into(),
         name: "test__echo".into(),
-        arguments: json!({"text": format!("found {FROM_THE_ENVIRONMENT} and {MODEL_KEY} and {NAMED_ONLY}")}),
+        arguments: json!({"text": format!("found {FROM_THE_ENVIRONMENT} and {MODEL_KEY} and {NAMED_ONLY}")}), ..Default::default()
     }])
     .push_text("ok");
     let model: DynModel = mock.clone();
@@ -830,6 +833,7 @@ async fn a_researcher_searches_a_stateless_mcp_server_and_answers_with_its_sourc
         id: "r1".into(),
         name: "search__web_search".into(),
         arguments: json!({"query": "rust async"}),
+        ..Default::default()
     }])
     .push_text("I searched the web. The best source I found is https://example.org/mock-search/1.");
     let model: DynModel = mock.clone();
@@ -899,11 +903,13 @@ async fn an_empty_search_and_a_failing_one_are_results_the_model_reads() {
         id: "r1".into(),
         name: "search__web_search".into(),
         arguments: json!({"query": "[mock:empty]"}),
+        ..Default::default()
     }])
     .push_tool_calls(vec![ToolCall {
         id: "r2".into(),
         name: "search__web_search".into(),
         arguments: json!({"query": "[mock:error]"}),
+        ..Default::default()
     }])
     .push_text("I found nothing, and the search failed once.");
     let model: DynModel = mock.clone();
@@ -988,12 +994,12 @@ async fn researcher_run(message: Message) -> (Task, Vec<adam_model::ModelRequest
     mock.push_tool_calls(vec![ToolCall {
         id: "r1".into(),
         name: "search__web_search".into(),
-        arguments: json!({"query": "rust async"}),
+        arguments: json!({"query": "rust async"}), ..Default::default()
     }])
     .push_tool_calls(vec![ToolCall {
         id: "r2".into(),
         name: "ui_catalog".into(),
-        arguments: json!({}),
+        arguments: json!({}), ..Default::default()
     }])
     .push_tool_calls(vec![ToolCall {
         id: "r3".into(),
@@ -1007,7 +1013,7 @@ async fn researcher_run(message: Message) -> (Task, Vec<adam_model::ModelRequest
                  "body": "How futures work.",
                  "url": "https://example.org/mock-search/2"}]},
             {"component": "Mermaid", "code": "graph TD\n  Future --> Executor\n  Executor --> Future"}
-        ]}),
+        ]}), ..Default::default()
     }])
     .push_text(
         "Async Rust is built on futures: https://example.org/mock-search/1 and https://example.org/mock-search/2.",
@@ -1188,6 +1194,7 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
         id: "c1".into(),
         name: "reviewer".into(),
         arguments: json!({"message": "review this"}),
+        ..Default::default()
     }])
     .push_text("LGTM, nothing to fix.")
     .push_text("The reviewer is happy.");

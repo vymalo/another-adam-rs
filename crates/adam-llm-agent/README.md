@@ -217,7 +217,7 @@ stateDiagram-v2
 Every tool call is a **step** ([`RunEvent::Step`](../adam-runtime/README.md#steps), the vocabulary of the orchestration
 layer's `steps/v1`; [ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)). The agent reports the
 step `tool:<call id>` as `running` before the tool runs and, after it, `completed` (a result), `failed` (an error
-result, a `Permanent` error, an unknown tool, or a `Transient` failure the run retries) or `waiting` (the tool asked
+result, a `Permanent` error, an unknown tool, a call whose arguments are not JSON, or a `Transient` failure the run retries) or `waiting` (the tool asked
 the person with `NeedsInput`, or the run parked on a child run or a remote task); a `waiting` step ends when the
 answer, the child's outcome or the remote task's result arrives (`completed`, or `failed` for an error result). The
 step's `detail` never holds a tool's result: it is a short line shown with the label.
@@ -487,6 +487,12 @@ existed decode with `class` absent). A retryable one becomes
 with `model call failed: ...`. An unreadable start message is
 `AgentError::Permanent` (`unusable start message: ...`), which A2A reports as
 invalid params.
+
+A model call whose arguments are not JSON (`ToolCall::invalid_arguments`) is not run and does not fail the
+run: it is answered with an error result that says the JSON was invalid, quotes what was sent (cut at 2 KiB), says
+the call did not run and, when the turn stopped at the output limit, that the reply was probably cut off. The
+answer is a function of the journaled model turn (no `tool:<id>` step), so a replay gives the same one, and the
+call counts against `max_tool_calls`. The call is echoed back to the model with `{}` as its arguments, never the raw text.
 
 ## Features and environment
 

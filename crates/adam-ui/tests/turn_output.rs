@@ -118,6 +118,7 @@ fn turn_output(id: &str, text: &str) -> ToolCall {
         id: id.into(),
         name: "turn_output".into(),
         arguments: json!({ "text": text }),
+        ..Default::default()
     }
 }
 

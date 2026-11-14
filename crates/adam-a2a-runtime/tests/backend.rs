@@ -1779,11 +1779,13 @@ async fn canceled_continuation_scenario(store: DynStore) {
                 id: "c1".into(),
                 name: "ask".into(),
                 arguments: json!({}),
+                ..Default::default()
             },
             adam_model::ToolCall {
                 id: "c2".into(),
                 name: "look".into(),
                 arguments: json!({}),
+                ..Default::default()
             },
         ])
         .push_text("starting over");

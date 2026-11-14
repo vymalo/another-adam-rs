@@ -1218,6 +1218,7 @@ pub fn call(id: &str, name: &str, args: Value) -> ToolCall {
         id: id.to_owned(),
         name: name.to_owned(),
         arguments: args,
+        ..Default::default()
     }
 }
 

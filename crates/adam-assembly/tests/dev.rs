@@ -60,6 +60,7 @@ fn call(id: &str, name: &str) -> ToolCall {
         id: id.into(),
         name: name.into(),
         arguments: json!({}),
+        ..Default::default()
     }
 }
 
@@ -789,6 +790,7 @@ async fn remote_subagent_settings_are_applied_again_on_reload() {
             id: "c1".into(),
             name: "billing".into(),
             arguments: json!({"message": "invoice 7"}),
+            ..Default::default()
         }])
         .push_text("gave up");
     let run = rt.start(&name, user_message("go"), None).await.unwrap();
@@ -835,6 +837,7 @@ async fn a_reload_gives_the_remote_tool_a_fresh_client_and_token() {
             id: id.into(),
             name: "billing".into(),
             arguments: json!({"message": "invoice 7"}),
+            ..Default::default()
         }]
     };
 

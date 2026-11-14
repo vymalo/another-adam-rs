@@ -649,6 +649,7 @@ mod tests {
             id: "c1".into(),
             name: "t".into(),
             arguments: json!({}),
+            ..Default::default()
         }]);
         let (result, events) = run(model).await;
         let streamed = result.expect("an answer");
@@ -770,6 +771,7 @@ mod tests {
             id: "c1".into(),
             name: "t".into(),
             arguments: json!({}),
+            ..Default::default()
         };
         let response = ModelResponse {
             message: Message::Assistant {
