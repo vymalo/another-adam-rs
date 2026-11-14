@@ -2,9 +2,8 @@
 # End-to-end test of the coder against the compose mocks: one A2A task that
 # must end in a branch on git-server and one pull request on mock-github.
 #
-#   dev/coder-e2e.sh                  # OpenCode (model mock-opencode) makes the change
-#   NO_OPENCODE=1 dev/coder-e2e.sh    # the check command makes it; OpenCode is not started
-#   SCENARIO=files dev/coder-e2e.sh   # the coder reads and writes the files itself; no OpenCode
+#   dev/coder-e2e.sh                  # the coder lists the branches, writes hello.txt and opens the pull request
+#   SCENARIO=files dev/coder-e2e.sh   # the coder also reads a file first
 #   SCENARIO=scratch dev/coder-e2e.sh # no repository is named: a scratch project, then published
 #   SCENARIO=second-repo dev/coder-e2e.sh            # another repository joins the workspace, the person says yes
 #   SCENARIO=second-repo ANSWER=no dev/coder-e2e.sh  # ... and with a no it does not
@@ -17,7 +16,7 @@
 #   GITHUB_AUTH=app dev/coder-e2e.sh  # the stack runs the coder as a GitHub App (see below)
 #
 # Start the stack first (the coder's models are the scripts in
-# dev/wiremock/mock-openai/mappings/coder-script.json and opencode-script.json):
+# dev/wiremock/mock-openai/mappings/coder-script.json):
 #
 #   docker compose --profile app up -d --build --wait \
 #     postgres mock-openai mock-github git-server coder
@@ -36,7 +35,7 @@
 #     branch, base = main;
 #   * git-server has the branch, and hello.txt on it is `hello`;
 #   * SCENARIO=files also: the stream says `read README.md (sandbox)` and `wrote hello.txt (sandbox)`
-#     (the coder's file tools ran, in the slot of the repository) and never `starting OpenCode`.
+#     (the coder's file tools ran, in the slot of the repository).
 #   * SCENARIO=scratch is two messages. The task names no repository, so the coder builds `fib.sh`
 #     in a scratch project and asks where to put it (the task is TASK_STATE_INPUT_REQUIRED, with the
 #     question; nothing was pushed or opened, and git-server has not even heard of the repository).
@@ -74,7 +73,7 @@
 #     of each call (ADR 0017, D4). Its journal is not reset: the coder connects the server when it starts,
 #     before this script, listing the tools with a placeholder bearer (`ghs_adam_listing_only`). So the
 #     journal holds at least one `initialize` and one `tools/list`, every `tools/list` carries the
-#     placeholder, and the default scenario (OpenCode; its script reads the repository's branches with
+#     placeholder, and the default scenario (its script reads the repository's branches with
 #     `github__list_branches` right after preparing the workspace) added exactly one `tools/call` of
 #     `list_branches` to it, and the model was given its answer; every `tools/call` in the journal carries
 #     the coder's own credentials (the token below, or the installation token of an App); every other
@@ -97,7 +96,7 @@
 #     returned; the checks artifact; the pushed branch; what Podman lists) and, besides, the lines of the
 #     steps the environment reports, which come after the first tool call (the clone), so the stream has attached:
 #       devcontainer: `local/devbox` ships `devbox-tool`, which only its devcontainer has. `run_command`
-#         (`dc-call-2`), `run_checks` and OpenCode's own bash command all ran there: the result of the first says
+#         (`dc-call-2`), `run` (`dc-call-4`) and `run_checks` all ran there: the result of the first says
 #         `devbox-tool 1.0 (from the devcontainer)`, `tool.txt` on the pushed branch says the same, and the last
 #         `checks` artifact has `environment {kind: devcontainer, source: .devcontainer/devcontainer.json}`; the
 #         step `Building the environment from .devcontainer/devcontainer.json (local/devbox)` ends done; the task
@@ -125,7 +124,6 @@
 #   MOCK_OPENAI_URL  http://127.0.0.1:${MOCK_OPENAI_PORT:-8081}   (its journal: the model was given the branches)
 #   GIT_SERVER_URL   http://127.0.0.1:${GIT_SERVER_PORT:-8083}   (from the host)
 #   TIMEOUT          300     seconds to wait for the task to end
-#   NO_OPENCODE      unset   1 = the [mock:no-opencode] script (no OpenCode)
 #   SCENARIO         default `default` (the script above), `files` (the [mock:files] script:
 #                    read_file, write_file; every check above holds, and so do the two lines),
 #                    `scratch` (the [mock:scratch] script, above) or `second-repo` (the
@@ -145,7 +143,7 @@
 #
 # Needs curl, jq and git. Verified by CI only in the compose run of
 # .github/workflows/coder.yml; the mock scripts were also run against the real
-# adam-coder binary and OpenCode 1.18.33 without docker.
+# adam-coder binary without docker.
 set -eu
 
 coder=${CODER_URL:-http://127.0.0.1:${CODER_PORT:-8080}}
@@ -203,10 +201,6 @@ case "$answer" in
   yes | no) ;;
   *) echo "ANSWER must be yes or no, not '$answer'" >&2; exit 2 ;;
 esac
-if [ "$scenario" != default ] && [ "${NO_OPENCODE:-}" = 1 ]; then
-  echo "NO_OPENCODE=1 and SCENARIO=$scenario are two different scripts: set one" >&2
-  exit 2
-fi
 
 devcontainers=0
 case "$scenario" in devcontainer | default-env | broken-env | no-runtime) devcontainers=1 ;; esac
@@ -257,11 +251,8 @@ elif [ "$scenario" = second-repo ]; then
 elif [ "$scenario" = files ]; then
   text="$text [mock:files]"
   echo "variant: the coder edits the files itself ([mock:files])"
-elif [ "${NO_OPENCODE:-}" = 1 ]; then
-  text="$text [mock:no-opencode]"
-  echo "variant: no OpenCode ([mock:no-opencode])"
 else
-  echo "variant: OpenCode makes the change"
+  echo "variant: the coder writes the file itself, after reading the branches over MCP"
 fi
 
 # --- reset the journal, then send the task ------------------------------------
@@ -347,7 +338,7 @@ saw_before=$(model_saw_branches)
 
 # The message id names the task (same agent, no context: same id, same task), so
 # it must differ between runs, including two variants started in one second.
-run_id="e2e-$scenario-${NO_OPENCODE:-0}-$(date +%s)-$$"
+run_id="e2e-$scenario-$(date +%s)-$$"
 
 # send_message <number> <text> [task id]: SendStreamingMessage, read until the server closes the
 # stream (the task reached a final state, or it waits for the person: the --max-time is the
@@ -661,7 +652,6 @@ if [ "$scenario" = files ] || [ "$scratchlike" = 1 ]; then
     if grep -q "^giving .*$name.git its first commit on main\$" "$lines"; then ok "the empty repository was given its first commit on main"; else bad "no 'giving $repo_url its first commit on main' line in the stream"; fi
     if grep -qx "copying fib into $slot (.)" "$lines"; then ok "the project was copied into the slot of the repository"; else bad "no 'copying fib into $slot (.)' line in the stream"; fi
   fi
-  if grep -q 'starting OpenCode' "$lines"; then bad "OpenCode was started, and this script does not delegate"; else ok "OpenCode was not started"; fi
 fi
 
 # --- the work environment (devcontainer, default-env) --------------------------------------------
@@ -671,7 +661,7 @@ if [ "$scenario" = devcontainer ] || [ "$scenario" = default-env ]; then
   if [ "$scenario" = devcontainer ]; then
     step="Building the environment from .devcontainer/devcontainer.json ($repo_path)"
     if grep -Fq "$step: done" "$tmp/lines.txt"; then ok "the step '$step' ended done"; else bad "no done step '$step' in the stream"; fi
-    # run_command, run_checks and OpenCode ran in the devcontainer: devbox-tool is only there.
+    # run_command, run and run_checks ran in the devcontainer: devbox-tool is only there.
     n=$(tool_result_has dc-call-2 'devbox-tool 1.0 (from the devcontainer)')
     if [ "$n" != '?' ] && [ "$n" -ge 1 ]; then ok "run_command found devbox-tool, which only the devcontainer has"; else bad "run_command's result does not say 'devbox-tool 1.0 (from the devcontainer)' ($n requests)"; fi
     # No secret of the coder is in the environment of a devcontainer.
@@ -696,11 +686,6 @@ if [ "$scenario" = devcontainer ] || [ "$scenario" = default-env ]; then
     if [ "$env_source" = .devcontainer/devcontainer.json ]; then ok "... built from .devcontainer/devcontainer.json"; else bad "the checks artifact's environment source is '${env_source:-absent}', want .devcontainer/devcontainer.json"; fi
   else
     if [ -z "$env_source" ]; then ok "... from the default image (no source file)"; else bad "the default environment has a source '$env_source'"; fi
-  fi
-  if grep -q 'starting OpenCode' "$tmp/lines.txt"; then
-    if [ "$scenario" = devcontainer ]; then ok "OpenCode was started (in the devcontainer)"; else bad "OpenCode was started, and this script does not delegate"; fi
-  elif [ "$scenario" = devcontainer ]; then
-    bad "OpenCode was not started"
   fi
 fi
 
@@ -731,7 +716,7 @@ if [ "$inits" != '?' ] && [ "$inits" -ge 1 ]; then ok "mock-github-mcp saw initi
 if [ "$lists" != '?' ] && [ "$lists" -ge 1 ]; then ok "mock-github-mcp saw tools/list ($lists)"; else bad "mock-github-mcp saw $lists tools/list, want at least 1"; fi
 branches_after=$(mcp_count tools/call list_branches)
 calls_after=$(mcp_count tools/call)
-if [ "$scenario" = default ] && [ "${NO_OPENCODE:-}" != 1 ]; then
+if [ "$scenario" = default ]; then
   # The default script reads the branches of the repository right after preparing the workspace.
   if [ "$branches_before" != '?' ] && [ "$branches_after" != '?' ] && [ $((branches_after - branches_before)) -eq 1 ]; then
     ok "mock-github-mcp saw exactly one tools/call of list_branches in this run"
@@ -839,7 +824,7 @@ if [ -n "$branch" ]; then
       if [ "$content" = 'echo 0 1 1 2 3 5 8' ]; then ok "fib.sh on the branch is the project's"; else bad "fib.sh on the branch is '$content', want 'echo 0 1 1 2 3 5 8'"; fi
       if [ "$(sh "$tmp/clone/fib.sh" 2>/dev/null)" = '0 1 1 2 3 5 8' ]; then ok "fib.sh prints the first 7 Fibonacci numbers"; else bad "fib.sh does not print '0 1 1 2 3 5 8'"; fi
     elif [ "$scenario" = devcontainer ]; then
-      # OpenCode's own bash command ran devbox-tool, and what it printed is in the pushed commit.
+      # `run` ran devbox-tool in the devcontainer (dc-call-4), and what it printed is in the pushed commit.
       content=$(cat "$tmp/clone/tool.txt" 2>/dev/null || echo '<missing>')
       if [ "$content" = 'devbox-tool 1.0 (from the devcontainer)' ]; then ok "tool.txt on the branch says it came from the devcontainer"; else bad "tool.txt on the branch is '$content', want 'devbox-tool 1.0 (from the devcontainer)'"; fi
     elif [ "$scenario" = second-repo ]; then

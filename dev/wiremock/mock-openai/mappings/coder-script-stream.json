@@ -17,9 +17,6 @@
             }
           },
           {
-            "doesNotContain": "[mock:no-opencode]"
-          },
-          {
             "doesNotContain": "tool_call_id"
           },
           {
@@ -69,9 +66,6 @@
             }
           },
           {
-            "doesNotContain": "[mock:no-opencode]"
-          },
-          {
             "doesNotContain": "[mock:scratch]"
           },
           {
@@ -118,9 +112,6 @@
               "expression": "$.model",
               "equalTo": "mock-coder"
             }
-          },
-          {
-            "doesNotContain": "[mock:no-opencode]"
           },
           {
             "doesNotContain": "tool_call_id"
@@ -191,10 +182,10 @@
       }
     },
     {
-      "name": "coder script 1: delegate_to_opencode (stream)",
+      "name": "coder script 1: write_file (stream)",
       "priority": 0,
       "metadata": {
-        "twinOf": "coder script 1: delegate_to_opencode"
+        "twinOf": "coder script 1: write_file"
       },
       "request": {
         "method": "POST",
@@ -226,7 +217,7 @@
           "Content-Type": "text/event-stream; charset=utf-8",
           "Cache-Control": "no-cache"
         },
-        "body": "data: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"coder-call-2\",\"type\":\"function\",\"function\":{\"name\":\"delegate_to_opencode\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"instructions\\\":\\\"Create a file he\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"llo.txt in the repository root co\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ntaining the single line: hello\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
+        "body": "data: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"coder-call-2\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"hello.\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"txt\\\",\\\"content\\\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"hello\\\\n\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
         "transformers": [
           "response-template"
         ]
@@ -395,223 +386,6 @@
           "Cache-Control": "no-cache"
         },
         "body": "data: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Opened the \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pull request: \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello.txt is \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"added on \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"new branch \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"and the \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"checks passed.\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
-        "transformers": [
-          "response-template"
-        ],
-        "chunkedDribbleDelay": {
-          "numberOfChunks": 8,
-          "totalDuration": 2000
-        }
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 0: prepare_workspace (stream)",
-      "priority": 0,
-      "metadata": {
-        "twinOf": "coder script (no OpenCode) 0: prepare_workspace"
-      },
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "[mock:no-opencode]"
-          },
-          {
-            "doesNotContain": "tool_call_id"
-          },
-          {
-            "doesNotContain": "nc-call-1"
-          },
-          {
-            "matchesJsonPath": {
-              "expression": "$.stream",
-              "equalTo": "true"
-            }
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache"
-        },
-        "body": "data: {\"id\":\"chatcmpl-coder-script-nc-call-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"nc-call-1\",\"type\":\"function\",\"function\":{\"name\":\"prepare_workspace\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"repo_url\\\":\\\"http://git-s\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"erver:8080/local/sandbox.\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"git\\\",\\\"base_branch\\\":\\\"main\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
-        "transformers": [
-          "response-template"
-        ]
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 1: run_checks (stream)",
-      "priority": 0,
-      "metadata": {
-        "twinOf": "coder script (no OpenCode) 1: run_checks"
-      },
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "nc-call-1"
-          },
-          {
-            "doesNotContain": "nc-call-2"
-          },
-          {
-            "matchesJsonPath": {
-              "expression": "$.stream",
-              "equalTo": "true"
-            }
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache"
-        },
-        "body": "data: {\"id\":\"chatcmpl-coder-script-nc-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"nc-call-2\",\"type\":\"function\",\"function\":{\"name\":\"run_checks\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"echo \"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"hello > hello.txt \"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"&& sh ./check.sh\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
-        "transformers": [
-          "response-template"
-        ]
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 2: commit_and_push (stream)",
-      "priority": 0,
-      "metadata": {
-        "twinOf": "coder script (no OpenCode) 2: commit_and_push"
-      },
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "nc-call-2"
-          },
-          {
-            "doesNotContain": "nc-call-3"
-          },
-          {
-            "matchesJsonPath": {
-              "expression": "$.stream",
-              "equalTo": "true"
-            }
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache"
-        },
-        "body": "data: {\"id\":\"chatcmpl-coder-script-nc-call-3\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"nc-call-3\",\"type\":\"function\",\"function\":{\"name\":\"commit_and_push\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-3\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"message\\\":\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-3\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"feat: add \"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-3\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"hello.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-3\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-3\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
-        "transformers": [
-          "response-template"
-        ]
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 3: open_pull_request (stream)",
-      "priority": 0,
-      "metadata": {
-        "twinOf": "coder script (no OpenCode) 3: open_pull_request"
-      },
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "nc-call-3"
-          },
-          {
-            "doesNotContain": "nc-call-4"
-          },
-          {
-            "matchesJsonPath": {
-              "expression": "$.stream",
-              "equalTo": "true"
-            }
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache"
-        },
-        "body": "data: {\"id\":\"chatcmpl-coder-script-nc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"nc-call-4\",\"type\":\"function\",\"function\":{\"name\":\"open_pull_request\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"title\\\":\\\"feat: add hello.txt\\\",\\\"body\\\":\\\"## Summary\\\\n\\\\nAdds `hello.\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"txt` to the repository root, containing the single line `hello`.\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\\n\\\\n## Verification\\\\n\\\\n- `sh ./check.sh`: passed (exit code 0)\\\\n\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-nc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
-        "transformers": [
-          "response-template"
-        ]
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 4: final answer (stream)",
-      "priority": 0,
-      "metadata": {
-        "twinOf": "coder script (no OpenCode) 4: final answer"
-      },
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "nc-call-4"
-          },
-          {
-            "doesNotContain": "nc-call-5"
-          },
-          {
-            "matchesJsonPath": {
-              "expression": "$.stream",
-              "equalTo": "true"
-            }
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "text/event-stream; charset=utf-8",
-          "Cache-Control": "no-cache"
-        },
-        "body": "data: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Opened the \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pull request: \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello.txt is \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"added on \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a new branch \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"and the \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"checks passed \"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"(no OpenCode).\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-final\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
         "transformers": [
           "response-template"
         ],
@@ -2411,10 +2185,10 @@
       }
     },
     {
-      "name": "coder script (devcontainer) 3: delegate_to_opencode (stream)",
+      "name": "coder script (devcontainer) 3: run (stream)",
       "priority": 0,
       "metadata": {
-        "twinOf": "coder script (devcontainer) 3: delegate_to_opencode"
+        "twinOf": "coder script (devcontainer) 3: run"
       },
       "request": {
         "method": "POST",
@@ -2446,7 +2220,7 @@
           "Content-Type": "text/event-stream; charset=utf-8",
           "Cache-Control": "no-cache"
         },
-        "body": "data: {\"id\":\"chatcmpl-coder-script-dc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"dc-call-4\",\"type\":\"function\",\"function\":{\"name\":\"delegate_to_opencode\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-dc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"instructions\\\":\\\"[mock:oc-devbox] Run devbox-tool --version and write its output into tool.txt.\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-dc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-dc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
+        "body": "data: {\"id\":\"chatcmpl-coder-script-dc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"dc-call-4\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-dc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"devbox-tool --version > tool.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-dc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-dc-call-4\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120,\"prompt_tokens_details\":{\"cached_tokens\":64},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n",
         "transformers": [
           "response-template"
         ]

@@ -7,7 +7,7 @@
 #   dev/coder-choices-e2e.sh
 #
 # Start the stack first (the model `mock-coder` is dev/wiremock/mock-openai/mappings/coder-script.json and
-# coder-choices.json; no repository, GitHub or OpenCode is needed for this scenario):
+# coder-choices.json; no repository or GitHub is needed for this scenario):
 #
 #   docker compose --profile app up -d --build --wait postgres mock-openai mock-github git-server coder
 #

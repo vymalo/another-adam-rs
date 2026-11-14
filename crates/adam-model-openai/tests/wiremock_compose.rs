@@ -358,15 +358,15 @@ async fn the_scripted_models_stream_what_they_complete() {
     let client = client(&format!("{root}/v1"), None);
     let user = |text: &str| vec![Message::user_text(text)];
 
-    // The coder: a greeting, then a task from the first call to the pull request (with OpenCode, and
-    // without), and a task that asks three questions at once.
+    // The coder: a greeting, then a task from the first call to the pull request, and a task that
+    // asks three questions at once.
     let greeting = play(&client, "mock-coder", PERSONA, user("Hi")).await;
     assert_eq!(greeting.len(), 1);
     grows(&greeting, 6, "the coder's greeting");
 
     let task = "In http://git-server:8080/local/sandbox.git (base branch main), add hello.txt containing hello.";
     let mut history = user(task);
-    let with_opencode = play_on(&client, "mock-coder", "x", &mut history).await;
+    let default_task = play_on(&client, "mock-coder", "x", &mut history).await;
     // The default script reads the repository's branches through the GitHub MCP server right after
     // preparing the workspace (the mock of dev/coder-agent/mcp.json answers it).
     let calls: Vec<(String, serde_json::Value)> = history
@@ -380,7 +380,7 @@ async fn the_scripted_models_stream_what_they_complete() {
         [
             "prepare_workspace",
             "github__list_branches",
-            "delegate_to_opencode",
+            "write_file",
             "run_checks",
             "commit_and_push",
             "open_pull_request"
@@ -392,23 +392,19 @@ async fn the_scripted_models_stream_what_they_complete() {
         "the branches of the repository the task names"
     );
     assert_eq!(
-        with_opencode.len(),
+        calls[2].1,
+        json!({"path": "hello.txt", "content": "hello\n"}),
+        "the coder writes the file itself"
+    );
+    assert_eq!(
+        default_task.len(),
         7,
         "six calls (the second reads the repository's branches over MCP, `github__list_branches`), the last the pull request, then the answer"
     );
-    grows(&with_opencode, 6, "the coder's last answer");
-    let without = play(
-        &client,
-        "mock-coder",
-        "x",
-        user(&format!("{task} [mock:no-opencode]")),
-    )
-    .await;
-    assert_eq!(without.len(), 5, "four calls, then the answer");
-    grows(&without, 6, "the coder's last answer without OpenCode");
+    grows(&default_task, 6, "the coder's last answer");
 
-    // The same task with the file tools: it reads and writes the files itself, and OpenCode is
-    // never called (the `[mock:files]` script: `read_file`, `write_file`).
+    // The same task with a read first: it reads and writes the files itself (the `[mock:files]`
+    // script: `read_file`, `write_file`).
     let files = play(
         &client,
         "mock-coder",
@@ -545,7 +541,7 @@ async fn the_scratch_script_asks_where_to_publish_and_goes_on_when_told() {
 
 /// The devcontainer scripts (slice 7b): each plays from its task to its answer, as a completion and as a
 /// stream, and says the same. `devcontainer` works in the repository's own environment (it looks for a
-/// tool only that has, looks at the environment, has OpenCode record the tool's output, checks, pushes
+/// tool only that has, looks at the environment, records the tool's output with `run`, checks, pushes
 /// and opens the pull request); `default-env` asks where it is, then does the default task;
 /// `broken-env` meets an environment that is broken and asks the person; `no-runtime` meets a tool that
 /// the repository's environment would have and the deployment lacks, and asks the person.
@@ -581,7 +577,7 @@ async fn the_devcontainer_scripts_play_to_their_answers_both_ways() {
             "prepare_workspace",
             "run_command",
             "run_command",
-            "delegate_to_opencode",
+            "run",
             "run_checks",
             "commit_and_push",
             "open_pull_request"
@@ -593,12 +589,9 @@ async fn the_devcontainer_scripts_play_to_their_answers_both_ways() {
     );
     assert_eq!(calls[1].1["command"], "devbox-tool --version");
     assert_eq!(calls[2].1["command"], "env");
-    assert!(
-        calls[3].1["instructions"]
-            .as_str()
-            .is_some_and(|i| i.contains("[mock:oc-devbox]")),
-        "OpenCode's script is selected by its instructions: {}",
-        calls[3].1
+    assert_eq!(
+        calls[3].1["command"], "devbox-tool --version > tool.txt",
+        "`run` records the tool's output in the devcontainer"
     );
     assert_eq!(calls[4].1["command"], "sh ./check.sh");
 

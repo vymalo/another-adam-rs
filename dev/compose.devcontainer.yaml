@@ -12,7 +12,7 @@
 #
 # The coder image carries the devcontainer CLI and Podman's client (docker/coder/Dockerfile), and the
 # coder reads its DEVCONTAINER_* configuration (bin/adam-coder/README.md, "Configuration"): with this file
-# a run's commands, checks and OpenCode run in the devcontainer of the run's first repository, or in the
+# a run's commands and checks run in the devcontainer of the run's first repository, or in the
 # default image, and a run whose repository's file cannot be used asks the person. If the service does not
 # answer, the coder goes on in its own container with a step that says so. dev/coder-e2e.sh runs the
 # scenarios `devcontainer`, `default-env`, `broken-env` and `no-runtime` against this stack.
@@ -54,8 +54,8 @@ services:
       - podman-storage:/home/agent/.local/share/containers
       # The coder's workspace volume, at the same path as in the coder.
       - ${PODMAN_WORK:-coder-work}:${PODMAN_WORK_TARGET:-/work}
-    # What a devcontainer can reach: the model (mock-openai, for OpenCode) and the internet (pulls). Not
-    # postgres, and not the orchestrator.
+    # What a devcontainer can reach: the internet (pulls). Not the model, not postgres, and not the
+    # orchestrator.
     networks: [devcontainers]
     healthcheck:
       test: ["CMD", "podman", "--remote", "--url", "unix:///run/podman/podman.sock", "info"]
@@ -79,10 +79,6 @@ services:
       WORKSPACE_SWEEP_SECS: "10"
     volumes:
       - ${PODMAN_SOCKET_DIR:-podman-socket}:/run/podman
-
-  # OpenCode, inside a devcontainer, reaches its model here.
-  mock-openai:
-    networks: [default, devcontainers]
 
 networks:
   devcontainers: {}

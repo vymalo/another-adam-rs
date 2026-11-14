@@ -14,9 +14,6 @@
             }
           },
           {
-            "doesNotContain": "[mock:no-opencode]"
-          },
-          {
             "doesNotContain": "tool_call_id"
           },
           {
@@ -75,9 +72,6 @@
               "expression": "$.model",
               "equalTo": "mock-coder"
             }
-          },
-          {
-            "doesNotContain": "[mock:no-opencode]"
           },
           {
             "doesNotContain": "[mock:scratch]"
@@ -151,9 +145,6 @@
               "expression": "$.model",
               "equalTo": "mock-coder"
             }
-          },
-          {
-            "doesNotContain": "[mock:no-opencode]"
           },
           {
             "doesNotContain": "tool_call_id"
@@ -277,7 +268,7 @@
       }
     },
     {
-      "name": "coder script 1: delegate_to_opencode",
+      "name": "coder script 1: write_file",
       "priority": 1,
       "request": {
         "method": "POST",
@@ -319,8 +310,8 @@
                     "id": "coder-call-2",
                     "type": "function",
                     "function": {
-                      "name": "delegate_to_opencode",
-                      "arguments": "{\"instructions\":\"Create a file hello.txt in the repository root containing the single line: hello\"}"
+                      "name": "write_file",
+                      "arguments": "{\"path\":\"hello.txt\",\"content\":\"hello\\n\"}"
                     }
                   }
                 ]
@@ -582,334 +573,6 @@
               "message": {
                 "role": "assistant",
                 "content": "Opened the pull request: hello.txt is added on a new branch and the checks passed."
-              },
-              "logprobs": null,
-              "finish_reason": "stop"
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 20,
-            "total_tokens": 120,
-            "prompt_tokens_details": {
-              "cached_tokens": 64
-            },
-            "completion_tokens_details": {
-              "reasoning_tokens": 5
-            }
-          }
-        }
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 0: prepare_workspace",
-      "priority": 1,
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "[mock:no-opencode]"
-          },
-          {
-            "doesNotContain": "tool_call_id"
-          },
-          {
-            "doesNotContain": "nc-call-1"
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "application/json"
-        },
-        "jsonBody": {
-          "id": "chatcmpl-coder-script-nc-call-1",
-          "object": "chat.completion",
-          "created": 1700000000,
-          "model": "mock-coder",
-          "system_fingerprint": "fp_mock",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                  {
-                    "id": "nc-call-1",
-                    "type": "function",
-                    "function": {
-                      "name": "prepare_workspace",
-                      "arguments": "{\"repo_url\":\"http://git-server:8080/local/sandbox.git\",\"base_branch\":\"main\"}"
-                    }
-                  }
-                ]
-              },
-              "logprobs": null,
-              "finish_reason": "tool_calls"
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 20,
-            "total_tokens": 120,
-            "prompt_tokens_details": {
-              "cached_tokens": 64
-            },
-            "completion_tokens_details": {
-              "reasoning_tokens": 5
-            }
-          }
-        }
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 1: run_checks",
-      "priority": 1,
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "nc-call-1"
-          },
-          {
-            "doesNotContain": "nc-call-2"
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "application/json"
-        },
-        "jsonBody": {
-          "id": "chatcmpl-coder-script-nc-call-2",
-          "object": "chat.completion",
-          "created": 1700000000,
-          "model": "mock-coder",
-          "system_fingerprint": "fp_mock",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                  {
-                    "id": "nc-call-2",
-                    "type": "function",
-                    "function": {
-                      "name": "run_checks",
-                      "arguments": "{\"command\":\"echo hello > hello.txt && sh ./check.sh\"}"
-                    }
-                  }
-                ]
-              },
-              "logprobs": null,
-              "finish_reason": "tool_calls"
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 20,
-            "total_tokens": 120,
-            "prompt_tokens_details": {
-              "cached_tokens": 64
-            },
-            "completion_tokens_details": {
-              "reasoning_tokens": 5
-            }
-          }
-        }
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 2: commit_and_push",
-      "priority": 1,
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "nc-call-2"
-          },
-          {
-            "doesNotContain": "nc-call-3"
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "application/json"
-        },
-        "jsonBody": {
-          "id": "chatcmpl-coder-script-nc-call-3",
-          "object": "chat.completion",
-          "created": 1700000000,
-          "model": "mock-coder",
-          "system_fingerprint": "fp_mock",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                  {
-                    "id": "nc-call-3",
-                    "type": "function",
-                    "function": {
-                      "name": "commit_and_push",
-                      "arguments": "{\"message\":\"feat: add hello.txt\"}"
-                    }
-                  }
-                ]
-              },
-              "logprobs": null,
-              "finish_reason": "tool_calls"
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 20,
-            "total_tokens": 120,
-            "prompt_tokens_details": {
-              "cached_tokens": 64
-            },
-            "completion_tokens_details": {
-              "reasoning_tokens": 5
-            }
-          }
-        }
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 3: open_pull_request",
-      "priority": 1,
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "nc-call-3"
-          },
-          {
-            "doesNotContain": "nc-call-4"
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "application/json"
-        },
-        "jsonBody": {
-          "id": "chatcmpl-coder-script-nc-call-4",
-          "object": "chat.completion",
-          "created": 1700000000,
-          "model": "mock-coder",
-          "system_fingerprint": "fp_mock",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                  {
-                    "id": "nc-call-4",
-                    "type": "function",
-                    "function": {
-                      "name": "open_pull_request",
-                      "arguments": "{\"title\":\"feat: add hello.txt\",\"body\":\"## Summary\\n\\nAdds `hello.txt` to the repository root, containing the single line `hello`.\\n\\n## Verification\\n\\n- `sh ./check.sh`: passed (exit code 0)\\n\"}"
-                    }
-                  }
-                ]
-              },
-              "logprobs": null,
-              "finish_reason": "tool_calls"
-            }
-          ],
-          "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 20,
-            "total_tokens": 120,
-            "prompt_tokens_details": {
-              "cached_tokens": 64
-            },
-            "completion_tokens_details": {
-              "reasoning_tokens": 5
-            }
-          }
-        }
-      }
-    },
-    {
-      "name": "coder script (no OpenCode) 4: final answer",
-      "priority": 1,
-      "request": {
-        "method": "POST",
-        "urlPathPattern": "(/v1)?/chat/completions",
-        "bodyPatterns": [
-          {
-            "matchesJsonPath": {
-              "expression": "$.model",
-              "equalTo": "mock-coder"
-            }
-          },
-          {
-            "contains": "nc-call-4"
-          },
-          {
-            "doesNotContain": "nc-call-5"
-          }
-        ]
-      },
-      "response": {
-        "status": 200,
-        "headers": {
-          "Content-Type": "application/json"
-        },
-        "jsonBody": {
-          "id": "chatcmpl-coder-script-final",
-          "object": "chat.completion",
-          "created": 1700000000,
-          "model": "mock-coder",
-          "system_fingerprint": "fp_mock",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "Opened the pull request: hello.txt is added on a new branch and the checks passed (no OpenCode)."
               },
               "logprobs": null,
               "finish_reason": "stop"
@@ -3636,7 +3299,7 @@
       }
     },
     {
-      "name": "coder script (devcontainer) 3: delegate_to_opencode",
+      "name": "coder script (devcontainer) 3: run",
       "priority": 1,
       "request": {
         "method": "POST",
@@ -3678,8 +3341,8 @@
                     "id": "dc-call-4",
                     "type": "function",
                     "function": {
-                      "name": "delegate_to_opencode",
-                      "arguments": "{\"instructions\":\"[mock:oc-devbox] Run devbox-tool --version and write its output into tool.txt.\"}"
+                      "name": "run",
+                      "arguments": "{\"command\":\"devbox-tool --version > tool.txt\"}"
                     }
                   }
                 ]
