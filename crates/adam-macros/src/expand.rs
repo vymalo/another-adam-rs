@@ -1131,15 +1131,15 @@ mod tests {
     #[test]
     fn step_label_and_icon_say_how_a_call_is_drawn_as_a_step() {
         let out = ok(
-            quote!(step = "subagent", label = "OpenCode", icon = "agent"),
+            quote!(step = "subagent", label = "Helper", icon = "agent"),
             quote! {
-                /// Hand the task to OpenCode.
+                /// Hand the task to the helper.
                 async fn delegate(task: String) -> String { task }
             },
         );
         has(
             &out,
-            "fnstep_style(&self)->::adam::StepStyle{::adam::StepStyle::new(::adam::StepKind::Subagent).with_label(\"OpenCode\").with_icon(::adam::StepIcon::Agent)}",
+            "fnstep_style(&self)->::adam::StepStyle{::adam::StepStyle::new(::adam::StepKind::Subagent).with_label(\"Helper\").with_icon(::adam::StepIcon::Agent)}",
         );
         // Each alone: a label makes a plain tool step, an icon too.
         let out = ok(

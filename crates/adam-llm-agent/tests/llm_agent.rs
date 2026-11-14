@@ -3148,13 +3148,13 @@ impl Tool for Driver {
 
     fn step_style(&self) -> StepStyle {
         StepStyle::new(StepKind::Subagent)
-            .with_label("OpenCode")
+            .with_label("Helper")
             .with_icon(StepIcon::Agent)
     }
 
     async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
         assert_eq!(ctx.step_id(), "tool:c1");
-        ctx.emit_progress("starting OpenCode").await;
+        ctx.emit_progress("starting Helper").await;
         ctx.report_step(
             StepEvent::new(
                 "acp:c1:1",
@@ -3197,7 +3197,7 @@ async fn a_tool_is_a_step_in_its_own_style_and_reports_the_steps_that_run_under_
     worker.stop().await;
 
     let own = |state| {
-        StepEvent::new("tool:c1", StepKind::Subagent, "OpenCode", state).with_icon(StepIcon::Agent)
+        StepEvent::new("tool:c1", StepKind::Subagent, "Helper", state).with_icon(StepIcon::Agent)
     };
     assert_eq!(
         h.events(run),
@@ -3207,14 +3207,9 @@ async fn a_tool_is_a_step_in_its_own_style_and_reports_the_steps_that_run_under_
             RunEvent::Step(own(StepState::Running)),
             // The progress line is an update of the call's own step, in its style.
             RunEvent::Step(
-                StepEvent::new(
-                    "tool:c1",
-                    StepKind::Subagent,
-                    "OpenCode",
-                    StepState::Running
-                )
-                .with_icon(StepIcon::Agent)
-                .with_detail("starting OpenCode")
+                StepEvent::new("tool:c1", StepKind::Subagent, "Helper", StepState::Running)
+                    .with_icon(StepIcon::Agent)
+                    .with_detail("starting Helper")
             ),
             // Reported steps run under the call's step ...
             RunEvent::Step(

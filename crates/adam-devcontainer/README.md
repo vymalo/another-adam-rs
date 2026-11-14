@@ -15,7 +15,7 @@ an empty environment plus an allow-list. The coder (`adam-coder`) composes it (`
 configuration, calls `install_tools`, `probe` and `prepull` at startup, hands the value to its tools and to its janitor, and a binary that
 composes it differently does the same.
 
-A run's commands (`run_command`, `run_checks`, OpenCode and everything OpenCode starts) go through the
+A run's commands (`run_command`, `run`, `run_checks` and everything they start) go through the
 run's `EnvSession`: the coder `prepare`s a command and spawns it. The files, the paths and all git work stay
 in the coder (it holds the credentials); **a path means the same inside the container as in the coder**.
 
@@ -23,8 +23,8 @@ in the coder (it holds the credentials); **a path means the same inside the cont
 
 | Item | What |
 |---|---|
-| `DevContainer` | the `Environment`: `new(Settings)`, plus `probe()`, `prepull()`, `install_tools()` and `prune()` for a binary's startup and care, and `rebuild(run, use_default)` (also the port's own `Environment::rebuild`, which the coder's `rebuild_environment` tool calls). Its session answers `EnvSession::tool_path("opencode")` with `/opt/adam/bin/opencode` when `Settings::opencode` is set, and `secret_ref("model-key")` with the file `/run/adam/secrets/model-key` |
-| `Settings` | the root, the CLI and Podman programs, `CONTAINER_HOST`, the default image, the network, the deployment label, the timeouts, the OpenCode binary and the model key; `Settings::new(root)` has the defaults |
+| `DevContainer` | the `Environment`: `new(Settings)`, plus `probe()`, `prepull()`, `install_tools()` and `prune()` for a binary's startup and care, and `rebuild(run, use_default)` (also the port's own `Environment::rebuild`, which the coder's `rebuild_environment` tool calls). Nothing but `adam-exec` is mounted into a container, and no secret: `Settings::opencode`, `Settings::model_key`, the copy of `opencode` into the tools directory and the `secrets/model-key` mount are gone ([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md); a breaking change of `Settings`, and of `EnvSession` in `adam-workspace`). An old `state.json` that holds `model_key` still loads |
+| `Settings` | the root, the CLI and Podman programs, `CONTAINER_HOST`, the default image, the network, the deployment label, the timeouts; `Settings::new(root)` has the defaults |
 | `Runtime` | `Off` (every run is in the coder's own container; the default) or `Podman` |
 | `Network` | `Inherit` (the Podman service's own network, which the deployment limits) or `None` |
 
@@ -83,7 +83,7 @@ the step that builds the environment.
 
 ```mermaid
 sequenceDiagram
-  participant T as tool (run_command, run_checks, OpenCode)
+  participant T as tool (run_command, run, run_checks)
   participant E as DevContainer::ensure
   participant C as devcontainer CLI
   participant P as Podman service
@@ -135,8 +135,8 @@ stateDiagram-v2
   `ExecSpec` are `--remote-env`, minus what it said to hide, plus `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=safe.directory`,
   `GIT_CONFIG_VALUE_0=*` (the tree is the coder's, whoever the remote user is). Every word after the working directory has a
   `:` in front, which `adam-exec` removes, because the CLI's option parser would take `--version` for its own. No secret
-  is ever on a command line: the model key is the file `/run/adam/secrets/model-key` (`secret_ref("model-key")`).
-* **`adam-exec`** (`src/adam-exec.sh`, POSIX sh, shellchecked; embedded and mounted read-only with the OpenCode binary at
+  is ever on a command line, and none is mounted.
+* **`adam-exec`** (`src/adam-exec.sh`, POSIX sh, shellchecked; embedded and mounted read-only, alone, at
   `/opt/adam/bin`) enters the directory, records the process (pid and start time, so that a reused pid is never mistaken for
   it) and becomes the command. `kill` stops that process and its descendants, found through the parent ids of the
   container's own `/proc`, and the members of its process group when it leads one. Killing the `devcontainer exec` client
@@ -158,8 +158,8 @@ stateDiagram-v2
 
 ## What is on the volume
 
-`<root>/environments/`: `.tools/<version>/{adam-exec,opencode}` (written once, atomically, shared by every run), `.cli-home/`, and
-per run `<run>/{state.json,devcontainer.json,secrets/model-key,build.log,lock}`. All of it is scratch: it goes with the run
+`<root>/environments/`: `.tools/<version>/adam-exec` (written once, atomically, shared by every run), `.cli-home/`, and
+per run `<run>/{state.json,devcontainer.json,build.log,lock}`. All of it is scratch: it goes with the run
 (`release` removes the container, the `vsc-*` images the CLI built for it, and this directory). The Podman storage volume is kept,
 so pulled images and layers are reused across runs.
 

@@ -2,7 +2,7 @@
 //!
 //! [`KubeEnvironment`] is an [`Environment`](adam_workspace::Environment) of `adam-workspace`: the coder
 //! asks it for the session of a run, has the session prepare each command (`run_command`, `run_checks`,
-//! OpenCode and every command OpenCode starts), and spawns what comes back. The files and the paths are
+//! and every command they start), and spawns what comes back. The files and the paths are
 //! the same in the pod as in the coder (the pod mounts the run's own directory of the coder's workspace
 //! volume at the same path, and the git directories its worktrees need), so the file tools and all git work
 //! stay in the coder, which is also where the credentials are. **A run pod sees only its own run**

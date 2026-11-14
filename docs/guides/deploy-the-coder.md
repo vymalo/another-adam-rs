@@ -23,10 +23,8 @@ flowchart LR
         subgraph pod["Pod: StatefulSet, 1 replica, uid 10001"]
             tini["tini (PID 1)<br/>forwards SIGTERM, reaps children"]
             coder["adam-coder<br/>A2A server + workers"]
-            oc["opencode acp<br/>child process"]
             kids["sh, git<br/>child processes"]
             tini --> coder
-            coder --> oc
             coder --> kids
         end
         pvc[("PVC at /work<br/>mirrors, workspaces, notes")]
@@ -41,7 +39,6 @@ flowchart LR
     coder -->|"DATABASE_URL"| cnpg
     secret -.-> coder
     coder -->|"chat completions"| gw
-    oc -->|"chat completions"| gw
     coder -->|"git fetch, git push"| remote
     coder -->|"find and open pull request"| ghapi
 ```
@@ -81,7 +78,7 @@ smoke-tested in the image and run by the chart with run pods; `adam-git-sandbox`
 where no secret is readable and `adam-git` the relay that stands in for git, [`crates/adam-git-sandbox`](../../crates/adam-git-sandbox/README.md),
 smoke-tested in the image and run by the chart, with run pods, as a container of the coder's pod that mounts the same work volume and holds no secret;
 a deployment without run pods that sets `GIT_SANDBOX_SOCKET` runs the server itself); it takes the official `github-mcp-server` binary (pinned by tag and digest); and the runtime is the
-`workspace` image of `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini, OpenCode, the obscura
+`workspace` image of `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini, the obscura
 headless browser), pinned by an immutable tag, with those binaries, the devcontainer CLI and Podman's remote client
 added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is
 `tini -- adam-coder` (`tini` forwards SIGTERM and reaps children). Tags are `sha-<7>` of the commit. Both agents' binaries are smoke-tested in CI
@@ -135,7 +132,7 @@ The values you will actually set:
 
 | Value | Decision |
 |---|---|
-| `config.modelBaseUrl`, `config.model`, `config.opencodeModel` | the gateway and the model alias (`coder`) |
+| `config.modelBaseUrl`, `config.model` | the gateway and the model alias (`coder`). `config.opencodeModel` is gone with OpenCode (ADR 0038): left in a values file it changes nothing, and `NOTES.txt` says it is ignored |
 | `config.publicUrl` | the URL clients reach (goes into the agent card); empty is the in-cluster Service URL |
 | `topology` | `combined` (default) or `split`. Switch with `--set topology=split`; the Service selector moves to the front once it exists, so do it at a quiet moment |
 | `replicaCount`, `workspace.placement` | more than one worker **needs** a placement (`isolated`, `affinity` or `shared`, [why](../reference/workspace-and-environments.md#placement-which-worker-holds-a-runs-files)); the chart refuses `replicaCount > 1` without one. Switching between a per-pod and a shared volume needs `kubectl delete statefulset <release>-coder --cascade=orphan` first |
@@ -172,7 +169,7 @@ SIGKILL is taken over once its lease expires.
 ## Run pods
 
 `runPods.enabled: true` ([ADR 0019](../decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)) runs each active
-run's checks, commands and OpenCode in **a pod of its own**, so a build is bounded by a pod's memory (2Gi) and
+run's checks and commands in **a pod of its own**, so a build is bounded by a pod's memory (2Gi) and
 not the coder's (about 1Gi). Off by default, and then invisible. It renders the pod template (a ConfigMap), a
 `PriorityClass` and a `ResourceQuota` scoped to it, a ServiceAccount with a Role for `pods` and `pods/exec`, a
 `ValidatingAdmissionPolicy` that refuses any pod of that ServiceAccount but the intended one, and a
@@ -182,8 +179,8 @@ a run pod reaches DNS, the **egress proxy** the chart runs beside it (`adam-egre
 of its allow-list over HTTPS (`CONNECT` to port 443, public IPv4 addresses only) and refuses every other host; the pod's
 `HTTPS_PROXY` names it. Add a host with `runPods.egressProxy.extraAllow`; there is no switch for open egress. Details:
 [chart README, "The egress proxy"](../../deploy/coder/README.md#the-egress-proxy). Needs Kubernetes 1.30+. A run pod mounts only its own run's directory, each slot's directory on its own (so the pod cannot rename it), the mirror of each of its
-repositories **read-only** and each worktree's own directory in it, and no Secret but the model key
-([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), proposed): `git commit` and anything else that writes the
+repositories **read-only** and each worktree's own directory in it, and no Secret at all (the pod gets no model key: ADR 0038;
+[ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), proposed): `git commit` and anything else that writes the
 mirror fails in the pod, the coder commits. The template must mount the work claim once, whole, at `WORKSPACE_ROOT` (the
 chart's does; a hand-written one that does not stops the coder, exit 78).
 
@@ -205,7 +202,7 @@ on Kubernetes ([why](../../deploy/coder/README.md#devcontainers-are-off-here)).
 ## Upgrading an App deployment
 
 **A breaking change** ([vymalo/another-adam-rs#120](https://github.com/vymalo/another-adam-rs/issues/120), ADR 0036 decision 6).
-With `github.auth: app` and `runPods.enabled: false`, the default, the commands of a run (`run_command`, `run_checks`, OpenCode)
+With `github.auth: app` and `runPods.enabled: false`, the default, the commands of a run (`run_command`, `run`, `run_checks`)
 run in the coder's own container as the user that can read the App's private key, a mounted file. A command can read it, mint
 installation tokens and act as the App at **any access tier, a `plan` included**. The coder used to log a warning and go on. It
 now **refuses to start** (exit 78), and the chart **refuses to render**.
@@ -220,7 +217,7 @@ now **refuses to start** (exit 78), and the chart **refuses to render**.
 Choose one, in the same change that moves `image.tag` (the chart's bump):
 
 1. **Turn on run pods** (the safe one): `runPods.enabled: true`. It needs Kubernetes 1.30 or later,
-   `externalSecrets.enabled: true` and the right to make the cluster-scoped objects the chart renders (a `PriorityClass`, a
+   the right to make the cluster-scoped objects the chart renders (a `PriorityClass`, a
    `ValidatingAdmissionPolicy` and its binding); [Run pods](#run-pods) and the
    [chart README](../../deploy/coder/README.md#run-pods) have the rest, and
    [`deploy/coder/examples/production.values.yaml`](../../deploy/coder/examples/production.values.yaml) is a complete set of values

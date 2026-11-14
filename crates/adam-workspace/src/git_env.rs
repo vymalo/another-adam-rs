@@ -1,6 +1,6 @@
 //! The environment of a `git` the coder starts itself.
 //!
-//! A worktree is written by code that is not ours (a repository's checks, a command, OpenCode), and
+//! A worktree is written by code that is not ours (a repository's checks, a command), and
 //! git runs what a repository's configuration names: a `filter.<name>.clean` command written to
 //! `.git/config` and a committed `.gitattributes` make the coder's own next `git add -A` run that
 //! command, in the coder's process environment. So every `git` the coder starts begins from an

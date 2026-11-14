@@ -31,7 +31,7 @@ npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs   # dia
 ```
 
 CI also runs the MSRV build (`rust-version` in `Cargo.toml`), `cargo deny`, line coverage
-(`cargo llvm-cov nextest --workspace`), and a nightly live-model and live-OpenCode smoke
+(`cargo llvm-cov nextest --workspace`), and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
 (`.github/workflows/nightly.yml`, needs secrets). The CI jobs are the reference:
 `.github/workflows/ci.yml` and `coder.yml`.
 
@@ -55,7 +55,7 @@ They are gated apart, so `ADAM_TEST_REQUIRE_DB=1` does not turn them on.
 | Kubernetes run pods (`adam-env-kubernetes`) | `ADAM_TEST_KUBECONFIG` (`ADAM_TEST_REQUIRE_KUBERNETES=1`) | a cluster; CI's `run-pods` job makes a `kind` cluster (the node image `ci.yml` pins, whose network plugin enforces `NetworkPolicy`) and runs `deploy/coder/tests/kind-run-pods.sh`, which you can run with `kind`: the cluster test, then the run pods' network policy and the egress proxy ([ADR 0042](../decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md); it fails where a policy is not enforced unless `ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1`), then the git sandbox ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), open decision 6): a pod made from the chart's own StatefulSet, with canaries for the secrets of the coder container, shows that the sandbox container has no token, Secret or view of the coder's processes, that a commit through its socket works, and that a scratch project whose `.git/config` names a clean filter and an fsmonitor runs them in the sandbox, with a marker that holds no canary, where plain git in the coder container (the control) reads them all; it builds `adam-egress`, `adam-git-sandbox` and `adam-git` with cargo and needs `docker`, `kubectl`, `helm` and `python3` |
 | git under a run pod's mounts (ADR 0041) | `ADAM_TEST_REQUIRE_MOUNTS=1` to fail instead of skip | root, `unshare` and `setpriv`: `sudo sh deploy/coder/tests/git-in-run-pod.sh` builds the pod's view with bind mounts (the read-only `HEAD`, `commondir`, `gitdir` and `logs` of the worktree's directory included: it tries to write, rename over, replace and remove them; and each slot as a mount of its own: it tries to rename, remove and exchange it and expects `EBUSY`) and runs real git in it |
 | `#[tool]` compile errors worded by rustc | `ADAM_TRYBUILD=1` | the CI toolchain (the `ui` job); the errors the macro writes itself always run ([`adam` README](../../crates/adam/README.md#tests)) |
-| live model, live OpenCode | `ADAM_TEST_OPENAI_*`, `ADAM_TEST_OPENCODE=1` | secrets |
+| live model; `adam-acp` against a live OpenCode (the coder no longer uses it) | `ADAM_TEST_OPENAI_*`, `ADAM_TEST_OPENCODE=1` | secrets |
 
 All test variables: [Environment](../reference/environment.md#tests).
 
@@ -85,7 +85,7 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 
 | Script | What it proves |
 |---|---|
-| `sh dev/coder-e2e.sh` | one task ends in a pushed branch and one pull request; the `checks`, `branch` and `pull_request` artifacts; GitHub read over MCP with the coder's credentials of each call. Variants: `NO_OPENCODE=1` (the check command makes the change), `SCENARIO=files` (the coder edits files itself), `scratch` (no repository named, then published), `second-repo` and `create-repo` (each with `ANSWER=yes` or `no`: consent is asked and honoured), `GITHUB_AUTH=app` (with `-f dev/compose.github-app.yaml`) |
+| `sh dev/coder-e2e.sh` | one task ends in a pushed branch and one pull request; the `checks`, `branch` and `pull_request` artifacts; GitHub read over MCP with the coder's credentials of each call. Variants: `SCENARIO=files` (the coder reads a file first), `scratch` (no repository named, then published), `second-repo` and `create-repo` (each with `ANSWER=yes` or `no`: consent is asked and honoured), `GITHUB_AUTH=app` (with `-f dev/compose.github-app.yaml`) |
 | `SCENARIO=devcontainer\|default-env\|broken-env\|no-runtime sh dev/coder-e2e.sh` | the repository's own devcontainer is the environment, a repository without one gets the default image, a broken file is refused and the person decides, a stopped Podman service is a step that says so. Needs `-f dev/compose.devcontainer.yaml` |
 | `sh dev/greeting-e2e.sh` | "hi" gets a greeting built from the folder's persona lines, streamed, and its one model call reported over `usage/v1` (the task carries the totals); the same task goes on to a pull request; a restart on an edited folder changes the answer |
 | `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text |

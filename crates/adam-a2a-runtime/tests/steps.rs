@@ -38,7 +38,7 @@ impl Agent for Stepper {
 
     async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
         let call = |state| {
-            StepEvent::new("tool:c1", StepKind::Subagent, "OpenCode", state)
+            StepEvent::new("tool:c1", StepKind::Subagent, "Helper", state)
                 .with_icon(StepIcon::Agent)
         };
         let command = |state| {
@@ -52,7 +52,7 @@ impl Agent for Stepper {
         };
         for step in [
             call(StepState::Running).with_input(task),
-            call(StepState::Running).with_detail("starting OpenCode"),
+            call(StepState::Running).with_detail("starting Helper"),
             command(StepState::Running).with_icon(StepIcon::Execute),
             // The same state again, at once: a client that activated steps does not need it.
             command(StepState::Running).with_detail("12 passed"),
@@ -158,11 +158,11 @@ async fn a_client_that_activated_steps_reads_each_step_as_a_report_beside_its_li
     assert_eq!(
         lines,
         [
-            "OpenCode",
+            "Helper",
             "npm test",
             "npm test",
             "npm test: failed: 1 failed",
-            "OpenCode: done",
+            "Helper: done",
         ]
     );
     let reports: Vec<&Value> = messages
@@ -171,7 +171,7 @@ async fn a_client_that_activated_steps_reads_each_step_as_a_report_beside_its_li
         .collect();
     assert_eq!(
         reports[0],
-        &json!({"id": "tool:c1", "kind": "subagent", "label": "OpenCode", "state": "running",
+        &json!({"id": "tool:c1", "kind": "subagent", "label": "Helper", "state": "running",
                 "icon": "agent", "input": {"task": "fix the build"}})
     );
     assert_eq!(
@@ -187,7 +187,7 @@ async fn a_client_that_activated_steps_reads_each_step_as_a_report_beside_its_li
     );
     assert_eq!(
         reports[4],
-        &json!({"id": "tool:c1", "kind": "subagent", "label": "OpenCode", "state": "completed",
+        &json!({"id": "tool:c1", "kind": "subagent", "label": "Helper", "state": "completed",
                 "icon": "agent", "output": {"text": "fixed"}})
     );
     // The message says which extension it uses.
@@ -206,13 +206,13 @@ async fn a_client_that_did_not_reads_every_step_as_a_line_and_nothing_else() {
     assert_eq!(
         lines,
         [
-            "OpenCode",
-            "starting OpenCode",
+            "Helper",
+            "starting Helper",
             "npm test",
             "npm test: 12 passed",
             "npm test",
             "npm test: failed: 1 failed",
-            "OpenCode: done",
+            "Helper: done",
         ]
     );
     assert!(

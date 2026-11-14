@@ -100,7 +100,7 @@ within `SCRATCH_IDLE_DAYS`) it removes everything but the scratch projects.
 
 ## Environments: where a run's processes run
 
-The project's checks, a command to look around and OpenCode are started through the `Environment` port.
+The project's checks, a command to look around and a command that makes something are started through the `Environment` port.
 A tool asks the run's session to **prepare** a command from a description (program or shell line, working
 directory, variables, the names of this process's secrets to hide) and spawns what comes back. Files and
 paths are the same in every environment, so the file tools and all git work stay in the coder.
@@ -118,14 +118,13 @@ for the model (no check cycle is used); a secret is never in a description, only
 
 The file is untrusted and checked three times; nothing of the coder's environment enters the container;
 every step of making it is shown ([ADR 0010](../decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)
-has the sequence and the lifecycle). The coder also starts OpenCode inside it (its own binary mounted
-read-only, the model key as a file), has a `rebuild_environment` tool for the way out of a file that cannot be
+has the sequence and the lifecycle). The coder brings in only `adam-exec`, mounted read-only: no agent binary and no secret ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)). It has a `rebuild_environment` tool for the way out of a file that cannot be
 used, and has its janitor release a run's environment before it removes the workspace. Why the chart does
 not turn it on: [the chart README](../../deploy/coder/README.md#devcontainers-are-off-here).
 
 ```mermaid
 sequenceDiagram
-    participant T as tool (run_command, run_checks, delegate_to_opencode)
+    participant T as tool (run_command, run, run_checks)
     participant E as Environment
     participant S as EnvSession
     participant P as process
@@ -173,7 +172,7 @@ pod. The chart's `runPods` block renders what surrounds it
 
 ```mermaid
 sequenceDiagram
-    participant T as tool (run_command, run_checks, delegate_to_opencode)
+    participant T as tool (run_command, run, run_checks)
     participant E as KubeEnvironment
     participant A as API server
     participant S as KubeSession

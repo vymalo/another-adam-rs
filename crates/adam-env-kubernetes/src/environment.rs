@@ -421,7 +421,7 @@ impl KubeEnvironment {
     /// [`ensure`](Environment::ensure) of the run makes a new pod and nothing is lost.
     ///
     /// A pod that runs a command (`adam-exec active` counts the processes `adam-exec` started that are
-    /// still alive: a long build, OpenCode) is never idle, however long ago the command was
+    /// still alive: a long build) is never idle, however long ago the command was
     /// started. A pod that cannot be asked is left for the next sweep. Returns the run ids whose pod
     /// was deleted.
     ///

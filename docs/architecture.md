@@ -417,7 +417,7 @@ sequenceDiagram
 ```
 
 Nothing new is stored: the totals are the agent's state, which every store keeps. A call of a try that is retried, of a
-turn a cancel drops, of a remote subagent or of OpenCode is in no total (the ADR says why).
+turn a cancel drops or of a remote subagent is in no total (the ADR says why).
 
 The same object carries the compute a run's commands used. A tool reports how long a command ran in a run pod
 (`ToolCtx::report_sandbox`); the loop journals it with the call's result, adds it to `Conversation::sandbox_usage` in the
@@ -579,7 +579,7 @@ sequenceDiagram
     participant X as Ctx
     participant M as ModelClient<br/>OpenAiCompatible
     participant L as Tool<br/>coder tools
-    participant E as workspace, OpenCode, GitHub
+    participant E as workspace, GitHub
     participant K as EventSink
 
     loop until shutdown
@@ -608,7 +608,7 @@ sequenceDiagram
             X->>DB: journal_get(run, seq)
             opt not recorded
                 X->>L: call(ctx, args)
-                L->>E: git, OpenCode over ACP, shell checks, pull request
+                L->>E: files, git, shell checks, pull request
                 L->>K: emit Step updates (emit_progress, report_step) and Artifact events
                 X->>DB: journal_put(run, entry)
             end
@@ -1115,8 +1115,8 @@ bindings ([ADR 0031](decisions/0031-swagger-ui-and-the-a2a-rest-binding.md)).
 * The A2A method names, `TASK_STATE_*` names and the codes `-32001` and `-32002` are as documented in
   `crates/adam-a2a/src/lib.rs` for the pinned SDK (`a2a-lf` 0.3, `a2a-server-lf` 0.4), not checked against
   the A2A specification here. Neither is the SDK's SSE keepalive (every 15 s).
-* OpenCode's behaviour (ACP over stdio, `{env:VAR}` in its inline config) is as recorded in
-  `bin/adam-coder/src/opencode.rs` (`sst/opencode@7945de2`); a live run against a real gateway is not in CI.
+* `adam-acp`'s notes on OpenCode's behaviour (ACP over stdio) are as recorded in its README; the coder
+  no longer starts OpenCode (ADR 0038), and a live run against a real gateway is the nightly `live-opencode` job.
 * The run pods (ADR 0019) were tested against a fake API server and a `kind` cluster, not the owner's.
 * The chart was rendered, not applied to a cluster; how it reaches the cluster after the tag bump is
   outside this repository.

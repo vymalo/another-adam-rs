@@ -1,6 +1,6 @@
 //! Keeping an agent process's secrets from its own children, beyond the names it hides from them.
 //!
-//! The checks, commands and OpenCode of a run of the coder, and the commands of the MCP servers
+//! The checks and commands of a run of the coder, and the commands of the MCP servers
 //! of any agent folder, are processes of the agent's user, and a process of a user can read
 //! `/proc/<pid>/environ` of another of the same user. [`make_non_dumpable`] closes that door for
 //! the process itself (Linux). Every agent binary calls it first (`adam-coder`, `adam-agent`).

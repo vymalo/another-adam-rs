@@ -62,8 +62,6 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
-| `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
 | `GITHUB_TOKEN` | push and pull request token, sent only to `ALLOWED_REPO_HOSTS`. Unset in App mode | one of this or the App's |
 | `GITHUB_APP_ID` | App mode: the App's id (the JWT's `iss`) | required in App mode |
 | `GITHUB_APP_INSTALLATION_ID` | **pins** the App to one installation | this or `GITHUB_APP_OWNERS`, exactly one |
@@ -103,12 +101,24 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `DEVCONTAINER_RUNTIME` | `off` or `podman` (the repository's devcontainer on a rootless Podman service) | `off` |
 | `CONTAINER_HOST` | Podman's own variable, e.g. `unix:///run/podman/podman.sock`; required with `podman` | unset |
 | `DEVCONTAINER_DEFAULT_IMAGE` | image for a repository with no `devcontainer.json`; **by digest only** | the `workspace` image the coder is built on |
-| `DEVCONTAINER_NETWORK` | `inherit` or `none` (then `delegate_to_opencode` refuses) | `inherit` |
+| `DEVCONTAINER_NETWORK` | `inherit` or `none` | `inherit` |
 | `DEVCONTAINER_DEPLOYMENT_ID` | label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
 | `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | pulling, building and creating; lifecycle commands | `1200`, `900` |
 | `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
 | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client | `devcontainer`, `podman-remote` |
-| `OPENCODE_BINARY` | with `podman`: the native OpenCode executable mounted into containers | `OPENCODE_COMMAND`'s program |
+
+### Removed, ignored with a warning
+
+The coder no longer uses OpenCode ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)). These
+variables are **not read and not refused**: a deployment rendered from an older chart still sets one, and nothing is less
+safe without it. For each one that is set, the process logs one warning at startup that names the variable (never its
+value), in every role.
+
+| Variable | Was |
+|---|---|
+| `OPENCODE_MODEL` | model alias OpenCode used through the same gateway (default `MODEL`) |
+| `OPENCODE_COMMAND` | the ACP program and arguments (default `opencode acp`) |
+| `OPENCODE_BINARY` | with `podman`: the native OpenCode executable mounted into containers (`podman` now needs only `CONTAINER_HOST`) |
 
 ## Egress proxy (`adam-egress`)
 
@@ -153,7 +163,7 @@ Put these in a `.env` next to `compose.yaml`.
 | `CODER_PORT`, `AGENT_PORT` | host ports of the coder and the general agent | `8080`, `8084` |
 | `ADAM_BUILD_REVISION` | build argument, not a runtime variable: the commit baked into both binaries, shown on the card as the version's `+<sha7>` and in `build/v1` ([ADR 0028](../decisions/0028-the-card-says-which-build-answers.md)). Unset says `unknown` | unset |
 | `CODER_IMAGE` | image of both agents; with `--no-build` runs a prebuilt one | `adam-rs/coder:dev` |
-| `CODER_MODEL`, `CODER_OPENCODE_MODEL`, `AGENT_MODEL` | the scripted models | `mock-coder`, `mock-opencode`, `mock-assistant` |
+| `CODER_MODEL`, `AGENT_MODEL` | the scripted models | `mock-coder`, `mock-assistant` |
 | `CODER_AGENT_DIR`, `AGENT_FOLDER` | the agent folders mounted at `/etc/adam/agent` | `./bin/adam-coder/agent`, `./dev/agents/assistant/agent` |
 
 ## Tests
@@ -167,7 +177,7 @@ Put these in a `.env` next to `compose.yaml`.
 | `ADAM_TEST_KUBECONFIG`, `ADAM_TEST_REQUIRE_KUBERNETES=1` | the cluster test of `adam-env-kubernetes` (more `ADAM_TEST_KUBE_*`, among them `ADAM_TEST_KUBE_ISOLATION_MIRROR` and `_ADMIN` for the isolation scenario, in `crates/adam-env-kubernetes/tests/cluster.rs`) |
 | `ADAM_TEST_REQUIRE_MOUNTS=1` | `deploy/coder/tests/git-in-run-pod.sh` (git under a run pod's mounts) fails instead of skipping when it cannot make a mount namespace (CI sets it) |
 | `ADAM_TEST_OPENAI_BASE_URL`, `ADAM_TEST_OPENAI_API_KEY`, `ADAM_TEST_OPENAI_MODEL` | a live model for `adam-model-openai/tests/live.rs` |
-| `ADAM_TEST_OPENCODE=1` | the live OpenCode test of `adam-acp` |
+| `ADAM_TEST_OPENCODE=1` | the live OpenCode test of `adam-acp` (a library no binary uses now) |
 | `ADAM_TRYBUILD=1` | the rustc-worded half of the `#[tool]` compile tests |
 | `ADAM_UPDATE_GOLDEN=1` | regenerate the codegen golden of `adam-agent-fs` |
 

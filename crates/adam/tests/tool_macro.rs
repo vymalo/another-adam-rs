@@ -551,8 +551,8 @@ async fn a_permanent_tool_error_is_the_models_to_read() {
 
 // ------------------------------------------------------------------ steps
 
-/// Hand the task to OpenCode and report what it does.
-#[tool(step = "subagent", label = "OpenCode", icon = "agent")]
+/// Hand the task to the helper and report what it does.
+#[tool(step = "subagent", label = "Helper", icon = "agent")]
 pub async fn delegate(
     /// What to do
     task: String,
@@ -582,7 +582,7 @@ pub async fn greet_step(
 fn step_options_say_how_a_call_is_drawn_as_a_step() {
     let style = Delegate.step_style();
     assert_eq!(style.kind, StepKind::Subagent);
-    assert_eq!(style.label.as_deref(), Some("OpenCode"));
+    assert_eq!(style.label.as_deref(), Some("Helper"));
     assert_eq!(style.icon, Some(StepIcon::Agent));
     // An icon alone: a plain tool step, labelled with the tool's name (no label of its own).
     let style = Lookup.step_style();

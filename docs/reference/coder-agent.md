@@ -23,7 +23,6 @@ sequenceDiagram
     participant M as model gateway<br/>OpenAI-compatible
     participant G as Workspaces<br/>git CLI
     participant W as worktree files<br/>read_file, write_file, apply_patch
-    participant O as OpenCode<br/>opencode acp
     participant Sh as sh -lc<br/>project checks
     participant R as git remote
     participant H as GitHub API
@@ -43,17 +42,11 @@ sequenceDiagram
     Note over A,G: a second repository the person named is a second slot of the run's workspace, and the tools then say which one with repo
     Note over A,G: with no repository named, start_scratch makes a scratch slot to build and check in (commit_and_push there is local), and once the person names a repository, publish_scratch copies the files into its slot (an empty repository first gets an empty first commit) and the checks that ran on the same tree carry over
 
-    alt a small, well-located change
-        A->>W: read_file(path), then write_file(path, content) or apply_patch(diff)
+    loop each change, a broad one is many
+        A->>W: read_file(path), then write_file(path, content), edit_file or apply_patch(diff)
         Note over A,W: every path is confined to the worktree, and a patch is checked by the paths git reads from it
         W-->>A: the text read, or the files changed
         A-->>C: progress lines: read README.md, patched README.md
-    else a broad, multi-file change
-        A->>O: delegate_to_opencode(instructions)
-        O->>M: its own model calls, same gateway
-        O-->>A: ACP updates: text, plan, tool calls
-        A-->>C: progress lines
-        O-->>A: TurnEnded, then the files that changed
     end
 
     loop until green, or the check cycles are used up
@@ -68,7 +61,7 @@ sequenceDiagram
         end
         A-->>C: artifact "checks" (with preexisting and base_commit when it fails on the base too)
         opt exit code is not 0
-            A->>W: apply_patch or write_file (or delegate_to_opencode) to fix the failure
+            A->>W: apply_patch, edit_file or write_file to fix the failure
         end
     end
 
@@ -113,20 +106,20 @@ stateDiagram-v2
     NoWorkspace --> NoWorkspace: prepare_workspace refuses a repository the person did not name, the model asks
     NoWorkspace --> WorktreeReady: prepare_workspace on a repository the person named
     NoWorkspace --> ScratchReady: start_scratch, no repository is named
-    ScratchReady --> Edited: write_file, apply_patch or delegate_to_opencode, a local commit with commit_and_push
+    ScratchReady --> Edited: write_file, edit_file or apply_patch, a local commit with commit_and_push
     ScratchReady --> InputRequired: the model asks which repository to publish to
     ScratchReady --> WorktreeReady: publish_scratch to a repository the person named
     WorktreeReady --> WorktreeReady: prepare_workspace on another repository the person named, a new slot
-    WorktreeReady --> Edited: write_file, apply_patch or delegate_to_opencode
+    WorktreeReady --> Edited: write_file, edit_file or apply_patch
     Edited --> ChecksGreen: run_checks passes
     Edited --> ChecksRed: run_checks fails, and passes on the base, one cycle used
     Edited --> ChecksPreexisting: run_checks fails, and fails on the base too, no cycle used
     Edited --> Pushed: commit_and_push without a green check, unless the budget is used up
-    ChecksRed --> Edited: the file tools or delegate_to_opencode to fix, cycles left
+    ChecksRed --> Edited: the file tools to fix, cycles left
     ChecksRed --> Exhausted: failed runs reach MAX_CHECK_CYCLES
     ChecksRed --> Pushed: commit_and_push, unless the budget is used up
     ChecksGreen --> Pushed: commit_and_push
-    ChecksPreexisting --> Edited: the file tools or delegate_to_opencode, the change must not make it worse
+    ChecksPreexisting --> Edited: the file tools, the change must not make it worse
     ChecksPreexisting --> Pushed: commit_and_push
     Pushed --> Edited: more changes, the green run no longer covers the tree
     Pushed --> PullRequest: open_pull_request, checks green on the pushed tree
@@ -206,7 +199,8 @@ artifact**: a lost database loses the run ledger, not the pushed branches or the
 | Git token | reaches `git` only in the environment of one invocation, never in a remote URL or `.git/config`, and only for hosts on `ALLOWED_REPO_HOSTS` |
 | GitHub App | a token **or** an App installation, never both ([ADR 0009](../decisions/0009-github-per-installation-read-through-mcp.md)): `GitHubApp` signs a short JWT, trades it for an installation token (kept until five minutes before it expires, one mint at a time), and finds the installation of each owner when not pinned (`GITHUB_APP_OWNERS`, required, [ADR 0017](../decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md)) |
 | GitHub reads | through the official GitHub MCP server, read-only, as a **sidecar** that holds no credential; the coder gives each call the token of the repository it is about (`GitHubReadBearer`). Writes stay the coder's own, behind the gate |
-| OpenCode | its child gets `MODEL_API_KEY` by reference (`{env:...}` or a file in a devcontainer); `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in it |
+| The model key | in no run environment: a devcontainer gets no key file and a run pod no `MODEL_API_KEY` ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)); a command never sees it. A variable an `mcp.json` names, `MODEL_API_KEY` included, is hidden from every command and redacted |
+| Commands | `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the environment of a command |
 | Everything | a `Redactor` scrubs the process's own secrets from every tool result, event and failure text |
 
 ## Limits and cancel
@@ -218,9 +212,8 @@ The coder never reads that answer as a question: **it completes only when the ru
 scratch project at all (a question, research) or already delivered** (a pull request, a shared file). With a
 repository or scratch project in the run and nothing delivered it fails with
 `turn limit reached before the work was delivered (max_turns = N): <the answer>` (or the `max_tool_calls`
-form), redacted, whether or not changes are left in the worktree. When a run is cancelled while OpenCode works, the tool
-sends ACP `session/cancel`, waits 2 seconds, then kills OpenCode and its process group and tells the run's
-environment which command to kill.
+form), redacted, whether or not changes are left in the worktree. When a run is cancelled while a command works, the tool
+kills the command and its process group and tells the run's environment which command to kill.
 
 Where the workspace, the janitor and the environments are: [Workspace and environments](workspace-and-environments.md).
 Configuration: [Environment variables](environment.md).

@@ -49,7 +49,7 @@ async fn asker() -> Result<&'static str, Nope> {
 }
 
 /// Drawn as a sub-agent step.
-#[tool(step = "subagent", label = "OpenCode", icon = "agent")]
+#[tool(step = "subagent", label = "Helper", icon = "agent")]
 async fn delegator() -> String {
     String::new()
 }
@@ -68,7 +68,7 @@ fn main() {
     assert!(Asker.asks_user());
     let style = Delegator.step_style();
     assert_eq!(style.kind, StepKind::Subagent);
-    assert_eq!(style.label.as_deref(), Some("OpenCode"));
+    assert_eq!(style.label.as_deref(), Some("Helper"));
     assert_eq!(style.icon, Some(StepIcon::Agent));
     let _ = tools![Searcher, StrictOne, Classified, ContextOnly, Asker];
 }

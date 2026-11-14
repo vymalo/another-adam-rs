@@ -16,7 +16,7 @@ flowchart LR
     end
     store[("Store<br/>Postgres or MongoDB<br/>runs, journal, leases")]
     model["model gateway<br/>OpenAI-compatible"]
-    tools["tools<br/>git, OpenCode, GitHub, MCP servers"]
+    tools["tools<br/>files, git, GitHub, MCP servers"]
 
     client -->|"JSON-RPC + bearer token"| server
     server -. "SSE events" .-> client
@@ -48,7 +48,7 @@ The stream ends in `TASK_STATE_COMPLETED` with a `pull_request` artifact. More: 
 
 | | What it does | Read |
 |---|---|---|
-| [`adam-coder`](bin/adam-coder/README.md) (the binary of **Adam**) | answers, researches, writes documents, and takes a coding task to a verified pull request: worktree, OpenCode, the project's own checks, push, PR | [the coder](docs/reference/coder-agent.md), [deploy it](docs/guides/deploy-the-coder.md) |
+| [`adam-coder`](bin/adam-coder/README.md) (the binary of **Adam**) | answers, researches, writes documents, and takes a coding task to a verified pull request: worktree, file edits, the project's own checks, push, PR | [the coder](docs/reference/coder-agent.md), [deploy it](docs/guides/deploy-the-coder.md) |
 | [`adam-agent`](bin/adam-agent/README.md) | serves **any agent folder** (instructions, skills, subagents, MCP tools) with no build | [write an agent](docs/guides/write-an-agent.md) |
 
 Both ship in one image, `ghcr.io/vymalo/another-adam-rs/coder`, and share the process in

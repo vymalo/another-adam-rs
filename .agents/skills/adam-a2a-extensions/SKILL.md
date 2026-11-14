@@ -137,8 +137,8 @@ card URL of each agent and nothing of its extensions: read the card for those.
   there either way).
 * A client of `usage/v1` ignores members of the task's usage object it does not know (`sandbox` is one, ADR 0043).
 * A `usage/v1` report is a status update **without a message**: a client that shows every status's text must skip it. Its
-  `call` repeats on a resubscribe (drop a call already seen). Counts arrive as whole floats (`41250.0`). OpenCode's calls
-  (the coder's `Hand to OpenCode`) report nothing.
+  `call` repeats on a resubscribe (drop a call already seen). Counts arrive as whole floats (`41250.0`). A remote subagent's
+  calls report nothing (the coder's own OpenCode calls were the same until ADR 0038 removed them).
 * A URI with another case, version or trailing slash does not match: copy it from the card.
 * A `text-stream/v1` chunk with `kind: "reasoning"` is the model's reasoning, not the reply: a reader that does not read `kind`
   shows it as a reply, so update the reader before the agents (ADR 0020).

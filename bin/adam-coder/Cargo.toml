@@ -1,6 +1,6 @@
 [package]
 name = "adam-coder"
-description = "Coder agent over A2A: takes a coding task to a verified pull request (worktree, OpenCode over ACP, checks, push, PR)"
+description = "Coder agent over A2A: takes a coding task to a verified pull request (worktree, file edits, checks, push, PR)"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true

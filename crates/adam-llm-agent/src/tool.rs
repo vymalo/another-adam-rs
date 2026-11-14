@@ -74,7 +74,7 @@ pub trait Tool: Send + Sync + 'static {
     /// tool's name when it says none) and an icon. The default is a plain tool: kind `tool`, the
     /// name as the label, no icon. A tool that hands its work to another agent says
     /// [`StepKind::Subagent`] here, so that the steps it reports nest under it
-    /// (`#[tool(step = "subagent", label = "OpenCode", icon = "agent")]` writes it for a function).
+    /// (`#[tool(step = "subagent", label = "Helper", icon = "agent")]` writes it for a function).
     /// A tool that wraps another (see [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it, as
     /// it forwards [`required_state`](Self::required_state).
     fn step_style(&self) -> StepStyle {

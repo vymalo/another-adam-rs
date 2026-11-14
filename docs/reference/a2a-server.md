@@ -284,7 +284,7 @@ call (the `tool:<call id>` of the call that started it), `provider` (`openai`), 
 `canceled`, `rejected`) or waits (`input-required`, `auth-required`) carries `metadata[URI] = {"totals": [...]}`, one entry
 per provider and model, the subagents' calls included, **whoever reads it** (`GetTask`, `ListTasks`, a stream's snapshot); a
 working task carries none. Counts are at most 2^53 - 1 and written as whole numbers (the SDK writes them as floats:
-`41250.0`); labels at most 128 bytes. OpenCode reports no tokens. Details: `adam-a2a-runtime`'s README, *Usage*.
+`41250.0`); labels at most 128 bytes. Details: `adam-a2a-runtime`'s README, *Usage*.
 
 The same object has a `sandbox` member beside `totals` ([ADR 0043](../decisions/0043-sandbox-time-as-usage.md)) when a tool reported the
 time its commands ran in a run pod: `{"environment": "kubernetes", "usage": [{"cpuMillis": 250, "memoryBytes": 536870912, "commands": 12,

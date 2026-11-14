@@ -11,6 +11,8 @@ either (*verified 2026-11-14*: no `Plugin`, `Rule`, `doom_loop`, `Conversation::
 
 *Built 2026-11-14:* slice 1 (the loop survives), with two changes from the text above: the closing turn keeps its tools and sends `tool_choice: none`, and a complete body without `finish_reason` stays a protocol error.
 
+*Built 2026-11-14:* slice 5 (ADR 0038's removal of OpenCode), with ADR 0038's slices 1, 2, 4 and 5 in one pull request; its operator slice (3) is void here, [ADR 0046](0046-the-operator-lives-in-the-platform-repository.md).
+
 ## Context
 
 The goal is the owner's: adam-rs "as stable as possible", as good as OpenCode 2 "and even above". Two of the directions are

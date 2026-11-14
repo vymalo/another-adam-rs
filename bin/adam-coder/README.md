@@ -9,8 +9,7 @@ Given "in repo X, do Y" it
 
 1. prepares a git worktree of X in the run's workspace (`adam-workspace`; a workspace holds several repositories, and
    a task that names none starts in a **scratch project** that is published to the repository the person names later),
-2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `edit_file`, `apply_patch`), broad ones
-   through OpenCode over ACP (`adam-acp`),
+2. makes the change itself, call by call (`read_file`, `write_file`, `edit_file`, `apply_patch`),
 3. runs the project's own checks, at most `MAX_CHECK_CYCLES` failing cycles (`SCRATCH_CHECK_CYCLES` in a scratch project),
 4. commits, pushes and opens a pull request, and
 5. streams progress throughout and reports the check results, the branch and the pull request as artifacts.
@@ -28,14 +27,14 @@ sequenceDiagram
   participant S as adam-coder (A2A server)
   participant R as Runtime + workers
   participant M as Model (OpenAI-compatible)
-  participant W as Worktree / OpenCode (ACP)
+  participant W as Worktree
   participant G as Git remote + GitHub
   O->>S: SendStreamingMessage "in repo X, do Y"
   S->>R: start run (task id = run id)
   loop until the model stops
     R->>M: next turn
     M-->>R: tool calls
-    R->>W: prepare_workspace / read_file, write_file, apply_patch / delegate_to_opencode / run_checks
+    R->>W: prepare_workspace / read_file, write_file, apply_patch / run_checks
     R-->>O: progress (status updates)
   end
   R->>G: commit_and_push, open_pull_request
@@ -49,7 +48,7 @@ sequenceDiagram
 | `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository that is granted**: one the person named in their own messages of the run, or agreed to add when `request_repository` asked (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `request_repository` (or to `ask_user`, when it has no repository to ask about). Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. **A repository with no ref at all (just created) is a normal start, not an error**: the call completes and says the repository is empty and that no worktree was made, with the way on (`start_scratch`, then `publish_scratch`, which gives the repository its first commit); it is told the same with or without a `base_branch`, and nothing is written to the repository. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
 | `start_scratch { name? }` | `RunWorkspace::add_scratch_for` for the run and its conversation (and then `Environment::seal`, like `prepare_workspace` and `publish_scratch`: a run pod mounts each slot on its own, [below](#a-pod-of-its-own-for-each-run)) (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. A project the conversation's earlier tasks made is returned with the files it holds listed. The result says the project **stays for the conversation** (the next tasks find it; it goes after days with no task in it) and that nothing reaches a repository unless it is published, and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
 | `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **that is granted** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
-| `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that sends the model to `run` (to make something with a command) or to the file tools and `delegate_to_opencode` (to change code). Writes to ignored paths (build output) are not changes. **For looking**: see `run` for making and `run_checks` for checking |
+| `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that sends the model to `run` (to make something with a command) or to the file tools (to change code). Writes to ignored paths (build output) are not changes. **For looking**: see `run` for making and `run_checks` for checking |
 | `run { command, cwd?, repo? }` | **making something with a command, and keeping it**: `npm run render`, `python chart.py`, an install, a build. Runs exactly as `run_command` does (the run's environment, the same shell, `cwd` rule, `CHECK_TIMEOUT_SECS` and output cap, secrets hidden from the child, a missing tool reported as a missing toolchain), but the **files it changes stay**, and the result lists what `git status` shows (files the project ignores are kept too and are not listed). It is **never a check**: no `checks` artifact, no cycle, nothing written to the run's notes, so the gate cannot see it; the files it changed make an earlier green check stale, which the result says. It cannot touch git: the same record as `run_command`'s is compared after the command, minus the files, and a command that changed `HEAD`, the branch, a ref, the `.git` file, the configuration or `info/exclude` is **undone entirely, its files included**, and refused ([below](#making-something-with-a-command)). A timeout kills the process group and what it had written stays. Progress lines: `running: <command>`, then `changed files: <command>` or `ran: <command>` |
 | `request_repository { repo_url, reason }` | **asks the person** whether another repository may join the workspace: the run parks (`input-required`) on a question **the tool writes**, which names the repository and quotes the model's `reason` (one line, at most 300 characters: `May I add the repository acme/lib (https://github.com/acme/lib) to this workspace? The agent says why: "..."`) and offers `Yes, add acme/lib` and `No`, as a form (one `Choices` question, id `consent`) on a screen that can draw it and as text on one that cannot (the same machinery as `ask_user`'s `choices`, [below](#asking-with-choices)). Only a yes adds the repository (it is then **granted**: the model calls `prepare_workspace` with it); the model never grants, see [the rules](#another-repository-only-with-the-persons-yes). A repository already granted is a result that says so (nobody is asked); one the person turned down (an explicit `no`) is an error result that says not to ask again; a message that is neither a yes nor a no (`wait`, `?`) records nothing, and the tool asks again; one the workspace's policy would refuse (its host is not in `ALLOWED_REPO_HOSTS`, or it is a local path) is an error result **before** anyone is asked. In a run another agent started it asks nobody and says so in an error result ([below](#when-another-agent-asks-nobody-to-agree)). `asks_user()` is `true`, so a subagent cannot have it |
 | `create_repository { owner, name, private?, description? }` | creates a new, **empty** repository (no commit: `publish_scratch` gives it its first), and only **after the person agrees, every time, unless they picked the `bypass` tier for the message**. The owners are `CREATE_REPO_OWNERS` when it lists some (a list restricts to exactly these), else, for a **GitHub App** that names its accounts, those (`GITHUB_APP_OWNERS` as a list, or the pinned installation's account; **`GITHUB_APP_OWNERS=*` does not count**, list the owners in `CREATE_REPO_OWNERS`), else none (a token with no list creates nothing); any other owner is an error result that says so; **when nobody may create, the tool is not in `coder_tools` at all**, so the model is not offered it, and the tool's own refusal stays as the last line of defence for a caller that composes its own tool set; it needs the `auto` tier; private unless `private: false`; `name` is `^[A-Za-z0-9._-]{1,100}$`, not `.`/`..`, not ending `.git`; `description` is at most 350 characters. The first call parks the run on a question **the tool writes** (`May I create the repository acme/fib on github.com? It will be private and empty.`, with the description quoted, and the options `Create acme/fib` and `Don't create it`); the answer comes back as that call's result, and **the model calls the tool again** with the same arguments: with a recorded yes for exactly `owner/name` **and that visibility** it creates the repository (a yes to the private one does not cover a public one), waits up to 10 s for it to be reachable over git, and grants it (the key of its clone URL) and records it (`RunNotes::created_repos`); a repeat after that is the same result and creates nothing; after a no it is an error result that says not to ask again; in a run another agent started nobody is asked ([below](#when-another-agent-asks-nobody-to-agree)). See [below](#a-repository-of-its-own-on-request). `asks_user()` is `true` |
@@ -58,7 +57,6 @@ sequenceDiagram
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
 | `edit_file { path, old, new, replace_all?, repo? }` | replaces **exact text** in a file of the worktree, confined like `write_file` ([below](#reading-and-changing-files-itself)): `old` (blanks and line breaks included) must be in the file, once unless `replace_all`. A file that is not there, a directory, binary or non-UTF-8 content, one over 1 MiB, an empty `old`, and `old == new` are results that say so. **When `old` is not found it changes nothing and shows the closest region**: its line numbers, two lines of context around it, the first line where it and `old` differ, and a hint when only blanks differ or the file has CRLF endings. **When `old` is in the file several times and `replace_all` is not set** it says how many times and at which lines. Written like `write_file` (a new file renamed over the old, the mode kept). Progress line: `edited <path> (<slot>)` |
 | `share_file { path, repo?, name? }` | shows the person **a file of the workspace**: the file is read in this process (confined like `read_file`: relative to the slot, no `..`, nothing inside `.git`, a symlink only while it stays inside the worktree), must be a regular file of at most 4 MiB, and comes back as a **file artifact** with its media type and filename; the model's result is one line, `Shared chart.svg (1.2 KiB, image/svg+xml). To show it in your answer, write ![description](chart.svg).` (the second sentence for an image only; a third gives its SHA-256, `To use it as the picture of an \`ask_user\` option, pass image {sha256: "<hash>", alt}.`), never the bytes. It works on what a command made inside the repository's devcontainer too (the workspace is one directory). See [Sharing a file](#sharing-a-file) and [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md). Progress line: `sharing <path> (<slot>)` |
-| `delegate_to_opencode { instructions, repo? }` | spawns the ACP agent in the worktree of the slot, as the run's environment prepared the command ([below](#where-the-processes-of-a-run-run); `ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
 | `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check; a failure the base commit has too is **pre-existing** (below), not a cycle |
 | `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
 | `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
@@ -120,26 +118,11 @@ bring its title.
 | `delete` | `delete_repository` |
 | `file` | `start_scratch`, `share_file` |
 | `think` | `ask_user`, `request_repository` (the tools that ask the person) |
-| `opencode` | `delegate_to_opencode` |
 
 `show` and `ui_catalog` have none, and neither has a call to a GitHub MCP tool (an MCP tool says a title, not a picture).
 The calls of the orchestrator's own tools (web search, reading a page) are steps the orchestrator reports itself
 (`reportsStep`), so their picture is its to choose. `every_tool_of_the_coder_has_an_icon_for_its_step` pins the table.
-**`delegate_to_opencode` is a `subagent` step titled "Hand to OpenCode"** with its own icon, `opencode`
-(`#[tool(step = "subagent", label = "Hand to OpenCode", icon = "opencode")]`), and what OpenCode reports over ACP is the
-tree under it:
-
-| OpenCode reports | The step |
-|---|---|
-| a tool call (`ToolCall`) | a child `acp:<call id>:<ACP id>` that runs under OpenCode's step: kind `command` for ACP's `execute`, `tool` for the others; the icon is ACP's kind when the contract has one (`read`, `edit`, `delete`, `move`, `search`, `think`, `fetch`, `execute`); the label is its title |
-| an update of that call (`ToolCallUpdate`) | `completed` or `failed` ends the child, with its output as the detail (cut to 300 characters); output while it runs is an update; `in_progress` with nothing new is not reported |
-| its plan (`Plan`) | an update of OpenCode's own step: `plan: 2 of 5 done` |
-| a line of its reply (`AgentText`) | an update of OpenCode's own step, the line as the detail |
-| its reply, at the end | one `message` child, `OpenCode's summary`, the last 1000 characters as the detail |
-| a tool call that never said it ended | ended `canceled` with the turn; `failed` when the turn failed, `canceled` when the run was cancelled |
-
-Every label and detail comes from OpenCode, so it is **scrubbed of the secrets the process holds and cut** before it is
-reported, like every other line.
+The `opencode` icon stays in the vocabulary (`StepIcon::OpenCode`, adam-ui's icon list) because `steps/v1` and the catalog are shared; the coder no longer sends it ([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)). Every tool call is one step, as for every other tool.
 
 **A tool call's step also carries what the tool was given and what it answered** ([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)):
 the arguments of `write_file`, `run_checks`, `prepare_workspace` and the rest as `input` on the report that starts the step
@@ -149,8 +132,7 @@ that ends it (8 KiB, head and tail). The coder's `Redactor` goes over every stri
 installation token as soon as it is minted, never reaches the steps; `tests/e2e.rs`
 (`a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_holds`) pins it. The orchestration layer redacts patterns
 on top and has a switch to drop both. A client that did not activate steps reads the same work as lines of text: the title of
-a tool call when it starts, `<title>: done` or `<title>: failed: <output>` when it ends, the lines of OpenCode's reply
-and its plan as they are, and `Hand to OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
+a tool call when it starts, `<title>: done` or `<title>: failed: <output>` when it ends (`tests/e2e.rs`, `tests/tools.rs`).
 
 ### Streamed answers: the words as the model writes them
 
@@ -173,17 +155,14 @@ layer's `docs/api/usage-v1.md`). A client that activates it reads, after each mo
 (`explorer`, `reviewer`, any `subagents/*.md`, whose reports carry the `stepId` of the call that started them), a `working`
 status with no message and the call's tokens in the event's metadata: provider `openai`, the alias as `model`, the input,
 output, reasoning and cached tokens the gateway says, and `MODEL_CONTEXT_WINDOW` as `contextWindow`. The task carries its
-totals per model when it ends or waits, whoever reads it. **OpenCode reports no tokens**: ACP gives adam no count per model call
-(its `usage_update` is the context used and its size, which `adam-acp` drops, and the turn's `usage` is an unstable feature
-of the protocol that is not on), so the OpenCode step has no report and its calls are in no total.
+totals per model when it ends or waits, whoever reads it. The coder's token totals are complete: every model call is one of its own (ADR 0038 closed the gap of the OpenCode calls that were in no total).
 
 **Sandbox time, beside the tokens** ([ADR 0043](../../docs/decisions/0043-sandbox-time-as-usage.md)). The task's `usage/v1` object also
 carries a `sandbox` member, for the compute a run pod holds: the wall time of each command of the run, from the moment the coder
 spawns the process to its exit (a timeout or a cancel kill included), weighted by the pod's **requests** in the template
 (`cpuMillis`, `memoryBytes`; a resource with a limit and no request counts its limit, as Kubernetes does, and one with neither is left out). One entry per shape, at most 8; commands of a subagent
 are added to its parent's, and commands that ran at the same time are summed. Every command of a pod passes `ToolEnv::run` (`run_command`,
-`run`, `run_checks`, the re-run of a failing check on the base, the OpenCode probe) and OpenCode's own process is timed from its
-spawn to the end of its call (`CommandClock`); both report to the call's `ToolCtx`, and the loop keeps the sum in the run's state with the
+`run`, `run_checks`, the re-run of a failing check on the base); each reports to the call's `ToolCtx`, and the loop keeps the sum in the run's state with the
 call's result. `ToolEnv::session` reports which environment the run asked for:
 
 | The run's commands ran in | The task says |
@@ -438,7 +417,7 @@ make them hold:
   `package.json` with `safe_fs` (a link, a pipe or a file over 1 MiB is no `package.json`)) is a
   dependency that is not installed yet, and the answer says to install the project's dependencies with its own
   command (`pnpm install`, `npm ci`, `pip install -r requirements.txt`, picked from the lock files) through
-  `delegate_to_opencode` **only** (an install that passes under `run_checks` would be a green check on code
+  `run` **only** (an install that passes under `run_checks` would be a green check on code
   nobody tested); it also costs no cycle. The second time the same tool is reported missing in a run
   (`RunNotes::missing_tools`, one entry per call id so a replay counts once) the answer is to ask the person,
   whatever the project says.
@@ -505,10 +484,9 @@ conversation pushed) lives in
 
 ### Reading and changing files itself
 
-The model used to change a worktree only by delegating to OpenCode: a process, a model and a conversation for a one-line
-fix. `read_file`, `write_file`, `edit_file` and `apply_patch` (`src/tools/files.rs`) read and change files of the worktree in this
+`read_file`, `write_file`, `edit_file` and `apply_patch` (`src/tools/files.rs`) read and change files of the worktree in this
 process, and the instructions say when to use which: small, well-located changes yourself (`edit_file` for a few lines,
-`apply_patch` for several changes at once), broad multi-file changes through `delegate_to_opencode`. The model chooses every path, so the paths are the point.
+`apply_patch` for several changes at once), a broad multi-file change is many such calls, file by file (ADR 0038: until the workers of ADR 0037 exist). The model chooses every path, so the paths are the point.
 
 **The confinement rule** (`confine(root: &SlotDir, rel, Access) -> Result<Confined, String>`, public):
 
@@ -544,7 +522,7 @@ not guess: it shows the **closest region** by letting every line of `old` that i
 vote for the window it would sit in, and when no line matches by taking the most alike pair of one of the longest lines of
 `old` and a line of the file (Sorensen-Dice over character pairs, at least 0.5); two or more places without `replace_all`
 are refused with their line numbers. The tools change files and never touch git: `commit_and_push`
-commits what the files say, a change made by these tools changes the worktree's tree like OpenCode's, so the commit
+commits what the files say, a change made by these tools changes the worktree's tree like any change, so the commit
 that follows is bound to a check only after a new `run_checks` (the gate is unchanged).
 
 ```mermaid
@@ -696,14 +674,12 @@ stateDiagram-v2
 ### Subagents: `explorer` and `reviewer`
 
 `agent/subagents/` has two read-only helpers, each a child run with its own prompt and the tools `read_file` and
-`run_command` only (no write, no checks, no `delegate_to_opencode`, no publishing, nothing that asks the person).
+`run_command` only (no write, no checks, no publishing, nothing that asks the person).
 `explorer` answers where and how questions about a repository with file paths and line numbers; `reviewer` reads
 `git diff origin/<base>...HEAD` and returns findings by severity with file and line. The prompt says when to use them
 (a large or unfamiliar repository; once before `open_pull_request`), and what they say is advice: the gates decide.
 They run one at a time: the agent loop runs a turn's tool calls in order (`crates/adam-llm-agent/src/agent.rs`), so two
-subagent calls never overlap, and no subagent edits. The prompt says so, and that OpenCode has subagents of its own
-(`explore`, `general`): for a change with independent parts the coder asks OpenCode, in `delegate_to_opencode`'s
-instructions, to split them across those, and checks the whole result itself.
+subagent calls never overlap, and no subagent edits. The prompt says so.
 
 A child run has an id of its own, so the tools key by the **root run** (`ToolCtx::root_run_id()`, carried down by
 `ToolCtx::start_child`: [ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)). Per place:
@@ -711,7 +687,7 @@ A child run has an id of its own, so the tools key by the **root run** (`ToolCtx
 | What | Keyed by | Why |
 |---|---|---|
 | the workspace's slots, the environment session, `prepare_workspace`, `start_scratch`, `rebuild_environment` | root | a subagent works in its parent's worktree and environment |
-| the run notes: check cycles and results, the repositories named and agreed to, created repositories, the credentials blocker, OpenCode's version check | root | a budget or a gate that protects the pull request is counted once, on the root: a subagent has no fresh budget and passes no gate the root has not |
+| the run notes: check cycles and results, the repositories named and agreed to, created repositories, the credentials blocker | root | a budget or a gate that protects the pull request is counted once, on the root: a subagent has no fresh budget and passes no gate the root has not |
 | a call id in the notes (`record_missing_tool`) | the subagent's run plus the call id | model call ids are unique only within the run that made them |
 | the steps the environment shows (`env:<run>:...`) | the run that makes the call | a step belongs to the run that emits it |
 | `share_file`'s "delivered" note, and its 6 MiB budget | the run that shares | the artifact stays on the subagent's run and never reaches the person, so it delivers nothing for the root |
@@ -834,7 +810,7 @@ tier, and the tools check it again against the tier in the notes.
 | Tier | The coder may | Forms |
 |---|---|---|
 | `plan` | read only: `read_file`, `run_command` (its changes are undone), `prepare_workspace`, `share_file`, `rebuild_environment`, the helpers, GitHub and web reads, `ask_user`; the answer is a plan | a repository the person did not name asks |
-| `edits` | also change files (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `delegate_to_opencode`, `start_scratch`), `publish_scratch`, `commit_and_push`, `open_pull_request` | same; a bare name does **not** count as named |
+| `edits` | also change files (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `start_scratch`), `publish_scratch`, `commit_and_push`, `open_pull_request` | same; a bare name does **not** count as named |
 | `auto` | also `merge_pull_request` (below) and `create_repository` | a name the person wrote **alone** in their newest message (`widgets`, not a piece of a URL or a path) counts as named when exactly one owner applies; `create_repository` still asks its yes or no |
 | `bypass` (only with `MAX_ACCESS_TIER=bypass`) | also `rename_repository` and `delete_repository` | none: any repository the host allows is granted, `create_repository` asks nothing |
 
@@ -931,7 +907,7 @@ its name says so (`get_`, `list_`, `search_`, `web_`, `..._read`), and **anythin
 to a person who asked for a plan). Not enforceable: what an asked agent (`ask_agent`) does (asking is reading; the prompt says not to
 ask for a change the tier forbids) and a server's write tool with a reading name.
 
-**The tier is not a boundary against a command.** `run_command`, `run`, `run_checks` and OpenCode run in the coder's own container
+**The tier is not a boundary against a command.** `run_command`, `run` and `run_checks` run in the coder's own container
 when there are no run pods and `DEVCONTAINER_RUNTIME=off` (the default), as the user that can read the GitHub App's private key
 **file** (`GITHUB_APP_PRIVATE_KEY_PATH`; a key given inline is hidden from the commands): a command can read it, mint an
 installation token and act as the App at any tier, a `plan` included. **The coder refuses to start in that configuration**
@@ -1169,7 +1145,7 @@ caller, as for a form's answer and the access tier. Decision: [ADR 0036](../../d
 
 ### Where the processes of a run run
 
-`run_command`, `run_checks` and `delegate_to_opencode` do not spawn a process themselves: each asks the run's
+`run_command`, `run` and `run_checks` do not spawn a process themselves: each asks the run's
 **environment** ([`adam_workspace::Environment`](../../crates/adam-workspace/README.md#where-a-runs-processes-run-the-environment-port),
 `ToolEnv::environment`) for the run's session, has the session prepare the command from an `ExecSpec`, and spawns what
 comes back in a process group of its own. The default is `Local`, this container, and it behaves exactly as the tools always
@@ -1181,7 +1157,7 @@ processes are in this container exactly as above; with `podman` they run in the 
 
 ```mermaid
 sequenceDiagram
-  participant T as run_command, run_checks, delegate_to_opencode
+  participant T as run_command, run, run_checks
   participant E as Environment
   participant S as EnvSession
   participant P as the process
@@ -1211,13 +1187,11 @@ stateDiagram-v2
   Killed --> [*]
 ```
 
-* **Paths are the same everywhere.** The `cwd` of a spec is the slot's own path, so the file tools, `resolve_cwd`, OpenCode's
-  `fs_root` and the git snapshots of `run_command` need no mapping. The file tools and all git work stay in this process.
-* **No secret in a spec.** `ExecSpec.env` carries the OpenCode configuration (which names the key by reference: `{env:MODEL_API_KEY}`
-  here, `{file:/run/adam/secrets/model-key}` in a devcontainer, what `EnvSession::secret_ref("model-key")` says) and
-  never a value of a secret; what the process must not see of this process's own environment is `ExecSpec.hide`:
-  `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY` for the project's commands,
-  the first four for OpenCode (which reads the model key from its environment). The App's key as a *file*
+* **Paths are the same everywhere.** The `cwd` of a spec is the slot's own path, so the file tools, `resolve_cwd`
+  and the git snapshots of `run_command` need no mapping. The file tools and all git work stay in this process.
+* **No secret in a spec.** `ExecSpec.env` carries no value of a secret, and no environment gives a process the model key
+  (ADR 0038); what the process must not see of this process's own environment is `ExecSpec.hide`:
+  `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY`. The App's key as a *file*
   (`GITHUB_APP_PRIVATE_KEY_PATH`) is a path, not a secret, and the file is readable by the user the checks run as: **in this
   container (no run pods, `DEVCONTAINER_RUNTIME=off`) a command can read the key and mint a token, so no access tier holds
   against a command**; the coder refuses to start that way unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it (and then
@@ -1229,15 +1203,11 @@ stateDiagram-v2
 * **A timeout or a cancel** kills the process group here and then calls `EnvSession::kill` with the id of the command, for what
   lives where this process cannot reach. `run_in` (and `run_timed`, which also says how long the process ran, from its spawn until it was stopped, for the sandbox usage) takes the run's `CancelToken`: a cancel ends `run_command`, `run` and
   `run_checks` at once with the `cancelled` tool error (`RunError::Cancelled`), whatever the command was doing (a `sleep 60`
-  included), and a command of a run that is cancelled already is not started. For OpenCode the same call follows the stop (`session/cancel`, then the kill).
-* **An environment may start OpenCode from nothing.** A session whose `PreparedCommand` has `env_clear` (the devcontainer's: its
-  command is the devcontainer CLI, which must not see this process's environment) is started by the ACP client with
-  `AcpCommand::clear_env()`: only what the environment set. `Local` never asks for it. OpenCode is where the environment says
-  it is (`EnvSession::tool_path("opencode")`: in a devcontainer, this container's own copy, mounted read-only).
+  included), and a command of a run that is cancelled already is not started.
 
 ### The work environment: the repository's devcontainer
 
-With `DEVCONTAINER_RUNTIME=podman` the commands of a run (`run_command`, `run_checks`), OpenCode and everything OpenCode starts run
+With `DEVCONTAINER_RUNTIME=podman` the commands of a run (`run_command`, `run`, `run_checks`) and everything they start run
 in the **devcontainer of the run's first repository** ([ADR 0010](../../docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md),
 [`adam-devcontainer`](../../crates/adam-devcontainer/README.md): the official devcontainer CLI against a rootless Podman service,
 never the host's Docker socket). The repository's `.devcontainer/devcontainer.json` says what it needs, and the coder's own
@@ -1248,7 +1218,7 @@ which holds the credentials; **a path means the same inside**.
 ```mermaid
 sequenceDiagram
   participant M as the model
-  participant T as run_command, run_checks, delegate_to_opencode
+  participant T as run_command, run, run_checks
   participant E as DevContainer (adam-devcontainer)
   participant C as devcontainer CLI, Podman service
   participant J as janitor
@@ -1293,30 +1263,21 @@ stateDiagram-v2
 * **A missing tool says where it is missing.** In a devcontainer built from a file: the tool has to be added to that file (a devcontainer feature, or
   its Dockerfile), and `rebuild_environment` makes the environment again after the change. On the default image: the repository has no devcontainer,
   and one can provide it.
-* **OpenCode inside.** The coder's own `opencode` (resolved from `OPENCODE_BINARY`, else from `OPENCODE_COMMAND`'s program, to its real file: the npm
-  package's `bin` entry is the native binary its postinstall put there) is mounted read-only in every container; it needs glibc. The
-  first `delegate_to_opencode` of a run in a container runs `opencode --version` there once, and keeps the answer in the run's notes
-  (`environment.opencode`): an image that cannot run it (musl, another architecture) gets a clear refusal that sends the model to
-  `read_file`, `write_file` and `apply_patch`; the other tools still work. With `DEVCONTAINER_NETWORK=none` OpenCode cannot reach its
-  model, and `delegate_to_opencode` refuses in a container for that reason.
 * **Secrets.** The CLI and Podman's client start from an empty environment plus an allow-list: nothing of this process's environment (`GITHUB_TOKEN`, the
   App's key, `DATABASE_URL`, `A2A_BEARER_TOKENS`, the thread-tools token) is in a container, and `${localEnv:X}` in a repository's file is empty.
-  The one secret a container gets is the **model key**, as the read-only file `/run/adam/secrets/model-key` that OpenCode reads with
-  `{file:...}` (never an argument or a variable). Code that runs in the container (a repository's own scripts, a build) can read that file, as it
-  can the model key anywhere OpenCode runs; the key is the model gateway's and not GitHub's. The untrusted file is checked three times against a
+  **No secret is mounted**: no model key, no key file ([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)); the tools directory holds `adam-exec` alone. The untrusted file is checked three times against a
   [policy](../../crates/adam-devcontainer/README.md#the-file-is-untrusted).
 * **Kubernetes.** The Helm chart keeps `DEVCONTAINER_RUNTIME` off ([`deploy/coder/README.md`](../../deploy/coder/README.md)): the Podman service
   needs the same workspace volume at the same path and relaxed seccomp, which a pod does not give. A cluster has its own environment instead,
   [a pod for each run](#a-pod-of-its-own-for-each-run) (`RUN_ENVIRONMENT=kubernetes`), which does not use the repository's `devcontainer.json`
   and is never on together with this one.
-* **At startup** (`serve`, through `environment_for`) with `podman`: the tools directory every container mounts (`<root>/environments/.tools/`: `adam-exec` and
-  OpenCode) is written (a failure stops the start), the service is probed (a service that does not answer is a warning: runs fall back to
+* **At startup** (`serve`, through `environment_for`) with `podman`: the tools directory every container mounts (`<root>/environments/.tools/`: `adam-exec` alone) is written (a failure stops the start), the service is probed (a service that does not answer is a warning: runs fall back to
   this container until it does), and the default image is pulled in the background (`DEVCONTAINER_PREPULL`). The janitor releases the
   environment of a run **before** it removes the run's workspace, and releases what `held_runs()` finds for runs that are over (a crash left it).
 
 ### A pod of its own for each run
 
-With `RUN_ENVIRONMENT=kubernetes` the commands of a run (`run_command`, `run_checks`), OpenCode and everything OpenCode starts run in **a pod of
+With `RUN_ENVIRONMENT=kubernetes` the commands of a run (`run_command`, `run`, `run_checks`) and everything they start run in **a pod of
 the run's own** ([ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)), made by
 [`adam-env-kubernetes`](../../crates/adam-env-kubernetes/README.md)'s `KubeEnvironment`, so that a Rust build, an `npm install` or a Flutter build is
 bounded by the pod's memory limit (2Gi in the chart) and an out-of-memory kill takes one run's command and not the coder. The coder pod holds the files,
@@ -1340,8 +1301,7 @@ every other problem of the configuration (exit 78).
 * **A command** is the program `adam-kube-exec` (in the image: `RUN_POD_EXEC_BINARY`), which the tools spawn as any command, in a process group of its
   own, with an empty environment but the variables it needs to reach the cluster. It runs `adam-exec run|shell` in the pod over `pods/exec` and exits
   with the command's code. A timeout or a cancel kills the client **and** runs `adam-exec kill` in the pod. **No GitHub credential, `DATABASE_URL` or
-  bearer token is ever in a run pod**; the model key is `MODEL_API_KEY` there, which `secret_ref("model-key")` names, so OpenCode reads it with
-  `{env:MODEL_API_KEY}`.
+  bearer token is ever in a run pod**, and no model key either: the template names no Secret, and the admission policy allows none.
 * **First command, and idle pods.** The pod is made on the first command of a run and waited for (`RUN_POD_READY_TIMEOUT_SECS`), with a step
   (`env:<run>:run-pod`). A pod no command used for `RUN_POD_IDLE_SECS` and that runs nothing is deleted, and the next command makes another: a run that
   waits hours for a person holds no pod. The janitor deletes the pod of a run that is over before it removes the workspace, and sweeps the pods it finds
@@ -1355,8 +1315,7 @@ every other problem of the configuration (exit 78).
 * **Its time is usage.** The template's run container requests (`resources.requests.cpu` and `memory`) are the pod's shape, read at
   startup (a request that is not a Kubernetes quantity is exit 78), and `EnvSession::sandbox_shape()` of the pod's session says it: the
   coder weights each command's time by it in the task's `sandbox` usage (see *Tokens*).
-* **OpenCode** is the coder's own native binary, copied by the pod's init container to `/opt/adam/bin/opencode` (`EnvSession::tool_path`), and is checked
-  once per run with `opencode --version` in the pod, like in a devcontainer. `EnvKind::Kubernetes` is what the `checks` artifact's `environment` says
+* **The tools** are `adam-exec` alone, copied by the pod's init container into `/opt/adam/bin`: no agent binary (ADR 0038). `EnvKind::Kubernetes` is what the `checks` artifact's `environment` says
   (`kind: "kubernetes"`, the image).
 * **The repository's own `devcontainer.json` is not used** in a run pod: the template's image is the environment, and a tool that image lacks is
   reported to the person like any missing tool.
@@ -1410,7 +1369,7 @@ sequenceDiagram
     end
   else something differs
     T->>W: reset --hard, clean, read-tree: back to the record
-    T-->>M: refused and undone, changes go through delegate_to_opencode
+    T-->>M: refused and undone, changes go through the file tools
   end
 ```
 
@@ -1487,8 +1446,7 @@ stateDiagram-v2
 ```
 
 The gate does not change. A check that passed is for the tree it ran on (`RunNotes::checked`), `run` changes the tree and
-records nothing, so the pull request is allowed only after `run_checks` has run on the new tree, exactly as after `write_file` or
-OpenCode's edits. A file a command made is shared with `share_file`, which reads the workspace's one directory whatever
+records nothing, so the pull request is allowed only after `run_checks` has run on the new tree, exactly as after `write_file`. A file a command made is shared with `share_file`, which reads the workspace's one directory whatever
 ran in it. A screenshot of a web page is one: the prompt names `obscura`, the headless browser of the coder's image and of
 the default environment, with `--allow-private-network` for a page served on 127.0.0.1, and says to delete the picture
 before committing. It names it as part of the environment, for any page, and forbids installing Chromium, Playwright or
@@ -1602,7 +1560,7 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
   run its checks, push a branch, open a pull request), ask when unsure. Then what
   it cannot do, and why: it works only on a repository the person names (it cannot start without one or create one),
   and it makes the change inside a private worktree of the repository, itself (`read_file`, `write_file`,
-  `apply_patch`: adam-rs#53) or with OpenCode. Tool names and arguments appear only if the person asks for the
+  `apply_patch`: adam-rs#53) Tool names and arguments appear only if the person asks for the
   detail. The "what I can't do" sentence stays true until the scratch workspace and repository creation of
   adam-rs#52 and #54 land, and then it must change with them.
 * **The two persona lines are a convention**: the body of the instructions starts with exactly
@@ -1789,17 +1747,18 @@ shipped files stay in the binary and cannot disagree with it.
   skip for an optional one.
 * **The variables a `mcp.json` names are this process's secrets.** Every `${VAR}` of the agent's own and the extra file's
   servers (`AgentDef::mcp_env_references`, defaults included) is **hidden from every process a run starts** (the checks,
-  `run_command`, `run`, OpenCode, in the coder's own container: `HidingEnvironment` over the environment adds the names to
+  `run_command`, `run`, in the coder's own container: `HidingEnvironment` over the environment adds the names to
   every `ExecSpec::hide`, beside the fixed lists `HIDDEN_FROM_CHECKS` and `HIDDEN_FROM_CHILD`), and **its value is
   registered with the [`Redactor`](crate::Redactor) for good** (`Redactor::add_fixed`, which the installation tokens a GitHub
   App mints never push out), so a repository's test script cannot read it with `env` and **the model never sees it**: what a
   tool prints, an error and a step are scrubbed. (Commits are not scrubbed: a file a run writes is committed as it is.) The
   startup log lists the names, the ones left alone and how many values were registered, never a value; the code is
   [`mcp_secrets`](crate::mcp_secrets).
-  * **Never hidden**: `MODEL_API_KEY` (OpenCode reads it), `PATH`, `HOME`, `LANG`, `LC_*`, `TMPDIR`, `USER`. A file that
+  * **Never hidden**: `PATH`, `HOME`, `LANG`, `LC_*`, `TMPDIR`, `USER`. A file that
     reads one (`"PATH": "${PATH}"` in a stdio server's `env`) would otherwise blank it for every command and redact it from
     every output, so these names are skipped with a warning that names the variable. The server still gets the value when it
     connects. (Skipping rather than refusing to start: a harmless `${HOME}` should not stop the coder.)
+    `MODEL_API_KEY` is **not** on that list any more (ADR 0038; it was there only because the coder's OpenCode read it): a file that names it gets it hidden from every command and redacted like any other secret.
 * **What keeps those keys from repository code, and what does not.**
   * The coder's own `git` (`add`, `apply`, the tree-id probes) starts from an **empty environment** plus a short allow-list
     (`adam_workspace::confine_git_env`), because a `filter.<x>.clean` that a check script writes to `.git/config` and a
@@ -1816,7 +1775,7 @@ shipped files stay in the binary and cannot disagree with it.
     mirror repair that removes the configuration keys which would run a program there is a list, not a proof (a writer in the sandbox
     can still change the file between the repair and the command's read of it); a proxy URL with a password in `HTTPS_PROXY` is inherited by git; a process with `CAP_SYS_PTRACE`, or root,
     reads everything (the chart drops all capabilities); a value shorter than four characters is not redacted; and a secret
-    a run's code is *given* on purpose (the model key OpenCode reads, a file the model reads) is as exposed as that act.
+    a run's code is *given* on purpose (a file the model reads) is as exposed as that act.
 * Tests: `tests/environment.rs` (`a_variable_a_mcp_json_names_is_*`, `the_names_the_coders_own_processes_need_*`), `src/config.rs`, `src/redact.rs`, `src/harden.rs`, `src/tools/gitcli.rs` (a malicious filter);
   `adam-assembly/tests/extra_mcp.rs`, `adam-mcp/tests/http.rs` (`an_optional_server_*`).
 
@@ -1835,10 +1794,7 @@ crash after it was posted and before the call was journaled posts it again when 
 ### Cancel and rate limits
 
 * **CancelTask** fails the run as `cancelled: ...` (A2A `canceled`) at once and
-  fires the step's `CancelToken`. `delegate_to_opencode` then sends ACP
-  `session/cancel`, gives OpenCode two seconds to end its turn, kills it **and
-  its process group** (the commands it started) and waits until it is reaped
-  before returning, so nothing outlives the tool. `commit_and_push` and
+  fires the step's `CancelToken`.
   `open_pull_request` refuse to act once the token has fired, so a later call of
   the same model turn cannot publish a cancelled run. The model call in flight is dropped too (`adam-llm-agent`'s
   *Cancel*), and the commands of `run_command`, `run` and `run_checks` are killed (process group and the
@@ -1871,10 +1827,9 @@ way; every problem is reported at once at startup):
 | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, public; `false` turns them off ([`adam-service`](../../crates/adam-service/README.md#environment)) | `true` |
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required by `all` and `worker` (key may be empty) |
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
-| `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value; read by the agent's own model calls only, not by OpenCode (`OPENCODE_MODEL`) | unset: nothing is added |
+| `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value; read by the agent's own model calls only | unset: nothing is added |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: keep the model's reasoning in the run's history and send it back under that member name. For a provider that requires it (DeepSeek's thinking mode with tools answers a request without it with a 400); `false` or unset sends none, which is what almost every model wants. Anything else: exit 78 | unset: never sent |
-| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none, and OpenCode reports no usage at all. Anything else: exit 78 | unset: reports carry no window |
-| `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
+| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none. Anything else: exit 78 | unset: reports carry no window |
 | `GITHUB_TOKEN` | push and pull request token (a personal access token); only ever sent to the `ALLOWED_REPO_HOSTS`. Must be unset or empty in App mode | one of this or the App's variables, for `all` and `worker` |
 | `GITHUB_APP_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | required in App mode |
 | `GITHUB_APP_INSTALLATION_ID` | App mode: **pins** the App to one installation (a positive integer), which serves every repository, with no lookup | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
@@ -1899,12 +1854,11 @@ way; every problem is reported at once at startup):
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` (and of one `run_command` and one `run`) | `900`, `16384` |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
-| `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
 | `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. The shipped `mcp.json` does not need it any more (the GitHub server is the sidecar, over http); the chart and `compose.yaml` still set it for one release, for an agent folder written before the sidecar. The image does not set it (it also carries `adam-agent`, which must refuse local processes unless its own deployment opts in) | `false` |
 | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
-| `RUN_ENVIRONMENT` | where a run's commands and OpenCode run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` ([a pod for each run](#a-pod-of-its-own-for-each-run)). With `kubernetes`, `DEVCONTAINER_RUNTIME=podman` is refused. Anything else: exit 78 | `local` |
+| `RUN_ENVIRONMENT` | where a run's commands run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` ([a pod for each run](#a-pod-of-its-own-for-each-run)). With `kubernetes`, `DEVCONTAINER_RUNTIME=podman` is refused. Anything else: exit 78 | `local` |
 | `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod (YAML or JSON) every run pod is made from; an existing file, read and checked at startup (the chart's `runPods` ConfigMap; the run container's CPU and memory requests must be Kubernetes quantities, they are the pod's shape in the `sandbox` usage) | required with `kubernetes` |
 | `RUN_POD_NAMESPACE` | with `kubernetes`: the namespace the run pods are made in | the ServiceAccount's namespace file; required when there is none |
 | `RUN_POD_INSTANCE` | with `kubernetes`: the release's `app.kubernetes.io/instance`, which finds this deployment's pods; a label value | required with `kubernetes` |
@@ -1913,15 +1867,14 @@ way; every problem is reported at once at startup):
 | `RUN_POD_READY_TIMEOUT_SECS` | with `kubernetes`: how long a pod may take to be ready (scheduling, the first pull of the image on a node) | `300` (the chart: `600`) |
 | `RUN_POD_IDLE_SECS` | with `kubernetes`: how long no command may have used a pod (and none runs in it) before it is deleted; the next command makes another. `0` keeps it until its run ends | `900` |
 | `RUN_POD_WAIT_SECS` | with `kubernetes`: how long a run waits, trying again with a growing pause, for a pod the cluster cannot give now, before the tool fails | `600` |
-| `DEVCONTAINER_RUNTIME` | where a run's commands and OpenCode run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service; see [The work environment](#the-work-environment-the-repositorys-devcontainer)). Anything else: exit 78 | `off` |
+| `DEVCONTAINER_RUNTIME` | where a run's commands run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service; see [The work environment](#the-work-environment-the-repositorys-devcontainer)). Anything else: exit 78 | `off` |
 | `CONTAINER_HOST` | Podman's own variable: where the service is, e.g. `unix:///run/podman/podman.sock`; **required** with `podman` | unset |
 | `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`. **Name it by digest only** (`registry/name@sha256:...`): the devcontainer CLI (0.89.0) cannot parse a reference that has both a tag and a digest ("Could not parse image name"), and then skips the image's details, the metadata that sets the remote user | the `workspace` image of `another-agentic-images` the coder is built on, by digest (`DEFAULT_DEVCONTAINER_IMAGE`; its tag, `DEFAULT_DEVCONTAINER_IMAGE_TAG`, is kept equal to the Dockerfile's `WORKSPACE_TAG` by a test) |
-| `DEVCONTAINER_NETWORK` | `inherit` (the Podman service's network, which the deployment limits) or `none` (then `delegate_to_opencode` refuses: OpenCode cannot reach its model) | `inherit` |
+| `DEVCONTAINER_NETWORK` | `inherit` (the Podman service's network, which the deployment limits) or `none` (the container has no network) | `inherit` |
 | `DEVCONTAINER_DEPLOYMENT_ID` | the label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
 | `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | how long pulling, building and creating a container may take, and how long the repository's lifecycle commands may take | `1200`, `900` |
 | `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
 | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (the image sets them) | `devcontainer`, `podman-remote` |
-| `OPENCODE_BINARY` | with `podman`: the OpenCode mounted into every container; **a native executable (an ELF file)**, since it is mounted and run there | `OPENCODE_COMMAND`'s program, found on `PATH` and resolved to its real file |
 | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
 | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file (exit 78 naming the variable otherwise). A server name the agent already has is refused (exit 78, nothing is replaced). It is read with the loader of `mcp.json` (`${VAR}`, `tools`, `optional`). See [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file) | unset: only the agent's own servers |
 
@@ -1929,13 +1882,9 @@ Everything from `MODEL_BASE_URL` down, except `ADAM_AGENT_DIR` (every role reads
 only (the `MCP_ALLOW_*` flags too: a control plane connects no MCP server), and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.
 A control plane neither needs nor validates any of it (see [Roles](#roles)).
 
-OpenCode's configuration is generated at startup into
-`OPENCODE_CONFIG_CONTENT` (custom `@ai-sdk/openai-compatible` provider at
-`MODEL_BASE_URL`, model `OPENCODE_MODEL`, key by reference, `{env:MODEL_API_KEY}` in this container and
-`{file:/run/adam/secrets/model-key}` in a devcontainer, never inlined) together with `OPENCODE_DISABLE_AUTOUPDATE=1`; see
-`src/opencode.rs` for what was verified against the OpenCode sources. The
-OpenCode child does not see `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` or
-`A2A_BEARER_TOKENS`, and the checks do not see those or `MODEL_API_KEY`.
+**Removed variables.** `OPENCODE_MODEL`, `OPENCODE_COMMAND` and `OPENCODE_BINARY` are ignored, each with one warning at startup that names the variable and never its value
+([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md); `Config::ignored`, `tests/binary.rs`: `a_removed_variable_is_logged_once_at_startup`). The checks and commands do not see `GITHUB_TOKEN`,
+`GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` or `MODEL_API_KEY`.
 
 ### Workspace placement
 
@@ -2016,7 +1965,7 @@ By default any worker may lease any run at any step. Several workers therefore n
 | `DATABASE_URL` | yes | yes | yes |
 | `A2A_BEARER_TOKENS`, `PUBLIC_URL`, and the optional `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS` | yes (the optional ones if set) | yes (the optional ones if set) | not read |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, and `GITHUB_TOKEN` or the `GITHUB_APP_*` variables | yes | not read | yes |
-| the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `GIT_SANDBOX_SOCKET`, `WORKSPACE_PLACEMENT`, `WORKER_ID`, `WORKERS`, `MAX_CHECK_CYCLES`, `SCRATCH_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
+| the rest of the table above (`OPENCODE_*` too, which are removed and only warned about, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `GIT_SANDBOX_SOCKET`, `WORKSPACE_PLACEMENT`, `WORKER_ID`, `WORKERS`, `MAX_CHECK_CYCLES`, `SCRATCH_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
 
 A missing required value is a configuration error (exit 78) listed with every other problem.
 What a role does not read it does not validate either: a worker ignores `A2A_BEARER_TOKENS` and
@@ -2134,7 +2083,7 @@ A token the App minted is a secret from the moment it exists: the redactor is sh
 each token they hand out (up to `2 * MAX_CACHED_INSTALLATIONS`, 128, are remembered, oldest forgotten first: two for each
 installation an App by owner can hold a token for), so a tool result, an error or a
 log line that quotes one is scrubbed (the App's PEM and its Base64 body are registered at startup). The key is
-hidden from OpenCode and from the project's commands as `GITHUB_TOKEN` is; a key file is a path, and sits
+hidden from the project's commands as `GITHUB_TOKEN` is; a key file is a path, and sits
 wherever the deployment mounted it (the chart: `/var/run/secrets/github-app/private-key.pem`, read-only, mode
 0440, group `fsGroup`).
 
@@ -2257,14 +2206,14 @@ sequenceDiagram
 
 ### Secrets in output
 
-Text from things this process does not control (OpenCode's stderr tail in an
-"ACP agent exited" error, a check's output, a provider's error body) reaches
+Text from things this process does not control (a command's output in an
+error, a check's output, a provider's error body) reaches
 clients as run errors, events and tool results. A `Redactor` built from the
 configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN` or the App's private key (the PEM and its
 Base64 body), each only where the role holds them, every
 `A2A_BEARER_TOKENS` entry and the `DATABASE_URL` password (and their Base64
 forms), and every installation token an App mints, from the moment it is minted (the redactor is shared, and
-the credentials add each token they hand out, up to 16 at a time), with `[redacted]` in tool results and errors, in OpenCode's and the
+the credentials add each token they hand out, up to 16 at a time), with `[redacted]` in tool results and errors, in the
 checks' progress lines, in the `checks` artifact's findings and summary, in the agent's final
 failure message, and in the process's own `adam-coder failed` log line.
 A failed step's error crosses one boundary (`boundary_error` in
@@ -2384,7 +2333,7 @@ database of its own, so the role needs `CREATEDB`):
   wins, a read message and a finish notice do not, a continuing task does not inherit) and `src/tools/mod.rs` (`grant_tests`: a
   bare name per tier, one owner, two owners, none, the words of a message).
 * `tests/e2e.rs`: a real A2A client and server, the scripted `MockModel`, a
-  local bare git repository as the remote, the `adam-acp` fake agent as OpenCode
+  local bare git repository as the remote,
   and a wiremock GitHub. **Every case runs once per store** (`memory::*`, and
   `postgres::*` when the variable is set): the happy path (working, progress,
   checks, artifacts (`checks`, the `checks` bound to the pushed commit, `branch`, `pull_request`), completed, branch on the remote, PR request at the mock),
@@ -2398,11 +2347,10 @@ database of its own, so the role needs `CREATEDB`):
   the explicit-acceptance path, ownership, the wrong bearer token (401 at the
   coder's own router; card and `/healthz` open), five crash points (inside
   `run_checks`, inside `commit_and_push`, after it was journaled, inside
-  `open_pull_request`, inside `delegate_to_opencode`) with a second worker taking
+  `open_pull_request`, inside `write_file`) with a second worker taking
   over: one commit, one push, one pull request, one `checks` artifact per
-  commit (the one bound to the pushed commit is emitted once), the same worktree; OpenCode crashing on every attempt
-  (run fails after the retry budget, with the child's stderr) and once
-  (retried, completes); two concurrent tasks on one repository (two branches,
+  commit (the one bound to the pushed commit is emitted once), the same worktree; a history that holds a `delegate_to_opencode` call (an upgrade in flight) replays and the owed call gets the unknown-tool answer;
+  two concurrent tasks on one repository (two branches,
   two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`, or the `GITHUB_APP_*` variables when the coder is an App
   installation); an App installation token that is minted, used for every call to the repositories' API and never
   echoed (a tool result that quotes it is scrubbed).
@@ -2417,14 +2365,14 @@ database of its own, so the role needs `CREATEDB`):
   is named and the one only the ask's text names is not, and `vymalo.caller` and `vymalo.person` are in the run's context.
 * `tests/binary.rs`: the `adam-coder` binary as a process. All problems of a
   bad configuration reported together with exit 78 (the `DEVCONTAINER_*` ones among them: a runtime that is neither `off` nor `podman`, `podman`
-  with no `CONTAINER_HOST`, an OpenCode that is a script and cannot be mounted, a timeout that is not a number); with
+  with no `CONTAINER_HOST`, a timeout that is not a number); with
   `DEVCONTAINER_RUNTIME=podman` and a service that does not answer, the worker starts, writes the tools directory
-  (`adam-exec` and OpenCode), says so, and stops cleanly; Postgres unreachable at boot
+  (`adam-exec` alone, even with `OPENCODE_BINARY` set), says so, and stops cleanly; the three removed variables are logged once each, by name; Postgres unreachable at boot
   (a clear "connecting to Postgres: ..." chain in exactly one `adam-coder failed`
   line, exit 69, nothing on stderr, no password, no panic; sqlx retries the
   connection for its 30 s acquire timeout first); with Postgres: the card and
   `/healthz`, a clean exit 0 on SIGTERM, and
-  SIGTERM in the middle of OpenCode's turn (the process waits for the step,
+  SIGTERM in the middle of a check (the process waits for the step,
   commits it, exits 0; a second process over the same database and workspace
   finishes the run with one commit, one push and one pull request). The last
   one runs the whole binary against a wiremock model (`/chat/completions`) and
@@ -2534,7 +2482,6 @@ database of its own, so the role needs `CREATEDB`):
   another agent's name, a worker whose folder cannot be assembled (exit 78, names the var; Postgres), a control
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
   embedded copy logged as `source=embedded`.
-* `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1`, `text-stream/v1` and `usage/v1` on the card. The tests' models stream too (the agent calls `stream`): a model that does its work in `complete` only is not asked for it any more, so `HangingModel` of `tests/e2e.rs` and the greeting model of `tests/agent_files.rs` do it in `stream` as well.
 * A slot swapped between the check and the use (vymalo/another-adam-rs#125): `files.rs` (`swap_tests`: `read_file`, `write_file` and
   `edit_file`, each with the slot and with a directory below it swapped for a link to another run's files at the checkpoint
   between the check and the use, and a bounded flip-flop of the slot while files are written), `share.rs` (`share_file`, both swaps),
@@ -2552,7 +2499,7 @@ database of its own, so the role needs `CREATEDB`):
   hunk counts applied by their lines). A patch applied or a file written is seen by the next `run_checks`, and a commit
   after a later edit is not bound to those checks. `tests/e2e.rs`'
   `the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request` (per store): `read_file`, `apply_patch`,
-  `run_checks`, `commit_and_push` and `open_pull_request` over A2A with OpenCode unavailable, the checks artifact bound
+  `run_checks`, `commit_and_push` and `open_pull_request` over A2A  the checks artifact bound
   to the pushed commit. The compose scenario is `SCENARIO=files sh dev/coder-e2e.sh` (the `[mock:files]` script).
 * The workspace of several slots: `tests/tools.rs` (`a_second_repository_joins_the_workspace_and_repo_says_which_one`: a
   second repository is added next to the first, a missing `repo` with two slots is an error that lists them, a slot is chosen by
@@ -2604,7 +2551,7 @@ database of its own, so the role needs `CREATEDB`):
   `GITHUB_APP_OWNERS` and no pin), and assert that the mock saw the installation looked up with a JWT (the first run after the
   coder started), the trade, and that every call to `/repos/...` carried the installation token and never the JWT.
 * Scratch projects: `tests/tools.rs` (`a_scratch_project_is_built_checked_and_committed_locally`: the file tools, `run_checks`
-  (an artifact with no `repository`), `run_command` (a stray file and a sneaky commit are undone, as in a worktree) and OpenCode
+  (an artifact with no `repository`), `run_command` (a stray file and a sneaky commit are undone, as in a worktree)
   work in it, `commit_and_push` is a local commit with no artifact and no remote branch, `open_pull_request` is refused and
   points to `publish_scratch`; `a_scratch_project_needs_a_plain_name_that_no_repository_has`;
   `publish_scratch_works_only_on_a_repository_the_person_named`: refused before any mirror is made;
@@ -2687,26 +2634,24 @@ database of its own, so the role needs `CREATEDB`):
 * `tests/environment.rs`, **sandbox time** (ADR 0043), against the same fake made a pod (`FakeSession::as_pod`): a command in a pod reports
   the time it ran and the pod's shape and the checks and `run_command` add to one entry; a request the pod does not make is absent; a
   command a **timeout** stopped, and one a **cancel** stopped (a call that ends in an error), still count until they were stopped;
-  OpenCode counts from its spawn to its end, a cancel included; the coder's own container and a dev container report where and no
+  a command a cancel stopped counts until it stopped; the coder's own container and a dev container report where and no
   time; a pod asked for and not used is a measured zero and an environment that could not be made reports nothing. `tests/e2e.rs`
   (`the_time_of_the_coders_commands_in_a_run_pod_is_the_tasks_sandbox_usage`,
   `the_coders_commands_in_its_own_container_are_reported_as_not_measured`): over A2A, the task read after it ended carries `sandbox`.
 * `tests/environment.rs`: the three tools that run a process go through a fake `Environment`
   (`FakeEnvironment` in `tests/common/mod.rs`): the command that runs is the one its session prepared (a variable the session
-  adds is seen by a check and by the fake OpenCode), the spec has the slot's path and hides the right names and carries no
-  secret, a check that times out and an OpenCode that is cancelled each tell the session which command to kill, what `ensure`
+  adds is seen by a check), the spec has the slot's path and hides the right names and carries no
+  secret, a check that times out and a check that is cancelled each tell the session which command to kill, what `ensure`
   says shows as steps of the tool call with the secret scrubbed from a detail, an environment that cannot be made (a build
   that failed with its log, a runtime that is down) is a permanent or a transient result for the model that runs nothing, uses
   no check cycle and records nothing, and is made again at the next call, and a cancel stops the wait for `ensure`. The devcontainer
-  side (slice 7b, A7b-2), against the same fake: a **broken** environment is a permanent result for `run_command`, `run_checks` and
-  `delegate_to_opencode` that names the file and the problem and says to ask the person (nothing ran, the coder never rebuilds
+  side (slice 7b, A7b-2), against the same fake: a **broken** environment is a permanent result for `run_command` and
+  `run_checks` that names the file and the problem and says to ask the person (nothing ran, the coder never rebuilds
   by itself), one that is only unavailable is transient and says nothing of rebuilding; `rebuild_environment` (with `use_default`: asks
-  the environment, notes the choice, makes the environment now and says so; without: forgets what the notes knew of OpenCode; with no
-  container runtime: "Nothing was rebuilt", no environment asked for; a rebuild that fails again: the same kind of result); OpenCode
-  started from the path the environment names with the key as `{file:...}` and no secret value in any argument or variable;
-  `opencode --version` run once per environment and refused for good, with the other tools unaffected, when it fails; `DEVCONTAINER_NETWORK=none`
-  refusing OpenCode in a container and not in this one; the `checks` artifact's `environment` (a devcontainer's file or the default image;
-  absent for this container); a missing tool's answer in each of the three environments; and the **real** `DevContainer`, composed by `environment_for` as `serve` does it, over a Podman client that says the service is down: the start goes on, the tools directory is written, a command runs in the coder's own container, exactly one fallback step is shown for the run, and the second command does not probe again.
+  the environment, notes the choice, makes the environment now and says so; without: makes it again from the file; with no
+  container runtime: "Nothing was rebuilt", no environment asked for; a rebuild that fails again: the same kind of result); a devcontainer that mounts only `adam-exec` and no secret (in `adam-devcontainer`'s tests)
+  a cancelled check is told to the session; the `checks` artifact's `environment` (a devcontainer's file or the default image;
+  absent for this container); a missing tool's answer in each of the three environments; and the **real** `DevContainer`, composed by `environment_for` as `serve` does it, over a Podman client that says the service is down (with `OPENCODE_BINARY` set to a file that is not there, which is ignored): the start goes on, the tools directory is written, a command runs in the coder's own container, exactly one fallback step is shown for the run, and the second command does not probe again.
 * `tests/janitor.rs` also covers the environment: it is released before the workspace is removed (and never for an open run),
   a release that fails keeps the workspace for the next sweep, and what an environment holds for runs that are over or unknown
   is released without a workspace (`orphans`), once, leaving an open run's and a name that is no run.
@@ -2724,8 +2669,8 @@ database of its own, so the role needs `CREATEDB`):
   variables each role requires, and that `Config::worker` is `Some` exactly for the roles that
   run workers; and placement: the default, each variant, `WORKER_ID` required by the pinning
   ones and validated as a safe name, `a2a-only` and unknown values refused, a control plane
-  ignoring both), the folder each placement gives the workspaces (`src/repos.rs`), prompt, OpenCode config (the spec for an environment to prepare, and the ACP command made of what it
-  prepared), shell execution (timeout
+  ignoring both), the folder each placement gives the workspaces (`src/repos.rs`), prompt,
+  shell execution (timeout
   kills the process group and tells the session, output tail, cwd confinement, hidden secrets, a spec the environment
   refuses, a program that cannot start), run
   notes, the exit code of each root cause (`src/exit.rs`), and the scrubbing
@@ -2747,12 +2692,12 @@ target directory as the running test executable (derived from
 
 ## Live smoke test (manual, not run in CI)
 
-Proves the real chain: gateway, OpenCode and GitHub. Needs a sandbox repository
+Proves the real chain: gateway and GitHub. Needs a sandbox repository
 you can push branches to and open pull requests in (for example
 `you/adam-coder-sandbox`, with a `README.md` and a trivial check such as a
 `justfile` with `test:` or a `cargo test`), a GitHub token with `contents` and
 `pull requests` write on it, an OpenAI-compatible gateway with a model that can
-call tools, and `opencode` on `PATH`.
+call tools.
 
 ```sh
 docker compose up -d --wait postgres     # from the repository root
@@ -2777,7 +2722,7 @@ curl -N http://127.0.0.1:8080/ \
         "In https://github.com/you/adam-coder-sandbox (base branch main), add a file hello.txt containing hello. Run the repository checks before opening a pull request."}]}}}'
 ```
 
-Expected: a stream of status updates whose messages include OpenCode's tool calls (`Write ...`, then
+Expected: a stream of status updates whose messages include the file tools' steps (`Write a file`, then
 `Write ...: done`) and `running checks: ...`, then artifacts `checks` (twice: of `HEAD`, then bound to the pushed commit), `branch` and `pull_request`,
 then `TASK_STATE_COMPLETED`. Send only "Hi" instead and the task ends `TASK_STATE_INPUT_REQUIRED` with
 the model's question, which should be a greeting that says the agent's name (`Adam`) and what it does in one

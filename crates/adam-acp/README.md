@@ -6,7 +6,10 @@ first of all `opencode acp`, plus a scripted fake agent for tests.
 ## Where it sits
 
 An **adapter** for an external agent protocol; nothing in the core depends on
-it. [`adam-coder`](../../bin/adam-coder/README.md) uses it to have OpenCode change
+it, and **no crate depends on it now**: the coder stopped using OpenCode
+([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)), and the owner keeps ACP for later. It is a
+workspace member, so it is still built and tested (`tests/fake_agent.rs` against the scripted agent; `tests/live_opencode.rs` is
+opt-in and the nightly job `live-opencode` runs it). It was used to have OpenCode change
 code inside a worktree prepared by
 [`adam-workspace`](../adam-workspace/README.md). The client also *serves* the
 agent's requests: file reads and writes under a policy root, and permission
@@ -83,13 +86,13 @@ No Cargo features. Runtime configuration is the `AcpCommand` (program,
 arguments, working directory, `OPENCODE_CONFIG_CONTENT`); the crate reads no
 environment variables itself. The child gets the parent's environment plus
 `AcpCommand::env`, unless the command says `.clear_env()`: then it gets only what
-`.env` set (the parent still resolves a bare program name on its own `PATH`). The coder
-clears it for a command that is the client of something that runs the real agent
-elsewhere, the devcontainer CLI, so that nothing of the coder's environment reaches it.
+`.env` set (the parent still resolves a bare program name on its own `PATH`). A caller that
+starts the agent through something that runs it elsewhere (a devcontainer CLI) clears it, so that
+nothing of its own environment reaches it.
 
 *Unverified:* how `opencode acp` behaves (which requests it sends, its
 configuration keys) is taken from OpenCode's sources as recorded in
-[`adam-coder`'s `src/opencode.rs`](../../bin/adam-coder/src/opencode.rs), not
+adam-rs's study of OpenCode (v1.18.33 and 1.19.0, [ADR 0037](../../docs/decisions/0037-parallel-subagent-calls-and-an-editing-worker.md), from OpenCode's sources), not
 re-checked here.
 
 ## Tests
