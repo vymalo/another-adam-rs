@@ -1,0 +1,141 @@
+{
+  "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
+  "components": {
+    "Text": {
+      "type": "object",
+      "description": "Plain text, drawn as text (no HTML, no links).",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Text"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "variant": {
+          "enum": [
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "caption",
+            "body"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "component",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "Column": {
+      "type": "object",
+      "description": "Stacks its children vertically.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Column"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "align": {
+          "enum": [
+            "start",
+            "center",
+            "end",
+            "stretch"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "component",
+        "children"
+      ],
+      "additionalProperties": false
+    },
+    "Checklist": {
+      "$comment": "Hand-written test fixture: a subset of the orchestration layer catalog, version 6, unverified against the published file.",
+      "type": "object",
+      "description": "A checklist: each item's state in words and a progress bar, N of M done.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Checklist"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "state": {
+                "enum": [
+                  "done",
+                  "doing",
+                  "todo",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "label",
+              "state"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "id",
+        "component",
+        "items"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

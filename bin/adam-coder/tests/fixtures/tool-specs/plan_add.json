@@ -1,0 +1,29 @@
+{
+  "name": "plan_add",
+  "description": "Add items you found on the way, at the end or after item `after`; they get the next numbers. Returns the whole plan.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 50,
+        "description": "The items to add, in order, one action each",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      },
+      "after": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Show the new items after this item; at the end when left out"
+      }
+    },
+    "required": [
+      "items"
+    ],
+    "additionalProperties": false
+  }
+}

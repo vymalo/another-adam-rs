@@ -158,7 +158,15 @@ async fn an_announced_answer_is_the_answer_and_the_end_of_the_turn() {
     assert_eq!(requests.len(), 1, "no model call after the answer");
     assert_eq!(
         names(&requests[0]),
-        ["ask_user", "show", "ui_catalog", "turn_output"]
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add",
+            "turn_output"
+        ]
     );
     assert_eq!(
         TURN_OUTPUT_DELIVERED,
@@ -248,7 +256,14 @@ async fn an_endpoint_without_the_tool_changes_nothing() {
     assert_eq!(status_text(&task), Some("Just the words."));
     assert_eq!(
         names(&rig.model.requests()[0]),
-        ["ask_user", "show", "ui_catalog"]
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add"
+        ]
     );
     assert!(server.calls().is_empty());
     let (output, state) = rig.state_of(&task).await;

@@ -1,0 +1,29 @@
+{
+  "name": "plan_work",
+  "description": "Write the plan for this task as a short checklist the person sees, replacing any earlier plan. Use it when the work has three or more steps or the person asked for several things; not for a question or a one-step change. One action per item, in order, at most 50, each under 200 characters. Then mark progress with plan_check (one item `doing` at a time, `done` as soon as it is) and add what you discover with plan_add. Every call returns the whole plan. Example: {\"title\":\"Fix the date parser\",\"items\":[\"Reproduce the failing test\",\"Fix parse_date for time zones\",\"Run the checks\",\"Open the pull request\"]}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "maxLength": 80,
+        "description": "A short name for the plan"
+      },
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 50,
+        "description": "The items, in order, one action each",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    },
+    "required": [
+      "items"
+    ],
+    "additionalProperties": false
+  }
+}

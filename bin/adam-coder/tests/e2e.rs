@@ -487,6 +487,9 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "ask_user",
             "show",
             "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add",
             "explorer",
             "reviewer"
         ]
@@ -4119,8 +4122,17 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 5..],
-        ["ask_user", "show", "ui_catalog", "explorer", "reviewer"],
+        offered[offered.len() - 8..],
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add",
+            "explorer",
+            "reviewer"
+        ],
         "{offered:?}"
     );
 

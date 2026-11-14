@@ -1,0 +1,31 @@
+{
+  "name": "plan_check",
+  "description": "Set one item of the plan: `doing` when you start it, `done` when it is finished, `dropped` when it is no longer needed (say why in `note`). `id` is the number shown before the item. Returns the whole plan.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "The number shown before the item"
+      },
+      "status": {
+        "enum": [
+          "doing",
+          "done",
+          "dropped"
+        ]
+      },
+      "note": {
+        "type": "string",
+        "maxLength": 200,
+        "description": "Why, or where the work is"
+      }
+    },
+    "required": [
+      "id",
+      "status"
+    ],
+    "additionalProperties": false
+  }
+}

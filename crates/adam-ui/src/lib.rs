@@ -10,6 +10,7 @@
 //! | [`AskUser`] (`ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`) | the plain question every agent has; with `choices`, one form (a title, why the agent asks, questions of type radio, checkboxes, a searchable list, a deck of pictures or a typed answer, options with a label, a description and a recommended mark) and the person's answers as the result; the subset an older screen has, or text, when the screen cannot draw it |
 //! | [`Show`] (`show { blocks, title? }`) | draws blocks of the screen's components, each checked against the catalog's schema; the A2UI surface goes out as a run artifact |
 //! | [`UiCatalogTool`] (`ui_catalog {}`) | the components, what they are for, and their schemas |
+//! | [`PlanWork`], [`PlanCheck`], [`PlanAdd`] (`plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }`) | the conversation's plan: a checklist the agent keeps and the person sees; each call returns the whole plan and draws it as one `Checklist` (or lines of `Text`) when the screen can |
 //! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, listed again at every model turn; a successful `turn_output { text }` makes `text` the run's answer; a tool the orchestrator reports as a step (`reportsStep`) gets no step of the agent's, a call waits as long as the tool's `timeoutSecs` (capped by `THREAD_TOOLS_MAX_CALL_SECS`) and carries a stable `callId`; with mentions in the run's context it adds a "Mentioned agents" block to the instructions |
 //! | [`card_extensions`] | the card entries that announce all this (A2UI v0.9.1, `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`) |
 //!
@@ -17,7 +18,7 @@
 //!
 //! ```ignore
 //! let ui = adam_ui::Ui::new(mcp_policy);
-//! let tools = my_tools.extend(ui.tools());                 // ask_user, show, ui_catalog
+//! let tools = my_tools.extend(ui.tools());                 // ask_user, show, ui_catalog, plan_*
 //! let bound = def.bind(tools)?.tool_source(ui.source());   // the thread tools, last
 //! let card = adam_ui::with_card_extensions(card);          // announce them
 //! let agents = Agents::new(name, register).inbound(vymalo_inbound);
@@ -43,6 +44,7 @@ mod ask;
 mod cache;
 mod catalog;
 mod mentions;
+mod plan;
 mod resolve;
 mod show;
 mod surface;
@@ -60,6 +62,7 @@ pub use catalog::{
     Catalog, CatalogError, Claimed, Component, MAX_CATALOG_BYTES, MAX_COMPONENTS, canonical_json,
     catalog_digest,
 };
+pub use plan::{PLAN_ADD, PLAN_CHECK, PLAN_WORK, PlanAdd, PlanCheck, PlanWork};
 pub use show::{MAX_BLOCKS, SHOW, Show, UI_CATALOG, UiCatalogTool};
 pub use surface::{A2UI_VERSION, ask_surface_id};
 pub use thread_tools::{
@@ -113,14 +116,18 @@ impl Ui {
         self
     }
 
-    /// `ask_user`, `show` and `ui_catalog`, in that order. Register them with the agent's own tools
-    /// (`ToolSet::extend`); a folder's `tools:` can narrow them by name. `ask_user` replaces any
-    /// other tool of that name an agent has: register one of them.
+    /// `ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check` and `plan_add`, in that order (the
+    /// order of the specs is part of the prompt's stable prefix). Register them with the agent's own
+    /// tools (`ToolSet::extend`); a folder's `tools:` can narrow them by name. `ask_user` replaces
+    /// any other tool of that name an agent has: register one of them.
     pub fn tools(&self) -> ToolSet {
         ToolSet::new()
             .tool(AskUser::new(Arc::clone(&self.state), self.ask_lead.clone()))
             .tool(Show::new(Arc::clone(&self.state)))
             .tool(UiCatalogTool::new(Arc::clone(&self.state)))
+            .tool(PlanWork::new(Arc::clone(&self.state)))
+            .tool(PlanCheck::new(Arc::clone(&self.state)))
+            .tool(PlanAdd::new(Arc::clone(&self.state)))
     }
 
     /// The thread tools as a tool source: every tool the endpoint of the run's messages lists, under

@@ -107,6 +107,9 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "ask_user"
         | "show"
         | "ui_catalog"
+        | "plan_work"
+        | "plan_check"
+        | "plan_add"
         | "ask_agent"
         | "explorer"
         | "reviewer"
@@ -309,6 +312,9 @@ mod tests {
             ("request_repository", Plan),
             ("share_file", Plan),
             ("ask_user", Plan),
+            ("plan_work", Plan),
+            ("plan_check", Plan),
+            ("plan_add", Plan),
             ("explorer", Plan),
             ("write_file", Edits),
             ("edit_file", Edits),

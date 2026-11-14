@@ -237,7 +237,7 @@ async fn a_folder_without_a_description_has_no_card() {
 
 /// "hi" to a chat folder is answered in role, over A2A: the task completes with the greeting that
 /// the folder's two persona lines give (the model is scripted by the prompt), the model is sent the
-/// folder's rendered prompt, and `ask_user` is the only tool it is offered.
+/// folder's rendered prompt, and the person's screen and the plan are the only tools it is offered.
 #[tokio::test]
 async fn a_chat_folder_answers_in_role_through_a2a() {
     let store = store();
@@ -283,7 +283,93 @@ async fn a_chat_folder_answers_in_role_through_a2a() {
         "the limits are the folder's"
     );
     let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(tools, ["ask_user", "show", "ui_catalog"]);
+    assert_eq!(
+        tools,
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add"
+        ]
+    );
+    worker.stop().await;
+}
+
+/// A folder with no `tools:` is offered the plan tools with the screen's, and a call to one keeps a
+/// plan (ADR 0044 decision 5); a `tools:` list narrows them by name like the other built-in tools.
+#[tokio::test]
+async fn a_folder_agent_without_tools_offers_the_plan_tools() {
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "p1".into(),
+        name: "plan_work".into(),
+        arguments: json!({"items": ["Read the file", "Answer"]}),
+        ..Default::default()
+    }])
+    .push_text("Planned.");
+    let model: DynModel = mock.clone();
+    let store = store();
+    let agents = build(def_of(&chat()), None, Some(worker_parts(model)))
+        .await
+        .unwrap();
+    let service = service_over(agents, &store);
+    let worker = Worker::start(&service);
+    let done = ask(&service, "two things please").await;
+    assert_eq!(said(&done), Some("Planned."));
+    let requests = mock.requests();
+    let offered: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        offered,
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add"
+        ]
+    );
+    match requests[1].messages.last().unwrap() {
+        adam_model::Message::Tool {
+            content, is_error, ..
+        } => {
+            assert!(!is_error, "{content}");
+            assert!(
+                content.starts_with("Plan saved (2 items).\nPlan\n1. [ ] Read the file\n"),
+                "{content}"
+            );
+        }
+        other => panic!("expected the plan call's result, got {other:?}"),
+    }
+    worker.stop().await;
+
+    // `tools:` narrows them by name, with `*`.
+    let narrowed = chat();
+    edit_instructions(&narrowed, |t| {
+        t.replacen(
+            "limits:",
+            "tools: [ask_user, plan_work, plan_check]\nlimits:",
+            1,
+        )
+    });
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Hi.");
+    let model: DynModel = mock.clone();
+    let store = self::store();
+    let agents = build(def_of(&narrowed), None, Some(worker_parts(model)))
+        .await
+        .unwrap();
+    let service = service_over(agents, &store);
+    let worker = Worker::start(&service);
+    ask(&service, "hi").await;
+    let offered: Vec<String> = mock.requests()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(offered, ["ask_user", "plan_work", "plan_check"]);
     worker.stop().await;
 }
 
@@ -541,7 +627,18 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
     );
     let requests = mock.requests();
     let offered: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(offered, ["ask_user", "show", "ui_catalog", "test__echo"]);
+    assert_eq!(
+        offered,
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add",
+            "test__echo"
+        ]
+    );
     match requests[1].messages.last().unwrap() {
         adam_model::Message::Tool {
             call_id,
@@ -868,9 +965,17 @@ async fn a_researcher_searches_a_stateless_mcp_server_and_answers_with_its_sourc
     let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         tools,
-        ["ask_user", "show", "ui_catalog", "search__web_search"]
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add",
+            "search__web_search"
+        ]
     );
-    let spec = &requests[0].tools[3];
+    let spec = &requests[0].tools[6];
     assert!(
         spec.description.contains("Search the web"),
         "{}",
@@ -1212,7 +1317,18 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
     assert_eq!(requests.len(), 3);
     let offered =
         |i: usize| -> Vec<&str> { requests[i].tools.iter().map(|t| t.name.as_str()).collect() };
-    assert_eq!(offered(0), ["ask_user", "show", "ui_catalog", "reviewer"]);
+    assert_eq!(
+        offered(0),
+        [
+            "ask_user",
+            "show",
+            "ui_catalog",
+            "plan_work",
+            "plan_check",
+            "plan_add",
+            "reviewer"
+        ]
+    );
     // The child: its own prompt, and no tool (a subagent gets none it does not list).
     assert_eq!(requests[1].system.as_deref(), Some("You review texts."));
     assert!(offered(1).is_empty(), "{:?}", offered(1));

@@ -597,7 +597,17 @@ async fn a_chat_folder_answers_in_role_over_a2a_and_an_edit_changes_it_after_a_r
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(tools, ["ask_user", "show", "ui_catalog"]);
+        assert_eq!(
+            tools,
+            [
+                "ask_user",
+                "show",
+                "ui_catalog",
+                "plan_work",
+                "plan_check",
+                "plan_add"
+            ]
+        );
     }
     p.stop_cleanly().await;
 
@@ -857,7 +867,15 @@ async fn a_researcher_answers_with_its_source_through_a_stateless_mcp_server() {
             .collect();
         assert_eq!(
             tools,
-            ["ask_user", "show", "ui_catalog", "search__web_search"]
+            [
+                "ask_user",
+                "show",
+                "ui_catalog",
+                "plan_work",
+                "plan_check",
+                "plan_add",
+                "search__web_search"
+            ]
         );
     }
     assert!(
