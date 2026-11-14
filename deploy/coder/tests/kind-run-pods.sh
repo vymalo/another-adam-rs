@@ -1,6 +1,6 @@
 #!/bin/sh
 # The functions below that until_ok and must_be_refused call by name are not unreachable.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 # Run pods against a real cluster (ADR 0019, ADR 0042): applies the chart's run-pod objects, the egress proxy and the network
 # policies to the cluster kubectl points at (a kind cluster in CI), runs the cluster test of adam-env-kubernetes against it
 # **as the coder's ServiceAccount**, so that the chart's admission policy applies to what the test makes, and then shows what
