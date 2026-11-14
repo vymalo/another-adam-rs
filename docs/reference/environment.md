@@ -111,8 +111,8 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 
 The coder no longer uses OpenCode ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)). These
 variables are **not read and not refused**: a deployment rendered from an older chart still sets one, and nothing is less
-safe without it. For each one that is set, the process logs one warning at startup that names the variable (never its
-value), in every role.
+safe without it. For each one that is set, the process logs one warning that names the variable (never its
+value), in every role, once the configuration is valid: a start that fails validation (exit 78) does not warn.
 
 | Variable | Was |
 |---|---|

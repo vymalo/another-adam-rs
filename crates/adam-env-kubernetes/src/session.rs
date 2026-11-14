@@ -115,7 +115,7 @@ impl EnvSession for KubeSession {
                 )));
             }
         }
-        // The pod has variables of its own (the model key, from the deployment's Secret): a name
+        // The pod has variables of its own (the template's, none from a Secret): a name
         // the caller hid is removed from the command's environment.
         let unset: Vec<String> = spec
             .hide

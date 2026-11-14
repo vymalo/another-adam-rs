@@ -26,7 +26,7 @@ github:
     owners: [acme] # set: the accounts the App may act for (or installationId: to pin one installation)
     privateKeySecret: coder-github-app
 
-# A pod for each active run (ADR 0019). Needs Kubernetes 1.30 or later and externalSecrets.enabled (below). Keep
+# A pod for each active run (ADR 0019). Needs Kubernetes 1.30 or later (a run pod reads no Secret, so no ExternalSecret for it). Keep
 # allowCommandsNextToSecrets false (the default): it accepts the risk this file exists to avoid.
 runPods:
   enabled: true

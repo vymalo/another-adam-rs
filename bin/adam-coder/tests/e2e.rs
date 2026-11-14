@@ -2526,11 +2526,11 @@ fn tool_results(messages: &[adam_model::Message]) -> Vec<(String, String, bool)>
         .collect()
 }
 
-/// ADR 0038: a run that was in flight at the upgrade has a `delegate_to_opencode` call in its journal,
-/// or a model that still asks for it. The call gets the loop's answer for an unknown tool, which lists
-/// the tools there are, and the history that holds it is sent back to the model as data on every later
-/// turn: the run goes on with the file tools and completes.
-async fn a_history_with_a_delegation_replays_and_an_owed_call_gets_the_unknown_tool_answer(
+/// ADR 0038: a model that still asks for `delegate_to_opencode` (a call **owed** at the upgrade, no
+/// result journaled for it) gets the loop's answer for an unknown tool, which lists the tools there are,
+/// and the history that holds it is sent back to the model as data on every later turn: the run goes
+/// on with the file tools and completes. (A journal the old binary wrote is the next test.)
+async fn a_model_that_still_asks_for_the_removed_tool_gets_the_unknown_tool_answer(
     store: DynStore,
 ) {
     let fx = Fixture::new().await;
@@ -2612,6 +2612,132 @@ async fn a_history_with_a_delegation_replays_and_an_owed_call_gets_the_unknown_t
             .iter()
             .all(|t| t.name != "delegate_to_opencode")
     );
+}
+
+/// The old binary's `delegate_to_opencode`, as a stand-in that answers in the shape the old tool answered.
+struct OldDelegate;
+
+#[async_trait]
+impl Tool for OldDelegate {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delegate_to_opencode".to_owned(),
+            description: "the removed tool, as the old binary offered it".to_owned(),
+            parameters: json!({"type": "object", "properties": {"instructions": {"type": "string"}}}),
+        }
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(
+            "OpenCode finished (stop reason: end_turn). RECORDED-BY-THE-OLD-BINARY\nchanged files:\n- hello.txt (untracked)",
+        ))
+    }
+}
+
+/// ADR 0038, the upgrade in flight: a journal the OLD binary wrote, holding a `model:<n>` record with a
+/// `delegate_to_opencode` call and a recorded `tool:<id>` entry with its result, is resumed by the new
+/// binary (which has no such tool). The run goes on, with no non-determinism: the model is not called for
+/// the recorded turns, and the next request carries the RECORDED result, not the unknown-tool answer.
+/// (Replay is safe because the coder always installs tool sources, so an unknown tool is answered inside
+/// the journaled `tool:<id>` step: see the comment in `adam-llm-agent`'s `run_tool`.)
+#[tokio::test]
+async fn a_journal_the_old_binary_wrote_replays_with_its_recorded_delegation() {
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let opts = |id: &str| RuntimeOptions {
+        worker_id: Some(id.to_owned()),
+        ..short_lease()
+    };
+
+    // The old binary: the tool exists; the worker dies at the third model call, after the delegation was
+    // journaled.
+    let first = Arc::new(MockModel::new());
+    first
+        .push_tool_calls(vec![call(
+            "c1",
+            "prepare_workspace",
+            json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+        )])
+        .push_tool_calls(vec![call(
+            "c2",
+            "delegate_to_opencode",
+            json!({"instructions": "add hello.txt containing hello"}),
+        )])
+        .push_text("never reached");
+    let reached = Arc::new(Notify::new());
+    let hanging: DynModel = Arc::new(HangingModel {
+        inner: first.clone(),
+        hang_on: 2,
+        calls: AtomicUsize::new(0),
+        armed: Arc::new(AtomicBool::new(true)),
+        reached: reached.clone(),
+    });
+    let mut tools: Vec<DynTool> = coder_tools(&fx.env).into_iter().collect();
+    tools.push(Arc::new(OldDelegate));
+    let old = Coder::new(
+        store.clone(),
+        CoderAgent::with_tools(hanging, "m", fx.env.clone(), tools),
+        &opts("old"),
+    );
+    let task = old
+        .backend
+        .submit(
+            Caller::new("token-0"),
+            user(&format!("add hello.txt in {}", fx.remote_url())),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let run = run_id(&task.id);
+    let a = spawn_worker(&old);
+    tokio::time::timeout(Duration::from_secs(60), reached.notified())
+        .await
+        .expect("the old binary journaled the delegation and reached its third model call");
+    a.handle.abort();
+    assert!(a.handle.await.expect_err("aborted").is_cancelled());
+
+    // The new binary, on the same store: it has no `delegate_to_opencode`.
+    let second = Arc::new(MockModel::new());
+    second.push_text("Nothing more to do.");
+    let model: DynModel = second.clone();
+    let new = Coder::new(
+        store.clone(),
+        CoderAgent::new(model, "m", fx.env.clone()),
+        &opts("new"),
+    );
+    let b = spawn_worker(&new);
+    let view = wait_for(&new.runtime, run, "the run to settle", |v| {
+        v.status.is_terminal() || v.waiting
+    })
+    .await;
+    b.stop().await;
+    assert_ne!(
+        view.status,
+        RunStatus::Failed,
+        "no non-determinism: {view:#?}"
+    );
+
+    let requests = second.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the two recorded model turns were replayed, not asked again"
+    );
+    let results = tool_results(&requests[0].messages);
+    let (_, recorded, is_error) = results
+        .iter()
+        .find(|(id, _, _)| id == "c2")
+        .expect("the delegation is in the history");
+    assert!(
+        !*is_error && recorded.contains("RECORDED-BY-THE-OLD-BINARY"),
+        "the recorded result, not an unknown-tool answer: {recorded}"
+    );
+    assert!(!recorded.contains("unknown tool"), "{recorded}");
 }
 
 /// The explicit-acceptance path: a red check does not block a pull request the
@@ -5254,7 +5380,7 @@ macro_rules! coder_suite {
                 a_message_in_the_context_of_a_parked_run_continues_it,
                 a_run_parked_by_a_plain_text_stop_can_be_canceled,
                 red_checks_n_times_fail_the_run_with_the_findings_and_no_pr,
-                a_history_with_a_delegation_replays_and_an_owed_call_gets_the_unknown_tool_answer,
+                a_model_that_still_asks_for_the_removed_tool_gets_the_unknown_tool_answer,
                 a_pull_request_with_red_checks_needs_explicit_acceptance,
                 crash_after_commit_and_push_was_journaled_repeats_nothing,
                 crash_inside_run_checks_before_the_journal_emits_one_checks_artifact,

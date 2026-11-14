@@ -185,7 +185,7 @@ impl DevContainer {
             .podman
             .info(self.inner.settings.probe_timeout)
             .await
-            .map_err(|e| EnvError::Unavailable(scrub(&e.to_string(), &[])))
+            .map_err(|e| EnvError::Unavailable(scrub(&e.to_string())))
     }
 
     /// Pull the default image, so that the first run that needs it does not wait for it.
@@ -686,7 +686,7 @@ impl DevContainer {
             &override_path,
         );
         let on_line = |line: &str| {
-            let text = scrub(&log_text(line), &[]);
+            let text = scrub(&log_text(line));
             if let Some(phase) = phase_of(&text) {
                 reporter.running(&phase);
             }
@@ -704,7 +704,6 @@ impl DevContainer {
                 "the devcontainer CLI could not read the configuration",
                 &file,
                 &done,
-                &[],
                 true,
             ));
         }
@@ -738,7 +737,7 @@ impl DevContainer {
                 .or_else(|| result.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("the devcontainer CLI could not make the container");
-            return Err(failure(reason, &file, &done, &[], false));
+            return Err(failure(reason, &file, &done, false));
         }
         let remote_user = result
             .get("remoteUser")
@@ -753,7 +752,6 @@ impl DevContainer {
                 "the devcontainer CLI did not say which container it made",
                 &file,
                 &done,
-                &[],
                 false,
             ));
         };
@@ -777,7 +775,7 @@ impl DevContainer {
         if !running {
             return Err(EnvError::Build {
                 reason: "the container stopped right after it was made".to_owned(),
-                log_tail: tail(&scrub(&log.as_plain(), &[]), TAIL_LINES),
+                log_tail: tail(&scrub(&log.as_plain()), TAIL_LINES),
             });
         }
 
@@ -803,7 +801,7 @@ impl DevContainer {
                 .or_else(|| result.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("a lifecycle command of the devcontainer failed");
-            return Err(failure(reason, &file, &done, &[], false));
+            return Err(failure(reason, &file, &done, false));
         }
 
         let mut ready = building;
@@ -869,7 +867,7 @@ impl DevContainer {
         let Ok(dir) = state::run_dir(&self.inner.settings.root, run) else {
             return;
         };
-        let text = scrub(&log.as_plain(), &[]);
+        let text = scrub(&log.as_plain());
         if let Err(e) = std::fs::write(dir.join("build.log"), text) {
             tracing::debug!(error = %e, run, "cannot write build.log");
         }
@@ -1140,15 +1138,9 @@ fn slot_record(slot: &Slot) -> SlotRecord {
 }
 
 /// An error of a CLI call that did not succeed: what it said, scrubbed, as the end of its log.
-fn failure(
-    reason: &str,
-    file: &Path,
-    done: &Finished,
-    secrets: &[&str],
-    is_config: bool,
-) -> EnvError {
-    let log_tail = tail(&scrub(&done.log.as_plain(), secrets), TAIL_LINES);
-    let reason = scrub(reason, secrets);
+fn failure(reason: &str, file: &Path, done: &Finished, is_config: bool) -> EnvError {
+    let log_tail = tail(&scrub(&done.log.as_plain()), TAIL_LINES);
+    let reason = scrub(reason);
     if is_config {
         EnvError::Config {
             file: file.to_owned(),

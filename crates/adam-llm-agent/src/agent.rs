@@ -1403,6 +1403,11 @@ impl LlmAgent {
             }
             // A name that is none of the agent's own: an agent with no source says so at once,
             // one with sources asks them, inside the step that records the answer.
+            // Consequence: this branch records NOTHING, so an agent with no source whose journal holds a
+            // `tool:<id>` step for a tool it no longer has (the tool was removed between two versions)
+            // would fail replay (a recorded step with no step asked for it: non-determinism). An agent
+            // with sources answers an unknown tool inside the journaled step below, and replays. The
+            // coder always installs sources, which is what makes ADR 0038's removal of a tool safe.
             None if self.sources.is_empty() => {
                 let unknown = self.unknown_tool(&call.name);
                 say(

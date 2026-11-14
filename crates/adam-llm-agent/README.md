@@ -144,6 +144,8 @@ messages; it is kept with the question in `PendingQuestion::ui` (`/pending_wait/
 A2A server reads it to send it beside the question in the `input-required` status. The agent does not look inside
 it.
 
+**Removing a tool is safe only for an agent with a tool source.** A call to a name the agent does not have is answered inside the journaled `tool:<call id>` step when the agent has sources, so a journal written before the removal replays; an agent with **no** source answers at once and records nothing, so a journal that holds a step for a removed tool would fail replay (the coder always installs sources).
+
 **Tool sources.** A `Tool` has one fixed spec; a `ToolSource` lists its tools anew for every model call and answers
 the calls to them:
 

@@ -12,10 +12,10 @@
 //!   pod template ([`PodTemplate`]) and waits for it to be ready, reporting what it waits for as a step.
 //!   The pod is found again by its name, so `ensure` is idempotent and a dropped call leaves nothing a
 //!   later call cannot use.
-//! * **The template is the deployment's.** Image, resources, priority class, security context, volumes,
-//!   variables from Secrets and node affinity are in a file the chart mounts; the code fills in a name,
+//! * **The template is the deployment's.** Image, resources, priority class, security context, volumes
+//!   and node affinity are in a file the chart mounts; the code fills in a name,
 //!   labels and annotations, and narrows the one mount of the workspace volume to the run
-//!   ([`PodTemplate::render`]). No GitHub credential is ever in a pod, and the cluster's admission policy
+//!   ([`PodTemplate::render`]). No GitHub credential is ever in a pod, a template that names a Secret is refused at startup, and the cluster's admission policy
 //!   (the chart's) refuses a pod that is anything else.
 //! * **Every slot is a mount of its own, and a new slot needs a new pod.** The pod mounts the run's directory
 //!   and, on top of it, each slot (a worktree or a scratch project), so that a slot's directory is a name

@@ -668,6 +668,64 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
             }),
         ),
         (
+            "a key of a Secret, as a variable of the init container",
+            Box::new(|p| {
+                p.spec
+                    .as_mut()
+                    .unwrap()
+                    .init_containers
+                    .as_mut()
+                    .expect("the chart's template has an init container")[0]
+                    .env
+                    .get_or_insert_default()
+                    .push(k8s_openapi::api::core::v1::EnvVar {
+                        name: "TOKEN".into(),
+                        value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                            secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+                                name: "any-secret".into(),
+                                key: "GITHUB_TOKEN".into(),
+                                optional: None,
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+            }),
+        ),
+        (
+            "every key of a Secret, as envFrom of the init container",
+            Box::new(|p| {
+                p.spec
+                    .as_mut()
+                    .unwrap()
+                    .init_containers
+                    .as_mut()
+                    .expect("the chart's template has an init container")[0]
+                    .env_from
+                    .get_or_insert_default()
+                    .push(EnvFromSource {
+                        secret_ref: Some(SecretEnvSource {
+                            name: "any-secret".into(),
+                            optional: None,
+                        }),
+                        ..EnvFromSource::default()
+                    });
+            }),
+        ),
+        (
+            "a pull secret the chart did not render (it sets none here)",
+            Box::new(|p| {
+                p.spec
+                    .as_mut()
+                    .unwrap()
+                    .image_pull_secrets
+                    .get_or_insert_default()
+                    .push(k8s_openapi::api::core::v1::LocalObjectReference {
+                        name: "any-secret".into(),
+                    });
+            }),
+        ),
+        (
             "a privileged container",
             Box::new(|p| {
                 p.spec.as_mut().unwrap().containers[0].security_context = Some(SecurityContext {

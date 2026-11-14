@@ -54,8 +54,9 @@ services:
       - podman-storage:/home/agent/.local/share/containers
       # The coder's workspace volume, at the same path as in the coder.
       - ${PODMAN_WORK:-coder-work}:${PODMAN_WORK_TARGET:-/work}
-    # What a devcontainer can reach: the internet (pulls). Not the model, not postgres, and not the
-    # orchestrator.
+    # What a devcontainer is put on: this network, with the internet (pulls). mock-openai, postgres and the
+    # orchestrator are not on it, and a devcontainer gets no model key (ADR 0038); nothing here probes the
+    # network from inside one.
     networks: [devcontainers]
     healthcheck:
       test: ["CMD", "podman", "--remote", "--url", "unix:///run/podman/podman.sock", "info"]

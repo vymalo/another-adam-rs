@@ -1846,7 +1846,7 @@ mod tests {
         );
         assert_eq!(prepared.exec.as_str(), parsed.id);
         assert!(crate::is_exec_id(prepared.exec.as_str()));
-        // No secret is anywhere in the command line: the model key is the pod's own variable.
+        // No secret is anywhere in the command line: the pod holds no model key.
         assert!(!args.iter().any(|a| a.contains("MODEL_API_KEY=")));
     }
 

@@ -1321,17 +1321,32 @@ check "policy: ... or any secretKeyRef at all: it names no Secret and no key" \
 check "policy: ... and allows no name or key of a Secret (nothing is compared with a Secret's name)" \
   fails policy_has "$pn" 'secretKeyRef.name'
 check "policy: ... the message says a run pod references no Secret" \
-  rhas ValidatingAdmissionPolicy "$pn" 'message: "a run pod references no Secret: no Secret volume, no secretKeyRef, no envFrom"'
+  rhas ValidatingAdmissionPolicy "$pn" 'message: "a run pod references no Secret a container can read: no Secret volume, no secretKeyRef, no envFrom"'
 no_secret_reference() { [ "$(run_pod_template | grep -Ec 'secretKeyRef|secretRef|secretName')" -eq 0 ]; }
 check "run pods reference no Secret at all: the template holds none" no_secret_reference
-check "run pods reference no Secret at all: the policy and the template agree (the render has no Secret name in the policy)" \
-  fails policy_has "$pn" "'coder' &&"
+# The policy's expressions, whole: weakening one (`|| true`, `spec.containers` for `variables.containers`) fails a named check.
+policy_line() { rdoc ValidatingAdmissionPolicy "$1" | grep -Fxq -- "$2"; }
+check "policy (exact): the containers it judges are the containers and the init containers" \
+  policy_line "$pn" '      expression: "object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])"'
+check "policy (exact): no secretKeyRef and no envFrom Secret, in every container and init container" \
+  policy_line "$pn" '    - expression: "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef))) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))"'
+check "policy (exact): the message says no Secret a container can read" \
+  policy_line "$pn" '      message: "a run pod references no Secret a container can read: no Secret volume, no secretKeyRef, no envFrom"'
+check "policy (exact): no pull secret when the chart sets none" \
+  policy_line "$pn" '    - expression: "!has(object.spec.imagePullSecrets) || size(object.spec.imagePullSecrets) == 0"'
+helm_rp --set 'imagePullSecrets[0].name=regcred' --set 'imagePullSecrets[1].name=other-cred' > "$out"
+check "pull secrets: the template carries the chart's own" tpl '^  imagePullSecrets:$'
+check "pull secrets: the policy admits only those names, and refuses any other" \
+  policy_line "$pn" "    - expression: \"!has(object.spec.imagePullSecrets) || object.spec.imagePullSecrets.all(s, s.name in ['regcred', 'other-cred'])\""
+check "pull secrets: ... and says so" policy_has "$pn" "a run pod names no pull secret but the chart's own: regcred and other-cred"
+helm_rp > "$out"
+check "pull secrets: none set, the template names none" notpl 'imagePullSecrets'
 check "policy: ... or envFrom a Secret" policy_has "$pn" '!has(f.secretRef)'
 check "policy: ... or a privileged container or one that may escalate" policy_has "$pn" 'c.securityContext.allowPrivilegeEscalation == false'
 check "policy: ... or root" policy_has "$pn" ') != 0 &&'
 check "policy: ... or hostNetwork, hostPID, hostIPC" policy_has "$pn" '!object.spec.hostNetwork'
 check "policy: ... or a service account token" policy_has "$pn" 'object.spec.automountServiceAccountToken == false'
-check "policy: nine rules" [ "$(rdoc ValidatingAdmissionPolicy "$pn" | grep -c -- '^    - expression:')" -eq 9 ]
+check "policy: ten rules (the pull secrets are one)" [ "$(rdoc ValidatingAdmissionPolicy "$pn" | grep -c -- '^    - expression:')" -eq 10 ]
 check "policy: the binding denies" rhas ValidatingAdmissionPolicyBinding "$pn" 'validationActions: \["Deny"\]'
 check "policy: ... for this namespace only" rhas ValidatingAdmissionPolicyBinding "$pn" 'kubernetes.io/metadata.name: coder-ns'
 
@@ -1862,6 +1877,22 @@ helm_rp > "$out"
 check "no role sets OPENCODE_MODEL (run pods on)" lacks 'OPENCODE|/opt/adam/bin/opencode'
 helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.opencodeModel=old-alias > "$out"
 check "config.opencodeModel set: the manifests are unchanged (the golden)" cmp -s "$out" "$golden"
+# ... whatever else is on: run pods (template, policy, StatefulSet) and the split topology, byte for byte.
+ref=$(mktemp)
+for extra in "--set runPods.enabled=true" "--set topology=split" "--set runPods.enabled=true --set topology=split"; do
+  # shellcheck disable=SC2086
+  helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 $extra > "$ref"
+  # shellcheck disable=SC2086
+  helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 $extra --set config.opencodeModel=old-alias > "$out"
+  check "config.opencodeModel set with ($extra): the render is byte for byte the one without it" cmp -s "$out" "$ref"
+done
+rm -f "$ref"
+# The run pod template is a deploy when it changes: two different resources give two different checksums.
+sum_of() { helm_rp "$@" | grep -m1 'checksum/run-pod:'; }
+check "run pods: a changed template changes checksum/run-pod" \
+  [ "$(sum_of --set runPods.resources.limits.memory=2Gi)" != "$(sum_of --set runPods.resources.limits.memory=3Gi)" ]
+check "run pods: ... and the same template keeps it" \
+  [ "$(sum_of --set runPods.resources.limits.memory=2Gi)" = "$(sum_of --set runPods.resources.limits.memory=2Gi)" ]
 # `helm template` does not print NOTES.txt: a copy of the chart whose NOTES.txt is a manifest does.
 notes_chart=$(mktemp -d)
 cp -R "$chart"/. "$notes_chart"/

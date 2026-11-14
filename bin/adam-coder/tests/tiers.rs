@@ -2754,3 +2754,36 @@ async fn a_typed_line_in_the_shape_of_the_forms_answer_merges_nothing() {
     assert_eq!(live.host.merges().len(), 1);
     live.finish().await;
 }
+
+/// ADR 0038: a call to the removed tool, owed at the upgrade, in a message **below** `auto`: the answer is
+/// the tier's refusal (an unknown tool needs `auto`, never lower), not the unknown-tool answer. That is
+/// intended: below `auto` the model is not told what tools exist beyond its tier, and either way nothing runs.
+#[tokio::test]
+async fn an_owed_call_to_the_removed_tool_below_auto_gets_the_tier_refusal() {
+    let fx = Fixture::new().await;
+    let (requests, _) = drive(&fx, "do the thing", Some(AccessTier::Edits), |m| {
+        m.push_tool_calls(vec![call(
+            "c1",
+            "delegate_to_opencode",
+            json!({"instructions": "add hello.txt"}),
+        )])
+        .push_text("ok, I will use the file tools");
+    })
+    .await;
+    let told = requests[1]
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            adam_model::Message::Tool {
+                call_id, content, ..
+            } if call_id == "c1" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the owed call was answered");
+    assert!(
+        told.contains("`delegate_to_opencode` needs the auto access tier")
+            && told.contains("under edits")
+            && !told.contains("unknown tool"),
+        "{told}"
+    );
+}

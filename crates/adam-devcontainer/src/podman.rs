@@ -126,7 +126,7 @@ impl Podman {
                 args.first().copied().unwrap_or(""),
                 done.code
                     .map_or_else(|| "a signal".to_owned(), |c| format!("exit {c}")),
-                tail(&scrub(&done.log.as_plain(), &[]), 5)
+                tail(&scrub(&done.log.as_plain()), 5)
             ))),
             Err(RunError::Spawn(e)) => Err(PodmanError(format!(
                 "cannot start {}: {e}",

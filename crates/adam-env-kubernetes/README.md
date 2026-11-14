@@ -88,7 +88,11 @@ The commands run in the container named `run`, which must mount `/opt/adam/bin` 
 container filled from the coder's image (`adam-exec` alone), and the workspace volume at the
 workspace root. The template names **no Secret**: a run pod gets no model key and no agent binary
 ([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md); `Settings::opencode` and
-`Settings::model_key` are gone, a breaking change).
+`Settings::model_key` are gone, a breaking change). **Breaking change of the template check:** a template that still names a Secret a
+container could read (a `secretKeyRef`, an `envFrom` Secret, a Secret or projected-Secret volume, in a container or an init container) is a
+configuration error at load (`EnvError::Config`, exit 78 in the coder), naming the container and the member, so that a template of an older
+chart (the model key as `MODEL_API_KEY`) never runs under this coder. The image pull secrets (`spec.imagePullSecrets`) are not a Secret a container reads and are left to the
+chart's admission policy, which admits only the names the chart renders.
 
 ## What a run pod mounts
 
@@ -221,8 +225,8 @@ one line); none carries a secret, and the API server never echoes one in a refus
   chart's own template, runs commands in it through `adam-kube-exec` (both streams, the exit code, the working directory,
   variables, every word its own argument, stdin and `/dev/null`, 3 MB of output, what a spec hides, that the coder's secrets are
   not in the pod), kills a command (the client alone leaves it, `kill` stops it and ends the client), sweeps an idle pod and not
-  a busy one, releases, and checks that the chart's admission policy refuses each of sixteen changes to the pod while accepting
-  the unchanged one (among them a key of a Secret as a variable, a Secret as a volume and a Secret as `envFrom`: the policy allows no Secret at all),
+  a busy one, releases, and checks that the chart's admission policy refuses each of nineteen changes to the pod while accepting
+  the unchanged one (among them a key of a Secret as a variable, a Secret as a volume and a Secret as `envFrom`: the policy allows no Secret a container can read),
   and (with `ADAM_TEST_KUBE_ISOLATION_MIRROR` and `_ADMIN`) that a run pod sees only its own run: on a volume seeded with two
   runs of one mirror, `meta/` and another mirror, the pod made as `ensure` makes it lists only its own directory and mirror,
   cannot read the other run's file or `meta/`, runs `git status` and `git log` in its worktree, cannot write the mirror's

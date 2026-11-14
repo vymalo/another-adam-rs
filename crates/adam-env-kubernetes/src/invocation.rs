@@ -14,7 +14,7 @@
 //! The command run in the pod is
 //! `[env [-u NAME]... [NAME=VALUE]...] PATH run|shell ID CWD :WORD...`: [`Invocation::remote_argv`].
 //! `--env` and `--unset` are the variables the caller set and the ones it hid; a secret is never
-//! one of them (the model key is a variable the pod's template sets from a Secret).
+//! one of them (a run pod holds no Secret at all: the template is refused when it names one).
 
 use std::fmt;
 

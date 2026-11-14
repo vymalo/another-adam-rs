@@ -60,7 +60,7 @@ it.
    * Devcontainers lose the file `/run/adam/secrets/model-key`, and the tools directory keeps only `adam-exec`.
    * Run pods lose `MODEL_API_KEY` and the init container's copy of `opencode`.
    * The run pods' admission policy, which let a run pod read exactly one Secret for that key, then lets it read none.
-   * `runPods.enabled` no longer needs `externalSecrets.enabled` for this reason (`deploy/coder/templates/_validate.tpl:193`).
+   * `runPods.enabled` no longer needs `externalSecrets.enabled` for this reason (the `runPods.enabled needs externalSecrets.enabled` rule of `deploy/coder/templates/_validate.tpl`, removed).
    * `EnvSession::tool_path` and `EnvSession::secret_ref` leave the `adam-workspace` environment port. Their only use was
      OpenCode. This is a breaking change of a trait (Rule 2): the PR and the crate README say so. The three environments and
      the test doubles drop them. An ACP agent run inside an environment again would bring them back by an ADR.

@@ -31,13 +31,9 @@ const SECRET_NAMES: [&str; 8] = [
 /// `text` without escape sequences and carriage returns, with every known secret and every
 /// credential-looking assignment masked.
 ///
-/// `secrets` are values this process holds (the model key): a value shorter than 6 bytes is not
-/// masked, because it would also mask ordinary words.
-pub(crate) fn scrub(text: &str, secrets: &[&str]) -> String {
-    let mut out = strip_escapes(text);
-    for secret in secrets.iter().filter(|s| s.len() >= 6) {
-        out = out.replace(secret, MASK);
-    }
+/// No value of this process is registered: no secret enters a devcontainer, or a log, from here (ADR 0038).
+pub(crate) fn scrub(text: &str) -> String {
+    let out = strip_escapes(text);
     out.lines()
         .map(mask_assignments)
         .collect::<Vec<_>>()
@@ -148,28 +144,12 @@ mod tests {
     #[test]
     fn escapes_and_carriage_returns_are_removed() {
         let text = "\u{1b}[1mRunning the postCreateCommand...\u{1b}[0m\r\nnext\u{1b}]0;title\u{7}";
-        assert_eq!(scrub(text, &[]), "Running the postCreateCommand...\nnext");
-    }
-
-    #[test]
-    fn a_secret_this_process_holds_is_masked_wherever_it_is() {
-        let text = "curl -H 'x-key: sk-live-0123456789' https://example.com/sk-live-0123456789";
-        let out = scrub(text, &["sk-live-0123456789"]);
-        assert!(!out.contains("sk-live"), "{out}");
-        assert_eq!(out.matches(MASK).count(), 2);
-    }
-
-    #[test]
-    fn a_short_secret_is_left_alone_so_that_words_survive() {
-        assert_eq!(scrub("a key is here", &["key"]), "a key is here");
+        assert_eq!(scrub(text), "Running the postCreateCommand...\nnext");
     }
 
     #[test]
     fn a_credential_looking_assignment_loses_its_value() {
-        let out = scrub(
-            "ENV GITHUB_TOKEN=ghp_abc PATH=/usr/bin API_KEY=abc  password=hunter2",
-            &[],
-        );
+        let out = scrub("ENV GITHUB_TOKEN=ghp_abc PATH=/usr/bin API_KEY=abc  password=hunter2");
         assert_eq!(
             out,
             "ENV GITHUB_TOKEN=*** PATH=/usr/bin API_KEY=***  password=***"
@@ -179,7 +159,7 @@ mod tests {
     #[test]
     fn a_bearer_token_is_masked() {
         assert_eq!(
-            scrub("Authorization: Bearer abc.def.ghi next", &[]),
+            scrub("Authorization: Bearer abc.def.ghi next"),
             "Authorization: Bearer *** next"
         );
     }

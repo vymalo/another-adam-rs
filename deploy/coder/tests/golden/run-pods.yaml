@@ -926,8 +926,9 @@ spec:
 # runPods.enabled: the guard that lets the coder make pods without being able to read the namespace's other Secrets,
 # mount the host, or run anything privileged. It applies to pods CREATED BY the coder's ServiceAccount (the match
 # condition) in this namespace (the binding), and refuses any that is not the intended run pod. Without it the RBAC
-# alone would let the coder create any pod in its namespace. A run pod references no Secret at all: no Secret volume,
-# no secretKeyRef, no envFrom (ADR 0038, ADR 0041).
+# alone would let the coder create any pod in its namespace. A run pod references no Secret a container can read: no
+# Secret volume, no secretKeyRef, no envFrom (ADR 0038, ADR 0041); the pull secrets are the chart's own (values imagePullSecrets),
+# and no other.
 # Needs Kubernetes 1.30 or later (admissionregistration.k8s.io/v1).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -963,7 +964,9 @@ spec:
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0'))"
       message: "a run pod mounts only emptyDir volumes and the claim work-coder-0: no hostPath, no Secret, no other claim"
     - expression: "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef))) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))"
-      message: "a run pod references no Secret: no Secret volume, no secretKeyRef, no envFrom"
+      message: "a run pod references no Secret a container can read: no Secret volume, no secretKeyRef, no envFrom"
+    - expression: "!has(object.spec.imagePullSecrets) || size(object.spec.imagePullSecrets) == 0"
+      message: "a run pod names no pull secret: the chart sets none (values imagePullSecrets is empty)"
     - expression: "variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && (!has(c.securityContext.privileged) || c.securityContext.privileged == false))"
       message: "a run pod is not privileged and sets allowPrivilegeEscalation: false on every container"
     - expression: "variables.containers.all(c, (has(c.securityContext) && has(c.securityContext.runAsUser) ? c.securityContext.runAsUser : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser) ? object.spec.securityContext.runAsUser : 0)) != 0 && (has(c.securityContext) && has(c.securityContext.runAsNonRoot) ? c.securityContext.runAsNonRoot : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) ? object.spec.securityContext.runAsNonRoot : false)))"

@@ -179,7 +179,7 @@ a run pod reaches DNS, the **egress proxy** the chart runs beside it (`adam-egre
 of its allow-list over HTTPS (`CONNECT` to port 443, public IPv4 addresses only) and refuses every other host; the pod's
 `HTTPS_PROXY` names it. Add a host with `runPods.egressProxy.extraAllow`; there is no switch for open egress. Details:
 [chart README, "The egress proxy"](../../deploy/coder/README.md#the-egress-proxy). Needs Kubernetes 1.30+. A run pod mounts only its own run's directory, each slot's directory on its own (so the pod cannot rename it), the mirror of each of its
-repositories **read-only** and each worktree's own directory in it, and no Secret at all (the pod gets no model key: ADR 0038;
+repositories **read-only** and each worktree's own directory in it, and no Secret a container can read (the pod gets no model key, and its pull secrets are the chart's own: ADR 0038;
 [ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), proposed): `git commit` and anything else that writes the
 mirror fails in the pod, the coder commits. The template must mount the work claim once, whole, at `WORKSPACE_ROOT` (the
 chart's does; a hand-written one that does not stops the coder, exit 78).

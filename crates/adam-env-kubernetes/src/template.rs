@@ -1,7 +1,7 @@
 //! The pod template: what a run pod is, as the deployment says it.
 //!
-//! The image, the resources, the priority class, the security context, the volumes, the variables
-//! that come from Secrets and the node affinity are the **deployment's**: they are in a file the
+//! The image, the resources, the priority class, the security context, the volumes and the node
+//! affinity are the **deployment's**: they are in a file the
 //! chart mounts (`RUN_POD_TEMPLATE_FILE`), a Pod in YAML or JSON (a bare PodSpec is accepted too).
 //! The code fills in only what a template cannot know: the pod's name and namespace, its labels
 //! and annotations ([`names`](crate::names)), and **the mounts of the workspace volume**: the
@@ -13,7 +13,10 @@
 //! The file is read once, at startup, and checked: a template that names the run pod's own labels,
 //! has no container with the name the exec client enters, has no single mount of a volume at the
 //! workspace root for the code to replace, or asks for what the cluster's admission policy refuses
-//! (a host namespace, a `hostPath` volume, a privileged container, a service account token) is a
+//! (a host namespace, a `hostPath` volume, a privileged container, a service account token) or **names
+//! a Secret a container could read** (a `secretKeyRef`, an `envFrom` Secret, a Secret or projected-Secret
+//! volume, in any container or init container: a run pod holds none, ADR 0038, so a template from an
+//! older chart that still gives the model key is refused rather than run with it) is a
 //! configuration error, so that it fails the coder's start and not a run.
 
 use std::path::{Path, PathBuf};
@@ -298,11 +301,48 @@ fn check(pod: &Pod, container: &str) -> Result<(), String> {
     {
         return Err("a hostPath volume is refused".to_owned());
     }
+    for volume in spec.volumes.iter().flatten() {
+        let projects_a_secret = volume.projected.as_ref().is_some_and(|p| {
+            p.sources
+                .iter()
+                .flatten()
+                .any(|source| source.secret.is_some())
+        });
+        if volume.secret.is_some() || projects_a_secret {
+            return Err(format!(
+                "volume {} is a Secret: a run pod holds no Secret (ADR 0038), so a template from an older chart that mounts one must be replaced",
+                volume.name
+            ));
+        }
+    }
     let containers = spec
         .containers
         .iter()
         .chain(spec.init_containers.iter().flatten());
     for container in containers {
+        for var in container.env.iter().flatten() {
+            if var
+                .value_from
+                .as_ref()
+                .is_some_and(|source| source.secret_key_ref.is_some())
+            {
+                return Err(format!(
+                    "container {} has the variable {} from a Secret (secretKeyRef): a run pod holds no Secret (ADR 0038), so a template from an older chart that gives the model key must be replaced",
+                    container.name, var.name
+                ));
+            }
+        }
+        if container
+            .env_from
+            .iter()
+            .flatten()
+            .any(|source| source.secret_ref.is_some())
+        {
+            return Err(format!(
+                "container {} takes variables from a Secret (envFrom): a run pod holds no Secret (ADR 0038)",
+                container.name
+            ));
+        }
         let security = container.security_context.as_ref();
         if security.is_some_and(|s| s.privileged == Some(true)) {
             return Err(format!("container {} is privileged", container.name));
@@ -892,6 +932,85 @@ spec:
             refused("spec:\n  containers:\n    - {name: run, image: i}\n")
                 .contains("automountServiceAccountToken")
         );
+    }
+
+    /// ADR 0038: a template that still names a Secret (an older chart's `MODEL_API_KEY`) would start run pods
+    /// with the key under this coder, so it fails the start, naming the container and the member.
+    #[test]
+    fn a_template_that_names_a_secret_is_refused_at_startup() {
+        let pod = |run_extra: &str, init: &str, volumes: &str| {
+            format!(
+                "spec:\n  automountServiceAccountToken: false\n  initContainers:\n    - name: tools\n      image: i\n{init}  containers:\n    - name: run\n      image: i\n{run_extra}  volumes:\n    - {{name: tools, emptyDir: {{}}}}\n{volumes}"
+            )
+        };
+        // The shape of the old chart: the model key as one variable of the run container.
+        let reason = refused(&pod(
+            "      env:\n        - name: MODEL_API_KEY\n          valueFrom:\n            secretKeyRef: {name: coder, key: MODEL_API_KEY}\n",
+            "",
+            "",
+        ));
+        assert!(
+            reason.contains("container run")
+                && reason.contains("MODEL_API_KEY")
+                && reason.contains("secretKeyRef"),
+            "{reason}"
+        );
+        // The same in an init container.
+        let reason = refused(&pod(
+            "",
+            "      env:\n        - name: K\n          valueFrom:\n            secretKeyRef: {name: s, key: k}\n",
+            "",
+        ));
+        assert!(
+            reason.contains("container tools") && reason.contains("secretKeyRef"),
+            "{reason}"
+        );
+        // envFrom, in either.
+        for (run, init, who) in [
+            (
+                "      envFrom:\n        - secretRef: {name: s}\n",
+                "",
+                "container run",
+            ),
+            (
+                "",
+                "      envFrom:\n        - secretRef: {name: s}\n",
+                "container tools",
+            ),
+        ] {
+            let reason = refused(&pod(run, init, ""));
+            assert!(
+                reason.contains(who) && reason.contains("envFrom"),
+                "{reason}"
+            );
+        }
+        // A Secret volume, and a projected volume with a Secret source.
+        let reason = refused(&pod(
+            "",
+            "",
+            "    - {name: s, secret: {secretName: coder}}\n",
+        ));
+        assert!(reason.contains("volume s is a Secret"), "{reason}");
+        let reason = refused(&pod(
+            "",
+            "",
+            "    - name: p\n      projected:\n        sources:\n          - secret: {name: coder}\n",
+        ));
+        assert!(reason.contains("volume p is a Secret"), "{reason}");
+        // What is not a Secret stays: a ConfigMap variable and a plain projected token source are left to the other rules.
+        let ok = pod(
+            "      env:\n        - name: A\n          valueFrom:\n            configMapKeyRef: {name: c, key: k}\n",
+            "",
+            "",
+        );
+        assert!(!refused_or_empty(&ok).contains("Secret"));
+    }
+
+    fn refused_or_empty(text: &str) -> String {
+        match PodTemplate::parse(text, Path::new("pod.yaml"), "run", Path::new("/work")) {
+            Err(EnvError::Config { reason, .. }) => reason,
+            _ => String::new(),
+        }
     }
 
     #[test]
