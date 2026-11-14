@@ -239,6 +239,16 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "SandboxUsage::is_empty")]
     pub sandbox: SandboxUsage,
+    /// What the tool says makes two results of the same call **the same result for the
+    /// repeated-call rule** (`doom_loop`): two answers of one call (same tool, same arguments) that
+    /// carry the same key count as equal, whatever their text says. A command that fails the same way
+    /// twice prints a different duration or path each time, so its text never repeats to the byte; the
+    /// key (`exit:2`) does. See [`with_repeat_key`](Self::with_repeat_key).
+    ///
+    /// Journaled with the result, so a replay decides the same; absent from a journal written before
+    /// it existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_key: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -255,6 +265,7 @@ impl ToolOutput {
             answer: None,
             ends_turn: false,
             sandbox: SandboxUsage::new(),
+            repeat_key: None,
         }
     }
 
@@ -268,6 +279,7 @@ impl ToolOutput {
             answer: None,
             ends_turn: false,
             sandbox: SandboxUsage::new(),
+            repeat_key: None,
         }
     }
 
@@ -297,6 +309,17 @@ impl ToolOutput {
     pub fn final_answer(mut self, text: impl Into<String>) -> Self {
         self.answer = Some(text.into());
         self.ends_turn = true;
+        self
+    }
+
+    /// Say what makes this result the same as another of the same call for the repeated-call rule:
+    /// three calls in a row with the same tool and arguments are refused when the two before carried
+    /// the same key (or gave equal results, or both were errors). Set it only for a **failure** whose
+    /// text varies and whose cause does not (`exit:2`), never on a success: a poll that succeeds with
+    /// a changing text must keep running.
+    #[must_use]
+    pub fn with_repeat_key(mut self, key: impl Into<String>) -> Self {
+        self.repeat_key = Some(key.into());
         self
     }
 
@@ -893,6 +916,23 @@ mod tests {
 
     /// Journal entries as older builds wrote them, by hand: every shape that existed before
     /// `AwaitRun` still decodes to the same value.
+    #[test]
+    fn an_output_journaled_before_repeat_keys_decodes_and_a_key_round_trips() {
+        let old: ToolOutput =
+            serde_json::from_value(serde_json::json!({"content": "x", "is_error": false})).unwrap();
+        assert_eq!(old.repeat_key, None);
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("repeat_key")
+                .is_none()
+        );
+        let keyed = ToolOutput::text("x").with_repeat_key("exit:2");
+        let back: ToolOutput =
+            serde_json::from_value(serde_json::to_value(&keyed).unwrap()).unwrap();
+        assert_eq!(back.repeat_key.as_deref(), Some("exit:2"));
+    }
+
     #[test]
     fn journals_written_before_await_run_still_decode() {
         let old = [

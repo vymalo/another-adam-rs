@@ -491,3 +491,245 @@ async fn the_count_starts_over_when_the_run_asks_the_person() {
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(calls.load(SeqCst), 3, "the call after the answer runs");
 }
+
+/// A command tool named `cmd`: it returns normal text, not an error result, with a duration in it
+/// that is never the same twice. A failing one carries the repeat key `exit:2`; a passing one none.
+struct Cmd {
+    fails: bool,
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for Cmd {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "cmd".into(),
+            description: "runs a command".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let n = self.runs.fetch_add(1, SeqCst);
+        let which = args["which"].as_str().unwrap_or("");
+        let text = if self.fails && which != "ok" {
+            format!("$ make\nexit code 2: FAILED\nfinished in 0.{n}{n}s")
+        } else {
+            format!("$ make\nexit code 0: passed\nfinished in 0.{n}{n}s")
+        };
+        let out = ToolOutput::text(text);
+        Ok(if self.fails && which != "ok" {
+            out.with_repeat_key("exit:2")
+        } else {
+            out
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_command_that_fails_the_same_way_three_times_is_refused_whatever_its_text_says() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let h = Harness::new(|b| {
+        b.tool(Cmd {
+            fails: true,
+            runs: runs.clone(),
+        })
+    });
+    for i in 1..=3 {
+        h.mock.push_tool_calls(vec![call(
+            &format!("c{i}"),
+            "cmd",
+            json!({"which": "make"}),
+        )]);
+    }
+    h.mock.push_text("make keeps failing");
+    let view = h.run("go").await;
+    assert_eq!(runs.load(SeqCst), 2, "the third failure is not run");
+    let answers = tool_answers(&conversation(&view));
+    assert!(
+        !answers[0].1 && !answers[1].1,
+        "normal text, not error results"
+    );
+    assert_ne!(answers[0].0, answers[1].0, "the texts differ");
+    assert!(
+        answers[2].0.starts_with("Not run: this is the third call"),
+        "{answers:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_same_command_succeeding_with_changing_output_runs_every_time() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let h = Harness::new(|b| {
+        b.tool(Cmd {
+            fails: true,
+            runs: runs.clone(),
+        })
+    });
+    for i in 1..=5 {
+        h.mock
+            .push_tool_calls(vec![call(&format!("c{i}"), "cmd", json!({"which": "ok"}))]);
+    }
+    h.mock.push_text("done");
+    let view = h.run("go").await;
+    assert_eq!(runs.load(SeqCst), 5);
+    assert!(tool_answers(&conversation(&view)).iter().all(|(_, e)| !e));
+}
+
+#[tokio::test]
+async fn a_failure_then_another_call_then_the_same_failure_twice_runs() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (other, _) = Scripted::new("other", &["x"]);
+    let h = Harness::new(|b| {
+        b.tool(Cmd {
+            fails: true,
+            runs: runs.clone(),
+        })
+        .tool(other)
+    });
+    for (i, name) in ["cmd", "other", "cmd", "cmd"].into_iter().enumerate() {
+        h.mock
+            .push_tool_calls(vec![call(&format!("c{i}"), name, json!({"which": "make"}))]);
+    }
+    h.mock.push_text("done");
+    let view = h.run("go").await;
+    assert_eq!(runs.load(SeqCst), 3, "the interleaved call reset the count");
+    assert_eq!(view.output.unwrap()["text"], "done");
+}
+
+/// Hangs the worker that emits the first failed step: the refusal's. Everything before it is
+/// committed, the refusal is decided and not committed.
+struct HoldAtRefusal {
+    inner: CollectingSink,
+    reached: Arc<tokio::sync::Notify>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl adam_runtime::EventSink for HoldAtRefusal {
+    async fn emit(&self, run: RunId, agent: &str, event: adam_runtime::RunEvent) {
+        let at = matches!(&event, adam_runtime::RunEvent::Step(s) if s.state == adam_runtime::StepState::Failed);
+        self.inner.emit(run, agent, event).await;
+        if at && self.armed.swap(false, SeqCst) {
+            self.reached.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_replay_of_a_journal_with_repeat_keys_refuses_the_same_call() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let agent = LlmAgent::builder("llm", model, "m")
+        .tool(Cmd {
+            fails: true,
+            runs: runs.clone(),
+        })
+        .build();
+    for i in 1..=3 {
+        mock.push_tool_calls(vec![call(
+            &format!("c{i}"),
+            "cmd",
+            json!({"which": "make"}),
+        )]);
+    }
+    mock.push_text("make keeps failing");
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let hold = Arc::new(HoldAtRefusal {
+        inner: CollectingSink::new(),
+        reached: reached.clone(),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let build = |worker: &str, sink: Arc<dyn adam_runtime::EventSink>| {
+        Runtime::builder(store.clone())
+            .agent(agent.clone())
+            .event_sink(sink)
+            .worker_id(worker)
+            .poll_interval(Duration::from_millis(20))
+            .lease_ttl(Duration::from_millis(300))
+            .build()
+    };
+    let rt_a = build("a", hold);
+    let rt_b = build("b", Arc::new(CollectingSink::new()));
+    let run = rt_a
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let (_stop, doomed) = {
+        let (stop, rx) = oneshot::channel::<()>();
+        let rt = rt_a.clone();
+        (
+            stop,
+            tokio::spawn(async move {
+                rt.run_worker(async {
+                    let _ = rx.await;
+                })
+                .await
+            }),
+        )
+    };
+    tokio::time::timeout(Duration::from_secs(20), reached.notified())
+        .await
+        .expect("the refusal was decided");
+    doomed.abort();
+    let _ = doomed.await;
+    assert_eq!(runs.load(SeqCst), 2);
+
+    let (stop, rx) = oneshot::channel::<()>();
+    let rt = rt_b.clone();
+    let worker = tokio::spawn(async move {
+        rt.run_worker(async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    let view = wait_terminal(&rt_b, run).await;
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+
+    assert_eq!(
+        runs.load(SeqCst),
+        2,
+        "the replay decided the same: the call is not run"
+    );
+    let answers = tool_answers(&conversation(&view));
+    assert!(
+        answers[2].0.starts_with("Not run: this is the third call"),
+        "{answers:?}"
+    );
+}
+
+/// A command that fails with another exit code each time: the keys differ, so nothing repeats.
+struct Codes(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for Codes {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "codes".into(),
+            description: "fails differently".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let n = self.0.fetch_add(1, SeqCst);
+        Ok(ToolOutput::text(format!("exit code {}: FAILED", n + 1))
+            .with_repeat_key(format!("exit:{}", n + 1)))
+    }
+}
+
+#[tokio::test]
+async fn failures_with_different_repeat_keys_are_not_the_same_result() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let h = Harness::new(|b| b.tool(Codes(runs.clone())));
+    for i in 1..=4 {
+        h.mock
+            .push_tool_calls(vec![call(&format!("c{i}"), "codes", json!({}))]);
+    }
+    h.mock.push_text("done");
+    let view = h.run("go").await;
+    assert_eq!(runs.load(SeqCst), 4);
+    assert_eq!(view.output.unwrap()["text"], "done");
+}

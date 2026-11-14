@@ -1213,7 +1213,9 @@ impl LlmAgent {
             let key = call_key(&call);
             if let Some(repeats) = &mut state.repeats
                 && repeats.key == key
-                && (repeats.count >= DOOM_LOOP_AFTER || repeats.failing >= DOOM_LOOP_AFTER)
+                && (repeats.count >= DOOM_LOOP_AFTER
+                    || repeats.failing >= DOOM_LOOP_AFTER
+                    || repeats.marked >= DOOM_LOOP_AFTER)
             {
                 repeats.refused += 1;
                 let ending = repeats.refused >= DOOM_LOOP_REFUSALS;
@@ -1280,11 +1282,12 @@ impl LlmAgent {
                     message,
                     artifacts,
                     answer,
+                    repeat_key,
                 } => {
                     if let Some(answer) = answer {
                         state.announce(answer);
                     }
-                    record_answer(state, key, &message);
+                    record_answer(state, key, &message, repeat_key);
                     (message, artifacts)
                 }
                 ToolResult::NeedsInput { question, ui } => {
@@ -1430,6 +1433,7 @@ impl LlmAgent {
                 message: Message::tool_error(call.id.clone(), said),
                 artifacts: Vec::new(),
                 answer: None,
+                repeat_key: None,
             };
             return Ok((answered, SandboxUsage::new()));
         }
@@ -1503,6 +1507,7 @@ impl LlmAgent {
                     message: Message::tool_error(call.id.clone(), unknown),
                     artifacts: Vec::new(),
                     answer: None,
+                    repeat_key: None,
                 };
                 return Ok((answered, SandboxUsage::new()));
             }
@@ -1553,6 +1558,7 @@ impl LlmAgent {
         };
         let answered = match outcome {
             Ok(output) => {
+                let repeat_key = output.repeat_key.clone();
                 let (message, artifacts, answer, outcome) = output_message(
                     ctx,
                     &call.id,
@@ -1579,6 +1585,7 @@ impl LlmAgent {
                     message,
                     artifacts,
                     answer,
+                    repeat_key,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -1601,6 +1608,7 @@ impl LlmAgent {
                     ),
                     artifacts: Vec::new(),
                     answer: None,
+                    repeat_key: None,
                 }
             }
             Err(ToolError::Transient(reason)) => {
@@ -2087,6 +2095,8 @@ enum ToolResult {
         artifacts: Vec<ArtifactRef>,
         /// What the tool announced as the run's answer, from a result that is not an error.
         answer: Option<Announcement>,
+        /// What the tool said makes this answer equal to another of the same call (`doom_loop`).
+        repeat_key: Option<String>,
     },
     NeedsInput {
         question: String,
@@ -2227,7 +2237,12 @@ fn call_key(call: &ToolCall) -> String {
 
 /// Count the answer of a call that ran: one more in a row when its key and its result are those of
 /// the call before, a new run of one otherwise.
-fn record_answer(state: &mut Conversation, key: String, message: &Message) {
+fn record_answer(
+    state: &mut Conversation,
+    key: String,
+    message: &Message,
+    repeat_key: Option<String>,
+) {
     let Message::Tool {
         content, is_error, ..
     } = message
@@ -2249,6 +2264,13 @@ fn record_answer(state: &mut Conversation, key: String, message: &Message) {
                 repeats.answer = answer;
             }
             repeats.failing = if *is_error { repeats.failing + 1 } else { 0 };
+            // The same repeat key again counts up whatever the text says.
+            repeats.marked = match (&repeats.marked_with, &repeat_key) {
+                (Some(before), Some(now)) if before == now => repeats.marked + 1,
+                (_, Some(_)) => 1,
+                (_, None) => 0,
+            };
+            repeats.marked_with = repeat_key;
         }
         slot => {
             *slot = Some(Repeats {
@@ -2257,6 +2279,8 @@ fn record_answer(state: &mut Conversation, key: String, message: &Message) {
                 count: 1,
                 refused: 0,
                 failing: failed,
+                marked: u32::from(repeat_key.is_some()),
+                marked_with: repeat_key,
             });
         }
     }

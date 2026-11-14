@@ -244,6 +244,13 @@ pub struct Repeats {
     /// How many calls in a row with this key ended in an error result, whatever the error said.
     #[serde(default)]
     pub failing: u32,
+    /// The repeat key ([`ToolOutput::repeat_key`](crate::ToolOutput::repeat_key)) of the last call, when
+    /// it carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marked_with: Option<String>,
+    /// How many calls in a row with this key carried that same repeat key.
+    #[serde(default)]
+    pub marked: u32,
 }
 
 /// A [`Limits`](crate::Limits) bound a run reached.
@@ -853,6 +860,8 @@ mod tests {
                 count: 2,
                 refused: 1,
                 failing: 2,
+                marked_with: None,
+                marked: 0,
             }),
             limit: Some(LimitHit {
                 limit: LimitKind::RepeatedCall,

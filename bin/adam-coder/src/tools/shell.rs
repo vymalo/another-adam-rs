@@ -50,6 +50,20 @@ impl ShellOutcome {
     pub fn passed(&self) -> bool {
         !self.timed_out && self.exit_code == Some(0)
     }
+
+    /// What makes this failure the same as another of the same command for the repeated-call rule
+    /// (`ToolOutput::repeat_key`): `exit:<code>`, `timeout`, or `signal`. `None` for a command that
+    /// passed, so a poll that succeeds with a changing output keeps running.
+    pub fn repeat_key(&self) -> Option<String> {
+        if self.timed_out {
+            return Some("timeout".to_owned());
+        }
+        match self.exit_code {
+            Some(0) => None,
+            Some(code) => Some(format!("exit:{code}")),
+            None => Some("signal".to_owned()),
+        }
+    }
 }
 
 /// Resolve `relative` (a sub-directory of the worktree, `None` = its root) to

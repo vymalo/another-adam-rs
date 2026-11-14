@@ -721,6 +721,7 @@ pub async fn run_checks(
     if passed {
         return Ok(ToolOutput::text(text).with_artifact(artifact));
     }
+    let key = outcome.repeat_key().unwrap_or_default();
     let mut text = text;
     if let OnBase::Fails(result) = &on_base {
         let branch = slot
@@ -733,7 +734,9 @@ pub async fn run_checks(
             failures,
             max,
         ));
-        return Ok(ToolOutput::error(text).with_artifact(artifact));
+        return Ok(ToolOutput::error(text)
+            .with_artifact(artifact)
+            .with_repeat_key(key));
     }
     if let (OnBase::Passes(result), Some(wt)) = (&on_base, slot.worktree()) {
         text.push_str(&preexisting::passes_text(result, &wt.repo().base_branch));
@@ -750,7 +753,9 @@ pub async fn run_checks(
              then run it again.\n"
         ));
     }
-    Ok(ToolOutput::error(text).with_artifact(artifact))
+    Ok(ToolOutput::error(text)
+        .with_artifact(artifact)
+        .with_repeat_key(key))
 }
 
 #[cfg(test)]

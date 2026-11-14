@@ -159,7 +159,11 @@ pub async fn run(
         format!("ran: {shown}")
     })
     .await;
-    Ok(ToolOutput::text(text))
+    let mut output = ToolOutput::text(text);
+    if let Some(key) = outcome.repeat_key() {
+        output = output.with_repeat_key(key);
+    }
+    Ok(output)
 }
 
 /// What the model is told of the undoing: whether the worktree is as it was.

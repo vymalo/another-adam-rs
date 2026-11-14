@@ -116,7 +116,11 @@ pub async fn run_command(
         .await?;
         return Ok(ToolOutput::error(said));
     }
-    Ok(ToolOutput::text(render(&shown, &outcome)))
+    let mut output = ToolOutput::text(render(&shown, &outcome));
+    if let Some(key) = outcome.repeat_key() {
+        output = output.with_repeat_key(key);
+    }
+    Ok(output)
 }
 
 /// What a command must leave as it found it: `HEAD` and the branch, the files of the worktree,
