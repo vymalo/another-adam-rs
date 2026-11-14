@@ -64,7 +64,7 @@ MongoDB) and `crates/adam-llm-agent/tests/child_runs.rs`.
 | 13 | The message races the timer: the parent reads the finished child at its timer, and the message lands while that step finishes (during the final model call, or before its commit) | The message answers nothing: the wait is settled. `Ctx::arrived` and the commit's reopen rule do not count a child's notice, so the parent finishes with its answer, as it would if the message came after the commit (then `deliver` answers `Finished`). The model is not asked again | `a_childs_notice_that_lands_while_a_run_finishes_does_not_reopen_it`, `a_notice_that_lands_while_the_parent_finishes_costs_no_model_turn` |
 
 | 14 | A child runs past its time limit | The runtime fails it with `cancelled: time limit: the run did not finish within 30 min`: before a step, within one poll for a step in flight (its token fires), and at the wake it set at the deadline for a parked one. The parent gets "the run failed: cancelled: time limit: ..." as the tool result and goes on | `a_child_past_its_deadline_fails_and_wakes_at_it`, `a_child_past_its_limit_is_an_error_result_for_its_parent` |
-| 15 | A child is created after its parent was cancelled, or for a parent that does not exist | It is cancelled when it is claimed, before it steps. A `Done` parent changes nothing | `a_child_created_after_the_cancel_never_steps`, `a_child_follows_a_parent_that_failed_but_not_one_that_is_done` |
+| 15 | A child is created after its parent was cancelled | It is cancelled when it is claimed, before it steps. A `Done` parent changes nothing, and a parent that is not in the store is unknown and cancels nothing | `a_child_created_after_the_cancel_never_steps`, `a_child_follows_a_parent_that_failed_but_not_one_that_is_done`, `a_done_parent_that_was_purged_leaves_its_open_child_running`, `a_child_parked_on_a_question_is_cancelled_when_its_parent_is`, `a_grandchild_under_a_parked_child_follows`, `a_healthy_parked_child_is_woken_without_stepping_the_agent` |
 | 16 | The same cancel arrives twice | The second is a no-op: a terminal run is left as it is | `a_child_created_after_the_cancel_never_steps` |
 
 ## Cancel cascades and time limits
@@ -88,7 +88,7 @@ sequenceDiagram
     loop before each transition of the child and on every poll of its cancel watch
         W->>DB: load_run(parent)
     end
-    DB-->>W: the parent is Failed, or gone
+    DB-->>W: the parent is Failed
     W->>DB: cancel_run(child, the parent run ended): commit Failed
     W->>C: fire the step's CancelToken
     Note over W,DB: the child's own children do the same when they next look at the child
@@ -97,7 +97,8 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> Working: start_child, with a deadline when started within a limit
-    Working --> Failed: the parent is Failed or gone (cancelled: the parent run ended)
+    Working --> Failed: the parent is Failed (cancelled: the parent run ended)
+    Working --> Working: parked, looked at once a minute, the agent not stepped
     Working --> Failed: the clock passes the deadline (cancelled: time limit)
     Working --> Done: the child answers
     Working --> Working: the parent is Done or still working
@@ -105,28 +106,41 @@ stateDiagram-v2
     Done --> [*]
 ```
 
-* **The rule.** A run with a `parent_id` is cancelled (`cancelled: the parent run ended`) when its parent is `Failed`, for
-  any reason (a cancel included), or gone. A `Done` parent changes nothing: it has no working rounds, and a session kept
-  open stays usable. A parent that cannot be read is not a reason to cancel: the child goes on.
+* **The rule.** A run with a `parent_id` is cancelled (`cancelled: the parent run ended`) when its parent is **loaded and
+  `Failed`**, for any reason (a cancel included). A `Done` parent changes nothing: it has no working rounds, and a session
+  kept open stays usable. A parent that cannot be loaded (the store is down, or retention purged a finished run) is
+  unknown, not ended: the child goes on (debug log). This assumes retention is longer than a minute
+  (`Store::purge_finished`).
 * **Where it is checked** (`crates/adam-runtime/src/worker.rs`). Before a child's transition, with one `load_run(parent)`;
-  and on every poll of the cancel watch of a step in flight (`poll_interval`, 250 ms by default), one more read of the parent
-  per poll. The cancel is `Inner::cancel_run`, the body of `Runtime::cancel`: idempotent, a no-op for a run that is
+  on the cancel watch of a step in flight, at most once a second per child (`PARENT_CHECK_EVERY`; the watch itself polls
+  every `poll_interval`, 250 ms by default, and reads the child's own run each time); and for a **parked** child at its
+  look (below). The cancel is `Inner::cancel_run`, the body of `Runtime::cancel`: idempotent, a no-op for a run that is
   already terminal.
-* **How fast.** `Runtime::cancel` commits the parent first, unchanged. A running child is told within one poll (its token
-  fires, and the coder's `shell.rs` kills its command); a runnable one when it is claimed; a parked one at its next
-  wake, which for a child waiting on its own child is at most `wait_poll` (60 s). Grandchildren follow one level at a
-  time. A child that the parent's last step created after the cancel never steps. The A2A `CancelTask` path is
-  unchanged and answers `Canceled` at once.
-* **A child that parks with no timer** (a session round waiting for a message) is not woken by its parent's cancel; a child
-  with a time limit is, at its deadline.
+* **The look at a parked child.** A parked run that works for a parent, or has a deadline, is committed with a wake no later
+  than `CHILD_WAIT_POLL` (a minute) away, and the envelope keeps the agent's own wake (`agent_wake`) and `hb`. When that
+  wake claims the run, the runtime reads the parent **before** the agent: the parent ended, the child is cancelled; the
+  parent is alive and nothing else is due (no message, the agent's own wake not yet), the run is parked again with the next
+  wake **without stepping the agent, without a journal entry and without a model call**. So a child waiting for an
+  answer to its own question, or with `max_minutes: 0`, is reached too, and so are its own children one level at a time.
+  The cost of a parked child is one read and one commit a minute. `RunView::wake_at` and `waiting` say what the agent asked,
+  not the runtime's wake.
+* **How fast.** `Runtime::cancel` commits the parent first, unchanged. A running child is told within about a second
+  (its token fires, and the coder's `shell.rs` kills its command); a runnable one when it is claimed; a parked one within
+  a minute. Grandchildren follow one level at a time. A child that the parent's last step created after the cancel never
+  steps. The A2A `CancelTask` path is unchanged and answers `Canceled` at once.
 * **Not cancelled: a remote A2A task.** A subagent on another agent (`a2a:`) is a task there, and the cascade does not
   send it `CancelTask` ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) slice 5).
   It keeps running until the remote end stops it. Cancelling the parent stops the wait and nothing else.
 * **Run pods** are keyed by the root's workspace, so the janitor removes the pod with the failed root.
 * **Time limit of a child.** `Runtime::start_child_within(parent, id, agent, input, Some(limit))` (also
   `ChildStarter::start_within`, `ToolCtx::start_child_within` and, for a session round,
-  `start_child_continuing_within`) stores `deadline` in the run's envelope, set from the runtime's own `Clock`, not
-  from a transition. `wake_at` is clamped to it, so a parked child wakes at it. `SubagentTool` passes
+  `start_child_continuing_within`; the last is the embedder's entry point until the session tools of ADR 0045 arrive)
+  stores `deadline` in the run's envelope, set **once** from the runtime's own `Clock`, not from a transition. `wake_at`
+  is clamped to it, runnable or parked, so a child wakes at it. **The time a child waits for a person is not counted**: when
+  it parks with no timer the deadline is cleared and what is left is kept (`remaining_secs`), and the next step that
+  follows a message sets it again; time on a timer, or on a child, still counts. A wake that arrives before the deadline
+  (the store's clock and the runtime's disagree) parks the run again to the deadline plus a second, without stepping the
+  agent, so a skew cannot make a tight loop. `SubagentTool` passes
   `limits.max_minutes` of the subagent's file: **30 minutes** when it says nothing, `0` for none, at most 1,440
   ([agent files](agent-files.md#the-subagent-tool)). The limit is per run: each round of a session has its own.
 * **Time limit of a tool call.** A call that runs past `Tool::time_limit` (300 s when it declares none) is stopped

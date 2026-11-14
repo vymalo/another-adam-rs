@@ -589,9 +589,12 @@ sequenceDiagram
         T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every poll interval)
         opt the run has a parent_id
             T->>DB: load_run(parent)
-            DB-->>T: Failed or gone: cancel_run(run), cancelled: the parent run ended, no step
+            DB-->>T: Failed: cancel_run(run), cancelled: the parent run ended, no step
         end
         T->>T: decode the Envelope, and cancel_run (cancelled: time limit) when its deadline has passed
+        opt a parked run that works for a parent, claimed at the wake the runtime set
+            T->>DB: park again with the next wake, the agent is not stepped, nothing is journaled
+        end
         T->>T: build a Ctx<br/>with seq, inbox and attempt
         T->>A: step(ctx, state)
         A->>X: take_inbox()
@@ -988,7 +991,7 @@ sequenceDiagram
     J-->>P: Err(AwaitRun { run: child }), journaled
     P->>DB: commit Park, wake_at = now + 60 s, pending_wait = { c1, child }
     C->>DB: claim, step ... terminal commit, Done or Failed
-    Note over C,DB: before a step and on each poll of its cancel watch the child reads the parent.<br/>Parent Failed or gone, the child fails as cancelled by the parent run ending.<br/>Past its deadline, the child fails as cancelled by its time limit.
+    Note over C,DB: before a step and on each poll of its cancel watch the child reads the parent.<br/>Parent Failed, the child fails as cancelled by the parent run ending.<br/>Past its deadline, the child fails as cancelled by its time limit.
     C->>R: after the commit: notify_parent
     R->>DB: deliver to the parent: adam.run.finished, id = child id,<br/>payload { status, output or error }
     DB-->>P: parent is Runnable, inbox holds the message
@@ -1013,7 +1016,7 @@ stateDiagram-v2
 
 The message is a hint; the parent's timer (`wait_poll`, 60 s) is the guarantee. The child id is derived
 (`child_run_id(parent, key)`), so a tool that runs again asks for the same child. Cancelling a parent does
-cancel its children: a child whose parent is `Failed` or gone is failed by its own worker, and a child started
+cancel its children: a child whose parent is `Failed` is failed by its own worker, and a child started
 within a time limit is failed past it ([Cancel cascades](reference/child-runs.md#cancel-cascades-and-time-limits)). A
 subagent on another A2A agent is the same wait with polling and no message, and a cancel does not reach that task.
 The failure interleavings, their tests and what the design refuses are in

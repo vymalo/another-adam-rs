@@ -250,7 +250,7 @@ Three results the loop writes itself, as error results the run goes on from (`ad
 
 | When | Text |
 |---|---|
-| The third call in a row of a tool with the same arguments and the same result as the two before (`doom_loop`) | `Not run: this is the third call in a row of `{tool}` with the same arguments, and the last two gave the same result. Calling it again will not change it. Change your approach: other arguments, another tool, or answer with what you know.` |
+| The third call in a row of a tool with the same arguments when the two before gave the same result, or both were errors (`doom_loop`) | `Not run: this is the third call in a row of `{tool}` with the same arguments, and the last two gave the same result. Calling it again will not change it. Change your approach: other arguments, another tool, or answer with what you know.` |
 | A call runs past its tool's time limit (300 s unless declared). The call's token fires, the tool has 5 s to stop, and the text is journaled, so a replay never waits | `` `{tool}` did not finish within {N} s and was stopped. What it had done is not undone: look at the state again before relying on it, and try a smaller step. `` (`{N} ms` under a second) |
 | A child run is past its `limits.max_minutes` | the parent reads `the run failed: cancelled: time limit: the run did not finish within 30 min` |
 

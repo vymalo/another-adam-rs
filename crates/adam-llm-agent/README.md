@@ -506,17 +506,25 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
 
 ## `doom_loop`, tool time limits
 
-* **`doom_loop`.** The third call in a row with the same tool, the same canonical arguments and the same result (`is_error`
-  included) as the previous two is not run: it is answered with an error result telling the model to change approach, and
-  after two refusals the run takes the closing turn with `limit: "repeated_call"`. A changed answer, or another call in
-  between, resets it. The decision reads only `Conversation::repeats` (two FNV-1a hashes and counters), so a replay decides
+* **`doom_loop`.** The third call in a row with the same tool and the same canonical arguments is not run when the previous
+  two gave the same result (`is_error` included) **or were both error results** (an error that carries a duration or a path
+  never repeats to the byte): it is answered with an error result telling the model to change approach, and after two
+  refusals the run takes the closing turn with `limit: "repeated_call"`. A changed successful answer, or another call in
+  between, resets it. A command tool that fails returns normal text with an exit code, not an error result, so the rule
+  reads its text and a result with a volatile line is not repeated: see the coder's notes. The decision reads only `Conversation::repeats` (two FNV-1a hashes and counters), so a replay decides
   the same. A call that waits (a question, a child) resets it.
 * **`Tool::time_limit`** (default `None` = `DEFAULT_TOOL_TIME_LIMIT`, 300 s; `FnTool::with_time_limit`; a wrapper must forward
   it). The timer runs inside the journaled `tool:<id>` step: the call gets a child `CancelToken`, which fires at the
   limit; the tool has `TOOL_STOP_GRACE` (5 s) to stop and is then dropped; the model gets an error result that says the call
   did not finish, and that is what the journal keeps. `ToolCtx::start_child_within` starts a child with a run limit.
-* **Breaking:** `LimitKind::RepeatedCall` is a new variant (every exhaustive match stops compiling until it handles it) and
-  `Conversation` gains `repeats` (struct literals).
+* **A tool that finishes while it is told to stop** (during the 5 s grace, or at the instant of the limit) with a result that
+  is not an error keeps its own result; only an error, a cancellation or silence is reported as stopped.
+* **Rollback:** an older binary cannot decode a `Conversation` whose `limit` is `"repeated_call"` (the enum is closed, a new
+  variant): a run that hit the new limit cannot be rolled back to a build that predates it.
+* **Breaking:** `LimitKind::RepeatedCall` is a new variant (every exhaustive match stops compiling until it handles it),
+  `Conversation` gains `repeats` (struct literals), **a tool that declares no bound of its own is stopped after 300 s**,
+  and **cancelling a parent cancels its children** and **a subagent run stops after 30 minutes unless its file says
+  otherwise** (`adam-runtime`, `adam-assembly`).
 
 ## Limits and the closing turn
 

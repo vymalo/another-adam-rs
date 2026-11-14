@@ -547,11 +547,13 @@ sees the parent's history. The sequence and the states of the wait are in
   `adam-coder`'s workspace and its check budget, keys it by the root: its subagents then share the worktree.
 * **Limits per child.** Its own `limits:` apply to its run; it does not count against the parent. A run also has a
   **time limit**, `limits.max_minutes`: 30 minutes when the file says nothing, `0` for none, an error above 1,440, a
-  warning on a root agent (it has no parent to stop it). Past it the runtime fails the child (`cancelled: time limit: the
+  warning on a root agent (it has no parent to stop it). The time the child spends waiting for a person is not counted.
+  Past it the runtime fails the child (`cancelled: time limit: the
   run did not finish within 30 min`) and the parent reads "the run failed: ..." as the tool result.
-* **Doom loop and tool limits.** In every agent, the third call in a row with the same tool, the same arguments (key order
-  does not matter) and the same result as the two before is not run and is answered with an error that tells the model to
-  change approach; after two such refusals the run takes the closing turn with `limit: "repeated_call"`. A poll whose
+* **Doom loop and tool limits.** In every agent, the third call in a row with the same tool and the same arguments (key
+  order does not matter) is not run when the two before gave the same result **or both were error results** (a failing
+  command whose message carries a duration or a path never repeats to the byte), and is answered with an error that tells
+  the model to change approach; after two such refusals the run takes the closing turn with `limit: "repeated_call"`. A poll whose
   answer changes, or the same call with another call in between, runs. A call that runs past its tool's time limit
   (300 s unless the tool declares one: the coder's command tools the deployment's command limit plus 30 s, MCP tools
   their call timeout plus 10 s) is stopped and answered with an error. The texts are in

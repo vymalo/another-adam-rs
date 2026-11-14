@@ -216,5 +216,26 @@ repository or scratch project in the run and nothing delivered it fails with
 form), redacted, whether or not changes are left in the worktree. When a run is cancelled while a command works, the tool
 kills the command and its process group and tells the run's environment which command to kill.
 
+### Time limit of each tool
+
+The agent stops a call that runs past its tool's limit (300 s for a tool that declares none) and tells the model it was
+stopped, so a tool with a bound of its own declares that bound and 30 s more, from the deployment's settings
+(`own_limit` in `bin/adam-coder/src/tools/mod.rs`); the table is held by `tests/time_limits.rs`, which walks the whole tool
+list and fails for a tool that has neither a limit nor a place on the `QUICK_TOOLS` list.
+
+| Tool | Limit |
+|---|---|
+| `run_command`, `run`, `run_checks` | making the environment ready (devcontainer: `DEVCONTAINER_UP_TIMEOUT_SECS` + `DEVCONTAINER_SETUP_TIMEOUT_SECS`; run pods: `RUN_POD_WAIT_SECS` + `RUN_POD_READY_TIMEOUT_SECS`; none in the coder's own container) + `CHECK_TIMEOUT_SECS` + 30 s |
+| `rebuild_environment` | making the environment ready + 30 s |
+| `delegate_to_opencode` | making the environment ready + 1 h + 30 s (OpenCode's turn has only an idle timeout) |
+| `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | one network git operation (30 min) and the local ones around it (5 min) + 30 s |
+| the rest (`read_file`, `write_file`, `apply_patch`, `edit_file`, `share_file`, `start_scratch`, `request_repository`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `delete_repository`, `ask_user`, `show`, `ui_catalog`) | quick by construction: the default 300 s |
+
+The doom loop (a third call in a row of a tool with the same arguments, refused when the two before gave the same result or
+both were errors) reads a command's answer as text: **a failing command is a normal result with `exit code N: FAILED` and
+its output tail, not an error result**, so a failure whose tail has a duration or a temporary path is a different result each
+time and is not caught. A stable comparison would need the command tools to say a normalised key (the exit code and the
+tail with numbers and paths removed), which no tool does yet.
+
 Where the workspace, the janitor and the environments are: [Workspace and environments](workspace-and-environments.md).
 Configuration: [Environment variables](environment.md).

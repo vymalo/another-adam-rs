@@ -165,14 +165,25 @@ A step that runs code which cannot hold the `Ctx` (a tool of an agent) starts ch
 possible parent is that run (`start(id, agent, input)` is `start_child` with the parent fixed). The agent has to
 be registered on that runtime, as an agent or as a starter.
 
-**Cancelling a run cancels the runs that work for it**: a child whose parent is `Failed` (any reason) or gone is failed with
-`cancelled: the parent run ended` by its worker, before it steps (one `load_run(parent)`) and on every poll of the cancel
-watch of a step in flight (one more read per poll); a `Done` parent changes nothing; no `Store` method is involved. Remote A2A
-tasks are not cancelled. **Breaking:** a child started for a parent that does not exist is cancelled when claimed.
-`Runtime::start_child_within` (and `start_child_continuing_within`, `ChildStarter::start_within`) start a child with a time
-limit: the deadline is stored from the runtime's `Clock`, `wake_at` is clamped to it, and a child past it fails with
-`cancelled: time limit: the run did not finish within N min`. `CancelToken::child()` makes a token that fires with its
-parent. Take the inbox in every step that can park, including the
+**Cancelling a run cancels the runs that work for it**: a child whose parent is `Failed` (any reason) is failed with
+`cancelled: the parent run ended` by its worker, before it steps (one `load_run(parent)`) and on the poll of the cancel
+watch of a step in flight (the parent is read at most once a second). A parked child that works for a parent always carries
+a wake no later than a minute away; at it the runtime reads the parent first and, when nothing else is due (no message, no
+wake of the agent's own), parks the run again **without stepping the agent**, journaling nothing and calling no model, so
+a child waiting for a person is reached too, and its own children after it. A `Done` parent changes nothing. A parent that
+cannot be loaded (retention purged it, the store is down) is **unknown and cancels nothing**: keep retention longer than a
+minute (`Store::purge_finished`). No `Store` method is involved. Remote A2A tasks are not cancelled.
+`Runtime::start_child_within` starts a child with a time limit: the deadline is stored once, from the runtime's `Clock`,
+`wake_at` is clamped to it, and a child past it fails with `cancelled: time limit: the run did not finish within N min`.
+**The time a child spends waiting for a person is not counted** (it parked with no timer: the deadline is cleared and what is
+left is kept, and the next step that follows a message sets it again); time on a timer or on a child still counts. A wake
+that comes before the deadline (clocks that disagree) parks the run again to the deadline plus a second. The first
+`RunView::wake_at` of such a run is the agent's own, not the runtime's. `start_child_continuing_within` (a session round
+with a limit) has no caller outside the runtime until the session tools of ADR 0045 arrive: it is the embedder's entry
+point. `CancelToken::child()` makes a token that fires with its parent.
+
+**Breaking:** cancelling a parent cancels its children. A subagent run stops after 30 minutes unless its file says
+otherwise (`limits.max_minutes`). Take the inbox in every step that can park, including the
 step that starts the child: a message already in the inbox when a step starts is not "arrived during the step",
 and an agent that parks without reading it sleeps until its timer. The design, the failure interleavings and
 the tests that make each happen are in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#failure-interleavings).
