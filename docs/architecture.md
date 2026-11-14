@@ -957,7 +957,9 @@ stateDiagram-v2
 
 A subagent is a child run: an agent started by a tool of another agent, with its own history, tools and
 limits, whose final answer is the result of that tool call. The runtime supplies `start_child`, the
-`adam.run.finished` message, `Ctx::child_status` and `ToolError::AwaitRun`; no scheduler.
+`adam.run.finished` message, `Ctx::child_status` and `ToolError::AwaitRun`; no scheduler. A child with a
+conversation (a session round, ADR 0045) reports with `adam.child.reported` instead, and
+`start_child_continuing` starts it ([Child runs](reference/child-runs.md#sessions-adr-0045-slice-1)).
 
 ```mermaid
 sequenceDiagram

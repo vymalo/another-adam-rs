@@ -106,6 +106,31 @@ the next step read `take_inbox()` for messages of kind `adam.run.finished` (`Chi
 already in the inbox when a step starts is not "arrived during the step", so an agent that parks without
 reading it sleeps until its timer.
 
+## Sessions (ADR 0045, slice 1)
+
+[ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) lets a subagent run in the
+background as a session that is sent more messages. Only the runtime half exists so far (`crates/adam-runtime`).
+
+**What exists.**
+
+* `Runtime::start_child_continuing` starts a child run **with a conversation id** (the parent's, then `/s/` and
+  the session id: `session_conversation_id`). Round 1's run id, `child_run_id(parent, call_id)`, is the session id.
+  From round 2 on the child starts from the previous round's state (`init_continuing`, ADR 0003). The store
+  already allows one open run per agent and conversation, so a start while a round is open is refused with
+  `ConversationBusy` (class `Rejected`) and the caller sends a message with `Runtime::deliver`, which the open round
+  reads as a steered message. A repeat with the same ids answers `false`, as `start_child` does.
+* A child with a conversation reports its end with **`adam.child.reported`** instead of `adam.run.finished`.
+  Same id, same payload, same standing (a wake-up; the parent reads the round with `Ctx::child_status`, so the
+  lost-notice cases above hold for a round: the report of a round whose delivery failed is recovered by that read).
+  A child without a conversation is unchanged.
+* `Runtime::list_sessions` lists a parent's sessions over `list_runs` with the conversation prefix, and a
+  parent never sees another's (the prefix ends in `/s/`, so `ctx1` does not match `ctx10`).
+
+**What does not exist yet.** The tools (`subagent_start` and the others), `Conversation::session`, closing, a
+reader of `adam.child.reported` in `LlmAgent` (it would treat the message as user text, which is why nothing
+starts a session before slice 2), `PendingWait::Session`, the limits, the cancel cascade, remote sessions and the
+A2A extension. A listed session is `Working` or `Idle` only, from its latest round's status.
+
 ## Remote tasks: the same wait without a message
 
 A subagent on another A2A agent (`a2a:` in its file) is the same idea with one thing missing: nothing tells

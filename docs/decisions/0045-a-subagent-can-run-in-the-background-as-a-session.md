@@ -3,13 +3,20 @@
 Status: **Accepted** (2026-11-14), the owner's decision: *"we need to add the capability that opencode has to create child
 session, and exchange messages with it. At creation, there should be a button to auto-close after work is done, so that the
 child session can further be reused."* The six defaults under [What was put to the owner](#what-was-put-to-the-owner) are
-recommendations the owner was told the work proceeds with. Nothing of it is built. Reverses "one-shot child runs" and "no
+recommendations the owner was told the work proceeds with. Only slice 1 is built (below). Reverses "one-shot child runs" and "no
 resume" of [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md); amends
 [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md), [ADR 0003](0003-a-new-task-continues-the-task-it-references.md),
 [ADR 0016](0016-a-message-sent-to-a-working-task-is-steered-into-it.md) and
 [ADR 0034](0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md) (dated notes in each); follows
 [ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) decisions 1 and 2 for its
 tools. The orchestration layer's side is its own ADR in `vymalo/another-agentic-system`.
+
+*Built 2026-11-14:* slice 1 (the runtime): `Runtime::start_child_continuing`, the kind `adam.child.reported`
+(`CHILD_REPORTED_KIND`, chosen by whether the child has a conversation) and `Runtime::list_sessions`, in
+`crates/adam-runtime`, with no change to a store or the testkit. Deviations: a listing over runs cannot tell a
+closed session, so `SessionState` is `Working` or `Idle` and `non_exhaustive` (`Closed` comes with the header, slice 2);
+`list_sessions` takes the agent names to look at, because a run listing is per agent; and the conversation id is the
+parent's id plus `/s/<session>`, which is what the design's `encode_conversation(subject, "<context>/s/<session>")` makes.
 
 ## Context
 
