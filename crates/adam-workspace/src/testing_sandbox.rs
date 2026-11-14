@@ -45,9 +45,18 @@ fn binary() -> &'static Path {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         let exe = std::env::current_exe().expect("test executable path");
+        // The nearest directory named after a built-in profile, wherever cargo put the test under
+        // it (`<profile>/deps/<test>`, or deeper in a newer layout); else the old guess.
         let profile_dir = exe
-            .parent()
-            .and_then(Path::parent)
+            .ancestors()
+            .skip(1)
+            .find(|dir| {
+                matches!(
+                    dir.file_name().and_then(|n| n.to_str()),
+                    Some("debug" | "release")
+                )
+            })
+            .or_else(|| exe.parent().and_then(Path::parent))
             .expect("<target>/<profile>/deps/<test>")
             .to_path_buf();
         let profile = profile_dir
