@@ -4917,8 +4917,10 @@ mod cases {
         assert!(store.load_run(parent).await.unwrap().is_none());
         // Several looks at the missing parent: the round is not cancelled.
         for _ in 0..3 {
-            clock.advance(Duration::from_secs(61));
+            // The version is read before the clock moves: read after, a look that had already
+            // happened would be the one waited for, and no other comes until the clock moves again.
             let seen = rt.view(round).await.unwrap().unwrap().version;
+            clock.advance(Duration::from_secs(61));
             wait_for(&rt, round, "looked at", |v| v.version > seen).await;
         }
         assert_eq!(
