@@ -53,8 +53,10 @@ before you rely on a detail here.
    `files: true` in a remote's file shares the file parts of its answer (a browser's screenshot) as files of the
    calling run; without it they are described and dropped. A subagent's files never reach the person.
    Formats: `docs/reference/agent-files.md`; the short version is `docs/guides/write-an-agent.md`.
-4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog`
-   (`crates/adam-ui/README.md`). Everything else comes from the folder, mainly MCP. Tell the agent in its
+4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog` and the plan,
+   `plan_work`, `plan_check`, `plan_add` (`crates/adam-ui/README.md`; a checklist of at most 50 items kept in the
+   conversation's state: tell the agent to plan work of three or more steps; a folder with `tools:` must list `plan_*`
+   to keep it; a subagent has no plan). Everything else comes from the folder, mainly MCP. Tell the agent in its
    instructions to offer options with `ask_user` and `choices` (a `title`, a `description` of why it asks,
    options that each have a `label` and a `description`) and never as a list in its reply: a prose list gets
    answers like "yes, add that" that cannot be told apart (`docs/decisions/0035-questions-carry-a-title-a-description-and-typed-options.md`).

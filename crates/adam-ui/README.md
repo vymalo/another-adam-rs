@@ -25,11 +25,12 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 | Item | What |
 |---|---|
 | `Ui::new(McpPolicy)`, `Ui::with_client(..)` | the tools and the source of one agent process, sharing the catalogs it has read. `McpPolicy` is the deployment's (`MCP_ALLOW_INSECURE` decides whether the thread-tools URL may be plain `http` to another machine; the call timeout, and `thread_tools_max_call`, the cap of `THREAD_TOOLS_MAX_CALL_SECS`) |
-| `Ui::tools() -> ToolSet`, `Ui::with_ask_lead(text)`, `DEFAULT_ASK_LEAD` | `ask_user`, `show`, `ui_catalog`, in that order. `with_ask_lead` opens the description of `ask_user` with the agent's own words about when to ask (the coder names pull requests); what follows, about `choices`, is the same |
+| `Ui::tools() -> ToolSet`, `Ui::with_ask_lead(text)`, `DEFAULT_ASK_LEAD` | `ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check`, `plan_add`, in that order (**six tools; it was three**: the specs are part of the prompt's stable prefix, so their order is fixed and a build that adds one changes every agent's prefix once). `with_ask_lead` opens the description of `ask_user` with the agent's own words about when to ask (the coder names pull requests); what follows, about `choices`, is the same |
 | `Ui::source() -> ThreadTools` | a `ToolSource` that offers **every tool the thread-tools endpoint lists, under its listed name**, listed again at every model turn, **except `get_ui_catalog`** (the model has `ui_catalog`; the relayed tools of attached servers and `ask_agent` appear with no change here), and that **describes `show` with the components of the conversation's screen** (`ToolSource::refine`, from the catalogs this process holds). Add it last among an agent's sources, and register `Ui::tools()` on the same agent |
 | `AskUser`, `ASK_USER` | `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`: see *The tools* |
 | `Show`, `SHOW`, `MAX_BLOCKS` | `show { blocks, title? }`, at most 16 blocks; refuses a `Choices` block |
 | `UiCatalogTool`, `UI_CATALOG` | `ui_catalog {}` |
+| `PlanWork`, `PlanCheck`, `PlanAdd`, `PLAN_WORK`, `PLAN_CHECK`, `PLAN_ADD` | the plan tools: see *The plan* |
 | `ThreadTools`, `ThreadToolsClient`, `META_KEY`, `GET_UI_CATALOG`, `TURN_OUTPUT`, `TURN_OUTPUT_DELIVERED` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
 | `Catalog`, `Claimed`, `Component`, `CatalogError`, `canonical_json`, `catalog_digest` | a catalog read and checked against the digest it claims; `validate(instance)` against a component's schema; the canonical form and the digest of [the contract](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md#2-digest-version-and-the-lock) |
 | `CatalogCache`, `MAX_CACHED_CATALOGS` | the catalogs this process holds, by digest (8, the oldest dropped) |
@@ -42,7 +43,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 
 ```rust
 let ui = adam_ui::Ui::new(mcp_policy);                          // once, at startup
-let tools = my_tools.extend(ui.tools());                        // ask_user, show, ui_catalog
+let tools = my_tools.extend(ui.tools());                        // ask_user, show, ui_catalog, plan_*
 let bound = def.bind(tools)?.tool_source(ui.source());          // BoundDef::tool_source of adam-assembly
 let card = adam_ui::with_card_extensions(def.card(url, ver)?);  // announce the extensions
 let agents = Agents::new(name, register).inbound(vymalo_inbound); // adam-service: read the screen's messages
@@ -142,7 +143,7 @@ inbound function reads a screen's action as JSON text.
   of it for the agent (`ToolSource::listing`; the note is kept with the model's answer, so the call, made later and
   anywhere, has it). The same note carries the tool's **step label**: the endpoint's `title` for the tool, else, for
   `turn_output`, "Send the answer" (`TURN_OUTPUT_TITLE`), so the step of the answer is not called `turn_output`.
-  The three tools of `Ui::tools()` are "Ask you" (drawn with the `think` icon), "Show on your screen" and "List what the screen can draw".
+  The tools of `Ui::tools()` are "Ask you" (drawn with the `think` icon), "Show on your screen", "List what the screen can draw" and, with the `think` icon, "Write the plan", "Update the plan" and "Add to the plan".
   * **`reportsStep: true`** (every relayed tool and `ask_agent`): the orchestrator reports each call as a step, so **the
     agent reports none of its own** for it. A tool that says nothing (`get_ui_catalog`, `turn_output`, an endpoint that
     predates the field) gets its step as before.
@@ -168,6 +169,64 @@ inbound function reads a screen's action as JSON text.
 None of them fails a run. With no catalog, or one that cannot be read, `show` and `ui_catalog` return an error result
 that says to answer in text; with no grant, or an expired or refused one, the source offers nothing and a call says
 the tools are gone.
+
+## The plan
+
+`plan_work`, `plan_check` and `plan_add` are the plan every **root** agent can keep, a chat as much as the coder
+([ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) decision 5).
+The state is `Conversation::plan` of [`adam-llm-agent`](../adam-llm-agent/README.md#the-plan): a tool reads the plan its call starts
+from (`ToolCtx::plan`) and returns **the whole new plan** (`ToolOutput::with_plan`); the loop keeps it only from a result that
+is not an error, a replay takes the journaled one, and a task that continues another keeps it.
+
+| Tool | Arguments | Result (ASCII, built only from the state, so the same plan gives the same bytes) |
+|---|---|---|
+| `plan_work` | `{title?: string (80), items: string[1..50]}` (each 1 to 200 characters) | `Plan saved (4 items).` or `Plan replaced (4 items).`, then the plan; replaces any earlier plan, ids start at 1 |
+| `plan_check` | `{id: integer, status: doing \| done \| dropped, note?: string (200)}` | `Item 2: doing.`, then the plan |
+| `plan_add` | `{items: string[1..50], after?: integer}` | `Added 2 items: 5, 6.`, then the plan |
+
+```text
+Plan: Fix the date parser          ("Plan" alone when there is no title)
+1. [x] Reproduce the failing test
+2. [>] Fix parse_date for time zones (note: lexer.rs)
+5. [ ] Add a test for UTC+14
+3. [ ] Run the checks
+4. [-] Open the pull request (note: the person opens it)
+1 of 5 done, 1 doing, 2 to do, 1 dropped.
+```
+
+* **Ids** are creation numbers (1 to n), never reused, never shifted: `plan_add`'s `after` only changes where the new items
+  are shown. Nothing is deleted (a dropped item stays), so the ids are always `1..=n`. `id` and `after` also accept a
+  numeric string (`"3"`), because small models send one.
+* **Limits** (refused with the number in the message, never cut): at most 50 items; an item is 1 to 200 characters after
+  trimming, with newlines and control characters turned into one space; the title at most 80, a note at most 200.
+  Errors, each leaving the plan, the state and the surface as they were: `There is no plan yet: start one with plan_work.`,
+  `There is no item 7: the items are 1 to 5.` (and the plan), `The plan would have 53 items; at most 50. ...`,
+  `Item 3 is 240 characters; at most 200.`
+* **A subagent has no plan**: a call from a run that is not the root run is an error result (`A subagent keeps no plan: put
+  what is left in your answer.`).
+* **Nothing volatile in the prompt.** The tools' specs are fixed; the plan is only ever in the results of these calls, so the
+  newest plan is at the end of the history and the provider's cached prefix is never broken by it.
+* **What the person sees.** Each call also draws the plan on the screen, as one surface `plan-<run id>` (the same id on every
+  call of a run, so each call replaces the surface the one before drew), decided **from the resolved catalog alone, never from
+  a version number**:
+  1. a catalog that validates a `Checklist` gets one `Checklist`, the root: `title` is the plan's title (or `Plan`), items in
+     display order, `pending` is `todo`, `doing` is `doing`, `done` is `done`. A `dropped` item uses the state `dropped` if the
+     catalog's `Checklist` allows that value, and is otherwise **left out** with the title saying so (`Fix the date parser (1
+     dropped)`); when every item is dropped and the state is not allowed, the next rule applies. An item's note is the item's
+     `note` if the catalog allows one, and otherwise is appended to the label as ` (note: ...)`, the label being cut to the
+     catalog's limit for it, at a character boundary, with `…`. The capabilities are found by asking the catalog's schema
+     (a probe item is validated), not by reading its version;
+  2. else a catalog that validates a `Column` of `Text`s gets one `Text` per line of the result (a plan of 49 items or more
+     does not fit the `Column`'s 50 children of version 5, and then the next rule applies);
+  3. else no surface: the result text in the step is the whole display. The call never fails for lack of a screen.
+
+  The `Checklist` is a component of version 6 of the orchestration layer's catalog (*unverified*: the fixtures of this
+  repository stop at version 5, and `tests/fixtures/catalog-v6.json` and `catalog-v7.json` are hand-written subsets, see
+  `tests/fixtures/README.md`). Nothing else in this crate draws two surfaces with one id (`show` and `ask_user` make one per
+  call), so that a renderer accepts `createSurface` for an id it already has is *unverified*; the A2A layer gives each
+  artifact an id from its content, so a changed plan is a new artifact of the same surface.
+* The step of each call is titled "Write the plan", "Update the plan" or "Add to the plan", drawn with the `think` icon.
+* **Breaking.** A folder agent's `tools:` that lists the screen's tools must now list `plan_*` (or `*`) to keep the plan.
 
 ## How a catalog reaches a tool
 
@@ -266,6 +325,11 @@ stateDiagram-v2
   a protocol-relative one), a property the schema does not have and a layout it does not list are refused;
   `ui_catalog` lists both with what they are for. A refusal that echoes a long value (a card's body, a graph's code)
   keeps the reason: the middle of the value is elided (`src/catalog.rs`, unit tests).
+* `tests/plan.rs`: the plan tools (see *The plan*): the exact result of each call and of each refusal, ids that do not shift,
+  the limits at their edges (characters, not bytes), ids as strings, a subagent, no screen, and the surface on four screens
+  (`catalog-v5.json`: `Column` and `Text`; `catalog-v6.json`: a `Checklist` with no `dropped` and no `note`, so a dropped item
+  is left out and counted and a long note is cut inside the label limit; `catalog-v7.json`: a `Checklist` that allows both),
+  and the specs, pinned byte for byte.
 * `tests/agent.rs`: a whole agent behind A2A over the fake thread-tools endpoint of
   [`adam-mcp-testkit`](../adam-mcp-testkit/README.md): the three questions as one form, the person's answer as an
   action and the model's next words, a tool the endpoint lists offered and called, a refetch over the thread tools,

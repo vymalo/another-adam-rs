@@ -1084,7 +1084,7 @@ by every pod that runs toolchains (the coder, its run pods, a devcontainer) and 
 | | [`adam-coder`](../bin/adam-coder/README.md) | [`adam-agent`](../bin/adam-agent/README.md) |
 |---|---|---|
 | Does | Adam: answers, researches, writes documents, and takes a coding task to a verified pull request | serves **any agent folder** |
-| Tools | the coder's 17 own tools (workspace, files, checks, git, pull request) plus the screen's `ask_user`, `show`, `ui_catalog` | the folder's MCP and skill tools, the screen's tools, one per subagent |
+| Tools | the coder's 17 own tools (workspace, files, checks, git, pull request) plus the screen's `ask_user`, `show`, `ui_catalog` and the plan's `plan_work`, `plan_check`, `plan_add` | the folder's MCP and skill tools, the screen's and the plan's tools, one per subagent |
 | Needs | model, GitHub, a workspace | a model; no workspace, no GitHub |
 | State | Postgres, plus files under `WORKSPACE_ROOT` | Postgres |
 | Prompt and card | `bin/adam-coder/agent` (embedded, or `ADAM_AGENT_DIR`) | `ADAM_AGENT_DIR`, required |

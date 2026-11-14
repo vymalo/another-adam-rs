@@ -3,7 +3,7 @@
 Adam (the `adam-coder` binary) is a general agent that answers and explains, researches with the tools it is given, writes documents and files, and plans before it acts on a large request ([ADR 0021](../decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)). Its strongest path, and the one this page describes, turns a coding task into a pull request. A client sends "in repository X, do Y"; the agent
 makes the change in a private git worktree (a slot of the run's workspace), runs the project's own checks
 and opens a pull request. It is an `LlmAgent` with 20 tools of its own plus the screen's `ask_user`,
-`show` and `ui_catalog`, one extra completion rule, running on the durable runtime and served over A2A.
+`show` and `ui_catalog` and the plan's `plan_work`, `plan_check` and `plan_add` (the plan is the conversation's state; tier `plan`), one extra completion rule, running on the durable runtime and served over A2A.
 Crate README with every detail: [`bin/adam-coder`](../../bin/adam-coder/README.md).
 
 Two read-only subagents, `explorer` and `reviewer` (`bin/adam-coder/agent/subagents/`), look at the same worktree

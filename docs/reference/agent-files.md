@@ -108,6 +108,11 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   knows and ignores (`color`, `permissionMode`, `temperature`, `target`, `user-invocable`,
   `disable-model-invocation`, ...) get a softer "ignored by adam" warning. `build("agent").strict()`
   turns warnings into errors.
+* **The tools a root agent has without writing any** are the person's screen and a plan: `ask_user`, `show`,
+  `ui_catalog`, `plan_work`, `plan_check`, `plan_add` (`adam-ui`), in that order. `tools:` narrows them by name like
+  any other, so **a folder with `tools:` must list `plan_*` (or `"*"`) to keep the plan**. A subagent has none of them
+  unless it lists them, and even then `plan_*` answers that a subagent keeps no plan: the plan belongs to the
+  conversation's root run.
 * **A subagent inherits nothing** from its parent (eve's isolation boundary), and omitting `tools:`
   gives it **no tools** (decision D3). Claude Code inherits everything; adam does not.
 * **A copied file parses unchanged, but its `tools` must name adam tools.** A Claude Code file listing

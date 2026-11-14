@@ -71,7 +71,9 @@ Rules worth knowing:
   ([Remote subagents](../reference/agent-files.md#remote-subagents-a2a)).
 * **A subagent of Adam shares its root run's workspace**: `bin/adam-coder/agent/subagents/` has two read-only ones
   (`explorer`, `reviewer`) that read the worktree the calling run prepared.
-* **The agent already has** `ask_user`, `show` and `ui_catalog` (the person's screen), the tools of its MCP
+* **The agent already has** `ask_user`, `show` and `ui_catalog` (the person's screen), `plan_work`, `plan_check` and
+  `plan_add` (a plan: a checklist the person sees; tell the agent in its instructions when to plan, for example for
+  work of three or more steps; with a `tools:` list, name `plan_*` to keep them), the tools of its MCP
   servers (`<server>__<tool>`), `load_skill` and `read_skill_file` when it has skills, and one tool per subagent.
 * **MCP**: credentials go in `headers` as `${VAR}`; `tools` is an allow-list; `"optional": true` lets a server be
   down; `"files": true` hands the images and documents its tools return (a browser's screenshot and PDF) to the
