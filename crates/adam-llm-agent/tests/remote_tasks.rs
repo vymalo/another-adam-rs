@@ -659,7 +659,10 @@ async fn a_long_answer_of_a_remote_task_is_kept_when_its_view_names_an_id() {
         let state = conversation(&rt.view(run).await.unwrap().unwrap());
         let id = adam_llm_agent::output_id(&run.to_string(), "c1");
         let shown = &tool_results(&state)[0].1;
-        assert!(shown.starts_with(&format!("[kept as {id}:")), "{backend}: {shown}");
+        assert!(
+            shown.starts_with(&format!("[kept as {id}:")),
+            "{backend}: {shown}"
+        );
         assert_eq!(
             state.kept_outputs.get(&id).map(String::len),
             Some(7000 * 11),

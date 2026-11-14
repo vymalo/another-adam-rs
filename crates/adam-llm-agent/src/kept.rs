@@ -377,8 +377,8 @@ impl Tool for ReadOutput {
             description: "Read a kept output page by page: the output of a command, or a long \
                           tool result, whose result named its id (o- and 16 hex characters). You \
                           get its lines, then a last line that says where the next page starts. The \
-                          same id and offset give the same page: asking for it a third time is a \
-                          loop and is stopped. Example: {\"id\":\"o-3f9c2a17b0d4e8a1\",\"offset\":2001}"
+                          same id and offset give the same page: a third call in a row with the \
+                          same arguments, after two identical results, is not run. Example: {\"id\":\"o-3f9c2a17b0d4e8a1\",\"offset\":2001}"
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -431,7 +431,9 @@ impl Tool for ReadOutput {
             store.0.page(&run, id, offset, limit).await
         } else {
             match ctx.kept_text(id) {
-                Some(text) => page_of(id, text, offset, limit),
+                // A secret the agent learned after the text was kept: scrubbed at read, as the
+                // layer around this tool scrubs its results (no hook: the text as it is).
+                Some(text) => page_of(id, &ctx.scrub(text), offset, limit),
                 None => Err(KeptError::NotFound(id.to_owned())),
             }
         };
@@ -698,6 +700,31 @@ mod tests {
         assert_eq!(last, "[end: 4 lines]");
         assert!(body.lines().all(|l| !l.starts_with('[')), "{page}");
         assert!(body.starts_with("\\x5bend: 3 lines]\n"), "{page}");
+    }
+
+    /// A folder agent's in-state text is scrubbed at read with the context's hook, so a secret
+    /// registered after the keep is not on a page.
+    #[tokio::test]
+    async fn a_page_of_the_state_text_is_scrubbed_at_read_when_the_context_has_a_hook() {
+        use std::sync::Arc;
+        let sink: adam_runtime::DynEventSink = Arc::new(adam_runtime::CollectingSink::new());
+        let id = "o-0123456789abcdef";
+        let mut kept = std::collections::BTreeMap::new();
+        kept.insert(id.to_owned(), "a\nkey=late-secret-value\nb\n".to_owned());
+        let plain =
+            ToolCtx::detached("read_output", "c1", sink.clone()).with_kept(0, Arc::new(kept));
+        let page = ReadOutput.call(&plain, json!({"id": id})).await.unwrap();
+        assert!(
+            page.content.contains("late-secret-value"),
+            "no hook: as it is"
+        );
+        let hooked = plain.with_scrub(|t| t.replace("late-secret-value", "[redacted]"));
+        let page = ReadOutput.call(&hooked, json!({"id": id})).await.unwrap();
+        assert!(
+            !page.content.contains("late-secret-value") && page.content.contains("key=[redacted]"),
+            "{}",
+            page.content
+        );
     }
 
     #[test]

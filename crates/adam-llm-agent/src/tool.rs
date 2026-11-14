@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
-use crate::plan::Plan;
 use crate::kept::KeptOutput;
+use crate::plan::Plan;
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
@@ -631,6 +631,7 @@ impl ToolCtx {
     /// there.
     pub fn plan(&self) -> Option<&Plan> {
         self.plan.as_deref()
+    }
 
     /// Say how many bytes the run may still keep in its own state and what it keeps there:
     /// [`kept_left`](Self::kept_left) and [`kept_text`](Self::kept_text). The agent loop does it for
