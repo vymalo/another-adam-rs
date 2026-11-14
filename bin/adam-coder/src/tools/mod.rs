@@ -6,8 +6,9 @@
 //! | `start_scratch { name? }`, `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | [`scratch`] |
 //! | `request_repository { repo_url, reason }` | [`consent`] |
 //! | `create_repository { owner, name, private?, description? }` | [`create`] |
-//! | `run_command { command, cwd? }`: look around, changes undone | [`inspect`] |
-//! | `run { command, cwd? }`: make something with a command, changes kept, never a check | [`make`] |
+//! | `run_command { command, cwd?, repo?, timeout? }`: look around, changes undone | [`inspect`] |
+//! | `run { command, cwd?, repo?, timeout? }`: make something with a command, changes kept, never a check | [`make`] |
+//! | `read_output { id, offset?, limit? }`: a kept output (a command's, or a long MCP result), paged | `adam_llm_agent::ReadOutput`, kept by [`kept`](crate::kept) |
 //! | `list_files { path?, offset?, limit? }`, `find_files { pattern, path?, offset?, limit? }`, `search_files { pattern, path?, include?, literal?, offset?, limit? }`: paged, git-aware looking around | [`find`] |
 //! | `read_file { path, offset?, limit? }` (paged; `start_line` and `end_line` are aliases), `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
 //! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
@@ -101,6 +102,7 @@ use adam_workspace::{
 };
 use serde_json::Value;
 
+use crate::kept::FileKept;
 use crate::redact::Redactor;
 use sandbox::Meter;
 
@@ -119,6 +121,7 @@ pub mod inspect;
 pub mod make;
 pub mod named;
 pub mod notes;
+mod output;
 mod preexisting;
 pub mod prepare;
 pub mod publish;
@@ -255,6 +258,10 @@ pub struct ToolEnv {
     /// Removes the process's secrets from everything a tool returns, reports
     /// or fails with. Empty (a no-op) until [`ToolEnv::with_redactor`].
     pub redactor: Redactor,
+    /// Where long outputs are kept for `read_output`: files under `<workspace root>/outputs`,
+    /// scrubbed with [`redactor`](Self::redactor) before they are written. Rebuilt by
+    /// [`ToolEnv::with_redactor`].
+    pub kept: Arc<FileKept>,
     /// The person's screen as tools (`ask_user` with choices, `show`, `ui_catalog`) and as a
     /// tool source (the tools of the conversation's endpoint): the catalogs this process has read
     /// are shared by the tools and the source, so both come from this one value. Under the
@@ -279,12 +286,14 @@ impl ToolEnv {
     /// Environment over `workspaces` and `code_host`.
     pub fn new(workspaces: Workspaces, code_host: DynCodeHost, settings: CoderSettings) -> Self {
         let notes = NotesStore::new(workspaces.root());
+        let kept = Arc::new(FileKept::new(workspaces.root(), Redactor::default()));
         Self {
             workspaces,
             code_host,
             settings,
             notes,
             redactor: Redactor::default(),
+            kept,
             ui: Ui::new(McpPolicy::default()).with_ask_lead(ASK_LEAD),
             environment: Arc::new(Local),
             unavailable_wait: None,
@@ -331,6 +340,7 @@ impl ToolEnv {
     /// progress line of the checks.
     #[must_use]
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.kept = Arc::new(FileKept::new(self.workspaces.root(), redactor.clone()));
         self.redactor = redactor;
         self
     }
@@ -460,7 +470,8 @@ impl ToolEnv {
         }
     }
 
-    /// [`run_in`](shell::run_in) for a tool: the command runs in `session`, stopped when the run is
+    /// [`run_in`](shell::run_in) for a tool (`keep`: the output is captured for `output::settle`,
+    /// which the caller then calls): the command runs in `session`, stopped when the run is
     /// cancelled, and in a pod the time it ran is reported as the call's sandbox usage whatever its
     /// end was (it exited, or a timeout or a cancel stopped it): ADR 0043.
     pub(crate) async fn run(
@@ -470,9 +481,14 @@ impl ToolEnv {
         spec: ExecSpec,
         timeout: Duration,
         tail_cap: usize,
+        keep: bool,
     ) -> Result<shell::ShellOutcome, shell::RunError> {
-        let (outcome, ran) =
-            shell::run_timed(session, spec, timeout, tail_cap, &ctx.cancel_token()).await;
+        let cancel = ctx.cancel_token();
+        let (outcome, ran) = if keep {
+            shell::run_captured(session, spec, timeout, tail_cap, &cancel).await
+        } else {
+            shell::run_timed(session, spec, timeout, tail_cap, &cancel).await
+        };
         if let (Some(meter), Some(ran)) = (Meter::of(session), ran) {
             meter.report_command(ctx, ran);
         }
@@ -767,6 +783,7 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         find::ListFiles,
         find::FindFiles,
         find::SearchFiles,
+        adam_llm_agent::ReadOutput,
         files::WriteFile,
         files::ApplyPatch,
         files::EditFile,
@@ -986,6 +1003,10 @@ impl Tool for Redacting {
                         item.text = r.scrub_string(std::mem::take(&mut item.text));
                         item.note = item.note.take().map(|n| r.scrub_string(n));
                     }
+                // A text a tool asks the run to keep in its state (a host with no keeper) is
+                // journaled and paged back: as scrubbed as what is shown.
+                if let Some(kept) = &mut out.kept {
+                    kept.text = r.scrub_string(std::mem::take(&mut kept.text));
                 }
                 for artifact in &mut out.artifacts {
                     r.scrub_value(&mut artifact.data);
@@ -1426,5 +1447,44 @@ mod redacting_tests {
         assert_eq!(plan.items[0].text, "use [redacted]");
         assert_eq!(plan.items[0].note.as_deref(), Some("[redacted]"));
         assert_eq!(plan.items[1].text, "plain");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod redacting_kept_tests {
+    use super::*;
+
+    /// Gives back a text it asks the run to keep (a host with no keeper journals it).
+    struct Keeps;
+
+    #[async_trait::async_trait]
+    impl Tool for Keeps {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "keeps".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            let mut out = ToolOutput::text("shown");
+            out.kept = Some(Box::new(adam_llm_agent::KeptOutput {
+                id: "o-0123456789abcdef".into(),
+                text: "line one\nkey=sk-live-0123456789abcdef\n".into(),
+            }));
+            Ok(out)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_text_a_tool_asks_the_run_to_keep_is_scrubbed_like_its_result() {
+        let mut layer = Redacting::layer(Redactor::new(["sk-live-0123456789abcdef"]));
+        let tool = layer(Arc::new(Keeps));
+        let ctx = ToolCtx::detached("keeps", "c1", Arc::new(adam_runtime::CollectingSink::new()));
+        let out = tool.call(&ctx, Value::Null).await.unwrap();
+        let kept = out.kept.unwrap();
+        assert_eq!(kept.text, "line one\nkey=[redacted]\n");
     }
 }

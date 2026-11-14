@@ -527,17 +527,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
         }
     };
     let mut text = format!("$ {command}\n{verdict}\n");
-    if outcome.truncated {
-        text.push_str(&format!(
-            "(output truncated: the last {} bytes follow)\n",
-            outcome.tail.len()
-        ));
-    }
-    text.push_str("--- output ---\n");
-    text.push_str(&outcome.tail);
-    if !outcome.tail.ends_with('\n') {
-        text.push('\n');
-    }
+    text.push_str(&super::output::section(outcome));
     text
 }
 
@@ -566,6 +556,8 @@ pub async fn run_checks(
     cwd: Option<String>,
     /// The slot to run in: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
+    /// Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {"command":"npm test","timeout":120}
+    timeout: Option<i64>,
 ) -> Outcome {
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
@@ -603,6 +595,10 @@ pub async fn run_checks(
         Ok(dir) => dir,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
+    let timeout = match super::output::timeout_of(&env, timeout) {
+        Ok(timeout) => timeout,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
+    };
 
     // What the command printed is not ours to publish: scrub the process's
     // secrets before the tail reaches the model, the notes, an event or a
@@ -616,13 +612,14 @@ pub async fn run_checks(
             ctx,
             &*environment,
             shell_spec(&dir, command),
-            env.settings.check_timeout,
+            timeout,
             env.settings.check_output_tail,
+            true,
         )
         .await
         .map_err(|e| run_error(redactor, &e))?;
 
-    outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
+    super::output::settle(&env, ctx, &mut outcome).await;
 
     // A command the shell could not find is a missing toolchain, not a failing check: the
     // workspace lacks the tool, and no change to the code would make the check pass. So it is not
@@ -680,7 +677,7 @@ pub async fn run_checks(
     let report = ChecksReport::of(&Run {
         command: &shown,
         outcome: &outcome,
-        timeout: env.settings.check_timeout,
+        timeout,
         head: head.as_deref(),
         dirty,
         tree: tree.as_deref(),
@@ -691,7 +688,7 @@ pub async fn run_checks(
     })
     .scrubbed(redactor);
     let artifact = report.clone().into_artifact(redactor);
-    let text = render(&shown, &outcome, env.settings.check_timeout);
+    let text = render(&shown, &outcome, timeout);
     let failures = notes.record_check(CheckRecord {
         call_id: call,
         command: shown.clone(),
@@ -776,6 +773,7 @@ mod tests {
             timed_out: false,
             tail: tail.to_owned(),
             truncated: false,
+            ..ShellOutcome::default()
         }
     }
 

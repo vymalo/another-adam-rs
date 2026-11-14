@@ -1,0 +1,25 @@
+{
+  "name": "read_output",
+  "description": "Read a kept output page by page: the output of a command, or a long tool result, whose result named its id (o- and 16 hex characters). You get its lines, then a last line that says where the next page starts. Example: {\"id\":\"o-3f9c2a17b0d4e8a1\",\"offset\":2001}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "description": "The output id from the result that kept it",
+        "type": "string"
+      },
+      "limit": {
+        "description": "Most lines (at most 2000)",
+        "type": "integer"
+      },
+      "offset": {
+        "description": "First line, from 1; -50 = the last 50 lines",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "id"
+    ],
+    "additionalProperties": false
+  }
+}

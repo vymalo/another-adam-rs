@@ -475,6 +475,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "list_files",
             "find_files",
             "search_files",
+            "read_output",
             "write_file",
             "apply_patch",
             "edit_file",

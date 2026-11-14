@@ -305,6 +305,8 @@ impl CoderAgent {
                 env.settings.max_access_tier,
             ))
             .state(env.clone())
+            // Where `read_output` and the long results of MCP servers keep what they hold.
+            .state(Arc::new(adam_llm_agent::KeptStore(env.kept.clone())))
             // What a call was given and what it answered go into its step: the process's secrets
             // are scrubbed from both first (ADR 0011).
             .step_io(env.redactor.step_io())

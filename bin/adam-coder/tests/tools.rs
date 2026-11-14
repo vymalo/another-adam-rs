@@ -652,9 +652,17 @@ async fn run_checks_times_out_and_caps_its_output() {
         .await
         .unwrap();
     assert!(!out.is_error);
-    assert!(out.content.contains("output truncated"), "{}", out.content);
+    // A long output is its head and its tail (a quarter and the rest of the 256 bytes), kept whole
+    // under an id: the middle is not shown.
     assert!(
-        out.content.contains("line-499") && !out.content.contains("line-1\n"),
+        out.content.contains("head and tail shown, kept as o-"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("line-0\n")
+            && out.content.contains("line-499")
+            && !out.content.contains("line-250\n"),
         "{}",
         out.content
     );

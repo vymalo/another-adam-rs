@@ -22,7 +22,7 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 28] = [
+const TOOLS: [&str; 29] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -34,6 +34,7 @@ const TOOLS: [&str; 28] = [
     "list_files",
     "find_files",
     "search_files",
+    "read_output",
     "write_file",
     "apply_patch",
     "edit_file",
@@ -174,14 +175,20 @@ async fn every_tool_has_its_tier_and_the_new_ones_need_the_high_ones() {
 }
 
 /// The loop pages by what a tool declares (`Tool::paged`), never by an `offset` in its schema: the
-/// four tools that read in pages declare it, and no other built-in tool does.
+/// five tools that read in pages declare it, and no other built-in tool does.
 #[tokio::test]
-async fn exactly_the_four_paged_tools_declare_that_they_page() {
+async fn exactly_the_five_paged_tools_declare_that_they_page() {
     let fx = Fixture::new().await.offering_creation();
     for tool in coder_tools(&fx.env) {
         let spec = tool.spec();
-        let paged =
-            ["read_file", "list_files", "find_files", "search_files"].contains(&spec.name.as_str());
+        let paged = [
+            "read_file",
+            "list_files",
+            "find_files",
+            "search_files",
+            "read_output",
+        ]
+        .contains(&spec.name.as_str());
         assert_eq!(tool.paged(), paged, "{}", spec.name);
         if paged {
             assert!(
@@ -273,10 +280,13 @@ async fn only_the_optional_arguments_are_nullable() {
             "rebuild_environment.use_default",
             "run.cwd",
             "run.repo",
+            "run.timeout",
             "run_checks.cwd",
             "run_checks.repo",
+            "run_checks.timeout",
             "run_command.cwd",
             "run_command.repo",
+            "run_command.timeout",
             "search_files.include",
             "search_files.limit",
             "search_files.literal",

@@ -552,3 +552,33 @@ async fn what_an_environment_holds_for_runs_that_are_over_is_released_without_a_
         "what is left held is the open run's and what is not a run's"
     );
 }
+
+/// The kept output of a run (`<root>/outputs/<run>`) goes with the run's workspace, also when the
+/// workspace is already gone; an open run's stays.
+#[tokio::test]
+async fn the_janitor_removes_kept_output_with_the_run() {
+    use adam_llm_agent::KeptOutputs as _;
+
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let done = run_in(&store, RunStatus::Done).await.to_string();
+    let orphan = run_in(&store, RunStatus::Failed).await.to_string();
+    let open = run_in(&store, RunStatus::Runnable).await.to_string();
+    workspace_of(&fx, &done).await;
+    for run in [&done, &orphan, &open] {
+        let id = adam_llm_agent::output_id(run, "c1");
+        fx.env.kept.keep(run, &id, "kept\n").await.unwrap();
+    }
+    let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)));
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(report.failed.is_empty(), "{report:?}");
+    let outputs = fx.root.join("outputs");
+    assert!(!outputs.join(&done).exists(), "removed with its workspace");
+    assert!(
+        !outputs.join(&orphan).exists(),
+        "removed with no workspace left"
+    );
+    assert!(outputs.join(&open).is_dir(), "an open run keeps its output");
+}

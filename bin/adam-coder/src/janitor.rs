@@ -25,6 +25,9 @@
 //!   and a project made without one belongs to its run: both go with it;
 //! * a directory whose name is not a run id is not the janitor's and is left alone.
 //!
+//! The kept output of a finished run (`<root>/outputs/<run>`, [`crate::kept`]) is removed with its
+//! workspace, and a sweep removes the outputs of finished runs that have no workspace any more.
+//!
 //! After that the sweep asks the environment what it still holds
 //! ([`held_runs`](adam_workspace::Environment::held_runs)) and releases what belongs to a run that is
 //! over or unknown, whether or not the run has a workspace on this volume: what a crash left behind.
@@ -41,6 +44,9 @@ use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, Store, StoreError
 use adam_error::BoxError;
 use adam_workspace::{DynEnvironment, Local, Workspaces};
 use tokio_util::sync::CancellationToken;
+
+use crate::kept::FileKept;
+use crate::redact::Redactor;
 
 /// What one sweep did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,6 +69,7 @@ pub struct Sweep {
 #[derive(Clone)]
 pub struct Janitor {
     workspaces: Workspaces,
+    kept: FileKept,
     every: Option<Duration>,
     environment: DynEnvironment,
     scratch_idle: Option<Duration>,
@@ -87,6 +94,7 @@ impl Janitor {
     /// component, and waits to be stopped).
     pub fn new(workspaces: Workspaces, every: Option<Duration>) -> Self {
         Self {
+            kept: FileKept::new(workspaces.root(), Redactor::default()),
             workspaces,
             every,
             environment: Arc::new(Local),
@@ -157,6 +165,12 @@ impl Janitor {
                         Ok(workspace) => workspace.remove().await.map(|()| 0),
                         Err(e) => Err(e),
                     };
+                    // Its kept command output goes with it, whether or not scratch projects stay.
+                    if removed.is_ok()
+                        && let Err(e) = self.kept.remove_run(&run).await
+                    {
+                        tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the kept output of a finished run");
+                    }
                     match removed {
                         Ok(0) => {
                             tracing::info!(%run, "removed the workspace of a finished run");
@@ -178,7 +192,36 @@ impl Janitor {
         }
         self.release_orphans(store, stop, &released, &mut report)
             .await;
+        self.sweep_outputs(store, stop).await;
         report
+    }
+
+    /// Remove the kept output of runs that are over and have no workspace here any more (a crash
+    /// between the two removals, a workspace removed by hand). An open run's stays.
+    async fn sweep_outputs(&self, store: &dyn Store, stop: &CancellationToken) {
+        let runs = match self.kept.runs().await {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!(error = %adam_error::report(&e), "cannot list the kept output to sweep");
+                return;
+            }
+        };
+        for run in runs {
+            if stop.is_cancelled() {
+                break;
+            }
+            match is_over(store, &run).await {
+                Ok(Some(true)) => {
+                    if let Err(e) = self.kept.remove_run(&run).await {
+                        tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the kept output of a finished run");
+                    }
+                }
+                Ok(Some(false) | None) => {}
+                Err(e) => {
+                    tracing::warn!(%run, error = %adam_error::report(&e), "cannot ask the store about a run; its kept output stays");
+                }
+            }
+        }
     }
 
     /// Whether the conversation of the finished run `record` may go on, so that its scratch projects

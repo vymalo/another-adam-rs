@@ -88,6 +88,7 @@ pub mod files;
 pub mod github_mcp;
 pub use adam_service::harden;
 pub mod janitor;
+pub mod kept;
 pub mod mcp_secrets;
 pub mod redact;
 mod repos;

@@ -95,7 +95,7 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 30] = [
+const TOOLS: [&str; 31] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -107,6 +107,7 @@ const TOOLS: [&str; 30] = [
     "list_files",
     "find_files",
     "search_files",
+    "read_output",
     "write_file",
     "apply_patch",
     "edit_file",
@@ -158,6 +159,7 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     assert_eq!(title("edit_file"), Some("Edit a file"));
     assert_eq!(title("run_command"), Some("Run a command"));
     assert_eq!(title("run_checks"), Some("Run the checks"));
+    assert_eq!(title("read_output"), Some("Read an output"));
     assert_eq!(title("start_scratch"), Some("Start a scratch project"));
     assert_eq!(title("ask_user"), Some("Ask you"));
     assert_eq!(title("plan_work"), Some("Write the plan"));
@@ -184,6 +186,7 @@ async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
         ("list_files", Search),
         ("find_files", Search),
         ("search_files", Search),
+        ("read_output", Read),
         ("write_file", Edit),
         ("edit_file", Edit),
         ("apply_patch", Edit),
@@ -768,6 +771,7 @@ async fn the_shipped_folder_has_a_read_only_explorer_and_reviewer() {
                 "list_files",
                 "find_files",
                 "search_files",
+                "read_output",
                 "run_command"
             ],
             "{name}"
@@ -1364,4 +1368,93 @@ async fn the_policy_and_the_servers_decide_what_a_folder_may_connect() {
         .await
         .expect_err("nothing listens on port 1");
     assert_eq!(error.class(), ErrorClass::Transient, "{error}");
+}
+
+/// `read_output` through the real `CoderAgent` (not a context with a store put in by hand): the model
+/// runs a long command, then reads the id from its result. The agent puts the keeper in the state of
+/// the tools: without it the second call fails.
+#[tokio::test]
+async fn the_model_reads_a_long_command_back_through_the_real_coder_agent() {
+    let fx = Fixture::new().await;
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let agent = CoderAgent::new(model, "test-model", fx.env.clone());
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = Runtime::builder(store)
+        .agent(agent)
+        .poll_interval(Duration::from_millis(20))
+        .build();
+    let run = rt
+        .start(
+            AGENT_NAME,
+            user_message(&format!("look around {}", fx.remote_url())),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = adam_llm_agent::output_id(&run.to_string(), "c2");
+    mock.push_tool_calls(vec![common::call(
+        "c1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![common::call(
+        "c2",
+        "run_command",
+        json!({"command": "seq 1 30000"}),
+    )])
+    .push_tool_calls(vec![common::call(
+        "c3",
+        "read_output",
+        json!({"id": id, "offset": 2001, "limit": 3}),
+    )])
+    .push_text("done");
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let worker = {
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            rt.run_worker(async {
+                let _ = rx.await;
+            })
+            .await
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let view = loop {
+        let view = rt.view(run).await.unwrap().expect("run exists");
+        match view.status {
+            RunStatus::Done => break view,
+            RunStatus::Failed => panic!("the run failed: {view:#?}"),
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "timed out: {view:#?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+
+    let state: adam_llm_agent::Conversation = serde_json::from_value(view.state).unwrap();
+    let said: Vec<(String, bool)> = state
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            adam_model::Message::Tool {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said.len(), 3, "{said:?}");
+    assert!(
+        said[1].0.contains(&format!("kept as {id}")),
+        "{}",
+        said[1].0
+    );
+    assert_eq!(
+        said[2],
+        (
+            "2001\n2002\n2003\n[more: 27997 lines left; next page: offset=2004]".to_owned(),
+            false
+        )
+    );
 }

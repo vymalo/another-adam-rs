@@ -186,7 +186,9 @@ The person watching a turn of yours sees two different things, and each has its 
 - `run_command { command, repo? }`: look around in the worktree with a shell command
   (`git branch -r`, `ls`, `cat README.md`, `git log --oneline`, `grep -rn name src`).
   It runs in the workspace's environment (see "The work environment").
-  It returns the exit code and the tail of the output. It costs no check cycle and
+  It returns the exit code and the output; a long output is shown as its head and tail
+  with an id, and is kept whole. Read the rest with `read_output { id, offset?, limit? }`, a page
+  at a time, as with `read_file`. It costs no check cycle and
   reports no checks; it is for looking: changes it makes to HEAD, the branch
   and the working tree are undone and refused.
 - `run { command, repo? }`: make something with a shell command and **keep** it: generate

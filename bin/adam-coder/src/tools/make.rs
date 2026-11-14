@@ -41,7 +41,7 @@ use super::checks::missing_tool_answer;
 use super::gitcli::{GitAt, status_text};
 use super::inspect::{Snapshot, render};
 use super::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
-use super::{Outcome, ToolEnv, non_empty, run_error};
+use super::{Outcome, ToolEnv, non_empty, output, run_error};
 
 /// Most changed files the result lists.
 const MAX_LISTED: usize = 20;
@@ -66,9 +66,15 @@ pub async fn run(
     cwd: Option<String>,
     /// The slot to run in: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
+    /// Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {"command":"npm test","timeout":120}
+    timeout: Option<i64>,
 ) -> Outcome {
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
+    };
+    let timeout = match output::timeout_of(&env, timeout) {
+        Ok(timeout) => timeout,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     // A repository's worktree or a scratch project: the command works on either.
     let slot = match env.slot(ctx, repo.as_deref()).await {
@@ -102,12 +108,13 @@ pub async fn run(
             ctx,
             &*environment,
             shell_spec(&dir, command),
-            env.settings.check_timeout,
+            timeout,
             env.settings.check_output_tail,
+            true,
         )
         .await
         .map_err(|e| run_error(redactor, &e))?;
-    outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
+    output::settle(&env, ctx, &mut outcome).await;
 
     // Did it touch git? The files are its to change; HEAD, the branch, the refs, the
     // configuration and `.git` are not.
@@ -276,6 +283,7 @@ mod tests {
             timed_out: false,
             tail: "out".into(),
             truncated: false,
+            ..ShellOutcome::default()
         };
         let said = touched_git("git commit -am x", &outcome, true);
         assert!(
@@ -293,6 +301,7 @@ mod tests {
             timed_out: false,
             tail: "out".into(),
             truncated: false,
+            ..ShellOutcome::default()
         };
         let said = unverified("npm run render", &outcome, true);
         assert!(

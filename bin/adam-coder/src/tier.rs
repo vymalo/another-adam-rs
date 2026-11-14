@@ -102,6 +102,7 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "list_files"
         | "find_files"
         | "search_files"
+        | "read_output"
         | "share_file"
         | "rebuild_environment"
         | "ask_user"
@@ -307,6 +308,7 @@ mod tests {
             ("list_files", Plan),
             ("find_files", Plan),
             ("search_files", Plan),
+            ("read_output", Plan),
             ("run_command", Plan),
             ("prepare_workspace", Plan),
             ("request_repository", Plan),

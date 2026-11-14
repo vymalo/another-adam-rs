@@ -384,6 +384,17 @@ impl Dir {
         Ok(())
     }
 
+    /// Make this directory private to its user: mode `0700` (`fchmod` on the descriptor held, so a
+    /// link swapped in meanwhile is not followed).
+    ///
+    /// # Errors
+    ///
+    /// The errors of `fchmod`.
+    pub fn set_private(&self) -> io::Result<()> {
+        rustix::fs::fchmod(&self.fd, Mode::from_raw_mode(0o700))?;
+        Ok(())
+    }
+
     /// Rename `from` to `to`, both in this directory, replacing what is at `to` (a link is replaced,
     /// not followed).
     ///

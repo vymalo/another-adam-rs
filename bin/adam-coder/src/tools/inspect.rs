@@ -29,7 +29,7 @@ use super::gitcli::{
     restore_worktree, status_text, working_tree_id,
 };
 use super::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
-use super::{Outcome, ToolEnv, non_empty, run_error};
+use super::{Outcome, ToolEnv, non_empty, output, run_error};
 
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
 /// `ls`, `cat README.md`, `grep -rn name src`. It runs in the workspace's environment (the
@@ -38,7 +38,8 @@ use super::{Outcome, ToolEnv, non_empty, run_error};
 /// It costs no check cycle and reports no checks, and it is for looking: changes it makes to
 /// HEAD, the branch and the working tree are undone and refused (to make a file or change the
 /// worktree with a command, use run; to change code, write_file, edit_file or
-/// apply_patch). Use it to look; use run_checks only for the project's real checks.
+/// apply_patch). Use it to look; use run_checks only for the project's real checks. Long output is
+/// kept: you get its head and tail and an id to read the rest with read_output.
 #[tool(label = "Run a command", icon = "execute")]
 pub async fn run_command(
     env: State<ToolEnv>,
@@ -49,9 +50,15 @@ pub async fn run_command(
     cwd: Option<String>,
     /// The slot to run in: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
+    /// Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {"command":"npm test","timeout":120}
+    timeout: Option<i64>,
 ) -> Outcome {
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
+    };
+    let timeout = match output::timeout_of(&env, timeout) {
+        Ok(timeout) => timeout,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     // A repository's worktree or a scratch project: both are looked at the same way.
     let slot = match env.slot(ctx, repo.as_deref()).await {
@@ -85,12 +92,13 @@ pub async fn run_command(
             ctx,
             &*environment,
             shell_spec(&dir, command),
-            env.settings.check_timeout,
+            timeout,
             env.settings.check_output_tail,
+            true,
         )
         .await
         .map_err(|e| run_error(redactor, &e))?;
-    outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
+    output::settle(&env, ctx, &mut outcome).await;
 
     // Did it change anything it should not have?
     let after = Snapshot::of_slot(&slot).await;
@@ -326,17 +334,7 @@ pub(super) fn render(command: &str, outcome: &ShellOutcome) -> String {
         }
     };
     let mut text = format!("$ {command}\n{how}\n");
-    if outcome.truncated {
-        text.push_str(&format!(
-            "(output truncated: the last {} bytes follow)\n",
-            outcome.tail.len()
-        ));
-    }
-    text.push_str("--- output ---\n");
-    text.push_str(&outcome.tail);
-    if !outcome.tail.ends_with('\n') {
-        text.push('\n');
-    }
+    text.push_str(&output::section(outcome));
     text
 }
 
@@ -350,6 +348,7 @@ mod tests {
             timed_out,
             tail: tail.to_owned(),
             truncated,
+            ..ShellOutcome::default()
         }
     }
 

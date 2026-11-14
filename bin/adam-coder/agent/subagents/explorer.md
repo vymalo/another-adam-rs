@@ -1,6 +1,6 @@
 ---
 description: "Reads a repository that is already in the workspace and answers where and how questions (where is X configured, how does Y flow) with file paths and line numbers. Read-only: it changes nothing."
-tools: [read_file, list_files, find_files, search_files, run_command]
+tools: [read_file, list_files, find_files, search_files, read_output, run_command]
 limits:
   max_turns: 40
   max_tool_calls: 80

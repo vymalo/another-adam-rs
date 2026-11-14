@@ -112,6 +112,7 @@ pub(super) async fn on_base(
                 shell_spec(&dir, command),
                 env.settings.check_timeout,
                 env.settings.check_output_tail,
+                false,
             )
             .await,
         ),
@@ -224,6 +225,7 @@ mod tests {
             timed_out,
             tail: tail.to_owned(),
             truncated: false,
+            ..ShellOutcome::default()
         }
     }
 

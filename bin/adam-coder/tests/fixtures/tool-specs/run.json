@@ -15,6 +15,11 @@
       "repo": {
         "type": "string",
         "description": "The slot to run in: its name, or the repository's address. Leave out when the workspace has one."
+      },
+      "timeout": {
+        "description": "Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {\"command\":\"npm test\",\"timeout\":120}",
+        "format": "int64",
+        "type": "integer"
       }
     },
     "required": [
