@@ -1,6 +1,6 @@
 ---
 description: "Reviews the change in the workspace's worktree before a pull request: reads the diff against the base branch and returns findings by severity with file and line. Read-only: it never edits."
-tools: [read_file, run_command]
+tools: [read_file, list_files, find_files, search_files, run_command]
 limits:
   max_turns: 40
   max_tool_calls: 80

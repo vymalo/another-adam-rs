@@ -52,7 +52,10 @@ sequenceDiagram
 | `run { command, cwd?, repo? }` | **making something with a command, and keeping it**: `npm run render`, `python chart.py`, an install, a build. Runs exactly as `run_command` does (the run's environment, the same shell, `cwd` rule, `CHECK_TIMEOUT_SECS` and output cap, secrets hidden from the child, a missing tool reported as a missing toolchain), but the **files it changes stay**, and the result lists what `git status` shows (files the project ignores are kept too and are not listed). It is **never a check**: no `checks` artifact, no cycle, nothing written to the run's notes, so the gate cannot see it; the files it changed make an earlier green check stale, which the result says. It cannot touch git: the same record as `run_command`'s is compared after the command, minus the files, and a command that changed `HEAD`, the branch, a ref, the `.git` file, the configuration or `info/exclude` is **undone entirely, its files included**, and refused ([below](#making-something-with-a-command)). A timeout kills the process group and what it had written stays. Progress lines: `running: <command>`, then `changed files: <command>` or `ran: <command>` |
 | `request_repository { repo_url, reason }` | **asks the person** whether another repository may join the workspace: the run parks (`input-required`) on a question **the tool writes**, which names the repository and quotes the model's `reason` (one line, at most 300 characters: `May I add the repository acme/lib (https://github.com/acme/lib) to this workspace? The agent says why: "..."`) and offers `Yes, add acme/lib` and `No`, as a form (one `Choices` question, id `consent`) on a screen that can draw it and as text on one that cannot (the same machinery as `ask_user`'s `choices`, [below](#asking-with-choices)). Only a yes adds the repository (it is then **granted**: the model calls `prepare_workspace` with it); the model never grants, see [the rules](#another-repository-only-with-the-persons-yes). A repository already granted is a result that says so (nobody is asked); one the person turned down (an explicit `no`) is an error result that says not to ask again; a message that is neither a yes nor a no (`wait`, `?`) records nothing, and the tool asks again; one the workspace's policy would refuse (its host is not in `ALLOWED_REPO_HOSTS`, or it is a local path) is an error result **before** anyone is asked. In a run another agent started it asks nobody and says so in an error result ([below](#when-another-agent-asks-nobody-to-agree)). `asks_user()` is `true`, so a subagent cannot have it |
 | `create_repository { owner, name, private?, description? }` | creates a new, **empty** repository (no commit: `publish_scratch` gives it its first), and only **after the person agrees, every time, unless they picked the `bypass` tier for the message**. The owners are `CREATE_REPO_OWNERS` when it lists some (a list restricts to exactly these), else, for a **GitHub App** that names its accounts, those (`GITHUB_APP_OWNERS` as a list, or the pinned installation's account; **`GITHUB_APP_OWNERS=*` does not count**, list the owners in `CREATE_REPO_OWNERS`), else none (a token with no list creates nothing); any other owner is an error result that says so; **when nobody may create, the tool is not in `coder_tools` at all**, so the model is not offered it, and the tool's own refusal stays as the last line of defence for a caller that composes its own tool set; it needs the `auto` tier; private unless `private: false`; `name` is `^[A-Za-z0-9._-]{1,100}$`, not `.`/`..`, not ending `.git`; `description` is at most 350 characters. The first call parks the run on a question **the tool writes** (`May I create the repository acme/fib on github.com? It will be private and empty.`, with the description quoted, and the options `Create acme/fib` and `Don't create it`); the answer comes back as that call's result, and **the model calls the tool again** with the same arguments: with a recorded yes for exactly `owner/name` **and that visibility** it creates the repository (a yes to the private one does not cover a public one), waits up to 10 s for it to be reachable over git, and grants it (the key of its clone URL) and records it (`RunNotes::created_repos`); a repeat after that is the same result and creates nothing; after a no it is an error result that says not to ask again; in a run another agent started nobody is asked ([below](#when-another-agent-asks-nobody-to-agree)). See [below](#a-repository-of-its-own-on-request). `asks_user()` is `true` |
-| `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
+| `read_file { path, offset?, limit?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)), **one page at a time** ([below](#paged-reads-read_file-list_files-find_files-search_files)): at most 2,000 lines or 50 KiB, each line behind its number, and a last line that says what is left (`[more: 3000 lines left; next page: offset=2001]`) or that it is the end (`[end: 5000 lines]`); a negative `offset` reads from the end; a line over 2,000 characters is cut and says how long it was; a missing file names the closest paths git knows; `start_line` and `end_line` are kept as the old names of `offset` and `limit` (`offset` with `start_line` is refused); a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
+| `list_files { path?, offset?, limit?, repo? }` | one directory of the worktree, not recursive, sorted by the bytes of the name; a directory ends in `/`, a link in `@`; hidden entries show, `.git` does not. Page of 200 entries. Tier `plan` |
+| `find_files { pattern, path?, offset?, limit?, repo? }` | the files below `path` whose path matches a glob (`*` stays within a directory, `**` crosses, `{a,b}`; a pattern with no `/` matches names anywhere), files git ignores left out, sorted. Page of 100 paths. Tier `plan` |
+| `search_files { pattern, path?, include?, literal?, offset?, limit?, repo? }` | the lines of the files below `path` that match a regular expression (`literal: true`: plain text), as `path:line:text`, sorted by path and line; `include` is a glob over the paths. Page of 100 lines. Tier `plan` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
 | `edit_file { path, old, new, replace_all?, repo? }` | replaces **exact text** in a file of the worktree, confined like `write_file` ([below](#reading-and-changing-files-itself)): `old` (blanks and line breaks included) must be in the file, once unless `replace_all`. A file that is not there, a directory, binary or non-UTF-8 content, one over 1 MiB, an empty `old`, and `old == new` are results that say so. **When `old` is not found it changes nothing and shows the closest region**: its line numbers, two lines of context around it, the first line where it and `old` differ, and a hint when only blanks differ or the file has CRLF endings. **When `old` is in the file several times and `replace_all` is not set** it says how many times and at which lines. Written like `write_file` (a new file renamed over the old, the mode kept). Progress line: `edited <path> (<slot>)` |
@@ -112,6 +115,7 @@ bring its title.
 | Icon | Tools |
 |---|---|
 | `read` | `read_file` |
+| `search` | `list_files`, `find_files`, `search_files` |
 | `edit` | `write_file`, `edit_file`, `apply_patch` |
 | `execute` | `run_command`, `run`, `run_checks`, `rebuild_environment` |
 | `git` | `prepare_workspace`, `commit_and_push`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `create_repository`, `publish_scratch` |
@@ -562,6 +566,49 @@ Limits: 256 KiB of a file read, 1 MiB of content or patch. The checks and the wr
 a run are called one at a time and what a command leaves running is killed with it, and a write goes to a new file that is
 renamed over its target, which replaces a symlink that appeared meanwhile instead of following it.
 
+### Paged reads: `read_file`, `list_files`, `find_files`, `search_files`
+
+[ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)
+decision 2: everything that reads is paged, with one convention (`adam_llm_agent::paging`). The call takes `offset` (from 1; negative
+counts from the end) and `limit` (clamped to the page); the result is the page and **one last line**, always the last, that says what is
+left and where the next page starts. The same call gives the same bytes, so a repeated read is a cached read.
+
+| Last line | Meaning |
+|---|---|
+| `[more: 3000 lines left; next page: offset=2001]` | call again with `offset` 2001 (`entries`, `paths` or `matches` for the other tools) |
+| `[end: 5000 lines]` | that was all; `; no newline at the end of the file` when the file has none |
+| `[end: 37 matches in 12 files; 2 files over 4 MiB not searched]` | the end of a search, and what it skipped |
+
+Page sizes: `read_file` 2,000 lines or 50 KiB of rendered text (at least one line), `list_files` 200, `find_files` 100, `search_files` 100. An
+offset past the end, an offset of 0 and a limit below 1 are error results. A negative `offset` on `read_file` reaches back at most 10,000 lines.
+
+**Where they read.** In the coder's own process, through the slot's descriptors (`SlotDir`), never through the run's environment: a run pod or a
+devcontainer is not started for a read. Every `path` goes through `confine` (no `..`, no absolute path, nothing inside `.git`, a link only while
+it stays inside).
+
+* `list_files` is one `getdents` of the held directory (`Dir::entries`, sorted by bytes), no `git`.
+* `find_files` and `search_files` take their candidates from `git ls-files -z --cached --others --exclude-standard`, asked through `GitAt` (so in
+  the git sandbox when `GIT_SANDBOX_SOCKET` is set; `src/tools/gitcli.rs` `list_files`). That is exact (nested `.gitignore`, `info/exclude`) and
+  is what `commit_and_push` sees. **With git unavailable the result is an error** ("cannot ask git which files are ignored"): nothing falls back
+  to walking a directory by its name. A tracked file that was deleted is looked at (`lstat`) and left out. At most 200,000 paths or 16 MiB of
+  git's answer ("narrow `path`").
+* Each candidate is opened relative to the slot's descriptor, so a link on the way is refused and a link at the file is not followed: **links
+  are listed by `find_files` and never searched**. A swap of the slot after the list is made is not followed (`safe_fs::race` checkpoint `search`).
+
+**Bounds.** A pattern is at most 1000 bytes. A regular expression is the `regex` crate's (linear time, no backtracking; compiled size at most
+1 MiB), a glob is `globset`'s (`*` and `?` stay within a directory, `**` crosses, `{a,b}`; a pattern with no `/` matches names anywhere; the
+same rule for `include`). `search_files` skips a file over 4 MiB (and says how many) and a binary one (a NUL in its first 8 KiB), reads at most
+20,000 files or 256 MiB, and keeps at most 20,000 matches: past any of them the result is an error that says to narrow `path` or `include`.
+The call has 30 s; **a timeout is an error result, never a partial page**, because a partial page would depend on time. The work is bounded by
+what it does, and every list is sorted by the bytes of the path (then the line), never by `readdir` order or modification time.
+
+**Secrets.** The redaction of tool results applies to a page like to any result. A registered secret that spans two lines or two pages is not
+recognised (the limit `Redactor` states).
+
+**The loop's backstop.** Any tool result over 64 KiB is cut before it enters the history, with `[cut by the loop: 65536 of N bytes shown]`, and
+`Call <tool> again with a later offset to read the rest` only for a tool whose schema has an `offset`
+([`adam-llm-agent`](../../crates/adam-llm-agent/README.md)).
+
 ### Sharing a file
 
 A reply holds text, cards and diagrams; a picture, an export or a report is a file. `share_file { path, repo?, name? }`
@@ -673,8 +720,8 @@ stateDiagram-v2
 
 ### Subagents: `explorer` and `reviewer`
 
-`agent/subagents/` has two read-only helpers, each a child run with its own prompt and the tools `read_file` and
-`run_command` only (no write, no checks, no publishing, nothing that asks the person).
+`agent/subagents/` has two read-only helpers, each a child run with its own prompt and the tools `read_file`, `list_files`,
+`find_files`, `search_files` and `run_command` only (no write, no checks, no publishing, nothing that asks the person).
 `explorer` answers where and how questions about a repository with file paths and line numbers; `reviewer` reads
 `git diff origin/<base>...HEAD` and returns findings by severity with file and line. The prompt says when to use them
 (a large or unfamiliar repository; once before `open_pull_request`), and what they say is advice: the gates decide.
@@ -809,7 +856,7 @@ tier, and the tools check it again against the tier in the notes.
 
 | Tier | The coder may | Forms |
 |---|---|---|
-| `plan` | read only: `read_file`, `run_command` (its changes are undone), `prepare_workspace`, `share_file`, `rebuild_environment`, the helpers, GitHub and web reads, `ask_user`; the answer is a plan | a repository the person did not name asks |
+| `plan` | read only: `read_file`, `list_files`, `find_files`, `search_files`, `run_command` (its changes are undone), `prepare_workspace`, `share_file`, `rebuild_environment`, the helpers, GitHub and web reads, `ask_user`; the answer is a plan | a repository the person did not name asks |
 | `edits` | also change files (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `start_scratch`), `publish_scratch`, `commit_and_push`, `open_pull_request` | same; a bare name does **not** count as named |
 | `auto` | also `merge_pull_request` (below) and `create_repository` | a name the person wrote **alone** in their newest message (`widgets`, not a piece of a URL or a path) counts as named when exactly one owner applies; `create_repository` still asks its yes or no |
 | `bypass` (only with `MAX_ACCESS_TIER=bypass`) | also `rename_repository` and `delete_repository` | none: any repository the host allows is granted, `create_repository` asks nothing |
@@ -2488,10 +2535,17 @@ database of its own, so the role needs `CREATEDB`):
   `gitcli.rs` (the `.git` file and a scratch project's `info/exclude` put back after the slot was swapped, and `git` not started on a
   slot replaced after the check). The tests use `adam_workspace::safe_fs::race` (the `test-util` feature of `adam-workspace`, which the
   crate enables for its own tests); the seam does nothing in the binary.
+* `src/tools/find.rs` (unit; each runs against a real `git init` directory) and `tests/tools.rs`
+  (`the_look_around_tools_page_find_and_search_inside_the_worktree`): `list_files` (sorted by bytes, `/` and `@`, no `.git`),
+  `find_files` (ignored files left out, `*` does not cross `/`), `search_files` (sorted `path:line:text`, `literal`, `(a+)+$` over 1 MiB in under
+  a second, a pattern over 1000 bytes or a compiled size over 1 MiB refused, a symlink out of the slot not searched, files over 4 MiB counted),
+  the paths outside the slot refused, **git unavailable fails closed**, and a timeout is an error that stops the blocking work;
+  `files.rs` `swap_tests` `search_does_not_follow_a_slot_swapped_after_the_check`.
 * `src/tools/files.rs` (unit) and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
   `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that
-  stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a range with numbers, a
-  range past the end, a cut at 256 KiB also inside a multi-byte character, a binary file, a directory),
+  stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a page of 2,000 lines and its
+  `[more: ...]` line, a negative offset, the 50 KiB cap, a long line cut, `start_line` and `end_line` as aliases, a missing file's closest paths,
+  no newline at the end, a binary file, a directory; the properties `prop_paging_reassembles_the_file` and `prop_same_call_same_bytes`),
   `write_file` (parents, replace, the mode kept, nothing left behind, the 1 MiB limit, the progress line), and
   `apply_patch` (two files, one a new one; a hunk that does not match changes nothing; a malformed, empty, oversized or
   NUL patch; a patch for `.git/config`, `.GIT/hooks`, `../x`, a path through a symlink, a symlink created by the patch, a
@@ -2613,8 +2667,8 @@ database of its own, so the role needs `CREATEDB`):
   over, the task is `Completed` with the file as an A2A artifact, no pull request and no check),
   `a_scratch_file_that_was_not_shared_does_not_complete_the_run` and
   `a_run_in_a_repository_that_shared_a_file_but_opened_no_pull_request_still_waits`.
-* Subagents (ADR 0021): `tests/agent_files.rs` has the manifest test (`explorer` and `reviewer`, each with exactly `read_file` and
-  `run_command`) and a run where the coder prepares a workspace and the explorer's `read_file` reads a file of it;
+* Subagents (ADR 0021): `tests/agent_files.rs` has the manifest test (`explorer` and `reviewer`, each with exactly `read_file`, `list_files`,
+  `find_files`, `search_files` and `run_command`) and a run where the coder prepares a workspace and the explorer's `read_file` reads a file of it;
   `tests/tools.rs` `a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run` (a child context reads the root's
   worktree, a stranger finds none, a failed check of the subagent is a cycle of the root).
 * `run_command`, the shell and the missing toolchain are tested in `tests/tools.rs`

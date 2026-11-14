@@ -752,7 +752,17 @@ async fn the_shipped_folder_has_a_read_only_explorer_and_reviewer() {
             .find(|i| i.name == name)
             .unwrap_or_else(|| panic!("{name} is missing: {info:#?}"));
         assert_eq!(sub.parent.as_deref(), Some(AGENT_NAME), "{name}");
-        assert_eq!(sub.tools, ["read_file", "run_command"], "{name}");
+        assert_eq!(
+            sub.tools,
+            [
+                "read_file",
+                "list_files",
+                "find_files",
+                "search_files",
+                "run_command"
+            ],
+            "{name}"
+        );
         assert!(sub.skills.is_empty(), "{name}");
     }
     assert_eq!(agent.subagents().len(), 2);

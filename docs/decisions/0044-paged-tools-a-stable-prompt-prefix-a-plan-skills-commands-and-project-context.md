@@ -2,7 +2,7 @@
 
 Status: **Accepted** (2026-11-14). The directions are the owner's, given the same day after a comparison of adam-rs at `37d0b11`
 with OpenCode 2.3.0; they are quoted where they decide something, and what was first only recommended was put to the owner
-the same day: see [The owner's answers](#the-owners-answers-2026-11-14). Nothing of it is built. Builds on
+the same day: see [The owner's answers](#the-owners-answers-2026-11-14). Slices 1 and 2 are built (below). Builds on
 [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md) (the loop, rules, compaction, plugins),
 [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md) (parallel subagents) and
 [ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md) (OpenCode leaves the coder), none of which is built
@@ -12,6 +12,8 @@ either (*verified 2026-11-14*: no `Plugin`, `Rule`, `doom_loop`, `Conversation::
 *Built 2026-11-14:* slice 1 (the loop survives), with two changes from the text above: the closing turn keeps its tools and sends `tool_choice: none`, and a complete body without `finish_reason` stays a protocol error.
 
 *Built 2026-11-14:* slice 5 (ADR 0038's removal of OpenCode), with ADR 0038's slices 1, 2, 4 and 5 in one pull request; its operator slice (3) is void here, [ADR 0046](0046-the-operator-lives-in-the-platform-repository.md).
+
+*Built 2026-11-14:* slice 2 (paged reads), decision 2 up to and including the loop's backstop: `crates/adam-llm-agent/src/paging.rs`, `read_file`, `list_files`, `find_files` and `search_files` (`bin/adam-coder/src/tools/files.rs`, `find.rs`), `Dir::entries`. As decided, with these details the text above left open: the last line is `[more: <n> lines left; next page: offset=<k>]` or `[end: <n> lines]` (`entries`, `paths`, `matches` for the other tools), with no header line; a negative `offset` reaches back at most 10,000 lines; the 64 KiB cap cuts on a character boundary and names `offset` only for a tool whose schema has one; `search_files` also stops with an error at 20,000 files, 256 MiB read or 20,000 matches, skips files over 4 MiB (counted in its last line) and binary files; a call over 30 s is an error result, never a partial page. The candidates of `find_files` and `search_files` come from `git ls-files` through the git sandbox and fail closed without it. Not built yet: the command output kept as `read_output`, the MCP result kept and paged, `read_skill_file`'s `offset` and `limit`, and decision 1.
 
 ## Context
 
