@@ -927,7 +927,7 @@ async fn a_secret_is_scrubbed_before_the_surface_cuts_the_text() {
         let made = work
             .call(
                 &ctx,
-                json!({"title": format!("Fix {TOKEN}"), "items": [format!("{}", "x".repeat(180)), format!("use {TOKEN} here")]}),
+                json!({"title": format!("Fix {TOKEN}"), "items": ["x".repeat(180), format!("use {TOKEN} here")]}),
             )
             .await
             .unwrap();

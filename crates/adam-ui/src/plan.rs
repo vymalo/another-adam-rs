@@ -224,7 +224,6 @@ fn no_such_item(id: u32, plan: &Plan) -> ToolOutput {
 }
 
 /// What every plan tool checks first: the call is the root run's, and not a subagent's.
-#[allow(clippy::result_large_err)] // the refusal is a whole `ToolOutput`, as every tool returns it
 fn root_only(ctx: &ToolCtx) -> Result<(), ToolOutput> {
     if ctx.run_id() == ctx.root_run_id() {
         Ok(())

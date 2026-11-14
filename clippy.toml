@@ -1,2 +1,6 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+# A tool's refusal is a whole `ToolOutput` (`Result<_, ToolOutput>`, or `Result<_, Result<ToolOutput, ToolError>>`),
+# the type every tool returns: 128 bytes, and a pointer more for each journaled member it gains. A tool call is
+# I/O, never a hot path, so the default of 128 bytes would only ask for an `allow` at every such function.
+large-error-threshold = 256

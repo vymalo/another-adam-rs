@@ -113,7 +113,6 @@ enum Use {
 }
 
 /// The repository `repo` names, checked against the policy of the workspace, the code host's own
-#[allow(clippy::result_large_err)] // the refusal is a whole `ToolOutput`, as every tool returns it
 /// host and what the person gave this run (see [`Use`]). A refusal is the result for the model.
 async fn target(
     env: &ToolEnv,
