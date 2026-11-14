@@ -288,10 +288,20 @@ mod tests {
             output: None,
             error: Some("boom".into()),
         };
-        let notice = status.notice(child);
+        let notice = status.notice(child, RUN_FINISHED_KIND);
         assert_eq!(notice.kind, RUN_FINISHED_KIND);
         assert_eq!(notice.id, child.to_string());
-        assert_eq!(ChildStatus::from_notice(&notice), Some((child, status)));
+        assert_eq!(
+            ChildStatus::from_notice(&notice),
+            Some((child, status.clone()))
+        );
+        assert!(ChildStatus::from_report(&notice).is_none());
+
+        let report = status.notice(child, CHILD_REPORTED_KIND);
+        assert_eq!(report.kind, CHILD_REPORTED_KIND);
+        assert_eq!(report.payload, notice.payload, "same payload, other kind");
+        assert_eq!(ChildStatus::from_report(&report), Some((child, status)));
+        assert!(ChildStatus::from_notice(&report).is_none());
     }
 
     #[test]
