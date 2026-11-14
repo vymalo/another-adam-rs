@@ -174,7 +174,7 @@ async fn every_tool_has_its_tier_and_the_new_ones_need_the_high_ones() {
 /// four tools that read in pages declare it, and no other built-in tool does.
 #[tokio::test]
 async fn exactly_the_four_paged_tools_declare_that_they_page() {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     for tool in coder_tools(&fx.env) {
         let spec = tool.spec();
         let paged =
