@@ -4726,11 +4726,15 @@ mod cases {
             rt.view(free).await.unwrap().unwrap().status,
             RunStatus::Parked
         );
-        assert_eq!(
-            rt.view(parent).await.unwrap().unwrap().status,
-            RunStatus::Parked,
-            "the parent has no deadline"
+        // The children's ends are news for the parent, so it may be runnable again when the worker stops: what
+        // holds is that no deadline ended it.
+        let parent = rt.view(parent).await.unwrap().unwrap();
+        assert!(
+            matches!(parent.status, RunStatus::Parked | RunStatus::Runnable),
+            "the parent has no deadline: {:?}",
+            parent.status
         );
+        assert_eq!(parent.error, None, "the parent has no deadline");
     }
 
     /// State written before deadlines existed has no `deadline` and runs as it did.
