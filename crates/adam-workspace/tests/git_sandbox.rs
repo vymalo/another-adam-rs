@@ -429,8 +429,10 @@ async fn a_filter_in_a_scratch_project_runs_in_the_servers_tree_and_without_the_
         "scratch project",
     );
     // The same filter, on the questions the coder's tools ask (`status` runs it too).
+    // The same length as before: git then has to read the file through the filter to know whether
+    // it changed (a different length answers that from the stat data alone, in newer gits).
     std::fs::remove_file(&marker).unwrap();
-    std::fs::write(scratch.path().join("a.txt"), "changed content\n").unwrap();
+    std::fs::write(scratch.path().join("a.txt"), "CONTENT\n").unwrap();
     scratch.status().await.unwrap();
     assert_ran_in_the_server(
         &std::fs::read_to_string(&marker).expect("status ran the filter"),
