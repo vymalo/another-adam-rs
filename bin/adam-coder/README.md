@@ -68,15 +68,16 @@ sequenceDiagram
 | `rename_repository { repo, new_name }`, `delete_repository { repo, confirm }` | rename a repository, or delete it for good, **only a repository the person named** (their words, a yes to `request_repository`, or a repository this run created: a bare name is never enough for an act that cannot be taken back). `confirm` must be exactly the repository's `owner/name` (without regard to case), checked before the host is asked, so that a slip of the model deletes nothing. A rename grants the new address; both are noted in the run's notes once the host answered, so a repeat is the same answer. Same refusals as the merge. Need the `bypass` tier. `src/tools/admin.rs` |
 | `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions as one form: a title, why the coder asks, radio buttons, checkboxes, a searchable list, a deck of pictures or a typed answer, each option with a label and a description) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). The instructions say the coder MUST ask with `choices` whenever it offers options, never as a list in prose. It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
+| `plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }` | the plan ([`adam-ui`](../../crates/adam-ui/README.md#the-plan), ADR 0044): a checklist of at most 50 items the person sees and the model keeps, in the conversation's state (journaled, kept by a task that continues another). Each call returns the whole plan as short lines and draws it on a screen that can (a `Checklist`, else lines of text, else only the step). **Tier `plan`**: they change nothing outside the conversation, so they are shown and allowed at every tier. The coder's redaction layer scrubs the plan's texts as it scrubs a result. A subagent has none (the shipped ones list only `read_file` and `run_command`) |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the twenty-three. The shipped folder's own `mcp.json` adds
+folder](#mcp-tools-from-the-folder)); they are not part of the twenty-six. The shipped folder's own `mcp.json` adds
 eleven **read-only** tools of GitHub, `github__get_file_contents`, `github__list_branches` and the
 rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)). A call to one waits as long as the tool says it may take (`_meta["thread-tools/v1"].timeoutSecs`), at most `THREAD_TOOLS_MAX_CALL_SECS`; a tool the orchestrator reports as a step gets no step of the coder's; and a message that mentions agents adds a "Mentioned agents" block to the instructions ([`adam-ui`](../../crates/adam-ui/README.md), [ADR 0015](../../docs/decisions/0015-tools-the-orchestrator-reports-long-calls-and-mentioned-agents.md)).
 
-Twenty tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the twenty is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Twenty tools are written in this crate; the other six are `adam-ui`'s (the screen's three and the plan's three), built from `ToolEnv::ui`. Each of the twenty is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that every call is checked against the access tier of the run (`Gated`, [below](#access-tiers-what-the-person-lets-it-do-alone)) and everything a tool returns or fails with passes through the `Redactor` (**without `create_repository` when
@@ -105,6 +106,7 @@ by its name; [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its
 | `run_checks` | Run the checks | `rebuild_environment` | Rebuild the environment |
 | `commit_and_push` | Commit and push | `open_pull_request` | Open a pull request |
 | `ask_user` | Ask you | `show`, `ui_catalog` | Show on your screen, List what the screen can draw |
+| `plan_work` | Write the plan | `plan_check`, `plan_add` | Update the plan, Add to the plan |
 | `turn_output` (the endpoint's) | Send the answer | a subagent (`explorer`) | its name capitalised (Explorer) |
 
 `tests/agent_files.rs` (`every_tool_of_the_coder_has_a_title_for_its_step`) fails for a tool with none, so a new tool must
@@ -121,7 +123,7 @@ bring its title.
 | `git` | `prepare_workspace`, `commit_and_push`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `create_repository`, `publish_scratch` |
 | `delete` | `delete_repository` |
 | `file` | `start_scratch`, `share_file` |
-| `think` | `ask_user`, `request_repository` (the tools that ask the person) |
+| `think` | `ask_user`, `request_repository` (the tools that ask the person), `plan_work`, `plan_check`, `plan_add` (the plan) |
 
 `show` and `ui_catalog` have none, and neither has a call to a GitHub MCP tool (an MCP tool says a title, not a picture).
 The calls of the orchestrator's own tools (web search, reading a page) are steps the orchestrator reports itself
@@ -208,7 +210,7 @@ sequenceDiagram
   S->>C: message: text, ui-catalog/v1 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
   C->>E: tools/list (at every model turn, with the grant)
   E-->>C: get_ui_catalog and the tools attached since
-  C->>M: the coder's tools, ask_user, show, ui_catalog, then the listed ones except get_ui_catalog
+  C->>M: the coder's tools, ask_user, show, ui_catalog, plan_work, plan_check, plan_add, then the listed ones except get_ui_catalog
   M->>C: ask_user {question, choices: [db, auth, deploy]}
   C->>C: the catalog: inline, held by digest, or get_ui_catalog once (digest checked)
   C-->>S: input-required: the question and an application/a2ui+json surface (one Choices)
@@ -876,7 +878,7 @@ tier, and the tools check it again against the tier in the notes.
 
 | Tier | The coder may | Forms |
 |---|---|---|
-| `plan` | read only: `read_file`, `list_files`, `find_files`, `search_files`, `run_command` (its changes are undone), `prepare_workspace`, `share_file`, `rebuild_environment`, the helpers, GitHub and web reads, `ask_user`; the answer is a plan | a repository the person did not name asks |
+| `plan` | read only: `read_file`, `list_files`, `find_files`, `search_files`, `run_command` (its changes are undone), `prepare_workspace`, `share_file`, `rebuild_environment`, the helpers, GitHub and web reads, `ask_user`, the plan tools (`plan_work`, `plan_check`, `plan_add`: they change nothing outside the conversation); the answer is a plan | a repository the person did not name asks |
 | `edits` | also change files (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `start_scratch`), `publish_scratch`, `commit_and_push`, `open_pull_request` | same; a bare name does **not** count as named |
 | `auto` | also `merge_pull_request` (below) and `create_repository` | a name the person wrote **alone** in their newest message (`widgets`, not a piece of a URL or a path) counts as named when exactly one owner applies; `create_repository` still asks its yes or no |
 | `bypass` (only with `MAX_ACCESS_TIER=bypass`) | also `rename_repository` and `delete_repository` | none: any repository the host allows is granted, `create_repository` asks nothing |

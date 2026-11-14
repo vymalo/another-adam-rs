@@ -16,7 +16,7 @@ It is the second binary over [`adam-service`](../../crates/adam-service/README.m
 [`adam-coder`](../adam-coder/README.md); the process (the store, the roles, the notifications, the exit
 codes) is the same code. What is different is the agent: `adam-coder` has an embedded one and nine tools of its own
 written in Rust (a worktree, its files, checks, a pull request); `adam-agent` has **none of its own**, and the
-only tools it brings are the person's screen: `ask_user`, `show` and `ui_catalog`
+only tools it brings are the person's screen and a plan: `ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check` and `plan_add`
 ([`adam-ui`](../../crates/adam-ui/README.md)). Everything else an agent can do comes from its folder.
 
 ## The agent folder
@@ -35,7 +35,7 @@ applies at the next start, and a restart is a deploy.
 | `limits:` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens` |
 | `model:` | the model alias of the agent, when it should not be `MODEL` |
 | `vars:` | `{{placeholders}}` of the prompt. **Every var needs a value in the file**: nothing in this binary supplies one, so a var declared without a value (or one the prompt does not use, or a placeholder `vars` does not declare) stops the process at startup, naming it |
-| `tools:` | optional; selects among the tools the agent has (`ask_user`, `show`, `ui_catalog`, the MCP tools `<server>__<tool>`, the skills' tools, the subagents). `linear__*` takes a server's tools. A name that is none of them is refused with a suggestion |
+| `tools:` | optional; selects among the tools the agent has (`ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check`, `plan_add`, the MCP tools `<server>__<tool>`, the skills' tools, the subagents). `linear__*` takes a server's tools. A name that is none of them is refused with a suggestion |
 | the body | the system prompt |
 | `skills/` | Agent Skills: a catalog the model loads from on demand (`load_skill`, `read_skill_file`) |
 | `subagents/` | assembled and **registered beside the agent** (`<name>/<subagent>`): one tool per subagent, a child run with its own prompt and tools. A subagent gets only the tools it lists, and not `ask_user` (nobody would answer it) |
@@ -54,6 +54,11 @@ The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/REA
 * `show { blocks, title? }` and `ui_catalog {}`: draw blocks of the components the person's screen has (cards, a
   diagram), and list them. They answer "answer in text" when the screen sent no catalog. A folder that does not want
   them lists the tools it does want in `tools:`.
+* `plan_work { title?, items }`, `plan_check { id, status, note? }` and `plan_add { items, after? }`: **every root agent has a
+  plan**, a chat included (ADR 0044). The plan is the conversation's state (journaled, kept by a task that continues
+  another), each call returns the whole plan as short lines and draws it as a `Checklist` (or lines of text) on a screen
+  that can, and a subagent has none. **A folder with `tools:` must list `plan_*` (or `*`) to get them**: they narrow by
+  name like `ask_user`. See [`adam-ui`](../../crates/adam-ui/README.md#the-plan) for the words and the limits.
 * **The conversation's tools.** A message from the orchestration layer's chat announces one MCP endpoint for the
   conversation (`thread-tools/v1`); whatever it lists is offered to the model at every turn under its listed name
   (the relayed tools of attached servers; not `get_ui_catalog`, which the model has as `ui_catalog`), through a
@@ -240,7 +245,7 @@ sequenceDiagram
   M->>S: serve(Config, shutdown)
   S->>F: load(ADAM_AGENT_DIR), log `agent files`
   alt a role that runs workers
-    S->>A: connect_mcp(policy), bind(ask_user, show, ui_catalog) and the thread-tools source, model(client, alias)
+    S->>A: connect_mcp(policy), bind(ask_user, show, ui_catalog, plan_*) and the thread-tools source, model(client, alias)
     A-->>S: Agents { the whole agent }
   else control plane
     S->>A: the start-only half (name and init)
@@ -284,7 +289,7 @@ The binary is `main.rs` over a small library, so everything it does is testable 
 | `serve(config, shutdown)` | the process: folder, card, assembly, then `adam_service::serve` |
 | `folder::load(path)`, `folder::log(&folder)` | read the folder (every diagnostic in the error), say which files run |
 | `card_of(&def, &public_url)`, `card_of_folder(&folder, &public_url)` | the A2A card the files declare; the second also declares `build/v1` (the revision and the folder's digest). `build_version()`, `BUILD_REVISION`, `VERSION` |
-| `assemble(def, model, alias, &policy)` | connect the MCP servers, bind `ask_user`, `show` and `ui_catalog` and the thread-tools source (the `policy` is also the one for the thread-tools URL), give the root and each subagent the model: the `Assembly`. `assemble_with(.., step_io)` also says how the tool-call steps report their input and output |
+| `assemble(def, model, alias, &policy)` | connect the MCP servers, bind `ask_user`, `show`, `ui_catalog` and the plan tools and the thread-tools source (the `policy` is also the one for the thread-tools URL), give the root and each subagent the model: the `Assembly`. `assemble_with(.., step_io)` also says how the tool-call steps report their input and output |
 | `redact::step_io_named(&config, vars, &names)`, `redact::secret_values_named` | the same, and also the variables in `names` whatever their names look like (`AgentDef::mcp_env_references`: what the folder's and the extra file's servers read as `${VAR}`); `serve` uses it |
 | `redact::step_io(&config, vars)`, `redact::secret_values` | the `StepIo` that scrubs the secrets of the configuration and of the environment variables `vars` (`redact::process_vars()` in `serve`: the process's, without what is not text) from the input and output of every tool-call step; `WorkerParts::step_io` carries it |
 | `agents(def, card, workers)` | the `Agents` for `adam_service::serve` or a composition of your own: the whole agent with `workers: Some(WorkerParts)`, its starter with `None` |
@@ -329,7 +334,7 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound).
 * `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the
-  model is sent the folder's rendered prompt and the screen's three tools only); an edited folder says the edited words; `ask_user`
+  model is sent the folder's rendered prompt and the screen's and the plan's six tools only; `a_folder_agent_without_tools_offers_the_plan_tools`: a `plan_work` call keeps a plan, and `tools:` narrows them); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the
   same store completes; the tools of an `mcp.json` server are offered and a call reaches the server with the
   token from the environment; **the screenshot of a `files: true` server reaches the A2A client as a file
