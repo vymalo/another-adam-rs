@@ -22,7 +22,7 @@ use serde_json::{Map, Value, json};
 
 use crate::conversation::{
     ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
-    PendingWait, parse_context, parse_root_run, parse_root_step, parse_user_text,
+    PendingWait, Repeats, parse_context, parse_root_run, parse_root_step, parse_user_text,
 };
 use crate::history::fit_history;
 use crate::paging::backstop;
@@ -1205,6 +1205,58 @@ impl LlmAgent {
             if ctx.is_cancelled() {
                 return Ok(Flow::Fail(CANCELLED.into()));
             }
+            // `doom_loop`: the third call in a row with the same tool, the same arguments and the
+            // same result as the two before it does not run. Decided from the committed state alone.
+            let key = call_key(&call);
+            if let Some(repeats) = &mut state.repeats
+                && repeats.key == key
+                && repeats.count >= DOOM_LOOP_AFTER
+            {
+                repeats.refused += 1;
+                let ending = repeats.refused >= DOOM_LOOP_REFUSALS;
+                let said = repeated_call(&call.name);
+                let silent = silent_call(self, state, &call.name);
+                let style = self.style_of(&call.name, &state.source_notes);
+                say(
+                    ctx,
+                    silent,
+                    RunEvent::Step(style.event(&call.name, &call.id, StepState::Running)),
+                )
+                .await;
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&said, true)),
+                        &state.source_notes,
+                    ),
+                )
+                .await;
+                state
+                    .messages
+                    .push(Message::tool_error(call.id.clone(), said));
+                state.pending_calls.remove(0);
+                if ending {
+                    // The calls the turn still owed are answered too, so that no call is left without
+                    // a result; the next model call is the closing turn.
+                    for rest in std::mem::take(&mut state.pending_calls) {
+                        state.messages.push(Message::tool_error(
+                            rest.id,
+                            "not run: the run is ending because a call was repeated with the same result",
+                        ));
+                    }
+                    state.limit = Some(LimitHit {
+                        limit: LimitKind::RepeatedCall,
+                        answered: false,
+                        answer: None,
+                    });
+                    return Ok(Flow::Next);
+                }
+                continue;
+            }
             let used = files_kept(&state.artifacts);
             let (result, reported) = self
                 .run_tool(
@@ -1229,9 +1281,11 @@ impl LlmAgent {
                     if let Some(answer) = answer {
                         state.announce(answer);
                     }
+                    record_answer(state, key, &message);
                     (message, artifacts)
                 }
                 ToolResult::NeedsInput { question, ui } => {
+                    state.repeats = None;
                     ctx.emit(RunEvent::Custom {
                         kind: "input_required".into(),
                         payload: json!({ "question": question, "call_id": call.id }),
@@ -1247,6 +1301,7 @@ impl LlmAgent {
                     return Ok(Flow::Park);
                 }
                 ToolResult::AwaitRun(run) => {
+                    state.repeats = None;
                     let wait = PendingRun {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
@@ -1283,6 +1338,7 @@ impl LlmAgent {
                     continue;
                 }
                 ToolResult::AwaitRemote { task, timeout_ms } => {
+                    state.repeats = None;
                     // The deadline is fixed now, from the journaled clock, so that every replay
                     // of this transition parks with the same one.
                     let deadline = match timeout_ms {
@@ -1675,6 +1731,9 @@ impl LlmAgent {
                 "turn limit exceeded: the model was called {} times (max_turns = {})",
                 state.turns, self.limits.max_turns
             ),
+            LimitKind::RepeatedCall => "the same tool call was repeated with the same result \
+                 and the run was stopped (doom_loop)"
+                .to_owned(),
         }
     }
 
@@ -2018,6 +2077,102 @@ enum ToolResult {
         task: String,
         timeout_ms: Option<u64>,
     },
+}
+
+/// The call that is the third in a row with the same result is refused after this many that ran.
+const DOOM_LOOP_AFTER: u32 = 2;
+
+/// The refusals after which a run is ended with the closing turn (`limit: "repeated_call"`).
+const DOOM_LOOP_REFUSALS: u32 = 2;
+
+/// What the model is told when it makes the third identical call in a row.
+fn repeated_call(tool: &str) -> String {
+    format!(
+        "Not run: this is the third call in a row of `{tool}` with the same arguments, and the last \
+         two gave the same result. Calling it again will not change it. Change your approach: other \
+         arguments, another tool, or answer with what you know."
+    )
+}
+
+/// FNV-1a over the parts, each followed by a zero byte: stable across processes and versions
+/// (`DefaultHasher` is not), which a hash kept in the durable state must be.
+fn fnv_hex(parts: &[&str]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for byte in part.bytes().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+/// `value` as text with the keys of every object in order, whatever order the map keeps them in.
+fn canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                canonical(&map[key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// The tool name and the canonical arguments of a call, hashed (the raw text for arguments that
+/// were not JSON).
+fn call_key(call: &ToolCall) -> String {
+    match &call.invalid_arguments {
+        Some(raw) => fnv_hex(&[&call.name, "raw", raw]),
+        None => {
+            let mut text = String::new();
+            canonical(&call.arguments, &mut text);
+            fnv_hex(&[&call.name, "json", &text])
+        }
+    }
+}
+
+/// Count the answer of a call that ran: one more in a row when its key and its result are those of
+/// the call before, a new run of one otherwise.
+fn record_answer(state: &mut Conversation, key: String, message: &Message) {
+    let Message::Tool {
+        content, is_error, ..
+    } = message
+    else {
+        state.repeats = None;
+        return;
+    };
+    let answer = fnv_hex(&[if *is_error { "error" } else { "ok" }, content]);
+    match &mut state.repeats {
+        Some(repeats) if repeats.key == key && repeats.answer == answer => repeats.count += 1,
+        slot => {
+            *slot = Some(Repeats {
+                key,
+                answer,
+                count: 1,
+                refused: 0,
+            });
+        }
+    }
 }
 
 /// The output of a run that ended at a limit, with the answer of its closing turn.

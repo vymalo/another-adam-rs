@@ -628,6 +628,10 @@ fn limited_ending(
         adam_llm_agent::LimitKind::MaxTurns => {
             ("turn", format!("max_turns = {}", limits.max_turns))
         }
+        adam_llm_agent::LimitKind::RepeatedCall => (
+            "repeated call",
+            "the same call with the same result, three times in a row".to_owned(),
+        ),
     };
     Some(format!(
         "{what} limit reached before the work was delivered ({bound}): {text}"
