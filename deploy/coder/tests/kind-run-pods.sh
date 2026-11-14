@@ -276,7 +276,7 @@ fi
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The network policy of run pods and the egress proxy (ADR 0042), asked of a run pod. The cluster test above has released its
-# pods; this one makes its own, so the quota (4 pods) has room. A failure here stops the script with the cluster's words.
+# pods; this one makes its own, once the quota (4 pods) has room. A failure here stops the script with the cluster's words.
 # ---------------------------------------------------------------------------------------------------------------------
 say "a run pod made from the chart's template, as the coder's ServiceAccount (the admission policy applies), and two plain pods"
 # The coder fills in the name and the labels of a run pod (ADR 0019); so does this, from the template as the chart wrote it.
@@ -294,6 +294,14 @@ labelled = template.replace(head, (
 open(sys.argv[2], "w").write(labelled)
 PY
 kubectl delete pod egress-check egress-target egress-peer -n "$namespace" --ignore-not-found --wait=true
+# The cluster test returns while its last run pods are still terminating, and the quota counts a pod until it is gone (and
+# updates its count a moment later): creating the pod below at once is refused with "exceeded quota". Wait for the count.
+tries=0
+until [ "$(kubectl get resourcequota coder-run-pods -n "$namespace" -o jsonpath='{.status.used.pods}')" = "0" ]; do
+  tries=$((tries + 1))
+  [ "$tries" -le 90 ] || die "the quota coder-run-pods still counts the cluster test's run pods after 180 s"
+  sleep 2
+done
 kubectl --kubeconfig "$work/kubeconfig" create -n "$namespace" -f "$work/run-pod.yaml" \
   || die "the admission policy or the quota refused the run pod made from the chart's template"
 # A listener that no policy selects, and a client that no policy selects: the control that the pod network works. The
