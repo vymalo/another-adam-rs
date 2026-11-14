@@ -446,7 +446,7 @@ pub(crate) async fn missing_tool_answer(
 /// must not retry variants, hunt the filesystem, or install a system toolchain. A tool the
 /// **project** brings itself (`install` is the project's own install command) is another story: the
 /// project's dependencies are installed with the project's own command, **through
-/// `delegate_to_opencode` and not `run_checks`** (an install that passes is a green check on code
+/// `run` and not `run_checks`** (an install that passes is a green check on code
 /// nobody tested, and `run_checks` is for the project's real checks). `repeated`: the same tool was
 /// already reported, so whatever was tried did not work, and the person decides. In a devcontainer
 /// the answer says which environment lacks it and how the tool gets there (`environment`).
@@ -461,9 +461,9 @@ pub(crate) fn missing_tool_text(
         return format!(
             "`{name}` is not on the PATH, but it is one of this project's own dependencies, which \
              are not installed in the workspace yet: that is not a missing toolchain and not a \
-             failing check (no check cycle was used, nothing was recorded as a check). Have \
-             OpenCode install the project's dependencies with its own command (`{install}`), with \
-             delegate_to_opencode (not run_checks: that is only for the project's real checks), \
+             failing check (no check cycle was used, nothing was recorded as a check). Install \
+             the project's dependencies with its own command (`{install}`), with run (not \
+             run_checks: that is only for the project's real checks), \
              then run this again. Only if that fails, tell the person with ask_user."
         );
     }

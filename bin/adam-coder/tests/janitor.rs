@@ -61,7 +61,7 @@ fn workspace_dir(fx: &Fixture, run: &str) -> std::path::PathBuf {
 /// published stays on the remote. (A project of a conversation lives for the thread: see below.)
 #[tokio::test]
 async fn a_scratch_project_goes_with_its_run_unless_the_run_is_waiting() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let cancelled = run_in(&store, RunStatus::Failed).await.to_string();
     let parked = run_in(&store, RunStatus::Parked).await.to_string();
@@ -102,7 +102,7 @@ async fn a_scratch_project_goes_with_its_run_unless_the_run_is_waiting() {
 /// stays for as long as the conversation has a task within the idle time, whatever sweeps happen.
 #[tokio::test]
 async fn a_scratch_project_outlives_its_run_while_the_conversation_is_alive() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let done = run_of(&store, RunStatus::Done, Some("caller:thread-1"))
         .await
@@ -183,7 +183,7 @@ async fn a_scratch_project_outlives_its_run_while_the_conversation_is_alive() {
 /// newest task, and an open task keeps it however old the finished one is.
 #[tokio::test]
 async fn a_scratch_project_goes_when_its_conversation_has_been_idle() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let idle = run_of(&store, RunStatus::Done, Some("caller:idle"))
         .await
@@ -222,7 +222,7 @@ async fn a_scratch_project_goes_when_its_conversation_has_been_idle() {
 /// `SCRATCH_IDLE_DAYS=0` is the old rule: the project goes with its run, conversation or not.
 #[tokio::test]
 async fn without_an_idle_time_a_scratch_project_goes_with_its_run() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let done = run_of(&store, RunStatus::Done, Some("caller:thread-1"))
         .await
@@ -245,7 +245,7 @@ async fn without_an_idle_time_a_scratch_project_goes_with_its_run() {
 
 #[tokio::test]
 async fn a_sweep_removes_what_is_over_and_keeps_what_is_open() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let done = run_in(&store, RunStatus::Done).await.to_string();
     let failed = run_in(&store, RunStatus::Failed).await.to_string();
@@ -358,7 +358,7 @@ async fn a_sweep_removes_what_is_over_and_keeps_what_is_open() {
 /// A sweep that is told to stop between two runs stops.
 #[tokio::test]
 async fn a_cancelled_sweep_stops_before_it_removes_anything() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let done = run_in(&store, RunStatus::Done).await.to_string();
     workspace_of(&fx, &done).await;
@@ -374,7 +374,7 @@ async fn a_cancelled_sweep_stops_before_it_removes_anything() {
 /// As a component: a sweep at start, then one every interval, and it ends when it is stopped.
 #[tokio::test]
 async fn the_component_sweeps_at_start_and_again_and_stops_with_the_workers() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let first = run_in(&store, RunStatus::Done).await.to_string();
     workspace_of(&fx, &first).await;
@@ -410,7 +410,7 @@ async fn the_component_sweeps_at_start_and_again_and_stops_with_the_workers() {
 /// component that ends before shutdown stops the process).
 #[tokio::test]
 async fn a_janitor_that_is_off_waits_for_the_stop_and_removes_nothing() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let store: DynStore = Arc::new(MemoryStore::new());
     let done = run_in(&store, RunStatus::Done).await.to_string();
     workspace_of(&fx, &done).await;
@@ -444,7 +444,7 @@ fn janitor_with(fx: &Fixture, fake: &Arc<FakeEnvironment>) -> Janitor {
 /// open run's is not touched.
 #[tokio::test]
 async fn the_environment_of_a_finished_run_is_released_before_its_workspace_is_removed() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let fake = FakeEnvironment::new(Some(&fx.root));
     let store: DynStore = Arc::new(MemoryStore::new());
     let done = run_in(&store, RunStatus::Done).await.to_string();
@@ -474,7 +474,7 @@ async fn the_environment_of_a_finished_run_is_released_before_its_workspace_is_r
 /// A workspace that an environment could not let go of stays, and goes at the next sweep.
 #[tokio::test]
 async fn a_release_that_fails_keeps_the_workspace_for_the_next_sweep() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let fake = FakeEnvironment::new(Some(&fx.root));
     let store: DynStore = Arc::new(MemoryStore::new());
     let done = run_in(&store, RunStatus::Done).await.to_string();
@@ -506,7 +506,7 @@ async fn a_release_that_fails_keeps_the_workspace_for_the_next_sweep() {
 /// a run, is not.
 #[tokio::test]
 async fn what_an_environment_holds_for_runs_that_are_over_is_released_without_a_workspace() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let fake = FakeEnvironment::new(Some(&fx.root));
     let store: DynStore = Arc::new(MemoryStore::new());
     let finished = run_in(&store, RunStatus::Failed).await.to_string();

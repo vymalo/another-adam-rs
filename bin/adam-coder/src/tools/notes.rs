@@ -162,21 +162,6 @@ pub struct EnvironmentNotes {
     /// `use_default`): the repository's own `devcontainer.json` is not used for the rest of the run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub use_default: bool,
-    /// Whether OpenCode starts in the environment (`opencode --version` ran there once): `Some(false)`
-    /// refuses `delegate_to_opencode` without running anything again, until the environment is made
-    /// again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opencode: Option<OpenCodeCheck>,
-}
-
-/// The answer of `opencode --version` in the run's environment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenCodeCheck {
-    /// It started and exited 0.
-    pub works: bool,
-    /// What it said (the end of its output, scrubbed) when it did not.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub detail: String,
 }
 
 impl EnvironmentNotes {
@@ -1033,6 +1018,28 @@ mod tests {
             defaults: Some(Vec::new()),
             when,
         }
+    }
+
+    /// ADR 0038: notes written before the removal hold `environment.opencode`. They still load, and the
+    /// member is gone from the next save.
+    #[tokio::test]
+    async fn old_notes_that_hold_the_opencode_check_load_and_drop_it_on_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NotesStore::new(dir.path());
+        let run = "11111111-2222-3333-4444-555555555555";
+        let file = dir.path().join("coder").join(format!("{run}.json"));
+        std::fs::create_dir_all(dir.path().join("coder")).unwrap();
+        std::fs::write(
+            &file,
+            r#"{"environment": {"use_default": true, "opencode": {"works": false, "detail": "exit code 1"}}}"#,
+        )
+        .unwrap();
+        let notes = store.load(run).await.expect("an old file still loads");
+        assert!(notes.environment.use_default, "what is still kept is kept");
+        store.save(run, &notes).await.unwrap();
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(!saved.contains("opencode"), "{saved}");
+        assert!(saved.contains("use_default"), "{saved}");
     }
 
     #[test]

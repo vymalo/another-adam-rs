@@ -15,7 +15,6 @@
 //! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix | required for `all` and `worker` |
 //! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker` |
 //! | `MODEL` | model alias of the agent itself | required for `all` and `worker` |
-//! | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
 //! | `GITHUB_TOKEN` | git push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | one of this or the App's three, for `all` and `worker` |
 //! | `GITHUB_APP_ID` | the GitHub App's application ID or client ID (the JWT's `iss`); App mode, instead of `GITHUB_TOKEN` | required with the App's other two |
 //! | `GITHUB_APP_INSTALLATION_ID` | the installation's ID, a positive integer: **pins** the App to that one installation, which serves every repository (no lookup) | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
@@ -41,20 +40,19 @@
 //! | `CHECK_OUTPUT_TAIL_BYTES` | output tail `run_checks` returns | `16384` |
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 //! | `PR_DRAFT` | open pull requests as drafts (`true`/`false`) | `false` |
-//! | `OPENCODE_COMMAND` | program that speaks ACP on stdio (arguments follow, whitespace-separated) | `opencode acp` |
 //! | `MCP_ALLOW_STDIO` | let an agent folder's `mcp.json` start local processes (`command` servers) | `false` |
 //! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
-//! | `DEVCONTAINER_RUNTIME` | where a run's commands and OpenCode run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service, [ADR 0010](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)) | `off` |
+//! | `DEVCONTAINER_RUNTIME` | where a run's commands run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service, [ADR 0010](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)) | `off` |
 //! | `CONTAINER_HOST` | Podman's own variable: where the service is, `unix:///run/podman/podman.sock`; required with `podman` | unset |
 //! | `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`; **by digest only** (`name@sha256:...`): the devcontainer CLI cannot parse a tag together with a digest | the `workspace` image of `another-agentic-images` ([`DEFAULT_DEVCONTAINER_IMAGE`]) |
-//! | `DEVCONTAINER_NETWORK` | `inherit` (the Podman service's network) or `none` (and then `delegate_to_opencode` refuses: OpenCode cannot reach its model) | `inherit` |
+//! | `DEVCONTAINER_NETWORK` | `inherit` (the Podman service's network) or `none` (the container has no network) | `inherit` |
 //! | `DEVCONTAINER_DEPLOYMENT_ID` | the label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
 //! | `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | how long pulling, building and creating the container may take, and how long the repository's lifecycle commands may take | `1200`, `900` |
 //! | `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
 //! | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (set by the image) | `devcontainer`, `podman-remote` |
-//! | `RUN_ENVIRONMENT` | where a run's commands and OpenCode run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` (a pod of its own for each run, [ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)); `kubernetes` with `DEVCONTAINER_RUNTIME=podman` is refused (exit 78) | `local` |
+//! | `RUN_ENVIRONMENT` | where a run's commands run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` (a pod of its own for each run, [ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)); `kubernetes` with `DEVCONTAINER_RUNTIME=podman` is refused (exit 78) | `local` |
 //! | `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod (YAML or JSON) every run pod is made from: image, resources, priority class, security context, volumes, variables from Secrets, node affinity; the chart mounts it; an existing file | required with `kubernetes` |
 //! | `RUN_POD_NAMESPACE` | the namespace of the run pods: the coder's own | the ServiceAccount's namespace file; required when there is none |
 //! | `RUN_POD_INSTANCE` | the release's `app.kubernetes.io/instance`: the label that finds this deployment's pods; a label value | required with `kubernetes` |
@@ -63,7 +61,6 @@
 //! | `RUN_POD_READY_TIMEOUT_SECS` | how long a pod may take to be ready: scheduling, pulling the image, starting | `300` |
 //! | `RUN_POD_IDLE_SECS` | how long no command may have used a pod before it is deleted (the next command makes another; the files are on the volume); `0` keeps it until the run ends | `900` |
 //! | `RUN_POD_WAIT_SECS` | how long a run waits, trying again with a growing pause, for a pod the cluster cannot give now (the quota is used up, no node has room), before the tool fails | `600` |
-//! | `OPENCODE_BINARY` | with `podman`: the OpenCode that is mounted into every devcontainer; a native executable (an ELF file) | `OPENCODE_COMMAND`'s program, found on `PATH` and resolved to its real file |
 //! | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers, in the shape of `mcp.json`, added to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file, and a server name the agent already has is refused at startup (exit 78). A variable it names as `${VAR}` is hidden from every process the coder starts and its value is redacted from tool output, like the `mcp.json`'s own | unset: only the agent's own servers |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
 //!
@@ -79,8 +76,14 @@
 //! * **The workers** (`all`, `worker`) need everything a step uses, the `MODEL_*`, `MODEL`
 //!   variables and a GitHub credential (`GITHUB_TOKEN`, or the `GITHUB_APP_*` variables: both, or a
 //!   partial App set, is refused with every problem listed), and read the rest of the table above (the workspace, the
-//!   checks, the commit identity, OpenCode, what MCP servers a folder may start or reach). They arrive in [`Config::worker`] as a
+//!   checks, the commit identity, what MCP servers a folder may start or reach). They arrive in [`Config::worker`] as a
 //!   [`WorkerConfig`], which is `Some` exactly when [`Role::runs_workers`](adam_host::Role::runs_workers).
+//!
+//! # Removed variables
+//!
+//! `OPENCODE_MODEL`, `OPENCODE_COMMAND` and `OPENCODE_BINARY` were the coder's OpenCode (ADR 0038). They are
+//! ignored, not refused: nothing is less safe without them, and a deployment rendered from an older chart still
+//! sets one. Each one that is set is named in [`Config::ignored`], and the process logs one warning for it.
 //!
 //! # Workspace placement
 //!
@@ -124,6 +127,9 @@ use adam_workspace::{AppKey, AppOwners, WorkspaceError};
 use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
 
+/// The variables of the coder's OpenCode, removed by ADR 0038: ignored when set.
+const REMOVED_VARIABLES: [&str; 3] = ["OPENCODE_MODEL", "OPENCODE_COMMAND", "OPENCODE_BINARY"];
+
 /// The binary's configuration.
 #[derive(Clone)]
 pub struct Config {
@@ -139,6 +145,9 @@ pub struct Config {
     /// What stepping a run needs: the model, GitHub, the workspaces and the checks. `Some` exactly
     /// when [`Role::runs_workers`](adam_host::Role::runs_workers); a control plane holds none of it.
     pub worker: Option<WorkerConfig>,
+    /// The removed variables (`OPENCODE_MODEL`, `OPENCODE_COMMAND`, `OPENCODE_BINARY`) that are
+    /// set, by name and never by value: ignored, and logged once at startup.
+    pub ignored: Vec<&'static str>,
 }
 
 impl std::fmt::Debug for Config {
@@ -148,6 +157,7 @@ impl std::fmt::Debug for Config {
             .field("agent_dir", &self.agent_dir)
             .field("max_access_tier", &self.max_access_tier)
             .field("worker", &self.worker)
+            .field("ignored", &self.ignored)
             .finish()
     }
 }
@@ -158,8 +168,6 @@ impl std::fmt::Debug for Config {
 pub struct WorkerConfig {
     /// `MODEL_BASE_URL`, `MODEL_API_KEY` and `MODEL`.
     pub model: ModelConfig,
-    /// `OPENCODE_MODEL`.
-    pub opencode_model: String,
     /// How the coder authenticates to GitHub: `GITHUB_TOKEN`, or the `GITHUB_APP_*` variables.
     pub github: GitHubAuth,
     /// `ALLOWED_REPO_HOSTS`, lowercased.
@@ -206,14 +214,12 @@ pub struct WorkerConfig {
     pub git_author_email: String,
     /// `PR_DRAFT`.
     pub pr_draft: bool,
-    /// `OPENCODE_COMMAND`, split into program and arguments.
-    pub opencode_command: Vec<String>,
     /// `MCP_ALLOW_*`: what the MCP servers of the agent folder's `mcp.json` may be.
     pub mcp: McpSettings,
     /// `ADAM_EXTRA_MCP_FILE`: a file of MCP servers (the shape of `mcp.json`) added to the agent's
     /// own before they connect, an existing file. `None`: only the agent's own servers.
     pub extra_mcp_file: Option<PathBuf>,
-    /// `DEVCONTAINER_*`: where the run's commands and OpenCode run.
+    /// `DEVCONTAINER_*`: where the run's commands run.
     pub devcontainer: DevcontainerConfig,
     /// `RUN_ENVIRONMENT` and `RUN_POD_*`: this container (with the devcontainers above), or a pod of
     /// its own for each run.
@@ -259,9 +265,8 @@ pub struct RunPodsConfig {
 const NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 
 impl RunPodsConfig {
-    /// The settings of [`adam_env_kubernetes::KubeEnvironment`] for the worker `worker`; `model_key`
-    /// says whether the gateway has a key (the template then gives it as `MODEL_API_KEY`).
-    pub fn settings(&self, worker: &str, model_key: bool) -> adam_env_kubernetes::Settings {
+    /// The settings of [`adam_env_kubernetes::KubeEnvironment`] for the worker `worker`.
+    pub fn settings(&self, worker: &str) -> adam_env_kubernetes::Settings {
         let mut settings = adam_env_kubernetes::Settings::new(
             self.namespace.clone(),
             self.instance.clone(),
@@ -271,7 +276,6 @@ impl RunPodsConfig {
         settings.exec_client.clone_from(&self.exec_binary);
         settings.ready_timeout = self.ready_timeout;
         settings.idle = self.idle;
-        settings.model_key = model_key;
         settings
     }
 
@@ -420,14 +424,11 @@ pub struct DevcontainerConfig {
     pub cli: PathBuf,
     /// `DEVCONTAINER_PODMAN`.
     pub podman: PathBuf,
-    /// `OPENCODE_BINARY`, resolved and checked; `Some` whenever the runtime is [`Runtime::Podman`].
-    pub opencode_binary: Option<PathBuf>,
 }
 
 impl DevcontainerConfig {
-    /// The settings of [`adam_devcontainer::DevContainer`] for the workspace root `root` and the
-    /// model key OpenCode reads as a file inside a container (`None` when the gateway needs none).
-    pub fn settings(&self, root: PathBuf, model_key: Option<SecretString>) -> Settings {
+    /// The settings of [`adam_devcontainer::DevContainer`] for the workspace root `root`.
+    pub fn settings(&self, root: PathBuf) -> Settings {
         let mut settings = Settings::new(root);
         settings.runtime = self.runtime;
         settings.cli.clone_from(&self.cli);
@@ -438,8 +439,6 @@ impl DevcontainerConfig {
         settings.deployment.clone_from(&self.deployment_id);
         settings.up_timeout = self.up_timeout;
         settings.setup_timeout = self.setup_timeout;
-        settings.opencode.clone_from(&self.opencode_binary);
-        settings.model_key = model_key;
         settings
     }
 
@@ -448,7 +447,6 @@ impl DevcontainerConfig {
     fn parse(
         get: &impl Fn(&str) -> Option<String>,
         worker_id: Option<&str>,
-        opencode_command: &[String],
         problems: &mut Vec<String>,
     ) -> Self {
         let runtime = match get("DEVCONTAINER_RUNTIME")
@@ -519,9 +517,6 @@ impl DevcontainerConfig {
         } else {
             parse_flag(get, "DEVCONTAINER_PREPULL", problems)
         };
-        let opencode_binary = (runtime == Runtime::Podman)
-            .then(|| opencode_binary(get, opencode_command, problems))
-            .flatten();
         Self {
             runtime,
             container_host,
@@ -537,7 +532,6 @@ impl DevcontainerConfig {
             podman: PathBuf::from(
                 get("DEVCONTAINER_PODMAN").unwrap_or_else(|| "podman-remote".to_owned()),
             ),
-            opencode_binary,
         }
     }
 }
@@ -548,78 +542,6 @@ fn is_container_host(host: &str) -> bool {
         host.strip_prefix(scheme)
             .is_some_and(|rest| !rest.is_empty())
     })
-}
-
-/// The OpenCode that is mounted into every devcontainer: `OPENCODE_BINARY`, else the program of
-/// `OPENCODE_COMMAND` found on `PATH`, resolved to its real file (the npm package's `bin` entry is a
-/// link to the native binary its postinstall put there). It must be a native executable: a script
-/// needs an interpreter the container may not have.
-fn opencode_binary(
-    get: &impl Fn(&str) -> Option<String>,
-    command: &[String],
-    problems: &mut Vec<String>,
-) -> Option<PathBuf> {
-    let (name, named) = match get("OPENCODE_BINARY") {
-        Some(path) => ("OPENCODE_BINARY", path),
-        None => (
-            "OPENCODE_COMMAND's program",
-            command
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "opencode".to_owned()),
-        ),
-    };
-    let named = PathBuf::from(named.trim());
-    let found = if named.components().count() > 1 {
-        Some(named.clone())
-    } else {
-        std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(&named))
-                .find(|candidate| candidate.is_file())
-        })
-    };
-    let Some(found) = found else {
-        problems.push(format!(
-            "{name} {} is not on PATH: DEVCONTAINER_RUNTIME=podman mounts the coder's OpenCode into every devcontainer (set OPENCODE_BINARY to its file)",
-            named.display()
-        ));
-        return None;
-    };
-    let real = match found.canonicalize() {
-        Ok(real) => real,
-        Err(e) => {
-            problems.push(format!("{name} {}: {e}", found.display()));
-            return None;
-        }
-    };
-    match is_native_executable(&real) {
-        Ok(true) => Some(real),
-        Ok(false) => {
-            problems.push(format!(
-                "{name} {} is not a native executable (an ELF file, not a script): it is mounted into the devcontainers, which may have no interpreter; point OPENCODE_BINARY at the binary itself",
-                real.display()
-            ));
-            None
-        }
-        Err(e) => {
-            problems.push(format!("{name} {}: {e}", real.display()));
-            None
-        }
-    }
-}
-
-/// Whether `path` is an executable ELF file.
-fn is_native_executable(path: &std::path::Path) -> std::io::Result<bool> {
-    use std::io::Read as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    let meta = std::fs::metadata(path)?;
-    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
-        return Ok(false);
-    }
-    let mut magic = [0u8; 4];
-    let read = std::fs::File::open(path)?.read(&mut magic)?;
-    Ok(read == 4 && magic == *b"\x7fELF")
 }
 
 /// How the coder authenticates to GitHub, chosen per installation: **exactly one** of a personal
@@ -909,7 +831,6 @@ impl std::fmt::Debug for WorkerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerConfig")
             .field("model", &self.model)
-            .field("opencode_model", &self.opencode_model)
             .field("github", &self.github)
             .field("allowed_repo_hosts", &self.allowed_repo_hosts)
             .field("create_repo_owners", &self.create_repo_owners)
@@ -935,7 +856,6 @@ impl std::fmt::Debug for WorkerConfig {
             .field("check_timeout", &self.check_timeout)
             .field("check_output_tail", &self.check_output_tail)
             .field("pr_draft", &self.pr_draft)
-            .field("opencode_command", &self.opencode_command)
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
             .field("devcontainer", &self.devcontainer)
@@ -1006,12 +926,18 @@ impl Config {
             None => None,
         };
 
+        let ignored = REMOVED_VARIABLES
+            .into_iter()
+            .filter(|name| get(name).is_some())
+            .collect();
+
         ConfigError::check(problems)?;
         Ok(Self {
             service,
             agent_dir,
             max_access_tier,
             worker,
+            ignored,
         })
     }
 }
@@ -1059,7 +985,6 @@ impl WorkerConfig {
         let github = GitHubAuth::parse(get, problems);
         let model = ModelConfig::parse(lookup, problems);
 
-        let opencode_model = get("OPENCODE_MODEL").unwrap_or_else(|| model.alias.clone());
         let workspace_root =
             PathBuf::from(get("WORKSPACE_ROOT").unwrap_or_else(|| "/work".to_owned()));
         let git_sandbox_socket = get("GIT_SANDBOX_SOCKET").and_then(|raw| {
@@ -1198,19 +1123,8 @@ impl WorkerConfig {
                 }
             },
         };
-        let opencode_command: Vec<String> = get("OPENCODE_COMMAND")
-            .unwrap_or_else(|| "opencode acp".to_owned())
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-
         let before_environment = problems.len();
-        let devcontainer = DevcontainerConfig::parse(
-            get,
-            settings.worker_id.as_deref(),
-            &opencode_command,
-            problems,
-        );
+        let devcontainer = DevcontainerConfig::parse(get, settings.worker_id.as_deref(), problems);
         let run_environment = RunEnvironment::parse(get, &devcontainer, problems);
         let environment_is_known = problems.len() == before_environment;
 
@@ -1221,7 +1135,6 @@ impl WorkerConfig {
         let github_mcp_url = github_mcp_url?;
         let worker = Self {
             model,
-            opencode_model,
             github,
             allowed_repo_hosts,
             create_repo_owners,
@@ -1246,7 +1159,6 @@ impl WorkerConfig {
             devcontainer,
             run_environment,
             allow_commands_next_to_secrets,
-            opencode_command,
             mcp,
             extra_mcp_file,
         };
@@ -1269,7 +1181,7 @@ impl WorkerConfig {
 /// The problem reported when a command can read the GitHub App's key file and the deployment has
 /// not accepted it (`ALLOW_COMMANDS_NEXT_TO_SECRETS`): why, and every way out.
 const COMMANDS_NEXT_TO_THE_APP_KEY: &str = "refusing to start with the GitHub App's private key in a file \
-    (GITHUB_APP_PRIVATE_KEY_PATH) next to the commands of a run (run_command, run, run_checks, OpenCode): they run \
+    (GITHUB_APP_PRIVATE_KEY_PATH) next to the commands of a run (run_command, run, run_checks): they run \
     in this container (RUN_ENVIRONMENT=local, DEVCONTAINER_RUNTIME=off) as the user that can read the file, so a \
     command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included. \
     Change one of these: run the commands in run pods (RUN_ENVIRONMENT=kubernetes) or in Podman devcontainers \
@@ -1391,8 +1303,6 @@ mod tests {
         assert_eq!(c.workers, 4);
         assert_eq!(c.max_check_cycles, 3);
         assert_eq!(c.scratch_check_cycles, 5, "scratch work gets more tries");
-        assert_eq!(c.opencode_model, "coder-large");
-        assert_eq!(c.opencode_command, ["opencode", "acp"]);
         assert_eq!(c.allowed_repo_hosts, ["github.com"]);
         assert!(!c.allow_local_repos, "local repositories are opt-in");
         assert_eq!(c.github_api_url.as_str(), "https://api.github.com/");
@@ -2682,15 +2592,6 @@ mod tests {
 
     // -------------------------------------------------------------------- devcontainers
 
-    /// A native executable file (the magic of an ELF), as `OPENCODE_BINARY` wants.
-    fn elf_in(dir: &std::path::Path, name: &str) -> String {
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = dir.join(name);
-        std::fs::write(&path, b"\x7fELF and then whatever").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path.to_string_lossy().into_owned()
-    }
-
     fn parse_dc(vars: &HashMap<&'static str, String>) -> Result<Config, ConfigError> {
         Config::from_lookup(|k| vars.get(k).cloned())
     }
@@ -2720,13 +2621,8 @@ mod tests {
         assert!(dc.prepull);
         assert_eq!(dc.cli, PathBuf::from("devcontainer"));
         assert_eq!(dc.podman, PathBuf::from("podman-remote"));
-        assert_eq!(
-            dc.opencode_binary, None,
-            "off: nothing is mounted, so nothing is looked for"
-        );
         // Without a runtime nothing that needs the service or the file system is checked.
         let mut vars = owned_full();
-        vars.insert("OPENCODE_BINARY", "/no/such/file".into());
         vars.insert("CONTAINER_HOST", "not an address".into());
         assert!(parse_dc(&vars).is_ok());
     }
@@ -2756,13 +2652,10 @@ mod tests {
     }
 
     #[test]
-    fn podman_needs_the_service_and_an_opencode_that_can_be_mounted() {
-        let dir = tempfile::tempdir().unwrap();
-        let opencode = elf_in(dir.path(), "opencode");
+    fn podman_needs_only_the_service() {
         let mut vars = owned_full();
         vars.insert("DEVCONTAINER_RUNTIME", " Podman ".into());
         vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-        vars.insert("OPENCODE_BINARY", opencode.clone());
         vars.insert("DEVCONTAINER_NETWORK", "none".into());
         vars.insert(
             "DEVCONTAINER_DEFAULT_IMAGE",
@@ -2786,23 +2679,40 @@ mod tests {
         assert_eq!(dc.up_timeout, Duration::from_secs(60));
         assert_eq!(dc.setup_timeout, Duration::from_secs(30));
         assert!(!dc.prepull);
-        assert_eq!(
-            dc.opencode_binary.as_deref(),
-            Some(
-                std::path::Path::new(&opencode)
-                    .canonicalize()
-                    .unwrap()
-                    .as_path()
-            )
-        );
         // The settings the environment is made with.
-        let settings = dc.settings(PathBuf::from("/work"), None);
+        let settings = dc.settings(PathBuf::from("/work"));
         assert_eq!(settings.runtime, Runtime::Podman);
         assert_eq!(settings.container_host, "unix:///run/podman/podman.sock");
         assert_eq!(settings.deployment, "coder-a");
         assert_eq!(settings.network, Network::None);
-        assert_eq!(settings.opencode, dc.opencode_binary);
-        assert!(settings.model_key.is_none());
+    }
+
+    /// ADR 0038: the three variables of the coder's OpenCode are not read, not checked and not
+    /// refused; each one that is set is listed, by name, so the process can warn.
+    #[test]
+    fn the_removed_opencode_variables_are_ignored_and_listed() {
+        let mut vars = owned_full();
+        assert!(parse_dc(&vars).unwrap().ignored.is_empty());
+        vars.insert("OPENCODE_MODEL", "coder-large".into());
+        vars.insert("OPENCODE_COMMAND", "opencode acp".into());
+        vars.insert("OPENCODE_BINARY", "/no/such/file".into());
+        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
+        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
+        let config = parse_dc(&vars).expect("a removed variable is not a failure");
+        assert_eq!(
+            config.ignored,
+            ["OPENCODE_MODEL", "OPENCODE_COMMAND", "OPENCODE_BINARY"]
+        );
+        // Every role: a control plane lists them too, and a blank value is unset.
+        vars.insert("ROLE", "control-plane".into());
+        vars.insert("OPENCODE_MODEL", "  ".into());
+        assert_eq!(
+            parse_dc(&vars).unwrap().ignored,
+            ["OPENCODE_COMMAND", "OPENCODE_BINARY"]
+        );
+        // Only the names: nothing of a value is in the debug output.
+        vars.insert("OPENCODE_COMMAND", "SECRETVALUE acp".into());
+        assert!(!format!("{:?}", parse_dc(&vars).unwrap()).contains("SECRETVALUE"));
     }
 
     // ----- RUN_ENVIRONMENT=kubernetes ------------------------------------------------------------
@@ -2858,13 +2768,11 @@ mod tests {
         assert_eq!(pods.idle, Some(Duration::from_secs(900)));
         assert_eq!(pods.wait, Duration::from_secs(600));
         // The settings of the environment.
-        let settings = pods.settings("coder-0", true);
+        let settings = pods.settings("coder-0");
         assert_eq!(settings.namespace, "coder-ns");
         assert_eq!(settings.instance, "coder");
         assert_eq!(settings.worker, "coder-0");
-        assert!(settings.model_key);
         assert_eq!(settings.idle, Some(Duration::from_secs(900)));
-        assert!(!pods.settings("coder-0", false).model_key);
     }
 
     #[test]
@@ -2894,7 +2802,6 @@ mod tests {
         let mut vars = kubernetes_vars(dir.path());
         vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
         vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-        vars.insert("OPENCODE_BINARY", elf_in(dir.path(), "opencode"));
         let problems = kube_problems(&vars);
         assert!(
             problems
@@ -2960,11 +2867,9 @@ mod tests {
 
     #[test]
     fn the_deployment_label_follows_the_worker_id_unless_it_is_set() {
-        let dir = tempfile::tempdir().unwrap();
         let mut vars = owned_full();
         vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
         vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-        vars.insert("OPENCODE_BINARY", elf_in(dir.path(), "opencode"));
         vars.insert("WORKER_ID", "coder-0".into());
         assert_eq!(devcontainer_of(&vars).deployment_id, "coder-0");
         vars.insert("DEVCONTAINER_DEPLOYMENT_ID", "pool-a".into());
@@ -2973,10 +2878,7 @@ mod tests {
 
     #[test]
     fn an_invalid_devcontainer_variable_is_a_problem_naming_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("opencode.js");
-        std::fs::write(&script, "#!/usr/bin/env node\n").unwrap();
-        let cases: [(&str, &str, &str); 9] = [
+        let cases: [(&str, &str, &str); 8] = [
             (
                 "DEVCONTAINER_RUNTIME",
                 "docker",
@@ -3013,17 +2915,11 @@ mod tests {
                 "DEVCONTAINER_DEFAULT_IMAGE",
             ),
             ("CONTAINER_HOST", "podman.sock", "CONTAINER_HOST"),
-            (
-                "OPENCODE_BINARY",
-                script.to_str().unwrap(),
-                "OPENCODE_BINARY",
-            ),
         ];
         for (name, value, expected) in cases {
             let mut vars = owned_full();
             vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
             vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-            vars.insert("OPENCODE_BINARY", elf_in(dir.path(), "opencode"));
             vars.insert(name, value.to_owned());
             if name == "DEVCONTAINER_RUNTIME" {
                 vars.insert(name, value.to_owned());
@@ -3039,10 +2935,9 @@ mod tests {
     }
 
     #[test]
-    fn podman_without_an_address_or_an_opencode_is_refused_with_both_problems_listed() {
+    fn podman_without_an_address_is_refused() {
         let mut vars = owned_full();
         vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
-        vars.insert("OPENCODE_BINARY", "/no/such/dir/opencode".into());
         let err = parse_dc(&vars).unwrap_err();
         let all = err.problems.join("\n");
         // A message a person pastes into a report has no runs of spaces (a re-wrapping slip, #68).
@@ -3051,55 +2946,10 @@ mod tests {
             all.contains("CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman"),
             "{all}"
         );
-        assert!(
-            all.contains("OPENCODE_BINARY /no/such/dir/opencode"),
-            "{all}"
-        );
-        // A script is not a native executable, and says why.
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("opencode");
-        std::fs::write(&script, "#!/bin/sh\n").unwrap();
-        vars.insert("OPENCODE_BINARY", script.to_string_lossy().into_owned());
-        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-        let err = parse_dc(&vars).unwrap_err();
-        assert!(
-            err.problems.iter().all(|p| !p.contains("  ")),
-            "{:?}",
-            err.problems
-        );
-        assert!(
-            err.problems
-                .iter()
-                .any(|p| p.contains("not a native executable")),
-            "{:?}",
-            err.problems
-        );
-    }
-
-    #[test]
-    fn opencode_is_found_through_the_command_when_no_binary_is_named() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = elf_in(dir.path(), "oc-real");
-        let link = dir.path().join("opencode.exe");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let mut vars = owned_full();
-        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
-        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
-        // The program of OPENCODE_COMMAND, here with a directory, is resolved to the real file the
-        // npm package's `bin` entry links to.
-        vars.insert(
-            "OPENCODE_COMMAND",
-            format!("{} acp", link.to_string_lossy()),
-        );
-        let dc = devcontainer_of(&vars);
         assert_eq!(
-            dc.opencode_binary.as_deref(),
-            Some(
-                std::path::Path::new(&real)
-                    .canonicalize()
-                    .unwrap()
-                    .as_path()
-            )
+            err.problems.len(),
+            1,
+            "nothing else is asked of podman: {all}"
         );
     }
 
@@ -3315,7 +3165,6 @@ mod tests {
                 "CONTAINER_HOST".to_owned(),
                 "unix:///run/podman/podman.sock".to_owned(),
             ),
-            ("OPENCODE_BINARY".to_owned(), elf_in(dir.path(), "opencode")),
         ]);
         let worker = parse_owned(&vars).unwrap().worker.unwrap();
         assert!(!worker.commands_can_read_the_app_key());

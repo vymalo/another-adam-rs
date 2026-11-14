@@ -7,7 +7,7 @@
 //! coder's own container and a dev container are not metered: asking for their session reports only
 //! where the run's commands run, which reads as *not measured* and never as zero.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use adam::prelude::ToolCtx;
 use adam_runtime::{SandboxEnvironment, SandboxUsage};
@@ -57,28 +57,5 @@ impl Meter {
                 u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             ));
         }
-    }
-
-    /// Start timing a process that is already running; the time is reported when the clock is dropped,
-    /// whichever way the call ends.
-    pub(crate) fn clock(self, ctx: &ToolCtx) -> CommandClock<'_> {
-        CommandClock {
-            ctx,
-            meter: self,
-            started: Instant::now(),
-        }
-    }
-}
-
-/// Times a process the tool keeps for the length of its call (OpenCode), and reports it when dropped.
-pub(crate) struct CommandClock<'a> {
-    ctx: &'a ToolCtx,
-    meter: Meter,
-    started: Instant,
-}
-
-impl Drop for CommandClock<'_> {
-    fn drop(&mut self) {
-        self.meter.report_command(self.ctx, self.started.elapsed());
     }
 }

@@ -3,8 +3,7 @@
 //! Given "in repo X, do Y", the agent
 //!
 //! 1. prepares a git worktree (`prepare_workspace`, `adam-workspace`),
-//! 2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `apply_patch`),
-//!    broad ones through OpenCode over ACP (`delegate_to_opencode`, `adam-acp`),
+//! 2. makes the change itself, call by call (`read_file`, `write_file`, `edit_file`, `apply_patch`),
 //! 3. runs the project's own checks, at most a configured number of failing
 //!    cycles (`run_checks`; looking around uses `run_command`, which is no check),
 //! 4. commits, pushes and opens a pull request (`commit_and_push`,
@@ -29,7 +28,6 @@
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`harden`] | `make_non_dumpable` (it lives in `adam-service`, and `adam-agent` calls it too): a same-user child cannot read the coder's `/proc/<pid>/environ` |
 //! | [`mcp_secrets`] | the variables an agent's `mcp.json` files read as `${VAR}`: hidden from the processes of runs (`HidingEnvironment`) and registered with the redactor, but never `PATH`, `HOME`, `MODEL_API_KEY` and the like |
-//! | [`opencode`] | OpenCode's generated configuration and how it is launched |
 //! | [`janitor`] | [`Janitor`]: the sweep that removes the workspaces of finished runs, a worker component of the process |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router (an [`adam_service::Service`] for the coder's agent); [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes (from `adam-service`) |
 //! | [`config`] | the binary's environment variables (the ones every agent binary shares are `adam-service`'s) |
@@ -40,15 +38,13 @@
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use adam_coder::*;
-//! # use adam_coder::opencode::OpenCodeLaunch;
 //! # async fn demo(
 //! #     store: adam_core::DynStore,
 //! #     model: adam_model::DynModel,
 //! #     workspaces: adam_workspace::Workspaces,
 //! #     code_host: adam_workspace::DynCodeHost,
 //! # ) {
-//! let launch = OpenCodeLaunch::opencode("https://gateway.example/v1", "coder-large");
-//! let env = Arc::new(ToolEnv::new(workspaces, code_host, CoderSettings::new(launch)));
+//! let env = Arc::new(ToolEnv::new(workspaces, code_host, CoderSettings::new()));
 //! let agent = CoderAgent::new(model, "coder-large", env);
 //! let coder = Coder::new(store, agent, &RuntimeOptions::default());
 //! # let _ = coder;
@@ -93,7 +89,6 @@ pub mod github_mcp;
 pub use adam_service::harden;
 pub mod janitor;
 pub mod mcp_secrets;
-pub mod opencode;
 pub mod redact;
 mod repos;
 mod serve;

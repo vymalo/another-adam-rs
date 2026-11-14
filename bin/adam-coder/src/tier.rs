@@ -111,16 +111,10 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "read_skill_file"
         | "turn_output" => AccessTier::Plan,
         // Change files, commit, push a branch, open a pull request: the work itself.
-        "start_scratch"
-        | "publish_scratch"
-        | "run"
-        | "write_file"
-        | "edit_file"
-        | "apply_patch"
-        | "delegate_to_opencode"
-        | "run_checks"
-        | "commit_and_push"
-        | "open_pull_request" => AccessTier::Edits,
+        "start_scratch" | "publish_scratch" | "run" | "write_file" | "edit_file"
+        | "apply_patch" | "run_checks" | "commit_and_push" | "open_pull_request" => {
+            AccessTier::Edits
+        }
         // What cannot be taken back easily, but is the normal course of work.
         "merge_pull_request" | "create_repository" => AccessTier::Auto,
         // What cannot be taken back at all.
@@ -315,7 +309,6 @@ mod tests {
             ("apply_patch", Edits),
             ("run", Edits),
             ("run_checks", Edits),
-            ("delegate_to_opencode", Edits),
             ("start_scratch", Edits),
             ("publish_scratch", Edits),
             ("commit_and_push", Edits),
@@ -328,6 +321,13 @@ mod tests {
             assert_eq!(known(tool), Some(tier), "{tool}");
             assert_eq!(needs(tool), tier, "{tool}");
         }
+    }
+
+    /// ADR 0038: the tool is gone, so a name that is still in an old journal is an unknown tool.
+    #[test]
+    fn delegate_to_opencode_is_unknown_and_needs_auto() {
+        assert_eq!(known("delegate_to_opencode"), None);
+        assert_eq!(needs("delegate_to_opencode"), AccessTier::Auto);
     }
 
     #[test]

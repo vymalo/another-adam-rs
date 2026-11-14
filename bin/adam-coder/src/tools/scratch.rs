@@ -1,8 +1,8 @@
 //! `start_scratch { name? }` and `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }`.
 //!
 //! A scratch project is a place to start before any repository is named: a local git repository
-//! in a slot of the run's workspace ([`adam_workspace::Scratch`]), where the file tools,
-//! OpenCode and the checks work as they do in a repository's worktree, and where
+//! in a slot of the run's workspace ([`adam_workspace::Scratch`]), where the file tools
+//! and the checks work as they do in a repository's worktree, and where
 //! `commit_and_push` only commits locally. It lives as long as the run: what it holds reaches a
 //! repository only through [`publish_scratch`], which copies its files into the slot of a
 //! repository **the person named** and leaves the rest (the checks, the push, the pull request)
@@ -28,8 +28,7 @@
 
 use adam::prelude::*;
 use adam_workspace::{
-    ChangedFile, CopyReport, GitIdentity, RepoRef, RunWorkspace, Scratch, Slot, WorkspaceError,
-    copy_into,
+    CopyReport, GitIdentity, RepoRef, RunWorkspace, Scratch, Slot, WorkspaceError, copy_into,
 };
 
 use super::gitcli::{GitAt, head_tree, working_tree_id};
@@ -55,7 +54,7 @@ const MAX_LISTED: usize = 20;
 
 /// Start a scratch project: a new local git repository in your workspace, to build and test
 /// something in when the person has named no repository yet (or before one exists). Write the
-/// files with write_file, apply_patch or delegate_to_opencode and run the real checks with
+/// files with write_file, edit_file or apply_patch and run the real checks with
 /// run_checks, passing `repo` with the project's name when the workspace has more than one slot.
 /// A scratch project stays for this conversation: the next tasks of it find the project again, and it
 /// goes after days with no task in the conversation. Nothing in it reaches a repository unless it
@@ -89,7 +88,7 @@ pub async fn start_scratch(
         .await;
     let mut text = format!(
         "Scratch project ready.\nslot: {}\npath: {}\nWrite files in it with write_file, \
-         apply_patch or delegate_to_opencode, and run its checks with run_checks (say \
+         edit_file or apply_patch, and run its checks with run_checks (say \
          `repo: {}` when the workspace has more than one slot).\nIt stays for this conversation: \
          the next tasks of it find the project again, and it goes after days with no task in the \
          conversation. Nothing in it reaches a repository unless it is published to one the \
@@ -514,15 +513,6 @@ pub(crate) fn published_note(slot: &Slot) -> Option<String> {
          copy them (a file that differs needs `overwrite: true`).",
         slot.dir()
     ))
-}
-
-/// The files `slot` has changed since its last commit, whatever the slot is.
-pub(crate) async fn changed_files(slot: &Slot) -> Result<Vec<ChangedFile>, WorkspaceError> {
-    match (slot.worktree(), slot.scratch()) {
-        (Some(wt), _) => wt.status().await,
-        (None, Some(scratch)) => scratch.status().await,
-        (None, None) => Ok(Vec::new()),
-    }
 }
 
 /// `commit_and_push` in a scratch project: a commit, and nothing else. There is no remote, no

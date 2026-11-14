@@ -10,7 +10,6 @@
 //! | `run { command, cwd? }`: make something with a command, changes kept, never a check | [`make`] |
 //! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
 //! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
-//! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
 //! | `rebuild_environment { use_default? }` | [`environment`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
@@ -101,7 +100,6 @@ use adam_workspace::{
 };
 use serde_json::Value;
 
-use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use sandbox::Meter;
 
@@ -112,7 +110,6 @@ pub mod admin;
 pub mod checks;
 pub mod consent;
 pub mod create;
-pub mod delegate;
 pub mod environment;
 pub mod files;
 pub(crate) mod gitcli;
@@ -174,8 +171,6 @@ pub struct CoderSettings {
     pub identity: GitIdentity,
     /// Open pull requests as drafts.
     pub draft_pull_requests: bool,
-    /// How to start OpenCode.
-    pub opencode: OpenCodeLaunch,
     /// The host `owner/name` stands for when the person writes a repository that way: the first
     /// of `ALLOWED_REPO_HOSTS` in the binary.
     pub default_repo_host: String,
@@ -194,9 +189,12 @@ pub struct CoderSettings {
     /// [`DEFAULT_MAX`](crate::tier::DEFAULT_MAX), `auto`: renaming and deleting a repository are
     /// the deployment's opt-in.
     pub max_access_tier: AccessTier,
-    /// The devcontainers have no network (`DEVCONTAINER_NETWORK=none`): OpenCode, inside one,
-    /// cannot reach its model, so `delegate_to_opencode` refuses there and says what to use instead.
-    pub container_network_none: bool,
+}
+
+impl Default for CoderSettings {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CoderSettings {
@@ -218,7 +216,7 @@ impl CoderSettings {
     /// Defaults: 3 check cycles in a repository and 5 in a scratch project, 15 minutes and 16 KiB per check run, the
     /// `adam-coder` identity, ready-for-review pull requests, `github.com` for `owner/name`, and no
     /// owner a repository may be created for.
-    pub fn new(opencode: OpenCodeLaunch) -> Self {
+    pub fn new() -> Self {
         Self {
             max_check_cycles: 3,
             scratch_check_cycles: 5,
@@ -226,12 +224,10 @@ impl CoderSettings {
             check_output_tail: 16 * 1024,
             identity: GitIdentity::new("adam-coder", "adam-coder@users.noreply.github.com"),
             draft_pull_requests: false,
-            opencode,
             default_repo_host: named::DEFAULT_HOST.to_owned(),
             create_repo_owners: Vec::new(),
             create_for_installed_owners: false,
             max_access_tier: crate::tier::DEFAULT_MAX,
-            container_network_none: false,
         }
     }
 }
@@ -256,7 +252,7 @@ pub struct ToolEnv {
     /// default [`McpPolicy`] until [`ToolEnv::with_mcp_policy`].
     pub ui: Ui,
     /// Where the run's processes run: the project's checks, the commands that look around and
-    /// OpenCode. [`Local`], this container, until [`ToolEnv::with_environment`]. The file tools and
+    /// the other commands. [`Local`], this container, until [`ToolEnv::with_environment`]. The file tools and
     /// everything git does stay in this process whatever it is: they act on the shared files.
     pub environment: DynEnvironment,
     /// How long a run waits for an environment that is **not available now** (the namespace's quota of
@@ -323,7 +319,7 @@ impl ToolEnv {
     }
 
     /// Scrub the values `redactor` knows from every tool result, tool error and
-    /// progress line of OpenCode and the checks.
+    /// progress line of the checks.
     #[must_use]
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
         self.redactor = redactor;
@@ -762,7 +758,6 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         files::ApplyPatch,
         files::EditFile,
         share::ShareFile,
-        delegate::DelegateToOpenCode,
         checks::RunChecks,
         environment::RebuildEnvironment,
         publish::CommitAndPush,
@@ -1037,7 +1032,6 @@ mod grant_tests {
     use secrecy::SecretString;
 
     use super::*;
-    use crate::opencode::OpenCodeLaunch;
     use crate::tools::notes::CreatedRepo;
 
     /// Credentials that act for `accounts`, or for no list (a token) when `None`.
@@ -1067,8 +1061,7 @@ mod grant_tests {
         ));
         let workspaces =
             Workspaces::new(root.path().join("work"), creds).allow_hosts(["github.com"]);
-        let mut settings =
-            CoderSettings::new(OpenCodeLaunch::opencode("http://gateway.invalid/v1", "m"));
+        let mut settings = CoderSettings::new();
         // These tests are about the tier in the notes: the deployment lets a person pick any.
         settings.max_access_tier = AccessTier::Bypass;
         let env = Arc::new(ToolEnv::new(

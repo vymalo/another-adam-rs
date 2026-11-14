@@ -28,7 +28,7 @@
 //!   nothing to the run's notes, so the gate cannot see it. The files it changes change the
 //!   worktree's tree, so a check that passed before no longer covers the code: `commit_and_push`
 //!   and `open_pull_request` bind a verdict to a tree, and a changed tree is unchecked until
-//!   `run_checks` has run on it (the same rule as for `write_file` and OpenCode's edits).
+//!   `run_checks` has run on it (the same rule as for `write_file`).
 //!
 //! A command that outlives its time limit is killed with its process group, and what it had
 //! written by then stays.

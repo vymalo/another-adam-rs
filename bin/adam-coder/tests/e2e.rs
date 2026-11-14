@@ -1,6 +1,6 @@
 //! The coder end to end, offline: A2A client -> A2A server -> runtime -> the
 //! coder agent (scripted `MockModel`) -> real worktrees over a local bare git
-//! remote, the adam-acp fake agent for OpenCode, and a mock GitHub.
+//! remote, and a mock GitHub.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -17,7 +17,6 @@ use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use adam_a2a::{AuthConfig, BackendError, Caller, TaskBackend, TaskEvent};
 use adam_a2a_runtime::RuntimeTaskBackend;
-use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{AGENT_NAME, Coder, CoderAgent, RuntimeOptions, ToolEnv, coder_tools};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{Conversation, DynTool, Tool, ToolCtx, ToolError, ToolOutput};
@@ -259,7 +258,7 @@ async fn postgres_backing() -> Option<Backing> {
 // ------------------------------------------------------------------- happy path
 
 async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store: DynStore) {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -285,7 +284,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
     }
     worker.stop().await;
 
-    // working -> progress (OpenCode's updates) -> checks -> artifacts -> completed
+    // working -> progress -> checks -> artifacts -> completed
     assert_eq!(
         seen.last_state,
         Some(TaskState::Completed),
@@ -302,27 +301,6 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         "{:#?}",
         seen.messages
     );
-    // OpenCode's tool call is a child step, which a client that did not ask for steps reads as lines:
-    // its title when it starts, and how it ended.
-    assert!(
-        seen.messages
-            .iter()
-            .any(|m| m.starts_with("Write ") && m.ends_with("hello.txt")),
-        "OpenCode's tool call is streamed as a step: {:#?}",
-        seen.messages
-    );
-    assert!(
-        seen.messages
-            .iter()
-            .any(|m| m.starts_with("Write ") && m.ends_with("hello.txt: done")),
-        "{:#?}",
-        seen.messages
-    );
-    assert!(
-        seen.saw_message("Hand to OpenCode: done"),
-        "the call's own step ends: {:#?}",
-        seen.messages
-    );
     assert!(
         seen.saw_message("running checks: test -f hello.txt"),
         "{:#?}",
@@ -330,21 +308,6 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
     );
     assert!(seen.saw_message("checks passed"), "{:#?}", seen.messages);
     assert!(seen.saw_message("pushing agent/"), "{:#?}", seen.messages);
-    let opencode = seen
-        .messages
-        .iter()
-        .position(|m| m == "starting OpenCode")
-        .unwrap();
-    let checks = seen
-        .messages
-        .iter()
-        .position(|m| m.contains("running checks"))
-        .unwrap();
-    assert!(
-        opencode < checks,
-        "OpenCode runs before the checks: {:#?}",
-        seen.messages
-    );
     // checks (of HEAD, from run_checks), checks (bound to the pushed commit), branch, pull request
     let artifact_labels: Vec<_> = seen
         .labels
@@ -513,7 +476,6 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "apply_patch",
             "edit_file",
             "share_file",
-            "delegate_to_opencode",
             "run_checks",
             "rebuild_environment",
             "commit_and_push",
@@ -530,14 +492,10 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
 
 // ------------------------------------------------------------------ editing files itself
 
-/// The coder fixes a one-line bug itself, with `read_file` and `apply_patch` and no OpenCode:
+/// The coder fixes a one-line bug itself, with `read_file` and `apply_patch`:
 /// the checks see the fix, and the pull request is for exactly the code they passed on.
 async fn the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request(store: DynStore) {
-    // A fake OpenCode that would fail the run if it were started: nothing here delegates.
-    let fx = Fixture::with("never written\n", |s| {
-        s.opencode = OpenCodeLaunch::program("/nonexistent/opencode-must-not-run");
-    })
-    .await;
+    let fx = Fixture::new().await;
     fx.commit_to_main("greet.sh", "echo \"helo world\"\n");
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
@@ -589,11 +547,6 @@ async fn the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request(stor
     // Not asserted: the progress lines of the read and the patch ("read greet.sh (remote)"). Progress
     // is not kept, and a stream that attaches after the task is made can miss a quick step's line; what
     // the model was told (below) is the durable proof.
-    assert!(
-        !seen.saw_message("starting OpenCode"),
-        "OpenCode was not needed: {:#?}",
-        seen.messages
-    );
     // What the model read, and what the patch said.
     let requests = mock.requests();
     let result_of = |id: &str| -> String {
@@ -641,10 +594,7 @@ async fn the_coder_shares_the_svg_it_made_as_an_a2a_file_artifact(store: DynStor
     use base64::Engine as _;
 
     const SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\"/></svg>\n";
-    let fx = Fixture::with("never written\n", |s| {
-        s.opencode = OpenCodeLaunch::program("/nonexistent/opencode-must-not-run");
-    })
-    .await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "g1",
@@ -782,10 +732,7 @@ fn push_a_chart_in_scratch(mock: &MockModel) {
 async fn a_scratch_run_that_made_and_shared_a_file_completes_without_a_pull_request(
     store: DynStore,
 ) {
-    let fx = Fixture::with("never used\n", |s| {
-        s.opencode = OpenCodeLaunch::program("/nonexistent/opencode-must-not-run");
-    })
-    .await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     push_a_chart_in_scratch(&mock);
     mock.push_tool_calls(vec![call(
@@ -855,7 +802,7 @@ async fn a_scratch_run_that_made_and_shared_a_file_completes_without_a_pull_requ
 /// A file that was made and not shared is not delivered: the run waits for the person, as ever,
 /// and the reply that ends the turn is the question it parks on.
 async fn a_scratch_file_that_was_not_shared_does_not_complete_the_run(store: DynStore) {
-    let fx = Fixture::new("never used\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     push_a_chart_in_scratch(&mock);
     let reply = "chart.svg is made. Do you want it shown to you?";
@@ -880,7 +827,7 @@ async fn a_scratch_file_that_was_not_shared_does_not_complete_the_run(store: Dyn
 async fn a_run_in_a_repository_that_shared_a_file_but_opened_no_pull_request_still_waits(
     store: DynStore,
 ) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "r1",
@@ -916,7 +863,7 @@ async fn a_run_in_a_repository_that_shared_a_file_but_opened_no_pull_request_sti
 /// the person names an empty repository, and the project is published there, checked, pushed and
 /// opened as a pull request: the pull request is for the code the checks passed on.
 async fn a_scratch_project_is_published_to_the_repository_the_person_names(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let empty = fx.empty_remote("fibonacci");
     let url = empty.to_string_lossy().into_owned();
     let mock = Arc::new(MockModel::new());
@@ -1070,7 +1017,7 @@ async fn a_scratch_project_is_published_to_the_repository_the_person_names(store
 // ------------------------------------------------------------------ input-required
 
 async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "q1",
@@ -1145,7 +1092,7 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
 /// resumes it (the model sees it, names the repository, and the run goes on to a pull request).
 /// What does not ask is a completed turn: see `an_answer_that_asks_nothing_completes_the_task`.
 async fn a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     let greeting =
         "Hi! I'm ready to help. Which repository, which base branch and what is the task?";
@@ -1233,7 +1180,7 @@ async fn a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run(store: D
 /// so no repository work is left; the thread's next message starts the next task, which continues the
 /// conversation.
 async fn an_answer_that_asks_nothing_completes_the_task(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "m1",
@@ -1299,7 +1246,7 @@ async fn an_answer_that_asks_nothing_completes_the_task(store: DynStore) {
 /// task's workspace holds it, the first's no longer does, and a conversation of another context
 /// finds nothing.
 async fn a_scratch_project_is_found_again_by_the_next_task_of_the_conversation(store: DynStore) {
-    let fx = Fixture::new("never used\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call("t1", "start_scratch", json!({"name": "site"}))])
         .push_tool_calls(vec![call(
@@ -1377,7 +1324,7 @@ async fn a_scratch_project_is_found_again_by_the_next_task_of_the_conversation(s
 async fn the_environment_is_sealed_when_a_project_is_started_and_when_one_is_taken_over(
     store: DynStore,
 ) {
-    let fx = Fixture::new("never used\n").await;
+    let fx = Fixture::new().await;
     let fake = common::FakeEnvironment::new(Some(&fx.root));
     let fx = fx.using(fake.clone());
     let mock = Arc::new(MockModel::new());
@@ -1459,7 +1406,7 @@ fn coder_limited(fx: &Fixture, mock: &Arc<MockModel>, store: DynStore) -> Coder 
 /// nobody pushed) is a failure that names the limit and carries the closing answer, even when that
 /// answer ends with a question mark. It never parks.
 async fn a_limited_coder_run_with_undelivered_work_fails(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "l1",
@@ -1517,7 +1464,7 @@ async fn a_limited_coder_run_with_undelivered_work_fails(store: DynStore) {
 /// The same limit with a worktree that was prepared and never touched: work was begun, nothing was
 /// delivered, so it fails too.
 async fn a_limited_coder_run_with_a_prepared_untouched_worktree_fails(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "u1",
@@ -1556,7 +1503,7 @@ async fn a_limited_coder_run_with_a_prepared_untouched_worktree_fails(store: Dyn
 /// completes with its closing answer, marked limited, and never parks, whatever the answer ends
 /// with.
 async fn a_limited_coder_run_with_nothing_owed_completes_and_never_parks(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "n1",
@@ -1602,7 +1549,7 @@ async fn a_limited_coder_run_with_nothing_owed_completes_and_never_parks(store: 
 /// What the person is owed is not a statement: a worktree with changes nobody committed or pushed
 /// keeps the run waiting, whatever the last reply says or does not ask.
 async fn work_left_in_a_worktree_is_not_finished_by_a_statement(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "w1",
@@ -1645,7 +1592,7 @@ async fn work_left_in_a_worktree_is_not_finished_by_a_statement(store: DynStore)
 /// completes the task with no pull request (the answer asks nothing), and the chat goes on in the
 /// next task.
 async fn a_question_is_answered_from_a_look_around_and_costs_no_check_cycles(store: DynStore) {
-    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 1).await;
+    let fx = Fixture::with(|s| s.max_check_cycles = 1).await;
     common::git(&fx.remote, &["branch", "master", "refs/heads/main"]);
     common::git(&fx.remote, &["symbolic-ref", "HEAD", "refs/heads/master"]);
     let mock = Arc::new(MockModel::new());
@@ -1751,7 +1698,7 @@ async fn a_question_is_answered_from_a_look_around_and_costs_no_check_cycles(sto
 
 /// A model that stops with no text at all still parks the run, with a fixed question.
 async fn a_stop_without_text_asks_what_to_do(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_text("  \n ");
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -1775,7 +1722,7 @@ async fn a_stop_without_text_asks_what_to_do(store: DynStore) {
 /// `git status`), opened no pull request and ended with text. Nothing was delivered: the task
 /// waits for the person instead of completing.
 async fn checks_without_a_pull_request_then_text_is_a_question(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "c1",
@@ -1815,7 +1762,7 @@ async fn checks_without_a_pull_request_then_text_is_a_question(store: DynStore) 
 /// ask; the refusal is a tool result, not a failure; nothing is fetched or created; and once the
 /// model asks, the person's answer is what names the repository.
 async fn an_invented_repository_is_refused_and_the_model_must_ask(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "c1",
@@ -1872,7 +1819,7 @@ async fn an_invented_repository_is_refused_and_the_model_must_ask(store: DynStor
 /// open run per conversation), so it continues the same conversation and a repository named in
 /// the original request still counts, although the rework text does not repeat it.
 async fn a_message_in_the_context_of_a_parked_run_continues_it(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_text("Which base branch should I use?");
     happy_script(&mock, &fx.remote_url());
@@ -1919,7 +1866,7 @@ async fn a_message_in_the_context_of_a_parked_run_continues_it(store: DynStore) 
 /// CancelTask on a run parked by a plain-text stop: the task ends `canceled`, like any waiting
 /// task, and nothing is delivered.
 async fn a_run_parked_by_a_plain_text_stop_can_be_canceled(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_text("What should I do?");
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -1948,7 +1895,7 @@ async fn a_run_parked_by_a_plain_text_stop_can_be_canceled(store: DynStore) {
 
 /// After a workspace exists the repository is known: an empty stop does not ask for one.
 async fn an_empty_stop_after_work_does_not_ask_for_the_repository(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "c1",
@@ -1977,7 +1924,7 @@ async fn an_empty_stop_after_work_does_not_ask_for_the_repository(store: DynStor
 /// Red checks do not fail a run that has check cycles left: the model's text is a question like
 /// any other. (At the limit the run fails: `red_checks_n_times_fail_the_run_with_the_findings`.)
 async fn red_checks_with_cycles_left_then_text_is_a_question(store: DynStore) {
-    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 3).await;
+    let fx = Fixture::with(|s| s.max_check_cycles = 3).await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "c1",
@@ -2011,7 +1958,7 @@ async fn red_checks_with_cycles_left_then_text_is_a_question(store: DynStore) {
 /// The message that sends a job back quotes tool and reviewer findings in `untrusted` fences.
 /// A repository named there is not one the person named; the one in their `request` is.
 async fn a_repository_in_quoted_findings_is_not_named(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "c1",
@@ -2070,7 +2017,7 @@ fn follow_up(text: &str, context: &str, task: &str) -> Message {
 /// again, and carries on with the branch the first pushed, so its push updates the same pull
 /// request. Its model is shown the first task's conversation.
 async fn a_second_task_continues_the_first_tasks_branch_and_pull_request(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -2092,7 +2039,7 @@ async fn a_second_task_continues_the_first_tasks_branch_and_pull_request(store: 
     let first_requests = mock.requests().len();
 
     // The second task: the repository is not named, the branch is the one `commit_and_push`
-    // reported, and the change is made by a command (what OpenCode would have done).
+    // reported, and the change is made by a command.
     mock.push_tool_calls(vec![call(
         "d1",
         "prepare_workspace",
@@ -2203,7 +2150,7 @@ async fn a_second_task_continues_the_first_tasks_branch_and_pull_request(store: 
 async fn a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone(
     store: DynStore,
 ) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -2270,7 +2217,7 @@ async fn a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes
 async fn a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone(
     store: DynStore,
 ) {
-    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 1).await;
+    let fx = Fixture::with(|s| s.max_check_cycles = 1).await;
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -2346,7 +2293,7 @@ async fn a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request
 /// the model said, or a block labelled `untrusted` quotes, is still not; and a branch that was not
 /// pushed in the conversation cannot be continued.
 async fn a_continued_task_refuses_what_only_the_model_or_a_fence_mentions(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     // Task 1 names the repository; its last words mention another one.
     mock.push_tool_calls(vec![call(
@@ -2356,8 +2303,8 @@ async fn a_continued_task_refuses_what_only_the_model_or_a_fence_mentions(store:
     )])
     .push_tool_calls(vec![call(
         "c2",
-        "delegate_to_opencode",
-        json!({"instructions": "add hello.txt containing hello"}),
+        "write_file",
+        json!({"path": "hello.txt", "content": "hello\n"}),
     )])
     .push_tool_calls(vec![call(
         "c3",
@@ -2451,7 +2398,7 @@ async fn a_continued_task_refuses_what_only_the_model_or_a_fence_mentions(store:
 /// findings, and no pull request; the tools hold the line even when the model
 /// keeps going.
 async fn red_checks_n_times_fail_the_run_with_the_findings_and_no_pr(store: DynStore) {
-    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 2).await;
+    let fx = Fixture::with(|s| s.max_check_cycles = 2).await;
     let mock = Arc::new(MockModel::new());
     let failing = &common::red("echo 'assertion failed: hello.txt is not enough'; exit 1");
     mock.push_tool_calls(vec![call(
@@ -2461,14 +2408,14 @@ async fn red_checks_n_times_fail_the_run_with_the_findings_and_no_pr(store: DynS
     )])
     .push_tool_calls(vec![call(
         "c2",
-        "delegate_to_opencode",
-        json!({"instructions": "add hello.txt"}),
+        "write_file",
+        json!({"path": "hello.txt", "content": "hello\n"}),
     )])
     .push_tool_calls(vec![call("c3", "run_checks", json!({"command": failing}))])
     .push_tool_calls(vec![call(
         "c4",
-        "delegate_to_opencode",
-        json!({"instructions": "fix the failure"}),
+        "write_file",
+        json!({"path": "hello.txt", "content": "hello again\n"}),
     )])
     .push_tool_calls(vec![call("c5", "run_checks", json!({"command": failing}))])
     // The model ignores the limit and tries everything it is told not to.
@@ -2579,10 +2526,14 @@ fn tool_results(messages: &[adam_model::Message]) -> Vec<(String, String, bool)>
         .collect()
 }
 
-/// The explicit-acceptance path: a red check does not block a pull request the
-/// user accepted, and the pull request says so.
-async fn a_pull_request_with_red_checks_needs_explicit_acceptance(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+/// ADR 0038: a run that was in flight at the upgrade has a `delegate_to_opencode` call in its journal,
+/// or a model that still asks for it. The call gets the loop's answer for an unknown tool, which lists
+/// the tools there are, and the history that holds it is sent back to the model as data on every later
+/// turn: the run goes on with the file tools and completes.
+async fn a_history_with_a_delegation_replays_and_an_owed_call_gets_the_unknown_tool_answer(
+    store: DynStore,
+) {
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "c1",
@@ -2592,7 +2543,91 @@ async fn a_pull_request_with_red_checks_needs_explicit_acceptance(store: DynStor
     .push_tool_calls(vec![call(
         "c2",
         "delegate_to_opencode",
-        json!({"instructions": "add hello.txt"}),
+        json!({"instructions": "add hello.txt containing hello"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c3",
+        "write_file",
+        json!({"path": "hello.txt", "content": "hello\n"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c4",
+        "run_checks",
+        json!({"command": "test -f hello.txt"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c5",
+        "commit_and_push",
+        json!({"message": "feat: add hello.txt"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c6",
+        "open_pull_request",
+        json!({"title": "feat: add hello.txt", "body": "Adds hello.txt.\n\n## Verification\n- `test -f hello.txt`: passed"}),
+    )])
+    .push_text("Opened the pull request.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?} {:#?}",
+        seen.labels,
+        seen.messages
+    );
+    let requests = mock.requests();
+    let results = tool_results(&requests.last().unwrap().messages);
+    let (_, answer, is_error) = results
+        .iter()
+        .find(|(id, _, _)| id == "c2")
+        .expect("the owed call was answered");
+    assert!(*is_error, "{answer}");
+    assert!(
+        answer.contains("unknown tool `delegate_to_opencode`")
+            && answer.contains("write_file")
+            && !answer.contains("available tools: delegate_to_opencode"),
+        "the loop's answer for an unknown tool, listing the tools there are: {answer}"
+    );
+    // The history that holds the call is replayed as data: every turn after it carries it.
+    for request in &requests[2..] {
+        assert!(
+            tool_results(&request.messages)
+                .iter()
+                .any(|(id, _, _)| id == "c2"),
+            "the delegation stays in the history"
+        );
+    }
+    let branches = fx.agent_branches();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    assert_eq!(fx.file_on(&branches[0], "hello.txt"), "hello");
+    assert_eq!(fx.created_pulls().await.len(), 1);
+    // Nobody offers the tool any more.
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .all(|t| t.name != "delegate_to_opencode")
+    );
+}
+
+/// The explicit-acceptance path: a red check does not block a pull request the
+/// user accepted, and the pull request says so.
+async fn a_pull_request_with_red_checks_needs_explicit_acceptance(store: DynStore) {
+    let fx = Fixture::new().await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "c1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c2",
+        "write_file",
+        json!({"path": "hello.txt", "content": "hello\n"}),
     )])
     .push_tool_calls(vec![call(
         "c3",
@@ -2747,9 +2782,9 @@ enum CrashPoint {
     AfterCommitAndPush,
     /// After `open_pull_request` created the PR, before its result was journaled.
     InsideOpenPullRequest,
-    /// After OpenCode finished and edited files, before `delegate_to_opencode`'s
-    /// result was journaled (so the whole call runs again on takeover).
-    InsideDelegate,
+    /// After `write_file` wrote the file, before its result was journaled (so the whole call
+    /// runs again on takeover).
+    InsideWriteFile,
 }
 
 fn short_lease() -> RuntimeOptions {
@@ -2763,18 +2798,7 @@ fn short_lease() -> RuntimeOptions {
 /// `point`; the second takes over and the run completes with exactly one
 /// commit, one branch update and one pull request.
 async fn crash_at(point: CrashPoint, store: DynStore) {
-    // OpenCode is launched through a script that logs every launch, so the
-    // delegate case can tell a rerun from a replay.
-    let agent_dir = tempfile::tempdir().unwrap();
-    let (scripted, launch_log) = common::scripted_agent(
-        agent_dir.path(),
-        "exec \"$AGENT\"",
-        OpenCodeLaunch::program("unused")
-            .env("FAKE_ACP_SCENARIO", "write-file")
-            .env("FAKE_ACP_WRITE_PATH", "hello.txt")
-            .env("FAKE_ACP_WRITE_CONTENT", "hello\n"),
-    );
-    let fx = Fixture::with("hello\n", |s| s.opencode = scripted).await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
     let reached = Arc::new(Notify::new());
@@ -2784,7 +2808,7 @@ async fn crash_at(point: CrashPoint, store: DynStore) {
         CrashPoint::InsideRunChecks => (mock.clone(), Some("run_checks")),
         CrashPoint::InsideCommitAndPush => (mock.clone(), Some("commit_and_push")),
         CrashPoint::InsideOpenPullRequest => (mock.clone(), Some("open_pull_request")),
-        CrashPoint::InsideDelegate => (mock.clone(), Some("delegate_to_opencode")),
+        CrashPoint::InsideWriteFile => (mock.clone(), Some("write_file")),
         CrashPoint::AfterCommitAndPush => (
             Arc::new(HangingModel {
                 inner: mock.clone(),
@@ -2845,16 +2869,15 @@ async fn crash_at(point: CrashPoint, store: DynStore) {
     assert!(a.handle.await.expect_err("aborted").is_cancelled());
     let view = doomed.runtime.view(run).await.unwrap().unwrap();
     assert_eq!(view.status, RunStatus::Runnable, "not finished: {view:#?}");
-    if matches!(point, CrashPoint::InsideDelegate) {
-        // OpenCode ran once and the run's worktree holds what it did; add an
-        // edit of "an earlier attempt" that only survives if the takeover
-        // reuses the same worktree instead of starting over.
-        assert_eq!(common::launches(&launch_log), 1);
+    if matches!(point, CrashPoint::InsideWriteFile) {
+        // The file was written and the run's worktree holds it; add an edit of "an earlier
+        // attempt" that only survives if the takeover reuses the same worktree instead of
+        // starting over.
         let worktree = common::slot_dir(&fx.root, &task.id);
         assert_eq!(
             std::fs::read_to_string(worktree.join("hello.txt")).unwrap(),
             "hello\n",
-            "OpenCode's edit is in the worktree before the takeover"
+            "the write is in the worktree before the takeover"
         );
         std::fs::write(worktree.join("wip.txt"), "earlier edit\n").unwrap();
     }
@@ -2893,12 +2916,7 @@ async fn crash_at(point: CrashPoint, store: DynStore) {
         "no duplicate pull request"
     );
     assert_eq!(fx.file_on(&branches[0], "hello.txt"), "hello");
-    if matches!(point, CrashPoint::InsideDelegate) {
-        assert_eq!(
-            common::launches(&launch_log),
-            2,
-            "the interrupted call ran again, once"
-        );
+    if matches!(point, CrashPoint::InsideWriteFile) {
         assert_eq!(
             fx.file_on(&branches[0], "wip.txt"),
             "earlier edit",
@@ -2978,15 +2996,14 @@ async fn crash_inside_open_pull_request_before_the_journal_is_idempotent(store: 
     crash_at(CrashPoint::InsideOpenPullRequest, store).await;
 }
 
-/// The crash the plan calls E6: the worker dies while OpenCode's turn is
-/// done but not journaled. The takeover reruns `delegate_to_opencode` in the
-/// same worktree (earlier edits kept), and the run still delivers one commit,
-/// one push and one pull request.
-async fn crash_during_delegate_to_opencode_reruns_on_the_same_worktree(store: DynStore) {
-    crash_at(CrashPoint::InsideDelegate, store).await;
+/// The crash the plan calls E6: the worker dies after a file was written and before the call was
+/// journaled. The takeover runs `write_file` again in the same worktree (earlier edits kept), and
+/// the run still delivers one commit, one push and one pull request.
+async fn crash_during_write_file_reruns_on_the_same_worktree(store: DynStore) {
+    crash_at(CrashPoint::InsideWriteFile, store).await;
 }
 
-// ------------------------------------------------------------ OpenCode failures
+// ------------------------------------------------------------ retries
 
 /// A coder whose runtime retries transient failures quickly (the default
 /// backoff is 1, 2, 4, 8 seconds).
@@ -3031,141 +3048,6 @@ async fn run_message(server: &Server, message: Message) -> Seen {
         seen.record(item.unwrap());
     }
     seen
-}
-
-fn prepare_and_delegate(mock: &MockModel, fx: &Fixture, delegate_ids: &[&str]) {
-    mock.push_tool_calls(vec![call(
-        "c1",
-        "prepare_workspace",
-        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
-    )]);
-    for id in delegate_ids {
-        mock.push_tool_calls(vec![call(
-            id,
-            "delegate_to_opencode",
-            json!({"instructions": "add hello.txt containing hello"}),
-        )]);
-    }
-}
-
-/// OpenCode dies on every launch: the tool error is transient, the runtime
-/// retries within its budget and then fails the run with what happened,
-/// including the child's stderr. Nothing is pushed or opened.
-async fn opencode_crashing_every_time_fails_the_run_with_its_stderr(store: DynStore) {
-    let fx = Fixture::with("hello\n", |s| {
-        s.opencode =
-            OpenCodeLaunch::program(common::fake_agent()).env("FAKE_ACP_SCENARIO", "crash");
-    })
-    .await;
-    let mock = Arc::new(MockModel::new());
-    // The retried turn asks the model again: one delegate call per attempt.
-    prepare_and_delegate(&mock, &fx, &["c2", "c2b"]);
-    let coder = coder_retrying(&fx, mock.clone(), store, 2);
-    let server = Server::start(coder).await;
-    let worker = spawn_worker(&server.coder);
-
-    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
-    worker.stop().await;
-
-    assert_eq!(
-        seen.last_state,
-        Some(TaskState::Failed),
-        "{:?}",
-        seen.labels
-    );
-    let transient = |seen: &Seen| {
-        seen.messages
-            .iter()
-            .filter(|m| m.as_str() == "Hand to OpenCode: failed")
-            .count()
-    };
-    assert_eq!(
-        transient(&seen),
-        2,
-        "the client sees both attempts fail: {:#?}",
-        seen.messages
-    );
-    let error = seen
-        .messages
-        .iter()
-        .find(|m| m.contains("gave up after 2 attempts"))
-        .unwrap_or_else(|| panic!("no failure message in {:#?}", seen.messages));
-    assert!(error.contains("OpenCode: ACP agent exited"), "{error}");
-    assert!(
-        error.contains("simulated crash"),
-        "the child's stderr explains it: {error}"
-    );
-    assert!(fx.agent_branches().is_empty(), "nothing was pushed");
-    assert!(fx.created_pulls().await.is_empty(), "no pull request");
-    assert_eq!(
-        mock.requests().len(),
-        3,
-        "prepare, then one turn per attempt"
-    );
-}
-
-/// OpenCode dies once: the retry launches it again in the same worktree and
-/// the run delivers as if nothing had happened.
-async fn opencode_crashing_once_is_retried_and_completes(store: DynStore) {
-    let agent_dir = tempfile::tempdir().unwrap();
-    let marker = agent_dir.path().join("crashed-once");
-    let (launch, log) = common::scripted_agent(
-        agent_dir.path(),
-        "if [ ! -e \"$MARKER\" ]; then : > \"$MARKER\"; FAKE_ACP_SCENARIO=crash exec \"$AGENT\"; fi\nexec \"$AGENT\"",
-        OpenCodeLaunch::program("unused")
-            .env("FAKE_ACP_SCENARIO", "write-file")
-            .env("FAKE_ACP_WRITE_PATH", "hello.txt")
-            .env("FAKE_ACP_WRITE_CONTENT", "hello\n")
-            .env("MARKER", marker.to_string_lossy()),
-    );
-    let fx = Fixture::with("hello\n", |s| s.opencode = launch).await;
-    let mock = Arc::new(MockModel::new());
-    prepare_and_delegate(&mock, &fx, &["c2", "c2b"]);
-    mock.push_tool_calls(vec![call(
-        "c3",
-        "run_checks",
-        json!({"command": "test -f hello.txt && cat hello.txt"}),
-    )])
-    .push_tool_calls(vec![call(
-        "c4",
-        "commit_and_push",
-        json!({"message": "feat: add hello.txt"}),
-    )])
-    .push_tool_calls(vec![call(
-        "c5",
-        "open_pull_request",
-        json!({"title": "feat: add hello.txt", "body": "Adds hello.txt.\n\n## Verification\n- `test -f hello.txt`: passed"}),
-    )])
-    .push_text("Opened the pull request.");
-    let server = Server::start(coder_retrying(&fx, mock.clone(), store, 2)).await;
-    let worker = spawn_worker(&server.coder);
-
-    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
-    worker.stop().await;
-
-    assert_eq!(
-        seen.last_state,
-        Some(TaskState::Completed),
-        "{:?} {:#?}",
-        seen.labels,
-        seen.messages
-    );
-    assert_eq!(
-        seen.messages
-            .iter()
-            .filter(|m| m.as_str() == "Hand to OpenCode: failed")
-            .count(),
-        1,
-        "the client sees the first attempt fail: {:#?}",
-        seen.messages
-    );
-    assert_eq!(common::launches(&log), 2, "one crash, one good launch");
-    let branches = fx.agent_branches();
-    assert_eq!(branches.len(), 1, "{branches:?}");
-    assert_eq!(fx.file_on(&branches[0], "hello.txt"), "hello");
-    assert_eq!(fx.commits_ahead(&branches[0]), 1);
-    assert_eq!(fx.created_pulls().await.len(), 1);
-    assert!(seen.artifacts.iter().any(|(n, _)| n == "pull_request"));
 }
 
 // ------------------------------------------------------------ rate limits
@@ -3217,7 +3099,7 @@ impl Respond for RateLimitedOnce {
 /// with exactly one pull request.
 async fn rate_limited_model_backs_off_and_completes(store: DynStore) {
     const HINT: Duration = Duration::from_secs(1);
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let replies = vec![
         tool_reply(
             "c1",
@@ -3226,8 +3108,8 @@ async fn rate_limited_model_backs_off_and_completes(store: DynStore) {
         ),
         tool_reply(
             "c2",
-            "delegate_to_opencode",
-            json!({"instructions": "add hello.txt containing hello"}),
+            "write_file",
+            json!({"path": "hello.txt", "content": "hello\n"}),
         ),
         tool_reply(
             "c3",
@@ -3305,116 +3187,6 @@ async fn rate_limited_model_backs_off_and_completes(store: DynStore) {
 }
 
 // ------------------------------------------------------------------ cancel
-
-/// CancelTask while OpenCode is mid-turn. The task ends `canceled` at once;
-/// the step's cancel token reaches the delegate tool, which stops the ACP turn
-/// (`session/cancel`) and kills OpenCode and what it started, so nothing is
-/// left running. The model is never asked again, so nothing is committed,
-/// pushed or opened.
-async fn cancel_during_opencode_turn_cancels_without_push_or_pr(store: DynStore) {
-    let agent_dir = tempfile::tempdir().unwrap();
-    let pid_file = agent_dir.path().join("agent.pid");
-    let child_file = agent_dir.path().join("child.pid");
-    let fx = Fixture::with("hello\n", |s| {
-        s.opencode = OpenCodeLaunch::program(common::fake_agent())
-            .env("FAKE_ACP_SCENARIO", "slow")
-            .env("FAKE_ACP_PID_FILE", pid_file.to_string_lossy())
-            .env("FAKE_ACP_CHILD_PID_FILE", child_file.to_string_lossy());
-    })
-    .await;
-    let mock = Arc::new(MockModel::new());
-    // The whole happy path is scripted: what a cancelled run must not reach
-    // (checks, commit, push, pull request) is there to be reached.
-    happy_script(&mock, &fx.remote_url());
-    let server = Server::start(coder_with(&fx, &mock, store)).await;
-
-    let mut stream = server
-        .client
-        .send_streaming_message(&request(user(&format!(
-            "add hello.txt in {}",
-            fx.remote_url()
-        ))))
-        .await
-        .unwrap();
-    let mut seen = Seen::default();
-    seen.record(stream.next().await.expect("snapshot").unwrap());
-    let worker = spawn_worker(&server.coder);
-
-    // OpenCode is mid-turn once it has started its own child.
-    let agent = common::wait_for_pid(&pid_file).await;
-    let grandchild = common::wait_for_pid(&child_file).await;
-    assert!(
-        !common::process_gone(agent, true),
-        "OpenCode should be running"
-    );
-
-    let cancelled_at = Instant::now();
-    let canceled = server
-        .client
-        .cancel_task(&a2a::CancelTaskRequest {
-            id: seen.task_id.clone(),
-            metadata: None,
-            tenant: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(canceled.status.state, TaskState::Canceled);
-    while let Some(item) = tokio::time::timeout(Duration::from_secs(5), stream.next())
-        .await
-        .expect("the stream ends after the cancel")
-    {
-        seen.record(item.unwrap());
-    }
-    assert_eq!(
-        seen.last_state,
-        Some(TaskState::Canceled),
-        "{:?}",
-        seen.labels
-    );
-    assert!(
-        cancelled_at.elapsed() < Duration::from_secs(2),
-        "canceled within 2 s, took {:?}",
-        cancelled_at.elapsed()
-    );
-
-    // No orphan: OpenCode is reaped and its child is dead, within 5 s.
-    assert!(
-        common::wait_gone(agent, true, Duration::from_secs(5)).await,
-        "OpenCode (pid {agent}) is still there after the cancel"
-    );
-    assert!(
-        common::wait_gone(grandchild, false, Duration::from_secs(5)).await,
-        "OpenCode's child (pid {grandchild}) is still there after the cancel"
-    );
-
-    // The run is over for good: the step that was cancelled does not go on.
-    worker.stop().await;
-    let done = server
-        .client
-        .get_task(&a2a::GetTaskRequest {
-            id: seen.task_id.clone(),
-            history_length: None,
-            tenant: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(done.status.state, TaskState::Canceled);
-    assert!(
-        !done
-            .artifacts
-            .unwrap_or_default()
-            .iter()
-            .any(|a| { matches!(a.name.as_deref(), Some("branch" | "pull_request")) }),
-        "a canceled run delivers nothing"
-    );
-    assert_eq!(
-        mock.requests().len(),
-        2,
-        "prepare and delegate, and no model turn after the cancel"
-    );
-    assert!(fx.agent_branches().is_empty(), "nothing was pushed");
-    assert!(fx.created_pulls().await.is_empty(), "no pull request");
-}
 
 // ------------------------------------------------ cancel: the model call and a command
 
@@ -3536,7 +3308,7 @@ async fn cancel_and_time(
 /// CancelTask while the model has not answered (it would take 30 s): the request is dropped, the
 /// task ends `canceled` within 2 s, and the worker is free as soon as it does.
 async fn a_cancel_ends_the_task_canceled_while_the_model_has_not_answered(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_text("never said");
     let model = StalledModel::new(&mock, 0);
@@ -3584,7 +3356,7 @@ async fn a_cancel_ends_the_task_canceled_while_the_model_has_not_answered(store:
 /// CancelTask while `run_command` is in a `sleep 60`: the command's process is killed at once, the
 /// task ends `canceled` within 2 s, and the model is not asked again.
 async fn a_cancel_ends_the_task_canceled_while_run_command_sleeps(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("sleep.pid");
     let mock = Arc::new(MockModel::new());
@@ -3668,7 +3440,7 @@ impl ModelClient for PerTaskModel {
 /// (concurrency 2): each gets its own worktree and branch, and its own pull
 /// request; the shared mirror serves both.
 async fn two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let (alpha, beta) = (Arc::new(MockModel::new()), Arc::new(MockModel::new()));
     common::happy_script_titled(&alpha, &fx.remote_url(), "feat: alpha");
     common::happy_script_titled(&beta, &fx.remote_url(), "feat: beta");
@@ -3783,7 +3555,7 @@ async fn two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs(store: Dy
 /// cannot fix a bad credential, so the run must not "complete" without a pull
 /// request: it fails, and the error says what to look at.
 async fn a_github_401_fails_the_run_with_a_clear_message(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     common::github_fails_with(&fx.github, 401, "Bad credentials").await;
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
@@ -3826,7 +3598,7 @@ async fn a_github_401_fails_the_run_with_a_clear_message(store: DynStore) {
 /// The same, for a process that is a GitHub App: GitHub (or the mint) refuses it, and what the run
 /// ends with names the App's variables, not `GITHUB_TOKEN`.
 async fn a_refused_github_app_fails_the_run_naming_its_own_variables(store: DynStore) {
-    let fx = Fixture::new("hello\n").await.with_credentials_hint(
+    let fx = Fixture::new().await.with_credentials_hint(
         "the GitHub App's credentials (GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and the private \
          key) are valid and that the App is installed on the repository with write access to its \
          contents and pull requests",
@@ -3867,7 +3639,7 @@ async fn a_refused_github_app_fails_the_run_naming_its_own_variables(store: DynS
 /// token with 401 and never runs anything, while the agent card and
 /// `/healthz` stay open.
 async fn wrong_token_on_the_coder_router_is_401(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     let coder = coder_with(&fx, &mock, store);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3953,79 +3725,33 @@ fn assert_no_secret(haystack: &str, what: &str) {
     }
 }
 
-/// OpenCode dies printing secrets to stderr (a key in a message, an
-/// Authorization header): the stderr tail is part of the error a client
-/// reads, and the values must be gone from it, from the stream, the task, the
-/// run's stored error and state.
-async fn secrets_in_opencode_stderr_never_reach_the_client(store: DynStore) {
-    let agent_dir = tempfile::tempdir().unwrap();
-    let (launch, _) = common::scripted_agent(
-        agent_dir.path(),
-        "printf 'auth failed for key %s\\n' \"$LEAK_KEY\" >&2\n\
-         printf 'Authorization: Basic %s\\n' \"$(printf 'x-access-token:%s' \"$LEAK_GH\" | base64 | tr -d '\\n')\" >&2\n\
-         printf 'bearer %s and db password %s\\n' \"$LEAK_A2A\" \"$LEAK_DB\" >&2\n\
-         FAKE_ACP_SCENARIO=crash exec \"$AGENT\"",
-        OpenCodeLaunch::program("unused")
-            .env("LEAK_KEY", common::MODEL_KEY)
-            .env("LEAK_GH", common::GITHUB_TOKEN)
-            .env("LEAK_A2A", common::A2A_TOKEN)
-            .env("LEAK_DB", common::DB_PASSWORD),
-    );
-    let fx = Fixture::with("hello\n", |s| s.opencode = launch).await;
-    let mock = Arc::new(MockModel::new());
-    prepare_and_delegate(&mock, &fx, &["c2"]);
-    // One attempt only: the first transient failure ends the run.
-    let server = Server::start(coder_retrying(&fx, mock.clone(), store, 1)).await;
-    let worker = spawn_worker(&server.coder);
-
-    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
-    worker.stop().await;
-
-    assert_eq!(
-        seen.last_state,
-        Some(TaskState::Failed),
-        "{:?}",
-        seen.labels
-    );
-    let error = seen
-        .messages
-        .iter()
-        .find(|m| m.contains("gave up after 1 attempts"))
-        .unwrap_or_else(|| panic!("no failure message in {:#?}", seen.messages));
-    assert!(
-        error.contains("auth failed for key [redacted]"),
-        "the diagnosis is kept, the key is not: {error}"
-    );
-    assert!(
-        error.contains("bearer [redacted] and db password [redacted]"),
-        "{error}"
-    );
-    assert!(error.contains("Authorization: Basic [redacted]"), "{error}");
-    assert_no_secret(
-        &everything_visible(&server, &fx, &seen).await,
-        "opencode stderr",
-    );
-}
-
 /// A failing check prints secrets (say a test dumps its environment): the
 /// findings a client reads as the run's error, the tool result the model sees,
 /// the notes and the progress lines are clean.
 async fn secrets_in_check_output_never_reach_the_client(store: DynStore) {
-    // OpenCode writes a file that holds secrets (a dumped environment); the
-    // failing check prints it.
+    // The failing check prints secrets, as a test that dumps its environment would. The command
+    // names each value in two halves, so that no secret is in the model's own call.
+    let halves = |secret: &str| {
+        let (head, tail) = secret.split_at(secret.len() / 2);
+        format!("'{head}' '{tail}'")
+    };
     let dump = format!(
-        "GITHUB_TOKEN={}\nMODEL_API_KEY={}\ndb=postgres://u:{}@h/db\n",
-        common::GITHUB_TOKEN,
-        common::MODEL_KEY,
-        common::DB_PASSWORD
+        "printf 'GITHUB_TOKEN=%s%s\\nMODEL_API_KEY=%s%s\\ndb=postgres://u:%s%s@h/db\\n' {} {} {}; exit 1",
+        halves(common::GITHUB_TOKEN),
+        halves(common::MODEL_KEY),
+        halves(common::DB_PASSWORD)
     );
-    let fx = Fixture::with(&dump, |s| s.max_check_cycles = 1).await;
+    let fx = Fixture::with(|s| s.max_check_cycles = 1).await;
     let mock = Arc::new(MockModel::new());
-    prepare_and_delegate(&mock, &fx, &["c2"]);
     mock.push_tool_calls(vec![call(
+        "c1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
         "c3",
         "run_checks",
-        json!({"command": common::red("cat hello.txt; exit 1")}),
+        json!({"command": common::red(&dump)}),
     )])
     .push_text("The checks fail.");
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -4066,7 +3792,7 @@ async fn secrets_in_check_output_never_reach_the_client(store: DynStore) {
 // -------------------------------------------------------------------- ownership
 
 async fn another_caller_cannot_see_or_resume_the_task(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "q1",
@@ -4207,7 +3933,7 @@ async fn until_it_waits(server: &Server, message: Message) -> Seen {
 /// once as **one form**; the answers come back as one A2UI action and are what the model reads; it goes
 /// on. Over HTTP, through the official client, so the metadata travels as an A2A server gets it.
 async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![three_questions()])
         .push_text("Going with Postgres, Keycloak and Compose.");
@@ -4330,7 +4056,7 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
         "found",
     );
 
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![three_questions()]);
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -4390,7 +4116,7 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
 /// A screen the coder cannot read (the catalog is only referenced and there is no grant): the form
 /// cannot be drawn, so the options are in the question's text.
 async fn a_screen_the_coder_cannot_read_gets_the_options_as_text(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![three_questions()]);
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -4470,7 +4196,7 @@ fn result_of(mock: &MockModel, id: &str) -> (String, bool) {
 async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_form(
     store: DynStore,
 ) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
     let library_url = library.to_string_lossy().into_owned();
     let mock = Arc::new(MockModel::new());
@@ -4582,7 +4308,7 @@ async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_
 /// the tool), and asking again for the repository the person turned down is refused too, and nothing
 /// of it is ever fetched.
 async fn a_no_on_the_form_adds_nothing_and_is_not_asked_again(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
     let library_url = library.to_string_lossy().into_owned();
     let mock = Arc::new(MockModel::new());
@@ -4660,7 +4386,7 @@ async fn a_no_on_the_form_adds_nothing_and_is_not_asked_again(store: DynStore) {
 /// A client that cannot draw the form is told the options in words, and answers with the label of
 /// the yes option: that names the repository, and it is the only way words say yes.
 async fn a_text_question_is_answered_with_the_label_of_its_yes_option(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
     let library_url = library.to_string_lossy().into_owned();
     let mock = Arc::new(MockModel::new());
@@ -4724,7 +4450,7 @@ async fn a_text_question_is_answered_with_the_label_of_its_yes_option(store: Dyn
 /// ask's text names is not. Over HTTP, through the official client, so the metadata travels as an
 /// A2A server gets it.
 async fn an_asked_coder_asks_nobody_for_consent_and_the_task_goes_on(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
     let library_url = library.to_string_lossy().into_owned();
     let mock = Arc::new(MockModel::new());
@@ -4796,7 +4522,7 @@ async fn an_asked_coder_asks_nobody_for_consent_and_the_task_goes_on(store: DynS
 /// asks again instead of saying the person declined.
 async fn a_bare_yes_or_no_to_a_text_question_is_no_answer(store: DynStore) {
     for word in ["yes", "no"] {
-        let fx = Fixture::new("hello\n").await;
+        let fx = Fixture::new().await;
         let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
         let library_url = library.to_string_lossy().into_owned();
         let mock = Arc::new(MockModel::new());
@@ -4860,7 +4586,7 @@ async fn a_bare_yes_or_no_to_a_text_question_is_no_answer(store: DynStore) {
 /// repository stays refused for now, and the tool asks the same question again instead of
 /// answering that the person declined.
 async fn a_wait_is_no_answer_and_the_question_is_asked_again(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
     let library_url = library.to_string_lossy().into_owned();
     let mock = Arc::new(MockModel::new());
@@ -4932,7 +4658,7 @@ async fn a_wait_is_no_answer_and_the_question_is_asked_again(store: DynStore) {
 /// question the model wrote with `ask_user` is the person's word, but it names no repository and
 /// agrees to nothing, and the same goes for a repository nobody asked about.
 async fn a_yes_to_a_question_the_model_wrote_grants_nothing(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
     let library_url = library.to_string_lossy().into_owned();
     let mock = Arc::new(MockModel::new());
@@ -4993,9 +4719,7 @@ async fn a_yes_to_a_question_the_model_wrote_grants_nothing(store: DynStore) {
 async fn a_repository_is_created_after_the_person_says_yes_and_the_project_goes_into_it(
     store: DynStore,
 ) {
-    let (fx, host) = Fixture::new("hello\n")
-        .await
-        .creating(&["acme"], &["acme"], None);
+    let (fx, host) = Fixture::new().await.creating(&["acme"], &["acme"], None);
     let made = host.path_of("acme", "fibonacci");
     let url = made.to_string_lossy().into_owned();
     let mock = Arc::new(MockModel::new());
@@ -5121,9 +4845,7 @@ async fn a_repository_is_created_after_the_person_says_yes_and_the_project_goes_
 /// With a no nothing is made, the coder is told not to ask again and not to look for a way round,
 /// and the run waits for the person.
 async fn a_no_to_creating_a_repository_creates_nothing(store: DynStore) {
-    let (fx, host) = Fixture::new("hello\n")
-        .await
-        .creating(&["acme"], &["acme"], None);
+    let (fx, host) = Fixture::new().await.creating(&["acme"], &["acme"], None);
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
         "c1",
@@ -5187,7 +4909,7 @@ async fn a_no_to_creating_a_repository_creates_nothing(store: DynStore) {
 async fn a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_holds() {
     use adam_runtime::{CollectingSink, RunEvent, StepEvent, StepState};
 
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let token = common::GITHUB_TOKEN;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call("s1", "start_scratch", json!({"name": "notes"}))])
@@ -5318,7 +5040,7 @@ fn with_usage(
 async fn the_tokens_of_the_coder_and_its_explorer_reach_an_activated_client() {
     use adam_a2a::USAGE_EXTENSION;
 
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let gateway = MockServer::start().await;
     let script = vec![
         with_usage(
@@ -5470,7 +5192,7 @@ async fn usage_of_two_commands(fx: &Fixture) -> serde_json::Value {
 /// carries the time they ran beside its totals, weighted by the pod's shape, as one entry.
 #[tokio::test]
 async fn the_time_of_the_coders_commands_in_a_run_pod_is_the_tasks_sandbox_usage() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let fake = common::FakeEnvironment::new(Some(&fx.root));
     fake.session.as_pod(Some(250), Some(512 * 1024 * 1024));
     let fx = fx.using(fake.clone());
@@ -5495,7 +5217,7 @@ async fn the_time_of_the_coders_commands_in_a_run_pod_is_the_tasks_sandbox_usage
 /// is *not measured*, which a reader must not take for zero.
 #[tokio::test]
 async fn the_coders_commands_in_its_own_container_are_reported_as_not_measured() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let usage = usage_of_two_commands(&fx).await;
     assert_eq!(usage["sandbox"], json!({"environment": "local"}), "{usage}");
 }
@@ -5532,22 +5254,19 @@ macro_rules! coder_suite {
                 a_message_in_the_context_of_a_parked_run_continues_it,
                 a_run_parked_by_a_plain_text_stop_can_be_canceled,
                 red_checks_n_times_fail_the_run_with_the_findings_and_no_pr,
+                a_history_with_a_delegation_replays_and_an_owed_call_gets_the_unknown_tool_answer,
                 a_pull_request_with_red_checks_needs_explicit_acceptance,
                 crash_after_commit_and_push_was_journaled_repeats_nothing,
                 crash_inside_run_checks_before_the_journal_emits_one_checks_artifact,
                 crash_inside_commit_and_push_before_the_journal_is_idempotent,
                 crash_inside_open_pull_request_before_the_journal_is_idempotent,
-                crash_during_delegate_to_opencode_reruns_on_the_same_worktree,
-                opencode_crashing_every_time_fails_the_run_with_its_stderr,
-                opencode_crashing_once_is_retried_and_completes,
+                crash_during_write_file_reruns_on_the_same_worktree,
                 rate_limited_model_backs_off_and_completes,
-                cancel_during_opencode_turn_cancels_without_push_or_pr,
                 a_cancel_ends_the_task_canceled_while_the_model_has_not_answered,
                 a_cancel_ends_the_task_canceled_while_run_command_sleeps,
                 two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs,
                 a_github_401_fails_the_run_with_a_clear_message,
                 a_refused_github_app_fails_the_run_naming_its_own_variables,
-                secrets_in_opencode_stderr_never_reach_the_client,
                 secrets_in_check_output_never_reach_the_client,
                 wrong_token_on_the_coder_router_is_401,
                 another_caller_cannot_see_or_resume_the_task,

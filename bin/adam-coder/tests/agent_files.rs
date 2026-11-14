@@ -70,9 +70,32 @@ fn expected_prompt(cycles: u32) -> String {
     rendered.trim_end().to_owned()
 }
 
+/// ADR 0038: neither the prompt (for any limit) nor the files it is read from say anything of OpenCode,
+/// and the prompt stays under the 30,000 characters above which the loader warns.
+#[test]
+fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
+    for cycles in [1, 3, 10] {
+        let prompt = expected_prompt(cycles);
+        assert!(
+            !prompt.to_lowercase().contains("opencode"),
+            "the prompt names OpenCode"
+        );
+        assert!(
+            prompt.chars().count() < 30_000,
+            "{} characters: the loader warns above 30,000",
+            prompt.chars().count()
+        );
+    }
+    let files = include_str!("../agent/instructions.md");
+    assert!(
+        !files.to_lowercase().contains("opencode"),
+        "agent/instructions.md (the card included) names OpenCode"
+    );
+}
+
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 25] = [
+const TOOLS: [&str; 24] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -85,7 +108,6 @@ const TOOLS: [&str; 25] = [
     "apply_patch",
     "edit_file",
     "share_file",
-    "delegate_to_opencode",
     "run_checks",
     "rebuild_environment",
     "commit_and_push",
@@ -105,7 +127,7 @@ const TOOLS: [&str; 25] = [
 /// them by name). The titles are words, so no underscore is left in them.
 #[tokio::test]
 async fn every_tool_of_the_coder_has_a_title_for_its_step() {
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         s.create_repo_owners = vec!["acme".to_owned()];
     })
     .await;
@@ -132,7 +154,6 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     assert_eq!(title("run_checks"), Some("Run the checks"));
     assert_eq!(title("start_scratch"), Some("Start a scratch project"));
     assert_eq!(title("ask_user"), Some("Ask you"));
-    assert_eq!(title("delegate_to_opencode"), Some("Hand to OpenCode"));
     let mut unique: Vec<&str> = titles.iter().map(|(_, l)| l.as_str()).collect();
     unique.sort_unstable();
     unique.dedup();
@@ -144,8 +165,8 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
 /// coder's README ("A step's picture"): a tool added later must be put in it, or this test fails.
 #[tokio::test]
 async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
-    use adam_llm_agent::StepIcon::{Delete, Edit, Execute, File, Git, OpenCode, Read, Think};
-    let fx = Fixture::with("hello\n", |s| {
+    use adam_llm_agent::StepIcon::{Delete, Edit, Execute, File, Git, Read, Think};
+    let fx = Fixture::with(|s| {
         s.create_repo_owners = vec!["acme".to_owned()];
     })
     .await;
@@ -170,7 +191,6 @@ async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
         ("share_file", File),
         ("request_repository", Think),
         ("ask_user", Think),
-        ("delegate_to_opencode", OpenCode),
     ];
     let tools = coder_tools(&fx.env);
     let icons: Vec<(String, Option<adam_llm_agent::StepIcon>)> = tools
@@ -194,7 +214,7 @@ async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
 
 async fn coder(cycles: u32) -> (Fixture, CoderAgent) {
     // A deployment that allows creating repositories: the tool is offered and the prompt describes it.
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         s.max_check_cycles = cycles;
         s.create_repo_owners = vec!["acme".to_owned()];
     })
@@ -276,7 +296,7 @@ async fn the_prompt_gives_the_agent_a_name_and_asks_for_plain_words() {
 /// (a deployment's live chats showed it doing so, then calling the tool with an owner it made up).
 #[tokio::test]
 async fn the_prompt_says_there_is_no_repository_creation_when_none_is_allowed() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     assert!(fx.env.settings.create_repo_owners.is_empty());
     let model: DynModel = Arc::new(MockModel::new());
     let agent = CoderAgent::new(model, "test-model", fx.env.clone());
@@ -377,7 +397,7 @@ async fn the_assembled_agent_is_what_the_hand_written_one_was() {
 
 #[tokio::test]
 async fn a_model_alias_the_assembly_refuses_is_an_error_not_a_panic_for_try_new() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let model = || -> DynModel { Arc::new(MockModel::new()) };
     for alias in ["", "two words"] {
         let err = CoderAgent::try_new(model(), alias, fx.env.clone())
@@ -422,7 +442,7 @@ async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
 /// the journal records (the step names, which a replay checks).
 #[tokio::test]
 async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     let mock = Arc::new(MockModel::new());
     // No workspace yet: the tool answers with an error result and has no effect.
     mock.push_tool_calls(vec![ToolCall {
@@ -560,7 +580,7 @@ fn options() -> RuntimeOptions {
 /// assembly (prompt, tools, limits) and the same card.
 #[tokio::test]
 async fn a_copy_of_the_shipped_folder_is_the_embedded_agent() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     // The shipped files as they are, `mcp.json` included: the digest covers it.
     let tmp = common::folder();
@@ -589,7 +609,7 @@ async fn a_copy_of_the_shipped_folder_is_the_embedded_agent() {
 /// edited prompt, with no rebuild. The limit is still the process's (`max_check_cycles`).
 #[tokio::test]
 async fn editing_the_folder_changes_what_the_model_is_sent() {
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         s.max_check_cycles = 5;
         s.create_repo_owners = vec!["acme".to_owned()];
     })
@@ -655,7 +675,7 @@ async fn a_folder_for_another_agent_is_refused_naming_the_field() {
 /// at startup, naming the var, and so does a tool the coder does not have.
 #[tokio::test]
 async fn a_folder_that_disagrees_with_the_code_fails_at_assembly() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     let model = || -> DynModel { mock.clone() };
 
@@ -700,7 +720,7 @@ async fn a_folder_that_disagrees_with_the_code_fails_at_assembly() {
 /// `tools:` in the folder narrows the coder's tools.
 #[tokio::test]
 async fn a_folder_may_narrow_the_tools() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     let tmp = folder();
     edit_instructions(&tmp, |text| {
@@ -736,7 +756,7 @@ async fn the_shipped_folder_has_a_read_only_explorer_and_reviewer() {
 /// tools work for the root of a child run.
 #[tokio::test]
 async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     let url = fx.remote_url();
     mock.push_tool_calls(vec![ToolCall {
@@ -799,7 +819,7 @@ async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
 /// a child run answers, and the coder goes on with the child's text.
 #[tokio::test]
 async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let tmp = folder();
     std::fs::create_dir_all(tmp.path().join("agent/subagents")).unwrap();
     std::fs::write(
@@ -921,7 +941,7 @@ impl ModelClient for PersonaModel {
 /// prompt; what a live model does with it is unverified.)
 #[tokio::test]
 async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
 
     let greet = |files: AgentFiles| {
         let fx = &fx;
@@ -989,7 +1009,7 @@ async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
 /// `display_name` is the one var of the persona: a folder that renames it renames the prompt.
 #[tokio::test]
 async fn the_display_name_var_is_the_name_in_the_prompt() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let mock = Arc::new(MockModel::new());
     let tmp = folder();
     edit_instructions(&tmp, |text| {
@@ -1044,7 +1064,7 @@ async fn connected_def(
 /// result. The token reaches the server from `${TEST_MCP_TOKEN}`.
 #[tokio::test]
 async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     let server = TestHttpServer::start(Some(MCP_TOKEN)).await;
     let tmp = folder();
     write_mcp_json(&tmp, &server.url());
@@ -1239,7 +1259,7 @@ async fn the_shipped_mcp_json_reaches_its_server_only_at_the_origin_the_deployme
 /// bound without them (fail closed): `try_from_files` is the sync path and cannot connect.
 #[tokio::test]
 async fn an_mcp_json_that_was_not_connected_is_refused_at_assembly() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let tmp = folder();
     write_mcp_json(&tmp, "http://127.0.0.1:9/mcp");
     let mock = Arc::new(MockModel::new());

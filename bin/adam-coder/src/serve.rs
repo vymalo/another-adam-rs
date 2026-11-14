@@ -28,17 +28,15 @@ use std::future::Future;
 use std::sync::Arc;
 
 use adam_a2a::AccessTier;
-use adam_devcontainer::{DevContainer, Network, Runtime};
+use adam_devcontainer::{DevContainer, Runtime};
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions, claim_scope_for};
 use adam_workspace::{DynCodeHost, DynEnvironment, GitHub, GitIdentity};
 use anyhow::Context as _;
-use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::agent::CoderStarter;
 use crate::github_mcp::{GitHubReadBearer, SERVER_NAME as GITHUB_SERVER};
 use crate::janitor::Janitor;
-use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
 use crate::{
@@ -61,7 +59,7 @@ async fn build_agent(
     if worker.commands_can_read_the_app_key() {
         tracing::warn!(
             "GitHub App mode with the private key in a file (GITHUB_APP_PRIVATE_KEY_PATH), and the commands of a run \
-             (run_command, run, run_checks, OpenCode) run in this container as the user that can read it: a \
+             (run_command, run, run_checks) run in this container as the user that can read it: a \
              command can read the key and mint installation tokens, so NO access tier holds against a command, \
              a `plan` included. ALLOW_COMMANDS_NEXT_TO_SECRETS=true accepted this; to remove it run the commands in \
              run pods (RUN_ENVIRONMENT=kubernetes) or in Podman devcontainers (DEVCONTAINER_RUNTIME=podman), or \
@@ -89,11 +87,7 @@ async fn build_agent(
             .with_api_base(worker.github_api_url.as_str()),
     );
 
-    let mut settings = CoderSettings::new(OpenCodeLaunch::from_command(
-        &worker.opencode_command,
-        &worker.model.base_url,
-        &worker.opencode_model,
-    ));
+    let mut settings = CoderSettings::new();
     settings.max_check_cycles = worker.max_check_cycles;
     settings.scratch_check_cycles = worker.scratch_check_cycles;
     if let Some(host) = worker.allowed_repo_hosts.first() {
@@ -107,7 +101,6 @@ async fn build_agent(
     // `GITHUB_APP_OWNERS=*` is not such a list: it needs `CREATE_REPO_OWNERS`.
     settings.create_for_installed_owners = worker.github.names_its_accounts();
     settings.max_access_tier = max_access_tier;
-    settings.container_network_none = worker.devcontainer.network == Network::None;
     settings.check_timeout = worker.check_timeout;
     settings.check_output_tail = worker.check_output_tail;
     settings.draft_pull_requests = worker.pr_draft;
@@ -116,7 +109,7 @@ async fn build_agent(
     // The agent's definition: its own files, with the extra MCP servers `ADAM_EXTRA_MCP_FILE` names
     // added (a name the agent already has is refused: exit 78). Read before the environment, because
     // the variables its servers refer to (`${VAR}` in a header) are secrets of this process: they are
-    // hidden from every process a run starts (a repository's checks, a command, OpenCode) and
+    // hidden from every process a run starts (a repository's checks, a command) and
     // redacted from what the tools answer, like the fixed ones.
     let mut def = files
         .def()
@@ -204,14 +197,14 @@ async fn build_agent(
     Ok((agent, janitor))
 }
 
-/// Where this worker's runs run their commands and OpenCode: the repository's devcontainer, on the
+/// Where this worker's runs run their commands: the repository's devcontainer, on the
 /// rootless Podman service `CONTAINER_HOST` names, or this container.
 ///
 /// [`DevContainer`] is the environment either way: with `DEVCONTAINER_RUNTIME=off` it is the coder's own
 /// container and says, once per run, that a repository's devcontainer is not used here. With `podman`
 /// it starts up like this:
 ///
-/// 1. the tools directory every devcontainer mounts (`adam-exec`, the coder's OpenCode) is written,
+/// 1. the tools directory every devcontainer mounts (`adam-exec`) is written,
 ///    which fails the start: a binary that cannot be read is a mistake of the deployment;
 /// 2. the service is probed. **A service that does not answer does not stop the coder**: it may start
 ///    after it, and every run probes again (at most every 30 seconds) and falls back to this container,
@@ -224,8 +217,7 @@ async fn build_agent(
 ///
 /// # Errors
 ///
-/// The tools directory cannot be written (an `OPENCODE_BINARY` that cannot be read, a volume that
-/// refuses): the process does not start. Nothing else here fails it.
+/// The tools directory cannot be written (a volume that refuses): the process does not start. Nothing else here fails it.
 pub async fn environment_for(
     worker: &WorkerConfig,
     root: &std::path::Path,
@@ -260,11 +252,7 @@ async fn kubernetes_environment(
         adam_env_kubernetes::PodTemplate::from_file(&pods.template_file, &pods.container, root)
             .context("reading the run pod template (RUN_POD_TEMPLATE_FILE)")?;
     let image = template.image().map(str::to_owned);
-    let key = &worker.model.api_key;
-    let settings = pods.settings(
-        worker.worker_id.as_deref().unwrap_or("adam-coder"),
-        !key.expose_secret().is_empty(),
-    );
+    let settings = pods.settings(worker.worker_id.as_deref().unwrap_or("adam-coder"));
     let environment = adam_env_kubernetes::KubeEnvironment::connect(settings, template)
         .await
         .context("connecting to the Kubernetes API for the run pods")?;
@@ -287,9 +275,7 @@ async fn local_environment(
     root: &std::path::Path,
 ) -> anyhow::Result<DynEnvironment> {
     let config = &worker.devcontainer;
-    let key = &worker.model.api_key;
-    let model_key: Option<SecretString> = (!key.expose_secret().is_empty()).then(|| key.clone());
-    let environment = DevContainer::new(config.settings(root.to_path_buf(), model_key));
+    let environment = DevContainer::new(config.settings(root.to_path_buf()));
     if config.runtime == Runtime::Podman {
         let tools = environment
             .install_tools()
@@ -367,6 +353,13 @@ pub async fn serve(
     // in it stops the process (exit 78) with every diagnostic, whether or not the database is up.
     let files = AgentFiles::load(config.agent_dir.as_deref()).context("reading the agent files")?;
     files.log();
+    // The variables of the coder's OpenCode (ADR 0038): ignored, and said once, by name only.
+    for name in &config.ignored {
+        tracing::warn!(
+            variable = %name,
+            "{name} is set and ignored: the coder no longer uses OpenCode (ADR 0038); remove it"
+        );
+    }
 
     // Only a role that runs workers builds the agent: model, GitHub client, workspaces, MCP
     // servers. A control plane starts, delivers to, cancels and views runs, which needs the

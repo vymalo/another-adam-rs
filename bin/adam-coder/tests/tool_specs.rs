@@ -22,7 +22,7 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 23] = [
+const TOOLS: [&str; 22] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -35,7 +35,6 @@ const TOOLS: [&str; 23] = [
     "apply_patch",
     "edit_file",
     "share_file",
-    "delegate_to_opencode",
     "run_checks",
     "rebuild_environment",
     "commit_and_push",
@@ -81,7 +80,7 @@ fn spec_json(tool: &dyn adam_llm_agent::Tool) -> Value {
 
 #[tokio::test]
 async fn every_spec_equals_its_snapshot() {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     let tools: Vec<_> = coder_tools(&fx.env).into_iter().collect();
     let names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
     assert_eq!(names, TOOLS, "the tools, in the order they are offered");
@@ -117,7 +116,7 @@ async fn every_spec_equals_its_snapshot() {
 /// offered, in the same order.
 #[tokio::test]
 async fn create_repository_is_not_offered_when_no_owner_may_create_one() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     assert!(fx.env.settings.create_repo_owners.is_empty());
     assert!(!fx.env.settings.create_for_installed_owners);
     let names: Vec<String> = coder_tools(&fx.env)
@@ -142,7 +141,7 @@ async fn create_repository_is_not_offered_when_no_owner_may_create_one() {
 /// tool is on by default for one (the process sets `create_for_installed_owners`).
 #[tokio::test]
 async fn create_repository_is_on_by_default_for_a_github_app() {
-    let fx = Fixture::with("hello\n", |settings| {
+    let fx = Fixture::with(|settings| {
         settings.create_for_installed_owners = true;
     })
     .await;
@@ -206,7 +205,7 @@ fn nullable_properties(prefix: &str, schema: &Value, found: &mut Vec<String>) {
 /// optional arguments say `null`, and `required` (the contract with the model) is what it is.
 #[tokio::test]
 async fn only_the_optional_arguments_are_nullable() {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     let mut found = Vec::new();
     for tool in coder_tools(&fx.env) {
         let spec = tool.spec();
@@ -220,7 +219,6 @@ async fn only_the_optional_arguments_are_nullable() {
             "commit_and_push.repo",
             "create_repository.description",
             "create_repository.private",
-            "delegate_to_opencode.repo",
             "edit_file.replace_all",
             "edit_file.repo",
             "merge_pull_request.delete_branch",
@@ -256,7 +254,7 @@ async fn only_the_optional_arguments_are_nullable() {
 /// such a tool to a subagent (nobody could answer it).
 #[tokio::test]
 async fn only_the_tools_that_ask_the_person_are_marked_so() {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     let asking: Vec<String> = coder_tools(&fx.env)
         .into_iter()
         .filter(|tool| tool.asks_user())
@@ -279,7 +277,7 @@ async fn only_the_tools_that_ask_the_person_are_marked_so() {
 /// The tools read `ToolEnv` from the agent's state, and the agent says so when it is missing.
 #[tokio::test]
 async fn the_tools_need_the_env_as_agent_state() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let model = || -> adam_model::DynModel { Arc::new(MockModel::new()) };
 
     let without = LlmAgent::builder("coder", model(), "m")

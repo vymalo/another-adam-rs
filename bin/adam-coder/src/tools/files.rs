@@ -1,7 +1,6 @@
 //! `read_file`, `write_file`, `edit_file` and `apply_patch`: the coder edits small, well-located things itself.
 //!
-//! The model used to change a worktree only by delegating to OpenCode, which costs a process, a
-//! model and a conversation for a one-line fix. These tools read and change files of the
+//! These tools read and change files of the
 //! worktree directly, in the coder's own process, and are **confined to it**: the model chooses
 //! the path, so a path is checked by [`confine`] before anything is opened, and a patch is checked
 //! by the paths `git` itself says it would touch.
@@ -35,7 +34,7 @@
 //!
 //! Git is not touched. The tools change files; `commit_and_push` commits what the files say, and a
 //! change made here changes the worktree's tree, so the next `commit_and_push` is bound to a check
-//! only after a new `run_checks` (the same rule as for OpenCode's edits).
+//! only after a new `run_checks` (the same rule as for every change).
 //!
 //! # Races
 //!
@@ -466,7 +465,7 @@ fn write_in(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String>
     if content.len() > WRITE_CAP {
         return Err(format!(
             "content is {} bytes, over the limit of {WRITE_CAP}: write the file in parts with \
-             apply_patch, or have OpenCode do it",
+             apply_patch",
             content.len()
         ));
     }
@@ -701,8 +700,7 @@ async fn plan(at: &GitAt, patch: &str, recount: bool) -> Result<Plan, PatchError
 async fn apply_in(at: &GitAt, patch: &str) -> Result<Vec<String>, PatchError> {
     if patch.len() > PATCH_CAP {
         return Err(PatchError::Refused(format!(
-            "the patch is {} bytes, over the limit of {PATCH_CAP}: split it, or have OpenCode make \
-             the change",
+            "the patch is {} bytes, over the limit of {PATCH_CAP}: split it into several patches",
             patch.len()
         )));
     }
@@ -797,7 +795,7 @@ pub async fn read_file(
 /// Create a file, or replace one, with exactly `content`. Parent directories are created. The
 /// path is relative to the root of the worktree; nothing inside `.git` and nothing through a
 /// symlink can be written. For a change to part of a file use edit_file (exact text replaced) or
-/// apply_patch (a diff); for a broad, multi-file change use delegate_to_opencode.
+/// apply_patch (a diff); for a broad, multi-file change write the files one by one.
 #[tool(label = "Write a file", icon = "edit")]
 pub async fn write_file(
     env: State<ToolEnv>,
@@ -842,7 +840,7 @@ pub async fn write_file(
 /// is refused; and it is all or nothing: if a hunk does not match the file, nothing is changed
 /// and you are told why. Read the file first, so the context lines match it exactly. Use it for
 /// several changes at once, in one file or several; for one exact replacement edit_file is simpler.
-/// Delegate broad, multi-file changes to OpenCode.
+/// A broad, multi-file change is several of these, or several files written one by one.
 #[tool(label = "Apply a patch", icon = "edit")]
 pub async fn apply_patch(
     env: State<ToolEnv>,
@@ -935,8 +933,7 @@ fn edit_in(
     }
     if meta.size() > WRITE_CAP as u64 {
         return Err(format!(
-            "`{shown}` is {} bytes, over the {WRITE_CAP} bytes edit_file works on: use apply_patch, \
-             or have OpenCode make the change",
+            "`{shown}` is {} bytes, over the {WRITE_CAP} bytes edit_file works on: use apply_patch",
             meta.size()
         ));
     }
@@ -949,8 +946,7 @@ fn edit_in(
         .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
     if bytes.len() > WRITE_CAP {
         return Err(format!(
-            "`{shown}` is over the {WRITE_CAP} bytes edit_file works on: use apply_patch, or have \
-             OpenCode make the change"
+            "`{shown}` is over the {WRITE_CAP} bytes edit_file works on: use apply_patch"
         ));
     }
     let Ok(content) = String::from_utf8(bytes) else {

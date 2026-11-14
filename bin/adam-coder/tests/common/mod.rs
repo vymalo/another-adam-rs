@@ -1,18 +1,16 @@
 //! Shared fixture: a local bare git repository as the remote, a mock GitHub for
-//! pull requests, the adam-acp fake agent standing in for OpenCode, and helpers
-//! to script the model. Everything is offline.
+//! pull requests, and helpers to script the model. Everything is offline.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use a2a::{Message as A2aMessage, Part, Role};
 use adam_a2a::A2UI_MEDIA_TYPE;
 use adam_a2a_runtime::vymalo_inbound;
-use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{CoderSettings, Redactor, ToolEnv};
 use adam_model::ToolCall;
 use adam_runtime::Inbound;
@@ -162,69 +160,6 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-/// Path of the scripted ACP agent, built on first use.
-///
-/// `CARGO_BIN_EXE_*` exists only inside `adam-acp`, so this crate's tests build
-/// the binary themselves: `cargo build -p adam-acp --bin adam-acp-fake-agent`,
-/// with the same profile as the running test binary. The output directory is
-/// derived from the test executable's own location
-/// (`<target>/<profile>/deps/<test>`), which is right for any `CARGO_TARGET_DIR`
-/// or `--target-dir`. Cargo is found through `$CARGO`, then `PATH`.
-pub fn fake_agent() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let exe = std::env::current_exe().expect("test executable path");
-        // The nearest directory named after a built-in profile, wherever cargo put the test under
-        // it (`<profile>/deps/<test>`, or deeper in a newer layout); else the old guess.
-        let profile_dir = exe
-            .ancestors()
-            .skip(1)
-            .find(|dir| {
-                matches!(
-                    dir.file_name().and_then(|n| n.to_str()),
-                    Some("debug" | "release")
-                )
-            })
-            .or_else(|| exe.parent().and_then(Path::parent))
-            .expect("<target>/<profile>/deps/<test>")
-            .to_path_buf();
-        let profile = profile_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("profile directory name")
-            .to_owned();
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-        let mut cmd = Command::new(cargo);
-        cmd.args([
-            "build",
-            "--quiet",
-            "-p",
-            "adam-acp",
-            "--bin",
-            "adam-acp-fake-agent",
-        ]);
-        match profile.as_str() {
-            "debug" => {}
-            "release" => {
-                cmd.arg("--release");
-            }
-            other => {
-                cmd.args(["--profile", other]);
-            }
-        }
-        // The same target directory as this test binary, wherever it is.
-        cmd.env(
-            "CARGO_TARGET_DIR",
-            profile_dir.parent().expect("target dir"),
-        );
-        let status = cmd.status().expect("cargo runs");
-        assert!(status.success(), "building adam-acp-fake-agent failed");
-        let bin = profile_dir.join("adam-acp-fake-agent");
-        assert!(bin.is_file(), "{} was not built", bin.display());
-        bin
-    })
 }
 
 /// The pull requests the mock GitHub has, by head branch: `number` starts at 7
@@ -799,13 +734,13 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    /// A fixture whose fake OpenCode writes `hello.txt` with `content`.
-    pub async fn new(content: &str) -> Self {
-        Self::with(content, |_| {}).await
+    /// A fixture: a bare remote with `README.md`, a mock GitHub and tools over them.
+    pub async fn new() -> Self {
+        Self::with(|_| {}).await
     }
 
     /// Like [`new`](Self::new), adjusting the settings first.
-    pub async fn with(content: &str, tweak: impl FnOnce(&mut CoderSettings)) -> Self {
+    pub async fn with(tweak: impl FnOnce(&mut CoderSettings)) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let remote = tmp.path().join("remote.git");
         let seed = tmp.path().join("seed");
@@ -843,11 +778,7 @@ impl Fixture {
             slug: RepoRef::new("https://github.com/octo/widgets.git", "main"),
         });
 
-        let launch = OpenCodeLaunch::program(fake_agent())
-            .env("FAKE_ACP_SCENARIO", "write-file")
-            .env("FAKE_ACP_WRITE_PATH", "hello.txt")
-            .env("FAKE_ACP_WRITE_CONTENT", content);
-        let mut settings = CoderSettings::new(launch);
+        let mut settings = CoderSettings::new();
         // A fixture is a deployment that lets a person pick any tier (`MAX_ACCESS_TIER=bypass`),
         // so that a test of a tier is a test of the tier; the cap itself is `capped_at`.
         settings.max_access_tier = adam_a2a::AccessTier::Bypass;
@@ -1222,7 +1153,7 @@ pub fn call(id: &str, name: &str, args: Value) -> ToolCall {
     }
 }
 
-/// The model script of the happy path: prepare, delegate, check, commit and
+/// The model script of the happy path: prepare, write `hello.txt`, check, commit and
 /// push, open the PR, then answer.
 pub fn happy_script(mock: &adam_model::MockModel, remote_url: &str) {
     happy_script_titled(mock, remote_url, "feat: add hello.txt");
@@ -1237,8 +1168,8 @@ pub fn happy_script_titled(mock: &adam_model::MockModel, remote_url: &str, title
     )])
     .push_tool_calls(vec![call(
         "c2",
-        "delegate_to_opencode",
-        json!({"instructions": "add hello.txt containing hello"}),
+        "write_file",
+        json!({"path": "hello.txt", "content": "hello\n"}),
     )])
     .push_tool_calls(vec![call(
         "c3",
@@ -1330,35 +1261,6 @@ pub fn text_reply(text: &str) -> Value {
         "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1}
     })
-}
-
-/// An ACP "OpenCode" that is a shell script around the fake agent, so tests
-/// can script what the real one would do across launches. The script runs with
-/// `$AGENT` set to the fake agent (which reads the `FAKE_ACP_*` variables of
-/// `base`) and `$LAUNCHES`, a file it appends one line to per launch.
-///
-/// Returns the launcher and the path of the launch log.
-pub fn scripted_agent(dir: &Path, script: &str, base: OpenCodeLaunch) -> (OpenCodeLaunch, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
-    let launches = dir.join("launches.log");
-    let file = dir.join("opencode.sh");
-    std::fs::write(
-        &file,
-        format!("#!/bin/sh\necho launched >> \"$LAUNCHES\"\n{script}\n"),
-    )
-    .unwrap();
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut launch = OpenCodeLaunch::program("/bin/sh")
-        .env("AGENT", fake_agent().to_string_lossy())
-        .env("LAUNCHES", launches.to_string_lossy());
-    launch.args = vec![file.to_string_lossy().into_owned()];
-    launch.env.extend(base.env);
-    (launch, launches)
-}
-
-/// How often the launch log says the agent was started.
-pub fn launches(log: &Path) -> usize {
-    std::fs::read_to_string(log).map_or(0, |t| t.lines().count())
 }
 
 /// The process id a test agent wrote to `file`, once it has (polls up to 30 s).

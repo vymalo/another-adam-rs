@@ -1,11 +1,11 @@
 //! Keeping the process's own secrets out of everything that leaves it.
 //!
 //! Text produced by things this process does not control ends up in places
-//! clients can read: OpenCode's stderr tail in an "ACP agent exited" error, a
+//! clients can read: a command's output in an error, a
 //! check's output in the findings of a failed run, a model provider's error
 //! body (which may echo the key it rejected). A [`Redactor`] replaces the
 //! *values* of the secrets the process holds with `[redacted]`, and is applied
-//! at the boundaries: tool results and errors, OpenCode's and the checks'
+//! at the boundaries: tool results and errors, the checks'
 //! progress lines, and the agent's final failure message.
 //!
 //! It is exact-value replacement, not a detector: a secret that was never
@@ -33,7 +33,7 @@ use crate::Config;
 pub const REDACTED: &str = "[redacted]";
 
 /// The most a run's failure text (`RunView::error`, the A2A `Failed` status message) may carry, in
-/// bytes. Upstream bodies and OpenCode's stderr tail can be long, and the text is shown to clients.
+/// bytes. Upstream bodies and a command's output can be long, and the text is shown to clients.
 pub const MAX_FAILURE_TEXT: usize = 2048;
 
 /// Appended to a failure text that was cut.

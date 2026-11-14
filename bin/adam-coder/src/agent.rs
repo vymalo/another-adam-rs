@@ -1207,7 +1207,7 @@ impl Agent for CoderAgent {
         let redactor = &self.env.redactor;
         self.record_grants(ctx, &state, &run).await?;
         // Whatever leaves this step as a failure, a retry note or the final
-        // answer may quote OpenCode's stderr, a check's output or a provider's
+        // answer may quote a check's output, a command's output or a provider's
         // error body, so it passes through the redactor.
         let transition = match self.assembly.root().step(ctx, state).await {
             Ok(t) => t,
@@ -1435,8 +1435,8 @@ mod tests {
         report(e)
     }
 
-    /// Regression for A6: a failure's text embeds what the peer said (an upstream body, OpenCode's
-    /// stderr tail), which can echo the model key. Every variant is scrubbed, including a cause
+    /// Regression for A6: a failure's text embeds what the peer said (an upstream body, a
+    /// command's output), which can echo the model key. Every variant is scrubbed, including a cause
     /// that used to be printed after the message without passing the redactor, and the retry hint
     /// is kept.
     #[test]

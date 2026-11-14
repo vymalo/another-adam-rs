@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 
 /// The tools of the coder in the order they are offered, with the two subagents, as the model is
 /// shown them at the highest tier.
-const ALL: [&str; 25] = [
+const ALL: [&str; 24] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -51,7 +51,6 @@ const ALL: [&str; 25] = [
     "apply_patch",
     "edit_file",
     "share_file",
-    "delegate_to_opencode",
     "run_checks",
     "rebuild_environment",
     "commit_and_push",
@@ -153,7 +152,7 @@ fn result_of(request: &ModelRequest, id: &str) -> String {
 
 #[tokio::test]
 async fn the_model_is_shown_only_the_tools_the_tier_of_the_message_allows() {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     let without = |drop: &[&str]| -> Vec<&'static str> {
         ALL.into_iter().filter(|n| !drop.contains(n)).collect()
     };
@@ -266,7 +265,7 @@ async fn with_memory_host() -> (Fixture, Arc<MemoryCodeHost>) {
     .await
     .unwrap();
     let dyn_host: DynCodeHost = host.clone();
-    (Fixture::new("hello\n").await.hosted_by(dyn_host), host)
+    (Fixture::new().await.hosted_by(dyn_host), host)
 }
 
 #[tokio::test]
@@ -371,7 +370,7 @@ async fn a_model_that_calls_a_tool_above_the_tier_anyway_is_refused_and_the_host
 /// root run can say the tier: a tool called directly is refused from them, a child's call too.
 #[tokio::test]
 async fn every_tool_checks_the_tier_in_the_notes_of_the_root_run_when_it_is_called() {
-    let fx = Fixture::new("hello\n").await.offering_creation();
+    let fx = Fixture::new().await.offering_creation();
     let sink = CollectingSink::new();
     let root =
         ToolCtx::detached("tool", "call-1", Arc::new(sink.clone())).with_state(fx.env.clone());
@@ -621,7 +620,7 @@ impl Rig {
 #[tokio::test]
 async fn a_pull_request_the_conversation_pushed_is_merged_through_github_with_the_method_and_the_head_it_read()
  {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "9f8e7d").await;
     rig.pushed("octo/widgets", "agent/x").await;
     let out = rig
@@ -650,7 +649,7 @@ async fn a_pull_request_the_conversation_pushed_is_merged_through_github_with_th
     assert_eq!(rig.requests("DELETE").await.len(), 1);
 
     // The default is a squash, and the branch stays unless asked.
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "1").await;
     rig.pushed("octo/widgets", "agent/x").await;
     let out = rig
@@ -686,7 +685,7 @@ async fn what_github_refuses_is_the_tools_error_in_githubs_words_with_the_class(
             "unauthenticated",
         ),
     ] {
-        let rig = Rig::new(Fixture::new("hello\n").await);
+        let rig = Rig::new(Fixture::new().await);
         common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "1").await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path(
@@ -732,7 +731,7 @@ async fn what_github_refuses_is_the_tools_error_in_githubs_words_with_the_class(
 /// before anybody is asked.
 #[tokio::test]
 async fn a_pull_request_the_conversation_did_not_push_is_put_to_the_person_and_not_merged() {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "1").await;
     // Nobody pushed it: the person is asked, the host is not.
     let asked = rig.asked().await;
@@ -775,7 +774,7 @@ async fn a_pull_request_the_conversation_did_not_push_is_put_to_the_person_and_n
 /// The mock GitHub with pull request 7 of `octo/widgets` from `agent/x`, whose head is `abc123`,
 /// and the run having pushed that branch: what a merge of the pull request the run opened is.
 async fn rig_with_a_pull_request_of_the_run(state: &str) -> Rig {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_pull(
         &rig.fx.github,
         "octo/widgets",
@@ -793,7 +792,7 @@ async fn rig_with_a_pull_request_of_the_run(state: &str) -> Rig {
 /// The mock GitHub with pull request 7 of `octo/widgets` from somebody else's branch, whose head is
 /// `abc123`: what a merge of a pull request nobody here pushed is.
 async fn rig_with_a_pull_request_of_somebody_else() -> Rig {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_pull(
         &rig.fx.github,
         "octo/widgets",
@@ -898,7 +897,7 @@ async fn what_the_person_says_in_words_does_not_decide_a_merge() {
 /// another's pull request, and the person is told it is from a fork.
 #[tokio::test]
 async fn a_branch_of_a_fork_with_the_name_of_a_pushed_branch_is_not_the_one_pushed() {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_pull_from(
         &rig.fx.github,
         "octo/widgets",
@@ -964,7 +963,7 @@ async fn a_pull_request_whose_checks_did_not_pass_is_not_merged() {
 
 #[tokio::test]
 async fn a_head_that_moved_after_the_checks_were_read_is_not_merged() {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     rig.pushed_sha("octo/widgets", "agent/x", "aaa").await;
     let github = &rig.fx.github;
     let (status, runs) = green();
@@ -1156,7 +1155,7 @@ async fn at_bypass_a_pull_request_is_merged_without_a_question_after_the_same_ch
 /// not just a branch of a name it used: a commit somebody pushed since is another's, and is asked.
 #[tokio::test]
 async fn a_branch_somebody_pushed_to_since_is_not_the_conversations() {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_pull(
         &rig.fx.github,
         "octo/widgets",
@@ -1180,7 +1179,7 @@ async fn a_branch_somebody_pushed_to_since_is_not_the_conversations() {
 /// did not ask for that one to be merged.
 #[tokio::test]
 async fn a_pull_request_from_the_conversations_branch_into_another_base_is_put_to_the_person() {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_pull_to(
         &rig.fx.github,
         "octo/widgets",
@@ -1199,7 +1198,7 @@ async fn a_pull_request_from_the_conversations_branch_into_another_base_is_put_t
     assert!(asked.contains("into release?"), "{asked}");
     assert!(rig.requests("PUT").await.is_empty());
     // A base the notes do not know is not the base either.
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_pull(
         &rig.fx.github,
         "octo/widgets",
@@ -1228,7 +1227,7 @@ async fn a_pull_request_from_the_conversations_branch_into_another_base_is_put_t
 /// failing one, what the person accepted when the pull request was opened says nothing about it.
 #[tokio::test]
 async fn red_checks_accepted_at_the_opening_do_not_cover_a_commit_somebody_else_pushed() {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_pull(
         &rig.fx.github,
         "octo/widgets",
@@ -1303,7 +1302,7 @@ async fn a_pull_request_no_ci_ever_checked_needs_the_checks_the_run_ran() {
         json!({"total_count": 0, "check_runs": []}),
     );
     // The conversation's own pull request: the run's checks passed on the commit, or it is not merged.
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     common::mount_pull(
         &rig.fx.github,
         "octo/widgets",
@@ -1376,7 +1375,7 @@ async fn failing_checks_of_a_pull_request_not_opened_red_are_not_a_question_for_
 /// With no notes of the run nothing was recorded, so it is a plan: the tools check it themselves.
 #[tokio::test]
 async fn the_admin_tools_take_missing_notes_for_a_plan() {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     assert!(
         rig.fx
             .env
@@ -1460,7 +1459,7 @@ async fn the_admin_tools_check_the_tier_in_their_own_body() {
     assert!(rig.requests("PUT").await.is_empty());
     assert!(rig.requests("PATCH").await.is_empty() && rig.requests("DELETE").await.is_empty());
     // And the deployment's cap is above the tier the notes hold.
-    let rig = Rig::new(Fixture::new("hello\n").await.capped_at(AccessTier::Auto));
+    let rig = Rig::new(Fixture::new().await.capped_at(AccessTier::Auto));
     rig.tier(AccessTier::Bypass).await;
     rig.say("delete octo/widgets").await;
     let out = rig
@@ -1480,11 +1479,7 @@ async fn the_admin_tools_check_the_tier_in_their_own_body() {
 /// A repository on another host than the code host's is not one these tools act on.
 #[tokio::test]
 async fn nothing_is_merged_renamed_or_deleted_on_another_host_than_the_code_hosts() {
-    let rig = Rig::new(
-        Fixture::new("hello\n")
-            .await
-            .also_allowing(&["ghe.example.com"]),
-    );
+    let rig = Rig::new(Fixture::new().await.also_allowing(&["ghe.example.com"]));
     rig.tier(AccessTier::Bypass).await;
     rig.say("merge https://ghe.example.com/octo/widgets/pull/7 and drop https://ghe.example.com/octo/widgets").await;
     for (tool, args) in [
@@ -1514,7 +1509,7 @@ async fn nothing_is_merged_renamed_or_deleted_on_another_host_than_the_code_host
 /// An address that GitHub redirects (the repository was renamed or transferred) is not acted on.
 #[tokio::test]
 async fn a_repository_that_moved_is_not_merged_or_deleted_through_its_old_address() {
-    let rig = Rig::new(Fixture::new("hello\n").await);
+    let rig = Rig::new(Fixture::new().await);
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/repos/octo/widgets"))
         .respond_with(
@@ -1592,7 +1587,7 @@ async fn githubs_refusal_of_a_rename_or_a_delete_is_reported_in_its_words() {
     let host =
         Arc::new(MemoryCodeHost::new().refusing_changes("Must have admin rights to Repository."));
     let dyn_host: DynCodeHost = host.clone();
-    let rig = Rig::new(Fixture::new("hello\n").await.hosted_by(dyn_host));
+    let rig = Rig::new(Fixture::new().await.hosted_by(dyn_host));
     rig.tier(AccessTier::Bypass).await;
     rig.say("octo/widgets").await;
     for (name, args, permission) in [
@@ -1684,11 +1679,10 @@ async fn a_repository_is_renamed_to_a_valid_new_name_and_the_new_address_is_gran
 /// A rig for a GitHub App installed on `accounts`, with no `CREATE_REPO_OWNERS`, whose host creates
 /// repositories for the organisation `acme`.
 async fn app_rig(accounts: &[&str]) -> (Rig, Arc<common::CreatingHost>) {
-    let (fx, host) =
-        Fixture::new("hello\n")
-            .await
-            .acting_for(accounts)
-            .creating(&[], &["acme"], None);
+    let (fx, host) = Fixture::new()
+        .await
+        .acting_for(accounts)
+        .creating(&[], &["acme"], None);
     let fx = fx.tweaked(|s| s.create_for_installed_owners = true);
     (Rig::new(fx), host)
 }
@@ -1723,7 +1717,7 @@ async fn with_no_owner_listed_a_github_app_creates_for_the_accounts_it_is_instal
 #[tokio::test]
 async fn a_list_still_restricts_a_github_app_and_a_token_creates_nothing_without_one() {
     // The App is on two accounts, the deployment lists one: a list restricts.
-    let (fx, host) = Fixture::new("hello\n")
+    let (fx, host) = Fixture::new()
         .await
         .acting_for(&["acme", "other"])
         .creating(&["acme"], &["acme", "other"], None);
@@ -1743,7 +1737,7 @@ async fn a_list_still_restricts_a_github_app_and_a_token_creates_nothing_without
     assert!(host.created().is_empty());
 
     // A token (no list of accounts, no owners named): the tool is not offered, and refuses.
-    let (fx, _) = Fixture::new("hello\n").await.creating(&[], &["acme"], None);
+    let (fx, _) = Fixture::new().await.creating(&[], &["acme"], None);
     assert!(!fx.env.settings.can_create_repositories());
     assert!(coder_tools(&fx.env).get("create_repository").is_none());
     let rig = Rig::new(fx);
@@ -1813,7 +1807,7 @@ fn refused_for_nobody(out: Result<ToolOutput, ToolError>, what: &str) {
 #[tokio::test]
 async fn in_a_run_another_agent_started_the_consent_tools_ask_nobody() {
     for caller in ["ask:1", UNREADABLE_CALLER] {
-        let rig = Rig::new(Fixture::new("hello\n").await).sent_for(caller);
+        let rig = Rig::new(Fixture::new().await).sent_for(caller);
         refused_for_nobody(ask(&rig).await, "adding acme/widgets to this workspace");
         let notes = rig
             .fx
@@ -1845,7 +1839,7 @@ async fn in_a_run_another_agent_started_the_consent_tools_ask_nobody() {
 
     // What needs nobody's yes is as it was: the conversation's own pull request is merged, and at
     // bypass (the tier is the consent) nothing is asked.
-    let rig = Rig::new(Fixture::new("hello\n").await).sent_for("ask:1");
+    let rig = Rig::new(Fixture::new().await).sent_for("ask:1");
     common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "9f8e7d").await;
     rig.pushed("octo/widgets", "agent/x").await;
     let out = rig.merge().await;
@@ -1854,13 +1848,13 @@ async fn in_a_run_another_agent_started_the_consent_tools_ask_nobody() {
         "{}",
         out.content
     );
-    let rig = Rig::new(Fixture::new("hello\n").await).sent_for("ask:1");
+    let rig = Rig::new(Fixture::new().await).sent_for("ask:1");
     rig.tier(AccessTier::Bypass).await;
     let out = ask(&rig).await.unwrap();
     assert!(out.content.contains("already granted"), "{}", out.content);
 
     // With a person behind the run, each asks.
-    let rig = Rig::new(Fixture::new("hello\n").await).sent_for("main");
+    let rig = Rig::new(Fixture::new().await).sent_for("main");
     assert!(matches!(ask(&rig).await, Err(ToolError::NeedsInput { .. })));
     let (rig, _) = app_rig(&["acme"]).await;
     let rig = rig.sent_for("main");
@@ -1900,7 +1894,7 @@ fn a2a_message(text: &str, id: &str, tier: Option<&str>) -> A2aMessage {
 /// the cap of the deployment (`MAX_ACCESS_TIER`), `auto` unless it says more.
 #[tokio::test]
 async fn the_coders_backend_refuses_a_bad_tier_and_says_the_tier_a_task_works_under() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let model: DynModel = Arc::new(MockModel::new());
     let agent = CoderAgent::new(model, "test-model", fx.env.clone());
     let coder = Coder::new(
@@ -1974,7 +1968,7 @@ async fn the_coders_backend_refuses_a_bad_tier_and_says_the_tier_a_task_works_un
 /// that names `bypass` is refused before anything is written.
 #[tokio::test]
 async fn by_default_bypass_is_the_deployments_opt_in_and_not_a_tier_a_message_may_name() {
-    let fx = Fixture::new("hello\n")
+    let fx = Fixture::new()
         .await
         .capped_at(adam_coder::tier::DEFAULT_MAX);
     let model: DynModel = Arc::new(MockModel::new());
@@ -2061,7 +2055,7 @@ async fn the_form_for_a_repository_the_person_did_not_name_stays_below_auto_and_
         (AccessTier::Auto, true),
         (AccessTier::Bypass, false),
     ] {
-        let rig = Rig::new(Fixture::new("hello\n").await);
+        let rig = Rig::new(Fixture::new().await);
         rig.tier(tier).await;
         rig.say("look at widgets").await;
         let out = ask(&rig).await;
@@ -2078,7 +2072,7 @@ async fn the_form_for_a_repository_the_person_did_not_name_stays_below_auto_and_
         (AccessTier::Edits, true),
         (AccessTier::Auto, false),
     ] {
-        let rig = Rig::new(Fixture::new("hello\n").await.acting_for(&["acme"]));
+        let rig = Rig::new(Fixture::new().await.acting_for(&["acme"]));
         rig.tier(tier).await;
         rig.say("look at widgets").await;
         let out = ask(&rig).await;
@@ -2089,7 +2083,7 @@ async fn the_form_for_a_repository_the_person_did_not_name_stays_below_auto_and_
         );
     }
     // The bare name has to be the one the person wrote.
-    let rig = Rig::new(Fixture::new("hello\n").await.acting_for(&["acme"]));
+    let rig = Rig::new(Fixture::new().await.acting_for(&["acme"]));
     rig.tier(AccessTier::Auto).await;
     rig.say("look at gadgets").await;
     assert!(matches!(ask(&rig).await, Err(ToolError::NeedsInput { .. })));
@@ -2106,7 +2100,7 @@ async fn a_bare_name_is_a_standalone_word_of_the_newest_message_and_never_a_frag
         "look at git@github.com:stranger/widgets.git",
         "look at https://example.com/?repo=widgets",
     ] {
-        let rig = Rig::new(Fixture::new("hello\n").await.acting_for(&["acme"]));
+        let rig = Rig::new(Fixture::new().await.acting_for(&["acme"]));
         rig.tier(AccessTier::Auto).await;
         rig.say(words).await;
         assert!(
@@ -2114,7 +2108,7 @@ async fn a_bare_name_is_a_standalone_word_of_the_newest_message_and_never_a_frag
             "{words}"
         );
     }
-    let rig = Rig::new(Fixture::new("hello\n").await.acting_for(&["acme"]));
+    let rig = Rig::new(Fixture::new().await.acting_for(&["acme"]));
     rig.tier(AccessTier::Auto).await;
     rig.say("look at widgets").await;
     assert!(
@@ -2428,7 +2422,7 @@ async fn a_subagent_keeps_a_servers_tools_to_the_tier_of_the_root_run() {
 #[tokio::test]
 async fn a_task_that_pushes_and_opens_a_pull_request_may_merge_it_on_its_own_notes() {
     // The fixture's remote is a path: `local` is the host of such a repository.
-    let fx = Fixture::new("hello\n")
+    let fx = Fixture::new()
         .await
         .tweaked(|s| s.default_repo_host = "local".to_owned());
     let at = RepoRef::new(fx.remote_url(), "main").locate().unwrap();

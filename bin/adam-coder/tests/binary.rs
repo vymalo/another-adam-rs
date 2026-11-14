@@ -454,6 +454,54 @@ async fn boot_fails_fast_when_postgres_is_unreachable() {
     );
 }
 
+/// ADR 0038: `OPENCODE_MODEL`, `OPENCODE_COMMAND` and `OPENCODE_BINARY` are ignored, not refused, and
+/// each one that is set is said once at startup, by name and never by value. (The Postgres address is
+/// unreachable: the warnings come before anything connects.)
+#[tokio::test]
+async fn a_removed_variable_is_logged_once_at_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut env = valid_env("postgres://adam:p@127.0.0.1:1/adam", tmp.path());
+    env.extend([
+        ("OPENCODE_MODEL".to_owned(), "VALUE-NOT-LOGGED-1".to_owned()),
+        (
+            "OPENCODE_COMMAND".to_owned(),
+            "VALUE-NOT-LOGGED-2 acp".to_owned(),
+        ),
+        (
+            "OPENCODE_BINARY".to_owned(),
+            "/VALUE-NOT-LOGGED-3".to_owned(),
+        ),
+    ]);
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(45)).await;
+    assert_eq!(
+        status.code(),
+        Some(69),
+        "the removed variables are no configuration error; only Postgres is unreachable:\n{}",
+        p.logs()
+    );
+    let out = p.stdout();
+    for name in ["OPENCODE_MODEL", "OPENCODE_COMMAND", "OPENCODE_BINARY"] {
+        let warned: Vec<Value> = out
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|log| {
+                log["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with(&format!("{name} is set and ignored")))
+            })
+            .collect();
+        assert_eq!(warned.len(), 1, "{name}: one line:\n{out}");
+        assert_eq!(warned[0]["level"], "WARN", "{name}");
+        assert_eq!(warned[0]["fields"]["variable"], name);
+    }
+    assert!(
+        !out.contains("VALUE-NOT-LOGGED"),
+        "no value is logged:\n{out}"
+    );
+    assert!(!p.stderr().contains("VALUE-NOT-LOGGED"), "{}", p.stderr());
+}
+
 // ------------------------------------------------------------ with a database
 
 /// The process serves the card (URL from `PUBLIC_URL`) and `/healthz`, refuses
@@ -1578,9 +1626,14 @@ fn seed_remote(dir: &Path) -> (PathBuf, PathBuf) {
     (remote, home)
 }
 
-/// The replies of the happy path in `repo_url`: prepare, delegate, checks, commit and push, pull
-/// request, done.
+/// The replies of the happy path in `repo_url`: prepare, write the file, checks, commit and push,
+/// pull request, done.
 fn happy_replies(repo_url: &str) -> Vec<Value> {
+    happy_replies_checking(repo_url, "test -f hello.txt && cat hello.txt")
+}
+
+/// [`happy_replies`] whose check is `check`.
+fn happy_replies_checking(repo_url: &str, check: &str) -> Vec<Value> {
     vec![
         tool_reply(
             "c1",
@@ -1589,14 +1642,10 @@ fn happy_replies(repo_url: &str) -> Vec<Value> {
         ),
         tool_reply(
             "c2",
-            "delegate_to_opencode",
-            json!({"instructions": "add hello.txt containing hello"}),
+            "write_file",
+            json!({"path": "hello.txt", "content": "hello\n"}),
         ),
-        tool_reply(
-            "c3",
-            "run_checks",
-            json!({"command": "test -f hello.txt && cat hello.txt"}),
-        ),
+        tool_reply("c3", "run_checks", json!({ "command": check })),
         tool_reply(
             "c4",
             "commit_and_push",
@@ -1611,14 +1660,19 @@ fn happy_replies(repo_url: &str) -> Vec<Value> {
     ]
 }
 
-/// Mount the happy-path model on `model`: prepare, delegate, checks, commit and push, pull
+/// Mount the happy-path model on `model`: prepare, write the file, checks, commit and push, pull
 /// request, done. Returns the turn of every request, in arrival order.
 async fn mount_happy_model(model: &MockServer) -> Arc<Mutex<Vec<usize>>> {
+    mount_model_checking(model, "test -f hello.txt && cat hello.txt").await
+}
+
+/// [`mount_happy_model`] whose check is `check`.
+async fn mount_model_checking(model: &MockServer, check: &str) -> Arc<Mutex<Vec<usize>>> {
     let asked = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(Script {
-            replies: happy_replies("https://github.com/octo/widgets"),
+            replies: happy_replies_checking("https://github.com/octo/widgets", check),
             asked: asked.clone(),
         })
         .mount(model)
@@ -1626,8 +1680,8 @@ async fn mount_happy_model(model: &MockServer) -> Arc<Mutex<Vec<usize>>> {
     asked
 }
 
-/// SIGTERM while OpenCode is working: the process does not abandon the step. It
-/// waits for OpenCode, commits the step (the run is not lost, not failed and
+/// SIGTERM while a check is running: the process does not abandon the step. It
+/// waits for the check, commits the step (the run is not lost, not failed and
 /// not repeated), and exits 0. A second process over the same database and
 /// workspace finishes the run: one commit, one push, one pull request.
 ///
@@ -1647,24 +1701,24 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
     // The remote, and the private git config that makes github.com point at it.
     let (remote, home) = seed_remote(dir);
 
-    // OpenCode: a script that reports it started and waits for `go`.
+    // The check: it reports that it started, waits for `go`, and notes that it ran.
     let (started, go, launches) = (
         dir.join("started"),
         dir.join("go"),
         dir.join("launches.log"),
     );
-    let script = dir.join("opencode.sh");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\necho launched >> \"$LAUNCHES\"\n: > \"$STARTED\"\ni=0\n\
-         while [ ! -e \"$GO\" ]; do i=$((i+1)); [ $i -gt 1200 ] && exit 9; sleep 0.05; done\n\
-         exec \"$AGENT\"\n",
-    )
-    .unwrap();
+    let check = format!(
+        "echo ran >> {launches}; : > {started}; i=0; \
+         while [ ! -e {go} ]; do i=$((i+1)); [ $i -gt 1200 ] && exit 9; sleep 0.05; done; \
+         test -f hello.txt && echo check-done",
+        launches = launches.display(),
+        started = started.display(),
+        go = go.display()
+    );
 
-    // The model: prepare, delegate, checks, commit and push, PR, done.
+    // The model: prepare, write the file, checks, commit and push, PR, done.
     let model = MockServer::start().await;
-    let asked = mount_happy_model(&model).await;
+    let asked = mount_model_checking(&model, &check).await;
     let github = common::mock_github().await;
 
     let workspace = dir.join("work");
@@ -1679,28 +1733,11 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
                 "GIT_CONFIG_GLOBAL".to_owned(),
                 home.join(".gitconfig").to_string_lossy().into_owned(),
             ),
-            (
-                "OPENCODE_COMMAND".to_owned(),
-                format!("/bin/sh {}", script.display()),
-            ),
-            (
-                "AGENT".to_owned(),
-                common::fake_agent().to_string_lossy().into_owned(),
-            ),
-            ("STARTED".to_owned(), started.to_string_lossy().into_owned()),
-            ("GO".to_owned(), go.to_string_lossy().into_owned()),
-            (
-                "LAUNCHES".to_owned(),
-                launches.to_string_lossy().into_owned(),
-            ),
-            ("FAKE_ACP_SCENARIO".to_owned(), "write-file".to_owned()),
-            ("FAKE_ACP_WRITE_PATH".to_owned(), "hello.txt".to_owned()),
-            ("FAKE_ACP_WRITE_CONTENT".to_owned(), "hello\n".to_owned()),
         ]);
         env
     };
 
-    // Process A takes the task and gets into OpenCode's turn.
+    // Process A takes the task and gets into the check.
     let mut a = Proc::spawn(&env_for());
     let addr_a = a.ready().await;
     let client = common::a2a_client(addr_a, A2A_TOKEN).await;
@@ -1728,27 +1765,27 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
     while !started.exists() {
         assert!(
             Instant::now() < deadline,
-            "OpenCode never started\n{}",
+            "the check never started\n{}",
             a.logs()
         );
         assert!(a.still_running(), "{}", a.logs());
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(turns(&asked), 2, "prepare and delegate turns");
+    assert_eq!(turns(&asked), 3, "prepare, write and check turns");
 
     // SIGTERM now: the step is in flight, so the process must not exit yet.
     a.sigterm().await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
         a.still_running(),
-        "the process left while OpenCode was working\n{}",
+        "the process left while the check was running\n{}",
         a.logs()
     );
     let store = db.store();
     let mid = store.load_run(run).await.unwrap().expect("the run exists");
     assert_eq!(mid.status, RunStatus::Runnable, "still mid-step");
 
-    // OpenCode finishes; the step commits; the process exits 0.
+    // The check finishes; the step commits; the process exits 0.
     std::fs::write(&go, "").unwrap();
     let status = a.exit_within(Duration::from_secs(30)).await;
     assert_eq!(status.code(), Some(0), "{}", a.logs());
@@ -1766,11 +1803,11 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
         after.version
     );
     assert!(
-        after.state.to_string().contains("OpenCode finished"),
-        "OpenCode's result is in the run: {}",
+        after.state.to_string().contains("check-done"),
+        "the check's result is in the run: {}",
         after.state
     );
-    assert_eq!(turns(&asked), 2, "no new turn after SIGTERM");
+    assert_eq!(turns(&asked), 3, "no new turn after SIGTERM");
     assert!(
         github.received_requests().await.unwrap().is_empty(),
         "nothing reached GitHub yet"
@@ -1803,9 +1840,9 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
     assert_eq!(status.code(), Some(0), "{}", b.logs());
 
     assert_eq!(
-        common::launches(&launches),
+        std::fs::read_to_string(&launches).unwrap().lines().count(),
         1,
-        "OpenCode ran once, not again"
+        "the check ran once, not again"
     );
     assert_eq!(
         turns(&asked),
@@ -1918,18 +1955,11 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
                 "GIT_CONFIG_GLOBAL".to_owned(),
                 home.join(".gitconfig").to_string_lossy().into_owned(),
             ),
-            (
-                "OPENCODE_COMMAND".to_owned(),
-                common::fake_agent().to_string_lossy().into_owned(),
-            ),
-            ("FAKE_ACP_SCENARIO".to_owned(), "write-file".to_owned()),
-            ("FAKE_ACP_WRITE_PATH".to_owned(), "hello.txt".to_owned()),
-            ("FAKE_ACP_WRITE_CONTENT".to_owned(), "hello\n".to_owned()),
         ]);
         env
     };
 
-    // The control plane alone takes the task. It gets no model, GitHub or OpenCode configuration
+    // The control plane alone takes the task. It gets no model or GitHub configuration
     // at all (and a workspace root it must leave alone): starting a run needs none of it.
     let mut front_env = role_env("control-plane", &db.url(), &front_workspace);
     front_env.push((
@@ -2294,25 +2324,12 @@ async fn a_sweep_of_zero_seconds_turns_the_janitor_off() {
 
 // ------------------------------------------------------------------------------ devcontainers
 
-/// A file that is a native executable as far as the configuration can tell (the ELF magic, and
-/// executable): what `OPENCODE_BINARY` must be when the runtime is `podman`.
-fn native_stub(dir: &Path) -> String {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = dir.join("opencode-native");
-    std::fs::write(&path, b"\x7fELF this is only a stub").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path.to_string_lossy().into_owned()
-}
-
 /// The devcontainer variables are checked before anything connects: a value that is not one, a
-/// runtime with no service address, an OpenCode that cannot be mounted. Exit 78, with the variable
-/// named.
+/// runtime with no service address. Exit 78, with the variable named.
 #[tokio::test]
 async fn a_bad_devcontainer_configuration_exits_78_naming_the_variable() {
     let tmp = tempfile::tempdir().unwrap();
-    let script = tmp.path().join("opencode.js");
-    std::fs::write(&script, "#!/usr/bin/env node\n").unwrap();
-    let cases: [(&str, Vec<(&str, String)>); 5] = [
+    let cases: [(&str, Vec<(&str, String)>); 4] = [
         (
             "DEVCONTAINER_RUNTIME must be off or podman",
             vec![("DEVCONTAINER_RUNTIME", "docker".into())],
@@ -2323,18 +2340,7 @@ async fn a_bad_devcontainer_configuration_exits_78_naming_the_variable() {
         ),
         (
             "CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman",
-            vec![
-                ("DEVCONTAINER_RUNTIME", "podman".into()),
-                ("OPENCODE_BINARY", native_stub(tmp.path())),
-            ],
-        ),
-        (
-            "is not a native executable",
-            vec![
-                ("DEVCONTAINER_RUNTIME", "podman".into()),
-                ("CONTAINER_HOST", "unix:///run/podman/podman.sock".into()),
-                ("OPENCODE_BINARY", script.to_string_lossy().into_owned()),
-            ],
+            vec![("DEVCONTAINER_RUNTIME", "podman".into())],
         ),
         (
             "DEVCONTAINER_UP_TIMEOUT_SECS is invalid",
@@ -2388,7 +2394,8 @@ async fn a_worker_with_devcontainers_on_starts_when_the_service_does_not_answer(
             ),
             ("DEVCONTAINER_PODMAN", client.to_string_lossy().into_owned()),
             ("DEVCONTAINER_PREPULL", "false".to_owned()),
-            ("OPENCODE_BINARY", native_stub(tmp.path())),
+            // Removed by ADR 0038: set and ignored, so podman starts without an OpenCode.
+            ("OPENCODE_BINARY", "/no/such/opencode".to_owned()),
         ]
         .map(|(k, v)| (k.to_owned(), v)),
     );
@@ -2418,8 +2425,8 @@ async fn a_worker_with_devcontainers_on_starts_when_the_service_does_not_answer(
     let dir = written[0].path();
     assert!(dir.join("adam-exec").is_file(), "{dir:?}");
     assert!(
-        dir.join("opencode").is_file(),
-        "the coder's OpenCode is in it: {dir:?}"
+        !dir.join("opencode").exists(),
+        "no OpenCode is mounted into a devcontainer: {dir:?}"
     );
     p.sigterm().await;
     assert_eq!(
@@ -2847,13 +2854,6 @@ async fn a_github_app_without_an_installation_id_opens_pull_requests_for_two_own
             "GIT_CONFIG_GLOBAL".to_owned(),
             home.join(".gitconfig").to_string_lossy().into_owned(),
         ),
-        (
-            "OPENCODE_COMMAND".to_owned(),
-            common::fake_agent().to_string_lossy().into_owned(),
-        ),
-        ("FAKE_ACP_SCENARIO".to_owned(), "write-file".to_owned()),
-        ("FAKE_ACP_WRITE_PATH".to_owned(), "hello.txt".to_owned()),
-        ("FAKE_ACP_WRITE_CONTENT".to_owned(), "hello\n".to_owned()),
     ]);
     let mut coder = Proc::spawn(&env);
     let addr = coder.ready().await;
@@ -3135,13 +3135,6 @@ async fn a_github_app_installation_gets_its_token_minted_and_opens_the_pull_requ
             "GIT_CONFIG_GLOBAL".to_owned(),
             home.join(".gitconfig").to_string_lossy().into_owned(),
         ),
-        (
-            "OPENCODE_COMMAND".to_owned(),
-            common::fake_agent().to_string_lossy().into_owned(),
-        ),
-        ("FAKE_ACP_SCENARIO".to_owned(), "write-file".to_owned()),
-        ("FAKE_ACP_WRITE_PATH".to_owned(), "hello.txt".to_owned()),
-        ("FAKE_ACP_WRITE_CONTENT".to_owned(), "hello\n".to_owned()),
     ]);
     let mut coder = Proc::spawn(&env);
     let addr = coder.ready().await;

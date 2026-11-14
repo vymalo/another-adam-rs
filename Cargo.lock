@@ -294,7 +294,6 @@ dependencies = [
  "adam",
  "adam-a2a",
  "adam-a2a-runtime",
- "adam-acp",
  "adam-agent-fs",
  "adam-core",
  "adam-devcontainer",

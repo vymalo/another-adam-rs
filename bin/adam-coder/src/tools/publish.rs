@@ -112,7 +112,7 @@ pub async fn commit_and_push(
     if committed.is_none() && ahead == Some(0) {
         return Ok(ToolOutput::error(format!(
             "Nothing to commit: the worktree has no changes and the branch has no commits \
-             beyond origin/{base}. Have OpenCode make the change first."
+             beyond origin/{base}. Make the change first."
         )));
     }
     let Some(sha) = head_sha(&GitAt::worktree(&wt)).await else {

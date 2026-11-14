@@ -7,10 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adam_coder::ToolEnv;
-use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::create::CreateRepository;
-use adam_coder::tools::delegate::DelegateToOpenCode;
 use adam_coder::tools::files::{ApplyPatch, EditFile, ReadFile, WriteFile};
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::make::Run;
@@ -21,9 +19,7 @@ use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_coder::tools::scratch::{PublishScratch, StartScratch};
 use adam_coder::tools::share::ShareFile;
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
-use adam_runtime::{
-    CancelToken, CollectingSink, RunEvent, StepEvent, StepIcon, StepKind, StepState,
-};
+use adam_runtime::{CancelToken, CollectingSink, RunEvent};
 use adam_workspace::EnvError;
 use common::{Fixture, PR_URL};
 use serde_json::{Value, json};
@@ -36,7 +32,7 @@ struct Rig {
 
 impl Rig {
     async fn new() -> Self {
-        Self::from(Fixture::new("hello\n").await)
+        Self::from(Fixture::new().await)
     }
 
     fn from(fx: Fixture) -> Self {
@@ -445,7 +441,7 @@ async fn prepare_workspace_without_a_base_branch_starts_from_the_remotes_default
         json!({"repo_url": remote}),
         json!({"repo_url": remote, "base_branch": "  "}),
     ] {
-        let rig = Rig::from(Fixture::new("hello\n").await);
+        let rig = Rig::from(Fixture::new().await);
         common::git(&rig.fx.remote, &["branch", "master", "refs/heads/main"]);
         common::git(
             &rig.fx.remote,
@@ -575,12 +571,6 @@ async fn tools_that_need_a_workspace_say_so() {
     let rig = Rig::new().await;
     let cases: Vec<(&str, Result<ToolOutput, ToolError>)> = vec![
         (
-            "delegate",
-            DelegateToOpenCode
-                .call(&rig.ctx, json!({"instructions": "x"}))
-                .await,
-        ),
-        (
             "checks",
             RunChecks.call(&rig.ctx, json!({"command": "true"})).await,
         ),
@@ -633,7 +623,7 @@ async fn run_checks_runs_in_the_worktree_and_never_outside_it() {
 
 #[tokio::test]
 async fn run_checks_times_out_and_caps_its_output() {
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         s.check_timeout = std::time::Duration::from_millis(500);
         s.check_output_tail = 256;
     })
@@ -839,7 +829,7 @@ async fn a_failure_the_change_caused_costs_a_cycle_and_says_the_base_passes() {
 /// they always did.
 #[tokio::test]
 async fn a_scratch_project_and_a_timeout_are_not_run_on_the_base() {
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         s.check_timeout = std::time::Duration::from_millis(500);
     })
     .await;
@@ -1004,7 +994,7 @@ async fn a_failing_check_emits_findings_with_its_name_and_output_tail() {
 
 #[tokio::test]
 async fn a_long_failing_output_is_capped_and_the_cut_is_marked() {
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         s.check_output_tail = 64 * 1024;
     })
     .await;
@@ -1419,169 +1409,6 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
     assert_eq!(rig.fx.created_pulls().await.len(), 1);
 }
 
-#[tokio::test]
-async fn delegate_to_opencode_streams_updates_and_returns_the_summary() {
-    let rig = Rig::new().await;
-    rig.prepare().await;
-    let out = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
-        .await
-        .unwrap();
-    assert!(!out.is_error, "{}", out.content);
-    assert!(
-        out.content.contains("stop reason: end_turn"),
-        "{}",
-        out.content
-    );
-    assert!(
-        out.content.contains("write: ok"),
-        "the agent's own summary: {}",
-        out.content
-    );
-    assert!(
-        out.content.contains("- hello.txt (untracked)"),
-        "changed files, with their status in words: {}",
-        out.content
-    );
-    assert_eq!(
-        std::fs::read_to_string(rig.worktree().join("hello.txt")).unwrap(),
-        "hello\n"
-    );
-
-    let progress = rig.progress();
-    assert!(
-        progress.contains(&"starting OpenCode".to_owned()),
-        "{progress:?}"
-    );
-    assert!(
-        progress.contains(&"write: ok".to_owned()),
-        "a line of the agent's reply is an update of the OpenCode step: {progress:?}"
-    );
-
-    // The call is a sub-agent step, and OpenCode's tool call is a child under it, ended by its
-    // update; the reply is a `message` child at the end.
-    let style = DelegateToOpenCode.step_style();
-    assert_eq!(style.kind, StepKind::Subagent);
-    assert_eq!(style.label.as_deref(), Some("Hand to OpenCode"));
-    assert_eq!(style.icon, Some(StepIcon::OpenCode));
-    let call = rig.ctx.step_id().to_owned();
-    let child_id = format!("acp:{}:tc-1", rig.ctx.call_id());
-    let steps: Vec<StepEvent> = rig
-        .sink
-        .events()
-        .into_iter()
-        .filter_map(|e| match e.event {
-            RunEvent::Step(step) => Some(step),
-            _ => None,
-        })
-        .collect();
-    let child = |state| {
-        steps
-            .iter()
-            .filter(|s| s.id == child_id && s.state == state)
-            .collect::<Vec<_>>()
-    };
-    let started = child(StepState::Running);
-    let ended = child(StepState::Completed);
-    assert_eq!((started.len(), ended.len()), (1, 1), "{steps:#?}");
-    for step in [started[0], ended[0]] {
-        assert_eq!(step.parent.as_deref(), Some(call.as_str()));
-        assert_eq!(
-            (step.kind, step.icon),
-            (StepKind::Tool, Some(StepIcon::Edit))
-        );
-        assert!(
-            step.label.starts_with("Write ") && step.label.ends_with("hello.txt"),
-            "{}",
-            step.label
-        );
-    }
-    let summary = steps
-        .iter()
-        .find(|s| s.id.ends_with(":summary"))
-        .unwrap_or_else(|| panic!("no summary step in {steps:#?}"));
-    assert_eq!(
-        (
-            summary.parent.as_deref(),
-            summary.kind,
-            summary.state,
-            summary.label.as_str()
-        ),
-        (
-            Some(call.as_str()),
-            StepKind::Message,
-            StepState::Completed,
-            "OpenCode's summary"
-        )
-    );
-    assert!(
-        summary.detail.as_deref().unwrap().contains("write: ok"),
-        "{summary:?}"
-    );
-    // How the turn ended is in the result (`stop reason: end_turn`, above), not a line of its own.
-    assert!(
-        !progress.iter().any(|p| p.contains("turn ended")),
-        "{progress:?}"
-    );
-}
-
-/// The run is cancelled while OpenCode ignores `session/cancel` (a hung tool):
-/// the tool gives it a short grace, then kills it and what it started, waits
-/// until it is reaped, and fails as cancelled, all without help from the
-/// caller. Nothing is left running when `call` returns.
-#[tokio::test]
-async fn delegate_to_opencode_kills_a_stubborn_opencode_when_the_run_is_cancelled() {
-    let agent_dir = tempfile::tempdir().unwrap();
-    let pid_file = agent_dir.path().join("agent.pid");
-    let child_file = agent_dir.path().join("child.pid");
-    let fx = Fixture::with("hello\n", |s| {
-        s.opencode = OpenCodeLaunch::program(common::fake_agent())
-            .env("FAKE_ACP_SCENARIO", "stubborn")
-            .env("FAKE_ACP_PID_FILE", pid_file.to_string_lossy())
-            .env("FAKE_ACP_CHILD_PID_FILE", child_file.to_string_lossy());
-    })
-    .await;
-    let mut rig = Rig::from(fx);
-    let token = CancelToken::new();
-    rig.ctx = rig.ctx.with_cancel_token(token.clone());
-    rig.prepare().await;
-
-    let tool = DelegateToOpenCode;
-    let cancel_when_running = async {
-        let grandchild = common::wait_for_pid(&child_file).await;
-        token.cancel();
-        grandchild
-    };
-    let started = Instant::now();
-    let (out, grandchild) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(
-            tool.call(&rig.ctx, json!({"instructions": "never finish"})),
-            cancel_when_running
-        )
-    })
-    .await
-    .expect("the tool returns after a cancel");
-
-    assert!(
-        matches!(&out, Err(ToolError::Permanent(m)) if m.contains("cancelled")),
-        "{out:?}"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "a cancel must not wait for the agent: {:?}",
-        started.elapsed()
-    );
-    let agent = common::wait_for_pid(&pid_file).await;
-    assert!(
-        common::process_gone(agent, true),
-        "OpenCode (pid {agent}) must be reaped when the tool returns"
-    );
-    assert!(
-        common::wait_gone(grandchild, false, Duration::from_secs(5)).await,
-        "OpenCode's child (pid {grandchild}) survived"
-    );
-}
-
 /// A cancelled run must not publish, even if the model asked for several
 /// calls in one turn and a later one is next in line: the cancelled tool's
 /// result is only an error to the loop, which goes on to the next call.
@@ -1615,58 +1442,6 @@ async fn publishing_tools_refuse_to_act_for_a_cancelled_run() {
 }
 
 #[tokio::test]
-async fn opencode_cannot_write_outside_the_worktree() {
-    let fx = Fixture::with("x", |s| {
-        s.opencode = OpenCodeLaunch::program(common::fake_agent())
-            .env("FAKE_ACP_SCENARIO", "write-file")
-            .env("FAKE_ACP_WRITE_PATH", "../escaped.txt")
-            .env("FAKE_ACP_WRITE_CONTENT", "nope");
-    })
-    .await;
-    let rig = Rig::from(fx);
-    rig.prepare().await;
-    let out = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "write outside"}))
-        .await
-        .unwrap();
-    assert!(out.content.contains("write: "), "{}", out.content);
-    assert!(
-        !out.content.contains("write: ok"),
-        "the write must be refused: {}",
-        out.content
-    );
-    // Beside the worktree, in the run's workspace, and above it.
-    let escaped = rig.worktree().parent().unwrap().join("escaped.txt");
-    assert!(!escaped.exists(), "{}", escaped.display());
-}
-
-#[tokio::test]
-async fn a_crashing_opencode_is_a_transient_error_and_a_missing_one_is_permanent() {
-    let fx = Fixture::with("x", |s| {
-        s.opencode =
-            OpenCodeLaunch::program(common::fake_agent()).env("FAKE_ACP_SCENARIO", "crash");
-    })
-    .await;
-    let rig = Rig::from(fx);
-    rig.prepare().await;
-    let out = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "x"}))
-        .await;
-    assert!(matches!(out, Err(ToolError::Transient(_))), "{out:?}");
-
-    let fx = Fixture::with("x", |s| {
-        s.opencode = OpenCodeLaunch::program("/nonexistent/opencode");
-    })
-    .await;
-    let rig = Rig::from(fx);
-    rig.prepare().await;
-    let out = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "x"}))
-        .await;
-    assert!(matches!(out, Err(ToolError::Permanent(_))), "{out:?}");
-}
-
-#[tokio::test]
 async fn ask_user_needs_input_with_the_question() {
     let rig = Rig::new().await;
     // The coder's `ask_user` is the screen's (`adam-ui`), under the coder's own words about when to
@@ -1692,7 +1467,6 @@ async fn malformed_arguments_are_reported_to_the_model() {
         (&CommitAndPush, json!({"message": ["a"]})),
         (&OpenPullRequest, json!({"title": "t"})),
         (&PrepareWorkspace, json!({"base_branch": "main"})),
-        (&DelegateToOpenCode, Value::Null),
     ] {
         let out = tool.call(&rig.ctx, args.clone()).await;
         assert!(is_error(&out), "{args}: {out:?}");
@@ -1813,7 +1587,7 @@ async fn run_command_undoes_a_change_and_says_where_changes_go() {
     rig.prepare().await;
     let dir = rig.worktree();
     // Uncommitted work of the run: an edit to a tracked file, a new file, a deleted-to-be file.
-    std::fs::write(dir.join("README.md"), "widgets\nedited by opencode\n").unwrap();
+    std::fs::write(dir.join("README.md"), "widgets\nedited earlier\n").unwrap();
     std::fs::write(dir.join("notes.txt"), "mine\n").unwrap();
     std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
     let before = worktree_state(&rig);
@@ -1842,7 +1616,7 @@ async fn run_command_undoes_a_change_and_says_where_changes_go() {
         assert!(
             out.content.contains("changed the worktree")
                 && out.content.contains("exactly as it was")
-                && out.content.contains("delegate_to_opencode"),
+                && out.content.contains("apply_patch"),
             "{command}: {}",
             out.content
         );
@@ -2255,7 +2029,7 @@ async fn a_project_dependency_is_to_be_installed_and_a_nested_not_found_is_a_fai
     )
     .unwrap();
     std::fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
-    // The first time: install the project's dependencies, through OpenCode and not run_checks.
+    // The first time: install the project's dependencies, with `run` and not run_checks.
     let first = RunChecks
         .call(&rig.ctx, json!({"command": "zzz-local-tool --run"}))
         .await
@@ -2266,7 +2040,7 @@ async fn a_project_dependency_is_to_be_installed_and_a_nested_not_found_is_a_fai
         said.contains("`zzz-local-tool` is not on the PATH")
             && said.contains("this project's own dependencies")
             && said.contains("`pnpm install`")
-            && said.contains("with delegate_to_opencode (not run_checks")
+            && said.contains("with run (not run_checks")
             && said.contains("no check cycle was used")
             && !said.contains("missing toolchain, not a failing check"),
         "{said}"
@@ -3963,16 +3737,16 @@ async fn a_scratch_project_is_built_checked_and_committed_locally() {
         "a scratch project has no repository: {report}"
     );
 
-    // OpenCode works in it too, and the changed files are the project's.
-    let delegated = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
+    // The file tools work in it too, and the file is the project's.
+    let written = WriteFile
+        .call(&rig.ctx, json!({"path": "hello.txt", "content": "hello\n"}))
         .await
         .unwrap();
-    assert!(!delegated.is_error, "{}", delegated.content);
+    assert!(!written.is_error, "{}", written.content);
     assert!(
-        delegated.content.contains("hello.txt"),
-        "the files OpenCode changed in the project: {}",
-        delegated.content
+        written.content.contains("hello.txt"),
+        "the file written in the project: {}",
+        written.content
     );
     assert_eq!(
         std::fs::read_to_string(dir.join("hello.txt")).unwrap(),
@@ -4581,7 +4355,7 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
     use adam_coder::{RedactingCredentials, Redactor, coder_tools};
     use adam_workspace::{DynGitCredentials, RepoRef, Workspaces};
 
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let redactor = Redactor::default();
     let creds: DynGitCredentials = Arc::new(RedactingCredentials::new(
         Arc::new(Minting),
@@ -4651,10 +4425,9 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
 /// A rig whose host creates repositories for the owner `acme` (an organisation), for `me` (a user
 /// the credentials are) and, when `login` is `None`, for organisations only.
 async fn creating(login: Option<&str>) -> (Rig, Arc<common::CreatingHost>) {
-    let (fx, host) =
-        Fixture::new("hello\n")
-            .await
-            .creating(&["acme", "me", "somebody"], &["acme"], login);
+    let (fx, host) = Fixture::new()
+        .await
+        .creating(&["acme", "me", "somebody"], &["acme"], login);
     (Rig::from(fx), host)
 }
 
@@ -5455,7 +5228,7 @@ async fn run_undoes_a_command_that_touches_git_entirely_and_refuses_it() {
 /// time ran out stays; a missing workspace and a missing tool are said as for the others.
 #[tokio::test]
 async fn run_respects_the_timeout_the_cwd_rule_and_a_missing_tool() {
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         // Long enough for a login shell to start on a loaded machine, short enough to wait for.
         s.check_timeout = std::time::Duration::from_secs(4);
     })
@@ -6059,7 +5832,7 @@ async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
 
 /// A rig whose environment records what it is asked to seal, and the environment.
 async fn sealing_rig() -> (Rig, Arc<common::FakeEnvironment>) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let fake = common::FakeEnvironment::new(Some(&fx.root));
     (Rig::from(fx.using(fake.clone())), fake)
 }

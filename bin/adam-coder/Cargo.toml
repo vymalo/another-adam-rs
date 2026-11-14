@@ -22,7 +22,6 @@ path = "src/main.rs"
 adam = { workspace = true, features = ["a2a", "mcp"] }
 adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true
-adam-acp.workspace = true
 adam-core.workspace = true
 adam-devcontainer.workspace = true
 adam-env-kubernetes.workspace = true

@@ -5,7 +5,7 @@
 //!
 //! Not every name a file may read is a secret, and hiding some would break the coder itself: an
 //! `env` of a stdio server that says `"PATH": "${PATH}"` would blank `PATH` for every command and
-//! redact it from every output, and `${MODEL_API_KEY}` would blank the key OpenCode reads. Those
+//! redact it from every output. Those
 //! names ([`NEVER_HIDDEN`], and `LC_*`) are skipped, with a warning that names the variable (never
 //! a value): the server still gets the value when it connects, and the coder's own children keep
 //! what they need. The alternative, refusing to start, would punish a harmless `${HOME}` in a
@@ -19,9 +19,9 @@ use adam_workspace::{DynEnvironment, HidingEnvironment};
 use crate::redact::Redactor;
 
 /// Variables of the coder's own environment that its children need and that are not secrets
-/// (`MODEL_API_KEY` is the exception: it is a secret, but the coder's OpenCode reads it, and it is
-/// already redacted from the configuration). Never hidden and never redacted, whatever a file says.
-pub const NEVER_HIDDEN: &[&str] = &["MODEL_API_KEY", "PATH", "HOME", "LANG", "TMPDIR", "USER"];
+/// (`MODEL_API_KEY` is not one: it is a secret, and a file that names it gets it hidden and redacted
+/// like any other, ADR 0038). Never hidden and never redacted, whatever a file says.
+pub const NEVER_HIDDEN: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "USER"];
 
 /// Whether `name` is one the coder's children need: [`NEVER_HIDDEN`], or a locale (`LC_*`).
 pub fn is_never_hidden(name: &str) -> bool {
@@ -73,5 +73,32 @@ pub fn hiding(environment: DynEnvironment, names: &[String]) -> DynEnvironment {
         environment
     } else {
         Arc::new(HidingEnvironment::new(environment, names.iter().cloned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR 0038: the key was exempt only because the coder's OpenCode read it. A file that names it
+    /// now gets it hidden from the commands of runs and redacted, like any other secret.
+    #[test]
+    fn model_api_key_named_by_an_mcp_file_is_hidden_and_redacted() {
+        assert!(!is_never_hidden("MODEL_API_KEY"));
+        let names: BTreeSet<String> = ["MODEL_API_KEY", "PATH"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let redactor = Redactor::default();
+        let protected = protect(&names, &redactor, |name| {
+            Some(format!("value-of-{name}-0123456789"))
+        });
+        assert_eq!(protected.hidden, ["MODEL_API_KEY"]);
+        assert_eq!(protected.skipped, ["PATH"]);
+        assert_eq!(protected.registered, 1);
+        assert_eq!(
+            redactor.scrub("key value-of-MODEL_API_KEY-0123456789 here"),
+            "key [redacted] here"
+        );
     }
 }

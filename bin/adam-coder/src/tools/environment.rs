@@ -1,6 +1,6 @@
 //! `rebuild_environment { use_default? }`: the way out of a work environment that is broken.
 //!
-//! The commands of a run (`run_command`, `run_checks`, OpenCode) run in the repository's devcontainer
+//! The commands of a run (`run_command`, `run`, `run_checks`) run in the repository's devcontainer
 //! when the deployment has a container runtime ([`adam_devcontainer`](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)).
 //! A repository whose `devcontainer.json` is wrong, refused by the policy, or does not build leaves the
 //! run with an environment that is **broken**, and every command says so: there is no silent fallback
@@ -53,7 +53,6 @@ pub async fn rebuild_environment(
     // What the rebuilt environment will be asked again, and what the person chose.
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     notes.environment.use_default |= use_default;
-    notes.environment.opencode = None;
     env.notes
         .save(&run, &notes)
         .await

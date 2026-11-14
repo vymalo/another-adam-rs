@@ -1,4 +1,4 @@
-//! The tools that run a process (`run_command`, `run_checks`, `delegate_to_opencode`) go through
+//! The tools that run a process (`run_command`, `run`, `run_checks`) go through
 //! the run's environment: the command is the one its session prepared, a timeout or a cancel tells
 //! the session, what the environment says while it is made is shown as steps, and a failure to make
 //! it is a result for the model. (The janitor's part is in `tests/janitor.rs`; the default,
@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::checks::RunChecks;
-use adam_coder::tools::delegate::DelegateToOpenCode;
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
@@ -35,7 +33,7 @@ struct Rig {
 
 impl Rig {
     async fn new() -> Self {
-        Self::from(Fixture::new("hello\n").await).await
+        Self::from(Fixture::new().await).await
     }
 
     async fn from(fx: Fixture) -> Self {
@@ -165,64 +163,8 @@ async fn a_command_and_a_check_run_as_the_environment_prepared_them() {
 }
 
 #[tokio::test]
-async fn opencode_is_started_from_the_command_the_environment_prepared() {
-    let rig = Rig::new().await;
-    rig.fake.session.extra_env.lock().unwrap().insert(
-        "FAKE_ACP_WRITE_CONTENT".to_owned(),
-        "written under the environment\n".to_owned(),
-    );
-    rig.prepare().await;
-
-    let out = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
-        .await
-        .unwrap();
-    assert!(!out.is_error, "{}", out.content);
-    assert_eq!(
-        std::fs::read_to_string(rig.worktree().join("hello.txt")).unwrap(),
-        "written under the environment\n",
-        "the process that ran had the environment the session prepared"
-    );
-
-    let specs = rig.fake.session.specs.lock().unwrap().clone();
-    assert_eq!(specs.len(), 1, "{specs:?}");
-    let spec = &specs[0];
-    assert_eq!(
-        spec.program,
-        Program::Argv(vec![common::fake_agent().as_os_str().to_owned()])
-    );
-    assert_eq!(
-        spec.cwd,
-        rig.worktree().canonicalize().unwrap_or(rig.worktree())
-    );
-    // OpenCode reads the model key by reference; the secrets it has no use for are hidden (the token,
-    // the GitHub App's key, the database, the A2A tokens).
-    assert_eq!(
-        spec.hide,
-        [
-            "GITHUB_TOKEN",
-            "GITHUB_APP_PRIVATE_KEY",
-            "DATABASE_URL",
-            "A2A_BEARER_TOKENS"
-        ]
-    );
-    assert_eq!(
-        spec.env.get("FAKE_ACP_SCENARIO").map(String::as_str),
-        Some("write-file")
-    );
-    let said = text_of(&rig);
-    for secret in common::SECRETS {
-        assert!(!said.contains(secret), "{said}");
-    }
-    assert!(
-        rig.fake.session.killed.lock().unwrap().is_empty(),
-        "an OpenCode that ends its turn is not killed"
-    );
-}
-
-#[tokio::test]
 async fn a_check_that_times_out_is_killed_in_the_environment_too() {
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         s.check_timeout = Duration::from_millis(500);
     })
     .await;
@@ -248,28 +190,17 @@ async fn a_check_that_times_out_is_killed_in_the_environment_too() {
 }
 
 #[tokio::test]
-async fn a_cancelled_opencode_is_killed_in_the_environment_too() {
-    let agent_dir = tempfile::tempdir().unwrap();
-    let pid_file = agent_dir.path().join("agent.pid");
-    let child_file = agent_dir.path().join("child.pid");
-    let fx = Fixture::with("hello\n", |s| {
-        s.opencode = OpenCodeLaunch::program(common::fake_agent())
-            .env("FAKE_ACP_SCENARIO", "stubborn")
-            .env("FAKE_ACP_PID_FILE", pid_file.to_string_lossy())
-            .env("FAKE_ACP_CHILD_PID_FILE", child_file.to_string_lossy());
-    })
-    .await;
-    let (rig, token) = Rig::from(fx).await.cancellable();
+async fn a_cancelled_check_is_killed_in_the_environment_too() {
+    let (rig, token) = Rig::new().await.cancellable();
     rig.prepare().await;
 
     let cancel_when_running = async {
-        let grandchild = common::wait_for_pid(&child_file).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         token.cancel();
-        grandchild
     };
-    let (out, grandchild) = tokio::time::timeout(Duration::from_secs(30), async {
+    let (out, ()) = tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(
-            DelegateToOpenCode.call(&rig.ctx, json!({"instructions": "never finish"})),
+            RunChecks.call(&rig.ctx, json!({"command": "sleep 30"})),
             cancel_when_running
         )
     })
@@ -287,7 +218,6 @@ async fn a_cancelled_opencode_is_killed_in_the_environment_too() {
         killed, prepared,
         "the session is told which command was cancelled"
     );
-    assert!(common::wait_gone(grandchild, false, Duration::from_secs(5)).await);
 }
 
 #[tokio::test]
@@ -350,9 +280,6 @@ async fn an_environment_that_cannot_be_made_is_a_result_for_the_model_and_nothin
     for out in [
         RunCommand.call(&rig.ctx, command.clone()).await,
         RunChecks.call(&rig.ctx, command.clone()).await,
-        DelegateToOpenCode
-            .call(&rig.ctx, json!({"instructions": "anything"}))
-            .await,
     ] {
         let Err(ToolError::Permanent(message)) = out else {
             panic!("a permanent error was expected: {out:?}");
@@ -438,7 +365,7 @@ fn slot_steps(rig: &Rig) -> Vec<(StepState, Option<String>)> {
 /// the run waits for a slot, with a step that says so, and the command runs once one is free.
 #[tokio::test]
 async fn an_environment_that_is_not_available_now_is_waited_for_when_the_deployment_says_to() {
-    let fx = Fixture::new("hello\n")
+    let fx = Fixture::new()
         .await
         .waiting_for_slots(Duration::from_secs(60));
     let rig = Rig::from(fx).await;
@@ -477,7 +404,7 @@ async fn an_environment_that_is_not_available_now_is_waited_for_when_the_deploym
 
 #[tokio::test]
 async fn a_wait_that_runs_out_is_the_tools_transient_result() {
-    let fx = Fixture::new("hello\n")
+    let fx = Fixture::new()
         .await
         .waiting_for_slots(Duration::from_secs(3));
     let rig = Rig::from(fx).await;
@@ -507,7 +434,7 @@ async fn a_wait_that_runs_out_is_the_tools_transient_result() {
 
 #[tokio::test]
 async fn a_cancel_ends_the_wait_for_a_slot() {
-    let fx = Fixture::new("hello\n")
+    let fx = Fixture::new()
         .await
         .waiting_for_slots(Duration::from_secs(600));
     let (rig, token) = Rig::from(fx).await.cancellable();
@@ -536,7 +463,7 @@ async fn a_cancel_ends_the_wait_for_a_slot() {
 /// the model's to hear at once, and the default (the devcontainer's behaviour) is not to wait.
 #[tokio::test]
 async fn only_unavailable_is_waited_for_and_by_default_nothing_is() {
-    let fx = Fixture::new("hello\n")
+    let fx = Fixture::new()
         .await
         .waiting_for_slots(Duration::from_secs(60));
     let rig = Rig::from(fx).await;
@@ -614,15 +541,7 @@ async fn a_broken_environment_is_a_result_that_says_to_ask_the_person_for_every_
         .call(&rig.ctx, json!({"command": "true"}))
         .await
         .unwrap_err();
-    let opencode = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "change it"}))
-        .await
-        .unwrap_err();
-    for (tool, err) in [
-        ("run_command", command),
-        ("run_checks", checks),
-        ("delegate_to_opencode", opencode),
-    ] {
+    for (tool, err) in [("run_command", command), ("run_checks", checks)] {
         let ToolError::Permanent(text) = err else {
             panic!("{tool}: a broken environment is not worth retrying: {err:?}")
         };
@@ -704,16 +623,10 @@ async fn rebuilding_with_the_default_goes_on_and_the_choice_is_noted() {
 }
 
 #[tokio::test]
-async fn rebuilding_without_use_default_makes_it_again_from_the_file_and_forgets_what_it_knew() {
+async fn rebuilding_without_use_default_makes_it_again_from_the_file() {
     let rig = Rig::new().await;
     rig.prepare().await;
     let run = rig.ctx.run_id().to_string();
-    let mut notes = rig.fx.env.notes.load(&run).await.unwrap();
-    notes.environment.opencode = Some(adam_coder::tools::notes::OpenCodeCheck {
-        works: false,
-        detail: "exec format error".to_owned(),
-    });
-    rig.fx.env.notes.save(&run, &notes).await.unwrap();
 
     let out = RebuildEnvironment.call(&rig.ctx, json!({})).await.unwrap();
     assert!(!out.is_error, "{}", out.content);
@@ -725,10 +638,6 @@ async fn rebuilding_without_use_default_makes_it_again_from_the_file_and_forgets
     assert_eq!(*rig.fake.rebuilt.lock().unwrap(), [(run.clone(), false)]);
     let notes = rig.fx.env.notes.load(&run).await.unwrap();
     assert!(!notes.environment.use_default);
-    assert_eq!(
-        notes.environment.opencode, None,
-        "a new environment is asked again whether OpenCode starts in it"
-    );
 }
 
 #[tokio::test]
@@ -787,171 +696,6 @@ async fn a_rebuild_that_fails_again_is_the_same_kind_of_result() {
             && text.contains("rebuild_environment"),
         "{text}"
     );
-}
-
-// --------------------------------------------------------------- where OpenCode runs, and its key
-
-fn scripted_opencode(dir: &std::path::Path, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = dir.join("opencode-stub");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
-
-#[tokio::test]
-async fn opencode_in_a_container_is_the_mounted_copy_and_reads_the_key_from_a_file() {
-    let launch = OpenCodeLaunch::from_command(
-        &[common::fake_agent().to_string_lossy().into_owned()],
-        "http://gateway.example/v1",
-        "model-x",
-    )
-    .env("FAKE_ACP_SCENARIO", "write-file");
-    let fx = Fixture::with("hello\n", |s| s.opencode = launch).await;
-    let rig = Rig::from(fx).await;
-    // The coder's own copy, which the environment mounts and names: the same binary here.
-    *rig.fake.session.opencode_at.lock().unwrap() = Some(common::fake_agent().to_path_buf());
-    rig.prepare().await;
-
-    let out = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
-        .await
-        .unwrap();
-    assert!(!out.is_error, "{}", out.content);
-
-    let specs = rig.fake.session.specs.lock().unwrap().clone();
-    // `opencode --version` first (it is asked once per environment), then OpenCode itself.
-    assert_eq!(specs.len(), 2, "{specs:?}");
-    assert_eq!(
-        specs[0].program,
-        Program::Argv(vec![
-            common::fake_agent().as_os_str().to_owned(),
-            "--version".into()
-        ])
-    );
-    let spec = &specs[1];
-    assert_eq!(
-        spec.program,
-        Program::Argv(vec![common::fake_agent().as_os_str().to_owned()])
-    );
-    let config = spec
-        .env
-        .get("OPENCODE_CONFIG_CONTENT")
-        .expect("the inline configuration");
-    assert!(
-        config.contains("{file:/run/secrets/model-key}"),
-        "the key is a reference to the file the environment gives: {config}"
-    );
-    assert!(!config.contains("{env:MODEL_API_KEY}"), "{config}");
-    let said = text_of(&rig);
-    for secret in common::SECRETS {
-        assert!(
-            !said.contains(secret),
-            "the value of a secret is in no argument or variable: {said}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn opencode_that_cannot_start_in_the_environment_is_refused_once_and_the_other_tools_work() {
-    let dir = tempfile::tempdir().unwrap();
-    let stub = scripted_opencode(
-        dir.path(),
-        "echo 'exec /opt/adam/bin/opencode: no such file or directory (musl)' >&2; exit 127",
-    );
-    let launch = OpenCodeLaunch::from_command(
-        &[stub.to_string_lossy().into_owned()],
-        "http://gateway.example/v1",
-        "model-x",
-    );
-    let fx = Fixture::with("hello\n", |s| s.opencode = launch).await;
-    let rig = Rig::from(fx).await;
-    rig.prepare().await;
-
-    for _ in 0..2 {
-        let out = DelegateToOpenCode
-            .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
-            .await
-            .unwrap();
-        assert!(out.is_error, "{}", out.content);
-        for expected in [
-            "OpenCode cannot start in this workspace's environment",
-            "exit code 127",
-            "musl",
-            "read_file, write_file and apply_patch",
-        ] {
-            assert!(
-                out.content.contains(expected),
-                "{expected}: {}",
-                out.content
-            );
-        }
-    }
-    assert_eq!(
-        rig.fake.session.specs.lock().unwrap().len(),
-        1,
-        "`opencode --version` ran once; the second call used the note"
-    );
-    // The other tools are not affected.
-    let looked = RunCommand
-        .call(&rig.ctx, json!({"command": "echo still=$FAKE_ENV"}))
-        .await
-        .unwrap();
-    assert!(looked.content.contains("still=fake"), "{}", looked.content);
-}
-
-#[tokio::test]
-async fn a_container_with_no_network_has_no_opencode_and_says_what_to_use() {
-    let launch = OpenCodeLaunch::from_command(
-        &[common::fake_agent().to_string_lossy().into_owned()],
-        "http://gateway.example/v1",
-        "model-x",
-    );
-    let fx = Fixture::with("hello\n", |s| {
-        s.opencode = launch;
-        s.container_network_none = true;
-    })
-    .await;
-    let rig = Rig::from(fx).await;
-    rig.prepare().await;
-    let out = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
-        .await
-        .unwrap();
-    assert!(
-        out.is_error
-            && out.content.contains("DEVCONTAINER_NETWORK=none")
-            && out.content.contains("apply_patch"),
-        "{}",
-        out.content
-    );
-    assert!(rig.fake.session.specs.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn in_the_coders_own_container_opencode_is_not_probed_and_the_network_setting_is_not_its_business()
- {
-    let launch = OpenCodeLaunch::from_command(
-        &[common::fake_agent().to_string_lossy().into_owned()],
-        "http://gateway.example/v1",
-        "model-x",
-    )
-    .env("FAKE_ACP_SCENARIO", "write-file");
-    let fx = Fixture::with("hello\n", |s| {
-        s.opencode = launch;
-        s.container_network_none = true;
-    })
-    .await;
-    let rig = Rig::from(fx).await;
-    *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Local);
-    rig.prepare().await;
-    let out = DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
-        .await
-        .unwrap();
-    assert!(!out.is_error, "{}", out.content);
-    let specs = rig.fake.session.specs.lock().unwrap().clone();
-    assert_eq!(specs.len(), 1, "no `--version` first: {specs:?}");
 }
 
 // --------------------------------------------------------------- what a check reports, and a missing tool
@@ -1077,7 +821,7 @@ async fn a_missing_tool_says_which_environment_lacks_it_and_how_it_gets_there() 
 #[tokio::test]
 async fn a_service_that_does_not_answer_gives_the_coders_own_container_with_one_step_per_run() {
     use std::os::unix::fs::PermissionsExt as _;
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let bin = tempfile::tempdir().unwrap();
     let calls = bin.path().join("calls");
     let client = bin.path().join("podman-remote");
@@ -1090,9 +834,6 @@ async fn a_service_that_does_not_answer_gives_the_coders_own_container_with_one_
     )
     .unwrap();
     std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let opencode = bin.path().join("opencode");
-    std::fs::write(&opencode, b"\x7fELF this is only a stub").unwrap();
-    std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let vars: std::collections::HashMap<&str, String> = [
         ("DATABASE_URL", "postgres://u:p@127.0.0.1:1/x".to_owned()),
@@ -1109,7 +850,8 @@ async fn a_service_that_does_not_answer_gives_the_coders_own_container_with_one_
         ),
         ("DEVCONTAINER_PODMAN", client.to_string_lossy().into_owned()),
         ("DEVCONTAINER_PREPULL", "false".to_owned()),
-        ("OPENCODE_BINARY", opencode.to_string_lossy().into_owned()),
+        // Removed by ADR 0038: ignored, so podman starts without it.
+        ("OPENCODE_BINARY", "/no/such/opencode".to_owned()),
     ]
     .into();
     let config = adam_coder::Config::from_lookup(|k| vars.get(k).cloned()).unwrap();
@@ -1206,7 +948,7 @@ fn def_with_extra_server_reading(name: &str) -> adam::AgentDef {
 async fn rig_over(
     wrap: impl FnOnce(Arc<FakeEnvironment>) -> adam_workspace::DynEnvironment,
 ) -> Rig {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new().await;
     let fake = FakeEnvironment::new(Some(&fx.root));
     let fx = fx.using(wrap(fake.clone()));
     let sink = CollectingSink::new();
@@ -1221,7 +963,7 @@ async fn rig_over(
 }
 
 #[tokio::test]
-async fn a_variable_a_mcp_json_names_is_hidden_from_checks_commands_and_opencode() {
+async fn a_variable_a_mcp_json_names_is_hidden_from_checks_and_commands() {
     let def = def_with_extra_server_reading("SEARCH_MCP_TOKEN");
     // What `build_agent` does with the definition: protect the names, wrap the environment.
     let protected = adam_coder::mcp_secrets::protect(
@@ -1245,13 +987,9 @@ async fn a_variable_a_mcp_json_names_is_hidden_from_checks_commands_and_opencode
         .call(&rig.ctx, json!({"command": "env"}))
         .await
         .unwrap();
-    DelegateToOpenCode
-        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
-        .await
-        .unwrap();
 
     let specs = rig.fake.session.specs.lock().unwrap().clone();
-    assert_eq!(specs.len(), 3, "a command, a check and OpenCode: {specs:?}");
+    assert_eq!(specs.len(), 2, "a command and a check: {specs:?}");
     for spec in &specs {
         assert!(
             spec.hide.iter().any(|name| name == "SEARCH_MCP_TOKEN"),
@@ -1267,10 +1005,9 @@ async fn a_variable_a_mcp_json_names_is_hidden_from_checks_commands_and_opencode
 
 #[test]
 fn the_names_the_coders_own_processes_need_are_never_hidden_or_redacted() {
-    // A file that reads `${PATH}` or `${MODEL_API_KEY}` (a stdio server's `env`) must not blank them
-    // for every command and for OpenCode, nor redact `PATH` from every output.
+    // A file that reads `${PATH}` (a stdio server's `env`) must not blank it for every command,
+    // nor redact it from every output.
     let names: std::collections::BTreeSet<String> = [
-        "MODEL_API_KEY",
         "PATH",
         "HOME",
         "LANG",
@@ -1288,15 +1025,7 @@ fn the_names_the_coders_own_processes_need_are_never_hidden_or_redacted() {
     assert_eq!(protected.hidden, ["SEARCH_MCP_TOKEN"]);
     assert_eq!(
         protected.skipped,
-        [
-            "HOME",
-            "LANG",
-            "LC_ALL",
-            "MODEL_API_KEY",
-            "PATH",
-            "TMPDIR",
-            "USER"
-        ]
+        ["HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "USER"]
     );
     assert_eq!(protected.registered, 1);
     assert_eq!(
@@ -1448,7 +1177,7 @@ async fn a_request_the_pod_does_not_make_is_absent_from_the_entry() {
 /// A command a timeout stopped still counts, until it was stopped.
 #[tokio::test]
 async fn a_command_a_timeout_stopped_still_counts() {
-    let fx = Fixture::with("hello\n", |s| {
+    let fx = Fixture::with(|s| {
         s.check_timeout = Duration::from_millis(500);
     })
     .await;
@@ -1508,50 +1237,6 @@ async fn a_command_a_cancel_stopped_still_counts() {
         (300..25_000).contains(&entry.milliseconds),
         "until the cancel stopped it: {entry:?}"
     );
-}
-
-/// OpenCode is a process of the pod for as long as its call lasts: a cancel that stops it counts the
-/// time it ran.
-#[tokio::test]
-async fn opencode_in_a_pod_counts_from_its_spawn_to_its_end_a_cancel_included() {
-    let agent_dir = tempfile::tempdir().unwrap();
-    let pid_file = agent_dir.path().join("agent.pid");
-    let child_file = agent_dir.path().join("child.pid");
-    let fx = Fixture::with("hello\n", |s| {
-        s.opencode = OpenCodeLaunch::program(common::fake_agent())
-            .env("FAKE_ACP_SCENARIO", "stubborn")
-            .env("FAKE_ACP_PID_FILE", pid_file.to_string_lossy())
-            .env("FAKE_ACP_CHILD_PID_FILE", child_file.to_string_lossy());
-    })
-    .await;
-    let (rig, token) = Rig::from(fx).await.cancellable();
-    rig.fake.session.as_pod(Some(250), Some(GIB / 2));
-    rig.prepare().await;
-
-    let cancel_when_running = async {
-        let grandchild = common::wait_for_pid(&child_file).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        token.cancel();
-        grandchild
-    };
-    let (out, grandchild) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(
-            DelegateToOpenCode.call(&rig.ctx, json!({"instructions": "never finish"})),
-            cancel_when_running
-        )
-    })
-    .await
-    .expect("the tool returns after a cancel");
-    assert!(out.is_err(), "{out:?}");
-    assert!(common::wait_gone(grandchild, false, Duration::from_secs(5)).await);
-
-    let usage = rig.ctx.reported_sandbox();
-    let [entry] = usage.entries() else {
-        panic!("one shape: {usage:?}");
-    };
-    // The launcher here is not OpenCode, so there is no version probe: OpenCode is the one command.
-    assert_eq!(entry.commands, 1, "{entry:?}");
-    assert!(entry.milliseconds >= 300, "{entry:?}");
 }
 
 /// The coder's own container and a dev container are not metered: the usage says where the commands

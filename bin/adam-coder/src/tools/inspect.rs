@@ -14,7 +14,7 @@
 //!   branch, the tree of the files as `commit_and_push` would commit them, and the refs and local
 //!   git configuration a command could change without touching a file), and a command after
 //!   which any of them differs is undone and refused. Changes are made by the file tools, by
-//!   `delegate_to_opencode` and, for a command that makes something (a build, an export, a
+//!   `write_file`, `edit_file` and `apply_patch` and, for a command that makes something (a build, an export, a
 //!   generated file), by `run` ([`run`](super::make)), which keeps the files it changes and is held
 //!   to the same guard for everything else.
 //!
@@ -37,8 +37,8 @@ use super::{Outcome, ToolEnv, non_empty, run_error};
 /// the tail of the output.
 /// It costs no check cycle and reports no checks, and it is for looking: changes it makes to
 /// HEAD, the branch and the working tree are undone and refused (to make a file or change the
-/// worktree with a command, use run; to change code, write_file, edit_file, apply_patch or
-/// delegate_to_opencode). Use it to look; use run_checks only for the project's real checks.
+/// worktree with a command, use run; to change code, write_file, edit_file or
+/// apply_patch). Use it to look; use run_checks only for the project's real checks.
 #[tool(label = "Run a command", icon = "execute")]
 pub async fn run_command(
     env: State<ToolEnv>,
@@ -304,7 +304,7 @@ fn changed_the_worktree(command: &str, outcome: &ShellOutcome, restored: bool) -
     };
     format!(
         "`{command}` changed the worktree (files, HEAD, the branch, a ref or the git \
-         configuration), and run_command is for looking around only. {what} To make something with a command use `run`; to change code use write_file, edit_file, apply_patch or delegate_to_opencode. Output of the \
+         configuration), and run_command is for looking around only. {what} To make something with a command use `run`; to change code use write_file, edit_file or apply_patch. Output of the \
          command, for what it is worth:\n{}",
         outcome.tail
     )
@@ -371,7 +371,7 @@ mod tests {
     fn the_refusal_says_what_happened_and_where_changes_go() {
         let said = changed_the_worktree("touch a", &outcome(Some(0), "out", false, false), true);
         assert!(
-            said.contains("exactly as it was") && said.contains("delegate_to_opencode"),
+            said.contains("exactly as it was") && said.contains("apply_patch"),
             "{said}"
         );
         let unsure = changed_the_worktree("touch a", &outcome(Some(0), "", false, false), false);
