@@ -350,7 +350,10 @@ fn range_args(
         Some(end) => {
             let start = offset.unwrap_or(1);
             if start < 1 {
-                return Err("end_line needs a first line from 1: give start_line, or use offset and limit".into());
+                return Err(
+                    "end_line needs a first line from 1: give start_line, or use offset and limit"
+                        .into(),
+                );
             }
             let end = i64::from(end);
             if end < start {
@@ -421,7 +424,10 @@ fn closest_paths(wanted: &str, candidates: &[String]) -> Vec<String> {
         .map(|c| (similarity(wanted, c), c))
         .filter(|(score, _)| *score >= CLOSEST_MIN)
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.as_bytes().cmp(b.1.as_bytes())));
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
+    });
     scored
         .into_iter()
         .take(CLOSEST_PATHS)
@@ -739,6 +745,7 @@ pub(super) fn push_published_note(text: &mut String, slot: &adam_workspace::Slot
 /// negative offset reads from the end. A binary file is not shown. Example:
 /// {"path":"src/main.rs","offset":2001}
 #[tool(label = "Read a file", icon = "read")]
+#[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn read_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -1380,6 +1387,30 @@ mod swap_tests {
     }
 
     #[test]
+    fn search_does_not_follow_a_slot_swapped_after_the_check() {
+        let p = pair();
+        let (slot, other) = (p.slot.clone(), p.other.clone());
+        // The candidates are listed; then the slot is swapped for a link to another run's files.
+        let hook = at(&p.slot, "search", move || swap_slot(&slot, &other));
+        let paths = ["sub/file.txt".to_owned(), "top.txt".to_owned()];
+        let got = super::super::find::search_files_in(
+            &open(&p.slot),
+            &paths,
+            "shared|original|SECRET",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(hook.reached("search"), 1, "the swap was made");
+        assert!(!got.contains(SECRET), "{got}");
+        assert_eq!(
+            got,
+            "sub/file.txt:1:shared line\nsub/file.txt:2:original sub\n\
+             top.txt:1:shared line\ntop.txt:2:original top\n[end: 4 matches in 2 files]"
+        );
+    }
+
+    #[test]
     fn a_write_does_not_land_in_a_slot_swapped_after_the_path_was_checked() {
         let p = pair();
         let before = tree(&p.other);
@@ -1905,7 +1936,10 @@ mod tests {
             second.chars().filter(|c| *c == 'é').count(),
             paging::MAX_LINE_CHARS
         );
-        assert!(text.contains("     3\tafter\n"), "the next line is still there");
+        assert!(
+            text.contains("     3\tafter\n"),
+            "the next line is still there"
+        );
     }
 
     #[test]
@@ -1961,8 +1995,14 @@ mod tests {
         let why = range_args(Some(3), None, Some(2), None).unwrap_err();
         assert!(why.contains("not both"), "{why}");
         // Either alone is fine, and `limit` and `end_line` meet at the smaller.
-        assert_eq!(range_args(Some(3), Some(10), None, None), Ok((Some(3), Some(10))));
-        assert_eq!(range_args(None, Some(10), Some(2), Some(4)), Ok((Some(2), Some(3))));
+        assert_eq!(
+            range_args(Some(3), Some(10), None, None),
+            Ok((Some(3), Some(10)))
+        );
+        assert_eq!(
+            range_args(None, Some(10), Some(2), Some(4)),
+            Ok((Some(2), Some(3)))
+        );
     }
 
     #[test]
@@ -1983,9 +2023,17 @@ mod tests {
             .collect();
         let near = closest_paths("src/mian.rs", &all);
         // The two that differ by one letter tie, and go by path; the third is further.
-        assert_eq!(near, ["src/mian.rb", "src/mian.rc", "src/main.rs"], "{near:?}");
+        assert_eq!(
+            near,
+            ["src/mian.rb", "src/mian.rc", "src/main.rs"],
+            "{near:?}"
+        );
         assert!(!near.contains(&"README.md".to_owned()), "{near:?}");
-        assert_eq!(near, closest_paths("src/mian.rs", &all), "the same answer twice");
+        assert_eq!(
+            near,
+            closest_paths("src/mian.rs", &all),
+            "the same answer twice"
+        );
     }
 
     /// The text of a file as `read_file` pages show it, with the numbers taken off: following
@@ -2002,7 +2050,13 @@ mod tests {
                 out.push('\n');
             }
             if let Some(rest) = last.strip_prefix("[more: ") {
-                offset = rest.rsplit_once("offset=").unwrap().1.trim_end_matches(']').parse().unwrap();
+                offset = rest
+                    .rsplit_once("offset=")
+                    .unwrap()
+                    .1
+                    .trim_end_matches(']')
+                    .parse()
+                    .unwrap();
             } else {
                 if last.contains("no newline at the end") {
                     assert!(out.ends_with('\n'));

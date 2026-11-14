@@ -1363,7 +1363,10 @@ mod tests {
             .collect();
         assert_eq!(names, [".git", "B", "a.txt", "l", "sub"]);
         assert!(entries[1].1.is_file());
-        assert!(entries[3].1.is_symlink(), "a link is a link, not its target");
+        assert!(
+            entries[3].1.is_symlink(),
+            "a link is a link, not its target"
+        );
         assert!(entries[4].1.is_dir());
         // The directory below is listed through its own descriptor, and twice gives the same.
         let sub = held.open_dir(OsStr::new("sub")).unwrap();

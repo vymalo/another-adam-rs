@@ -95,7 +95,7 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 24] = [
+const TOOLS: [&str; 27] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -104,6 +104,9 @@ const TOOLS: [&str; 24] = [
     "run_command",
     "run",
     "read_file",
+    "list_files",
+    "find_files",
+    "search_files",
     "write_file",
     "apply_patch",
     "edit_file",
@@ -165,13 +168,16 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
 /// coder's README ("A step's picture"): a tool added later must be put in it, or this test fails.
 #[tokio::test]
 async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
-    use adam_llm_agent::StepIcon::{Delete, Edit, Execute, File, Git, Read, Think};
+    use adam_llm_agent::StepIcon::{Delete, Edit, Execute, File, Git, Read, Search, Think};
     let fx = Fixture::with(|s| {
         s.create_repo_owners = vec!["acme".to_owned()];
     })
     .await;
     let want = [
         ("read_file", Read),
+        ("list_files", Search),
+        ("find_files", Search),
+        ("search_files", Search),
         ("write_file", Edit),
         ("edit_file", Edit),
         ("apply_patch", Edit),

@@ -8,7 +8,8 @@
 //! | `create_repository { owner, name, private?, description? }` | [`create`] |
 //! | `run_command { command, cwd? }`: look around, changes undone | [`inspect`] |
 //! | `run { command, cwd? }`: make something with a command, changes kept, never a check | [`make`] |
-//! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
+//! | `list_files { path?, offset?, limit? }`, `find_files { pattern, path?, offset?, limit? }`, `search_files { pattern, path?, include?, literal?, offset?, limit? }`: paged, git-aware looking around | [`find`] |
+//! | `read_file { path, offset?, limit? }` (paged; `start_line` and `end_line` are aliases), `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
 //! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
 //! | `run_checks { command }` | [`checks`] |
 //! | `rebuild_environment { use_default? }` | [`environment`] |
@@ -112,6 +113,7 @@ pub mod consent;
 pub mod create;
 pub mod environment;
 pub mod files;
+pub mod find;
 pub(crate) mod gitcli;
 pub mod inspect;
 pub mod make;
@@ -754,6 +756,9 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         inspect::RunCommand,
         make::Run,
         files::ReadFile,
+        find::ListFiles,
+        find::FindFiles,
+        find::SearchFiles,
         files::WriteFile,
         files::ApplyPatch,
         files::EditFile,

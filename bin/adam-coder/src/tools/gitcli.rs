@@ -42,6 +42,16 @@ impl GitAt {
         }
     }
 
+    /// A directory whose repository is not known: every question is "unknown", as for a repository
+    /// the coder's metadata cannot tell.
+    #[cfg(test)]
+    pub(crate) fn refused(dir: &Path) -> Self {
+        Self::of(
+            Arc::new(SlotDir::open(dir).expect("a plain directory")),
+            None,
+        )
+    }
+
     /// A slot: a worktree of a repository or a scratch project.
     pub(crate) fn slot(slot: &Slot) -> Self {
         Self::of(Arc::clone(slot.root()), slot.git_pin())
@@ -306,10 +316,7 @@ pub(crate) async fn list_files(at: &GitAt, dir: &Path) -> Result<Vec<String>, Li
         .split(|&b| b == 0)
         .filter(|p| !p.is_empty() && !p.ends_with(b"/"))
         .filter_map(|p| std::str::from_utf8(p).ok())
-        .filter(|p| {
-            !p.split('/')
-                .any(|part| part.eq_ignore_ascii_case(".git"))
-        })
+        .filter(|p| !p.split('/').any(|part| part.eq_ignore_ascii_case(".git")))
         .map(str::to_owned)
         .collect();
     paths.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));

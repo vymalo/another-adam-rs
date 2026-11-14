@@ -1479,9 +1479,15 @@ impl LlmAgent {
         };
         let answered = match outcome {
             Ok(output) => {
-                let (message, artifacts, answer, outcome) =
-                    output_message(ctx, &call.id, &call.name, self.pages(&call.name), output, files_used)
-                        .await;
+                let (message, artifacts, answer, outcome) = output_message(
+                    ctx,
+                    &call.id,
+                    &call.name,
+                    self.pages(&call.name),
+                    output,
+                    files_used,
+                )
+                .await;
                 // What the step says is what the model is told (the refusal of a file included).
                 let said = match &message {
                     Message::Tool {
@@ -1756,16 +1762,15 @@ impl LlmAgent {
             Ok(RemotePoll::Working) => Ok(None),
             Ok(RemotePoll::Ready(output)) => {
                 let used = files_kept(&state.artifacts);
-                let (message, artifacts, answer, outcome) =
-                    output_message(
-                        ctx,
-                        &wait.call_id,
-                        &wait.tool,
-                        self.pages(&wait.tool),
-                        output,
-                        used,
-                    )
-                    .await;
+                let (message, artifacts, answer, outcome) = output_message(
+                    ctx,
+                    &wait.call_id,
+                    &wait.tool,
+                    self.pages(&wait.tool),
+                    output,
+                    used,
+                )
+                .await;
                 state.artifacts.extend(artifacts);
                 if let Some(answer) = answer {
                     state.announce(answer);

@@ -1,0 +1,27 @@
+{
+  "name": "list_files",
+  "description": "List one directory of your worktree (not recursive), sorted; a directory ends in /, a link in @. Example: {\"path\":\"src\"}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Directory relative to the worktree root; leave out for the root"
+      },
+      "offset": {
+        "type": "integer",
+        "format": "int64",
+        "description": "First entry, from 1; -20 = the last 20"
+      },
+      "limit": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Most entries (at most 200)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to list in; leave out when there is one"
+      }
+    }
+  }
+}

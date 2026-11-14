@@ -18,6 +18,7 @@
 //! | name | where |
 //! |---|---|
 //! | `read` | `read_file` and `share_file`: the path is resolved, the file is not yet opened |
+//! | `search` | `search_files`: the candidates are listed, no file is opened yet |
 //! | `write` | `write_file`: the directories are made, the new file is not yet created |
 //! | `edit` | `edit_file`: the file is located, not yet read |
 //! | `copy-source`, `copy-dest` | `copy_into`: the plan is made, no file is written yet |

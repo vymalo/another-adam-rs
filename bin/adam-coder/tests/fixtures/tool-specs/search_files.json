@@ -1,0 +1,42 @@
+{
+  "name": "search_files",
+  "description": "Search file contents for a pattern (a regular expression; literal:true for plain text). Gives path:line:text, sorted. Files git ignores are left out. Example: {\"pattern\":\"fn main\",\"include\":\"*.rs\"}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "Regular expression (`(?i)` ignores case), or plain text with `literal`"
+      },
+      "path": {
+        "type": "string",
+        "description": "Directory (or file) to search, relative to the worktree root; leave out for all of it"
+      },
+      "include": {
+        "type": "string",
+        "description": "Glob the file paths must match, e.g. `*.rs`"
+      },
+      "literal": {
+        "type": "boolean",
+        "description": "Take the pattern as plain text, not a regular expression"
+      },
+      "offset": {
+        "type": "integer",
+        "format": "int64",
+        "description": "First match, from 1; -20 = the last 20"
+      },
+      "limit": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Most matches (at most 100)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to search in; leave out when there is one"
+      }
+    },
+    "required": [
+      "pattern"
+    ]
+  }
+}

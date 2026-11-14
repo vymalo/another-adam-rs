@@ -10,6 +10,7 @@ use adam_coder::ToolEnv;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::create::CreateRepository;
 use adam_coder::tools::files::{ApplyPatch, EditFile, ReadFile, WriteFile};
+use adam_coder::tools::find::{FindFiles, ListFiles, SearchFiles};
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::make::Run;
 use adam_coder::tools::named::{named_in, without_untrusted};
@@ -2814,8 +2815,7 @@ async fn read_file_reads_the_worktree_and_numbers_a_range() {
         .await
         .unwrap();
     assert_eq!(
-        range.content,
-        "     2\ttwo\n     3\tthree\n[more: 1 lines left; next page: offset=4]",
+        range.content, "     2\ttwo\n     3\tthree\n[more: 1 lines left; next page: offset=4]",
         "start_line and end_line are the old names of offset and limit"
     );
 
@@ -2866,7 +2866,10 @@ async fn read_file_pages_a_big_file_and_says_where_the_next_page_starts() {
         .call(&rig.ctx, json!({"path": "big.txt"}))
         .await
         .unwrap();
-    assert_eq!(first.content, again.content, "the same call, the same bytes");
+    assert_eq!(
+        first.content, again.content,
+        "the same call, the same bytes"
+    );
     let tail = ReadFile
         .call(&rig.ctx, json!({"path": "big.txt", "offset": -2}))
         .await
@@ -2900,6 +2903,75 @@ async fn a_missing_file_names_the_closest_paths() {
         .call(&rig.ctx, json!({"path": "zzzzzzzzzzzz"}))
         .await;
     assert_eq!(text(out), "`zzzzzzzzzzzz` does not exist");
+}
+
+/// The three tools that look around answer in pages, from the worktree's own files and from what
+/// git shows there, and keep to the worktree.
+#[tokio::test]
+async fn the_look_around_tools_page_find_and_search_inside_the_worktree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+    std::fs::write(wt.join("src/a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+    std::fs::write(wt.join("src/b.txt"), "alpha in prose\n").unwrap();
+    std::fs::write(wt.join(".gitignore"), "ignored/\n").unwrap();
+    std::fs::create_dir_all(wt.join("ignored")).unwrap();
+    std::fs::write(wt.join("ignored/c.rs"), "fn alpha() {}\n").unwrap();
+
+    let listed = ListFiles
+        .call(&rig.ctx, json!({"path": "src"}))
+        .await
+        .unwrap();
+    assert_eq!(listed.content, "a.rs\nb.txt\n[end: 2 entries]");
+    let root = ListFiles.call(&rig.ctx, json!({})).await.unwrap();
+    assert!(
+        root.content.lines().all(|l| l != ".git" && l != ".git/"),
+        "{}",
+        root.content
+    );
+    assert!(root.content.contains("src/\n"), "{}", root.content);
+
+    let found = FindFiles
+        .call(&rig.ctx, json!({"pattern": "*.rs"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        found.content, "src/a.rs\n[end: 1 paths]",
+        "ignored/ is left out"
+    );
+
+    let hits = SearchFiles
+        .call(&rig.ctx, json!({"pattern": "alpha", "limit": 1}))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.content,
+        "src/a.rs:1:fn alpha() {}\n[more: 1 matches left; next page: offset=2]"
+    );
+    let rest = SearchFiles
+        .call(&rig.ctx, json!({"pattern": "alpha", "offset": 2}))
+        .await
+        .unwrap();
+    assert_eq!(
+        rest.content,
+        "src/b.txt:1:alpha in prose\n[end: 2 matches in 2 files]"
+    );
+
+    for (path, needle) in [("../x", "`..`"), ("/etc", "absolute"), (".GIT", ".git")] {
+        for out in [
+            ListFiles.call(&rig.ctx, json!({"path": path})).await,
+            FindFiles
+                .call(&rig.ctx, json!({"pattern": "*", "path": path}))
+                .await,
+            SearchFiles
+                .call(&rig.ctx, json!({"pattern": "x", "path": path}))
+                .await,
+        ] {
+            assert!(is_error(&out), "{path}: {out:?}");
+            assert!(text(out).contains(needle), "{path}");
+        }
+    }
 }
 
 /// Whatever the model passes, a path that leaves the worktree reads and writes nothing, and says

@@ -1,0 +1,34 @@
+{
+  "name": "find_files",
+  "description": "Find files by name pattern (glob). Files git ignores are left out. * stays within one directory, ** crosses directories; a pattern with no / matches file names anywhere. Example: {\"pattern\":\"**/*.test.ts\"}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "Glob, e.g. `*.rs` or `src/**/*.ts`"
+      },
+      "path": {
+        "type": "string",
+        "description": "Directory to look in, relative to the worktree root; leave out for all of it"
+      },
+      "offset": {
+        "type": "integer",
+        "format": "int64",
+        "description": "First path, from 1; -20 = the last 20"
+      },
+      "limit": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Most paths (at most 100)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to look in; leave out when there is one"
+      }
+    },
+    "required": [
+      "pattern"
+    ]
+  }
+}

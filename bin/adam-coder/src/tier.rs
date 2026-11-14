@@ -99,6 +99,9 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "request_repository"
         | "run_command"
         | "read_file"
+        | "list_files"
+        | "find_files"
+        | "search_files"
         | "share_file"
         | "rebuild_environment"
         | "ask_user"
@@ -298,6 +301,9 @@ mod tests {
         use AccessTier::*;
         for (tool, tier) in [
             ("read_file", Plan),
+            ("list_files", Plan),
+            ("find_files", Plan),
+            ("search_files", Plan),
             ("run_command", Plan),
             ("prepare_workspace", Plan),
             ("request_repository", Plan),

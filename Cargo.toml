@@ -57,6 +57,8 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
 futures = "0.3"
+# `find_files` (adam-coder): a glob compiled to the same linear-time regex engine.
+globset = "0.4"
 http = "1"
 # Parses the request head of the egress proxy (adam-egress); already in the tree under hyper.
 httparse = "1"
@@ -77,6 +79,8 @@ proptest = "1"
 quote = "1"
 # Client only, and only the transports adam-mcp uses; the crate picks its own features.
 rmcp = { version = "3.9", default-features = false }
+# `search_files` (adam-coder): a linear-time engine, with no backtracking and a size limit.
+regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream", "json", "query"] }
 # The process-wide TLS provider (adam-env-kubernetes): kube builds its TLS configuration with it, and a binary whose tree enables both providers
 # (the coder's does) has to name one. Already in the tree under rustls.
