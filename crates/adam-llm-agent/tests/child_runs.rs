@@ -21,9 +21,9 @@ use adam_model::{
     ToolCall, ToolSpec,
 };
 use adam_runtime::{
-    Clock, CollectingSink, Inbound, ManualClock, RUN_FINISHED_KIND, RetryPolicy, RunEvent, RunView,
-    Runtime, RuntimeBuilder, RuntimeError, StepEvent, StepKind, StepOutput, StepState,
-    child_run_id,
+    CHILD_REPORTED_KIND, Clock, CollectingSink, Inbound, ManualClock, RUN_FINISHED_KIND,
+    RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError, StepEvent, StepKind,
+    StepOutput, StepState, child_run_id,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -453,6 +453,14 @@ fn notice(child: RunId, payload: Value) -> Inbound {
     Inbound::new(RUN_FINISHED_KIND, payload).with_id(child.to_string())
 }
 
+/// A report whose payload also reads as a person's message (a `text` field), so only its kind
+/// keeps it out of the model's history.
+fn reported_like_a_message(text: &str) -> Value {
+    let mut payload = child_said(text);
+    payload["text"] = json!(text);
+    payload
+}
+
 fn child_said(text: &str) -> Value {
     json!({"status": "done", "output": {"text": text, "artifacts": []}})
 }
@@ -780,6 +788,85 @@ mod cases {
             tool_results(&conversation(&end)),
             vec![("c1".into(), "child says 42".into(), false)]
         );
+    }
+
+    /// A session round's report (ADR 0045) reaching a parent that does not read reports is not a
+    /// person's message: the model never sees it, it does not reopen a run that is finishing, and
+    /// no extra model turn is spent on it.
+    pub async fn a_session_report_is_not_a_message_and_does_not_reopen_the_run(store: DynStore) {
+        let rig = Rig::new();
+        let gate = Arc::new(Gate::default());
+        rig.parent_mock.push_text("all done");
+        let model: DynModel = Arc::new(GateModel {
+            inner: rig.parent_mock.clone(),
+            hold_on: 0,
+            calls: AtomicUsize::new(0),
+            armed: AtomicBool::new(true),
+            gate: gate.clone(),
+        });
+        let parent_agent = LlmAgent::builder(&rig.parent_name, model, "m").build();
+        let rt = rig.builder(&store, "w").agent(parent_agent).build();
+        let parent = rt
+            .start(&rig.parent_name, user_message("go"), None)
+            .await
+            .expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&gate.reached, "the parent's model call").await;
+        rt.deliver(
+            parent,
+            Inbound::new(
+                CHILD_REPORTED_KIND,
+                reported_like_a_message("REPORT-TEXT-XYZ"),
+            )
+            .with_id(RunId::new().to_string()),
+        )
+        .await
+        .expect("the report");
+        gate.release.notify_one();
+        let end = wait_for(&rt, parent, "the end", |v| v.status.is_terminal()).await;
+        worker.stop().await;
+
+        assert_eq!(end.status, RunStatus::Done, "{end:#?}");
+        assert_eq!(end.output.clone().expect("output")["text"], "all done");
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 1, "no second model turn");
+        for request in &requests {
+            assert!(!format!("{:?}", request.messages).contains("REPORT-TEXT-XYZ"));
+        }
+        assert!(!format!("{:?}", conversation(&end).messages).contains("REPORT-TEXT-XYZ"));
+    }
+
+    /// The same report already in the inbox when the step starts is dropped before it can become
+    /// the person's message: the model is asked once, about the person's own message.
+    pub async fn a_session_report_in_the_inbox_is_never_shown_to_the_model(store: DynStore) {
+        let rig = Rig::new();
+        rig.parent_mock.push_text("all done");
+        let model: DynModel = rig.parent_mock.clone();
+        let parent_agent = LlmAgent::builder(&rig.parent_name, model, "m").build();
+        let rt = rig.builder(&store, "w").agent(parent_agent).build();
+        let parent = rt
+            .start(&rig.parent_name, user_message("go"), None)
+            .await
+            .expect("start");
+        rt.deliver(
+            parent,
+            Inbound::new(
+                CHILD_REPORTED_KIND,
+                reported_like_a_message("REPORT-TEXT-XYZ"),
+            )
+            .with_id(RunId::new().to_string()),
+        )
+        .await
+        .expect("the report");
+        let worker = spawn_worker(&rt);
+        let end = wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        assert_eq!(end.output.clone().expect("output")["text"], "all done");
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(!format!("{:?}", requests[0].messages).contains("REPORT-TEXT-XYZ"));
+        assert!(!format!("{:?}", conversation(&end).messages).contains("REPORT-TEXT-XYZ"));
     }
 
     /// A failing child is an error result: the model sees why and the run goes on.
@@ -1316,6 +1403,8 @@ macro_rules! child_suite {
                 a_lost_terminal_ack_is_recovered_when_the_timer_fires,
                 a_notice_that_lands_while_the_parent_finishes_costs_no_model_turn,
                 a_failing_child_is_an_error_result,
+                a_session_report_is_not_a_message_and_does_not_reopen_the_run,
+                a_session_report_in_the_inbox_is_never_shown_to_the_model,
                 a_cancelled_child_is_an_error_result,
                 cancelling_the_parent_leaves_the_child_running,
                 only_the_awaited_childs_notice_answers,

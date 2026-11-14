@@ -21,8 +21,9 @@ use adam_core::{ClaimScope, DynStore, JournalEntry, MemoryStore, NewRun, RunId, 
 use adam_runtime::{
     Agent, AgentError, AgentStarter, Artifact, BroadcastSink, CHILD_REPORTED_KIND, ChildStatus,
     Classify, Clock, CollectingSink, Ctx, Inbound, LocalNotifier, MAX_RETRY_AFTER, ManualClock,
-    RUN_FINISHED_KIND, RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError,
-    SessionState, Transition, child_run_id, session_conversation_id,
+    RUN_FINISHED_KIND, RetryPolicy, RoundOutcome, RunEvent, RunView, Runtime, RuntimeBuilder,
+    RuntimeError, SessionState, Transition, child_run_id, parse_session_conversation_id,
+    session_conversation_id,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -749,6 +750,29 @@ fn collecting_parent(name: &str, seen: &Arc<Mutex<Vec<Inbound>>>) -> FnAgent {
             .boxed()
         }),
     )
+}
+
+/// The documented shape of a session conversation id, held beyond the doctest.
+#[test]
+fn the_session_conversation_id_has_the_documented_shape() {
+    let session = RunId::new();
+    for parent in ["alice:ctx1", "a/s/b", "100%", "/", ""] {
+        let id = session_conversation_id(parent, session);
+        assert!(id.ends_with(&format!("/s/{session}")), "{id}");
+        assert_eq!(
+            parse_session_conversation_id(&id),
+            Some((parent.to_owned(), session))
+        );
+        assert!(id.starts_with(&adam_runtime::session_conversation_prefix(parent)));
+    }
+    assert_eq!(
+        session_conversation_id("alice:ctx1", session),
+        format!("alice:ctx1/s/{session}")
+    );
+    assert_ne!(
+        session_conversation_id("alice:ctx1", session),
+        session_conversation_id("alice:ctx10", session)
+    );
 }
 
 mod cases {
@@ -4999,20 +5023,11 @@ mod cases {
                 .await
                 .unwrap()
         );
-        for prior in [None, Some(RunId::new()), Some(parent)] {
-            assert!(
-                !rt.start_child_continuing(
-                    parent,
-                    session,
-                    &agent,
-                    say("second"),
-                    &conversation,
-                    prior
-                )
+        assert!(
+            !rt.start_child_continuing(parent, session, &agent, say("second"), &conversation, None)
                 .await
                 .expect("a repeat is not an error, open round or not"),
-            );
-        }
+        );
         let view = rt.view(session).await.unwrap().unwrap();
         assert_eq!(round_of(&view).text, "first");
         let listed = rt
@@ -5284,6 +5299,484 @@ mod cases {
             json!({"status": "done", "output": {"text": "hi"}})
         );
     }
+
+    // -- child sessions: what a caller may not make of the entry points --------
+
+    /// A runtime with a parent that only waits and the agent `name` for rounds.
+    fn rounds_runtime(store: &DynStore, parent_name: &str, rounds: &[(&str, bool)]) -> Runtime {
+        let mut builder = Runtime::builder(store.clone())
+            .agent(child_parked(parent_name))
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20));
+        for (name, waits) in rounds {
+            builder = builder.agent(RoundAgent {
+                name: (*name).to_owned(),
+                waits: *waits,
+            });
+        }
+        builder.build()
+    }
+
+    /// A finished first round of `agent` under `conversation`, started by `parent`.
+    async fn finished_first_round(
+        rt: &Runtime,
+        parent: RunId,
+        agent: &str,
+        conversation_of: impl Fn(RunId) -> String,
+        key: &str,
+    ) -> (RunId, String) {
+        let session = child_run_id(parent, key);
+        let conversation = conversation_of(session);
+        rt.start_child_continuing(parent, session, agent, say("one"), &conversation, None)
+            .await
+            .unwrap();
+        let worker = spawn_worker(rt);
+        wait_done(rt, session).await;
+        worker.stop().await;
+        (session, conversation)
+    }
+
+    /// `prior` is checked: a finished round of another session, of another agent, a run that is
+    /// not a round of the session at all, and a conversation id that is not a session's are each
+    /// refused, and nothing is created. A still-open prior is the busy case.
+    pub async fn a_prior_must_be_a_finished_round_of_this_session(store: DynStore) {
+        let (parent_name, agent, other_agent) = (uniq("parent"), uniq("round"), uniq("other"));
+        let rt = rounds_runtime(
+            &store,
+            &parent_name,
+            &[(&agent, false), (&other_agent, true)],
+        );
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let alice = uniq("alice:ctx");
+        let (a_session, a_conv) = finished_first_round(
+            &rt,
+            parent,
+            &agent,
+            |s| session_conversation_id(&alice, s),
+            "a",
+        )
+        .await;
+        let other_parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let bob = uniq("bob:ctx");
+        let b_session = child_run_id(other_parent, "b");
+        let b_conv = session_conversation_id(&bob, b_session);
+
+        let next = RunId::new();
+        // Bob's session continues from Alice's finished round: another conversation.
+        for (conversation, id, prior, what) in [
+            (&b_conv, b_session, None, "round 1 of Bob's"),
+            (
+                &b_conv,
+                next,
+                Some(a_session),
+                "Alice's round as Bob's prior",
+            ),
+        ] {
+            let res = rt
+                .start_child_continuing(other_parent, id, &agent, say("x"), conversation, prior)
+                .await;
+            if prior.is_none() {
+                assert!(res.unwrap(), "{what}");
+            } else {
+                let err = res.expect_err(what);
+                assert_eq!(err.class(), adam_runtime::ErrorClass::Invalid, "{err}");
+                assert!(matches!(err, RuntimeError::InvalidSession { .. }), "{err}");
+                assert!(store.load_run(id).await.unwrap().is_none(), "{what}");
+            }
+        }
+
+        // Another agent's run is not this agent's state to read.
+        let foreign = rt
+            .start(&other_agent, say("f"), Some(&a_conv))
+            .await
+            .expect("another agent in Alice's conversation");
+        let err = rt
+            .start_child_continuing(parent, next, &agent, say("x"), &a_conv, Some(foreign))
+            .await
+            .expect_err("another agent's prior");
+        assert_eq!(err.class(), adam_runtime::ErrorClass::Invalid);
+        assert!(store.load_run(next).await.unwrap().is_none());
+
+        // A conversation id that is not a session's.
+        let err = rt
+            .start_child_continuing(parent, next, &agent, say("x"), "alice:plain", None)
+            .await
+            .expect_err("not a session conversation id");
+        assert!(matches!(err, RuntimeError::InvalidSession { .. }), "{err}");
+        assert!(store.load_run(next).await.unwrap().is_none());
+
+        // The id of round 1 is the session id, and only round 1's.
+        let err = rt
+            .start_child_continuing(parent, next, &agent, say("x"), &a_conv, None)
+            .await
+            .expect_err("round 1 is the session id");
+        assert!(matches!(err, RuntimeError::InvalidSession { .. }), "{err}");
+        let err = rt
+            .start_child_continuing(
+                parent,
+                a_session,
+                &agent,
+                say("x"),
+                &a_conv,
+                Some(a_session),
+            )
+            .await
+            .expect_err("a later round is not the session id");
+        assert!(matches!(err, RuntimeError::InvalidSession { .. }), "{err}");
+
+        // A top-level run in a session-shaped conversation is not a round: continuing it is refused.
+        let spoof_session = RunId::new();
+        let spoof_conv = session_conversation_id(&alice, spoof_session);
+        let spoof = rt.start(&agent, say("s"), Some(&spoof_conv)).await.unwrap();
+        rt.cancel(spoof, "over").await.unwrap();
+        let err = rt
+            .start_child_continuing(parent, next, &agent, say("x"), &spoof_conv, Some(spoof))
+            .await
+            .expect_err("a root run is not a round");
+        assert!(matches!(err, RuntimeError::InvalidSession { .. }), "{err}");
+        assert!(store.load_run(next).await.unwrap().is_none());
+
+        // An open prior of this session is the busy case, not an invalid one.
+        let c_session = child_run_id(parent, "c");
+        let c_conv = session_conversation_id(&alice, c_session);
+        rt.start_child_continuing(parent, c_session, &other_agent, say("c"), &c_conv, None)
+            .await
+            .unwrap();
+        let err = rt
+            .start_child_continuing(
+                parent,
+                next,
+                &other_agent,
+                say("x"),
+                &c_conv,
+                Some(c_session),
+            )
+            .await
+            .expect_err("the round is open");
+        assert!(err.is_busy(), "{err}");
+        assert!(store.load_run(next).await.unwrap().is_none());
+    }
+
+    /// A repeat is a repeat only of the same round: a run with that id that has another agent,
+    /// another conversation or (for round 1) another parent is refused, not answered `false`.
+    pub async fn a_repeat_is_only_a_repeat_of_the_same_round(store: DynStore) {
+        let (parent_name, agent, other_agent) = (uniq("parent"), uniq("round"), uniq("other"));
+        let rt = rounds_runtime(
+            &store,
+            &parent_name,
+            &[(&agent, false), (&other_agent, false)],
+        );
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let ctx = uniq("u:ctx");
+        let (session, conv) = finished_first_round(
+            &rt,
+            parent,
+            &agent,
+            |s| session_conversation_id(&ctx, s),
+            "a",
+        )
+        .await;
+
+        // The same round, again: `false`, for round 1 and for a later round.
+        assert!(
+            !rt.start_child_continuing(parent, session, &agent, say("y"), &conv, None)
+                .await
+                .unwrap()
+        );
+        let second = child_run_id(parent, "second");
+        assert!(
+            rt.start_child_continuing(parent, second, &agent, say("two"), &conv, Some(session))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !rt.start_child_continuing(parent, second, &agent, say("y"), &conv, Some(session))
+                .await
+                .unwrap()
+        );
+
+        // Another parent for round 1, another agent, or another conversation: refused.
+        let stranger = rt.start(&parent_name, inbound(), None).await.unwrap();
+        for (who, id, name, conversation, prior) in [
+            (stranger, session, &agent, conv.clone(), None),
+            (parent, session, &other_agent, conv.clone(), None),
+            (parent, second, &other_agent, conv.clone(), Some(session)),
+        ] {
+            let err = rt
+                .start_child_continuing(who, id, name, say("y"), &conversation, prior)
+                .await
+                .expect_err("an existing run that is not this round");
+            assert_eq!(err.class(), adam_runtime::ErrorClass::Invalid, "{err}");
+        }
+        // The parent's own run id, used as a session id: it exists and is not a round.
+        let own_conv = session_conversation_id(&ctx, parent);
+        let err = rt
+            .start_child_continuing(parent, parent, &agent, say("y"), &own_conv, None)
+            .await
+            .expect_err("the parent is not a round");
+        assert_eq!(err.class(), adam_runtime::ErrorClass::Invalid, "{err}");
+        let view = rt.view(parent).await.unwrap().unwrap();
+        assert_eq!(view.agent, parent_name, "nothing was changed");
+    }
+
+    /// A session has one agent: a round of another agent is refused whether it continues a round
+    /// or claims to be round 1, so one open round per session follows from the store's index.
+    pub async fn a_session_keeps_one_agent(store: DynStore) {
+        let (parent_name, agent, other_agent) = (uniq("parent"), uniq("round"), uniq("other"));
+        let rt = rounds_runtime(
+            &store,
+            &parent_name,
+            &[(&agent, true), (&other_agent, true)],
+        );
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let ctx = uniq("u:ctx");
+        let session = child_run_id(parent, "a");
+        let conv = session_conversation_id(&ctx, session);
+        rt.start_child_continuing(parent, session, &agent, say("one"), &conv, None)
+            .await
+            .unwrap();
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, session).await;
+
+        // Round 1 is open: the other agent cannot take its place by naming the session id, nor
+        // continue it.
+        let err = rt
+            .start_child_continuing(parent, session, &other_agent, say("x"), &conv, None)
+            .await
+            .expect_err("another agent as round 1");
+        assert_eq!(err.class(), adam_runtime::ErrorClass::Invalid, "{err}");
+        let next = RunId::new();
+        let err = rt
+            .start_child_continuing(parent, next, &other_agent, say("x"), &conv, Some(session))
+            .await
+            .expect_err("another agent's round 2");
+        assert!(store.load_run(next).await.unwrap().is_none(), "{err}");
+        // Nothing of the other agent's is in the conversation.
+        let none = store
+            .open_run_for_conversation(&other_agent, &conv)
+            .await
+            .unwrap();
+        assert!(none.is_none());
+        worker.stop().await;
+    }
+
+    /// A session conversation id longer than the bound is refused and names its length.
+    pub async fn a_session_conversation_id_has_a_length_limit(store: DynStore) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let rt = rounds_runtime(&store, &parent_name, &[(&agent, false)]);
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let session = child_run_id(parent, "a");
+        let long = "x".repeat(adam_runtime::MAX_SESSION_CONVERSATION_BYTES);
+        let conv = session_conversation_id(&long, session);
+        let err = rt
+            .start_child_continuing(parent, session, &agent, say("x"), &conv, None)
+            .await
+            .expect_err("too long");
+        assert_eq!(err.class(), adam_runtime::ErrorClass::Invalid);
+        assert!(err.to_string().contains(&conv.len().to_string()), "{err}");
+        assert!(store.load_run(session).await.unwrap().is_none());
+        // Just under the bound it works.
+        let fits = session_conversation_id(
+            &"x".repeat(adam_runtime::MAX_SESSION_CONVERSATION_BYTES - 39),
+            session,
+        );
+        assert_eq!(fits.len(), adam_runtime::MAX_SESSION_CONVERSATION_BYTES);
+        assert!(
+            rt.start_child_continuing(parent, session, &agent, say("x"), &fits, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The parents' ids hold `/s/`, `%` and `/`, or only start alike: each lists its own sessions
+    /// and no other's, and a top-level run in a session-shaped conversation is not a session.
+    pub async fn session_listings_do_not_mix_awkward_parent_ids(store: DynStore) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let rt = rounds_runtime(&store, &parent_name, &[(&agent, false)]);
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let owner = uniq("owner");
+        let parents: Vec<String> = ["ctx1", "ctx10", "a/s/b", "a%2Fs", "a%", "a/", "a"]
+            .iter()
+            .map(|c| format!("{owner}:{c}"))
+            .collect();
+        let mut sessions = Vec::new();
+        for (i, conversation) in parents.iter().enumerate() {
+            let session = child_run_id(parent, &format!("s{i}"));
+            rt.start_child_continuing(
+                parent,
+                session,
+                &agent,
+                say("x"),
+                &session_conversation_id(conversation, session),
+                None,
+            )
+            .await
+            .unwrap();
+            sessions.push(session);
+        }
+        // A client's own context that spells a session's conversation id, started at the top.
+        let loose = RunId::new();
+        rt.start(
+            &agent,
+            say("loose"),
+            Some(&session_conversation_id(&parents[0], loose)),
+        )
+        .await
+        .unwrap();
+
+        for (conversation, session) in parents.iter().zip(&sessions) {
+            let listed = rt
+                .list_sessions(conversation, &[&agent], 0, 10)
+                .await
+                .unwrap();
+            let ids: Vec<RunId> = listed.sessions.iter().map(|s| s.id).collect();
+            assert_eq!(ids, vec![*session], "{conversation:?}");
+        }
+    }
+
+    /// The agents named twice count once, the page is capped, and the listing reads past one scan
+    /// page of the store (more than 200 rounds of one agent).
+    pub async fn a_session_listing_dedupes_agents_caps_the_page_and_reads_every_page(
+        store: DynStore,
+    ) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let rt = rounds_runtime(&store, &parent_name, &[(&agent, false)]);
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let ctx = uniq("u:ctx");
+        let mut made = HashSet::new();
+        for i in 0..201 {
+            let session = child_run_id(parent, &format!("s{i}"));
+            rt.start_child_continuing(
+                parent,
+                session,
+                &agent,
+                say("x"),
+                &session_conversation_id(&ctx, session),
+                None,
+            )
+            .await
+            .unwrap();
+            made.insert(session);
+        }
+        let all = rt
+            .list_sessions(&ctx, &[&agent, &agent], 0, 1000)
+            .await
+            .unwrap();
+        assert_eq!(all.total, 201, "every round was read, none twice");
+        assert_eq!(all.sessions.len(), adam_runtime::MAX_SESSION_PAGE);
+        assert!(all.sessions.iter().all(|s| s.round == 1));
+        let tail = rt.list_sessions(&ctx, &[&agent], 200, 1000).await.unwrap();
+        assert_eq!(tail.sessions.len(), 1);
+        let mut seen: HashSet<RunId> = all.sessions.iter().map(|s| s.id).collect();
+        for offset in [100, 200] {
+            let page = rt
+                .list_sessions(&ctx, &[&agent], offset, 100)
+                .await
+                .unwrap();
+            seen.extend(page.sessions.iter().map(|s| s.id));
+        }
+        assert_eq!(seen, made, "the pages together are every session once");
+    }
+
+    /// A listing says how the latest round ended, and a working session comes before a newer idle
+    /// one.
+    pub async fn a_session_listing_says_how_the_round_ended(store: DynStore) {
+        let parent_name = uniq("parent");
+        let (done, failed, cancelled, working) = (
+            uniq("done"),
+            uniq("failed"),
+            uniq("cancelled"),
+            uniq("working"),
+        );
+        let rt = Runtime::builder(store.clone())
+            .agent(child_parked(&parent_name))
+            .agent(RoundAgent {
+                name: done.clone(),
+                waits: false,
+            })
+            .agent(child_failing(&failed, "boom"))
+            .agent(child_parked(&cancelled))
+            .agent(child_parked(&working))
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let ctx = uniq("u:ctx");
+        let worker = spawn_worker(&rt);
+        let mut ids = HashMap::new();
+        // The working one is created first, so every idle one is newer than it.
+        for name in [&working, &cancelled, &done, &failed] {
+            let session = child_run_id(parent, name);
+            rt.start_child_continuing(
+                parent,
+                session,
+                name,
+                say("x"),
+                &session_conversation_id(&ctx, session),
+                None,
+            )
+            .await
+            .unwrap();
+            ids.insert(name.clone(), session);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        wait_waiting(&rt, ids[&working]).await;
+        wait_waiting(&rt, ids[&cancelled]).await;
+        rt.cancel(ids[&cancelled], "enough").await.unwrap();
+        wait_done(&rt, ids[&done]).await;
+        wait_failed(&rt, ids[&failed]).await;
+        worker.stop().await;
+
+        let names = [
+            working.as_str(),
+            cancelled.as_str(),
+            done.as_str(),
+            failed.as_str(),
+        ];
+        let listed = rt.list_sessions(&ctx, &names, 0, 10).await.unwrap();
+        let outcome = |name: &String| {
+            listed
+                .sessions
+                .iter()
+                .find(|s| s.id == ids[name])
+                .map(|s| (s.state, s.outcome))
+                .expect("listed")
+        };
+        assert_eq!(outcome(&working), (SessionState::Working, None));
+        assert_eq!(
+            outcome(&done),
+            (SessionState::Idle, Some(RoundOutcome::Done))
+        );
+        assert_eq!(
+            outcome(&failed),
+            (SessionState::Idle, Some(RoundOutcome::Failed))
+        );
+        assert_eq!(
+            outcome(&cancelled),
+            (SessionState::Idle, Some(RoundOutcome::Cancelled))
+        );
+        assert_eq!(
+            listed.sessions[0].id, ids[&working],
+            "a working session comes before newer idle ones"
+        );
+    }
+
+    /// A report that lands while a run finishes is not news, as a finished notice is not: no
+    /// agent reads it before slice 2.
+    pub async fn a_report_that_lands_while_a_run_finishes_does_not_reopen_it(store: DynStore) {
+        let name = uniq("reopen-report");
+        let report = Inbound::new(
+            CHILD_REPORTED_KIND,
+            json!({"status": "done", "output": "42"}),
+        )
+        .with_id(RunId::new().to_string());
+        let (rt, run, phase0_runs, arrived) = finishing_agent(&store, &name, true, &[report]).await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(view.output, Some(json!("first")), "the first answer stands");
+        assert_eq!(count(&phase0_runs), 1);
+        assert_eq!(arrived.load(SeqCst), 0, "a report is not an arrival yet");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5374,6 +5867,14 @@ macro_rules! runtime_suite {
                 the_notice_kind_depends_on_the_childs_conversation,
                 the_sessions_of_a_parent_are_listed_sorted_paged_and_scoped,
                 a_lost_round_report_is_recovered_by_reading_the_round,
+                a_prior_must_be_a_finished_round_of_this_session,
+                a_repeat_is_only_a_repeat_of_the_same_round,
+                a_session_keeps_one_agent,
+                a_session_conversation_id_has_a_length_limit,
+                session_listings_do_not_mix_awkward_parent_ids,
+                a_session_listing_dedupes_agents_caps_the_page_and_reads_every_page,
+                a_session_listing_says_how_the_round_ended,
+                a_report_that_lands_while_a_run_finishes_does_not_reopen_it,
             );
         }
     };

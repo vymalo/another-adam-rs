@@ -11,9 +11,9 @@ use adam_model::{
     ToolChoice, ToolSpec,
 };
 use adam_runtime::{
-    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Emitter, Inbound,
-    MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, SandboxUsage, StepState, Transition,
-    UsageEvent, UsageTotals,
+    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, ChildStatus, Ctx,
+    Emitter, Inbound, MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, SandboxUsage, StepState,
+    Transition, UsageEvent, UsageTotals,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -2094,6 +2094,9 @@ impl Agent for LlmAgent {
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx
             .take_inbox()
             .into_iter()
+            // A session round's report (ADR 0045) is a wake-up, not a person's words: until the
+            // loop reads reports it is dropped, never shown to the model.
+            .filter(|i| i.kind != CHILD_REPORTED_KIND)
             .partition(|i| i.kind == RUN_FINISHED_KIND);
         let notices: Vec<(RunId, ChildStatus)> = finished
             .iter()

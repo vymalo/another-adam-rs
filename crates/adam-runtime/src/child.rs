@@ -35,7 +35,9 @@ pub const RUN_FINISHED_KIND: &str = "adam.run.finished";
 pub const CHILD_REPORTED_KIND: &str = "adam.child.reported";
 
 /// How many of the messages in `inbox` after its first `base` a run that is finishing has to read:
-/// all of them but the [`RUN_FINISHED_KIND`] notices. A notice only saves a waiting parent its
+/// all of them but the [`RUN_FINISHED_KIND`] notices and, for now, the [`CHILD_REPORTED_KIND`]
+/// ones. No agent reads a report before ADR 0045 slice 2, so counting it would reopen a run that
+/// has nothing to do with it; slices 2 and 3 make a report reopen a turn on purpose (decision 4). A notice only saves a waiting parent its
 /// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
 /// store), and the same notice delivered just after its commit is refused, so one that lands during
 /// the step must not keep the run going either.
@@ -43,7 +45,7 @@ pub(crate) fn news_since(inbox: &[Inbound], base: usize) -> usize {
     inbox
         .iter()
         .skip(base)
-        .filter(|i| i.kind != RUN_FINISHED_KIND)
+        .filter(|i| i.kind != RUN_FINISHED_KIND && i.kind != CHILD_REPORTED_KIND)
         .count()
 }
 

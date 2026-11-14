@@ -68,6 +68,8 @@ macro_rules! store_conformance {
             push_configs_go_with_their_run,
             list_runs_is_scoped_ordered_and_pages_by_keyset, list_runs_filters_by_status_and_time,
             list_runs_scopes_match_exactly, count_runs_ignores_the_page,
+            list_runs_prefixes_with_slashes_match_literally,
+            two_creates_with_different_ids_in_one_conversation_leave_one_open_run,
         );
     };
     (@cases $make:path; $($case:ident),* $(,)?) => {
@@ -1943,6 +1945,86 @@ pub mod cases {
         assert_eq!(count(ConversationScope::Exact("a.b*c:1".into())).await, 1);
         assert_eq!(count(ConversationScope::Exact("a.b*c".into())).await, 0);
         assert_eq!(count(ConversationScope::Exact("nope".into())).await, 0);
+    }
+
+    /// A prefix that holds `/` or ends in `/` matches literally: `x:a/s/` covers the conversations
+    /// below it and not `x:a/sx`, `x:a%2Fs/` or `x:ab/s/`.
+    pub async fn list_runs_prefixes_with_slashes_match_literally(store: DynStore) {
+        let agent = agent();
+        for conversation in [
+            "x:a/s/1",
+            "x:a/s/2",
+            "x:a/sx",
+            "x:a%2Fs/1",
+            "x:ab/s/1",
+            "x:a/",
+            "x:a/s",
+            "x:a//s/1",
+        ] {
+            store
+                .create_run(NewRun::new(&agent, json!({})).conversation(conversation))
+                .await
+                .unwrap();
+        }
+        let count = |prefix: &'static str| {
+            let store = store.clone();
+            let agent = agent.clone();
+            async move {
+                store
+                    .list_runs(&RunQuery::new(
+                        &agent,
+                        ConversationScope::Prefix(prefix.into()),
+                        100,
+                    ))
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(count("x:a/s/").await, 2);
+        assert_eq!(count("x:a/").await, 6, "a prefix that ends in a slash");
+        assert_eq!(count("x:a%2Fs/").await, 1);
+        assert_eq!(count("x:a/s").await, 4);
+        assert_eq!(count("x:a//").await, 1);
+    }
+
+    /// Two creates with different ids in one agent and conversation leave one open run: the
+    /// second is refused with `ConversationBusy`, whichever ids they carry.
+    pub async fn two_creates_with_different_ids_in_one_conversation_leave_one_open_run(
+        store: DynStore,
+    ) {
+        let agent = agent();
+        let conversation = "x:one/s/open";
+        let first = RunId::new();
+        store
+            .create_run(
+                NewRun::new(&agent, json!({}))
+                    .with_id(first)
+                    .conversation(conversation),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .create_run(
+                NewRun::new(&agent, json!({}))
+                    .with_id(RunId::new())
+                    .conversation(conversation),
+            )
+            .await;
+        assert!(
+            matches!(second, Err(StoreError::ConversationBusy { .. })),
+            "{second:?}"
+        );
+        let open = store
+            .open_run_for_conversation(&agent, conversation)
+            .await
+            .unwrap()
+            .expect("an open run");
+        assert_eq!(open.id, first);
+        let mut query = RunQuery::new(&agent, ConversationScope::Exact(conversation.into()), 10);
+        assert_eq!(store.count_runs(&query).await.unwrap(), 1);
+        query.statuses = Some(vec![RunStatus::Runnable, RunStatus::Parked]);
+        assert_eq!(store.count_runs(&query).await.unwrap(), 1);
     }
 
     pub async fn count_runs_ignores_the_page(store: DynStore) {

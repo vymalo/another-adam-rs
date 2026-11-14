@@ -14,9 +14,14 @@ tools. The orchestration layer's side is its own ADR in `vymalo/another-agentic-
 *Built 2026-11-14:* slice 1 (the runtime): `Runtime::start_child_continuing`, the kind `adam.child.reported`
 (`CHILD_REPORTED_KIND`, chosen by whether the child has a conversation) and `Runtime::list_sessions`, in
 `crates/adam-runtime`, with no change to a store or the testkit. Deviations: a listing over runs cannot tell a
-closed session, so `SessionState` is `Working` or `Idle` and `non_exhaustive` (`Closed` comes with the header, slice 2);
+closed session, so `SessionState` is a closed enum of `Working` and `Idle` (`Closed` comes with the header, slice 2, as a deliberate breaking addition);
 `list_sessions` takes the agent names to look at, because a run listing is per agent; and the conversation id is the
-parent's id plus `/s/<session>`, which is what the design's `encode_conversation(subject, "<context>/s/<session>")` makes.
+parent's id with `%` and `/` escaped (`%25`, `%2F`), then `/s/<session>`, because a client chooses its context ids freely; a
+run counts as a session's only when its round 1 exists with a parent; `start_child_continuing` refuses a `prior` that is
+not a round of the session and a round of another agent (`InvalidSession`), but an open `prior` of the session is
+`ConversationBusy`, which a caller tells apart with `RuntimeError::is_busy()`; the listing says how the latest round
+ended (`Done`, `Failed`, `Cancelled`); until slice 2 a report is not read by any agent (`LlmAgent` drops it, and
+`Ctx::arrived` does not count it).
 
 ## Context
 

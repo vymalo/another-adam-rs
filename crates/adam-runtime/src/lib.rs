@@ -117,8 +117,9 @@ pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
 pub use session::{
-    MAX_SESSION_PAGE, SessionList, SessionState, SessionSummary, session_conversation_id,
-    session_conversation_prefix,
+    MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_PAGE, MAX_SESSION_ROUNDS_SCANNED, RoundOutcome,
+    SessionList, SessionState, SessionSummary, parse_session_conversation_id,
+    session_conversation_id, session_conversation_prefix,
 };
 pub use step::{
     MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, STEP_INPUT_MAX_BYTES,

@@ -396,6 +396,8 @@ thread tool `turn_output` ([ADR 0014](../../docs/decisions/0014-a-turn-output-an
 
 ## Child runs
 
+An `adam.child.reported` message (the end of a child *session* round, ADR 0045) is dropped by the loop, never shown to the model, until slice 2 reads it.
+
 A tool that delegates returns `Err(ToolError::AwaitRun { run })` after starting the child:
 
 ```rust
