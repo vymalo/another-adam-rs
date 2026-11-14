@@ -683,6 +683,23 @@ impl ToolCtx {
     /// [`detached`](Self::detached), which belongs to no runtime; [`ToolError::Transient`] for a
     /// store failure worth retrying.
     pub async fn start_child(&self, agent: &str, message: &str) -> Result<RunId, ToolError> {
+        self.start_child_within(agent, message, None).await
+    }
+
+    /// [`start_child`](Self::start_child) for a child that must finish within `within` (`None`: no
+    /// limit). The runtime stores the deadline from its own clock; a child past it is failed with
+    /// `cancelled: time limit: the run did not finish within N min`, which the parent reads as the
+    /// child's error ("the run failed: ..."). See `Runtime::start_child_within`.
+    ///
+    /// # Errors
+    ///
+    /// As [`start_child`](Self::start_child).
+    pub async fn start_child_within(
+        &self,
+        agent: &str,
+        message: &str,
+        within: Option<Duration>,
+    ) -> Result<RunId, ToolError> {
         let Some(children) = &self.children else {
             return Err(ToolError::Permanent(
                 "this tool context belongs to no runtime, so it cannot start a child run".into(),
@@ -717,7 +734,7 @@ impl ToolCtx {
             }
         }
         children
-            .start(child, agent, first)
+            .start_within(child, agent, first, within)
             .await
             .map_err(|e| ToolError::from_classified(&e))?;
         Ok(child)

@@ -18,7 +18,7 @@ use crate::error::{Error, Origin, ToolClash};
 use crate::mcp::{self, McpBinding};
 use crate::remote::{RemoteSettings, RemoteSubagentTool};
 use crate::skills::{self, SkillFiles};
-use crate::subagent::SubagentTool;
+use crate::subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 use crate::suggest::closest;
 use crate::template::{self, Piece};
 
@@ -770,11 +770,14 @@ fn add_subagent_tools(
             });
         }
         let tool: DynTool = match sub {
-            Subagent::Local(child) => Arc::new(SubagentTool::new(
-                child.name.clone(),
-                format!("{}/{}", origin.agent, child.name),
-                child.frontmatter.description.as_deref().unwrap_or_default(),
-            )),
+            Subagent::Local(child) => Arc::new(
+                SubagentTool::new(
+                    child.name.clone(),
+                    format!("{}/{}", origin.agent, child.name),
+                    child.frontmatter.description.as_deref().unwrap_or_default(),
+                )
+                .with_run_limit(run_limit(child.frontmatter.limits.as_ref())),
+            ),
             Subagent::Remote(agent) => {
                 Arc::new(RemoteSubagentTool::bind(&sub_origin, agent, remote)?)
             }
@@ -783,6 +786,16 @@ fn add_subagent_tools(
         tools.push((name.to_owned(), tool));
     }
     Ok(())
+}
+
+/// The time limit of a subagent's run: `limits.max_minutes` of its file, 30 minutes when it says
+/// nothing, none for `0`. The loader refuses more than a day; a hand-made value is clamped.
+fn run_limit(file: Option<&FileLimits>) -> Option<Duration> {
+    let minutes = file
+        .and_then(|limits| limits.max_minutes)
+        .unwrap_or(DEFAULT_SUBAGENT_MINUTES);
+    (minutes > 0)
+        .then(|| Duration::from_secs(u64::from(minutes.min(adam_agent_fs::MAX_MINUTES_LIMIT)) * 60))
 }
 
 /// The loop's limits: what the frontmatter sets, the loop's default for the rest.
@@ -988,6 +1001,24 @@ mod tests {
         assert!(!glob("exact", "exactly"));
         // The pieces of a pattern cannot overlap: `ab*ba` needs four characters.
         assert!(!glob("ab*ba", "aba"));
+    }
+
+    #[test]
+    fn a_subagents_run_limit_is_30_minutes_unless_its_file_says_otherwise() {
+        let minutes = |m: Option<u32>| {
+            let limits = FileLimits {
+                max_minutes: m,
+                ..FileLimits::default()
+            };
+            run_limit(Some(&limits))
+        };
+        let min = |n: u64| Some(Duration::from_secs(n * 60));
+        assert_eq!(run_limit(None), min(30));
+        assert_eq!(minutes(None), min(30));
+        assert_eq!(minutes(Some(5)), min(5));
+        assert_eq!(minutes(Some(0)), None, "0 is no limit");
+        assert_eq!(minutes(Some(1_440)), min(1_440));
+        assert_eq!(minutes(Some(99_999)), min(1_440), "clamped to a day");
     }
 
     #[test]

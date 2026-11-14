@@ -8,7 +8,8 @@ mod schedule;
 mod skill;
 
 pub use agent::{
-    AgentFrontmatter, Card, CardSkill, ExtendedCard, Limits, ModelRef, SkillSelection, ToolList,
+    AgentFrontmatter, Card, CardSkill, ExtendedCard, Limits, MAX_MINUTES_LIMIT, ModelRef,
+    SkillSelection, ToolList,
 };
 pub use mcp::{EnvRef, McpConfig, McpServer, RemoteKind, Segment, split_env_references};
 pub use names::{is_agent_name, is_env_name, is_skill_name, is_tool_name};

@@ -116,6 +116,9 @@ impl<'de> Deserialize<'de> for ModelRef {
     }
 }
 
+/// The largest `limits.max_minutes`: 24 hours.
+pub const MAX_MINUTES_LIMIT: u32 = 1_440;
+
 /// The limits of the agent loop (`adam_llm_agent::Limits`). Absent fields keep the loop's
 /// default. Claude Code's top-level `maxTurns` is read as `max_turns`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -133,6 +136,11 @@ pub struct Limits {
     /// Budget for the history sent to the model.
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxHistoryTokens")]
     pub max_history_tokens: Option<u32>,
+    /// The longest a run of this agent may take **as a subagent**, in minutes; `0` is no limit, at
+    /// most [`MAX_MINUTES_LIMIT`]. Absent: 30. Only a subagent has it: on a root agent it is ignored
+    /// with a warning.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "maxMinutes")]
+    pub max_minutes: Option<u32>,
     /// Keys this schema does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

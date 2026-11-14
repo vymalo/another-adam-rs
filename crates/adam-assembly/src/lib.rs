@@ -168,7 +168,7 @@ pub use folder::{
     extra_mcp_file_from_env,
 };
 pub use skills::{LOAD_SKILL, READ_SKILL_FILE, SkillError, SkillFiles};
-pub use subagent::SubagentTool;
+pub use subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 pub use template::TemplateProblem;
 
 /// The URL type of [`Assembly::card`], so a caller needs no `url` dependency of its own.

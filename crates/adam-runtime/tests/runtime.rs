@@ -4629,6 +4629,91 @@ mod cases {
         assert_eq!(round_of(&view).before, vec!["one"]);
     }
 
+    /// A child started with a time limit is failed when the runtime's clock passes its deadline
+    /// (`cancelled: time limit: ...`): a running one within one poll, its token fired, and a parked
+    /// one, which would wait for a message that never comes, at the wake the runtime set at the
+    /// deadline. A child with no limit parks with no wake.
+    pub async fn a_child_past_its_deadline_fails_and_wakes_at_it(store: DynStore) {
+        let (name, parked_name, running_name) = (uniq("parent"), uniq("parked"), uniq("running"));
+        let (started, saw) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &child_parked(&name))
+            .agent(child_parked(&parked_name))
+            .agent(child_listening(&running_name, &started, &saw))
+            .clock(clock.clone())
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let limit = Duration::from_secs(30 * 60);
+        let deadline = clock.now() + chrono::Duration::minutes(30);
+
+        let parked = child_run_id(parent, "parked");
+        rt.start_child_within(parent, parked, &parked_name, inbound(), Some(limit))
+            .await
+            .expect("parked child");
+        let view = wait_for(&rt, parked, "the child parked", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+        assert_eq!(view.wake_at, Some(deadline), "it wakes at its deadline");
+        let free = child_run_id(parent, "free");
+        rt.start_child(parent, free, &parked_name, inbound())
+            .await
+            .expect("child with no limit");
+        let view = wait_waiting(&rt, free).await;
+        assert_eq!(view.wake_at, None, "no limit, no wake");
+
+        let running = child_run_id(parent, "running");
+        rt.start_child_within(parent, running, &running_name, inbound(), Some(limit))
+            .await
+            .expect("running child");
+        notified(&started, "the running child").await;
+
+        clock.advance(Duration::from_secs(31 * 60));
+        for run in [parked, running] {
+            let ended = wait_failed(&rt, run).await;
+            assert_eq!(
+                ended.error.as_deref(),
+                Some("cancelled: time limit: the run did not finish within 30 min")
+            );
+        }
+        wait_until("the running child's token to fire", || saw.load(SeqCst)).await;
+        worker.stop().await;
+        assert_eq!(
+            rt.view(free).await.unwrap().unwrap().status,
+            RunStatus::Parked
+        );
+        assert_eq!(
+            rt.view(parent).await.unwrap().unwrap().status,
+            RunStatus::Parked,
+            "the parent has no deadline"
+        );
+    }
+
+    /// State written before deadlines existed has no `deadline` and runs as it did.
+    pub async fn an_envelope_without_a_deadline_decodes(store: DynStore) {
+        let name = uniq("old");
+        let rt = runtime(&store, &child_done(&name, json!("ok")));
+        let id = RunId::new();
+        store
+            .create_run(
+                NewRun::new(
+                    &name,
+                    json!({
+                        "v": 1, "agent": {}, "inbox": [], "seq": 0, "attempt": 0, "rev": 0,
+                        "output": null, "error": null, "artifacts": []
+                    }),
+                )
+                .with_id(id),
+            )
+            .await
+            .expect("create");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, id).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!("ok")));
+    }
+
     /// Fencing. The worker that started the child loses its lease before it commits; another
     /// worker replays the step (the journal keeps the child from being started twice) and parks
     /// the parent, and when the first worker finally commits, the store refuses it. The child
@@ -6213,6 +6298,8 @@ macro_rules! runtime_suite {
                 a_child_created_after_the_cancel_never_steps,
                 a_child_follows_a_parent_that_failed_but_not_one_that_is_done,
                 a_cancelled_parent_fails_the_open_round_and_the_session_continues,
+                a_child_past_its_deadline_fails_and_wakes_at_it,
+                an_envelope_without_a_deadline_decodes,
                 a_parent_that_loses_its_lease_does_not_start_or_resume_twice,
                 child_status_reads_only_the_callers_children,
                 a_purged_child_reads_as_gone,

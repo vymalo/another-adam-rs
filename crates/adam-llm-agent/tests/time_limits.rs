@@ -12,7 +12,7 @@ use adam_llm_agent::{
     user_message,
 };
 use adam_model::{DynModel, Message, MockModel, ToolCall, ToolSpec};
-use adam_runtime::{CollectingSink, RunEvent, RunView, Runtime, StepState};
+use adam_runtime::{CollectingSink, ManualClock, RunEvent, RunView, Runtime, StepState};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
@@ -360,4 +360,78 @@ async fn a_timed_out_call_replays_without_waiting() {
         *is_error && content.contains("did not finish within 100 ms"),
         "{content}"
     );
+}
+
+/// Starts the agent `child` with a time limit of a minute and waits for it.
+struct Delegate;
+
+#[async_trait]
+impl Tool for Delegate {
+    fn spec(&self) -> ToolSpec {
+        spec("delegate")
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let run = ctx
+            .start_child_within("child", "go", Some(Duration::from_secs(60)))
+            .await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
+#[tokio::test]
+async fn a_child_past_its_limit_is_an_error_result_for_its_parent() {
+    let parent_model = Arc::new(MockModel::new());
+    parent_model
+        .push_tool_calls(vec![call("d1", "delegate")])
+        .push_text("it took too long");
+    let child_model = Arc::new(MockModel::new());
+    child_model.push_tool_calls(vec![call("h1", "hang")]);
+    let (hang, calls, fired) = Hang::new(Some(Duration::from_secs(3600)), true);
+    let (parent_model, child_model): (DynModel, DynModel) = (parent_model, child_model);
+    let parent = LlmAgent::builder("llm", parent_model, "m")
+        .tool(Delegate)
+        .build();
+    let child = LlmAgent::builder("child", child_model, "m")
+        .tool(hang)
+        .build();
+    let clock = ManualClock::new();
+    let rt = Runtime::builder(store())
+        .agent(parent)
+        .agent(child)
+        .clock(clock.clone())
+        .event_sink(CollectingSink::new())
+        .worker_id("w")
+        .poll_interval(Duration::from_millis(20))
+        .build();
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let (stop, handle) = spawn_worker(&rt);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while calls.load(SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the child's tool never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    clock.advance(Duration::from_secs(61));
+    let view = loop {
+        let view = rt.view(run).await.unwrap().unwrap();
+        if view.status == RunStatus::Done {
+            break view;
+        }
+        assert!(Instant::now() < deadline, "timed out; last view: {view:#?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let _ = stop.send(());
+    handle.await.expect("worker task").expect("worker result");
+
+    assert!(fired.load(SeqCst), "the child's tool saw its token fire");
+    assert_eq!(
+        conversation(&view).messages[2],
+        Message::tool_error(
+            "d1",
+            "the run failed: cancelled: time limit: the run did not finish within 1 min"
+        )
+    );
+    assert_eq!(view.output.unwrap()["text"], "it took too long");
 }

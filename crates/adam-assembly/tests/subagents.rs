@@ -804,4 +804,10 @@ fn a_subagent_tool_can_be_made_by_hand() {
     assert_eq!(tool.spec().name, "planner");
     assert!(!tool.asks_user());
     assert!(tool.spec().description.starts_with("Plans. "));
+    // Its runs stop after 30 minutes unless it is told otherwise.
+    assert_eq!(
+        tool.run_limit(),
+        Some(std::time::Duration::from_secs(30 * 60))
+    );
+    assert_eq!(tool.with_run_limit(None).run_limit(), None);
 }

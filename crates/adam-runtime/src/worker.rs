@@ -303,22 +303,64 @@ async fn cancel_for_parent(inner: &Inner, run: RunId) {
     }
 }
 
+/// What the failure of a run past its time limit says.
+fn time_limit_reason(limit_secs: Option<u64>) -> String {
+    match limit_secs {
+        Some(secs) if secs >= 60 && secs % 60 == 0 => {
+            format!(
+                "time limit: the run did not finish within {} min",
+                secs / 60
+            )
+        }
+        Some(secs) => format!("time limit: the run did not finish within {secs} s"),
+        None => "time limit: the run did not finish in time".to_owned(),
+    }
+}
+
+/// Fail `run` because it is past its deadline. Idempotent, like a cancel.
+async fn cancel_for_deadline(inner: &Inner, run: RunId, limit_secs: Option<u64>) {
+    tracing::info!(%run, "the run is past its time limit; cancelling it");
+    match inner.cancel_run(run, &time_limit_reason(limit_secs)).await {
+        Ok(()) | Err(RuntimeError::NotFound(_)) => {}
+        Err(e) => {
+            tracing::warn!(%run, error = %report(&e), "cancelling a run past its time limit failed; it is tried again");
+        }
+    }
+}
+
+/// What a worker watches for a run it steps besides the run's own status: the run it works for
+/// and its deadline, both only for a child run.
+#[derive(Clone, Copy)]
+struct Watched {
+    parent: Option<RunId>,
+    deadline: Option<DateTime<Utc>>,
+    limit_secs: Option<u64>,
+}
+
 /// Fires `token` once the run turns terminal (or vanishes) in the store, which
 /// is how a cancel issued by another process reaches a step running here. A child run is also
-/// cancelled here when its parent has ended (`parent`), which costs one more read per poll.
+/// cancelled here when its parent has ended, which costs one more read per poll, and a run
+/// with a deadline when the clock passes it (no read).
 fn spawn_cancel_watch(
     inner: Arc<Inner>,
     run: RunId,
-    parent: Option<RunId>,
+    watched: Watched,
     token: CancelToken,
 ) -> AbortOnDrop {
     let every = inner.cfg.poll_interval.max(Duration::from_millis(1));
     AbortOnDrop(tokio::spawn(async move {
         loop {
             tokio::time::sleep(every).await;
+            if let Some(deadline) = watched.deadline
+                && inner.clock.now() >= deadline
+            {
+                cancel_for_deadline(&inner, run, watched.limit_secs).await;
+                token.cancel();
+                return;
+            }
             match inner.store.load_run(run).await {
                 Ok(Some(rec)) if rec.status.is_open() => {
-                    if let Some(parent) = parent
+                    if let Some(parent) = watched.parent
                         && parent_has_ended(&inner, parent).await
                     {
                         cancel_for_parent(&inner, run).await;
@@ -362,7 +404,13 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
         .then(|| spawn_renewer(inner.clone(), run));
     let cancel = CancelToken::new();
     let tracked = inner.track(run, cancel.clone());
-    let watch = spawn_cancel_watch(inner.clone(), run, lease.run.parent_id, cancel.clone());
+    let envelope = Envelope::decode(run, &lease.run.state).ok();
+    let watched = Watched {
+        parent: lease.run.parent_id,
+        deadline: envelope.as_ref().and_then(|e| e.deadline),
+        limit_secs: envelope.as_ref().and_then(|e| e.limit_secs),
+    };
+    let watch = spawn_cancel_watch(inner.clone(), run, watched, cancel.clone());
     let release = transition(&inner, lease.run, cancel).await;
     drop(watch);
     drop(tracked);
@@ -428,6 +476,12 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
             return true;
         }
     };
+    if let Some(deadline) = env.deadline
+        && inner.clock.now() >= deadline
+    {
+        cancel_for_deadline(inner, run, env.limit_secs).await;
+        return true;
+    }
     let Some(agent) = inner
         .agents
         .get(&rec.agent)
@@ -660,6 +714,13 @@ fn build_update(
     } else {
         (next.status, next.wake_at)
     };
+    // A run with a time limit wakes at its deadline at the latest, so that a parked one, which
+    // may wait for a message that never comes, is failed there and not left for ever.
+    let wake_at = match (cur.deadline, status) {
+        (Some(deadline), RunStatus::Parked) => Some(wake_at.map_or(deadline, |w| w.min(deadline))),
+        (Some(deadline), RunStatus::Runnable) => wake_at.map(|w| w.min(deadline)),
+        _ => wake_at,
+    };
     let mut artifacts = cur.artifacts.clone();
     artifacts.extend(next.artifacts.iter().cloned());
     let env = Envelope {
@@ -676,6 +737,8 @@ fn build_update(
         },
         error: next.error.clone(),
         artifacts,
+        deadline: cur.deadline,
+        limit_secs: cur.limit_secs,
     };
     let mut update = RunUpdate::new(status, env.encode()?);
     update.wake_at = wake_at;

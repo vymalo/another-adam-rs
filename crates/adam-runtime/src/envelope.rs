@@ -2,6 +2,7 @@
 //!
 //! Its layout is private to the runtime. Current version: 1.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,6 +42,16 @@ pub(crate) struct Envelope {
     /// Artifacts emitted so far, committed with their transitions.
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    /// When the run must have finished, set once from the runtime's own clock when a child is
+    /// started with a time limit ([`Runtime::start_child_within`](crate::Runtime::start_child_within)).
+    /// Past it the worker fails the run (`cancelled: time limit: ...`), before a step and while one
+    /// runs, and a parked run is woken at it. Absent from state written before it existed, and
+    /// not written while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
+    /// The limit [`deadline`](Self::deadline) was set from, in seconds: what the failure says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_secs: Option<u64>,
 }
 
 impl Envelope {
@@ -55,7 +66,20 @@ impl Envelope {
             output: Value::Null,
             error: None,
             artifacts: Vec::new(),
+            deadline: None,
+            limit_secs: None,
         }
+    }
+
+    /// Give the run a time limit of `within`, counted from `now`.
+    pub fn with_limit(mut self, now: DateTime<Utc>, within: std::time::Duration) -> Self {
+        let span = chrono::Duration::from_std(within).unwrap_or(chrono::Duration::MAX);
+        self.deadline = Some(
+            now.checked_add_signed(span)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
+        );
+        self.limit_secs = Some(within.as_secs());
+        self
     }
 
     pub fn decode(run: RunId, state: &Value) -> Result<Self, RuntimeError> {
@@ -79,5 +103,33 @@ impl Envelope {
     pub fn encode(&self) -> Result<Value, StoreError> {
         serde_json::to_value(self)
             .map_err(|e| StoreError::InvalidInput(format!("the envelope does not serialize: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_envelope_written_before_deadlines_decodes_without_one() {
+        let old = serde_json::json!({
+            "v": 1, "agent": {"x": 1}, "inbox": [], "seq": 3, "attempt": 0, "rev": 2,
+            "output": null, "error": null, "artifacts": []
+        });
+        let env = Envelope::decode(RunId::new(), &old).expect("decodes");
+        assert_eq!((env.deadline, env.limit_secs), (None, None));
+        // And one with no deadline is written without the members.
+        let again = env.encode().expect("encodes");
+        assert!(again.get("deadline").is_none() && again.get("limit_secs").is_none());
+    }
+
+    #[test]
+    fn a_deadline_survives_the_round_trip() {
+        let now = Utc::now();
+        let env = Envelope::new(serde_json::json!({}))
+            .with_limit(now, std::time::Duration::from_secs(1800));
+        let back = Envelope::decode(RunId::new(), &env.encode().unwrap()).unwrap();
+        assert_eq!(back.deadline, Some(now + chrono::Duration::seconds(1800)));
+        assert_eq!(back.limit_secs, Some(1800));
     }
 }

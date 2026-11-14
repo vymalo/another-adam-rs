@@ -267,6 +267,24 @@ fn cases() -> Vec<Case> {
             "`limits.max_turn`",
         ),
         (
+            "max_minutes on a root agent",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_minutes: 10 }\n---\nHi.\n",
+            )],
+            Warning,
+            "`limits.max_minutes` is for a subagent",
+        ),
+        with_root(
+            "max_minutes is at most a day",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nlimits: { max_minutes: 1441 }\n---\nBody.\n",
+            )],
+            Error,
+            "`limits.max_minutes` is at most 1440",
+        ),
+        (
             "unknown card key",
             vec![(
                 "agent/instructions.md",

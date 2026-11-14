@@ -1,9 +1,14 @@
 //! [`SubagentTool`]: the tool a parent calls to run a subagent as a durable child run.
 
+use std::time::Duration;
+
 use adam_llm_agent::{StepIcon, StepKind, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde_json::{Value, json};
+
+/// How long a subagent run may take when its file says nothing (`limits.max_minutes`): 30 minutes.
+pub const DEFAULT_SUBAGENT_MINUTES: u32 = 30;
 
 /// What every subagent tool says after the subagent's own description: the child starts with an
 /// empty history.
@@ -66,6 +71,10 @@ pub(crate) fn title_of(tool_name: &str) -> String {
 /// * Only the child's final **text** comes back. Its artifacts stay on the child's run.
 /// * The calls of one model turn run one after another, so two subagent calls in a turn run one
 ///   after the other and not side by side.
+/// * The child run has a time limit ([`run_limit`](Self::run_limit)): 30 minutes unless the
+///   subagent's file says `limits.max_minutes` (`0` is none). Past it the runtime fails the child
+///   (`cancelled: time limit: the run did not finish within 30 min`) and the parent reads "the run
+///   failed: ..." as the tool result.
 /// * A `message` that is missing, not a string, or blank is an error result for the model to fix; no
 ///   child is started.
 #[derive(Debug, Clone)]
@@ -73,6 +82,8 @@ pub struct SubagentTool {
     /// The name the child is registered under on the runtime: `coder/reviewer`.
     agent: String,
     spec: ToolSpec,
+    /// The time limit of the child run (`None`: none).
+    within: Option<Duration>,
 }
 
 impl SubagentTool {
@@ -82,7 +93,23 @@ impl SubagentTool {
         Self {
             agent: agent.into(),
             spec: subagent_spec(&tool_name.into(), description),
+            within: Some(Duration::from_secs(
+                u64::from(DEFAULT_SUBAGENT_MINUTES) * 60,
+            )),
         }
+    }
+
+    /// Give the child runs this tool starts a time limit of `within` (`None`: no limit). The
+    /// default is [`DEFAULT_SUBAGENT_MINUTES`].
+    #[must_use]
+    pub fn with_run_limit(mut self, within: Option<Duration>) -> Self {
+        self.within = within;
+        self
+    }
+
+    /// The time limit of the child runs this tool starts.
+    pub fn run_limit(&self) -> Option<Duration> {
+        self.within
     }
 
     /// The registration name of the agent this tool runs.
@@ -115,7 +142,9 @@ impl Tool for SubagentTool {
                 )));
             }
         };
-        let run = ctx.start_child(&self.agent, message).await?;
+        let run = ctx
+            .start_child_within(&self.agent, message, self.within)
+            .await?;
         Err(ToolError::AwaitRun { run })
     }
 }

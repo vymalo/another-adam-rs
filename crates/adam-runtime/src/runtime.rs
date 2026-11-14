@@ -873,7 +873,6 @@ impl Runtime {
     /// steps and on every poll of its cancel watch. `parent` is not checked when the child is
     /// started, so a child started for a parent that does not exist is cancelled when it is first
     /// claimed.
-    #[tracing::instrument(skip(self, input))]
     pub async fn start_child(
         &self,
         parent: RunId,
@@ -881,9 +880,28 @@ impl Runtime {
         agent: &str,
         input: Inbound,
     ) -> Result<bool, RuntimeError> {
+        self.start_child_within(parent, id, agent, input, None)
+            .await
+    }
+
+    /// [`start_child`](Self::start_child) with a time limit: the child must finish within `within`
+    /// of now, by the runtime's own clock (`None`: no limit, which is `start_child`). The deadline is
+    /// stored with the run. Past it the worker fails the child with `cancelled: time limit: the run
+    /// did not finish within N min`, before a step and, for a step in flight, within one poll
+    /// (the step's token fires), and a child that is parked is woken at it. The parent gets the
+    /// failure as it gets any: the child's error.
+    #[tracing::instrument(skip(self, input))]
+    pub async fn start_child_within(
+        &self,
+        parent: RunId,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+        within: Option<Duration>,
+    ) -> Result<bool, RuntimeError> {
         let registered = self.registered(agent)?;
         let new = self
-            .new_run(registered.starter(), input, None, Some(id), None)?
+            .new_run_within(registered.starter(), input, None, Some(id), None, within)?
             .parent(parent);
         match self.inner.store.create_run(new).await {
             Ok(rec) => {
@@ -932,7 +950,6 @@ impl Runtime {
     ///
     /// A round whose own record was purged and is asked for again is not recognised as a repeat
     /// (nothing is left to compare), as for [`start_with_id_continuing`](Self::start_with_id_continuing).
-    #[tracing::instrument(skip(self, input))]
     pub async fn start_child_continuing(
         &self,
         parent: RunId,
@@ -941,6 +958,26 @@ impl Runtime {
         input: Inbound,
         conversation_id: &str,
         prior: Option<RunId>,
+    ) -> Result<bool, RuntimeError> {
+        self.start_child_continuing_within(parent, id, agent, input, conversation_id, prior, None)
+            .await
+    }
+
+    /// [`start_child_continuing`](Self::start_child_continuing) for a round that must finish within
+    /// `within` of now (the same limit as [`start_child_within`](Self::start_child_within), counted
+    /// per round: each round has its own deadline). Past it the round fails and the session stays
+    /// usable, as it does when its parent is cancelled.
+    #[tracing::instrument(skip(self, input))]
+    #[allow(clippy::too_many_arguments)] // `start_child_continuing` and the time limit
+    pub async fn start_child_continuing_within(
+        &self,
+        parent: RunId,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+        conversation_id: &str,
+        prior: Option<RunId>,
+        within: Option<Duration>,
     ) -> Result<bool, RuntimeError> {
         fn invalid<T>(reason: impl Into<String>) -> Result<T, RuntimeError> {
             Err(RuntimeError::InvalidSession {
@@ -1016,12 +1053,13 @@ impl Runtime {
             }
         };
         let new = self
-            .new_run(
+            .new_run_within(
                 registered.starter(),
                 input,
                 prior.zip(state.as_ref()),
                 Some(id),
                 Some(conversation_id),
+                within,
             )?
             .parent(parent);
         self.create_with_id(new).await
@@ -1118,11 +1156,29 @@ impl Runtime {
         id: Option<RunId>,
         conversation_id: Option<&str>,
     ) -> Result<NewRun, RuntimeError> {
+        self.new_run_within(agent, input, prior, id, conversation_id, None)
+    }
+
+    /// [`new_run`](Self::new_run) for a run that must finish within `within` of now, by the
+    /// runtime's own clock.
+    fn new_run_within(
+        &self,
+        agent: &dyn ErasedStarter,
+        input: Inbound,
+        prior: Option<(RunId, &Value)>,
+        id: Option<RunId>,
+        conversation_id: Option<&str>,
+        within: Option<Duration>,
+    ) -> Result<NewRun, RuntimeError> {
         let state = match prior {
             Some((run, state)) => agent.init_continuing(input, state, run)?,
             None => agent.init(input)?,
         };
-        let mut new = NewRun::new(agent.name(), Envelope::new(state).encode()?);
+        let mut envelope = Envelope::new(state);
+        if let Some(within) = within {
+            envelope = envelope.with_limit(self.inner.clock.now(), within);
+        }
+        let mut new = NewRun::new(agent.name(), envelope.encode()?);
         if let Some(id) = id {
             new = new.with_id(id);
         }

@@ -7,7 +7,8 @@ use crate::diagnostic::Sink;
 use crate::frontmatter::{Split, clean_body, key_line};
 use crate::manifest::RemoteAuth;
 use crate::schema::{
-    AgentFrontmatter, ModelRef, ToolList, is_agent_name, is_env_name, is_tool_name,
+    AgentFrontmatter, MAX_MINUTES_LIMIT, ModelRef, ToolList, is_agent_name, is_env_name,
+    is_tool_name,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -95,6 +96,17 @@ pub(crate) fn parse_agent_file(
     check_keys(sink, &split, &fm);
     check_values(sink, &split, &fm);
 
+    if kind != FileKind::Sub
+        && fm
+            .limits
+            .as_ref()
+            .is_some_and(|limits| limits.max_minutes.is_some())
+    {
+        sink.warn(
+            key_line(&split, "limits"),
+            "`limits.max_minutes` is for a subagent run (the parent stops it); it is ignored on this agent",
+        );
+    }
     if kind != FileKind::Sub {
         if fm.a2a.is_some() || fm.auth.is_some() {
             sink.error(
@@ -351,6 +363,16 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
                 ),
             );
         }
+    }
+    if let Some(minutes) = fm.limits.as_ref().and_then(|limits| limits.max_minutes)
+        && minutes > MAX_MINUTES_LIMIT
+    {
+        sink.error(
+            key_line(split, "limits"),
+            format!(
+                "`limits.max_minutes` is at most {MAX_MINUTES_LIMIT} (24 hours), and `0` means no limit; it is {minutes}"
+            ),
+        );
     }
     for key in fm.vars.keys() {
         if !is_env_name(key) {

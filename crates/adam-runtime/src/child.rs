@@ -132,6 +132,19 @@ impl ChildStarter {
             .start_child(self.parent, id, agent, input)
             .await
     }
+
+    /// [`start`](Self::start) with a time limit: [`Runtime::start_child_within`]. `None` is no limit.
+    pub async fn start_within(
+        &self,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+        within: Option<std::time::Duration>,
+    ) -> Result<bool, RuntimeError> {
+        self.runtime
+            .start_child_within(self.parent, id, agent, input, within)
+            .await
+    }
 }
 
 /// Where a child run stands, as far as its parent needs to know.
