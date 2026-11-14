@@ -894,7 +894,8 @@ const LIMIT_MARGIN: Duration = Duration::from_secs(30);
 /// list (`tests/time_limits.rs`).
 pub const QUICK_TOOLS: [&str; 16] = [
     // The run's own files: `apply_patch` runs `git apply` for at most 60 s. (The four read tools,
-    // `read_file`, `list_files`, `find_files` and `search_files`, have a deadline of their own, 30 s:
+    // `read_file`, `list_files`, `find_files`, `search_files` and `read_output`, have a deadline of
+    // their own, 30 s:
     // they declare it, see `own_limit`.)
     "write_file",
     "apply_patch",
@@ -925,14 +926,16 @@ pub const QUICK_TOOLS: [&str; 16] = [
 /// |---|---|
 /// | `run_command`, `run`, `run_checks` | the environment is made ready (`environment_start`) and the command runs (`CHECK_TIMEOUT_SECS`) |
 /// | `rebuild_environment` | the environment is made ready (`environment_start`) |
-/// | `read_file`, `list_files`, `find_files`, `search_files` | their own deadline (`find::DEADLINE`, 30 s) |
+/// | `read_file`, `list_files`, `find_files`, `search_files`, `read_output` | their own deadline (`find::DEADLINE`, 30 s) |
 /// | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | git: one network operation and the local ones around it |
 fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
     let environment = settings.environment_start;
     let bound = match name {
         "run_command" | "run" | "run_checks" => environment + settings.check_timeout,
         "rebuild_environment" => environment,
-        "read_file" | "list_files" | "find_files" | "search_files" => find::DEADLINE,
+        "read_file" | "list_files" | "find_files" | "search_files" | "read_output" => {
+            find::DEADLINE
+        }
         "prepare_workspace" | "commit_and_push" | "publish_scratch" | "create_repository" => {
             adam_workspace::NETWORK_TIMEOUT + adam_workspace::LOCAL_TIMEOUT
         }
@@ -1003,6 +1006,7 @@ impl Tool for Redacting {
                         item.text = r.scrub_string(std::mem::take(&mut item.text));
                         item.note = item.note.take().map(|n| r.scrub_string(n));
                     }
+                }
                 // A text a tool asks the run to keep in its state (a host with no keeper) is
                 // journaled and paged back: as scrubbed as what is shown.
                 if let Some(kept) = &mut out.kept {

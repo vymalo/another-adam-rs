@@ -32,7 +32,7 @@ async fn limits_with(environment_start: u64) -> BTreeMap<String, Option<Duration
 #[tokio::test]
 async fn every_tool_declares_its_own_bound_or_is_quick_by_construction() {
     let limits = limits_with(0).await;
-    assert_eq!(limits.len(), 28, "the whole list: {:?}", limits.keys());
+    assert_eq!(limits.len(), 29, "the whole list: {:?}", limits.keys());
     for (name, limit) in &limits {
         let quick = QUICK_TOOLS.contains(&name.as_str());
         match limit {
@@ -56,6 +56,24 @@ async fn every_tool_declares_its_own_bound_or_is_quick_by_construction() {
     }
 }
 
+/// A command's own `timeout` is at most the deployment's command limit, so it always fits under the
+/// time limit of the tool that runs it (the environment's start, the command and the margin): the loop
+/// never cuts a command the deployment allowed.
+#[tokio::test]
+async fn a_commands_timeout_at_the_cap_fits_under_its_tools_limit() {
+    for environment_start in [0, 90] {
+        let limits = limits_with(environment_start).await;
+        // The cap of `limits_with`: 700 s. The largest `timeout` a call may ask for.
+        for command in ["run_command", "run", "run_checks"] {
+            let limit = limits[command].unwrap();
+            assert!(
+                limit >= Duration::from_secs(700 + environment_start + MARGIN),
+                "{command}: {limit:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_limits_come_from_the_deployments_settings() {
     // A deployment whose environment takes up to 2100 s to be made ready (up 1200 + setup 900) and
@@ -67,7 +85,13 @@ async fn the_limits_come_from_the_deployments_settings() {
     }
     assert_eq!(secs("rebuild_environment"), 2100 + MARGIN);
     // The four read tools have a deadline of 30 s of their own, whatever the environment.
-    for read in ["read_file", "list_files", "find_files", "search_files"] {
+    for read in [
+        "read_file",
+        "list_files",
+        "find_files",
+        "search_files",
+        "read_output",
+    ] {
         assert_eq!(secs(read), 30 + MARGIN, "{read}");
     }
     // One network operation of git (30 minutes) and the local ones around it (5 minutes).
@@ -85,6 +109,7 @@ async fn the_limits_come_from_the_deployments_settings() {
         if let Some(limit) = limit
             && !name.ends_with("_files")
             && name != "read_file"
+            && name != "read_output"
         {
             assert!(*limit > DEFAULT_TOOL_TIME_LIMIT, "{name}: {limit:?}");
         }

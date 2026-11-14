@@ -1,6 +1,6 @@
 {
   "name": "read_output",
-  "description": "Read a kept output page by page: the output of a command, or a long tool result, whose result named its id (o- and 16 hex characters). You get its lines, then a last line that says where the next page starts. Example: {\"id\":\"o-3f9c2a17b0d4e8a1\",\"offset\":2001}",
+  "description": "Read a kept output page by page: the output of a command, or a long tool result, whose result named its id (o- and 16 hex characters). You get its lines, then a last line that says where the next page starts. The same id and offset give the same page: asking for it a third time is a loop and is stopped. Example: {\"id\":\"o-3f9c2a17b0d4e8a1\",\"offset\":2001}",
   "parameters": {
     "type": "object",
     "properties": {

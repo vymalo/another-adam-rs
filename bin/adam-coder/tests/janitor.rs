@@ -567,7 +567,7 @@ async fn the_janitor_removes_kept_output_with_the_run() {
     workspace_of(&fx, &done).await;
     for run in [&done, &orphan, &open] {
         let id = adam_llm_agent::output_id(run, "c1");
-        fx.env.kept.keep(run, &id, "kept\n").await.unwrap();
+        fx.env.kept.keep(run, &id, "kept\n", 0).await.unwrap();
     }
     let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)));
     let report = janitor
