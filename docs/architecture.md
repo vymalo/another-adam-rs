@@ -1097,6 +1097,46 @@ by every pod that runs toolchains (the coder, its run pods, a devcontainer) and 
 ([ADR 0040](decisions/0040-a-shared-package-cache-at-cache.md); chart value `cache`,
 `DEVCONTAINER_CACHE_DIR`). Installed trees (`node_modules`, `target/`) stay in the workspace.
 
+The **kept output** of a long command, or of a long MCP result, is a file of the run too:
+`<root>/outputs/<run>/<id>.txt`, written by the coder's own process (never by a pod) after the text is scrubbed
+of the process's secrets, read back by `read_output`, and removed with the run by the janitor. Nothing of it is
+in the journal. An agent that is only a folder has no volume: it keeps a long MCP result in the run's own state, up
+to 4 MiB.
+
+```mermaid
+sequenceDiagram
+    participant M as model
+    participant L as LlmAgent step
+    participant T as run_command / run_checks
+    participant K as FileKept (bin/adam-coder/src/kept.rs)
+    participant R as read_output
+    M->>L: call run_command
+    L->>T: journaled step tool:CALL_ID
+    Note over T: the output is captured from the pipes (the first 16 MiB, and the tail)
+    T->>K: keep(run, id, scrubbed whole output)
+    K-->>T: lines kept
+    T-->>L: head, tail, output id
+    L-->>M: the result (journaled: the same bytes on a replay)
+    M->>L: call read_output(id, offset)
+    L->>R: journaled step tool:CALL_ID
+    R->>K: page(root run, id, offset, limit)
+    K-->>R: lines and the last line (more / end)
+    R-->>L: the page
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Short: the output fits 16 KiB
+    [*] --> Kept: it does not
+    Short --> [*]: shown whole, nothing kept
+    Kept --> Kept: read_output reads a page
+    Kept --> Cut: over 16 MiB
+    Cut --> Kept: the first 16 MiB are kept, and the view and the last page say so
+    Kept --> Refused: the run's 64 MiB, or a link in the way
+    Refused --> [*]: head and tail only, the result says so
+    Kept --> [*]: the janitor removes it with the run
+```
+
 ## The two agents
 
 | | [`adam-coder`](../bin/adam-coder/README.md) | [`adam-agent`](../bin/adam-agent/README.md) |
