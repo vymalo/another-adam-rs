@@ -111,11 +111,14 @@ mod base64_bytes {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Artifact {
-    /// A name this artifact is kept under in the run, when it has one of its own. A later artifact
-    /// with the same id **replaces** this one (in place, keeping its position) instead of being
-    /// added after it, so a thing that changes while a run works (a plan) is one artifact, not one
-    /// per change. `None` (artifacts journaled before ids existed, and every artifact that is only
-    /// ever made once) is not replaced by anything.
+    /// The artifact's identity within the run, when it has one: **a later artifact of the run with
+    /// the same id replaces it, whichever tool made it**, in place (it keeps its position) instead of
+    /// being added after it, so a thing that changes while a run works (a plan, a surface) is one
+    /// artifact, not one per change. `None` (artifacts journaled before ids existed, and every
+    /// artifact that is only ever made once) is not replaced by anything. **Files have no id**: a
+    /// file artifact is content-addressed ([ADR 0012](../../../docs/decisions/0012-files-as-a2a-artifacts.md)),
+    /// so [`with_id`](Self::with_id) leaves a file without one, and the run never replaces a file nor
+    /// replaces anything with a file (an id on a file is dropped, both are kept).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Artifact name.
@@ -141,10 +144,12 @@ impl Artifact {
         }
     }
 
-    /// Keep this artifact under `id`: see [`id`](Self::id).
+    /// Keep this artifact under `id`: see [`id`](Self::id). A file artifact stays without one.
     #[must_use]
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
-        self.id = Some(id.into());
+        if self.file.is_none() {
+            self.id = Some(id.into());
+        }
         self
     }
 

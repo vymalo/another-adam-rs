@@ -168,6 +168,25 @@ impl Agent for Scripted {
                 output: json!({"text": format!("answered: {answer}")}),
             });
         }
+        if text.contains("[flip]") {
+            // A, then B, then A again, all under one id.
+            if let Some(v) = ["A", "B", "A"].get(usize::try_from(phase).unwrap_or(3)) {
+                ctx.emit(RunEvent::Artifact {
+                    id: Some("plan-x".into()),
+                    name: "plan".into(),
+                    mime_type: None,
+                    data: json!({"v": v}),
+                    file: None,
+                })
+                .await;
+                state["phase"] = json!(phase + 1);
+                return Ok(Transition::Continue(state));
+            }
+            return Ok(Transition::Done {
+                state,
+                output: json!({"text": "finished"}),
+            });
+        }
         if text.contains("[plan]") {
             // A thing that changes while the run works: three drawings, one id.
             if phase < 3 {
@@ -580,6 +599,66 @@ async fn an_artifact_with_an_id_is_replaced_in_the_task_and_in_the_stream() {
         plans[0].parts[0].content,
         PartContent::Data(json!({"v": 2}))
     );
+}
+
+/// A, then B, then A again under one id: the third is a change from what the client holds (B), so
+/// it is sent, and the client ends with what `GetTask` says. A client that subscribes afterwards
+/// is told the newest content once, in the snapshot.
+#[tokio::test]
+async fn a_change_back_to_an_earlier_content_under_one_id_is_sent() {
+    use a2a::PartContent;
+
+    let rig = Rig::new();
+    let task = rig
+        .backend
+        .submit(alice(), user("[flip] A, B, A"), None, None)
+        .await
+        .expect("submit");
+    let mut events = rig.backend.subscribe(&alice(), &task.id);
+    let _snapshot = next(&mut events).await;
+    let worker = rig.worker();
+    let events = rest(&mut events).await;
+    let contents: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            TaskEvent::Artifact(u) if u.artifact.name.as_deref() == Some("plan") => {
+                Some(u.artifact.parts[0].content.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let said = |v: &str| PartContent::Data(json!({ "v": v }));
+    assert_eq!(contents, [said("A"), said("B"), said("A")], "{events:?}");
+
+    let done = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
+    let plans: Vec<_> = done
+        .artifacts
+        .clone()
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.name.as_deref() == Some("plan"))
+        .collect();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].parts[0].content, said("A"));
+    // Subscribing now: the snapshot, with the newest content once, and no artifact event after it.
+    let mut late = rig.backend.subscribe(&alice(), &task.id);
+    let TaskEvent::Snapshot(snapshot) = next(&mut late).await else {
+        panic!("the first event is the snapshot");
+    };
+    let in_snapshot: Vec<_> = snapshot
+        .artifacts
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.name.as_deref() == Some("plan"))
+        .collect();
+    assert_eq!(in_snapshot.len(), 1);
+    assert_eq!(in_snapshot[0].parts[0].content, said("A"));
+    let after = rest(&mut late).await;
+    assert!(
+        after.iter().all(|e| !matches!(e, TaskEvent::Artifact(_))),
+        "{after:?}"
+    );
+    worker.stop().await;
 }
 
 #[tokio::test]

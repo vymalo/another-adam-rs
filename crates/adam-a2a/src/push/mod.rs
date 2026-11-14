@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-pub use cursor::{PushCursor, status_key};
+pub use cursor::{PushCursor, REPLACEABLE_ARTIFACT, status_key};
 pub use deliverer::{PushDeliverer, PushDeliveryOptions};
 pub use policy::{
     GuardedResolver, MAX_URL_LEN, PolicyEntryError, PushPolicy, Refused, is_refused_ip,

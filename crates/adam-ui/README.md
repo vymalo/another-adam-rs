@@ -235,6 +235,7 @@ Plan: Fix the date parser          ("Plan" alone when there is no title)
   hold no form, input or button, and this crate draws only `Checklist`, `Column` and `Text`. The `Checklist` is a component of
   version 6 of that catalog (*unverified*: the fixtures of this repository stop at version 5, and
   `tests/fixtures/catalog-v6.json` and `catalog-v7.json` are hand-written subsets, see `tests/fixtures/README.md`).
+* **The plan in the state is scrubbed when it is written**: a secret the redactor learns later stays in `Conversation::plan` until the next plan call writes it again; every result and surface is scrubbed again when it is made.
 * **Scrub, then cut.** The surface is a pure function of `(plan, catalog)` (`plan_surface`), and the plan it is given has
   **already been scrubbed**: each call runs `ToolCtx::scrub` (the redaction layer around the tool sets it, the coder's
   `Redacting`) over the title, every item and every note, then builds the result, the state's plan and the surface from that.

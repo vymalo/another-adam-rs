@@ -422,7 +422,8 @@ decision 5). `adam-ui` has the three tools that write it (`plan_work`, `plan_che
   `Redacting`) hands the tools it wraps (`ToolCtx::with_scrub`; without a layer it returns the text as it is). **A tool that
   shortens a text it puts in its result calls it on the whole text first**: a secret cut in half is not recognised by the
   scrubber that runs on the finished result, and the front half stays in what is durable.
-* **Breaking.** `Conversation` and `ToolOutput` gain a public field `plan`, and `ArtifactRef` a public field `id`: a struct
+* **The plan in the state is scrubbed when it is written** (by the tool, through `ToolCtx::scrub`, and again by the coder's `Redacting`): a secret registered later stays in the stored state until the next plan call writes the plan again, while every display (the result, the surface) re-scrubs it.
+* **Breaking.** `Conversation` and `ToolOutput` gain a public field `plan`, and `ArtifactRef` a public field `id` (a reference to a file never has one): an exhaustive pattern on `RunEvent::Artifact` outside this crate must also name or `..` its new `id`; a struct
   literal of any must name it (build a `ToolOutput` with its constructors, a `Conversation` with `Conversation::new`).
 
 ## Child runs

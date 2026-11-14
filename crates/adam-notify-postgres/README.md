@@ -208,3 +208,5 @@ ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/adam_test \
 [`adam-notify-testkit`](../adam-notify-testkit/README.md),
 [`adam-store-postgres`](../adam-store-postgres/README.md),
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md).
+
+**Breaking (from `adam-runtime`):** `RunEvent::Artifact` has a member `id`, carried across processes when set and absent otherwise; a payload from before reads as before.

@@ -1328,3 +1328,43 @@ async fn the_largest_plan_is_under_the_backstop_and_is_not_cut() {
         checked.content.as_str()
     );
 }
+
+#[tokio::test]
+async fn setting_an_item_to_the_status_it_has_says_nothing_changed() {
+    let plan = plan_of(&call_bare("plan_work", None, started()).await);
+    let once = call_bare(
+        "plan_check",
+        Some(&plan),
+        json!({"id": 1, "status": "done"}),
+    )
+    .await;
+    assert!(once.content.starts_with("Item 1: done.\n"));
+    let twice = call_bare(
+        "plan_check",
+        Some(&plan_of(&once)),
+        json!({"id": 1, "status": "done"}),
+    )
+    .await;
+    assert!(!twice.is_error);
+    assert!(
+        twice.content.starts_with("Item 1 was already done.\n"),
+        "{}",
+        twice.content
+    );
+    assert_eq!(plan_of(&twice), plan_of(&once));
+    // With a note that is new it is a change; with the note it has, it is not.
+    let noted = call_bare(
+        "plan_check",
+        Some(&plan_of(&once)),
+        json!({"id": 1, "status": "done", "note": "x"}),
+    )
+    .await;
+    assert!(noted.content.starts_with("Item 1: done.\n"));
+    let same_note = call_bare(
+        "plan_check",
+        Some(&plan_of(&noted)),
+        json!({"id": 1, "status": "done", "note": "x"}),
+    )
+    .await;
+    assert!(same_note.content.starts_with("Item 1 was already done.\n"));
+}

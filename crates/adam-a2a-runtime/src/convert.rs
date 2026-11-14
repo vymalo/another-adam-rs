@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use a2a::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 use adam_a2a::A2UI_MEDIA_TYPE;
+use adam_a2a::push::REPLACEABLE_ARTIFACT;
 use adam_core::RunStatus;
 use adam_runtime::{Inbound, RunView};
 use serde_json::{Value, json};
@@ -311,7 +312,10 @@ pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
         name: Some(artifact.name.clone()),
         description: None,
         parts,
-        metadata: None,
+        metadata: artifact
+            .id
+            .is_some()
+            .then(|| HashMap::from([(REPLACEABLE_ARTIFACT.to_owned(), json!(true))])),
         extensions: None,
     }
 }
@@ -335,13 +339,16 @@ pub fn artifact_id(artifact: &adam_runtime::Artifact) -> String {
     artifact.id.clone().unwrap_or_else(|| derived_id(artifact))
 }
 
-/// What a subscriber has been sent of an artifact: its id and its content. Two artifacts with the
-/// same id and different content are two things to say; the same twice is one.
-pub(crate) fn artifact_key(artifact: &adam_runtime::Artifact) -> String {
-    format!(
-        "{}|{}",
-        artifact.id.as_deref().unwrap_or_default(),
-        derived_id(artifact)
+/// Where a subscriber's memory of an artifact is kept, and what it holds: `(slot, content)`. The
+/// slot is the artifact's id when it has one, so the subscriber remembers **the last content it was
+/// sent under that id** (one entry per id, however often it changes, and a change back to an earlier
+/// content is a change); an artifact with no id has its content-derived id for a slot, and is said
+/// once.
+pub(crate) fn artifact_slot(artifact: &adam_runtime::Artifact) -> (String, String) {
+    let content = derived_id(artifact);
+    (
+        artifact.id.clone().unwrap_or_else(|| content.clone()),
+        content,
     )
 }
 

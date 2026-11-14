@@ -1913,15 +1913,18 @@ impl LlmAgent {
 }
 
 /// `new` added to `refs`: after the others, except one with an id that one of them has, which
-/// takes its place (the run holds one artifact for an id, see
-/// [`Artifact::id`](adam_runtime::Artifact::id)).
+/// takes its place where it stands (the run holds one artifact for an id, see
+/// [`Artifact::id`](adam_runtime::Artifact::id)). A reference to a file (it has `bytes`) is never
+/// replaced and never replaces: the runtime keeps both, so the bytes count once each.
 fn add_artifact_refs(refs: &mut Vec<ArtifactRef>, new: Vec<ArtifactRef>) {
-    for one in new {
-        match one
-            .id
-            .as_ref()
-            .and_then(|id| refs.iter_mut().find(|r| r.id.as_ref() == Some(id)))
-        {
+    for mut one in new {
+        if one.bytes.is_some() {
+            one.id = None;
+        }
+        match one.id.as_ref().and_then(|id| {
+            refs.iter_mut()
+                .find(|r| r.bytes.is_none() && r.id.as_ref() == Some(id))
+        }) {
             Some(held) => *held = one,
             None => refs.push(one),
         }
@@ -1989,7 +1992,7 @@ async fn output_message(
         .artifacts
         .iter()
         .map(|a| ArtifactRef {
-            id: a.id.clone(),
+            id: a.id.clone().filter(|_| a.file.is_none()),
             name: a.name.clone(),
             mime_type: a.mime_type.clone(),
             bytes: a.file.as_ref().map(|f| f.bytes.len() as u64),
@@ -2738,5 +2741,58 @@ mod failure_tests {
         let back: ModelFailure =
             serde_json::from_value(serde_json::to_value(&new).unwrap()).unwrap();
         assert_eq!(back.class, new.class);
+    }
+}
+
+#[cfg(test)]
+mod artifact_ref_tests {
+    use super::*;
+
+    fn reference(name: &str, id: Option<&str>, bytes: Option<u64>) -> ArtifactRef {
+        ArtifactRef {
+            id: id.map(str::to_owned),
+            name: name.to_owned(),
+            mime_type: None,
+            bytes,
+        }
+    }
+
+    fn names(refs: &[ArtifactRef]) -> Vec<&str> {
+        refs.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_replaced_reference_keeps_its_position() {
+        let mut refs = vec![
+            reference("x", None, None),
+            reference("plan", Some("p"), None),
+            reference("y", None, None),
+        ];
+        add_artifact_refs(&mut refs, vec![reference("plan2", Some("p"), None)]);
+        assert_eq!(names(&refs), ["x", "plan2", "y"]);
+    }
+
+    #[test]
+    fn two_of_one_id_in_one_call_are_one_entry_with_the_second() {
+        let mut refs = vec![reference("x", None, None)];
+        add_artifact_refs(
+            &mut refs,
+            vec![
+                reference("a", Some("p"), None),
+                reference("b", Some("p"), None),
+            ],
+        );
+        assert_eq!(names(&refs), ["x", "b"]);
+    }
+
+    #[test]
+    fn a_file_reference_never_replaces_and_is_never_replaced() {
+        let mut refs = vec![reference("plan", Some("p"), None)];
+        add_artifact_refs(&mut refs, vec![reference("logo", Some("p"), Some(10))]);
+        assert_eq!(names(&refs), ["plan", "logo"], "both kept");
+        assert_eq!(refs[1].id, None);
+        assert_eq!(files_kept(&refs), 10, "the bytes count once");
+        add_artifact_refs(&mut refs, vec![reference("plan2", Some("p"), None)]);
+        assert_eq!(names(&refs), ["plan2", "logo"]);
     }
 }

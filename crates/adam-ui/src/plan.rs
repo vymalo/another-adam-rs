@@ -662,10 +662,20 @@ impl Tool for PlanCheck {
         let Some(item) = plan.items.iter_mut().find(|i| i.id == id) else {
             return Ok(no_such_item(id, &plan));
         };
+        // Nothing changes when the status is the one the item has and the note, if one was
+        // given, is the one it has: the model is told so, not that it set something.
+        let unchanged = args
+            .status
+            .is_none_or(|status| item.status == status.stored())
+            && note.as_ref().is_none_or(|note| *note == item.note);
         if let Some(status) = args.status {
             item.status = status.stored();
         }
         let first = match (args.status, note) {
+            (Some(status), _) if unchanged => {
+                format!("Item {id} was already {}.", status.word())
+            }
+            (None, Some(_)) if unchanged => format!("Item {id}: the note was already that."),
             (Some(status), note) => {
                 if let Some(note) = note {
                     item.note = note;

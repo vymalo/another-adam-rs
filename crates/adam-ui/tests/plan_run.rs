@@ -296,10 +296,10 @@ fn answers_of(rig: &Rig) -> Vec<(String, String, bool)> {
         .collect()
 }
 
-/// The doom loop (the third identical call in a row with the same result is not run) and a plan:
-/// showing an unchanged plan three times in a row is refused the third time, with the plan intact
-/// and the next real update working; and a plan that changed between two identical reads is not a
-/// repeat, because the key of a call is its tool, its arguments and its result.
+/// The doom loop and a plan (the exact rule is in the comment of the next test): showing an
+/// unchanged plan three times in a row is refused the third time, with the plan intact and the next
+/// real update working; and a plan that changed between two identical reads is not a repeat, because
+/// the call before the third read was a different call (other arguments).
 #[tokio::test]
 async fn re_reading_an_unchanged_plan_three_times_is_refused_and_an_update_is_never_a_repeat() {
     let rig = Rig::new();
@@ -389,4 +389,59 @@ async fn another_conversation_draws_on_another_surface() {
     stop.send(()).unwrap();
     handle.await.unwrap();
     assert_ne!(surfaces[0], surfaces[1], "{surfaces:?}");
+}
+
+/// How slice 10 keys a repeat (`call_key` and `record_answer` of `adam-llm-agent`'s `agent.rs`): a
+/// call is refused when it is the **same call** as the one before (the tool name and the canonical
+/// arguments) and the two before it had **the same result** (`is_error` and the text, hashed), or
+/// failed, or carried the same repeat key. So the same call three times in a row with different
+/// results is not a repeat, and with the same result it is.
+///
+/// Here `plan_add {"items": ["x"]}` three times in a row gives three different results (each names
+/// a new id) and is never refused; `plan_check {}` three times gives one result three times and the
+/// third is.
+#[tokio::test]
+async fn the_same_call_with_different_results_is_not_a_repeat_and_with_the_same_result_is() {
+    let rig = Rig::new();
+    let add = |id: &str| call(id, "plan_add", json!({"items": ["x"]}));
+    rig.model
+        .push_tool_calls(vec![call("c1", "plan_work", json!({"items": ["a"]}))])
+        .push_tool_calls(vec![add("c2")])
+        .push_tool_calls(vec![add("c3")])
+        .push_tool_calls(vec![add("c4")])
+        .push_tool_calls(vec![call("c5", "plan_check", json!({}))])
+        .push_tool_calls(vec![call("c6", "plan_check", json!({}))])
+        .push_tool_calls(vec![call("c7", "plan_check", json!({}))])
+        .push_text("done");
+    let (stop, handle) = rig.worker();
+    let task = rig
+        .backend
+        .submit(
+            alice(),
+            from_the_screen("plan it", &[]),
+            None,
+            Some("ctx".into()),
+        )
+        .await
+        .unwrap();
+    rig.wait(&task).await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
+
+    let answers = answers_of(&rig);
+    let of = |id: &str| answers.iter().find(|a| a.0 == id).unwrap().clone();
+    for (id, new) in [("c2", 2), ("c3", 3), ("c4", 4)] {
+        assert!(!of(id).2, "{id}: {:?}", of(id));
+        assert!(
+            of(id).1.starts_with(&format!("Added 1 item: {new}.\n")),
+            "{}",
+            of(id).1
+        );
+    }
+    assert!(!of("c5").2 && !of("c6").2, "two identical reads are run");
+    assert!(
+        of("c7").1.starts_with("Not run: this is the third call"),
+        "{}",
+        of("c7").1
+    );
 }

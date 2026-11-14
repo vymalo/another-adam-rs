@@ -184,3 +184,5 @@ stateDiagram-v2
 * *Not exercised:* the compose stack. A scripted-model scenario for the coder would need a stream twin for every step of the
   script and a repository or a scratch project the coder cannot complete; the orchestration layer's `artifact-e2e` (its S13)
   is the scenario that runs the chain across both systems.
+
+*Amended 2026-11-14 (ADR 0044 slice 6):* "a changed file is a new one" still holds, and files stay content-addressed with **no id**. The exception is not a file: an artifact may have an **id** (`Artifact::id`), and a later artifact of the run with the same id **replaces** it in place (the plan, a surface). A file artifact never has an id, is never replaced and never replaces anything (an id on a file is dropped and both are kept); its bytes are counted once, by `ArtifactRef::bytes`.

@@ -514,7 +514,7 @@ sequenceDiagram
         D->>S: claim_due(worker, now, ttl)
         S->>DB: push_claim_due (lease, earliest due first)
         D->>B: get(owner, taskId)
-        D->>D: PushCursor.next_event(task): pending, then a new artifact, then a changed status
+        D->>D: PushCursor.next_event(task): pending, then a new or replaced artifact (same id, other content), then a changed status
         alt the webhook has heard everything
             D->>S: commit(idle, due after the poll interval, Done when the task is terminal)
         else an event to send
