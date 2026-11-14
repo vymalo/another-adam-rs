@@ -5280,9 +5280,11 @@ mod cases {
         }
         worker.stop().await;
         let extra = reads[1].saturating_sub(reads[0]);
-        // 250 polls of the window would each read the parent without the limit; about 3 do.
+        // Without the limit every poll of the window would read the parent too, which doubles the reads; with it
+        // about 3 do. The two windows are measured one after the other, and on a real database the number of
+        // polls in a window varies by a few percent, so the bound is a share of the polls and not a count.
         assert!(
-            extra <= 8,
+            extra <= reads[0] / 4,
             "the parent was read {extra} times more than a run with none: {reads:?}"
         );
     }
