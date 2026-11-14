@@ -49,11 +49,9 @@ fn unescape(escaped: &str) -> Option<String> {
         if let Some(t) = tail.strip_prefix("%25") {
             out.push('%');
             rest = t;
-        } else if let Some(t) = tail.strip_prefix("%2F") {
-            out.push('/');
-            rest = t;
         } else {
-            return None;
+            out.push('/');
+            rest = tail.strip_prefix("%2F")?;
         }
     }
     out.push_str(rest);
