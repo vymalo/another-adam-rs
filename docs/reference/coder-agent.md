@@ -226,9 +226,9 @@ list and fails for a tool that has neither a limit nor a place on the `QUICK_TOO
 
 | Tool | Limit |
 |---|---|
-| `run_command`, `run`, `run_checks` | making the environment ready (devcontainer: `DEVCONTAINER_UP_TIMEOUT_SECS` + `DEVCONTAINER_SETUP_TIMEOUT_SECS`; run pods: `RUN_POD_WAIT_SECS` + `RUN_POD_READY_TIMEOUT_SECS`; none in the coder's own container) + `CHECK_TIMEOUT_SECS` + 30 s |
+| `run_command`, `run`, `run_checks` | making the environment ready (devcontainer: `DEVCONTAINER_UP_TIMEOUT_SECS` + `DEVCONTAINER_SETUP_TIMEOUT_SECS`; run pods: `RUN_POD_WAIT_SECS` + `RUN_POD_READY_TIMEOUT_SECS`; none in the coder's own container) + `CHECK_TIMEOUT_SECS` + 30 s (a call's own `timeout` is at most `CHECK_TIMEOUT_SECS`, so it always fits under this) |
 | `rebuild_environment` | making the environment ready + 30 s |
-| `read_file`, `list_files`, `find_files`, `search_files` | their own deadline, 30 s (`find::DEADLINE`) + 30 s |
+| `read_file`, `list_files`, `find_files`, `search_files`, `read_output` | their own deadline, 30 s (`find::DEADLINE`) + 30 s |
 | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | one network git operation (30 min) and the local ones around it (5 min) + 30 s |
 | the rest (`write_file`, `apply_patch`, `edit_file`, `share_file`, `start_scratch`, `request_repository`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `delete_repository`, `ask_user`, `show`, `ui_catalog`) | quick by construction: the default 300 s |
 

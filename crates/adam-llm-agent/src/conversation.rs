@@ -895,6 +895,10 @@ impl Conversation {
     }
 }
 
+fn is_empty_map(map: &Arc<BTreeMap<String, String>>) -> bool {
+    map.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1970,8 +1974,4 @@ mod tests {
         assert!(shortened(&next.messages[2]));
         assert!(!shortened(&next.messages[10]));
     }
-}
-
-fn is_empty_map(map: &Arc<BTreeMap<String, String>>) -> bool {
-    map.is_empty()
 }

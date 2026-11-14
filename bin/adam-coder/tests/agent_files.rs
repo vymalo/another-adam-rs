@@ -1387,7 +1387,7 @@ async fn the_model_reads_a_long_command_back_through_the_real_coder_agent() {
     let run = rt
         .start(
             AGENT_NAME,
-            user_message(&format!("look around {}", fx.remote_url())),
+            user_message(format!("look around {}", fx.remote_url())),
             None,
         )
         .await
