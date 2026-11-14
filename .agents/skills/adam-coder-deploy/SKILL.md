@@ -11,7 +11,8 @@ entrypoint) and `adam-agent` (run with `--entrypoint tini ... -- adam-agent`, se
 or package.
 
 On Kubernetes the coder (or a folder agent) can also run as `AgentService` and `AgentConfig` custom
-resources under the adam-rs operator instead of this chart: `adam-operator`. Pick one per agent, never both
+resources under the operator of vymalo/another-agentic-platform instead of this chart
+(https://github.com/vymalo/another-agentic-platform/blob/main/deploy/operator/README.md). Pick one per agent, never both
 (the chart's objects block the operator's).
 
 Every adam-rs path below is in `vymalo/another-adam-rs` at the revision you pin (replace `main`
@@ -24,7 +25,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
 * Releasing a new image, or finding which image tag a commit produced.
 * Deploying the coder (or an `adam-agent` folder agent) on Kubernetes, or in compose.
 * Not for choosing which adam-rs revision a consumer pins: `adam-upgrade`.
-* Not for running agents as custom resources under the operator: `adam-operator`.
+* Not for running agents as custom resources: the operator is in vymalo/another-agentic-platform, not here.
 
 ## Procedure
 
@@ -123,7 +124,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
 6. **Deploy a folder agent from the same image**: run the image with the entrypoint
    `tini -- adam-agent`, the folder mounted at `ADAM_AGENT_DIR`, readable by uid 10001
    (`adam-agent-folder`). The chart deploys the coder only. For a folder agent use an `AgentService`
-   (`adam-operator`) or write your own manifest, using the chart's StatefulSet as a model for the variables.
+   (the platform's operator, https://github.com/vymalo/another-agentic-platform/blob/main/deploy/operator/README.md) or write your own manifest, using the chart's StatefulSet as a model for the variables.
 7. **Local stack**: `docker compose --profile app up -d --build --wait` (see `compose.yaml` and
    `docs/guides/run-locally.md` and `docs/reference/dev-stack.md`).
 
@@ -186,5 +187,5 @@ Then the compose scenarios of the `image` job in `.github/workflows/coder.yml`
 
 * `deploy/coder/README.md`, `bin/adam-coder/README.md`, `bin/adam-agent/README.md`
   ("Image and compose"), `docs/guides/deploy-the-coder.md`.
-* `adam-agent-folder`, `adam-upgrade`, `adam-operator` (the same image as custom resources).
+* `adam-agent-folder`, `adam-upgrade`.
 * https://github.com/vymalo/another-adam-rs/blob/main/.github/workflows/coder.yml

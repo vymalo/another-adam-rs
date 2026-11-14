@@ -94,7 +94,7 @@ the agent registry. Image `ghcr.io/vymalo/another-adam-rs/operator`, charts [`de
 - **Security:** report a vulnerability privately, as [`SECURITY.md`](SECURITY.md) says.
 - **AI assistants:** read [`CLAUDE.md`](CLAUDE.md). The skills for repositories that integrate adam-rs install with
   `npx skills add vymalo/another-adam-rs --list` (`adam-agent-folder`, `adam-embed`, `adam-store-adapter`,
-  `adam-a2a-extensions`, `adam-coder-deploy`, `adam-operator`, `adam-upgrade`).
+  `adam-a2a-extensions`, `adam-coder-deploy`, `adam-upgrade`).
 
 ## License
 
