@@ -821,6 +821,10 @@ impl Tool for Gated {
         self.inner.asks_user()
     }
 
+    fn paged(&self) -> bool {
+        self.inner.paged()
+    }
+
     fn step_style(&self) -> StepStyle {
         self.inner.step_style()
     }
@@ -877,6 +881,10 @@ impl Tool for Redacting {
 
     fn asks_user(&self) -> bool {
         self.inner.asks_user()
+    }
+
+    fn paged(&self) -> bool {
+        self.inner.paged()
     }
 
     fn step_style(&self) -> StepStyle {

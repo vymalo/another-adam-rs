@@ -434,6 +434,70 @@ pub(crate) struct Ran {
     pub(crate) success: bool,
 }
 
+/// Most bytes of standard error a capped run keeps.
+const CAPPED_STDERR: usize = 64 * 1024;
+
+/// What a capped run left.
+#[derive(Debug)]
+pub(crate) struct CappedRan {
+    pub(crate) ran: Ran,
+    /// Standard output went past the cap: the command was stopped.
+    pub(crate) exceeded: bool,
+}
+
+/// An output sink that keeps at most `cap` bytes. Past it, it either fails (`drop_excess` unset:
+/// the writer is how the sandbox's client learns to stop the command) or drops the rest.
+struct CapWriter {
+    kept: Vec<u8>,
+    cap: usize,
+    exceeded: bool,
+    drop_excess: bool,
+}
+
+impl CapWriter {
+    fn new(cap: usize) -> Self {
+        Self {
+            kept: Vec::new(),
+            cap,
+            exceeded: false,
+            drop_excess: false,
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for CapWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let room = self.cap.saturating_sub(self.kept.len());
+        if buf.len() > room {
+            self.exceeded = true;
+            if !self.drop_excess {
+                return std::task::Poll::Ready(Err(io::Error::other("output over the cap")));
+            }
+        }
+        let n = buf.len().min(room);
+        self.kept.extend_from_slice(&buf[..n]);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 /// Why a command could not be run in the sandbox.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SandboxFailure {
@@ -507,6 +571,122 @@ impl Invocation {
             code: output.status.code(),
             success: output.status.success(),
         })
+    }
+
+    /// As [`run_here`](Self::run_here), but standard output is read as it comes and at most
+    /// `max_stdout` bytes of it are kept: past that the command is killed and `exceeded` is set.
+    /// Standard error keeps at most [`CAPPED_STDERR`] bytes (the rest is read and dropped, so the
+    /// command never blocks on a full pipe).
+    pub(crate) async fn run_here_capped(&self, max_stdout: usize) -> io::Result<CappedRan> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut cmd = Command::new("git");
+        cmd.args(&self.args).env_clear().envs(&self.env);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn()?;
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let stderr_task = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            if let Some(pipe) = stderr_pipe.as_mut() {
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = pipe.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let room = CAPPED_STDERR.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+            kept
+        });
+        let mut stdout = Vec::new();
+        let mut exceeded = false;
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let n = pipe.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                if stdout.len() + n > max_stdout {
+                    exceeded = true;
+                    break;
+                }
+                stdout.extend_from_slice(&chunk[..n]);
+            }
+        }
+        if exceeded {
+            let _ = child.start_kill();
+        }
+        let status = child.wait().await?;
+        let stderr = stderr_task.await.unwrap_or_default();
+        Ok(CappedRan {
+            ran: Ran {
+                stdout,
+                stderr,
+                code: status.code(),
+                success: status.success() && !exceeded,
+            },
+            exceeded,
+        })
+    }
+
+    /// As [`run_in`](Self::run_in), with the same cap on standard output as
+    /// [`run_here_capped`](Self::run_here_capped).
+    pub(crate) async fn run_in_capped(
+        &self,
+        sandbox: &GitSandbox,
+        max_stdout: usize,
+    ) -> Result<CappedRan, SandboxFailure> {
+        if self.carries_credentials() {
+            return Err(SandboxFailure::Credential);
+        }
+        let cwd = self
+            .cwd
+            .clone()
+            .or_else(|| self.root.clone())
+            .ok_or(SandboxFailure::NoDirectory)?;
+        let env = environment::filter(self.env.clone())
+            .into_iter()
+            .filter(|(name, _)| name != "PATH")
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value)));
+        let request = Request::new(self.args.clone(), cwd, env);
+        let mut stdout = CapWriter::new(max_stdout);
+        let mut stderr = CapWriter::new(CAPPED_STDERR);
+        stderr.drop_excess = true;
+        let ended = sandbox
+            .client
+            .run(request, &self.stdin[..], &mut stdout, &mut stderr)
+            .await;
+        let exceeded = stdout.exceeded;
+        match ended {
+            Ok(exit) => Ok(CappedRan {
+                ran: Ran {
+                    success: exit.success() && !exceeded,
+                    code: exit.code,
+                    stdout: stdout.kept,
+                    stderr: stderr.kept,
+                },
+                exceeded,
+            }),
+            Err(_) if exceeded => Ok(CappedRan {
+                ran: Ran {
+                    success: false,
+                    code: None,
+                    stdout: stdout.kept,
+                    stderr: stderr.kept,
+                },
+                exceeded: true,
+            }),
+            Err(e) => Err(SandboxFailure::Client(e)),
+        }
     }
 
     /// Run `git` in the sandbox. Only the variables the sandbox allows are sent
@@ -996,6 +1176,50 @@ impl LocalGit {
     }
 }
 
+/// What a [`LocalGit::output_capped`] run left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedOutput {
+    /// Whether it exited with code 0 and its output stayed within the cap.
+    pub success: bool,
+    /// Standard output, at most the cap (the part before the cap when `exceeded`).
+    pub stdout: Vec<u8>,
+    /// Standard error, at most 64 KiB.
+    pub stderr: Vec<u8>,
+    /// Standard output went past the cap and the command was stopped.
+    pub exceeded: bool,
+}
+
+impl LocalGit {
+    /// As [`output`](Self::output), but standard output is read as it comes and never held past
+    /// `max_stdout` bytes: past it the command is stopped and `exceeded` is set. For a command
+    /// whose output is as long as a tree is large. It takes no standard input.
+    ///
+    /// # Errors
+    ///
+    /// As [`output`](Self::output).
+    pub async fn output_capped(self, max_stdout: usize) -> io::Result<CappedOutput> {
+        let ran = match &self.sandbox {
+            Some(sandbox) => self
+                .invocation
+                .run_in_capped(sandbox, max_stdout)
+                .await
+                .map_err(io::Error::other)?,
+            None => {
+                if self.invocation.carries_credentials() {
+                    return Err(io::Error::other(SandboxFailure::Credential));
+                }
+                self.invocation.run_here_capped(max_stdout).await?
+            }
+        };
+        Ok(CappedOutput {
+            success: ran.ran.success,
+            stdout: ran.ran.stdout,
+            stderr: ran.ran.stderr,
+            exceeded: ran.exceeded,
+        })
+    }
+}
+
 /// Turn a failed command's (already scrubbed) stderr into the closest
 /// [`WorkspaceError`].
 pub(crate) fn classify(command: &str, code: Option<i32>, stderr: &str) -> WorkspaceError {
@@ -1059,6 +1283,51 @@ fn truncate_tail(s: &str, max: usize) -> String {
     let skip = count - max;
     let start = s.char_indices().nth(skip).map_or(0, |(i, _)| i);
     format!("...{}", &s[start..])
+}
+
+#[cfg(test)]
+mod capped_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_capped_run_stops_the_command_and_keeps_no_more_than_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        run(&["init", "-q"]);
+        for i in 0..200 {
+            std::fs::write(dir.path().join(format!("file-{i:04}.txt")), "x").unwrap();
+        }
+        let ls = || LocalGit::new(dir.path(), None).args(["ls-files", "-z", "--others"]);
+        let all = ls().output_capped(1 << 20).await.unwrap();
+        assert!(all.success && !all.exceeded);
+        assert_eq!(
+            all.stdout
+                .split(|&b| b == 0)
+                .filter(|p| !p.is_empty())
+                .count(),
+            200
+        );
+        let cut = ls().output_capped(100).await.unwrap();
+        assert!(cut.exceeded && !cut.success);
+        assert!(cut.stdout.len() <= 100, "{}", cut.stdout.len());
+        // A failing command is not "exceeded".
+        let bad = LocalGit::new(dir.path(), None)
+            .args(["no-such-subcommand"])
+            .output_capped(100)
+            .await
+            .unwrap();
+        assert!(!bad.success && !bad.exceeded && !bad.stderr.is_empty());
+    }
 }
 
 #[cfg(test)]

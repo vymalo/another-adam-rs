@@ -66,7 +66,7 @@ use std::fs;
 use std::io::{self, Read, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use adam::prelude::*;
@@ -368,13 +368,43 @@ fn range_args(
     Ok((offset, limit))
 }
 
+/// A reader that ends with an error once `stop` is set: the read of a call that ran out of time.
+struct StopRead<'a, R> {
+    inner: R,
+    stop: &'a AtomicBool,
+}
+
+impl<R: Read> Read for StopRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "out of time"));
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// One page of `rel` under `root`: its lines behind their numbers and the final line of
 /// [`paging`](adam_llm_agent::paging) (see the tool).
+///
+/// **The whole file is read to count its lines** (a file is at most [`READ_MAX_FILE`]): a page of a
+/// big file costs as much as the file, whatever its offset.
+#[cfg(test)]
 fn read_in(
     root: &SlotDir,
     rel: &str,
     offset: Option<i64>,
     limit: Option<i64>,
+) -> Result<String, String> {
+    read_in_until(root, rel, offset, limit, &AtomicBool::new(false))
+}
+
+/// [`read_in`] that gives up when `stop` is set.
+fn read_in_until(
+    root: &SlotDir,
+    rel: &str,
+    offset: Option<i64>,
+    limit: Option<i64>,
+    stop: &AtomicBool,
 ) -> Result<String, String> {
     let (offset, limit) = paging::window_args(offset, limit, paging::PAGE_LINES)?;
     let (file, meta) = open_for_read(root, rel)?;
@@ -394,7 +424,8 @@ fn read_in(
             meta.size()
         ));
     }
-    match paging::page_lines(io::BufReader::new(file), offset, limit, true) {
+    let reader = io::BufReader::new(StopRead { inner: file, stop });
+    match paging::page_lines(reader, offset, limit, true) {
         Ok(page) if page.total == 0 => Ok(format!("`{shown}` is empty\n{}", page.render())),
         Ok(page) => Ok(page.render()),
         Err(paging::PageError::PastEnd { offset, total }) => Err(format!(
@@ -416,22 +447,60 @@ const CLOSEST_PATHS: usize = 3;
 /// Below this ([`similarity`], 0 to 1000) a path is not like the one asked for.
 const CLOSEST_MIN: usize = 600;
 
-/// The paths of `candidates` that look most like `wanted`, best first and then by path, so the
-/// same files give the same answer.
-fn closest_paths(wanted: &str, candidates: &[String]) -> Vec<String> {
-    let mut scored: Vec<(usize, &String)> = candidates
-        .iter()
-        .map(|c| (similarity(wanted, c), c))
-        .filter(|(score, _)| *score >= CLOSEST_MIN)
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
-    });
+/// A name asked for longer than this (in characters) is not matched against anything, and a
+/// candidate longer than [`CLOSEST_CANDIDATE_CHARS`] is not considered: the likeness costs time by
+/// the length of both.
+const CLOSEST_WANTED_CHARS: usize = 256;
+const CLOSEST_CANDIDATE_CHARS: usize = 512;
+
+/// How often [`closest_paths`] looks at `stop`.
+const CLOSEST_CHECK_EVERY: usize = 1024;
+
+/// The paths of `candidates` (bytes: a name need not be UTF-8) that look most like `wanted`, best
+/// first and then by path, so the same files give the same answer. Empty when `wanted` is longer than
+/// [`CLOSEST_WANTED_CHARS`], and when `stop` is set: the caller has run out of time and there is no
+/// suggestion to make.
+fn closest_paths(wanted: &str, candidates: &[Vec<u8>], stop: &AtomicBool) -> Vec<String> {
+    if wanted.chars().count() > CLOSEST_WANTED_CHARS {
+        return Vec::new();
+    }
+    let wanted = wanted.trim();
+    let mut wanted_pairs = Vec::new();
+    bigrams(wanted, &mut wanted_pairs);
+    let mut pairs = Vec::new();
+    let mut scored: Vec<(usize, &[u8])> = Vec::new();
+    for (i, candidate) in candidates.iter().enumerate() {
+        if i % CLOSEST_CHECK_EVERY == 0 && stop.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        if candidate.len() > CLOSEST_CANDIDATE_CHARS * 4 {
+            continue;
+        }
+        let shown = String::from_utf8_lossy(candidate);
+        let shown = shown.trim();
+        if shown.chars().count() > CLOSEST_CANDIDATE_CHARS {
+            continue;
+        }
+        let score = if shown == wanted {
+            1000
+        } else {
+            // Two pair lists can share at most the shorter one: the best score they could have.
+            let (n, m) = (wanted_pairs.len(), shown.chars().count().saturating_sub(1));
+            if n + m == 0 || 2 * n.min(m) * 1000 / (n + m) < CLOSEST_MIN {
+                continue;
+            }
+            bigrams(shown, &mut pairs);
+            dice(&wanted_pairs, &pairs)
+        };
+        if score >= CLOSEST_MIN {
+            scored.push((score, candidate));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     scored
         .into_iter()
         .take(CLOSEST_PATHS)
-        .map(|(_, path)| path.clone())
+        .map(|(_, path)| paging::escape_name(path))
         .collect()
 }
 
@@ -744,7 +813,7 @@ pub(super) fn push_published_note(text: &mut String, slot: &adam_workspace::Slot
 /// with its number. If the last line says `[more: ... offset=N]`, call again with offset N. A
 /// negative offset reads from the end. A binary file is not shown. Example:
 /// {"path":"src/main.rs","offset":2001}
-#[tool(label = "Read a file", icon = "read")]
+#[tool(label = "Read a file", icon = "read", paged)]
 #[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn read_file(
     env: State<ToolEnv>,
@@ -776,15 +845,37 @@ pub async fn read_file(
     ctx.emit_progress(format!("read {path} ({})", slot.dir()))
         .await;
     let (root, rel) = (Arc::clone(slot.root()), path.to_owned());
-    let read = tokio::task::spawn_blocking(move || read_in(&root, &rel, offset, limit))
-        .await
-        .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&stop);
+    let work = async {
+        tokio::task::spawn_blocking(move || read_in_until(&root, &rel, offset, limit, &seen))
+            .await
+            .map_err(|e| format!("the read was interrupted: {e}"))
+    };
+    let read = match super::find::within(super::find::DEADLINE, &stop, work).await {
+        Ok(read) => read,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
+    };
     Ok(match read {
         Ok(text) => ToolOutput::text(text),
         Err(reason) if reason == does_not_exist(path) => {
             let at = GitAt::slot(&slot);
+            let wanted = path.to_owned();
+            // The suggestion is a courtesy: it has what is left of the call's time, and none is
+            // made when it runs out.
             let near = match super::gitcli::list_files(&at, Path::new("")).await {
-                Ok(all) => closest_paths(path, &all),
+                Ok(all) => {
+                    let look = Arc::new(AtomicBool::new(false));
+                    let seen = Arc::clone(&look);
+                    let work = async {
+                        tokio::task::spawn_blocking(move || closest_paths(&wanted, &all, &seen))
+                            .await
+                            .map_err(|e| e.to_string())
+                    };
+                    super::find::within(super::find::DEADLINE, &look, work)
+                        .await
+                        .unwrap_or_default()
+                }
                 Err(_) => Vec::new(),
             };
             let mut reason = reason;
@@ -1032,24 +1123,45 @@ fn similarity(a: &str, b: &str) -> usize {
     if a == b {
         return 1000;
     }
-    let pairs = |s: &str| -> Vec<(char, char)> {
-        let chars: Vec<char> = s.chars().collect();
-        chars.windows(2).map(|w| (w[0], w[1])).collect()
-    };
-    let (mut left, right) = (pairs(a), pairs(b));
-    if left.is_empty() || right.is_empty() {
-        // A single character each: alike only if equal, which `a == b` above already took.
-        return 0;
-    }
-    let total = left.len() + right.len();
-    let mut common = 0;
-    for pair in right {
-        if let Some(at) = left.iter().position(|p| *p == pair) {
-            left.swap_remove(at);
-            common += 1;
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    bigrams(a, &mut left);
+    bigrams(b, &mut right);
+    dice(&left, &right)
+}
+
+/// The sorted character pairs of `s`, each packed in a `u64`, in `out` (emptied first).
+fn bigrams(s: &str, out: &mut Vec<u64>) {
+    out.clear();
+    let mut chars = s.chars();
+    if let Some(mut before) = chars.next() {
+        for c in chars {
+            out.push((u64::from(u32::from(before)) << 32) | u64::from(u32::from(c)));
+            before = c;
         }
     }
-    2 * common * 1000 / total
+    out.sort_unstable();
+}
+
+/// The Sorensen-Dice coefficient of two sorted lists of pairs, from 0 to 1000; two lists with no
+/// pair at all are not alike (a single character each: alike only if equal, which callers took).
+fn dice(left: &[u64], right: &[u64]) -> usize {
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    // The pairs the two have in common, as a multiset: a merge of the two sorted lists.
+    let (mut i, mut j, mut common) = (0, 0, 0);
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                common += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    2 * common * 1000 / (left.len() + right.len())
 }
 
 /// Where the lines of `old` are most nearly in the lines of `content`: the 0-based index of the
@@ -2017,11 +2129,11 @@ mod tests {
 
     #[test]
     fn closest_paths_rank_by_likeness_then_by_path() {
-        let all: Vec<String> = ["src/main.rs", "README.md", "src/mian.rb", "src/mian.rc"]
+        let all: Vec<Vec<u8>> = ["src/main.rs", "README.md", "src/mian.rb", "src/mian.rc"]
             .into_iter()
-            .map(String::from)
+            .map(|p| p.as_bytes().to_vec())
             .collect();
-        let near = closest_paths("src/mian.rs", &all);
+        let near = closest_paths("src/mian.rs", &all, &AtomicBool::new(false));
         // The two that differ by one letter tie, and go by path; the third is further.
         assert_eq!(
             near,
@@ -2031,8 +2143,61 @@ mod tests {
         assert!(!near.contains(&"README.md".to_owned()), "{near:?}");
         assert_eq!(
             near,
-            closest_paths("src/mian.rs", &all),
+            closest_paths("src/mian.rs", &all, &AtomicBool::new(false)),
             "the same answer twice"
+        );
+    }
+
+    #[test]
+    fn closest_paths_over_a_big_tree_is_quick_and_bounded() {
+        let all: Vec<Vec<u8>> = (0..200_000)
+            .map(|i| format!("crates/module-{:03}/src/part-{i:06}/mod.rs", i % 500).into_bytes())
+            .collect();
+        let started = std::time::Instant::now();
+        let near = closest_paths(
+            "crates/module-001/src/part-000001/mod.rc",
+            &all,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(near.len(), CLOSEST_PATHS, "{near:?}");
+        // A name longer than the bound is matched against nothing; one candidate over it is skipped.
+        let long = "a/".repeat(CLOSEST_WANTED_CHARS);
+        assert!(closest_paths(&long, &all, &AtomicBool::new(false)).is_empty());
+        let big = vec!["x/".repeat(CLOSEST_CANDIDATE_CHARS).into_bytes()];
+        assert!(closest_paths(&"x/".repeat(100), &big, &AtomicBool::new(false)).is_empty());
+        // Out of time: no suggestion, and it stops looking.
+        assert!(
+            closest_paths(
+                "crates/module-001/src/part-000001/mod.rc",
+                &all,
+                &AtomicBool::new(true)
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_read_that_is_out_of_time_is_an_error_not_a_page() {
+        let dir = root();
+        numbered_file(dir.path(), "big.txt", 10_000);
+        let stop = AtomicBool::new(true);
+        let why = super::read_in_until(&open(dir.path()).unwrap(), "big.txt", None, None, &stop)
+            .unwrap_err();
+        assert!(why.contains("cannot read"), "{why}");
+        assert!(
+            super::read_in_until(
+                &open(dir.path()).unwrap(),
+                "big.txt",
+                None,
+                None,
+                &AtomicBool::new(false)
+            )
+            .is_ok()
         );
     }
 

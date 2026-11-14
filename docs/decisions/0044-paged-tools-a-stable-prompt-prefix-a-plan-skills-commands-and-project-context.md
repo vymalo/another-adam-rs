@@ -13,7 +13,7 @@ either (*verified 2026-11-14*: no `Plugin`, `Rule`, `doom_loop`, `Conversation::
 
 *Built 2026-11-14:* slice 5 (ADR 0038's removal of OpenCode), with ADR 0038's slices 1, 2, 4 and 5 in one pull request; its operator slice (3) is void here, [ADR 0046](0046-the-operator-lives-in-the-platform-repository.md).
 
-*Built 2026-11-14:* slice 2 (paged reads), decision 2 up to and including the loop's backstop: `crates/adam-llm-agent/src/paging.rs`, `read_file`, `list_files`, `find_files` and `search_files` (`bin/adam-coder/src/tools/files.rs`, `find.rs`), `Dir::entries`. As decided, with these details the text above left open: the last line is `[more: <n> lines left; next page: offset=<k>]` or `[end: <n> lines]` (`entries`, `paths`, `matches` for the other tools), with no header line; a negative `offset` reaches back at most 10,000 lines; the 64 KiB cap cuts on a character boundary and names `offset` only for a tool whose schema has one; `search_files` also stops with an error at 20,000 files, 256 MiB read or 20,000 matches, skips files over 4 MiB (counted in its last line) and binary files; a call over 30 s is an error result, never a partial page. The candidates of `find_files` and `search_files` come from `git ls-files` through the git sandbox and fail closed without it. Not built yet: the command output kept as `read_output`, the MCP result kept and paged, `read_skill_file`'s `offset` and `limit`, and decision 1.
+>>>>>>> d05f4c4 (fix(coder): paged reads that cannot panic, overflow or be forged)
 
 ## Context
 

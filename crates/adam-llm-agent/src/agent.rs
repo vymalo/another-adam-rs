@@ -692,12 +692,10 @@ impl LlmAgent {
         self.index.get(name).map(|&i| &self.tools[i])
     }
 
-    /// Whether the tool `name` pages its results: its schema has an `offset`.
+    /// Whether the tool `name` pages its results: it says so ([`Tool::paged`]). Never inferred
+    /// from its schema, which an unrelated tool may give an `offset` argument.
     fn pages(&self, name: &str) -> bool {
-        self.specs
-            .iter()
-            .find(|s| s.name == name)
-            .is_some_and(|s| s.parameters.pointer("/properties/offset").is_some())
+        self.tool(name).is_some_and(|t| t.paged())
     }
 
     /// Move inbound messages into the state; the first one answers a pending
@@ -1877,7 +1875,8 @@ async fn output_message(
         .map(|text| Announcement { text, ends_turn });
     let message = Message::Tool {
         call_id: call_id.to_owned(),
-        // After the journal: the step recorded the whole output, and the cut is a pure function of it.
+        // After the journal: the journal holds the whole output, and the cut (which the history, the
+        // model and the step event carry) is a pure function of it.
         content: backstop(&output.content, tool, paged).into_owned(),
         is_error: output.is_error,
     };

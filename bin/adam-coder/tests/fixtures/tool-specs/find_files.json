@@ -1,6 +1,6 @@
 {
   "name": "find_files",
-  "description": "Find files by name pattern (glob). Files git ignores are left out. * stays within one directory, ** crosses directories; a pattern with no / matches file names anywhere. Example: {\"pattern\":\"**/*.test.ts\"}",
+  "description": "Find files by name pattern (glob). Files git ignores are left out. * stays within one directory, ** crosses directories; a pattern with no / matches file names anywhere. Paths are shown escaped (\\n, \\t, \\\\ and \\xNN for other control or non-UTF-8 bytes). Example: {\"pattern\":\"**/*.test.ts\"}",
   "parameters": {
     "type": "object",
     "properties": {

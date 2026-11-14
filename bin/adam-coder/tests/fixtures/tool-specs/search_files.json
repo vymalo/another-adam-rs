@@ -1,6 +1,6 @@
 {
   "name": "search_files",
-  "description": "Search file contents for a pattern (a regular expression; literal:true for plain text). Gives path:line:text, sorted. Files git ignores are left out. Example: {\"pattern\":\"fn main\",\"include\":\"*.rs\"}",
+  "description": "Search file contents for a pattern (a regular expression; literal:true for plain text). Gives path:line:text, sorted. Files git ignores are left out. Paths are shown escaped (\\n, \\t, \\\\ and \\xNN for other control or non-UTF-8 bytes), and control characters of a line as \\xNN. Example: {\"pattern\":\"fn main\",\"include\":\"*.rs\"}",
   "parameters": {
     "type": "object",
     "properties": {

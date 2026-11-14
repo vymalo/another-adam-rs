@@ -260,7 +260,7 @@ pub(crate) async fn status_text(at: &GitAt) -> Option<String> {
 
 /// Most paths [`list_files`] gives, and most bytes of `git`'s answer it reads.
 pub(crate) const MAX_LISTED_PATHS: usize = 200_000;
-const MAX_LISTED_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_LISTED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Why [`list_files`] has no list.
 #[derive(Debug, PartialEq, Eq)]
@@ -268,23 +268,60 @@ pub(crate) enum ListError {
     /// `git` cannot be run for this slot (a refused repository, a pin that cannot be trusted, no
     /// sandbox): which files are ignored is not known, and the caller must not guess.
     Unavailable,
-    /// More than [`MAX_LISTED_PATHS`] paths or 16 MiB of them.
+    /// More than the most paths or bytes the caller allows.
     TooMany,
-    /// `git` ran and failed.
+    /// `git` ran and failed; what it said, with no path of this machine in it.
     Failed(String),
+}
+
+/// What `git` said, for the model: the slot's directory is `.` and any other absolute path is
+/// `<path>`, so that no name of this machine's file system reaches the conversation.
+fn without_host_paths(said: &str, slot: &Path) -> String {
+    let slot = slot.to_string_lossy();
+    let said = if slot.is_empty() {
+        said.to_owned()
+    } else {
+        said.replace(slot.as_ref(), ".")
+    };
+    said.split_inclusive(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ':' | ','))
+        .map(|word| {
+            let end = word
+                .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ':' | ','))
+                .unwrap_or(word.len());
+            if word.starts_with('/') {
+                format!("<path>{}", &word[end..])
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect()
 }
 
 /// The files of the slot below `dir` (a path relative to the slot; empty for all of it) that git
 /// shows: tracked ones and untracked ones that no ignore rule hides (`ls-files --cached --others
-/// --exclude-standard`), as paths from the slot's root, sorted by bytes and each once.
+/// --exclude-standard`), as paths from the slot's root (**bytes**: a name need not be UTF-8), sorted
+/// by bytes and each once.
 ///
 /// This is the **only** way the read tools enumerate files: it asks `git` through [`GitAt`], so the
 /// git sandbox applies when there is one, and nested `.gitignore` files, `info/exclude` and the
 /// global rules are `git`'s own and agree with what `commit_and_push` sees. It never walks the
-/// directory by its name. Left out: a path that is not UTF-8, one under a `.git`, and a directory
-/// (an embedded repository is listed by `git` with a trailing `/`). A tracked file that was deleted
-/// is still listed: the caller looks at each file it uses.
-pub(crate) async fn list_files(at: &GitAt, dir: &Path) -> Result<Vec<String>, ListError> {
+/// directory by its name. Left out: a path under a `.git` (any case) and a directory (an embedded
+/// repository is listed by `git` with a trailing `/`). A tracked file that was deleted is still
+/// listed: the caller looks at each file it uses.
+///
+/// `git`'s answer is read as it comes and held to [`MAX_LISTED_BYTES`]: past it the command is
+/// stopped, and a list of more than [`MAX_LISTED_PATHS`] paths is refused too ([`ListError::TooMany`]).
+pub(crate) async fn list_files(at: &GitAt, dir: &Path) -> Result<Vec<Vec<u8>>, ListError> {
+    list_files_within(at, dir, MAX_LISTED_PATHS, MAX_LISTED_BYTES).await
+}
+
+/// [`list_files`] with its two limits given.
+pub(crate) async fn list_files_within(
+    at: &GitAt,
+    dir: &Path,
+    max_paths: usize,
+    max_bytes: usize,
+) -> Result<Vec<Vec<u8>>, ListError> {
     let Some(git) = at.command().await else {
         return Err(ListError::Unavailable);
     };
@@ -300,28 +337,40 @@ pub(crate) async fn list_files(at: &GitAt, dir: &Path) -> Result<Vec<String>, Li
         git = git.arg("--").arg(dir);
     }
     let out = git
-        .output()
+        .output_capped(max_bytes)
         .await
-        .map_err(|e| ListError::Failed(e.to_string()))?;
-    if !out.success {
-        return Err(ListError::Failed(
-            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-        ));
-    }
-    if out.stdout.len() > MAX_LISTED_BYTES {
+        .map_err(|e| ListError::Failed(without_host_paths(&e.to_string(), at.path())))?;
+    if out.exceeded {
         return Err(ListError::TooMany);
     }
-    let mut paths: Vec<String> = out
-        .stdout
-        .split(|&b| b == 0)
-        .filter(|p| !p.is_empty() && !p.ends_with(b"/"))
-        .filter_map(|p| std::str::from_utf8(p).ok())
-        .filter(|p| !p.split('/').any(|part| part.eq_ignore_ascii_case(".git")))
-        .map(str::to_owned)
-        .collect();
-    paths.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    if !out.success {
+        return Err(ListError::Failed(without_host_paths(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            at.path(),
+        )));
+    }
+    sorted_paths(&out.stdout, max_paths)
+}
+
+/// The paths of `git ls-files -z` output, filtered, sorted by bytes and each once; at most
+/// `max_paths` of them.
+fn sorted_paths(stdout: &[u8], max_paths: usize) -> Result<Vec<Vec<u8>>, ListError> {
+    let mut paths: Vec<Vec<u8>> = Vec::new();
+    for path in stdout.split(|&b| b == 0) {
+        if path.is_empty() || path.ends_with(b"/") {
+            continue;
+        }
+        if path
+            .split(|&b| b == b'/')
+            .any(|part| part.eq_ignore_ascii_case(b".git"))
+        {
+            continue;
+        }
+        paths.push(path.to_vec());
+    }
+    paths.sort_unstable();
     paths.dedup();
-    if paths.len() > MAX_LISTED_PATHS {
+    if paths.len() > max_paths {
         return Err(ListError::TooMany);
     }
     Ok(paths)
@@ -601,6 +650,159 @@ pub(crate) async fn working_tree_id(at: &GitAt) -> Option<String> {
     };
     run(&["add", "-A"]).await?;
     run(&["write-tree"]).await.filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod list_tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::process::Command;
+
+    use super::*;
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        dir
+    }
+
+    fn touch(dir: &Path, name: &[u8]) {
+        let path = dir.join(OsStr::from_bytes(name));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "x\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unsorted_untracked_set_is_given_sorted_by_bytes() {
+        let dir = repo();
+        for name in ["z.txt", "B.txt", "a/b.txt", "a.txt", "a-b.txt", "_u.txt"] {
+            touch(dir.path(), name.as_bytes());
+        }
+        let got = list_files(&GitAt::plain(dir.path()), Path::new(""))
+            .await
+            .unwrap();
+        let mut want = got.clone();
+        want.sort();
+        assert_eq!(got, want);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into())
+            .collect();
+        assert_eq!(
+            names,
+            ["B.txt", "_u.txt", "a-b.txt", "a.txt", "a/b.txt", "z.txt"]
+        );
+    }
+
+    /// `ls-files --cached --others` gives the tracked files and then the untracked ones: the union
+    /// is sorted here, by bytes, and each path is given once.
+    #[tokio::test]
+    async fn tracked_then_untracked_files_are_merged_into_one_sorted_list() {
+        let dir = repo();
+        touch(dir.path(), b"z-tracked.txt");
+        touch(dir.path(), b"m-tracked.txt");
+        let out = Command::new("git")
+            .args(["add", "z-tracked.txt", "m-tracked.txt"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        touch(dir.path(), b"a-untracked.txt");
+        let got = list_files(&GitAt::plain(dir.path()), Path::new(""))
+            .await
+            .unwrap();
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into())
+            .collect();
+        assert_eq!(names, ["a-untracked.txt", "m-tracked.txt", "z-tracked.txt"]);
+    }
+
+    #[test]
+    fn the_paths_of_git_are_sorted_filtered_and_given_once() {
+        let out = b"z\0b/.GIT/f\0a\0\0dir/\0b\0a\0bad-\xff\0";
+        let got = sorted_paths(out, 10).unwrap();
+        assert_eq!(
+            got,
+            [
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"bad-\xff".to_vec(),
+                b"z".to_vec()
+            ]
+        );
+        assert_eq!(sorted_paths(out, 3), Err(ListError::TooMany));
+    }
+
+    #[tokio::test]
+    async fn a_dot_git_of_any_case_below_a_directory_is_left_out() {
+        let dir = repo();
+        touch(dir.path(), b"x/.GIT/f");
+        touch(dir.path(), b"x/.Git/g");
+        touch(dir.path(), b"x/ok.txt");
+        let got = list_files(&GitAt::plain(dir.path()), Path::new(""))
+            .await
+            .unwrap();
+        assert_eq!(got, [b"x/ok.txt".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn a_name_that_is_not_utf8_is_listed_as_the_bytes_it_is() {
+        let dir = repo();
+        touch(dir.path(), b"bad-\xff.txt");
+        touch(dir.path(), b"good.txt");
+        let got = list_files(&GitAt::plain(dir.path()), Path::new(""))
+            .await
+            .unwrap();
+        assert_eq!(got, [b"bad-\xff.txt".to_vec(), b"good.txt".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn more_paths_or_bytes_than_allowed_is_too_many_and_git_is_stopped() {
+        let dir = repo();
+        for i in 0..50 {
+            touch(dir.path(), format!("f{i:02}.txt").as_bytes());
+        }
+        let at = GitAt::plain(dir.path());
+        assert_eq!(
+            list_files_within(&at, Path::new(""), 49, MAX_LISTED_BYTES).await,
+            Err(ListError::TooMany)
+        );
+        assert_eq!(
+            list_files_within(&at, Path::new(""), 50, MAX_LISTED_BYTES)
+                .await
+                .unwrap()
+                .len(),
+            50
+        );
+        // 50 paths of 8 bytes are 400 bytes: a cap of 100 stops the command before it is read.
+        assert_eq!(
+            list_files_within(&at, Path::new(""), usize::MAX, 100).await,
+            Err(ListError::TooMany)
+        );
+    }
+
+    #[test]
+    fn what_git_says_names_no_path_of_this_machine() {
+        let slot = Path::new("/work/workspaces/run-1/repo");
+        let said = "fatal: cannot open '/work/workspaces/run-1/repo/.git/index': denied; \
+                    also /mirror/objects/ab: bad";
+        let shown = without_host_paths(said, slot);
+        assert!(
+            !shown.contains("/work") && !shown.contains("/mirror"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("./.git/index") || shown.contains("<path>"),
+            "{shown}"
+        );
+        assert_eq!(without_host_paths("nothing here", slot), "nothing here");
+    }
 }
 
 #[cfg(test)]

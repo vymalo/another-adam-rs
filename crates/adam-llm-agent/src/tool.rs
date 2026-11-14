@@ -70,6 +70,16 @@ pub trait Tool: Send + Sync + 'static {
         false
     }
 
+    /// Whether this tool's results are pages in the [paging convention](crate::paging): the tool
+    /// takes `offset` and `limit` and ends every result with one final line that says where the
+    /// next page starts. The loop's cap on a result (64 KiB) then tells the model to call again
+    /// with a later `offset`. The default is `false`, and it is **a declaration of the tool**, never
+    /// inferred from its schema: a tool that merely has an `offset` argument (an MCP tool, say) is
+    /// not paged. `#[tool(paged)]` sets it. A tool that wraps another must forward it.
+    fn paged(&self) -> bool {
+        false
+    }
+
     /// How a call of this tool is drawn as a step ([`RunEvent::Step`]): its kind, the label (the
     /// tool's name when it says none) and an icon. The default is a plain tool: kind `tool`, the
     /// name as the label, no icon. A tool that hands its work to another agent says

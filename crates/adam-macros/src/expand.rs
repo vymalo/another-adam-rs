@@ -43,13 +43,14 @@ struct Options {
     strict: Option<Span>,
     classify: bool,
     asks_user: bool,
+    paged: bool,
     krate: Option<Path>,
     step: Option<LitStr>,
     label: Option<LitStr>,
     icon: Option<LitStr>,
 }
 
-const OPTIONS: &str = "name, type, strict, classify, asks_user, crate, step, label, icon";
+const OPTIONS: &str = "name, type, strict, classify, asks_user, paged, crate, step, label, icon";
 
 /// The kinds a step may have (`steps/v1`): `adam_runtime::StepKind`, whose variants these are the
 /// words of. The `adam` crate's tests check that the two lists are the same.
@@ -95,6 +96,7 @@ impl Parse for Options {
                 "strict" => opts.strict.replace(key.span()).is_some(),
                 "classify" => std::mem::replace(&mut opts.classify, true),
                 "asks_user" => std::mem::replace(&mut opts.asks_user, true),
+                "paged" => std::mem::replace(&mut opts.paged, true),
                 other => {
                     return Err(Error::new(
                         key.span(),
@@ -184,6 +186,7 @@ struct Analysis {
     strict: bool,
     classify: bool,
     asks_user: bool,
+    paged: bool,
     /// `step`, `label` and `icon`, checked: how a call is drawn as a step.
     step_style: Option<StepStyle>,
     return_span: Span,
@@ -332,6 +335,7 @@ fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
         strict: opts.strict.is_some(),
         classify: opts.classify,
         asks_user: opts.asks_user,
+        paged: opts.paged,
         step_style,
         return_span,
     })
@@ -723,6 +727,14 @@ impl Analysis {
             }
         });
 
+        let paged = self.paged.then(|| {
+            quote! {
+                fn paged(&self) -> bool {
+                    true
+                }
+            }
+        });
+
         let asks_user = self.asks_user.then(|| {
             quote! {
                 fn asks_user(&self) -> bool {
@@ -794,6 +806,7 @@ impl Analysis {
                 #required_state
 
                 #asks_user
+                #paged
 
                 #step_style
 
@@ -1105,6 +1118,26 @@ mod tests {
         );
         has(&out, "::adam::__private::classified(__result)");
         lacks(&out, "into_tool_result");
+    }
+
+    #[test]
+    fn paged_declares_that_the_tool_pages() {
+        let out = ok(
+            quote!(paged),
+            quote! {
+                /// Read.
+                async fn read(path: String) -> String { path }
+            },
+        );
+        has(&out, "fnpaged(&self)->bool{true}");
+        let out = ok(
+            quote!(),
+            quote! {
+                /// Read.
+                async fn read(offset: Option<i64>) -> String { String::new() }
+            },
+        );
+        lacks(&out, "paged");
     }
 
     #[test]
@@ -1544,7 +1577,7 @@ mod tests {
         );
         assert_eq!(
             msg,
-            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, crate, step, label, icon"
+            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon"
         );
         for repeated in [
             quote!(name = "a", name = "b"),

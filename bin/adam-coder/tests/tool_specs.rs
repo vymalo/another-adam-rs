@@ -170,6 +170,26 @@ async fn every_tool_has_its_tier_and_the_new_ones_need_the_high_ones() {
     assert_eq!(adam_coder::tier::needs("delete_repository"), Bypass);
 }
 
+/// The loop pages by what a tool declares (`Tool::paged`), never by an `offset` in its schema: the
+/// four tools that read in pages declare it, and no other built-in tool does.
+#[tokio::test]
+async fn exactly_the_four_paged_tools_declare_that_they_page() {
+    let fx = Fixture::new("hello\n").await.offering_creation();
+    for tool in coder_tools(&fx.env) {
+        let spec = tool.spec();
+        let paged =
+            ["read_file", "list_files", "find_files", "search_files"].contains(&spec.name.as_str());
+        assert_eq!(tool.paged(), paged, "{}", spec.name);
+        if paged {
+            assert!(
+                spec.parameters.pointer("/properties/offset").is_some(),
+                "{}",
+                spec.name
+            );
+        }
+    }
+}
+
 #[test]
 fn nullable_types_normalise_to_the_plain_type() {
     let mut schema = json!({

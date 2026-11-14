@@ -1,6 +1,6 @@
 {
   "name": "list_files",
-  "description": "List one directory of your worktree (not recursive), sorted; a directory ends in /, a link in @. Example: {\"path\":\"src\"}",
+  "description": "List one directory of your worktree (not recursive), sorted; a directory ends in /, a link in @. Names are shown escaped (\\n, \\t, \\\\ and \\xNN for other control or non-UTF-8 bytes). Example: {\"path\":\"src\"}",
   "parameters": {
     "type": "object",
     "properties": {
