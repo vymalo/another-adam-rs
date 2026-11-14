@@ -11,8 +11,8 @@
 //!
 //! * `list_files` reads **one directory**: one `getdents` of the held descriptor, no `git`.
 //! * `find_files` and `search_files` take their **candidates from `git`**: `git ls-files --cached
-//!   --others --exclude-standard`, asked through [`GitAt`] (so in the git sandbox when there is one;
-//!   see [`list_files`](super::gitcli::list_files)). That is exact (nested `.gitignore` files,
+//!   --others --exclude-standard`, asked through `GitAt` (so in the git sandbox when there is one;
+//!   see `gitcli::list_files`). That is exact (nested `.gitignore` files,
 //!   `info/exclude`, the global rules) and is what `commit_and_push` sees. When `git` cannot be asked
 //!   the result is an error: **never a walk of the directory by its name**, which would leave out
 //!   nothing that is ignored and follow what a run's commands put there.
