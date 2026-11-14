@@ -17,7 +17,7 @@ use common::Fixture;
 const MARGIN: u64 = 30;
 
 async fn limits_with(environment_start: u64) -> BTreeMap<String, Option<Duration>> {
-    let fx = Fixture::with("hello\n", |settings| {
+    let fx = Fixture::with(|settings| {
         settings.check_timeout = Duration::from_secs(700);
         settings.environment_start = Duration::from_secs(environment_start);
     })

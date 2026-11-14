@@ -243,12 +243,12 @@ pub struct ToolOutput {
     /// repeated-call rule** (`doom_loop`): two answers of one call (same tool, same arguments) that
     /// carry the same key count as equal, whatever their text says. A command that fails the same way
     /// twice prints a different duration or path each time, so its text never repeats to the byte; the
-    /// key (`exit:2`) does. See [`with_repeat_key`](Self::with_repeat_key).
+    /// key (`exit:2`) does (boxed, so that a `Result<_, ToolOutput>` stays small). See [`with_repeat_key`](Self::with_repeat_key).
     ///
     /// Journaled with the result, so a replay decides the same; absent from a journal written before
     /// it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repeat_key: Option<String>,
+    pub repeat_key: Option<Box<String>>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -319,7 +319,7 @@ impl ToolOutput {
     /// a changing text must keep running.
     #[must_use]
     pub fn with_repeat_key(mut self, key: impl Into<String>) -> Self {
-        self.repeat_key = Some(key.into());
+        self.repeat_key = Some(Box::new(key.into()));
         self
     }
 
@@ -930,7 +930,10 @@ mod tests {
         let keyed = ToolOutput::text("x").with_repeat_key("exit:2");
         let back: ToolOutput =
             serde_json::from_value(serde_json::to_value(&keyed).unwrap()).unwrap();
-        assert_eq!(back.repeat_key.as_deref(), Some("exit:2"));
+        assert_eq!(
+            back.repeat_key.as_deref().map(String::as_str),
+            Some("exit:2")
+        );
     }
 
     #[test]

@@ -1558,7 +1558,7 @@ impl LlmAgent {
         };
         let answered = match outcome {
             Ok(output) => {
-                let repeat_key = output.repeat_key.clone();
+                let repeat_key = output.repeat_key.as_deref().cloned();
                 let (message, artifacts, answer, outcome) = output_message(
                     ctx,
                     &call.id,
