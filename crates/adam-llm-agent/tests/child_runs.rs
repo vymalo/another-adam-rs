@@ -382,6 +382,10 @@ async fn wait_done(rt: &Runtime, run: RunId) -> RunView {
     wait_for(rt, run, "done", |v| v.status == RunStatus::Done).await
 }
 
+async fn wait_failed(rt: &Runtime, run: RunId) -> RunView {
+    wait_for(rt, run, "failed", |v| v.status == RunStatus::Failed).await
+}
+
 /// Parked on the wait timer (not on a question).
 async fn wait_parked_on_timer(rt: &Runtime, run: RunId) -> RunView {
     wait_for(rt, run, "parked on the wait timer", |v| {
@@ -934,9 +938,9 @@ mod cases {
         );
     }
 
-    /// The parent is cancelled while it waits: the child is not (v1 has no cascade), it finishes
-    /// on its own, and its message to the finished parent changes nothing.
-    pub async fn cancelling_the_parent_leaves_the_child_running(store: DynStore) {
+    /// The parent is cancelled while it waits: the child is cancelled with it (ADR 0044 slice 10),
+    /// whatever its tool was doing, and nothing it would have said is kept or asked of its model.
+    pub async fn cancelling_the_parent_cancels_the_child_too(store: DynStore) {
         let rig = Rig::new();
         let gate = Arc::new(Gate::default());
         rig.parent_script("never asked twice");
@@ -961,12 +965,22 @@ mod cases {
             cancelled.error.as_deref(),
             Some("cancelled: changed my mind")
         );
-        assert!(rt.view(child).await.unwrap().unwrap().status.is_open());
+        let ended = wait_failed(&rt, child).await;
+        assert_eq!(
+            ended.error.as_deref(),
+            Some("cancelled: the parent run ended")
+        );
 
         gate.release.notify_one();
-        let child_done = wait_done(&rt, child).await;
         worker.stop().await;
-        assert_eq!(child_done.output.expect("output")["text"], "nobody listens");
+        let child_after = rt.view(child).await.unwrap().unwrap();
+        assert_eq!(child_after.status, RunStatus::Failed);
+        assert_eq!(child_after.output, None, "its answer was not kept");
+        assert_eq!(
+            rig.child_mock.requests().len(),
+            1,
+            "the child never asked its model again"
+        );
         let after = rt.view(parent).await.unwrap().unwrap();
         assert_eq!(after.status, RunStatus::Failed);
         assert_eq!(
@@ -1406,7 +1420,7 @@ macro_rules! child_suite {
                 a_session_report_is_not_a_message_and_does_not_reopen_the_run,
                 a_session_report_in_the_inbox_is_never_shown_to_the_model,
                 a_cancelled_child_is_an_error_result,
-                cancelling_the_parent_leaves_the_child_running,
+                cancelling_the_parent_cancels_the_child_too,
                 only_the_awaited_childs_notice_answers,
                 a_notice_that_beats_the_park_is_used,
                 a_retry_finds_the_notice_before_the_wait_is_recorded,

@@ -326,6 +326,44 @@ impl Inner {
         }
     }
 
+    /// Fail `run` with `cancelled: <reason>`; see [`Runtime::cancel`]. A run that is terminal is
+    /// left alone, so asking twice is a no-op (and asking for a run that has finished fires the token
+    /// of a step of ours that is still running it). Also how a child run follows a parent that
+    /// ended (`worker.rs`).
+    pub async fn cancel_run(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
+        for _ in 0..MAX_COMMIT_RETRIES {
+            let rec = self
+                .store
+                .load_run(run)
+                .await?
+                .ok_or(RuntimeError::NotFound(run))?;
+            if rec.status.is_terminal() {
+                // Finished already (maybe cancelled elsewhere): a step of ours
+                // that is still running is pointless.
+                self.fire_cancel(run);
+                return Ok(());
+            }
+            let mut env = Envelope::decode(run, &rec.state)?;
+            let error = format!("cancelled: {reason}");
+            env.error = Some(error.clone());
+            env.inbox.clear();
+            let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
+            match self.store.commit_run(run, rec.version, update).await {
+                Ok(committed) => {
+                    self.fire_cancel(run);
+                    self.announce_finished(run).await;
+                    self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
+                        .await;
+                    self.notify_parent(&committed).await;
+                    return Ok(());
+                }
+                Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(RuntimeError::Contended(format!("run {run}")))
+    }
+
     /// Append `inbound` to the inbox of `run`; see [`Runtime::deliver`].
     pub async fn deliver(&self, run: RunId, inbound: Inbound) -> Result<(), RuntimeError> {
         for _ in 0..MAX_COMMIT_RETRIES {
@@ -829,10 +867,12 @@ impl Runtime {
     /// [`child_run_id`](crate::child_run_id), and a step that runs again finds the child it started
     /// instead of starting another.
     ///
-    /// The child is an ordinary run: it has no conversation, and cancelling the parent does not
-    /// cancel it (it finishes within its own limits and its message to the finished parent is
-    /// dropped). `parent` is not checked, so a child started for a parent that does not exist runs
-    /// and its message finds nobody.
+    /// The child is an ordinary run: it has no conversation. **It does not outlive a parent that
+    /// failed**: when `parent` is `Failed` for any reason (a [`cancel`](Self::cancel) included) or is
+    /// gone, the worker that holds the child fails it with `cancelled: the parent run ended` before it
+    /// steps and on every poll of its cancel watch. `parent` is not checked when the child is
+    /// started, so a child started for a parent that does not exist is cancelled when it is first
+    /// claimed.
     #[tracing::instrument(skip(self, input))]
     pub async fn start_child(
         &self,
@@ -1161,41 +1201,18 @@ impl Runtime {
     /// early (`LlmAgent` drops its model request, the coder kills its
     /// commands), one that does not runs to its end (its result is dropped
     /// either way).
+    ///
+    /// **Cancelling a run cancels the runs that work for it** (ADR 0044 slice 10): a child run, whose
+    /// parent is `Failed` for any reason (this cancel included) or gone, is failed with
+    /// `cancelled: the parent run ended` by the worker that holds it, before it steps and on every
+    /// poll of its cancel watch, and its own children after it in turn. A running child is told
+    /// within one poll interval, a runnable one when it is claimed, a parked one at its next wake
+    /// (a child waiting for its own child, at most its wait poll). A parent that is `Done` changes
+    /// nothing. Remote A2A tasks a run started are not cancelled by this. Asking twice, or for a
+    /// finished run, is a no-op.
     #[tracing::instrument(skip(self))]
     pub async fn cancel(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
-        for _ in 0..MAX_COMMIT_RETRIES {
-            let rec = self
-                .inner
-                .store
-                .load_run(run)
-                .await?
-                .ok_or(RuntimeError::NotFound(run))?;
-            if rec.status.is_terminal() {
-                // Finished already (maybe cancelled elsewhere): a step of ours
-                // that is still running is pointless.
-                self.inner.fire_cancel(run);
-                return Ok(());
-            }
-            let mut env = Envelope::decode(run, &rec.state)?;
-            let error = format!("cancelled: {reason}");
-            env.error = Some(error.clone());
-            env.inbox.clear();
-            let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
-            match self.inner.store.commit_run(run, rec.version, update).await {
-                Ok(committed) => {
-                    self.inner.fire_cancel(run);
-                    self.inner.announce_finished(run).await;
-                    self.inner
-                        .emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
-                        .await;
-                    self.inner.notify_parent(&committed).await;
-                    return Ok(());
-                }
-                Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(RuntimeError::Contended(format!("run {run}")))
+        self.inner.cancel_run(run, reason).await
     }
 
     /// Snapshot of a run from its durable record (`None` if it does not exist).

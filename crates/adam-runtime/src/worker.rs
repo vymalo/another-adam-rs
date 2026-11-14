@@ -274,15 +274,58 @@ async fn recheck_in_flight(inner: &Inner) {
     }
 }
 
+/// Why a run is cancelled when the run it works for has ended.
+pub(crate) const PARENT_ENDED: &str = "the parent run ended";
+
+/// Whether the run `parent` ended in failure (any reason, a cancel included) or is gone: the runs
+/// that work for it have nobody to work for. A parent that is `Done` has not ended in that sense: it
+/// has no working rounds left, and a kept-open session stays usable. A store that cannot be read
+/// answers no: the run goes on.
+async fn parent_has_ended(inner: &Inner, parent: RunId) -> bool {
+    match inner.store.load_run(parent).await {
+        Ok(Some(rec)) => rec.status == RunStatus::Failed,
+        Ok(None) => true,
+        Err(e) => {
+            tracing::debug!(%parent, error = %e, "could not read the parent run; carrying on");
+            false
+        }
+    }
+}
+
+/// Fail `run` because its parent ended. Idempotent: a run that is terminal is left as it is.
+async fn cancel_for_parent(inner: &Inner, run: RunId) {
+    tracing::info!(%run, "the parent run ended; cancelling this run");
+    match inner.cancel_run(run, PARENT_ENDED).await {
+        Ok(()) | Err(RuntimeError::NotFound(_)) => {}
+        Err(e) => {
+            tracing::warn!(%run, error = %report(&e), "cancelling a run whose parent ended failed; it is tried again");
+        }
+    }
+}
+
 /// Fires `token` once the run turns terminal (or vanishes) in the store, which
-/// is how a cancel issued by another process reaches a step running here.
-fn spawn_cancel_watch(inner: Arc<Inner>, run: RunId, token: CancelToken) -> AbortOnDrop {
+/// is how a cancel issued by another process reaches a step running here. A child run is also
+/// cancelled here when its parent has ended (`parent`), which costs one more read per poll.
+fn spawn_cancel_watch(
+    inner: Arc<Inner>,
+    run: RunId,
+    parent: Option<RunId>,
+    token: CancelToken,
+) -> AbortOnDrop {
     let every = inner.cfg.poll_interval.max(Duration::from_millis(1));
     AbortOnDrop(tokio::spawn(async move {
         loop {
             tokio::time::sleep(every).await;
             match inner.store.load_run(run).await {
-                Ok(Some(rec)) if rec.status.is_open() => {}
+                Ok(Some(rec)) if rec.status.is_open() => {
+                    if let Some(parent) = parent
+                        && parent_has_ended(&inner, parent).await
+                    {
+                        cancel_for_parent(&inner, run).await;
+                        token.cancel();
+                        return;
+                    }
+                }
                 Ok(_) => {
                     tracing::debug!(%run, "run finished elsewhere while stepping; signalling cancellation");
                     token.cancel();
@@ -319,7 +362,7 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
         .then(|| spawn_renewer(inner.clone(), run));
     let cancel = CancelToken::new();
     let tracked = inner.track(run, cancel.clone());
-    let watch = spawn_cancel_watch(inner.clone(), run, cancel.clone());
+    let watch = spawn_cancel_watch(inner.clone(), run, lease.run.parent_id, cancel.clone());
     let release = transition(&inner, lease.run, cancel).await;
     drop(watch);
     drop(tracked);
@@ -363,6 +406,14 @@ enum Plan {
 /// Returns whether the lease should be released.
 async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> bool {
     let run = rec.id;
+    // A run that works for a parent that has ended does not step: it is cancelled here, before it
+    // can do anything (one read of the parent per transition of a child).
+    if let Some(parent) = rec.parent_id
+        && parent_has_ended(inner, parent).await
+    {
+        cancel_for_parent(inner, run).await;
+        return true;
+    }
     let env = match Envelope::decode(run, &rec.state) {
         Ok(env) => env,
         Err(e) => {
