@@ -154,7 +154,7 @@ pub use agent::{
     BuildError, CLOSING_TURN, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
 };
 pub use conversation::{
-    ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit,
+    ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit, LimitKind,
     MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MESSAGE_KIND,
     OMITTED_MARKER_PREFIX, PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun,
     PendingWait, STOPPED_BY_THE_PERSON, user_message,

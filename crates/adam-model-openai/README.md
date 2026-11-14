@@ -53,13 +53,14 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   user messages) goes out as **one string**, the parts joined with a blank line (`\n\n`); the
   parts stay in the stored state. An array of typed parts is for a part that is not text
   (`ContentPart` has only `Text` today), so a chat template that wants a string content always gets one.
-* Tool-call arguments that are not JSON do not fail the call: the response carries the call with `ToolCall::invalid_arguments` set to the raw text and `arguments` `{}`, and the agent answers it with an error. A call with no name is still `Protocol`.
+* Tool-call arguments that are not JSON do not fail the call: the response carries the call with `ToolCall::invalid_arguments` set to the raw text (cut at 8 KiB, with a marker saying how much) and `arguments` the JSON string `INVALID_ARGUMENTS_MARKER`, and the agent answers it with an error. A call like that is sent back to the provider with `{}` as its arguments. A call with no name is still `Protocol`.
 * A transport failure (timeout, connection error) is a `Transient` that keeps
   the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
   that keeps the parser's error. The message does not repeat the source.
 * A response that stops short is `Transient`, so the runtime retries the turn: a stream (or `[DONE]`)
-  that ended with no `finish_reason`, a last chunk cut off mid-JSON, a body cut off mid-JSON, a body whose
-  choice has no `finish_reason` (absent or `null`). A *complete* chunk that is not JSON stays `Protocol`.
+  that ended with no `finish_reason`, a last chunk cut off mid-JSON, a body cut off mid-JSON. A *complete*
+  chunk that is not JSON, and a complete non-streamed body whose choice has no `finish_reason` (absent or
+  `null`), stay `Protocol`: a server that never sends it fails fast, not after every retry.
 
 ## Reasoning
 

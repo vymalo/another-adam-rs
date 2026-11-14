@@ -203,13 +203,37 @@ pub struct ArtifactRef {
     pub bytes: Option<u64>,
 }
 
+/// Which [`Limits`](crate::Limits) bound a run reached. Serialised as the bound's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    /// `max_turns`.
+    MaxTurns,
+    /// `max_tool_calls`.
+    MaxToolCalls,
+}
+
+impl LimitKind {
+    /// The bound's name, as the output's `limit` says it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTurns => "max_turns",
+            Self::MaxToolCalls => "max_tool_calls",
+        }
+    }
+}
+
 /// A [`Limits`](crate::Limits) bound a run reached.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LimitHit {
-    /// The name of the bound: `max_turns` or `max_tool_calls`.
-    pub limit: String,
+    /// The bound.
+    pub limit: LimitKind,
     /// The closing turn has answered.
     pub answered: bool,
+    /// The output the closing answer ended the run with, kept so that a run reopened with no new
+    /// message ends with exactly it again. Cleared when a message makes another closing turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
 }
 
 /// The state of an [`LlmAgent`](crate::LlmAgent) run: the persisted history

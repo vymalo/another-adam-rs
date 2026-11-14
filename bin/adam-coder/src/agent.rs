@@ -126,9 +126,10 @@ const REPOSITORY_CREATION_OFF: &str = "Creating a repository is switched off in 
 ///   (`asks_the_person`): a sentence ending in `?` in the last paragraph.
 ///
 /// * **A run that reached `max_turns` or `max_tool_calls`** ends with the answer of its closing turn
-///   (`output.limited`), and that is never read as a question: with repository work undelivered
-///   it fails, naming the limit and carrying the answer (what was done, what is left); with nothing
-///   owed it completes.
+///   (`output.limited`), and that is never read as a question: with a repository or scratch
+///   project in the run and nothing delivered it fails, naming the limit and carrying the answer
+///   (what was done, what is left), whether or not changes are left in a worktree; with none (a
+///   question, research) it completes.
 ///
 /// So a run that has repository work to deliver does not complete on its own. It ends with a pull
 /// request, with a failure (the rules above, a model or tool error that is not retried, a limit
@@ -599,22 +600,34 @@ fn is_limited(output: &Value) -> bool {
     output.get("limited").and_then(Value::as_bool) == Some(true)
 }
 
-/// How a run that ended at a limit (`is_limited`) is not delivered: `Some(error)` when it left
-/// repository work undelivered (`owes`), `None` when nothing was owed and the answer completes it.
-fn limited_ending(output: &Value, owes: bool, limits: &adam_llm_agent::Limits) -> Option<String> {
-    if !owes {
+/// How a run that ended at a limit (`is_limited`) and delivered nothing ends: `Some(error)` when
+/// the run has a repository or scratch project (`has_slot`: work was begun, and no pull request or
+/// shared file came of it, whether or not changes are left), `None` when it has none (a question,
+/// research) and the answer completes it.
+fn limited_ending(
+    output: &Value,
+    has_slot: bool,
+    limits: &adam_llm_agent::Limits,
+) -> Option<String> {
+    if !has_slot {
         return None;
     }
     let text = output
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let (what, bound) = match output.get("limit").and_then(Value::as_str) {
-        Some("max_tool_calls") => (
+    let kind = output
+        .get("limit")
+        .and_then(|limit| serde_json::from_value::<adam_llm_agent::LimitKind>(limit.clone()).ok())
+        .unwrap_or(adam_llm_agent::LimitKind::MaxTurns);
+    let (what, bound) = match kind {
+        adam_llm_agent::LimitKind::MaxToolCalls => (
             "tool call",
             format!("max_tool_calls = {}", limits.max_tool_calls),
         ),
-        _ => ("turn", format!("max_turns = {}", limits.max_turns)),
+        adam_llm_agent::LimitKind::MaxTurns => {
+            ("turn", format!("max_turns = {}", limits.max_turns))
+        }
     };
     Some(format!(
         "{what} limit reached before the work was delivered ({bound}): {text}"
@@ -1229,8 +1242,11 @@ impl Agent for CoderAgent {
                         } else if is_limited(&output) {
                             // The run ran out of turns or calls and said where it got to: that is
                             // never a question for the person, whatever its words end with.
-                            let owes = owes_delivery(&notes, &slots).await;
-                            match limited_ending(&output, owes, self.assembly.root().limits()) {
+                            match limited_ending(
+                                &output,
+                                !slots.is_empty(),
+                                self.assembly.root().limits(),
+                            ) {
                                 Some(error) => Transition::Fail {
                                     state,
                                     error: redactor.failure_text(error),
@@ -1398,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn a_limited_answer_with_nothing_owed_completes() {
+    fn a_limited_answer_with_no_repository_or_scratch_project_completes() {
         let limits = adam_llm_agent::Limits::default();
         let output = json!({"text": "Read three files; the fourth is left.", "limited": true, "limit": "max_turns"});
         assert_eq!(limited_ending(&output, false, &limits), None);

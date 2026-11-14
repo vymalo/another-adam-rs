@@ -489,10 +489,15 @@ with `model call failed: ...`. An unreadable start message is
 invalid params.
 
 A model call whose arguments are not JSON (`ToolCall::invalid_arguments`) is not run and does not fail the
-run: it is answered with an error result that says the JSON was invalid, quotes what was sent (cut at 2 KiB), says
+run: it is answered with an error result that says the JSON was invalid, quotes what was sent (the client keeps at most 8 KiB of it, and the quote is cut at 2 KiB), says
 the call did not run and, when the turn stopped at the output limit, that the reply was probably cut off. The
 answer is a function of the journaled model turn (no `tool:<id>` step), so a replay gives the same one, and the
 call counts against `max_tool_calls`. The call is echoed back to the model with `{}` as its arguments, never the raw text.
+
+The stored call keeps `invalid_arguments` and has the JSON **string** `INVALID_ARGUMENTS_MARKER` as `arguments`,
+not `{}`: a binary that predates the field reads the state without it, and a typed tool rejects a string, so the
+call cannot run there with empty arguments (fail closed). Still, **roll every worker before relying on this**, as
+ADR 0037 says of its state: a worker that has not been rolled runs a tool whose schema accepts any JSON.
 
 ## Limits and the closing turn
 
@@ -503,8 +508,11 @@ prefix is the one the provider has cached, but sets `tool_choice: none` and ends
 `CLOSING_TURN`, that is sent for that call only and never stored in the history. A tool call the model sends
 anyway is dropped (the stored message has none). Its words end the run `Done` with the output
 `{"text", "artifacts", "limited": true, "limit": "max_turns" | "max_tool_calls"}` (plus `truncated` and `stream`
-as for any answer); a message that arrives afterwards, or a reply to a question, finishes the run again with the
-same answer, calling no model. A closing turn with no words fails the run with the `turn limit exceeded` or
+as for any answer). A message that arrives after the closing answer (or while it is written) is read by **one more
+closing turn**, whose answer replaces the old one (`steer/v1`: an accepted message is never lost). A reopen
+with nothing new in the history ends with exactly the stored output again (`Conversation::limit.answer`, its
+`stream` and `truncated` included) and calls no model. `max_turns: 0` makes the first call a closing turn: the
+run answers once with no tool. A closing turn with no words fails the run with the `turn limit exceeded` or
 `tool call limit exceeded` message. The state remembers it in `Conversation::limit`. A child run that hits its limit
 is `Done`, and its parent's tool result ends with a note that the answer may be incomplete.
 

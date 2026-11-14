@@ -66,6 +66,6 @@ pub use client::{DynModel, ModelClient};
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
 pub use types::{
-    ContentPart, FinishReason, Message, ModelDelta, ModelRequest, ModelResponse, ToolCall,
-    ToolChoice, ToolSpec, Usage,
+    ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, Message, ModelDelta, ModelRequest,
+    ModelResponse, ToolCall, ToolChoice, ToolSpec, Usage,
 };

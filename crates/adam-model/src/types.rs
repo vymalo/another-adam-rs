@@ -191,6 +191,9 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
+/// The `arguments` of a call whose text was not JSON.
+pub const INVALID_ARGUMENTS_MARKER: &str = "arguments were not valid JSON";
+
 /// A tool call requested by the model.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -198,12 +201,15 @@ pub struct ToolCall {
     pub id: String,
     /// Name of the tool to run.
     pub name: String,
-    /// Parsed JSON arguments; `{}` when the model's text was not JSON (see
-    /// [`ToolCall::invalid_arguments`]).
+    /// Parsed JSON arguments. When the model's text was not JSON (see
+    /// [`ToolCall::invalid_arguments`]) this is the JSON string [`INVALID_ARGUMENTS_MARKER`], not
+    /// an object: a binary that predates `invalid_arguments` reads the state without that field,
+    /// and a typed tool rejects a string, so the call cannot run there with empty arguments.
     pub arguments: Value,
-    /// The raw argument text, when it did not parse as JSON. A call with this set must not run:
-    /// the agent answers it with an error that quotes the text. It is never echoed back to the
-    /// model as `arguments` (which stay `{}`), and older journals, which lack it, decode as `None`.
+    /// The raw argument text, when it did not parse as JSON (bounded by the client that parsed
+    /// it). A call with this set must not run: the agent answers it with an error that quotes the
+    /// text. Clients echo it to the model as `{}`, never as text. Older journals, which lack it,
+    /// decode as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid_arguments: Option<String>,
 }
@@ -219,7 +225,8 @@ impl ToolCall {
         }
     }
 
-    /// A call whose argument text was not JSON: `arguments` is `{}` and `raw` is kept.
+    /// A call whose argument text was not JSON: `arguments` is [`INVALID_ARGUMENTS_MARKER`] and
+    /// `raw` is kept.
     pub fn with_invalid_arguments(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -227,7 +234,7 @@ impl ToolCall {
     ) -> Self {
         Self {
             invalid_arguments: Some(raw.into()),
-            ..Self::new(id, name, Value::Object(Default::default()))
+            ..Self::new(id, name, Value::String(INVALID_ARGUMENTS_MARKER.into()))
         }
     }
 }
@@ -441,8 +448,15 @@ mod tests {
     #[test]
     fn an_invalid_call_roundtrips_and_a_valid_one_keeps_its_shape() {
         let bad = ToolCall::with_invalid_arguments("c", "w", "{\"city\": ");
-        assert_eq!(bad.arguments, json!({}));
-        roundtrip(bad);
+        assert_eq!(bad.arguments, json!(INVALID_ARGUMENTS_MARKER));
+        roundtrip(bad.clone());
+        // What a binary without the field reads from new state: the arguments are not an object.
+        #[derive(Deserialize)]
+        struct OldToolCall {
+            arguments: Value,
+        }
+        let old: OldToolCall = serde_json::from_value(serde_json::to_value(&bad).unwrap()).unwrap();
+        assert!(!old.arguments.is_object());
         let good = ToolCall::new("c", "w", json!({"x": 1}));
         assert_eq!(
             serde_json::to_value(&good).unwrap(),

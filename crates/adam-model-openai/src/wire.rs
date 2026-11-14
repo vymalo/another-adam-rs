@@ -212,13 +212,18 @@ fn wire_message(
         } => {
             let mut wire_calls = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
-                let arguments = serde_json::to_string(&call.arguments).map_err(|e| {
-                    ModelError::invalid_request(format!(
-                        "arguments of tool call {} are not serializable",
-                        call.id
-                    ))
-                    .with_source(e)
-                })?;
+                // A call whose text was not JSON goes back as `{}`: the text is not echoed.
+                let arguments = if call.invalid_arguments.is_some() {
+                    "{}".to_owned()
+                } else {
+                    serde_json::to_string(&call.arguments).map_err(|e| {
+                        ModelError::invalid_request(format!(
+                            "arguments of tool call {} are not serializable",
+                            call.id
+                        ))
+                        .with_source(e)
+                    })?
+                };
                 wire_calls.push(json!({
                     "id": call.id,
                     "type": "function",
@@ -284,7 +289,7 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         .ok_or_else(|| ModelError::protocol("choice has no message"))?;
     let finish = choice
         .finish_reason
-        .ok_or_else(|| ModelError::transient("choice has no finish_reason"))?;
+        .ok_or_else(|| ModelError::protocol("choice has no finish_reason"))?;
 
     let mut tool_calls = Vec::new();
     for call in message.tool_calls.unwrap_or_default() {
@@ -438,13 +443,26 @@ fn check_name(name: &str) -> Result<(), ModelError> {
     Ok(())
 }
 
+/// The most of an invalid argument text that is kept (the journal and the state hold it).
+const MAX_INVALID_ARGUMENTS: usize = 8 * 1024;
+
 /// Parse tool-call arguments. Empty means "no arguments"; text that is not JSON comes back as
-/// `Err(raw)`, for the agent to answer the call with an error instead of failing the run.
+/// `Err(raw)`, cut to [`MAX_INVALID_ARGUMENTS`] bytes on a char boundary, for the agent to answer
+/// the call with an error instead of failing the run.
 fn parse_arguments(raw: &str) -> Result<Value, String> {
     if raw.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(raw).map_err(|_| raw.to_owned())
+    serde_json::from_str(raw).map_err(|_| {
+        if raw.len() <= MAX_INVALID_ARGUMENTS {
+            return raw.to_owned();
+        }
+        let mut end = MAX_INVALID_ARGUMENTS;
+        while !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{} [{} bytes cut]", &raw[..end], raw.len() - end)
+    })
 }
 
 fn map_finish(reason: &str) -> FinishReason {
@@ -1005,12 +1023,53 @@ mod tests {
     }
 
     #[test]
-    fn a_completion_that_stops_short_is_transient() {
+    fn a_complete_completion_without_a_finish_reason_is_a_protocol_error() {
         for body in [
             &br#"{"choices":[{"message":{"content":"x"}}]}"#[..],
             br#"{"choices":[{"message":{"content":"x"},"finish_reason":null}]}"#,
-            br#"{"choices":[{"message":{"content":"x"#,
         ] {
+            assert!(
+                matches!(parse_completion(body), Err(ModelError::Protocol { .. })),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_invalid_argument_text_is_cut_on_a_char_boundary() {
+        // Multi-byte characters around the cut: 8192 is inside one of them.
+        let raw = format!("{{\"a\": {}", "\u{e9}\u{4e2d}".repeat(10_000));
+        assert!(raw.len() > 30_000);
+        let kept = parse_arguments(&raw).unwrap_err();
+        let (text, note) = kept.split_once(" [").expect("a marker");
+        assert!(text.len() <= MAX_INVALID_ARGUMENTS && raw.starts_with(text));
+        assert_eq!(note, format!("{} bytes cut]", raw.len() - text.len()));
+        // And a short one is untouched.
+        assert_eq!(parse_arguments("{oops").unwrap_err(), "{oops");
+    }
+
+    #[test]
+    fn an_invalid_call_is_echoed_as_empty_arguments() {
+        let call = adam_model::ToolCall::with_invalid_arguments("c", "w", "{oops");
+        let message = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![call],
+            reasoning: None,
+        };
+        let wire = wire_message(&message, None).unwrap();
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["tool_calls"][0]["function"]["arguments"], "{}");
+        let text = json.to_string();
+        assert!(
+            !text.contains("oops") && !text.contains("valid JSON"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_completion_cut_inside_its_json_is_transient() {
+        for body in [&br#"{"choices":[{"message":{"content":"x"#[..]] {
             assert!(
                 matches!(parse_completion(body), Err(ModelError::Transient { .. })),
                 "{}",
@@ -1257,7 +1316,7 @@ mod tests {
         let response = asm.finish().unwrap();
         let call = &response.message.tool_calls()[0];
         assert_eq!(call.invalid_arguments.as_deref(), Some("{\"x\": "));
-        assert_eq!(call.arguments, json!({}));
+        assert_eq!(call.arguments, json!(adam_model::INVALID_ARGUMENTS_MARKER));
     }
 
     #[test]

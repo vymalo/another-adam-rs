@@ -78,7 +78,7 @@ a crash, transitions committed to a store, and fail-closed composition.
      the cached one and a history that holds tool calls is valid for every provider; a call the model sends anyway is dropped.
      It is the call that would trip `max_turns` (so a run has `max_turns` turns with tools plus one closing turn). The grace
      also covers `max_tool_calls`: a turn whose calls would go over it has each call answered "not run", and the closing turn
-     follows. The coder never parks a limited answer as a question: it fails when repository work is undelivered, and completes
+     follows. The coder never parks a limited answer as a question: it fails when the run has a repository or scratch project and delivered nothing, and completes
      otherwise.
 3. **Rules per agent, with patterns** (`adam-llm-agent`).
    * **The rule.** `Rule {key, pattern, action: Allow | Ask | Deny}`, with globs for `key` and `pattern`. The last match wins,

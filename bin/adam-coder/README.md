@@ -404,8 +404,8 @@ make them hold:
   above, a model or tool error that is not retried) and CancelTask (a chat's Stop).
   **A run that reaches `max_turns` or `max_tool_calls`** gets one closing model call in which it may call no tool
   (`adam-llm-agent`) and ends with that answer (`output.limited`), which is never read as a question: with
-  repository work undelivered (`owes_delivery`) the run fails with `turn limit reached before the work was
-  delivered (max_turns = N): <the answer>` (or the `max_tool_calls` form), redacted; with nothing owed it completes.
+  a repository or scratch project in the run and nothing delivered the run fails (whether or not changes are left) with `turn limit reached before the work was
+  delivered (max_turns = N): <the answer>` (or the `max_tool_calls` form), redacted; with neither (a question, research) it completes.
   A pull request already delivered is a success whatever the limit (the verdict runs first).
 * **A scratch project lives for the thread, and what is published is what was checked.** It stays for the conversation:
   the next task takes it over, and the janitor removes it once the conversation has had no task for `SCRATCH_IDLE_DAYS`

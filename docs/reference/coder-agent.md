@@ -152,9 +152,9 @@ stateDiagram-v2
 
 `Exhausted` has no way out except failure: `run_checks`, `commit_and_push` and `open_pull_request` all
 refuse, and `accept_red_checks` never overrides it. `InputRequired` is the chat waiting for the person; a run
-with repository work to deliver ends only with a pull request, a failure (a limit reached with the work undelivered
+with repository work to deliver ends only with a pull request, a failure (a limit reached with a repository or scratch project and nothing delivered
 among them: the run gets one closing turn without tools, and its answer is the failure's text), or `CancelTask`; a run
-without any ends when the model answers and asks nothing, and so does one that reached a limit with nothing owed.
+without any ends when the model answers and asks nothing, and so does one that reached a limit with no repository or scratch project.
 
 ## Rules in code
 
@@ -212,7 +212,13 @@ artifact**: a lost database loses the run ledger, not the pushed branches or the
 ## Limits and cancel
 
 `limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 8192 output tokens per call, 100,000
-tokens of history; a limit that trips fails the run. When a run is cancelled while OpenCode works, the tool
+tokens of history. A run that reaches `max_turns` or `max_tool_calls` gets one closing model call in which it
+may call no tool, and its answer ends the run with `output.limited: true` ([A2A server](a2a-server.md#a-run-that-ends-at-its-limit)).
+The coder never reads that answer as a question: **it completes only when the run has no repository or
+scratch project at all (a question, research) or already delivered** (a pull request, a shared file). With a
+repository or scratch project in the run and nothing delivered it fails with
+`turn limit reached before the work was delivered (max_turns = N): <the answer>` (or the `max_tool_calls`
+form), redacted, whether or not changes are left in the worktree. When a run is cancelled while OpenCode works, the tool
 sends ACP `session/cancel`, waits 2 seconds, then kills OpenCode and its process group and tells the run's
 environment which command to kill.
 

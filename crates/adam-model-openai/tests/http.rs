@@ -221,7 +221,7 @@ async fn malformed_tool_call_json_is_kept_as_an_invalid_call() {
     let resp = client(&server).complete(request()).await.unwrap();
     let call = &resp.message.tool_calls()[0];
     assert_eq!(call.invalid_arguments.as_deref(), Some("{\"city\": "));
-    assert_eq!(call.arguments, json!({}));
+    assert_eq!(call.arguments, json!(adam_model::INVALID_ARGUMENTS_MARKER));
     assert_eq!(call.name, "weather");
 }
 
@@ -374,7 +374,7 @@ async fn stream_malformed_tool_arguments_are_kept_as_an_invalid_call() {
     };
     let call = &resp.message.tool_calls()[0];
     assert_eq!(call.invalid_arguments.as_deref(), Some("{\"city\": "));
-    assert_eq!(call.arguments, json!({}));
+    assert_eq!(call.arguments, json!(adam_model::INVALID_ARGUMENTS_MARKER));
 }
 
 #[tokio::test]

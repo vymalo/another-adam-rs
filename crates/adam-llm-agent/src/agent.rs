@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::conversation::{
-    ArtifactRef, Conversation, LimitHit, PendingQuestion, PendingRemote, PendingRun, PendingWait,
-    parse_context, parse_root_run, parse_root_step, parse_user_text,
+    ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
+    PendingWait, parse_context, parse_root_run, parse_root_step, parse_user_text,
 };
 use crate::history::fit_history;
 use crate::source::{
@@ -33,6 +33,15 @@ use crate::step_io::StepIo;
 use crate::text_stream;
 use crate::tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use crate::toolset::ToolSet;
+
+/// What the run state says to the call it is about to run.
+#[derive(Clone, Copy)]
+struct CallFacts {
+    /// Bytes of files the run has already handed over.
+    files_used: u64,
+    /// The turn that asked for the call stopped at the output limit.
+    output_cut: bool,
+}
 
 /// What the model is asked in the closing turn, the last model call of a run that reached
 /// `max_turns` or `max_tool_calls`. Sent after the history, as a user message that is not kept in it.
@@ -817,26 +826,25 @@ impl LlmAgent {
         if ctx.is_cancelled() {
             return Ok(Flow::Fail(CANCELLED.into()));
         }
-        // A message that reaches a run after its closing answer, or a reply to a question, does not
-        // call the model again: the run finishes with that answer, marked limited.
-        if let Some(hit) = &state.limit
+        // The run was reopened after its closing answer. With no message since (the answer is still
+        // the last one), it ends with exactly that output again and calls no model. A message that
+        // arrived is read by one more closing turn: its answer replaces the old one.
+        if let Some(hit) = &mut state.limit
             && hit.answered
         {
-            let text = state
-                .messages
-                .iter()
-                .rev()
-                .find(|m| matches!(m, Message::Assistant { .. }))
-                .map(Message::text)
-                .unwrap_or_default();
-            return Ok(Flow::Done(limited_output(
-                state, &hit.limit, text, false, None,
-            )));
+            if let Some(answer) = &hit.answer
+                && matches!(state.messages.last(), Some(Message::Assistant { .. }))
+            {
+                return Ok(Flow::Done(answer.clone()));
+            }
+            hit.answered = false;
+            hit.answer = None;
         }
         if state.limit.is_none() && state.turns >= self.limits.max_turns {
             state.limit = Some(LimitHit {
-                limit: "max_turns".into(),
+                limit: LimitKind::MaxTurns,
                 answered: false,
+                answer: None,
             });
         }
         let closing = state.limit.is_some();
@@ -1011,7 +1019,7 @@ impl LlmAgent {
         // An answer that was recorded before a message this transition has read (the commit of the
         // transition that recorded it was lost, and the message arrived before this one began) did
         // not read it: it is dropped and the model answers again, with the message in front of it.
-        if calls.is_empty() && answered_stale && !closing {
+        if calls.is_empty() && answered_stale {
             tracing::debug!(
                 run = %ctx.run_id(),
                 turn,
@@ -1023,7 +1031,7 @@ impl LlmAgent {
         // the answer is not the last word, and the run takes another turn instead of ending
         // (`steer/v1`: an accepted message is never lost). What arrives after this check is caught
         // by the commit (`Ctx::reopen_on_arrival`).
-        let unread = !closing && calls.is_empty() && ctx.arrived().await? > 0;
+        let unread = calls.is_empty() && ctx.arrived().await? > 0;
         if !text.is_empty() {
             let mut payload = json!({ "text": text, "turn": turn });
             // The words before a tool call are said whole, under the stream they were sent as, because
@@ -1053,25 +1061,17 @@ impl LlmAgent {
             );
             return Ok(Flow::Next);
         }
-        if closing {
-            let limit = state
-                .limit
-                .as_ref()
-                .map_or_else(|| "max_turns".to_owned(), |hit| hit.limit.clone());
+        if let Some(limit) = state.limit.as_ref().map(|hit| hit.limit) {
             let said = state.announced.clone().unwrap_or(text);
             if said.trim().is_empty() {
-                return Ok(Flow::Fail(self.limit_message(state, &limit)));
+                return Ok(Flow::Fail(self.limit_message(state, limit)));
             }
+            let output = limited_output(state, limit, said, finish == FinishReason::Length, stream);
             if let Some(hit) = &mut state.limit {
                 hit.answered = true;
+                hit.answer = Some(output.clone());
             }
-            return Ok(Flow::Done(limited_output(
-                state,
-                &limit,
-                said,
-                finish == FinishReason::Length,
-                stream,
-            )));
+            return Ok(Flow::Done(output));
         }
         if calls.is_empty() {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
@@ -1112,8 +1112,9 @@ impl LlmAgent {
                     .map(|call| Message::tool_error(call.id, said.clone())),
             );
             state.limit = Some(LimitHit {
-                limit: "max_tool_calls".into(),
+                limit: LimitKind::MaxToolCalls,
                 answered: false,
+                answer: None,
             });
             return Ok(Flow::Next);
         }
@@ -1200,8 +1201,10 @@ impl LlmAgent {
                     (state.root_run, state.root_step.as_deref()),
                     &state.source_notes,
                     &call,
-                    used,
-                    state.output_cut,
+                    CallFacts {
+                        files_used: used,
+                        output_cut: state.output_cut,
+                    },
                 )
                 .await?;
             state.sandbox_usage.merge(&reported);
@@ -1307,7 +1310,6 @@ impl LlmAgent {
     }
 
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), tool = %call.name, call_id = %call.id))]
-    #[allow(clippy::too_many_arguments)] // the pieces of the run state one call reads
     async fn run_tool(
         &self,
         ctx: &mut Ctx,
@@ -1315,9 +1317,12 @@ impl LlmAgent {
         root: (Option<RunId>, Option<&str>),
         notes: &[ToolNote],
         call: &ToolCall,
-        files_used: u64,
-        output_cut: bool,
+        facts: CallFacts,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
+        let CallFacts {
+            files_used,
+            output_cut,
+        } = facts;
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
         // What the listing that offered this tool said about it. Only a source's tool has a note: the
         // agent's own tools win a name clash.
@@ -1633,17 +1638,16 @@ impl LlmAgent {
     }
 
     /// Why a run that reached `limit` fails when its closing turn says nothing.
-    fn limit_message(&self, state: &Conversation, limit: &str) -> String {
-        if limit == "max_tool_calls" {
-            format!(
+    fn limit_message(&self, state: &Conversation, limit: LimitKind) -> String {
+        match limit {
+            LimitKind::MaxToolCalls => format!(
                 "tool call limit exceeded: {} calls already made (max_tool_calls = {})",
                 state.tool_calls, self.limits.max_tool_calls
-            )
-        } else {
-            format!(
+            ),
+            LimitKind::MaxTurns => format!(
                 "turn limit exceeded: the model was called {} times (max_turns = {})",
                 state.turns, self.limits.max_turns
-            )
+            ),
         }
     }
 
@@ -1972,13 +1976,10 @@ enum ToolResult {
     },
 }
 
-/// A child's output as the text of the tool result. An `LlmAgent` child finishes with
-/// `{"text": ..., "artifacts": [...]}` and the parent's model gets the text (the same reading the
-/// A2A adapter has of an output); another string is passed as it is, and anything else as JSON.
 /// The output of a run that ended at a limit, with the answer of its closing turn.
 fn limited_output(
     state: &Conversation,
-    limit: &str,
+    limit: LimitKind,
     text: String,
     truncated: bool,
     stream: Option<String>,
@@ -1987,7 +1988,7 @@ fn limited_output(
         "text": text,
         "artifacts": state.artifacts,
         "limited": true,
-        "limit": limit,
+        "limit": limit.as_str(),
     });
     if truncated {
         output["truncated"] = json!(true);
@@ -2023,6 +2024,9 @@ fn invalid_arguments(name: &str, raw: &str, output_cut: bool) -> String {
     )
 }
 
+/// A child's output as the text of the tool result. An `LlmAgent` child finishes with
+/// `{"text": ..., "artifacts": [...]}` and the parent's model gets the text (the same reading the
+/// A2A adapter has of an output); another string is passed as it is, and anything else as JSON.
 fn render_output(output: Option<&Value>) -> String {
     let text = match output {
         None | Some(Value::Null) => String::new(),
@@ -2038,11 +2042,16 @@ fn render_output(output: Option<&Value>) -> String {
         return "(the run finished without output)".to_owned();
     }
     // A child that ran out of turns or tool calls still answered, from its closing turn.
-    match output.and_then(|o| o.get("limited").and(o.get("limit"))) {
-        Some(Value::String(limit)) => format!(
+    let limited = output.and_then(|o| {
+        (o.get("limited") == Some(&Value::Bool(true)))
+            .then(|| o.get("limit").and_then(Value::as_str))
+            .flatten()
+    });
+    match limited {
+        Some(limit) => format!(
             "{text}\n\n(the run stopped at its `{limit}` limit; this answer may be incomplete)"
         ),
-        _ => text,
+        None => text,
     }
 }
 

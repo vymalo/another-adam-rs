@@ -1431,6 +1431,174 @@ async fn the_environment_is_sealed_when_a_project_is_started_and_when_one_is_tak
     );
 }
 
+/// A coder whose `max_turns` is 2: the shipped agent files with that one line changed.
+fn coder_limited(fx: &Fixture, mock: &Arc<MockModel>, store: DynStore) -> Coder {
+    let folder = common::plain_folder();
+    common::edit_instructions(&folder, |text| {
+        assert!(text.contains("max_turns: 200"));
+        text.replace("max_turns: 200", "max_turns: 2")
+    });
+    let files = adam_coder::AgentFiles::load(Some(folder.path())).expect("the folder loads");
+    let model: DynModel = mock.clone();
+    let def = files
+        .def()
+        .expect("a definition")
+        .mcp_tools(AGENT_NAME, adam_llm_agent::ToolSet::new());
+    let agent = CoderAgent::try_from_def(
+        def,
+        model,
+        "test-model",
+        fx.env.clone(),
+        coder_tools(&fx.env),
+    )
+    .expect("the files assemble");
+    Coder::new(store, agent, &options())
+}
+
+/// A run that reaches its turn limit with a repository's work begun and nothing delivered (a commit
+/// nobody pushed) is a failure that names the limit and carries the closing answer, even when that
+/// answer ends with a question mark. It never parks.
+async fn a_limited_coder_run_with_undelivered_work_fails(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "l1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![
+        call(
+            "l2",
+            "write_file",
+            json!({"path": "hello.txt", "content": "hello\n"}),
+        ),
+        call(
+            "l3",
+            "run_command",
+            json!({"command": "git add -A && git -c user.name=t -c user.email=t@example.com commit -qm local"}),
+        ),
+    ])
+    // The closing turn.
+    .push_text("The commit is local, not pushed. Shall I open the pull request?");
+    let server = Server::start(coder_limited(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(
+        &server,
+        &format!("In {} (base branch main), add hello.txt.", fx.remote_url()),
+    )
+    .await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message("max_turns = 2") && seen.saw_message("before the work was delivered"),
+        "{:#?}",
+        seen.messages
+    );
+    assert!(seen.saw_message("not pushed"), "{:#?}", seen.messages);
+    let view = server
+        .coder
+        .runtime
+        .view(run_id(&seen.task_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.status, RunStatus::Failed);
+    assert!(!view.waiting, "no question is pending");
+    assert!(fx.created_pulls().await.is_empty());
+    assert_eq!(mock.requests().len(), 3);
+}
+
+/// The same limit with a worktree that was prepared and never touched: work was begun, nothing was
+/// delivered, so it fails too.
+async fn a_limited_coder_run_with_a_prepared_untouched_worktree_fails(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "u1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call("u2", "run_command", json!({"command": "ls"}))])
+    .push_text("I only looked around. Where should I start?");
+    let server = Server::start(coder_limited(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(
+        &server,
+        &format!("In {} (base branch main), add hello.txt.", fx.remote_url()),
+    )
+    .await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        seen.labels
+    );
+    assert!(seen.saw_message("max_turns = 2"), "{:#?}", seen.messages);
+    let view = server
+        .coder
+        .runtime
+        .view(run_id(&seen.task_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!view.waiting, "no question is pending");
+}
+
+/// A run with no repository and no scratch project (a question, research) that reaches the limit
+/// completes with its closing answer, marked limited, and never parks, whatever the answer ends
+/// with.
+async fn a_limited_coder_run_with_nothing_owed_completes_and_never_parks(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "n1",
+        "run_command",
+        json!({"command": "echo one"}),
+    )])
+    .push_tool_calls(vec![call(
+        "n2",
+        "run_command",
+        json!({"command": "echo two"}),
+    )])
+    .push_text("Two lookups so far. Shall I go on?");
+    let server = Server::start(coder_limited(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(&server, "What is in the environment?").await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message("Two lookups so far"),
+        "{:#?}",
+        seen.messages
+    );
+    let view = server
+        .coder
+        .runtime
+        .view(run_id(&seen.task_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.status, RunStatus::Done);
+    assert!(!view.waiting);
+    let state: Conversation = serde_json::from_value(view.state.clone()).unwrap();
+    assert!(state.pending_wait.is_none());
+    assert_eq!(view.output.as_ref().expect("output")["limited"], true);
+}
+
 /// What the person is owed is not a statement: a worktree with changes nobody committed or pushed
 /// keeps the run waiting, whatever the last reply says or does not ask.
 async fn work_left_in_a_worktree_is_not_finished_by_a_statement(store: DynStore) {
@@ -5350,6 +5518,9 @@ macro_rules! coder_suite {
                 a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,
                 an_answer_that_asks_nothing_completes_the_task,
                 work_left_in_a_worktree_is_not_finished_by_a_statement,
+                a_limited_coder_run_with_undelivered_work_fails,
+                a_limited_coder_run_with_a_prepared_untouched_worktree_fails,
+                a_limited_coder_run_with_nothing_owed_completes_and_never_parks,
                 a_scratch_project_is_found_again_by_the_next_task_of_the_conversation,
                 the_environment_is_sealed_when_a_project_is_started_and_when_one_is_taken_over,
                 a_stop_without_text_asks_what_to_do,

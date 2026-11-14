@@ -83,7 +83,7 @@ model: coder-large             # a gateway alias; `inherit` = the parent's (defa
 tools: [prepare_workspace, run_checks, ask_user]     # or "a, b, c"; "*" = all; MCP: "linear__*"
 skills: all                    # or a list; default: every skill in this agent's skills/
 limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as limits.max_turns
-  max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none
+  max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 card:                          # root only: becomes adam_a2a::AgentCardConfig
