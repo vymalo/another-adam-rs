@@ -8,6 +8,8 @@ same behaviour). Builds on [ADR 0007](0007-progress-as-steps-and-streamed-text.m
 (steering), [ADR 0020](0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md) (reasoning is never stored) and
 [ADR 0032](0032-usage-per-model-call.md) (usage per call).
 
+*Amended 2026-11-14 ([ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md)):* "one-shot child runs" and "no resume" (the last rows of *What adam-rs does not copy*) are reversed: a subagent can run as a session that is sent further messages. One tool per subagent stays, beside the session tools.
+
 ## Context
 
 OpenCode leaves the coder (ADR 0038), but its loop is well shaped, and the owner wants that shape and a plugin system in

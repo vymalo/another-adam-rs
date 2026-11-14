@@ -10,6 +10,8 @@ the task that is running). **Built:** `STEER_EXTENSION` and `ExtensionConfig::st
 `BackendError::UnsupportedOperation`, the steer path of `RuntimeTaskBackend::submit`, `Ctx::arrived` and
 `Ctx::reopen_on_arrival`, `Conversation::read_ids`, and the recorded model step's `seen`.
 
+*Amended 2026-11-14 ([ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md)):* a session round's report (`adam.child.reported`) counts as a message that arrived, so one that lands during the final model call reopens the turn; `adam.run.finished` of a one-shot child still does not.
+
 *Amended 2026-10-03:* a task is `working` from the moment a worker claims its run, not from its first commit. A turn
 commits once, so during the first model call the run still read as version 1 and the task as `submitted`, and the
 orchestration layer, which steers only a thread that is `working`, held a message sent then until the turn was over. The

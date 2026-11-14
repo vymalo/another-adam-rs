@@ -6,6 +6,8 @@ always a question; and its consequence "a scratch project is deleted when its ru
 [ADR 0008](0008-a-workspace-holds-several-repositories.md) (decision 5: "deleted with the workspace"; the alternative "a
 workspace per conversation"). Builds on [ADR 0003](0003-a-new-task-continues-the-task-it-references.md).
 
+*Amended 2026-11-14 ([ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md)):* a turn that asks nothing does not complete while a session round it started still works, and a kept-open session lives for the thread, as scratch does.
+
 ## Context
 
 The owner tested Adam in production on a thread of seven jobs (2026-10-11). Two things cost him time:

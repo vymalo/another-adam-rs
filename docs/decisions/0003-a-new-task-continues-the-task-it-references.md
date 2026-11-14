@@ -5,6 +5,8 @@ the carry cap), then `adam-a2a-runtime` (choosing the run from `referenceTaskIds
 agent does with a carried conversation (which repositories a task named, reusing a pushed branch) is
 slice 11 of the same branch, built; see *Consequences*.
 
+*Amended 2026-11-14 ([ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md)):* a child run can continue a child run too: a session's round n+1 starts from round n's conversation, and the parent's record of which rounds it has read is carried into a continued task.
+
 *Amended 2026-09-30, after review, before the first release:* decision 3 (the cap gave up the task
 itself in a long chain: tool output is now shortened first and the first user message is never
 dropped), decision 2 (the roles of a continued history alternate), decision 4 (a reference is judged
