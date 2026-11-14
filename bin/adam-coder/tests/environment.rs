@@ -1206,6 +1206,10 @@ async fn a_command_a_timeout_stopped_still_counts() {
 }
 
 /// A command a cancel stopped counts too, though its call ends in an error.
+///
+/// The cancel comes 2 s after the call began and the count starts when the command does, so the
+/// lower bound below leaves 1.7 s for the tool to get the command started: on a loaded machine that
+/// start has taken more than 100 ms.
 #[tokio::test]
 async fn a_command_a_cancel_stopped_still_counts() {
     let (rig, token) = Rig::new().await.cancellable();
@@ -1213,7 +1217,7 @@ async fn a_command_a_cancel_stopped_still_counts() {
     rig.prepare().await;
 
     let cancel_when_running = async {
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         token.cancel();
     };
     let (out, ()) = tokio::time::timeout(Duration::from_secs(30), async {
