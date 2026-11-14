@@ -1,8 +1,8 @@
 # 0044. Paged tools and a stable prompt prefix; a plan, skills, commands and project context are built in
 
-Status: **Proposed** (2026-11-14). The directions are the owner's, given the same day after a comparison of adam-rs at `37d0b11`
-with OpenCode 2.3.0; they are quoted where they decide something. What is marked *recommended* is not the owner's yet: see
-[Open questions](#open-questions). Nothing of it is built. Builds on
+Status: **Accepted** (2026-11-14). The directions are the owner's, given the same day after a comparison of adam-rs at `37d0b11`
+with OpenCode 2.3.0; they are quoted where they decide something, and what was first only recommended was put to the owner
+the same day: see [The owner's answers](#the-owners-answers-2026-11-14). Nothing of it is built. Builds on
 [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md) (the loop, rules, compaction, plugins),
 [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md) (parallel subagents) and
 [ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md) (OpenCode leaves the coder), none of which is built
@@ -61,7 +61,9 @@ Facts about third parties:
    * **The proof** is a test of the loop: for a scripted run, each request's bytes start with the previous request's, except
      across a compaction step.
    * **A cache key** (`MODEL_PROMPT_CACHE_KEY=conversation`, off by default) sends the conversation id as `prompt_cache_key`.
-     Explicit cache breakpoints are not sent: [open question 4](#open-questions).
+   * **Cache markers.** No gateway is assumed (answer 5), so a marker for providers that cache only at marked points is a
+     setting of its own, off by default, built when a deployment names the provider. That any gateway passes one through is
+     *unverified*.
 
 ### Everything that reads is paged
 
@@ -82,7 +84,8 @@ Facts about third parties:
    * The three new tools are tier `plan`, confined to the slot like `read_file`, and bounded in time (30 s).
    * **A backstop in the loop**: a tool result over a common cap (64 KiB) is cut with a marker before it enters the history,
      whatever the tool. A tool with a paged form says how to read the rest; any other says only that it was cut.
-   * An MCP result stays cut at 64 KiB; paging it is [open question 5](#open-questions).
+   * **An MCP result over 64 KiB is kept whole for the run and paged with `read_output`** (answer 4), like a command's
+     output. An agent with no workspace keeps it in the run's state, under the loop's limit on what a run may keep.
 
 ### What stays outside
 
@@ -98,7 +101,8 @@ Facts about third parties:
      dev stack.
    * **Inline** is a capability of the model alias that the deployment declares (`MODEL_OUTPUT_MODALITIES=text,image`). An
      image in the model's answer becomes a shared file ([ADR 0012](0012-files-as-a2a-artifacts.md)) and never enters the
-     history. The wire shape differs by provider and is *unverified*; it is built against the first provider a deployment names.
+     history. The wire shape differs by provider and is *unverified*; it is built later, against the first provider a
+     deployment names (answer 6). The MCP way comes first.
    * **Seeing images** is the other half: with `MODEL_INPUT_MODALITIES=text,image`, `read_file` on an image gives it to the
      model; without, it answers as today that the file is binary.
 
@@ -116,10 +120,13 @@ Facts about third parties:
    * **What the person sees.** A surface on a screen that can draw it, and a step otherwise.
    * A subagent has no plan of its own in the first slice.
 6. **`ask_user` gets more kinds of question.** The owner: "`ask_user` should be made better, support more variants of
-   questions." *Recommended* set, beside the six of today: `confirm` (yes or no, with the two labels), `number` (`min`, `max`,
+   questions." Beside the six of today (answer 3): `confirm` (yes or no, with the two labels), `number` (`min`, `max`,
    `step`, `unit`), `scale` (a rating between two labelled ends), `date` (a day, or a day and a time) and `rank` (put 2 to 12
    options in order). Each needs a component version on the screen's side (`docs/api/ui-catalog-v1.md` of
    `vymalo/another-agentic-system`); on a screen without it the question degrades to text, as today, and never fails the run.
+   The owner also: "Images, graphs,... A2UI is enabled by default so we might as well use it." So **a question may show what
+   it asks about**: the form takes the display blocks `show` already draws (an image shared in the conversation, a graph, a
+   card) above its questions, checked against the screen's catalog like the rest.
 7. **`share_file` and `show` say how to be used.** The owner asks for "good doc, around how the agent should use them". Their
    descriptions are rewritten: when to use each, when not, the limits, one example each. The reference page gains a section
    for a person who writes an agent. The descriptions are pinned by the prompt's golden file.
@@ -129,11 +136,10 @@ Facts about third parties:
    * `load_skill`'s `name` becomes a string checked at the call (an unknown name lists what exists), no longer an enum, so the
      tool's schema does not change when a skill appears (decision 1).
    * **The coder ships skills** of its own for its recurring work (the first set is a slice).
-   * *Recommended reading of "if present":* the skills of the repository a run works on (`.agents/skills`, `.claude/skills`,
+   * **"If present" includes the repository** (answer 2): the skills of the repository a run works on (`.agents/skills`, `.claude/skills`,
      `.opencode/skills` of a slot) are listed to the model when the slot is prepared, as a message, and loaded with the same
      tool. They are text from the repository, trusted as its `AGENTS.md` is (decision 10): they grant no tool and no tier.
-9. **Commands: yes, as prompt templates the agent serves** (*recommended*; the owner asked "Should it support slash
-   commands?"). The slash is the client's; the template is the agent's, so every client of an agent gets the same commands.
+9. **Commands: yes, as prompt templates the agent serves** (the owner asked "Should it support slash commands?", answer 1). The slash is the client's; the template is the agent's, so every client of an agent gets the same commands.
    * **Where.** `commands/<name>.md` in the agent folder: a `description`, an `argument-hint`, and a body with `$ARGUMENTS`
      and `$1`, `$2`. MCP prompts become commands once the client reads them.
    * **How a client learns them.** An optional extension of the card, `https://agents.vymalo.com/a2a/extensions/commands/v1`,
@@ -236,7 +242,7 @@ stateDiagram-v2
 
 ## Slices
 
-Each is testable alone. Slices 1 to 4 need no open question answered.
+Each is testable alone.
 
 | Order | Slice | Proof | Depends on |
 |---|---|---|---|
@@ -251,19 +257,18 @@ Each is testable alone. Slices 1 to 4 need no open question answered.
 | 9 | **Compaction and overflow recovery** (ADR 0039 slices 1 and 8; decision 11) | a scripted long run is summarised once and keeps the prefix after it; a rejected prompt is compacted and retried once | 4 |
 | 10 | **`doom_loop`**, tool and child time limits, the cancel that reaches a child | a call repeated three times is denied; a child past its limit is an error result | nothing |
 | 11 | **`ask_user` kinds**, the `share_file` and `show` descriptions | each kind validates and degrades to text; the golden prompt | the screen's catalog for the forms |
-| 12 | **Commands** and the `commands/v1` extension | a card lists them; metadata and `/name` expand the same; an unknown one is `InvalidParams` | open question 1 |
+| 12 | **Commands** and the `commands/v1` extension | a card lists them; metadata and `/name` expand the same; an unknown one is `InvalidParams` | nothing |
 | 13 | **References** as read-only slots | a write there is refused; a repository-declared one asks | 7 |
 | 14 | **MCP**: timeouts per server, server instructions, prompts; the image example | a slow server is bounded by its own setting | nothing |
-| 15 | **Modalities**: images in, images out | built against a named provider | open question 3 |
+| 15 | **Modalities**: images in, then images out | built against a named provider | a deployment that names one |
 | 16 | **Commands that keep running** | started, read, stopped; gone with the pod | 3 |
 
-## Open questions
+## The owner's answers (2026-11-14)
 
-1. **Commands (decision 9).** Is "yes, as templates in the agent folder, announced by an extension" the answer the owner wants?
-2. **Skills from the repository a run works on (decision 8).** Is that what "a model can pick a new skill if present" means, or
-   only the agent's own folder?
-3. **Inline images (decision 4).** Which provider or gateway first? Its wire shape decides the client's code.
-4. **Cache breakpoints.** Providers that cache only at marked points (Anthropic behind a gateway) need a marker in the
-   request. Which gateway does the deployment use, and does it pass one through? *Unverified.*
-5. **Paging an MCP result.** Keep the 64 KiB cut, or keep the whole result and page it with `read_output`?
-6. **The `ask_user` kinds (decision 6).** Is the recommended set the right one?
+1. **Commands:** the agent serves them: templates in its folder, announced by the `commands/v1` extension, invoked by
+   metadata or by text.
+2. **Skills:** the agent's folder and the repository a run works on. A repository's skills grant no tool and no tier.
+3. **`ask_user`:** `confirm`, `number` and `scale`, `date` and `rank`, and images and graphs in a question through A2UI.
+4. **A large MCP result** is kept and paged.
+5. **The gateway is not fixed.** adam-rs assumes none, and each behaviour that depends on one is a setting.
+6. **Inline images** come later; image generation through an MCP server comes first.
