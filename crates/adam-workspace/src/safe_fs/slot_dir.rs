@@ -229,6 +229,41 @@ impl Dir {
         Ok(Meta::of(&stat))
     }
 
+    /// The entries of this directory (`.` and `..` left out) with what each is, without following
+    /// any, **sorted by the bytes of the name**: the order does not depend on the file system. An
+    /// entry that goes away while the directory is read is left out.
+    ///
+    /// The directory is read through a new open file description of this descriptor, so two
+    /// listings at once do not share a position.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `openat`, `getdents` and `lstat`.
+    pub fn entries(&self) -> io::Result<Vec<(OsString, Meta)>> {
+        let fd = rustix::fs::openat(
+            &self.fd,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let mut out = Vec::new();
+        for entry in rustix::fs::Dir::read_from(&fd)? {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let name = OsString::from_vec(name.to_vec());
+            match self.lstat(&name) {
+                Ok(meta) => out.push((name, meta)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        Ok(out)
+    }
+
     /// The directory `name` of this one, opened as [`open_dir`](Self::open_dir) does, with the
     /// kernel's refusal of links (`openat2`) when `backend` is [`Backend::Kernel`].
     fn open_dir_using(&self, name: &OsStr, backend: Backend) -> io::Result<Dir> {
@@ -1313,6 +1348,28 @@ mod tests {
             std::fs::remove_file(path.join("sub")).unwrap();
             std::fs::rename(path.join("sub.away"), path.join("sub")).unwrap();
         }
+    }
+
+    #[test]
+    fn entries_are_sorted_by_bytes_say_what_each_is_and_follow_nothing() {
+        let tmp = slot();
+        symlink(tmp.path().join("outside"), tmp.path().join("slot/l")).unwrap();
+        std::fs::write(tmp.path().join("slot/B"), "").unwrap();
+        let held = open(&tmp, Backend::detect());
+        let entries = held.entries().unwrap();
+        let names: Vec<_> = entries
+            .iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [".git", "B", "a.txt", "l", "sub"]);
+        assert!(entries[1].1.is_file());
+        assert!(entries[3].1.is_symlink(), "a link is a link, not its target");
+        assert!(entries[4].1.is_dir());
+        // The directory below is listed through its own descriptor, and twice gives the same.
+        let sub = held.open_dir(OsStr::new("sub")).unwrap();
+        let below: Vec<_> = sub.entries().unwrap().into_iter().map(|e| e.0).collect();
+        assert_eq!(below, [OsString::from("b.txt"), OsString::from("deep")]);
+        assert_eq!(held.entries().unwrap(), entries);
     }
 
     #[test]
