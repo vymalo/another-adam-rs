@@ -1,5 +1,6 @@
 //! The [`Tool`] trait and the values that flow through it.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use serde_json::{Map, Value};
 
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
 use crate::plan::Plan;
+use crate::kept::KeptOutput;
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
@@ -258,6 +260,15 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Box<Plan>>,
+    /// A long text the tool wants the run to keep **in its own state**, for
+    /// [`read_output`](crate::ReadOutput) to page through ([`keep_long`](crate::keep_long) makes it,
+    /// and only when the agent has no [`KeptStore`](crate::KeptStore)). The loop moves it into
+    /// [`Conversation::kept_outputs`](crate::Conversation::kept_outputs); it is journaled with the
+    /// result, so a replay keeps the same text.
+    ///
+    /// Absent from a journal written before it existed, and not written while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<Box<KeptOutput>>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -276,6 +287,7 @@ impl ToolOutput {
             sandbox: SandboxUsage::new(),
             repeat_key: None,
             plan: None,
+            kept: None,
         }
     }
 
@@ -291,6 +303,7 @@ impl ToolOutput {
             sandbox: SandboxUsage::new(),
             repeat_key: None,
             plan: None,
+            kept: None,
         }
     }
 
@@ -519,6 +532,10 @@ pub struct ToolCtx {
     /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
     /// the context, so a tool may hand one to a task it spawns.
     sandbox: Arc<Mutex<SandboxUsage>>,
+    /// The bytes the run may still keep in its own state ([`kept_left`](Self::kept_left)).
+    kept_left: usize,
+    /// The outputs the run keeps in its own state ([`kept_text`](Self::kept_text)).
+    kept: Arc<BTreeMap<String, String>>,
     /// The conversation's plan as the call starts ([`plan`](Self::plan)).
     plan: Option<Arc<Plan>>,
     /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
@@ -571,6 +588,8 @@ impl ToolCtx {
             sandbox: Arc::default(),
             plan: None,
             scrub: None,
+            kept_left: 0,
+            kept: Arc::default(),
         }
     }
 
@@ -612,6 +631,26 @@ impl ToolCtx {
     /// there.
     pub fn plan(&self) -> Option<&Plan> {
         self.plan.as_deref()
+
+    /// Say how many bytes the run may still keep in its own state and what it keeps there:
+    /// [`kept_left`](Self::kept_left) and [`kept_text`](Self::kept_text). The agent loop does it for
+    /// every call.
+    #[must_use]
+    pub fn with_kept(mut self, left: usize, kept: Arc<BTreeMap<String, String>>) -> Self {
+        self.kept_left = left;
+        self.kept = kept;
+        self
+    }
+
+    /// The bytes a tool may still hand back in [`ToolOutput::kept`]: [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES)
+    /// less what the run keeps already (none for a detached context).
+    pub fn kept_left(&self) -> usize {
+        self.kept_left
+    }
+
+    /// The text the run keeps under the output id `id` in its own state.
+    pub fn kept_text(&self, id: &str) -> Option<&str> {
+        self.kept.get(id).map(String::as_str)
     }
 
     /// Say how many bytes of files the run may still share: what [`files_left`](Self::files_left)

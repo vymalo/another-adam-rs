@@ -161,7 +161,8 @@ impl Page {
             if self.numbered {
                 let _ = writeln!(out, "{:>NUMBER_WIDTH$}\t{}", line.number, line.text);
             } else {
-                let _ = writeln!(out, "{}", line.text);
+                let (lead, rest) = escape_lead(&line.text, false);
+                let _ = writeln!(out, "{lead}{rest}");
             }
         }
         match self.next_offset() {
@@ -246,7 +247,26 @@ fn next_line(
 }
 
 /// Bytes a line takes when rendered, its line end included.
+/// A line of an unnumbered page (a kept output) that starts with `[` is shown with that character
+/// written `\x5b`: the last line of a page is then the only one that starts with `[`, however the
+/// text was made up.
+fn escape_lead(text: &str, numbered: bool) -> (&'static str, &str) {
+    match text.strip_prefix('[') {
+        Some(rest) if !numbered => ("\\x5b", rest),
+        _ => ("", text),
+    }
+}
+
 fn rendered_len(number: u64, text: &str, numbered: bool) -> usize {
+    let extra = if escape_lead(text, numbered).0.is_empty() {
+        0
+    } else {
+        3
+    };
+    extra + rendered_len_plain(number, text, numbered)
+}
+
+fn rendered_len_plain(number: u64, text: &str, numbered: bool) -> usize {
     let prefix = if numbered {
         NUMBER_WIDTH.max(number.to_string().len()) + 1
     } else {

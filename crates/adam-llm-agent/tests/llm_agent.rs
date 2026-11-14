@@ -3701,3 +3701,405 @@ async fn replay_gives_the_same_cut_bytes() {
     let expected = adam_llm_agent::paging::backstop(&whole, "bulky", false);
     assert_eq!(conversation(&view).messages[2].text(), expected.as_ref());
 }
+
+// ---------------------------------------------------------------------------
+// Kept output (ADR 0044, slice 3): a long result is kept and read back by `read_output`
+// ---------------------------------------------------------------------------
+
+/// Answers a long text, kept for `read_output` the way `adam-mcp` keeps a long result.
+struct Wordy {
+    text: String,
+}
+
+#[async_trait]
+impl Tool for Wordy {
+    fn spec(&self) -> ToolSpec {
+        spec("wordy")
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let (shown, kept) = adam_llm_agent::keep_long(ctx, &self.text).await;
+        let mut output = ToolOutput::text(shown);
+        output.kept = kept;
+        Ok(output)
+    }
+}
+
+/// 7,000 lines of 11 bytes: 77,000 bytes, four pages of at most 2,000 lines.
+fn rows() -> String {
+    (0..7000).map(|i| format!("row-{i:06}\n")).collect()
+}
+
+/// What each request carries ahead of its last message must be what the request before it carried:
+/// `system` and `tools` byte for byte, and the messages as a prefix.
+fn assert_prefix_holds(requests: &[adam_model::ModelRequest]) {
+    assert!(requests.len() > 1);
+    for pair in requests.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        assert_eq!(
+            serde_json::to_string(&(&a.system, &a.tools)).unwrap(),
+            serde_json::to_string(&(&b.system, &b.tools)).unwrap(),
+            "system and tools are the same in every request"
+        );
+        assert!(b.messages.len() > a.messages.len());
+        assert_eq!(
+            serde_json::to_string(&a.messages[..]).unwrap(),
+            serde_json::to_string(&b.messages[..a.messages.len()]).unwrap(),
+            "a request starts with the messages of the one before it"
+        );
+    }
+}
+
+fn tool_texts(view: &RunView) -> Vec<String> {
+    conversation(view)
+        .messages
+        .iter()
+        .filter(|m| matches!(m, adam_model::Message::Tool { .. }))
+        .map(adam_model::Message::text)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_long_result_is_kept_in_the_state_and_read_back_whole_page_by_page() {
+    let h = Harness::new();
+    let text = rows();
+    let agent = h
+        .agent()
+        .instructions("be brief")
+        .tool(Wordy { text: text.clone() })
+        .tool(adam_llm_agent::ReadOutput)
+        .build();
+    let rt = h.runtime(&agent);
+    // The id names the run, so the run starts before the model is scripted to read it.
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let id = adam_llm_agent::output_id(&run.to_string(), "c1");
+    h.mock.push_tool_calls(vec![call("c1", "wordy", json!({}))]);
+    for offset in [2001, 4001, 6001] {
+        h.mock.push_tool_calls(vec![call(
+            &format!("r{offset}"),
+            "read_output",
+            json!({"id": id, "offset": offset}),
+        )]);
+    }
+    h.mock.push_text("done");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let state = conversation(&view);
+    assert_eq!(state.kept_outputs.get(&id), Some(&text));
+    let texts = tool_texts(&view);
+    assert_eq!(texts.len(), 4);
+    let head = format!("[kept as {id}: 7000 lines; read_output {{\"id\":\"{id}\"}} reads it]\n");
+    assert!(texts[0].starts_with(&head), "{}", &texts[0][..120]);
+    assert!(
+        texts[0].ends_with("[more: 5000 lines left; next page: offset=2001]"),
+        "{}",
+        &texts[0][texts[0].len() - 80..]
+    );
+    let mut all = String::new();
+    for (n, said) in texts.iter().enumerate() {
+        let body = said.strip_prefix(&head).unwrap_or(said);
+        let (lines, last) = body.rsplit_once('\n').unwrap();
+        all.push_str(lines);
+        all.push('\n');
+        if n < 3 {
+            assert!(last.starts_with("[more: "), "{last}");
+        } else {
+            assert_eq!(last, "[end: 7000 lines]");
+        }
+    }
+    assert_eq!(all, text, "no byte lost");
+    assert_prefix_holds(&h.mock.requests());
+
+    // The same call again gives the same bytes.
+    let again = adam_llm_agent::page_of(&id, &text, 2001, 2000).unwrap();
+    assert_eq!(again, texts[1]);
+}
+
+#[tokio::test]
+async fn kept_output_survives_a_replay() {
+    let h = Harness::new();
+    let reached = Arc::new(Notify::new());
+    let text = rows();
+    let agent = h
+        .agent()
+        .tool(Wordy { text: text.clone() })
+        .tool(AsyncTool2 {
+            name: "b",
+            calls: Arc::new(AtomicUsize::new(0)),
+            first: Arc::new(AtomicBool::new(true)),
+            reached: reached.clone(),
+        })
+        .tool(adam_llm_agent::ReadOutput)
+        .build();
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "wordy", json!({})),
+            call("c2", "b", json!({})),
+        ])
+        .push_text("done");
+    let (rt_a, rt_b) = (
+        h.runtime_with(&agent, "crash-a", short_lease),
+        h.runtime_with(&agent, "crash-b", short_lease),
+    );
+    let run = rt_a.start("llm", user_message("go"), None).await.unwrap();
+    let doomed = spawn_worker(&rt_a);
+    notified(&reached, "tool b starting").await;
+    doomed.handle.abort();
+    let _ = doomed.handle.await;
+    let survivor = spawn_worker(&rt_b);
+    let view = wait_done(&rt_b, run).await;
+    survivor.stop().await;
+    let id = adam_llm_agent::output_id(&run.to_string(), "c1");
+    assert_eq!(
+        conversation(&view).kept_outputs.get(&id),
+        Some(&text),
+        "the recorded result carried the kept text across the crash"
+    );
+}
+
+#[tokio::test]
+async fn a_result_over_the_runs_room_is_not_kept_and_says_so() {
+    let h = Harness::new();
+    let line = "x".repeat(70) + "\n";
+    let text = line.repeat(adam_llm_agent::MAX_RUN_KEPT_BYTES / line.len() + 10);
+    let agent = h
+        .agent()
+        .tool(Wordy { text })
+        .tool(adam_llm_agent::ReadOutput)
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "wordy", json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert!(conversation(&view).kept_outputs.is_empty());
+    let shown = &tool_texts(&view)[0];
+    assert!(
+        shown.contains("[not kept: a run keeps at most 4 MiB of long results here"),
+        "{}",
+        &shown[shown.len().saturating_sub(200)..]
+    );
+    assert!(shown.starts_with(&"x".repeat(70)));
+}
+
+#[tokio::test]
+async fn read_output_says_what_is_wrong_with_the_id() {
+    let h = Harness::new();
+    let agent = h.agent().tool(adam_llm_agent::ReadOutput).build();
+    h.mock
+        .push_tool_calls(vec![
+            call("r1", "read_output", json!({"id": "../etc/passwd"})),
+            call("r2", "read_output", json!({"id": "o-0123456789abcdef"})),
+            call("r3", "read_output", json!({})),
+        ])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let said = tool_texts(&view);
+    assert!(said[0].contains("is not an output id"), "{}", said[0]);
+    assert!(
+        said[1].contains("no kept output `o-0123456789abcdef` in this run"),
+        "{}",
+        said[1]
+    );
+    assert_eq!(said[2], "id is required");
+}
+
+#[tokio::test]
+async fn with_a_store_in_the_state_the_text_is_not_in_the_run() {
+    let h = Harness::new();
+    let text = rows();
+    let store = Arc::new(adam_llm_agent::KeptStore(Arc::new(
+        adam_llm_agent::MemoryKept::new(),
+    )));
+    let agent = h
+        .agent()
+        .state(store)
+        .tool(Wordy { text })
+        .tool(adam_llm_agent::ReadOutput)
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "wordy", json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert!(conversation(&view).kept_outputs.is_empty());
+    assert!(tool_texts(&view)[0].starts_with("[kept as o-"));
+    assert!(
+        !view.state.to_string().contains("row-006999"),
+        "nothing of the text but the first page is in the run's state"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Kept output, round 2: what the reviews found
+// ---------------------------------------------------------------------------
+
+/// Answers what it is given as a kept text, as an error result when `fail` says so.
+struct Keeper {
+    text: String,
+    fail: bool,
+}
+
+#[async_trait]
+impl Tool for Keeper {
+    fn spec(&self) -> ToolSpec {
+        spec("keeper")
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let (shown, kept) = adam_llm_agent::keep_long(ctx, &self.text).await;
+        let mut output = if self.fail {
+            ToolOutput::error(shown)
+        } else {
+            ToolOutput::text(shown)
+        };
+        output.kept = kept;
+        Ok(output)
+    }
+}
+
+#[tokio::test]
+async fn the_runs_four_mib_is_a_bound_and_every_id_the_model_was_shown_reads() {
+    let h = Harness::new();
+    let line = format!("{}\n", "x".repeat(70));
+    let text = line.repeat(3 * 1024 * 1024 / line.len());
+    let agent = h
+        .agent()
+        .tool(Keeper {
+            text: text.clone(),
+            fail: false,
+        })
+        .tool(adam_llm_agent::ReadOutput)
+        .build();
+    let rt = h.runtime(&agent);
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let first = adam_llm_agent::output_id(&run.to_string(), "c1");
+    h.mock
+        .push_tool_calls(vec![call("c1", "keeper", json!({}))])
+        .push_tool_calls(vec![call("c2", "keeper", json!({}))])
+        .push_tool_calls(vec![call(
+            "r1",
+            "read_output",
+            json!({"id": first, "offset": -1}),
+        )])
+        .push_text("done");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let said = tool_texts(&view);
+    assert!(
+        said[0].starts_with(&format!("[kept as {first}:")),
+        "{}",
+        &said[0][..80]
+    );
+    assert!(
+        said[1].contains("[not kept: a run keeps at most 4 MiB"),
+        "{}",
+        said[1].chars().rev().take(200).collect::<String>()
+    );
+    assert!(
+        !said[1].contains("[kept as"),
+        "the second names no id: it is not kept"
+    );
+    assert!(said[2].contains("[end: "), "{}", said[2]);
+    assert_eq!(conversation(&view).kept_outputs.len(), 1);
+}
+
+#[tokio::test]
+async fn a_long_line_is_kept_folded_and_reassembles_from_its_pages() {
+    let h = Harness::new();
+    let text = format!("{}\nshort\n", "ab".repeat(20_000));
+    let agent = h
+        .agent()
+        .tool(Keeper {
+            text: text.clone(),
+            fail: false,
+        })
+        .tool(adam_llm_agent::ReadOutput)
+        .build();
+    let rt = h.runtime(&agent);
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let id = adam_llm_agent::output_id(&run.to_string(), "c1");
+    h.mock
+        .push_tool_calls(vec![call("c1", "keeper", json!({}))])
+        .push_tool_calls(vec![call(
+            "r1",
+            "read_output",
+            json!({"id": id, "offset": 1}),
+        )])
+        .push_text("done");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let state = conversation(&view);
+    // What the state keeps is the prepared text (folded), not the raw one.
+    let kept = state.kept_outputs.get(&id).unwrap();
+    assert!(kept.lines().all(|l| l.chars().count() <= 2000));
+    assert_eq!(kept.replace('\n', ""), text.replace('\n', ""));
+    let said = tool_texts(&view);
+    let page = &said[1];
+    let body = page.rsplit_once('\n').unwrap().0;
+    assert_eq!(body.replace('\n', ""), text.replace('\n', ""));
+}
+
+#[tokio::test]
+async fn an_error_result_never_puts_a_text_in_the_state() {
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .tool(Keeper {
+            text: rows(),
+            fail: true,
+        })
+        .tool(adam_llm_agent::ReadOutput)
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "keeper", json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert!(conversation(&view).kept_outputs.is_empty());
+}
+
+/// With a keeper in the state, what the model is shown of the first page is made from what the
+/// keeper kept (scrubbed by it), never from the text the tool gave.
+#[tokio::test]
+async fn the_first_page_is_made_from_what_the_keeper_kept() {
+    let h = Harness::new();
+    let secret = "tok-1234-secret-value";
+    let text = format!("first line {secret}\n{}", rows());
+    let store = Arc::new(adam_llm_agent::KeptStore(Arc::new(
+        adam_llm_agent::MemoryKept::new()
+            .scrubbing(|t| t.replace("tok-1234-secret-value", "[redacted]")),
+    )));
+    let agent = h
+        .agent()
+        .state(store)
+        .tool(Keeper { text, fail: false })
+        .tool(adam_llm_agent::ReadOutput)
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "keeper", json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let shown = &tool_texts(&view)[0];
+    assert!(!shown.contains(secret), "{}", &shown[..200]);
+    assert!(shown.contains("first line [redacted]"), "{}", &shown[..200]);
+}

@@ -1,5 +1,8 @@
 //! The agent's durable state and the inbound message format.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use adam_core::RunId;
 use adam_model::{Message, ToolCall, Usage};
 use adam_runtime::{Inbound, SandboxUsage, UsageTotals};
@@ -311,6 +314,20 @@ pub struct Conversation {
     /// that continues another starts with none (a new task).
     #[serde(default, skip_serializing_if = "SandboxUsage::is_empty")]
     pub sandbox_usage: SandboxUsage,
+    /// The long outputs this run keeps in its own state, by output id, for
+    /// [`read_output`](crate::ReadOutput): what a tool handed back in
+    /// [`ToolOutput::kept`](crate::ToolOutput::kept) when its agent has no
+    /// [`KeptStore`](crate::KeptStore) (an agent that is only a folder). At most
+    /// [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES) in all. Absent from state written before it
+    /// existed, and not written while empty; a run that continues another starts with none (its
+    /// history names outputs of the run before, which are not kept for it).
+    ///
+    /// Shared behind an `Arc` (the calls of a turn read it without a copy; a write makes the one
+    /// copy when something still holds the old). **One write of the state can cost up to
+    /// [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES) (4 MiB) beside the history**, and the step
+    /// of the call that kept a text journals it once more (in its result).
+    #[serde(default, skip_serializing_if = "is_empty_map")]
+    pub kept_outputs: Arc<BTreeMap<String, String>>,
     /// Calls of the last assistant message that have no result yet, in order.
     /// Only non-empty while a step is in flight or the run is parked on
     /// [`pending_wait`](Self::pending_wait).
@@ -842,6 +859,23 @@ impl Conversation {
         self.continued_within(text, from, MAX_CARRIED_BYTES)
     }
 
+    /// Keep what a call asked the run to keep, if it fits the room the run has: the call was told
+    /// its room ([`ToolCtx::kept_left`](crate::ToolCtx::kept_left)), so a result over it was never
+    /// offered. An error result's is never offered either.
+    pub(crate) fn keep_output(&mut self, kept: Option<Box<crate::kept::KeptOutput>>) {
+        if let Some(kept) = kept
+            && self.kept_bytes() + kept.text.len() <= crate::kept::MAX_RUN_KEPT_BYTES
+        {
+            let crate::kept::KeptOutput { id, text } = *kept;
+            Arc::make_mut(&mut self.kept_outputs).insert(id, text);
+        }
+    }
+
+    /// The bytes of the outputs the run keeps in its own state.
+    pub fn kept_bytes(&self) -> usize {
+        self.kept_outputs.values().map(String::len).sum()
+    }
+
     fn continued_within(&self, text: impl Into<String>, from: RunId, cap: usize) -> Self {
         let mut prior = self.messages.clone();
         answer_owed_calls(&mut prior);
@@ -864,6 +898,16 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A continuing task starts with no kept output: its history names ids it cannot read.
+    #[test]
+    fn a_continued_run_carries_no_kept_output() {
+        let mut prior = Conversation::new("first");
+        Arc::make_mut(&mut prior.kept_outputs).insert("o-0123456789abcdef".into(), "text\n".into());
+        let next = prior.continued("second", RunId::new());
+        assert!(next.kept_outputs.is_empty());
+        assert_eq!(prior.kept_outputs.len(), 1);
+    }
 
     #[test]
     fn a_continued_run_starts_with_no_repeat_count_and_no_limit() {
@@ -1926,4 +1970,8 @@ mod tests {
         assert!(shortened(&next.messages[2]));
         assert!(!shortened(&next.messages[10]));
     }
+}
+
+fn is_empty_map(map: &Arc<BTreeMap<String, String>>) -> bool {
+    map.is_empty()
 }

@@ -139,7 +139,7 @@ impl Rig {
         }
     }
 
-    fn agent(&self, tool: RemoteTool) -> LlmAgent {
+    fn agent(&self, tool: impl Tool) -> LlmAgent {
         let model: DynModel = self.mock.clone();
         LlmAgent::builder(&self.name, model, "m").tool(tool).build()
     }
@@ -612,5 +612,58 @@ async fn a_remote_result_that_carries_a_plan_sets_it_and_an_error_result_leaves_
         worker.stop().await;
         assert_eq!(conversation(&done).plan, None, "{backend}");
         assert!(done.state.get("plan").is_none(), "{backend}");
+    }
+}
+
+/// A remote task whose answer is long: it is kept (the view names an id), so the run must keep
+/// it, as it does for a call that answers at once.
+struct LongAnswer;
+
+#[async_trait]
+impl Tool for LongAnswer {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "remote".into(),
+            description: "starts a remote task".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::AwaitRemote {
+            task: format!("task-of-{}", ctx.call_id()),
+            timeout_ms: None,
+        })
+    }
+
+    async fn poll_remote(&self, ctx: &ToolCtx, _task: &str) -> Result<RemotePoll, ToolError> {
+        let text: String = (0..7000).map(|i| format!("row-{i:06}\n")).collect();
+        let (shown, kept) = adam_llm_agent::keep_long(ctx, &text).await;
+        let mut output = ToolOutput::text(shown);
+        output.kept = kept;
+        Ok(RemotePoll::Ready(output))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_answer_of_a_remote_task_is_kept_when_its_view_names_an_id() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new("noted");
+        let rt = rig.runtime(&store, rig.agent(LongAnswer));
+        let run = rt.start(&rig.name, user_message("go"), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        wait_for(&rt, run, "parked", |v| v.status == RunStatus::Parked).await;
+        rig.clock.advance(Duration::from_secs(61));
+        wait_done(&rt, run).await;
+        worker.stop().await;
+        let state = conversation(&rt.view(run).await.unwrap().unwrap());
+        let id = adam_llm_agent::output_id(&run.to_string(), "c1");
+        let shown = &tool_results(&state)[0].1;
+        assert!(shown.starts_with(&format!("[kept as {id}:")), "{backend}: {shown}");
+        assert_eq!(
+            state.kept_outputs.get(&id).map(String::len),
+            Some(7000 * 11),
+            "{backend}: the id the model was shown reads"
+        );
     }
 }

@@ -139,6 +139,7 @@ mod agent;
 mod conversation;
 mod fn_tool;
 mod history;
+mod kept;
 pub mod paging;
 mod plan;
 #[cfg(feature = "schema")]
@@ -166,6 +167,12 @@ pub use fn_tool::FnTool;
 pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};
 pub use history::TRUNCATION_MARKER_PREFIX;
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
+pub use kept::{
+    KeptError, KeptInfo, KeptMap, KeptOutput, KeptOutputs, KeptStore, MAX_KEPT_BYTES,
+    MAX_RUN_KEPT_BYTES, MemoryKept, READ_OUTPUT, ReadOutput, SCRUB_OVERLAP, call_key, count_lines,
+    is_output_id, keep_long, kept_header, kept_outputs_conformance, kept_view, output_id,
+    output_id_of, page_of, prepare, unkept_view,
+};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
 pub use source::{

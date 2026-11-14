@@ -1,6 +1,6 @@
 //! [`LlmAgent`]: the durable model <-> tools loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ use crate::conversation::{
     PendingWait, Repeats, parse_context, parse_root_run, parse_root_step, parse_user_text,
 };
 use crate::history::fit_history;
+use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
 use crate::paging::backstop;
 use crate::plan::Plan;
 use crate::source::{
@@ -40,12 +41,15 @@ use crate::tool::{
 use crate::toolset::ToolSet;
 
 /// What the run state says to the call it is about to run.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CallFacts {
     /// Bytes of files the run has already handed over.
     files_used: u64,
     /// The turn that asked for the call stopped at the output limit.
     output_cut: bool,
+    /// The outputs the run keeps in its own state, and how many bytes it may still keep there.
+    kept: Arc<BTreeMap<String, String>>,
+    kept_left: usize,
 }
 
 /// What the model is asked in the closing turn, the last model call of a run that reached
@@ -1278,6 +1282,8 @@ impl LlmAgent {
                     CallFacts {
                         files_used: used,
                         output_cut: state.output_cut,
+                        kept: Arc::clone(&state.kept_outputs),
+                        kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                     },
                 )
                 .await?;
@@ -1289,6 +1295,7 @@ impl LlmAgent {
                     answer,
                     repeat_key,
                     plan,
+                    kept,
                 } => {
                     if let Some(answer) = answer {
                         state.announce(answer);
@@ -1297,6 +1304,9 @@ impl LlmAgent {
                     if let Some(plan) = plan {
                         state.plan = Some(*plan);
                     }
+                    // What the call asked the run to keep, within what the run may keep: the call was
+                    // told its room (`ToolCtx::kept_left`), so a result over it was never offered.
+                    state.keep_output(kept);
                     (message, artifacts)
                 }
                 ToolResult::NeedsInput { question, ui } => {
@@ -1405,6 +1415,8 @@ impl LlmAgent {
         let CallFacts {
             files_used,
             output_cut,
+            kept,
+            kept_left,
         } = facts;
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
         // What the listing that offered this tool said about it. Only a source's tool has a note: the
@@ -1444,6 +1456,7 @@ impl LlmAgent {
                 answer: None,
                 repeat_key: None,
                 plan: None,
+                kept: None,
             };
             return Ok((answered, SandboxUsage::new()));
         }
@@ -1451,7 +1464,8 @@ impl LlmAgent {
         let tool_ctx = self
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
             .with_note(note.cloned())
-            .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used));
+            .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used))
+            .with_kept(kept_left, kept);
         let args = call.arguments.clone();
         // What a source holds back is refused here too, inside the step that records the answer:
         // the model was shown the tools of a turn that may be over, or named one it was not shown.
@@ -1519,6 +1533,7 @@ impl LlmAgent {
                     answer: None,
                     repeat_key: None,
                     plan: None,
+                    kept: None,
                 };
                 return Ok((answered, SandboxUsage::new()));
             }
@@ -1570,7 +1585,7 @@ impl LlmAgent {
         let answered = match outcome {
             Ok(output) => {
                 let repeat_key = output.repeat_key.as_deref().cloned();
-                let (message, artifacts, answer, plan, outcome) = output_message(
+                let (message, artifacts, answer, plan, outcome, kept) = output_message(
                     ctx,
                     &call.id,
                     &call.name,
@@ -1598,6 +1613,7 @@ impl LlmAgent {
                     answer,
                     repeat_key,
                     plan,
+                    kept,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -1622,6 +1638,7 @@ impl LlmAgent {
                     answer: None,
                     repeat_key: None,
                     plan: None,
+                    kept: None,
                 }
             }
             Err(ToolError::Transient(reason)) => {
@@ -1854,6 +1871,10 @@ impl LlmAgent {
             )
             .with_files_left(
                 (MAX_RUN_FILE_BYTES as u64).saturating_sub(files_kept(&state.artifacts)),
+            )
+            .with_kept(
+                MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
+                Arc::clone(&state.kept_outputs),
             );
         let task = wait.task.clone();
         let polled: Result<RemotePoll, ToolError> = ctx
@@ -1865,7 +1886,7 @@ impl LlmAgent {
             Ok(RemotePoll::Working) => Ok(None),
             Ok(RemotePoll::Ready(output)) => {
                 let used = files_kept(&state.artifacts);
-                let (message, artifacts, answer, plan, outcome) = output_message(
+                let (message, artifacts, answer, plan, outcome, kept) = output_message(
                     ctx,
                     &wait.call_id,
                     &wait.tool,
@@ -1875,6 +1896,7 @@ impl LlmAgent {
                 )
                 .await;
                 add_artifact_refs(&mut state.artifacts, artifacts);
+                state.keep_output(kept);
                 if let Some(answer) = answer {
                     state.announce(answer);
                 }
@@ -1958,6 +1980,7 @@ async fn output_message(
     Option<Announcement>,
     Option<Box<Plan>>,
     StepState,
+    Option<Box<KeptOutput>>,
 ) {
     let mut used = files_used;
     let mut refused: Vec<String> = Vec::new();
@@ -2002,6 +2025,7 @@ async fn output_message(
         ctx.emit(RunEvent::from(artifact)).await;
     }
     let ends_turn = output.ends_turn;
+    let kept = output.kept.take().filter(|_| !output.is_error);
     let answer = output
         .answer
         .take()
@@ -2015,7 +2039,7 @@ async fn output_message(
         content: backstop(&output.content, tool, paged).into_owned(),
         is_error: output.is_error,
     };
-    (message, refs, answer, plan, outcome)
+    (message, refs, answer, plan, outcome, kept)
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -2147,6 +2171,8 @@ enum ToolResult {
         repeat_key: Option<String>,
         /// The plan the tool returned, from a result that is not an error.
         plan: Option<Box<Plan>>,
+        /// A long output the tool asks the run to keep in its state.
+        kept: Option<Box<KeptOutput>>,
     },
     NeedsInput {
         question: String,
