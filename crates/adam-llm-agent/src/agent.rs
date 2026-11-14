@@ -1095,10 +1095,23 @@ impl LlmAgent {
 
         let requested = u32::try_from(calls.len()).unwrap_or(u32::MAX);
         if state.tool_calls.saturating_add(requested) > self.limits.max_tool_calls {
-            return Ok(Flow::Fail(format!(
-                "tool call limit exceeded: {} calls already made, the model asked for {} more (max_tool_calls = {})",
+            // None of the turn's calls runs, and each is answered, so the history has no call without
+            // a result; the next model call is the closing turn.
+            let said = format!(
+                "not run: {} tool calls were already made and this turn asked for {} more \
+                 (max_tool_calls = {})",
                 state.tool_calls, requested, self.limits.max_tool_calls
-            )));
+            );
+            state.messages.extend(
+                calls
+                    .into_iter()
+                    .map(|call| Message::tool_error(call.id, said.clone())),
+            );
+            state.limit = Some(LimitHit {
+                limit: "max_tool_calls".into(),
+                answered: false,
+            });
+            return Ok(Flow::Next);
         }
         state.tool_calls += requested;
         state.pending_calls = calls;

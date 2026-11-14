@@ -2005,7 +2005,7 @@ async fn crash_during_the_closing_turn_replays_its_answer() {
 }
 
 #[tokio::test]
-async fn max_tool_calls_fails_the_run_across_turns() {
+async fn max_tool_calls_ends_the_run_limited_across_turns() {
     let h = Harness::new();
     let (a, a_calls) = CountingTool::new("a");
     let agent = h
@@ -2016,27 +2016,37 @@ async fn max_tool_calls_fails_the_run_across_turns() {
             ..Limits::default()
         })
         .build();
-    for i in 0..5 {
+    for i in 0..3 {
         h.mock
             .push_tool_calls(vec![call(&format!("c{i}"), "a", json!({}))]);
     }
+    h.mock.push_text("two calls made");
     let rt = h.runtime(&agent);
     let run = rt
         .start("llm", user_message("loop"), None)
         .await
         .expect("start");
     let worker = spawn_worker(&rt);
-    let view = wait_failed(&rt, run).await;
+    let view = wait_done(&rt, run).await;
     worker.stop().await;
 
-    let error = view.error.expect("error");
-    assert!(error.contains("max_tool_calls = 2"), "{error}");
     assert_eq!(a_calls.load(SeqCst), 2, "the third call never runs");
-    assert_eq!(h.mock.requests().len(), 3);
+    assert_eq!(h.mock.requests().len(), 4);
+    let output = view.output.clone().expect("output");
+    assert_eq!(output["limit"], "max_tool_calls");
+    assert_eq!(output["text"], "two calls made");
+    let state = conversation(&view);
+    let Message::Tool {
+        content, is_error, ..
+    } = &state.messages[6]
+    else {
+        panic!("{:?}", state.messages)
+    };
+    assert!(*is_error && content.contains("not run"), "{content}");
 }
 
 #[tokio::test]
-async fn max_tool_calls_rejects_an_oversized_turn_before_running_any_tool() {
+async fn max_tool_calls_answers_an_oversized_turn_not_run_and_then_closes() {
     let h = Harness::new();
     let (a, a_calls) = CountingTool::new("a");
     let agent = h
@@ -2047,21 +2057,48 @@ async fn max_tool_calls_rejects_an_oversized_turn_before_running_any_tool() {
             ..Limits::default()
         })
         .build();
-    h.mock.push_tool_calls(vec![
-        call("c1", "a", json!({})),
-        call("c2", "a", json!({})),
-        call("c3", "a", json!({})),
-    ]);
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "a", json!({})),
+            call("c2", "a", json!({})),
+            call("c3", "a", json!({})),
+        ])
+        .push_text("I could not run them");
     let rt = h.runtime(&agent);
     let run = rt
         .start("llm", user_message("many"), None)
         .await
         .expect("start");
     let worker = spawn_worker(&rt);
-    let view = wait_failed(&rt, run).await;
+    let view = wait_done(&rt, run).await;
     worker.stop().await;
-    assert!(view.error.expect("error").contains("asked for 3 more"));
     assert_eq!(a_calls.load(SeqCst), 0);
+    let state = conversation(&view);
+    for (i, id) in ["c1", "c2", "c3"].into_iter().enumerate() {
+        let Message::Tool {
+            call_id,
+            content,
+            is_error,
+        } = &state.messages[2 + i]
+        else {
+            panic!("{:?}", state.messages)
+        };
+        assert_eq!(call_id, id);
+        assert!(*is_error);
+        assert!(content.contains("not run"), "{content}");
+        assert!(content.contains("max_tool_calls = 2"), "{content}");
+    }
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].tool_choice, ToolChoice::None);
+    assert_eq!(
+        requests[1].messages.last(),
+        Some(&Message::user_text(CLOSING_TURN))
+    );
+    let output = view.output.expect("output");
+    assert_eq!(output["text"], "I could not run them");
+    assert_eq!(output["limited"], true);
+    assert_eq!(output["limit"], "max_tool_calls");
 }
 
 fn invalid_call_response(id: &str, name: &str, raw: &str, finish: FinishReason) -> ModelResponse {
