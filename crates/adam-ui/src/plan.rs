@@ -282,8 +282,8 @@ fn plural(n: usize) -> &'static str {
 /// The id of the plan's surface, and of the artifact that carries it: `plan-` and 12 hex digits of
 /// a hash of the conversation's id (the root run's id when the call is not in a conversation).
 /// Stable for the conversation, so a task that is continued draws on the same surface. The orchestration
-/// layer's UI catalog (version 8) reads an id that starts with `plan-` as a plan: drawn once,
-/// updated in place, with no form, input or button (*unverified* against the published page,
+/// layer's UI catalog (version 8) reads an id that starts with `plan-` as a plan: drawn from
+/// its newest copy, with no form, input or button (*unverified* against the published page,
 /// 2026-11-14).
 fn plan_surface_id(ctx: &ToolCtx) -> String {
     let root = ctx

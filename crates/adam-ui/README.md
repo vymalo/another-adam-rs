@@ -231,7 +231,7 @@ Plan: Fix the date parser          ("Plan" alone when there is no title)
 
   **The client rule** (written by the orchestration layer's UI catalog version 8, *unverified* against the published page,
   2026-11-14, as that version is in review there): a `createSurface` for a surface that exists starts it over, and a surface
-  whose id starts with `plan-` (and has at least one more character) is a plan, drawn once and updated in place; a plan may
+  whose id starts with `plan-` (and has at least one more character) is a plan, drawn from its newest copy (where a screen draws it is the screen's rule); a plan may
   hold no form, input or button, and this crate draws only `Checklist`, `Column` and `Text`. The `Checklist` is a component of
   version 6 of that catalog (*unverified*: the fixtures of this repository stop at version 5, and
   `tests/fixtures/catalog-v6.json` and `catalog-v7.json` are hand-written subsets, see `tests/fixtures/README.md`).

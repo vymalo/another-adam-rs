@@ -60,7 +60,8 @@ read the exact strings in the file at your rev.
    id; each change is an artifact update with that id and no `append`, which replaces it). The client rule, written by the
    orchestration layer's UI catalog version 8 and *unverified* against the published page, 2026-11-14: a `createSurface`
    for a surface that exists starts it over, and a surface whose id starts with `plan-` (plus at least one character) is a
-   plan, drawn once and updated in place, which may hold no form, input or button);
+   plan, drawn from its newest copy (where a screen draws it is the screen's rule), which may hold no form, input or
+   button);
    `adam-a2a-runtime` (`crates/adam-a2a-runtime/README.md`) reads the messages a screen sends
    (`vymalo_inbound`), reports steps, streamed text and tokens ("Usage"), and implements steering ("Steering a
    running task": a message to a finished task is `UnsupportedOperation`, `-32004`; to a working
