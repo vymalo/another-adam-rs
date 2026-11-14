@@ -92,6 +92,7 @@ mod file;
 mod notify;
 mod retry;
 mod runtime;
+mod session;
 mod step;
 mod text;
 mod usage;
@@ -101,7 +102,7 @@ pub use adam_error::{Classify, ErrorClass};
 pub use adam_model::Usage;
 pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
 pub use cancel::CancelToken;
-pub use child::{ChildStarter, ChildStatus, RUN_FINISHED_KIND, child_run_id};
+pub use child::{CHILD_REPORTED_KIND, ChildStarter, ChildStatus, RUN_FINISHED_KIND, child_run_id};
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};
 pub use ctx::{Ctx, Emitter};
 pub use events::{
@@ -115,6 +116,10 @@ pub use file::{
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
+pub use session::{
+    MAX_SESSION_PAGE, SessionList, SessionState, SessionSummary, session_conversation_id,
+    session_conversation_prefix,
+};
 pub use step::{
     MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, STEP_INPUT_MAX_BYTES,
     STEP_INPUT_STRING_MAX_CHARS, STEP_OUTPUT_MAX_BYTES, StepEvent, StepIcon, StepKind, StepOutput,

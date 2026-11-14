@@ -9,18 +9,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 
-use adam_core::{ClaimScope, DynStore, NewRun, RunId, RunRecord, RunStatus, RunUpdate, StoreError};
+use adam_core::{
+    ClaimScope, ConversationScope, DynStore, NewRun, RunId, RunQuery, RunRecord, RunStatus,
+    RunUpdate, StoreError,
+};
 use adam_error::{BoxError, Classify, ErrorClass};
 
 use crate::agent::{Agent, AgentError, AgentStarter, Inbound};
 use crate::cancel::CancelToken;
-use crate::child::ChildStatus;
+use crate::child::{CHILD_REPORTED_KIND, ChildStatus, RUN_FINISHED_KIND};
 use crate::clock::{Clock, DynClock, SystemClock};
 use crate::envelope::Envelope;
 use crate::erased::{Erased, ErasedAgent, ErasedStarter, StarterOnly};
 use crate::events::{Artifact, DynEventSink, EventSink, NoopSink, RunEvent};
 use crate::notify::{DynNotifier, Notifier, Signal};
 use crate::retry::RetryPolicy;
+use crate::session::{
+    MAX_SESSION_PAGE, SessionList, SessionState, SessionSummary, session_conversation_prefix,
+    session_of,
+};
 
 /// How often a commit that lost a CAS race is retried before giving up.
 pub(crate) const MAX_COMMIT_RETRIES: usize = 16;
@@ -334,7 +341,8 @@ impl Inner {
     }
 
     /// `child` just reached a terminal state: if it has a parent, tell it
-    /// ([`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND)).
+    /// ([`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND), or
+    /// [`CHILD_REPORTED_KIND`](crate::CHILD_REPORTED_KIND) when the child has a conversation).
     ///
     /// Best effort by design, and never an error for the child: this runs after the child's own
     /// commit, so a crash or a store error here loses the message and nothing else. The parent
@@ -347,7 +355,13 @@ impl Inner {
         if child.status.is_open() {
             return;
         }
-        let notice = ChildStatus::from_record(child).notice(child.id);
+        // A child with a conversation is a session round (ADR 0045); a one-shot child has none.
+        let kind = if child.conversation_id.is_some() {
+            CHILD_REPORTED_KIND
+        } else {
+            RUN_FINISHED_KIND
+        };
+        let notice = ChildStatus::from_record(child).notice(child.id, kind);
         match self.deliver(parent, notice).await {
             Ok(()) => {}
             Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {
@@ -808,6 +822,139 @@ impl Runtime {
             Err(StoreError::AlreadyExists(_)) => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Start a round of a child **session** (ADR 0045): [`start_child`](Self::start_child) for a
+    /// child that has a conversation, `conversation_id` (see
+    /// [`session_conversation_id`](crate::session_conversation_id)), and, from round 2 on, that
+    /// continues `prior`, the previous round, the way a task continues a finished one
+    /// ([`start_with_id_continuing`](Self::start_with_id_continuing)). Round 1 passes no `prior`
+    /// and its `id` is the session id.
+    ///
+    /// Because the child has a conversation, its end is reported to `parent` as
+    /// [`CHILD_REPORTED_KIND`](crate::CHILD_REPORTED_KIND), not `adam.run.finished`.
+    ///
+    /// Idempotent like `start_child`: `true` if this call created the round, `false` if a run with
+    /// `id` already exists (then `input` is ignored and `prior` is neither read nor checked).
+    ///
+    /// # Errors
+    ///
+    /// * [`RuntimeError::ConversationBusy`] (class `Rejected`) when another round of the session
+    ///   is still open: nothing is created, and the caller steers that round with
+    ///   [`deliver`](Self::deliver) instead.
+    /// * [`RuntimeError::NotFound`] / [`RuntimeError::WrongAgent`] for a `prior` that is not a
+    ///   run of `agent`; that it belongs to the same session is the caller's to guarantee, as
+    ///   for `start_with_id_continuing`.
+    /// * [`RuntimeError::UnknownAgent`] and the store's errors.
+    #[tracing::instrument(skip(self, input))]
+    pub async fn start_child_continuing(
+        &self,
+        parent: RunId,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+        conversation_id: &str,
+        prior: Option<RunId>,
+    ) -> Result<bool, RuntimeError> {
+        let registered = self.registered(agent)?;
+        // A repeat answers before anything is read: the prior may be purged by now.
+        if self.inner.store.load_run(id).await?.is_some() {
+            return Ok(false);
+        }
+        let state = match prior {
+            Some(run) => Some(self.prior_state(agent, run).await?),
+            None => None,
+        };
+        let new = self
+            .new_run(
+                registered.starter(),
+                input,
+                prior.zip(state.as_ref()),
+                Some(id),
+                Some(conversation_id),
+            )?
+            .parent(parent);
+        self.create_with_id(new).await
+    }
+
+    /// The sessions `parent_conversation` holds, one row per session with its latest round, read
+    /// from the runs of `agents` alone (ADR 0045; no store method of its own).
+    ///
+    /// `agents` names the agents whose rounds to look for: a session's agent is a subagent of the
+    /// parent's folder, and a run listing is per agent. Rows are ordered working first, then most
+    /// recently updated, then by id, so a page boundary is unambiguous; `offset` and `limit` page
+    /// them (`limit` is capped at [`MAX_SESSION_PAGE`]). Only the sessions of the parent itself
+    /// are listed, not those of its sessions.
+    ///
+    /// It reads every round of the parent's sessions, which the limits of ADR 0045 bound.
+    ///
+    /// # Errors
+    ///
+    /// The store's errors.
+    #[tracing::instrument(skip(self))]
+    pub async fn list_sessions(
+        &self,
+        parent_conversation: &str,
+        agents: &[&str],
+        offset: usize,
+        limit: usize,
+    ) -> Result<SessionList, RuntimeError> {
+        const SCAN_PAGE: usize = 200;
+        let scope = ConversationScope::Prefix(session_conversation_prefix(parent_conversation));
+        let mut rounds: HashMap<String, Vec<RunRecord>> = HashMap::new();
+        for agent in agents {
+            let mut query = RunQuery::new(*agent, scope.clone(), SCAN_PAGE);
+            loop {
+                let page = self.inner.store.list_runs(&query).await?;
+                let after = page.last().map(|r| (r.updated_at, r.id));
+                let full = page.len() == SCAN_PAGE;
+                for rec in page {
+                    if let Some(conv) = rec.conversation_id.clone()
+                        && session_of(parent_conversation, &conv).is_some()
+                    {
+                        rounds.entry(conv).or_default().push(rec);
+                    }
+                }
+                match after {
+                    Some(after) if full => query.after = Some(after),
+                    _ => break,
+                }
+            }
+        }
+        let mut sessions: Vec<SessionSummary> = rounds
+            .into_iter()
+            .filter_map(|(conversation_id, mut runs)| {
+                let id = session_of(parent_conversation, &conversation_id)?;
+                runs.sort_by_key(|r| (r.created_at, r.id.0));
+                let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
+                let latest = runs.pop()?;
+                Some(SessionSummary {
+                    id,
+                    agent: latest.agent,
+                    conversation_id,
+                    latest_run: latest.id,
+                    round,
+                    state: if latest.status.is_open() {
+                        SessionState::Working
+                    } else {
+                        SessionState::Idle
+                    },
+                    updated_at: latest.updated_at,
+                })
+            })
+            .collect();
+        sessions.sort_by(|a, b| {
+            (a.state != SessionState::Working)
+                .cmp(&(b.state != SessionState::Working))
+                .then(b.updated_at.cmp(&a.updated_at))
+                .then(a.id.0.cmp(&b.id.0))
+        });
+        let total = sessions.len();
+        let limit = limit.min(MAX_SESSION_PAGE);
+        Ok(SessionList {
+            sessions: sessions.into_iter().skip(offset).take(limit).collect(),
+            total,
+        })
     }
 
     /// The record of a new run. With `prior` (the run continued and its stored agent state) the
