@@ -1,4 +1,4 @@
-# The coder as a production deployment of a GitHub App: the commands of a run (run_command, run_checks, OpenCode) run in
+# The coder as a production deployment of a GitHub App: the commands of a run (run_command, run, run_checks) run in
 # a pod of their own, which has no key, and the App's private key is a file that only the coder container mounts; the coder's
 # own git runs in a sandbox container of its pod that has no key either (ADR 0041, open decision 6). This is the
 # shape the chart asks for. With github.auth=app and runPods.enabled=false the chart refuses to render and the coder
@@ -16,7 +16,6 @@
 config:
   modelBaseUrl: https://gateway.example.com/v1 # set:
   model: coder
-  opencodeModel: coder
 
 # The App. The key is a Secret you make yourself (the chart never holds it), with one key, `private-key.pem`:
 #   kubectl -n another-agentic-system create secret generic coder-github-app --from-file=private-key.pem=app.pem

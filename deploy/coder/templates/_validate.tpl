@@ -201,13 +201,10 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "config.extraEnv sets ALLOW_COMMANDS_NEXT_TO_SECRETS: set runPods.allowCommandsNextToSecrets instead (the chart renders the variable from it, and only then)" -}}
 {{- end -}}
 {{- if and (include "coder.commandsReadTheAppKey" .) (not (include "coder.allowCommandsNextToSecrets" .)) -}}
-{{- fail "github.auth=app with runPods.enabled=false runs the commands of a run (run_command, run_checks, OpenCode) in the coder's own container, next to the App's private key file: a command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included, and the coder refuses to start that way (exit 78), so a rollout would crash-loop. Set runPods.enabled=true (the commands then run in pods that have no key; needs externalSecrets.enabled and Kubernetes 1.30 or later), or set runPods.allowCommandsNextToSecrets=true to accept the risk (see deploy/coder/README.md, \"The access tiers\", and docs/guides/deploy-the-coder.md, \"Upgrading an App deployment\")" -}}
+{{- fail "github.auth=app with runPods.enabled=false runs the commands of a run (run_command, run, run_checks) in the coder's own container, next to the App's private key file: a command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included, and the coder refuses to start that way (exit 78), so a rollout would crash-loop. Set runPods.enabled=true (the commands then run in pods that have no key; needs Kubernetes 1.30 or later), or set runPods.allowCommandsNextToSecrets=true to accept the risk (see deploy/coder/README.md, \"The access tiers\", and docs/guides/deploy-the-coder.md, \"Upgrading an App deployment\")" -}}
 {{- end -}}
 {{- if include "coder.runPods" . -}}
 {{- $rp := .Values.runPods -}}
-{{- if not .Values.externalSecrets.enabled -}}
-{{- fail "runPods.enabled needs externalSecrets.enabled=true: the model key reaches a run pod only as MODEL_API_KEY from the ExternalSecret's Secret, which the admission policy lets a run pod read, and no GitHub credential ever does" -}}
-{{- end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (not (include "coder.sharedWork" .)) -}}
 {{- fail "runPods.enabled with replicaCount > 1 needs workspace.placement shared or affinity (a ReadWriteMany volume): a run pod mounts one claim, and the per-pod ReadWriteOnce claim of a coder pod cannot serve the runs of the others" -}}
 {{- end -}}
@@ -269,7 +266,7 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "runPods.extraEnv must be a name -> value map" -}}
 {{- end -}}
 {{- if hasKey $rp.extraEnv "MODEL_API_KEY" -}}
-{{- fail "runPods.extraEnv sets MODEL_API_KEY: the chart sets it from the ExternalSecret, and a secret is never a chart value" -}}
+{{- fail "runPods.extraEnv sets MODEL_API_KEY: a run pod holds no model key (ADR 0038), and a secret is never a chart value" -}}
 {{- end -}}
 {{- /* The run pods' network policy is deny by default (ADR 0042): its switch is gone, and turning it off would be open egress. */ -}}
 {{- if and (hasKey $rp.networkPolicy "enabled") (not (eq (toString $rp.networkPolicy.enabled) "true")) -}}

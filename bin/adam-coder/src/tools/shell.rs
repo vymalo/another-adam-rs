@@ -448,9 +448,7 @@ async fn kill_group(pid: Option<u32>) {
 
 #[cfg(test)]
 mod tests {
-    use adam_workspace::{
-        EnvDescription, EnvKind, ExecId, LocalSession, PreparedCommand, SecretRef,
-    };
+    use adam_workspace::{EnvDescription, EnvKind, ExecId, LocalSession, PreparedCommand};
     use async_trait::async_trait;
 
     use super::*;
@@ -502,10 +500,6 @@ mod tests {
 
         async fn kill(&self, exec: &ExecId) {
             self.killed.lock().unwrap().push(exec.clone());
-        }
-
-        fn secret_ref(&self, _name: &str) -> Option<SecretRef> {
-            None
         }
     }
 

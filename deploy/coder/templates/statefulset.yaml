@@ -221,8 +221,6 @@ spec:
             - name: MODEL_CONTEXT_WINDOW
               value: {{ . | quote }}
             {{- end }}
-            - name: OPENCODE_MODEL
-              value: {{ .Values.config.opencodeModel | quote }}
             - name: WORKERS
               value: {{ .Values.config.workers | quote }}
             - name: MAX_CHECK_CYCLES

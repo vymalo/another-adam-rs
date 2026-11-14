@@ -1977,27 +1977,16 @@ mod tests {
         assert_eq!(requests["memory"].0, "512Mi");
     }
 
+    /// ADR 0038: a run pod carries no agent binary and no model key. The environment gives its
+    /// commands neither, and the pod made from a template that names none has none.
     #[tokio::test]
-    async fn opencode_and_the_model_key_are_where_the_template_puts_them() {
+    async fn a_run_pod_spec_has_no_model_key_and_no_opencode() {
         let fx = fixture(settings());
-        let session = fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
-        assert_eq!(
-            session.tool_path("opencode"),
-            Some("/opt/adam/bin/opencode".into())
-        );
-        assert_eq!(session.tool_path("git"), None);
-        assert_eq!(
-            session.secret_ref("model-key"),
-            Some(adam_workspace::SecretRef::Env("MODEL_API_KEY".to_owned()))
-        );
-        assert_eq!(session.secret_ref("github-token"), None);
-
-        let mut bare = settings();
-        bare.opencode = false;
-        bare.model_key = false;
-        let fx = fixture(bare);
-        let session = fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
-        assert_eq!(session.tool_path("opencode"), None);
-        assert_eq!(session.secret_ref("model-key"), None);
+        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
+        let pod = fx.api.lock().unwrap().pods.values().next().unwrap().clone();
+        let text = serde_json::to_string(&pod).unwrap();
+        assert!(!text.contains("MODEL_API_KEY"), "{text}");
+        assert!(!text.contains("opencode"), "{text}");
+        assert!(!text.contains("secretKeyRef"), "{text}");
     }
 }

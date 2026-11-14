@@ -6,18 +6,15 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use adam_devcontainer::Runtime;
 use adam_error::{Classify, ErrorClass};
-use adam_workspace::{
-    EnvError, EnvKind, EnvSession, EnvStepState, Environment, ExecId, ExecSpec, SecretRef,
-};
+use adam_workspace::{EnvError, EnvKind, EnvSession, EnvStepState, Environment, ExecId, ExecSpec};
 use common::{
-    CONTAINER, DEFAULT_IMAGE, DEPLOYMENT, MODEL_KEY, RUN, Rig, Steps, devcontainer_file, flag,
-    flags,
+    CONTAINER, DEFAULT_IMAGE, DEPLOYMENT, RUN, Rig, Steps, devcontainer_file, flag, flags,
 };
 use serde_json::json;
 
@@ -45,7 +42,7 @@ async fn devbox() -> (Rig, adam_workspace::RunWorkspace, PathBuf) {
     let slot = rig
         .repository(&ws, "devbox", &as_refs(&devbox_files()))
         .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     (rig, ws, slot)
 }
 
@@ -209,7 +206,7 @@ async fn a_repository_without_a_devcontainer_gets_the_default_image_and_says_so(
     let rig = Rig::new();
     let ws = rig.run(RUN);
     rig.repository(&ws, "sandbox", &[]).await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     let steps = Steps::default();
     rig.env.ensure(&ws, &steps).await.unwrap();
 
@@ -238,7 +235,7 @@ async fn the_first_slot_decides_and_a_scratch_slot_counts() {
     rig.scratch(&ws, "notes", &[]).await;
     rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
         .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     let steps = Steps::default();
     rig.env.ensure(&ws, &steps).await.unwrap();
     assert_eq!(rig.override_file(RUN)["image"], DEFAULT_IMAGE);
@@ -273,7 +270,7 @@ async fn the_first_slot_decides_and_a_scratch_slot_counts() {
         &[(".devcontainer/devcontainer.json", r#"{"image":"ignored"}"#)],
     )
     .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     let steps = Steps::default();
     rig.env.ensure(&ws, &steps).await.unwrap();
     assert_eq!(rig.override_file(RUN)["build"]["dockerfile"], "Dockerfile");
@@ -298,7 +295,7 @@ async fn several_devcontainer_folders_use_the_first_and_a_step_says_so() {
         ],
     )
     .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     let steps = Steps::default();
     rig.env.ensure(&ws, &steps).await.unwrap();
     assert_eq!(rig.override_file(RUN)["image"], "go");
@@ -350,7 +347,6 @@ async fn the_cli_and_podman_start_from_nothing_and_get_the_allow_list() {
             rig.root.join("environments/.cli-home").display()
         )));
         assert!(text.contains("CONTAINER_HOST=unix:///run/podman/podman.sock"));
-        assert!(!text.contains(MODEL_KEY));
     }
 }
 
@@ -415,7 +411,7 @@ async fn a_command_is_devcontainer_exec_with_adam_exec_and_nothing_secret_on_the
     // A program and its arguments: a word that looks like an option of the CLI is not one.
     let argv = session
         .prepare(&ExecSpec::argv(
-            ["opencode", "acp", "--version", "-c", ""],
+            ["devbox-tool", "acp", "--version", "-c", ""],
             &slot,
         ))
         .unwrap();
@@ -427,87 +423,59 @@ async fn a_command_is_devcontainer_exec_with_adam_exec_and_nothing_secret_on_the
     assert_eq!(args[args.len() - 8], "run");
     assert_eq!(
         &args[args.len() - 5..],
-        [":opencode", ":acp", ":--version", ":-c", ":"].map(str::to_owned)
+        [":devbox-tool", ":acp", ":--version", ":-c", ":"].map(str::to_owned)
     );
     assert_ne!(
         argv.exec, prepared.exec,
         "every command has an id of its own"
     );
     assert!(prepared.exec.as_str().starts_with("dc-"));
-
-    // The model key is a file, and nowhere else: not an argument, not a variable, not in a log.
-    assert_eq!(
-        session.secret_ref("model-key"),
-        Some(SecretRef::File(PathBuf::from(
-            "/run/adam/secrets/model-key"
-        )))
-    );
-    assert_eq!(session.secret_ref("anything-else"), None);
-    let key_file = rig
-        .root
-        .join("environments")
-        .join(RUN)
-        .join("secrets/model-key");
-    assert_eq!(std::fs::read_to_string(&key_file).unwrap(), MODEL_KEY);
-    assert_eq!(
-        std::fs::metadata(&key_file).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert_eq!(
-        std::fs::metadata(key_file.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    assert_eq!(
-        rig.files_containing(MODEL_KEY),
-        [key_file],
-        "the key is in the one file that is mounted read-only"
-    );
-    assert!(
-        !args
-            .iter()
-            .chain(
-                &prepared
-                    .args
-                    .iter()
-                    .map(|a| a.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            )
-            .any(|a| a.contains(MODEL_KEY))
-    );
-    let mounts = rig.override_file(RUN)["mounts"].to_string();
-    assert!(
-        mounts.contains("target=/run/adam/secrets,readonly"),
-        "{mounts}"
-    );
 }
 
+/// ADR 0038: what a devcontainer gets from the coder is the exec script and the repository's own
+/// files. No agent binary, no secret: no `secrets` directory, no mount of one, no key anywhere on the
+/// volume.
 #[tokio::test]
-async fn without_a_model_key_there_is_no_secret_to_refer_to() {
-    let rig = Rig::with(|s| s.model_key = None);
-    let ws = rig.run(RUN);
-    let slot = rig
-        .repository(&ws, "devbox", &as_refs(&devbox_files()))
-        .await;
-    rig.inspect_for(&ws, false).await;
+async fn a_devcontainer_mounts_only_adam_exec_and_no_secret() {
+    let (rig, ws, slot) = devbox().await;
     let session = rig.env.ensure(&ws, &Steps::default()).await.unwrap();
-    assert_eq!(session.secret_ref("model-key"), None);
+
+    let tools = rig.env.install_tools().await.unwrap();
+    let files: Vec<_> = std::fs::read_dir(&tools)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(files, ["adam-exec"], "the tools directory holds one script");
+
+    let mounts = rig.override_file(RUN)["mounts"].to_string();
+    assert!(mounts.contains("target=/opt/adam/bin,readonly"), "{mounts}");
+    assert!(!mounts.contains("/run/adam/secrets"), "{mounts}");
     assert!(
         !rig.root
             .join("environments")
             .join(RUN)
-            .join("secrets/model-key")
-            .exists()
+            .join("secrets")
+            .exists(),
+        "no secrets directory"
+    );
+    // Nothing the coder holds is on a command line or in a variable of a command.
+    let prepared = session.prepare(&ExecSpec::shell("true", &slot)).unwrap();
+    assert!(
+        prepared
+            .env
+            .keys()
+            .all(|name| !name.to_string_lossy().contains("KEY")),
+        "{:?}",
+        prepared.env
     );
     assert!(
-        !rig.override_file(RUN)["mounts"]
-            .to_string()
-            .contains("/run/adam/secrets")
+        !prepared
+            .args
+            .iter()
+            .any(|a| a.to_string_lossy().contains("MODEL_API_KEY")),
+        "{:?}",
+        prepared.args
     );
-    session.prepare(&ExecSpec::shell("true", &slot)).unwrap();
 }
 
 #[tokio::test]
@@ -580,7 +548,7 @@ async fn a_refused_file_is_a_failed_step_that_names_the_file_and_the_key_and_sta
             )],
         )
         .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     let steps = Steps::default();
     let err = error_of(rig.env.ensure(&ws, &steps).await);
     let EnvError::Refused(why) = &err else {
@@ -636,7 +604,7 @@ async fn rebuild_with_use_default_goes_on_in_the_default_image_and_keeps_the_fil
         )],
     )
     .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     error_of(rig.env.ensure(&ws, &Steps::default()).await);
     rig.env.rebuild(RUN, true).await.unwrap();
     let steps = Steps::default();
@@ -730,7 +698,7 @@ async fn a_build_that_fails_says_what_it_said_with_the_secrets_gone() {
             "{{\"type\":\"text\",\"level\":2,\"timestamp\":{n},\"text\":\"step {n}\"}}\n"
         ));
     }
-    log.push_str(&format!("{{\"type\":\"text\",\"level\":2,\"timestamp\":99,\"text\":\"ENV GITHUB_TOKEN=ghp_abcdef0123 key {MODEL_KEY}\"}}\n"));
+    log.push_str("{\"type\":\"text\",\"level\":2,\"timestamp\":99,\"text\":\"ENV GITHUB_TOKEN=ghp_abcdef0123\"}\n");
     log.push_str("{\"type\":\"text\",\"level\":3,\"timestamp\":100,\"text\":\"ERROR: failed to solve: dockerfile parse error\"}\n");
     rig.put("cli.up.stderr", &log);
     let steps = Steps::default();
@@ -756,22 +724,10 @@ async fn a_build_that_fails_says_what_it_said_with_the_secrets_gone() {
         !log_tail.contains("step 0\n") && log_tail.contains("step 59"),
         "the end, not the start"
     );
-    assert!(
-        !log_tail.contains("ghp_abcdef0123") && !log_tail.contains(MODEL_KEY),
-        "{log_tail}"
-    );
-    assert!(
-        !steps
-            .latest()
-            .pop()
-            .unwrap()
-            .detail
-            .unwrap()
-            .contains(MODEL_KEY)
-    );
+    assert!(!log_tail.contains("ghp_abcdef0123"), "{log_tail}");
     let build_log =
         std::fs::read_to_string(rig.root.join("environments").join(RUN).join("build.log")).unwrap();
-    assert!(!build_log.contains(MODEL_KEY) && !build_log.contains("ghp_abcdef0123"));
+    assert!(!build_log.contains("ghp_abcdef0123"));
     assert_eq!(rig.state(RUN)["phase"], "broken");
     assert!(
         rig.state(RUN)["error"]
@@ -822,7 +778,7 @@ async fn a_slow_phase_is_a_timeout_and_the_partial_container_is_removed_by_label
     let ws = rig.run(RUN);
     rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
         .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     rig.put("cli.up.sleep", "5");
     rig.put("up.no-container", "");
     // A container the CLI made before it hung.
@@ -858,7 +814,7 @@ async fn a_cli_that_is_not_there_is_unavailable_and_is_tried_again() {
     let ws = rig.run(RUN);
     rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
         .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     let err = error_of(rig.env.ensure(&ws, &Steps::default()).await);
     assert!(matches!(err, EnvError::Unavailable(_)), "{err:?}");
     assert!(err.to_string().contains("/no/such/devcontainer"));
@@ -961,7 +917,7 @@ async fn a_service_that_answers_is_probed_once_for_every_run_in_the_interval() {
             &json!([{"Id": CONTAINER, "State": "running", "Labels": {"adam.vymalo.com/run": run}}])
                 .to_string(),
         );
-        rig.inspect_for(&ws, true).await;
+        rig.inspect_for(&ws).await;
         rig.env.ensure(&ws, &Steps::default()).await.unwrap();
     }
     assert_eq!(
@@ -998,7 +954,7 @@ async fn a_repository_that_joins_restarts_the_environment_with_its_mirror_mounte
     let (rig, ws, _) = devbox().await;
     rig.env.ensure(&ws, &Steps::default()).await.unwrap();
     rig.repository(&ws, "library", &[]).await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     // The restart finds the container listed the same way.
     let steps = Steps::default();
     rig.env.ensure(&ws, &steps).await.unwrap();
@@ -1247,45 +1203,7 @@ async fn the_tools_directory_is_written_once_for_every_run() {
     assert_eq!(dir.parent().unwrap(), rig.root.join("environments/.tools"));
     assert!(dir.join("adam-exec").is_file());
     assert_eq!(rig.env.install_tools().await.unwrap(), dir);
-    let binary = rig.tmp.path().join("opencode");
-    std::fs::write(&binary, b"\x7fELF").unwrap();
-    let with = adam_devcontainer::DevContainer::new({
-        let mut s = rig.settings.clone();
-        s.opencode = Some(binary);
-        s
-    });
-    let dir_with = with.install_tools().await.unwrap();
-    assert_ne!(dir_with, dir);
-    assert!(dir_with.join("opencode").is_file());
-}
-
-#[tokio::test]
-async fn the_coders_opencode_is_where_the_tools_directory_is_mounted_and_only_when_there_is_one() {
-    let rig = Rig::new();
-    let ws = rig.run(RUN);
-    rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
-        .await;
-    rig.inspect_for(&ws, true).await;
-    let session = rig.env.ensure(&ws, &Steps::default()).await.unwrap();
-    assert_eq!(
-        session.tool_path("opencode"),
-        None,
-        "no binary was given to mount"
-    );
-
-    let binary = rig.tmp.path().join("opencode");
-    std::fs::write(&binary, b"\x7fELF").unwrap();
-    let rig = Rig::with(|s| s.opencode = Some(binary));
-    let ws = rig.run(RUN);
-    rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
-        .await;
-    rig.inspect_for(&ws, true).await;
-    let session = rig.env.ensure(&ws, &Steps::default()).await.unwrap();
-    assert_eq!(
-        session.tool_path("opencode"),
-        Some(PathBuf::from("/opt/adam/bin/opencode"))
-    );
-    assert_eq!(session.tool_path("git"), None, "only what the coder brings");
+    assert!(!dir.join("opencode").exists(), "no agent binary (ADR 0038)");
 }
 
 #[tokio::test]
@@ -1294,7 +1212,7 @@ async fn the_port_rebuild_makes_the_environment_again_and_says_whether_there_was
     let ws = rig.run(RUN);
     rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
         .await;
-    rig.inspect_for(&ws, true).await;
+    rig.inspect_for(&ws).await;
     rig.env.ensure(&ws, &Steps::default()).await.unwrap();
     let ports: &dyn Environment = &rig.env;
     assert!(ports.rebuild(RUN, true).await.unwrap());

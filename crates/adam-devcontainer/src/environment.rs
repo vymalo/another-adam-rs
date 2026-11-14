@@ -13,7 +13,7 @@
 //! ```
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -24,7 +24,6 @@ use adam_workspace::{
     RunWorkspace, Slot,
 };
 use async_trait::async_trait;
-use secrecy::ExposeSecret;
 use serde_json::Value;
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
@@ -182,13 +181,11 @@ impl DevContainer {
     ///
     /// [`EnvError::Unavailable`] with the reason, scrubbed.
     pub async fn probe(&self) -> Result<(), EnvError> {
-        let secrets = self.secrets();
-        let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
         self.inner
             .podman
             .info(self.inner.settings.probe_timeout)
             .await
-            .map_err(|e| EnvError::Unavailable(scrub(&e.to_string(), &refs)))
+            .map_err(|e| EnvError::Unavailable(scrub(&e.to_string(), &[])))
     }
 
     /// Pull the default image, so that the first run that needs it does not wait for it.
@@ -210,14 +207,13 @@ impl DevContainer {
     ///
     /// # Errors
     ///
-    /// [`EnvError::Io`], including an `opencode` that cannot be read.
+    /// [`EnvError::Io`].
     pub async fn install_tools(&self) -> Result<PathBuf, EnvError> {
         let root = self.inner.settings.root.clone();
-        let opencode = self.inner.settings.opencode.clone();
         self.inner
             .tools
             .get_or_try_init(|| async move {
-                tokio::task::spawn_blocking(move || tools::install(&root, opencode.as_deref()))
+                tokio::task::spawn_blocking(move || tools::install(&root))
                     .await
                     .map_err(std::io::Error::other)?
             })
@@ -263,15 +259,6 @@ impl DevContainer {
             fresh.write(&self.inner.settings.root)?;
         }
         Ok(())
-    }
-
-    fn secrets(&self) -> Vec<String> {
-        self.inner
-            .settings
-            .model_key
-            .iter()
-            .map(|k| k.expose_secret().to_owned())
-            .collect()
     }
 
     fn lock_for(&self, run: &str) -> Arc<Mutex<()>> {
@@ -402,7 +389,6 @@ impl DevContainer {
             container_id: state.container_id.clone().unwrap_or_default(),
             image: state.image.clone().unwrap_or_default(),
             label: label.to_owned(),
-            has_model_key: state.model_key,
         })
     }
 
@@ -635,8 +621,6 @@ impl DevContainer {
     ) -> Result<(DevSession, Vec<String>), EnvError> {
         let s = &self.inner.settings;
         let run = ws.run();
-        let secrets = self.secrets();
-        let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
         let first = &plan.slots[0];
         let file = plan
             .discovered
@@ -662,9 +646,7 @@ impl DevContainer {
         }
 
         let env_dir = state::run_dir(&s.root, run)?;
-        tokio::fs::create_dir_all(env_dir.join("secrets")).await?;
         tokio::fs::create_dir_all(&self.inner.env.home()).await?;
-        let has_key = self.write_model_key(&env_dir).await?;
         let tools_dir = self.install_tools().await?;
         let made = override_file::build(&OverrideInput {
             raw: &plan.discovered.value,
@@ -672,7 +654,6 @@ impl DevContainer {
             config_slot: first,
             slots: &plan.slots,
             tools_dir: &tools_dir,
-            secrets_dir: has_key.then(|| env_dir.join("secrets")).as_deref(),
             network: s.network,
         })?;
         let override_path = env_dir.join("devcontainer.json");
@@ -688,7 +669,6 @@ impl DevContainer {
         building.config_digest.clone_from(&plan.discovered.digest);
         building.use_default = previous.is_some_and(|p| p.use_default);
         building.slots.clone_from(&plan.records);
-        building.model_key = has_key;
         building.tools = Some(tools_dir.display().to_string());
         building.write(&s.root)?;
         reporter.running(&format!("{} changes to the file", made.changes.len()));
@@ -706,7 +686,7 @@ impl DevContainer {
             &override_path,
         );
         let on_line = |line: &str| {
-            let text = scrub(&log_text(line), &secret_refs);
+            let text = scrub(&log_text(line), &[]);
             if let Some(phase) = phase_of(&text) {
                 reporter.running(&phase);
             }
@@ -724,7 +704,7 @@ impl DevContainer {
                 "the devcontainer CLI could not read the configuration",
                 &file,
                 &done,
-                &secret_refs,
+                &[],
                 true,
             ));
         }
@@ -758,7 +738,7 @@ impl DevContainer {
                 .or_else(|| result.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("the devcontainer CLI could not make the container");
-            return Err(failure(reason, &file, &done, &secret_refs, false));
+            return Err(failure(reason, &file, &done, &[], false));
         }
         let remote_user = result
             .get("remoteUser")
@@ -773,7 +753,7 @@ impl DevContainer {
                 "the devcontainer CLI did not say which container it made",
                 &file,
                 &done,
-                &secret_refs,
+                &[],
                 false,
             ));
         };
@@ -797,7 +777,7 @@ impl DevContainer {
         if !running {
             return Err(EnvError::Build {
                 reason: "the container stopped right after it was made".to_owned(),
-                log_tail: tail(&scrub(&log.as_plain(), &secret_refs), TAIL_LINES),
+                log_tail: tail(&scrub(&log.as_plain(), &[]), TAIL_LINES),
             });
         }
 
@@ -823,7 +803,7 @@ impl DevContainer {
                 .or_else(|| result.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("a lifecycle command of the devcontainer failed");
-            return Err(failure(reason, &file, &done, &secret_refs, false));
+            return Err(failure(reason, &file, &done, &[], false));
         }
 
         let mut ready = building;
@@ -848,7 +828,6 @@ impl DevContainer {
                 container_id,
                 image,
                 label,
-                has_model_key: has_key,
             },
             made.changes.clone(),
         ))
@@ -885,32 +864,12 @@ impl DevContainer {
         }
     }
 
-    /// Write the model key for the container (mode 0600 in a directory of mode 0700), if there is one.
-    async fn write_model_key(&self, env_dir: &Path) -> Result<bool, EnvError> {
-        let Some(key) = &self.inner.settings.model_key else {
-            return Ok(false);
-        };
-        let dir = env_dir.join("secrets");
-        let file = dir.join("model-key");
-        let value = key.expose_secret().to_owned();
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-            std::fs::write(&file, value)?;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
-        })
-        .await
-        .map_err(|e| EnvError::Io(std::io::Error::other(e)))??;
-        Ok(true)
-    }
-
     /// Keep the end of what the CLI said, scrubbed, as `build.log`.
     fn save_log(&self, run: &str, log: &LogTail) {
-        let secrets = self.secrets();
-        let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
         let Ok(dir) = state::run_dir(&self.inner.settings.root, run) else {
             return;
         };
-        let text = scrub(&log.as_plain(), &refs);
+        let text = scrub(&log.as_plain(), &[]);
         if let Err(e) = std::fs::write(dir.join("build.log"), text) {
             tracing::debug!(error = %e, run, "cannot write build.log");
         }

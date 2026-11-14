@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::invocation::DEFAULT_ADAM_EXEC;
 
-/// The directory the template mounts the tools in (`adam-exec`, `opencode`), read-only, in the run
+/// The directory the template mounts the tools in (`adam-exec`), read-only, in the run
 /// container: the same layout as the devcontainer's.
 pub const TOOLS_DIR: &str = "/opt/adam/bin";
 
@@ -43,12 +43,6 @@ pub struct Settings {
     pub adam_exec: String,
     /// Where the tools are in the run container ([`TOOLS_DIR`]).
     pub tools_dir: String,
-    /// The coder has an OpenCode to bring along: the template's init container puts it in the tools
-    /// directory, and [`tool_path`](adam_workspace::EnvSession::tool_path) says where.
-    pub opencode: bool,
-    /// The pod's template gives the commands a model key (`MODEL_API_KEY`, from the deployment's
-    /// Secret), so that [`secret_ref`](adam_workspace::EnvSession::secret_ref) can name it.
-    pub model_key: bool,
     /// How long a pod may take to be ready (`RUN_POD_READY_TIMEOUT_SECS`, 300): scheduling, pulling
     /// the image, starting.
     pub ready_timeout: Duration,
@@ -81,8 +75,6 @@ impl Settings {
             exec_client: PathBuf::from("adam-kube-exec"),
             adam_exec: DEFAULT_ADAM_EXEC.to_owned(),
             tools_dir: TOOLS_DIR.to_owned(),
-            opencode: true,
-            model_key: true,
             ready_timeout: Duration::from_secs(300),
             ready_poll: Duration::from_secs(2),
             idle: Some(Duration::from_secs(900)),

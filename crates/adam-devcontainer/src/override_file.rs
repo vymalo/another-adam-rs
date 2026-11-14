@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `workspaceFolder` | the first slot's own path: the same path in the coder and in the container |
 //! | `workspaceMount` | a bind of the run's whole workspace at the same path, so every slot is in |
-//! | `mounts` | the repository's own (volumes and tmpfs, checked by [`policy`](crate::policy)), then ours, all read-only: the mirror of each repository slot, each slot's `.git`, the tools, the secrets. The first slot is also bound where the repository says its workspace is (default `/workspaces/<dir>`), read-write |
+//! | `mounts` | the repository's own (volumes and tmpfs, checked by [`policy`](crate::policy)), then ours, all read-only: the mirror of each repository slot, each slot's `.git`, the tools. The first slot is also bound where the repository says its workspace is (default `/workspaces/<dir>`), read-write |
 //! | `runArgs` | the repository's own (checked), then `--network=host` or `--network=none` |
 //! | `initializeCommand` | removed: the specification runs it on the host side, which here is the coder, next to its credentials |
 //! | `appPort`, `forwardPorts`, `portsAttributes`, `otherPortsAttributes` | removed: nothing is published |
@@ -23,7 +23,7 @@ use adam_workspace::EnvError;
 use serde_json::{Map, Value, json};
 
 use crate::Network;
-use crate::policy::{Bind, SECRETS_TARGET, TOOLS_TARGET};
+use crate::policy::{Bind, TOOLS_TARGET};
 
 /// A slot of the run, as far as the file needs to know it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,8 +48,6 @@ pub(crate) struct OverrideInput<'a> {
     pub slots: &'a [SlotInfo],
     /// `<root>/environments/.tools/<version>`.
     pub tools_dir: &'a Path,
-    /// `<root>/environments/<run>/secrets`, when there is a secret to give.
-    pub secrets_dir: Option<&'a Path>,
     /// The network of the container.
     pub network: Network,
 }
@@ -106,23 +104,11 @@ pub(crate) fn build(input: &OverrideInput<'_>) -> Result<Override, EnvError> {
     }
     let tools = input.tools_dir.display().to_string();
     readonly.push(Bind::new(tools, TOOLS_TARGET, true));
-    if let Some(secrets) = input.secrets_dir {
-        readonly.push(Bind::new(
-            secrets.display().to_string(),
-            SECRETS_TARGET,
-            true,
-        ));
-    }
     binds.extend(readonly.iter().cloned());
     changes.push(format!(
         "{} read-only mounts added: each repository's mirror and each slot's .git (so that git can read \
-         inside), the tools at {TOOLS_TARGET}{}",
-        readonly.len(),
-        if input.secrets_dir.is_some() {
-            format!(", the secrets at {SECRETS_TARGET}")
-        } else {
-            String::new()
-        }
+         inside), the tools at {TOOLS_TARGET}",
+        readonly.len()
     ));
     match declared {
         Some(folder) if folder == slot_path => {}
@@ -255,14 +241,13 @@ mod tests {
         }
     }
 
-    fn make(raw: &Value, slots: &[SlotInfo], secrets: bool, network: Network) -> Override {
+    fn make(raw: &Value, slots: &[SlotInfo], network: Network) -> Override {
         build(&OverrideInput {
             raw,
             run_dir: Path::new("/work/workspaces/r1"),
             config_slot: &slots[0],
             slots,
             tools_dir: Path::new("/work/environments/.tools/ab12"),
-            secrets_dir: secrets.then_some(Path::new("/work/environments/r1/secrets")),
             network,
         })
         .unwrap()
@@ -282,7 +267,6 @@ mod tests {
         let o = make(
             &json!({"image": "x", "workspaceFolder": "/workspaces/devbox", "workspaceMount": "type=bind,source=/etc,target=/w"}),
             &[slot("devbox", true)],
-            false,
             Network::Inherit,
         );
         assert_eq!(o.value["workspaceFolder"], "/work/workspaces/r1/devbox");
@@ -305,7 +289,6 @@ mod tests {
         let o = make(
             &json!({"image": "x"}),
             &[slot("devbox", true)],
-            false,
             Network::Inherit,
         );
         let mounts = mounts_of(&o);
@@ -323,7 +306,6 @@ mod tests {
         let o = make(
             &json!({"image": "x", "workspaceFolder": "/src/${localWorkspaceFolderBasename}"}),
             &[slot("devbox", false)],
-            false,
             Network::Inherit,
         );
         assert!(
@@ -342,7 +324,6 @@ mod tests {
             let o = make(
                 &json!({"image": "x", "workspaceFolder": folder}),
                 &[slot("devbox", false)],
-                false,
                 Network::Inherit,
             );
             assert!(
@@ -356,13 +337,13 @@ mod tests {
     }
 
     #[test]
-    fn every_mirror_and_every_dot_git_is_read_only_and_so_are_the_tools_and_the_secrets() {
+    fn every_mirror_and_every_dot_git_is_read_only_and_so_are_the_tools_and_no_secret_is_mounted() {
         let slots = [
             slot("devbox", true),
             slot("lib", true),
             slot("notes", false),
         ];
-        let o = make(&json!({"image": "x"}), &slots, true, Network::Inherit);
+        let o = make(&json!({"image": "x"}), &slots, Network::Inherit);
         let mounts = mounts_of(&o);
         for want in [
             "type=bind,source=/work/git/h/o/devbox.git,target=/work/git/h/o/devbox.git,readonly",
@@ -371,7 +352,6 @@ mod tests {
             "type=bind,source=/work/workspaces/r1/lib/.git,target=/work/workspaces/r1/lib/.git,readonly",
             "type=bind,source=/work/workspaces/r1/notes/.git,target=/work/workspaces/r1/notes/.git,readonly",
             "type=bind,source=/work/environments/.tools/ab12,target=/opt/adam/bin,readonly",
-            "type=bind,source=/work/environments/r1/secrets,target=/run/adam/secrets,readonly",
         ] {
             assert!(mounts.contains(&want), "{want} in {mounts:?}");
         }
@@ -379,12 +359,10 @@ mod tests {
             !mounts.iter().any(|m| m.contains("notes.git")),
             "a scratch slot has no mirror"
         );
-        // Without a secret there is no secrets mount.
-        let o = make(&json!({"image": "x"}), &slots, false, Network::Inherit);
+        // Nothing else of ours is mounted: in particular no secret (ADR 0038).
         assert!(
-            !mounts_of(&o)
-                .iter()
-                .any(|m| m.contains("/run/adam/secrets"))
+            !mounts.iter().any(|m| m.contains("/run/adam/secrets")),
+            "{mounts:?}"
         );
     }
 
@@ -393,7 +371,6 @@ mod tests {
         let o = make(
             &json!({"image": "x", "mounts": ["type=volume,source=cache,target=/c", {"type": "tmpfs", "target": "/t"}]}),
             &[slot("devbox", true)],
-            false,
             Network::Inherit,
         );
         let all = o.value["mounts"].as_array().unwrap();
@@ -407,19 +384,13 @@ mod tests {
         let o = make(
             &json!({"image": "x", "runArgs": ["--init", "-e", "A=b"]}),
             &[slot("d", false)],
-            false,
             Network::Inherit,
         );
         assert_eq!(
             o.value["runArgs"],
             json!(["--init", "-e", "A=b", "--network=host"])
         );
-        let o = make(
-            &json!({"image": "x"}),
-            &[slot("d", false)],
-            false,
-            Network::None,
-        );
+        let o = make(&json!({"image": "x"}), &[slot("d", false)], Network::None);
         assert_eq!(o.value["runArgs"], json!(["--network=none"]));
         assert!(
             o.changes
@@ -434,7 +405,6 @@ mod tests {
             &json!({"image": "x", "initializeCommand": "touch /work/INIT-RAN", "appPort": [3000],
                     "forwardPorts": [3000], "portsAttributes": {"3000": {}}, "postCreateCommand": "true"}),
             &[slot("d", false)],
-            false,
             Network::Inherit,
         );
         let map = o.value.as_object().unwrap();
@@ -464,7 +434,6 @@ mod tests {
         let o = make(
             &json!({"image": "x"}),
             &[slot("devbox", true)],
-            true,
             Network::Inherit,
         );
         let mounts: Vec<String> = mounts_of(&o).iter().map(|m| (*m).to_owned()).collect();
@@ -490,7 +459,6 @@ mod tests {
             config_slot: &slots[0],
             slots: &slots,
             tools_dir: Path::new("/t"),
-            secrets_dir: None,
             network: Network::Inherit,
         })
         .unwrap_err();

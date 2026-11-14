@@ -19,7 +19,7 @@
 # `adam-git-sandbox` with `adam-git`, which run the coder's git where no secret is readable)
 # on a Debian trixie Rust image, so their glibc
 # matches the runtime image (debian:trixie-slim). Stage 2 is the workspace
-# image (Rust, Flutter/Dart, Node, git, tini, OpenCode) with the binaries added.
+# image (Rust, Flutter/Dart, Node, git, tini) with the binaries added.
 
 # Rust builder, pinned by tag and digest.
 # Verified 2026-09-29: HEAD on registry-1.docker.io/v2/library/rust/manifests/1.94-trixie
@@ -101,15 +101,14 @@ COPY --from=build /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
 # The tools a run pod gets (ADR 0019): the chart's init container copies /opt/adam/bin/* into an emptyDir that the
 # run container mounts read-only at the same path, the layout of a devcontainer's tools directory. `adam-exec` is
-# the script the devcontainer crate embeds (one source, so the two environments cannot disagree about it), and
-# `opencode` is a link to the native binary the npm package put on PATH (the init container copies what it points
-# at, `cp -L`); the pod's image need carry neither.
+# the script the devcontainer crate embeds (one source, so the two environments cannot disagree about it); the
+# pod's image need not carry it. Nothing else is there: the coder brings no agent binary into a run (ADR 0038). The
+# OpenCode CLI of the base image stays on PATH, for people and for repositories that want it.
 COPY --chmod=0755 crates/adam-devcontainer/src/adam-exec.sh /opt/adam/bin/adam-exec
 # /work holds mirrors and worktrees; the deployment mounts a volume there. The
 # base image already creates it owned by uid 10001, as does this line for a
 # base that does not.
-RUN install -d -o 10001 -g 10001 /work \
- && bash -lc 'ln -s "$(readlink -f "$(command -v opencode)")" /opt/adam/bin/opencode'
+RUN install -d -o 10001 -g 10001 /work
 # The static client of the service's own release; `sha256sum -c` stops the build when the download is not
 # the pinned file. (Not `ADD --checksum`: the hadolint of the `lint Dockerfile` job cannot parse the flag.)
 RUN curl -fsSL -o /tmp/podman-remote.tar.gz \
@@ -147,9 +146,8 @@ EXPOSE 8080
 # shells out to are on PATH. The GitHub MCP server
 # is there, runs, and lists the twelve read tools of the coder's allow-list over stdio with no
 # credential (a missing name would stop the coder at startup). The devcontainer CLI and Podman's client
-# run, and the OpenCode that is mounted into every devcontainer is a native executable (an ELF file, not
-# the npm package's script: DEVCONTAINER_RUNTIME=podman refuses to start otherwise). The run pod's tools are in
-# /opt/adam/bin (adam-exec, and OpenCode as a native executable), and adam-kube-exec rejects an empty command line.
+# run. The run pod's tools are in /opt/adam/bin (adam-exec only: no OpenCode link, ADR 0038), and adam-kube-exec
+# rejects an empty command line.
 # obscura comes with the base; it is checked because the coder's instructions name it.
 RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/github-mcp-tools.sh \
     bash -lc 'set -e; \
@@ -157,10 +155,10 @@ RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/g
       command -v adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git git opencode tini github-mcp-server devcontainer podman-remote obscura; \
       test "$(devcontainer --version)" = "0.89.0"; \
       podman-remote --version | grep -q "5\.8\.7"; \
-      test "$(head -c 4 "$(readlink -f "$(command -v opencode)")" | tail -c 3)" = ELF; \
       github-mcp-server --version | grep -q "v1.12.2"; \
       test -x /opt/adam/bin/adam-exec; \
-      test "$(head -c 4 /opt/adam/bin/opencode | tail -c 3)" = ELF; \
+      test ! -e /opt/adam/bin/opencode; \
+      test "$(ls /opt/adam/bin)" = adam-exec; \
       out="$(adam-kube-exec 2>&1 || true)"; \
       echo "$out" | grep -q "expected run or shell"; \
       sh /tmp/github-mcp-tools.sh; \

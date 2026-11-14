@@ -2,7 +2,7 @@
 //!
 //! [`DevContainer`] is an [`Environment`](adam_workspace::Environment) of `adam-workspace`: the
 //! coder asks it for the session of a run, has the session prepare each command
-//! (`run_command`, `run_checks`, OpenCode and every command OpenCode starts), and spawns what comes
+//! (`run_command`, `run`, `run_checks`), and spawns what comes
 //! back. The files and the paths are the same inside the container as in the coder, so the file
 //! tools and all git work stay in the coder, which is also where the credentials are.
 //!
@@ -65,8 +65,6 @@ mod tools;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use secrecy::SecretString;
-
 pub use environment::DevContainer;
 
 /// Whether devcontainers are used at all.
@@ -87,7 +85,7 @@ pub enum Network {
     /// container's own), which the deployment limits.
     #[default]
     Inherit,
-    /// None. OpenCode cannot reach its model.
+    /// None.
     None,
 }
 
@@ -124,10 +122,6 @@ pub struct Settings {
     pub probe_interval: Duration,
     /// How long releasing a run may take (60 seconds).
     pub release_timeout: Duration,
-    /// The OpenCode binary to mount in every container (a native ELF), if OpenCode is to run inside.
-    pub opencode: Option<PathBuf>,
-    /// The model key, written as a read-only file for OpenCode's `{file:...}`: never an argument or a variable.
-    pub model_key: Option<SecretString>,
 }
 
 impl Settings {
@@ -148,8 +142,6 @@ impl Settings {
             probe_timeout: Duration::from_secs(10),
             probe_interval: Duration::from_secs(30),
             release_timeout: Duration::from_secs(60),
-            opencode: None,
-            model_key: None,
         }
     }
 }

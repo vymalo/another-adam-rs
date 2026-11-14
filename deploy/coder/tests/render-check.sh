@@ -182,14 +182,14 @@ check "the probes still use /healthz for a worker" count 'path: /healthz' 3
 
 # The model and GitHub settings belong to the roles that run workers. A control plane only starts,
 # delivers to, cancels and views runs, so it gets none of them (and needs neither secret).
-model_and_github='name: (MODEL_API_KEY|GITHUB_TOKEN|MODEL_BASE_URL|MODEL|OPENCODE_MODEL)$'
+model_and_github='name: (MODEL_API_KEY|GITHUB_TOKEN|MODEL_BASE_URL|MODEL)$'
 workspace_and_checks='name: (WORKSPACE_ROOT|WORKSPACE_SWEEP_SECS|WORKERS|MAX_CHECK_CYCLES|CHECK_TIMEOUT_SECS|ALLOWED_REPO_HOSTS|GITHUB_API_URL|PR_DRAFT|GIT_AUTHOR_NAME|GIT_AUTHOR_EMAIL)$'
 secrets_of_workers='secretKey: (MODEL_API_KEY|GITHUB_TOKEN)$'
 front='name: (A2A_BEARER_TOKENS|DATABASE_URL|PUBLIC_URL)$'
 
 helm template coder "$chart" --namespace coder-ns --set config.role=control-plane > "$out"
 check "a control plane renders ROLE=control-plane" has 'value: "control-plane"'
-check "a control plane gets no model, GitHub or OpenCode settings" lacks "$model_and_github"
+check "a control plane gets no model or GitHub settings" lacks "$model_and_github"
 check "a control plane gets no workspace or check settings" lacks "$workspace_and_checks"
 check "a control plane connects no MCP server, so it allows none: no MCP_ALLOW_STDIO" lacks 'name: MCP_ALLOW_STDIO'
 check "a control plane's ExternalSecret carries neither worker secret" lacks "$secrets_of_workers"
@@ -212,7 +212,7 @@ for role in "" all worker; do
   if [ -n "$role" ]; then set -- --set "config.role=$role"; else set --; fi
   label=${role:-default}
   helm template coder "$chart" --namespace coder-ns "$@" > "$out"
-  check "the $label role gets the model, GitHub and OpenCode settings" count "$model_and_github" 5
+  check "the $label role gets the model and GitHub settings" count "$model_and_github" 4
   check "the $label role gets the workspace and check settings" count "$workspace_and_checks" 10
   check "the $label role gets both worker secrets, in the pod and in the ExternalSecret" count "$secrets_of_workers" 2
   check "the $label role reads both worker secrets from the Secret" count '^                  key: (MODEL_API_KEY|GITHUB_TOKEN)$' 2
@@ -234,7 +234,7 @@ check "split: the agent card URL is still the Service" has 'http://coder.coder-n
 check "split: the Deployment is the front" dhas Deployment '^  name: coder-front$'
 check "split: the Deployment is a control plane" dhas Deployment 'value: "control-plane"'
 check "split: the Deployment has no volume" dlacks Deployment 'volumeMounts:|volumeClaimTemplates:|mountPath:'
-check "split: the Deployment has no model, GitHub or OpenCode settings" dlacks Deployment "$model_and_github"
+check "split: the Deployment has no model or GitHub settings" dlacks Deployment "$model_and_github"
 check "split: the Deployment has no workspace or check settings" dlacks Deployment "$workspace_and_checks"
 check "split: the Deployment allows no local-process MCP server" dlacks Deployment 'name: MCP_ALLOW_STDIO'
 check "split: the worker StatefulSet allows them" dhas StatefulSet 'name: MCP_ALLOW_STDIO'
@@ -246,7 +246,7 @@ check "split: the StatefulSet is still named coder and is the worker" dhas State
 check "split: the worker mounts /work" dhas StatefulSet 'mountPath: /work'
 check "split: the worker has neither the A2A tokens nor the public URL" dlacks StatefulSet 'name: (A2A_BEARER_TOKENS|PUBLIC_URL)$'
 check "split: the worker keeps the database" dhas StatefulSet 'name: DATABASE_URL$'
-check "split: the worker gets the model, GitHub and OpenCode settings" dcount StatefulSet "$model_and_github" 5
+check "split: the worker gets the model and GitHub settings" dcount StatefulSet "$model_and_github" 4
 check "split: the worker gets the workspace and check settings" dcount StatefulSet "$workspace_and_checks" 10
 check "split: the worker keeps one replica" dhas StatefulSet '^  replicas: 1$'
 check "split: the StatefulSet identity equals the combined one (the PVC is reused)" \
@@ -435,7 +435,7 @@ check "app: the per-pod /work volume is untouched" dhas StatefulSet '^  volumeCl
 check "app: no Secret object and no key in the render" lacks '^kind: Secret$|PRIVATE KEY'
 check "app: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
 check "app: the model, workspace and check settings are unchanged" dcount StatefulSet "$workspace_and_checks" 10
-check "app: the model settings stay (the token is the only one gone)" count "$model_and_github" 4
+check "app: the model settings stay (the token is the only one gone)" count "$model_and_github" 3
 helm_app --set externalSecrets.properties.githubToken=null > "$out"
 check "app: externalSecrets.properties.githubToken is not needed" count "$app_env" 3
 
@@ -532,7 +532,7 @@ check "it has the container security context" shas 'allowPrivilegeEscalation: fa
 check "it has resources" shas '^          resources:$'
 check "the coder is told where it is: GITHUB_MCP_URL, once" count 'name: GITHUB_MCP_URL$' 1
 check "GITHUB_MCP_URL is on loopback at the port" chas '^              value: "http://127.0.0.1:8082"$'
-check "the coder still has the GitHub settings it had" count "$model_and_github" 5
+check "the coder still has the GitHub settings it had" count "$model_and_github" 4
 check "the sidecar adds no health probe path (the coder's three are the only httpGet ones)" count 'path: /healthz' 3
 
 # Values-driven: the port (and the coder's URL with it), the host (only the sidecar has it), off.
@@ -847,7 +847,7 @@ for role in "" all worker; do
   check "url on, $label role: the ExternalSecret copies the property into MODEL_BASE_URL" \
     dhas ExternalSecret '^    - secretKey: MODEL_BASE_URL$'
   check "url on, $label role: the default AWS property is model_base_url" dhas ExternalSecret '^        property: model_base_url$'
-  check "url on, $label role: model, GitHub and OpenCode settings unchanged in number" count "$model_and_github" 5
+  check "url on, $label role: model and GitHub settings unchanged in number" count "$model_and_github" 4
   check "url on, $label role: the ExternalSecret has one more key (MODEL_API_KEY, MODEL_BASE_URL, GITHUB_TOKEN, A2A_BEARER_TOKENS)" \
     dcount ExternalSecret 'secretKey:' 4
 done
@@ -870,7 +870,7 @@ helm_url --set config.modelBaseUrlFromSecret=true --set topology=split --set fro
 check "url on, split: the worker reads MODEL_BASE_URL from the Secret" urlhas '^                  key: MODEL_BASE_URL$'
 check "url on, split: the front has no MODEL_BASE_URL" dlacks Deployment 'MODEL_BASE_URL|model_base_url'
 check "url on, split: the ExternalSecret copies it for the worker" dhas ExternalSecret '^    - secretKey: MODEL_BASE_URL$'
-check "url on, split: the worker still has the five model and GitHub settings" dcount StatefulSet "$model_and_github" 5
+check "url on, split: the worker still has the four model and GitHub settings" dcount StatefulSet "$model_and_github" 4
 
 # A control plane never reads the model: nothing is rendered, and nothing is required, even with the option on.
 helm_url --set config.modelBaseUrlFromSecret=true --set config.role=control-plane \
@@ -1060,8 +1060,9 @@ check "template: runs as uid 10001, non-root" tpl 'runAsUser: 10001'
 check "template: allowPrivilegeEscalation false and every capability dropped" tpl 'allowPrivilegeEscalation: false'
 check "template: tini holds the container open" tpl 'command: \["tini", "--", "sleep", "infinity"\]'
 check "template: the tools directory is mounted read-only at /opt/adam/bin" tpl 'mountPath: /opt/adam/bin'
-check "template: an init container copies adam-exec and OpenCode out of the coder image" \
-  tpl 'cp -L /opt/adam/bin/adam-exec /opt/adam/bin/opencode /tools/'
+check "template: an init container copies adam-exec, and nothing else, out of the coder image" \
+  tpl '"cp -L /opt/adam/bin/adam-exec /tools/ && chmod 0755 /tools/adam-exec"'
+check "template: ... no OpenCode in the pod" notpl 'opencode'
 check "template: the init container is the coder's image" tpl 'image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"'
 check "template: /work is the coder's claim, the per-pod one" tpl 'claimName: work-coder-0'
 one_work_mount() { [ "$(run_pod_template | grep -c 'mountPath: /work$')" -eq 1 ] && notpl 'subPath'; }
@@ -1071,8 +1072,8 @@ check "template: required pod affinity to the coder pod, by hostname (a ReadWrit
   tpl 'requiredDuringSchedulingIgnoredDuringExecution'
 check "template: ... topologyKey kubernetes.io/hostname" tpl 'topologyKey: kubernetes.io/hostname'
 check "template: ... selecting the coder pods" tpl 'app.kubernetes.io/instance: coder'
-check "template: the model key comes from the ExternalSecret's Secret, by key" tpl 'name: MODEL_API_KEY'
-check "template: ... as secretKeyRef coder / MODEL_API_KEY" tpl 'key: MODEL_API_KEY'
+check "template: no model key: no MODEL_API_KEY variable" notpl 'MODEL_API_KEY'
+check "template: ... and no reference to a Secret at all (ADR 0038)" notpl 'secretKeyRef|secretRef|secretName|^      secret:'
 check "template: no GitHub token, database URL or bearer token" notpl 'GITHUB_TOKEN|GITHUB_APP|DATABASE_URL|A2A_BEARER|SEARCH_MCP_TOKEN|CONTEXT7'
 check "template: no hostPath, hostNetwork, hostPID, hostIPC, privileged" notpl 'hostPath|hostNetwork|hostPID|hostIPC|privileged: true'
 check "template: no Secret volume" notpl '^      secret:'
@@ -1315,12 +1316,16 @@ check "policy: ... or a hostPath: only emptyDir and the work claim" \
   policy_has "$pn" "has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0'))"
 check "policy: ... or a Secret as a volume (a run pod mounts no Secret at all)" \
   fails policy_has "$pn" 'has(v.secret)'
-check "policy: ... or any Secret reference but the model key: the Secret's name and the key MODEL_API_KEY" \
-  policy_has "$pn" "(e.valueFrom.secretKeyRef.name == 'coder' && e.valueFrom.secretKeyRef.key == 'MODEL_API_KEY')"
-one_secret_reference() {
-  [ "$(run_pod_template | grep -c 'secretKeyRef:')" -eq 1 ] && tpl '^              name: coder$' && tpl '^              key: MODEL_API_KEY$'
-}
-check "policy: ... the template makes that one reference, and no other" one_secret_reference
+check "policy: ... or any secretKeyRef at all: it names no Secret and no key" \
+  policy_has "$pn" '!has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)'
+check "policy: ... and allows no name or key of a Secret (nothing is compared with a Secret's name)" \
+  fails policy_has "$pn" 'secretKeyRef.name'
+check "policy: ... the message says a run pod references no Secret" \
+  rhas ValidatingAdmissionPolicy "$pn" 'message: "a run pod references no Secret: no Secret volume, no secretKeyRef, no envFrom"'
+no_secret_reference() { [ "$(run_pod_template | grep -Ec 'secretKeyRef|secretRef|secretName')" -eq 0 ]; }
+check "run pods reference no Secret at all: the template holds none" no_secret_reference
+check "run pods reference no Secret at all: the policy and the template agree (the render has no Secret name in the policy)" \
+  fails policy_has "$pn" "'coder' &&"
 check "policy: ... or envFrom a Secret" policy_has "$pn" '!has(f.secretRef)'
 check "policy: ... or a privileged container or one that may escalate" policy_has "$pn" 'c.securityContext.allowPrivilegeEscalation == false'
 check "policy: ... or root" policy_has "$pn" ') != 0 &&'
@@ -1482,9 +1487,8 @@ check "service account named: the coder pod uses it" sts_of '^      serviceAccou
 check "service account named: the binding is to it" rhas RoleBinding coder-run-pods 'name: my-sa$'
 check "service account named: the policy is matched to it" policy_has "$pn" "system:serviceaccount:coder-ns:my-sa"
 helm_rp --set externalSecrets.targetSecretName=model-secrets > "$out"
-check "a named target Secret: the policy allows the model key of that Secret, by name and key, and no other reference" \
-  policy_has "$pn" "(e.valueFrom.secretKeyRef.name == 'model-secrets' && e.valueFrom.secretKeyRef.key == 'MODEL_API_KEY')"
-check "... and the template references that Secret" tpl '^              name: model-secrets$'
+check "a named target Secret: the policy names no Secret (a run pod reads none)" fails policy_has "$pn" 'model-secrets'
+check "... and the template does not reference that Secret" notpl 'model-secrets'
 check "... and still no Secret volume" fails policy_has "$pn" 'has(v.secret)'
 helm_rp --set 'runPods.admissionPolicy.extraAllowedImages={registry.example/extra:1}' > "$out"
 check "policy: extra allowed images are values-driven" policy_has "$pn" "'registry.example/extra:1'"
@@ -1537,9 +1541,12 @@ message=$(helm_rp --set replicaCount=2 2>&1 || true)
 check "refused: two workers on per-pod ReadWriteOnce volumes" fails helm_rp --set replicaCount=2
 check "... the error says a run pod mounts one claim" says "$message" 'mounts one claim'
 check "refused: isolated placement with two workers" fails helm_rp --set workspace.placement=isolated --set replicaCount=2
-message=$(helm_rp --set externalSecrets.enabled=false 2>&1 || true)
-check "refused: no ExternalSecret (the model key reaches a run pod only from it)" fails helm_rp --set externalSecrets.enabled=false
-check "... the error names externalSecrets.enabled" says "$message" 'externalSecrets.enabled'
+# A run pod gets no model key (ADR 0038), so run pods no longer need the ExternalSecret.
+check "runPods.enabled without externalSecrets renders" helm_rp --set externalSecrets.enabled=false
+helm_rp --set externalSecrets.enabled=false > "$out" || : > "$out"
+check "runPods.enabled without externalSecrets: the run pod template is there" has '^kind: ConfigMap$'
+check "runPods.enabled without externalSecrets: ... and there is no ExternalSecret" lacks '^kind: ExternalSecret$'
+check "runPods.enabled without externalSecrets: ... and still no Secret in the run pod template" notpl 'secretKeyRef|secretRef|secretName|MODEL_API_KEY'
 check "refused: a model key in extraEnv" fails helm_rp --set runPods.extraEnv.MODEL_API_KEY=x
 check "refused: a bad image digest" fails helm_rp --set runPods.image.digest=sha256:abc
 check "refused: no memory limit (the quota would refuse every pod)" fails helm_rp --set runPods.resources.limits.memory=null
@@ -1840,5 +1847,29 @@ check "production: ... and the App's key is mounted in the coder alone" coder_na
 check "production: no Secret object and no key in the render" lacks '^kind: Secret$|PRIVATE KEY'
 check "production: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
 check "production: no GITHUB_TOKEN anywhere (an App has none)" lacks 'GITHUB_TOKEN'
+
+# The OpenCode path is gone (ADR 0038): no role sets OPENCODE_MODEL, and a values file that still sets
+# config.opencodeModel changes no manifest (the chart has no values.schema.json, so Helm ignores the value)
+# and gets one line in NOTES.txt.
+for role in "" all worker control-plane; do
+  if [ -n "$role" ]; then set -- --set "config.role=$role"; else set --; fi
+  helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@" > "$out"
+  check "no role sets OPENCODE_MODEL (${role:-default})" lacks 'OPENCODE'
+done
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set topology=split > "$out"
+check "no role sets OPENCODE_MODEL (split)" lacks 'OPENCODE'
+helm_rp > "$out"
+check "no role sets OPENCODE_MODEL (run pods on)" lacks 'OPENCODE|/opt/adam/bin/opencode'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.opencodeModel=old-alias > "$out"
+check "config.opencodeModel set: the manifests are unchanged (the golden)" cmp -s "$out" "$golden"
+# `helm template` does not print NOTES.txt: a copy of the chart whose NOTES.txt is a manifest does.
+notes_chart=$(mktemp -d)
+cp -R "$chart"/. "$notes_chart"/
+mv "$notes_chart/templates/NOTES.txt" "$notes_chart/templates/notes.yaml"
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --set config.opencodeModel=old-alias --show-only templates/notes.yaml --debug 2>&1 || true)
+check "config.opencodeModel set: NOTES.txt warns" says "$notes" 'config.opencodeModel is set and ignored'
+notes=$(helm template coder "$notes_chart" --namespace coder-ns --set image.tag=sha-abc1234 --show-only templates/notes.yaml --debug 2>&1 || true)
+check "config.opencodeModel unset: NOTES.txt does not warn" fails says "$notes" 'opencodeModel'
+rm -rf "$notes_chart"
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

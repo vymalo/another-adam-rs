@@ -12,14 +12,12 @@ use adam_devcontainer::{DevContainer, Network, Runtime, Settings};
 use adam_workspace::{
     EnvProgress, EnvStep, GitIdentity, RepoRef, RunWorkspace, StaticToken, Workspaces,
 };
-use secrecy::SecretString;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 pub const RUN: &str = "run-0001";
 pub const DEPLOYMENT: &str = "coder-test";
 pub const CONTAINER: &str = "0123456789abcdef0123456789abcdef";
-pub const MODEL_KEY: &str = "sk-model-key-0123456789";
 pub const DEFAULT_IMAGE: &str = "registry.example/base:1@sha256:aaaa";
 
 const PODMAN: &str = r#"#!/bin/sh
@@ -146,7 +144,6 @@ impl Rig {
         settings.default_image = DEFAULT_IMAGE.to_owned();
         settings.network = Network::Inherit;
         settings.deployment = DEPLOYMENT.to_owned();
-        settings.model_key = Some(SecretString::from(MODEL_KEY));
         settings.up_timeout = Duration::from_secs(20);
         settings.setup_timeout = Duration::from_secs(20);
         settings.read_timeout = Duration::from_secs(20);
@@ -261,7 +258,7 @@ impl Rig {
 
     /// `podman inspect` of a container as the stub's `up` made it: the binds are what the override
     /// asked for, recomputed here from the slots (an oracle independent of the code under test).
-    pub async fn inspect_for(&self, ws: &RunWorkspace, secrets: bool) {
+    pub async fn inspect_for(&self, ws: &RunWorkspace) {
         let slots = ws.slots_in_join_order().await.unwrap();
         let run_dir = self.root.join("workspaces").join(ws.run());
         let tools = self.env.install_tools().await.unwrap();
@@ -274,14 +271,6 @@ impl Rig {
             mounts.push(bind(&git, &git, false));
         }
         mounts.push(bind(&tools, Path::new("/opt/adam/bin"), false));
-        if secrets {
-            let dir = self
-                .root
-                .join("environments")
-                .join(ws.run())
-                .join("secrets");
-            mounts.push(bind(&dir, Path::new("/run/adam/secrets"), false));
-        }
         mounts.push(bind(
             slots[0].path(),
             &PathBuf::from(format!("/workspaces/{}", slots[0].dir())),

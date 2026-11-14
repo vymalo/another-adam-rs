@@ -267,8 +267,6 @@ spec:
               value: "https://gateway.example.invalid/v1"
             - name: MODEL
               value: "coder"
-            - name: OPENCODE_MODEL
-              value: "coder"
             - name: WORKERS
               value: "4"
             - name: MAX_CHECK_CYCLES

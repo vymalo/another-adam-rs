@@ -10,8 +10,7 @@
 //! * `ADAM_TEST_KUBE_NAMESPACE` (default `default`), `ADAM_TEST_KUBE_INSTANCE` (default `coder`), the
 //!   release's namespace and instance label, and `ADAM_TEST_KUBE_WORKER` (default `ci-0`);
 //! * optionally `ADAM_TEST_KUBE_QUOTA_PODS`, the `pods` of the chart's ResourceQuota, which turns on the
-//!   test of the quota, and `ADAM_TEST_KUBE_MODEL_KEY`, the value of the model key the template's
-//!   Secret holds, which turns on the test of what a spec hides;
+//!   test of the quota;
 //! * optionally `ADAM_TEST_KUBE_ISOLATION_MIRROR` and `ADAM_TEST_KUBE_ISOLATION_ADMIN`, which turn on the
 //!   test that a run pod sees only its own run. The volume must hold, made by whoever sets the cluster
 //!   up (`kind-run-pods.sh` does): a bare mirror at the first path, a worktree of it for the run
@@ -61,7 +60,6 @@ struct Cluster {
     worker: String,
     template_file: PathBuf,
     quota_pods: Option<usize>,
-    model_key: Option<String>,
 }
 
 async fn cluster() -> Option<Cluster> {
@@ -94,7 +92,6 @@ async fn cluster() -> Option<Cluster> {
         quota_pods: std::env::var("ADAM_TEST_KUBE_QUOTA_PODS")
             .ok()
             .and_then(|n| n.parse().ok()),
-        model_key: std::env::var("ADAM_TEST_KUBE_MODEL_KEY").ok(),
     })
 }
 
@@ -372,19 +369,10 @@ async fn commands_run_in_the_runs_own_pod(c: &Cluster) {
     .await;
     assert_eq!(done.stdout.len(), 3_000_000);
 
-    // What the spec hides is not in the command's environment; what it does not is.
-    if let Some(key) = &c.model_key {
-        let show = "printf '%s' \"${MODEL_API_KEY-unset}\"";
-        let (done, _) = run(&session, &ExecSpec::shell(show, &cwd), None).await;
-        assert_eq!(&done.stdout, key, "the pod has the key the Secret holds");
-        let (done, _) = run(
-            &session,
-            &ExecSpec::shell(show, &cwd).hide(["MODEL_API_KEY"]),
-            None,
-        )
-        .await;
-        assert_eq!(done.stdout, "unset");
-    }
+    // The pod has no model key (ADR 0038), and what the spec hides is not in the command's environment.
+    let show = "printf '%s' \"${MODEL_API_KEY-unset}\"";
+    let (done, _) = run(&session, &ExecSpec::shell(show, &cwd), None).await;
+    assert_eq!(done.stdout, "unset", "no model key reaches a run pod");
     // The coder's own secrets are not in the pod at all.
     let (done, _) = run(
         &session,
@@ -624,10 +612,13 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
             }),
         ),
         (
-            "another key of the Secret the model key is in",
+            "a key of a Secret, as a variable",
             Box::new(|p| {
-                let mut reference = model_key_reference(p);
-                reference.key = "GITHUB_TOKEN".into();
+                let reference = k8s_openapi::api::core::v1::SecretKeySelector {
+                    name: "any-secret".into(),
+                    key: "GITHUB_TOKEN".into(),
+                    optional: None,
+                };
                 p.spec.as_mut().unwrap().containers[0]
                     .env
                     .get_or_insert_default()
@@ -642,9 +633,9 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
             }),
         ),
         (
-            "the Secret the model key is in, as a volume",
+            "a Secret as a volume",
             Box::new(|p| {
-                let name = model_key_reference(p).name;
+                let name = "any-secret".to_owned();
                 p.spec
                     .as_mut()
                     .unwrap()
@@ -661,9 +652,9 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
             }),
         ),
         (
-            "every key of the Secret the model key is in, as envFrom",
+            "every key of a Secret, as envFrom",
             Box::new(|p| {
-                let name = model_key_reference(p).name;
+                let name = "any-secret".to_owned();
                 p.spec.as_mut().unwrap().containers[0]
                     .env_from
                     .get_or_insert_default()
@@ -755,20 +746,6 @@ async fn the_admission_policy_refuses_everything_but_the_intended_pod(c: &Cluste
         );
         eprintln!("refused {what}: HTTP {}", status.code);
     }
-}
-
-/// The reference to the model key the template's run container has, whose Secret is the one Secret
-/// the policy allows.
-fn model_key_reference(pod: &Pod) -> k8s_openapi::api::core::v1::SecretKeySelector {
-    pod.spec
-        .as_ref()
-        .unwrap()
-        .containers
-        .iter()
-        .flat_map(|c| c.env.iter().flatten())
-        .find(|e| e.name == "MODEL_API_KEY")
-        .and_then(|e| e.value_from.as_ref()?.secret_key_ref.clone())
-        .expect("the template gives the run container MODEL_API_KEY from a Secret")
 }
 
 /// A run pod sees its own run and the git directories its worktree needs, and nothing of any other run:

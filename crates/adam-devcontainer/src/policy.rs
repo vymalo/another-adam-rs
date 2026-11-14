@@ -23,8 +23,6 @@ use crate::Network;
 
 /// Where the tools of the coder are mounted in the container.
 pub(crate) const TOOLS_TARGET: &str = "/opt/adam/bin";
-/// Where the secrets of a run are mounted in the container.
-pub(crate) const SECRETS_TARGET: &str = "/run/adam/secrets";
 /// Targets a repository may not mount over: ours.
 const RESERVED_TARGETS: [&str; 2] = ["/opt/adam", "/run/adam"];
 /// The prefix of the labels this crate puts on its containers.

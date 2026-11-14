@@ -22,10 +22,8 @@
 //!   ([`release`](Environment::release), idempotent) and says which runs it holds something for
 //!   ([`held_runs`](Environment::held_runs)), so that an orphan sweep can find what a crash left.
 //! * [`EnvSession`] is the run's view of it: [`describe`](EnvSession::describe) for a person,
-//!   [`prepare`](EnvSession::prepare), [`kill`](EnvSession::kill), and
-//!   [`secret_ref`](EnvSession::secret_ref), which says how a process in that environment reads a
-//!   secret (an environment variable it has, or a file it can read) so that no secret is ever put
-//!   in a command line.
+//!   [`prepare`](EnvSession::prepare) and [`kill`](EnvSession::kill). No secret is ever put in a
+//!   command line, and an environment gives none to its processes.
 //! * [`EnvProgress`] is how a slow `ensure` (building an image) tells the caller what it is doing,
 //!   as [`EnvStep`]s the caller shows.
 //!
@@ -68,8 +66,7 @@ pub struct ExecSpec {
     pub program: Program,
     /// The working directory.
     pub cwd: PathBuf,
-    /// Environment variables to set. **Never a secret**: a secret is given by reference
-    /// ([`EnvSession::secret_ref`]).
+    /// Environment variables to set. **Never a secret.**
     pub env: BTreeMap<String, String>,
     /// Names of variables the process must not see, in an environment that passes its caller's
     /// along (the secrets of the caller's own process). An environment that starts the process
@@ -186,15 +183,6 @@ impl PreparedCommand {
         }
         cmd
     }
-}
-
-/// How a process in an environment reads a secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SecretRef {
-    /// An environment variable the process has (a config's `{env:NAME}`).
-    Env(String),
-    /// A file the process can read (a config's `{file:/path}`).
-    File(PathBuf),
 }
 
 /// What a sandbox reserves for the processes in it: the shape a command's time is weighted by when an
@@ -417,15 +405,6 @@ pub trait EnvSession: Send + Sync {
     /// what it cannot do is logged, and a process that is already gone is not an error.
     async fn kill(&self, exec: &ExecId);
 
-    /// Where the program `name` is in this environment, when it is **not** where the caller finds
-    /// it: an environment that runs processes elsewhere brings along the caller's own copy of a
-    /// program the caller needs inside (the coder's `opencode`), at a path of its own. `None`: the
-    /// caller uses the program as it names it (the default, and [`Local`]).
-    fn tool_path(&self, name: &str) -> Option<PathBuf> {
-        let _ = name;
-        None
-    }
-
     /// What a process in this environment reserves, **when the environment meters the time of its
     /// processes**: the coder reports how long each command ran, weighted by this shape, as the run's
     /// sandbox usage (ADR 0043). `None`, the default, is an environment that is not metered (the
@@ -435,11 +414,6 @@ pub trait EnvSession: Send + Sync {
     fn sandbox_shape(&self) -> Option<SandboxShape> {
         None
     }
-
-    /// How a process in this environment reads the secret called `name`, if it can be given:
-    /// [`Local`] gives `"model-key"` as the variable `MODEL_API_KEY` of the caller's own
-    /// environment, which the process inherits.
-    fn secret_ref(&self, name: &str) -> Option<SecretRef>;
 }
 
 /// What can go wrong with an environment. No variant carries a secret.
@@ -594,10 +568,6 @@ impl EnvSession for LocalSession {
     }
 
     async fn kill(&self, _exec: &ExecId) {}
-
-    fn secret_ref(&self, name: &str) -> Option<SecretRef> {
-        (name == "model-key").then(|| SecretRef::Env("MODEL_API_KEY".to_owned()))
-    }
 }
 
 /// An [`Environment`] that hides some variables of the caller's own environment from **every**
@@ -713,16 +683,8 @@ impl EnvSession for HidingSession {
         self.inner.kill(exec).await;
     }
 
-    fn tool_path(&self, name: &str) -> Option<PathBuf> {
-        self.inner.tool_path(name)
-    }
-
     fn sandbox_shape(&self) -> Option<SandboxShape> {
         self.inner.sandbox_shape()
-    }
-
-    fn secret_ref(&self, name: &str) -> Option<SecretRef> {
-        self.inner.secret_ref(name)
     }
 }
 
@@ -756,10 +718,10 @@ mod tests {
 
     #[test]
     fn local_prepares_a_program_and_its_arguments_as_they_are() {
-        let spec = ExecSpec::argv(["opencode", "acp"], "/w");
+        let spec = ExecSpec::argv(["git", "status"], "/w");
         let prepared = LocalSession.prepare(&spec).unwrap();
-        assert_eq!(prepared.program, PathBuf::from("opencode"));
-        assert_eq!(prepared.args, ["acp"]);
+        assert_eq!(prepared.program, PathBuf::from("git"));
+        assert_eq!(prepared.args, ["status"]);
         assert!(prepared.env.is_empty() && prepared.env_remove.is_empty());
     }
 
@@ -782,14 +744,8 @@ mod tests {
     }
 
     #[test]
-    fn local_says_what_it_is_and_gives_the_model_key_as_a_variable() {
-        let session = LocalSession;
-        assert_eq!(session.describe().kind, EnvKind::Local);
-        assert_eq!(
-            session.secret_ref("model-key"),
-            Some(SecretRef::Env("MODEL_API_KEY".to_owned()))
-        );
-        assert_eq!(session.secret_ref("anything-else"), None);
+    fn local_says_what_it_is() {
+        assert_eq!(LocalSession.describe().kind, EnvKind::Local);
     }
 
     #[test]
@@ -863,10 +819,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_has_nothing_to_make_again_and_brings_no_program_of_its_own() {
+    async fn local_has_nothing_to_make_again() {
         assert!(!Local.rebuild("any-run", false).await.unwrap());
         assert!(!Local.rebuild("any-run", true).await.unwrap());
-        assert_eq!(LocalSession.tool_path("opencode"), None);
     }
 
     fn a_run(dir: &std::path::Path) -> RunWorkspace {
@@ -971,10 +926,6 @@ mod tests {
         assert!(env.held_runs().await.unwrap().is_empty());
         env.release("any").await.unwrap();
         assert!(!env.rebuild("any", false).await.unwrap());
-        assert_eq!(
-            session.secret_ref("model-key"),
-            Some(SecretRef::Env("MODEL_API_KEY".to_owned()))
-        );
     }
 
     /// An environment whose sessions say they are metered.
@@ -1002,10 +953,6 @@ mod tests {
 
         fn sandbox_shape(&self) -> Option<SandboxShape> {
             Some(SandboxShape::new(Some(250), Some(512 * 1024 * 1024)))
-        }
-
-        fn secret_ref(&self, _name: &str) -> Option<SecretRef> {
-            None
         }
     }
 

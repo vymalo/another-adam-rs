@@ -2,12 +2,11 @@
 //!
 //! ```text
 //! <root>/environments/
-//!   .tools/<version>/{adam-exec,opencode}   written once, mounted read-only by every run
+//!   .tools/<version>/adam-exec              written once, mounted read-only by every run
 //!   .cli-home/                              HOME of the devcontainer CLI (its caches)
 //!   <run>/
 //!     state.json      what is known of the run's environment (below)
 //!     devcontainer.json  the override file the CLI is given
-//!     secrets/model-key  mode 0600, mounted read-only in the container
 //!     build.log       the last 64 KiB of what the CLI said
 //!     lock            the flock that makes `ensure` single-flight across processes
 //! ```
@@ -148,9 +147,6 @@ pub(crate) struct State {
     pub image: Option<String>,
     #[serde(default)]
     pub keep_id: bool,
-    /// Whether a model key was written for the container.
-    #[serde(default)]
-    pub model_key: bool,
     /// The tools directory that was mounted.
     pub tools: Option<String>,
     /// Why the run is local (`phase` is `local`).
@@ -174,7 +170,6 @@ impl State {
             container_id: None,
             image: None,
             keep_id: false,
-            model_key: false,
             tools: None,
             local_reason: None,
             error: None,
@@ -256,7 +251,6 @@ mod tests {
         state.container_id = Some("0123".into());
         state.image = Some("localhost/vsc-devbox-1-uid:latest".into());
         state.keep_id = true;
-        state.model_key = true;
         state.tools = Some("/work/environments/.tools/ab".into());
         state
     }

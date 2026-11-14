@@ -289,9 +289,9 @@ data:
         - name: tools
           image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
           imagePullPolicy: IfNotPresent
-          # adam-exec and the native OpenCode, out of the coder's image, into the directory the run container mounts
-          # read-only: the layout of a devcontainer's tools directory.
-          command: ["sh", "-c", "cp -L /opt/adam/bin/adam-exec /opt/adam/bin/opencode /tools/ && chmod 0755 /tools/adam-exec /tools/opencode"]
+          # adam-exec, out of the coder's image, into the directory the run container mounts read-only: the layout of
+          # a devcontainer's tools directory. Nothing else: a run pod holds no agent binary and no secret (ADR 0038).
+          command: ["sh", "-c", "cp -L /opt/adam/bin/adam-exec /tools/ && chmod 0755 /tools/adam-exec"]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -333,11 +333,6 @@ data:
               value: "localhost,127.0.0.1"
             - name: no_proxy
               value: "localhost,127.0.0.1"
-            - name: MODEL_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: coder
-                  key: MODEL_API_KEY
           resources:
             limits:
               memory: 2Gi
@@ -633,7 +628,7 @@ spec:
         app.kubernetes.io/name: coder
         app.kubernetes.io/instance: coder
       annotations:
-        checksum/run-pod: e9ef0ea52208cdbb2fddcf963429e33d92570fd9ba7aa859e69ff574a9690b8f
+        checksum/run-pod: 57ad0b8a9378d15ed5e816ae1f48cc57f23b32396fdbf69983c250d22c346829
     spec:
       serviceAccountName: coder
       automountServiceAccountToken: false
@@ -748,8 +743,6 @@ spec:
             - name: MODEL_BASE_URL
               value: "https://gateway.example.invalid/v1"
             - name: MODEL
-              value: "coder"
-            - name: OPENCODE_MODEL
               value: "coder"
             - name: WORKERS
               value: "4"
@@ -964,8 +957,8 @@ spec:
 # runPods.enabled: the guard that lets the coder make pods without being able to read the namespace's other Secrets,
 # mount the host, or run anything privileged. It applies to pods CREATED BY the coder's ServiceAccount (the match
 # condition) in this namespace (the binding), and refuses any that is not the intended run pod. Without it the RBAC
-# alone would let the coder create any pod in its namespace. A run pod may reference exactly one Secret key, the model
-# key, by the Secret's name and the key: no Secret volume, no envFrom, no other key of that Secret (ADR 0041).
+# alone would let the coder create any pod in its namespace. A run pod references no Secret at all: no Secret volume,
+# no secretKeyRef, no envFrom (ADR 0038, ADR 0041).
 # Needs Kubernetes 1.30 or later (admissionregistration.k8s.io/v1).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -1000,8 +993,8 @@ spec:
       message: "a run pod uses only the images the chart allows"
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName in ['work-coder-0', 'coder-cache']))"
       message: "a run pod mounts only emptyDir volumes and the claims work-coder-0 and coder-cache: no hostPath, no Secret, no other claim"
-    - expression: "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || (e.valueFrom.secretKeyRef.name == 'coder' && e.valueFrom.secretKeyRef.key == 'MODEL_API_KEY'))) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))"
-      message: "a run pod references no Secret but the key MODEL_API_KEY of coder (as one variable): no Secret volume, no envFrom, no other key"
+    - expression: "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef))) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))"
+      message: "a run pod references no Secret: no Secret volume, no secretKeyRef, no envFrom"
     - expression: "variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && (!has(c.securityContext.privileged) || c.securityContext.privileged == false))"
       message: "a run pod is not privileged and sets allowPrivilegeEscalation: false on every container"
     - expression: "variables.containers.all(c, (has(c.securityContext) && has(c.securityContext.runAsUser) ? c.securityContext.runAsUser : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser) ? object.spec.securityContext.runAsUser : 0)) != 0 && (has(c.securityContext) && has(c.securityContext.runAsNonRoot) ? c.securityContext.runAsNonRoot : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) ? object.spec.securityContext.runAsNonRoot : false)))"

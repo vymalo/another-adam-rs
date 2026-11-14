@@ -13,7 +13,6 @@ adam-error.workspace = true
 adam-workspace.workspace = true
 async-trait.workspace = true
 jsonc-parser.workspace = true
-secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -19,7 +19,7 @@ use adam_workspace::{
     EnvError, EnvKind, EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec,
     GitCredentials, GitHub, LocalSession, MergePullRequest, MergedPullRequest, NewPullRequest,
     NewRepository, OwnerKind, PreparedCommand, PullRequest, RepoRef, RunWorkspace, SandboxShape,
-    ScopedToken, SecretRef, WorkspaceError, Workspaces,
+    ScopedToken, WorkspaceError, Workspaces,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -1486,8 +1486,6 @@ pub struct FakeSession {
     pub extra_env: Mutex<BTreeMap<String, String>>,
     /// What the session says it is; a devcontainer of an image `fake` when not set.
     pub kind: Mutex<Option<EnvKind>>,
-    /// Where the session says the coder's OpenCode is (`EnvSession::tool_path`).
-    pub opencode_at: Mutex<Option<PathBuf>>,
     /// What the session says its processes reserve (`EnvSession::sandbox_shape`); `None`: it is not
     /// metered.
     pub shape: Mutex<Option<SandboxShape>>,
@@ -1628,14 +1626,6 @@ impl EnvSession for FakeSession {
         }
     }
 
-    fn tool_path(&self, name: &str) -> Option<PathBuf> {
-        if name == "opencode" {
-            self.opencode_at.lock().unwrap().clone()
-        } else {
-            None
-        }
-    }
-
     fn sandbox_shape(&self) -> Option<SandboxShape> {
         *self.shape.lock().unwrap()
     }
@@ -1652,9 +1642,5 @@ impl EnvSession for FakeSession {
 
     async fn kill(&self, exec: &ExecId) {
         self.killed.lock().unwrap().push(exec.clone());
-    }
-
-    fn secret_ref(&self, name: &str) -> Option<SecretRef> {
-        (name == "model-key").then(|| SecretRef::File(PathBuf::from("/run/secrets/model-key")))
     }
 }

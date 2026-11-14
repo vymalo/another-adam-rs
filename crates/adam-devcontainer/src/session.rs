@@ -14,19 +14,12 @@ use std::sync::atomic::Ordering;
 
 use adam_workspace::{
     EnvDescription, EnvError, EnvKind, EnvSession, ExecId, ExecSpec, PreparedCommand, Program,
-    SecretRef,
 };
 use async_trait::async_trait;
 
 use crate::environment::Inner;
 use crate::podman::{DEPLOYMENT_LABEL, RUN_LABEL};
-use crate::policy::{SECRETS_TARGET, TOOLS_TARGET};
-
-/// The name the model key has for [`EnvSession::secret_ref`].
-const MODEL_KEY: &str = "model-key";
-
-/// The program the coder brings along (the name [`EnvSession::tool_path`] is asked for).
-const OPENCODE: &str = "opencode";
+use crate::policy::TOOLS_TARGET;
 
 /// Where the CLI keeps its per-container cache inside the container.
 pub(crate) const CONTAINER_SESSION_DATA: &str = "/tmp/adam-devcontainer";
@@ -77,7 +70,6 @@ pub(crate) struct DevSession {
     pub(crate) image: String,
     /// A line for a person: whose environment this is.
     pub(crate) label: String,
-    pub(crate) has_model_key: bool,
 }
 
 impl DevSession {
@@ -221,17 +213,5 @@ impl EnvSession for DevSession {
         {
             tracing::warn!(error = %e, exec = %exec, "could not stop what the command left in the container");
         }
-    }
-
-    fn tool_path(&self, name: &str) -> Option<PathBuf> {
-        // The coder's own OpenCode, which `install_tools` put in the directory every container
-        // mounts; there is none when the coder has no binary to mount.
-        (name == OPENCODE && self.inner.settings.opencode.is_some())
-            .then(|| PathBuf::from(format!("{TOOLS_TARGET}/{OPENCODE}")))
-    }
-
-    fn secret_ref(&self, name: &str) -> Option<SecretRef> {
-        (name == MODEL_KEY && self.has_model_key)
-            .then(|| SecretRef::File(PathBuf::from(format!("{SECRETS_TARGET}/{MODEL_KEY}"))))
     }
 }

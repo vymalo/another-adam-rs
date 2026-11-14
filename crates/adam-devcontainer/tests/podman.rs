@@ -226,7 +226,6 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
     settings.default_image = base.clone();
     settings.network = Network::Inherit;
     settings.deployment = "adam-test".to_owned();
-    settings.model_key = Some("sk-integration-test-key".to_owned().into());
     if let Some(secs) = std::env::var("ADAM_TEST_DEVCONTAINER_UP_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -290,19 +289,17 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
         "DATABASE_URL",
         "A2A_BEARER_TOKENS",
         "MODEL_API_KEY",
-        "sk-integration-test-key",
     ] {
         assert!(
             !env.contains(secret),
             "{secret} is in the container's environment"
         );
     }
-    let (code, key) = inside.run("cat /run/adam/secrets/model-key", None).await;
-    assert_eq!((code, key.as_str()), (0, "sk-integration-test-key"));
-    let (code, _) = inside
-        .run("echo x > /run/adam/secrets/model-key", None)
-        .await;
-    assert_ne!(code, 0, "the secrets are read-only");
+    // No secret is mounted and no agent binary is brought along (ADR 0038).
+    let (code, _) = inside.run("test -e /run/adam/secrets", None).await;
+    assert_ne!(code, 0, "no secrets directory in the container");
+    let (code, _) = inside.run("test -e /opt/adam/bin/opencode", None).await;
+    assert_ne!(code, 0, "no OpenCode is mounted");
 
     // A file made inside is the coder's outside, and git reads the read-only mirror.
     let (code, _) = inside

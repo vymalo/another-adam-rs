@@ -29,9 +29,13 @@ them before they run out. It reads the key at startup: after rotating it, restar
 {{- if include "coder.allowCommandsNextToSecrets" . }}
 {{- if include "coder.commandsReadTheAppKey" . }}
 
-WARNING: the commands of a run (run_command, run_checks, OpenCode) run in the coder's own container, as the user that
+WARNING: the commands of a run (run_command, run, run_checks) run in the coder's own container, as the user that
 can read the App's key (runPods.allowCommandsNextToSecrets accepts that). A command can mint installation tokens and
 act as the App at any access tier. Turn on runPods.enabled to remove the risk.
 {{- end }}
 {{- end }}
+{{- end }}
+{{- if .Values.config.opencodeModel }}
+
+WARNING: config.opencodeModel is set and ignored: the coder no longer uses OpenCode (ADR 0038). Remove it from your values.
 {{- end }}

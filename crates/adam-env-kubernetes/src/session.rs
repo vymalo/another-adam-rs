@@ -15,23 +15,13 @@ use std::sync::atomic::Ordering;
 
 use adam_workspace::{
     EnvDescription, EnvError, EnvKind, EnvSession, ExecId, ExecSpec, PreparedCommand, Program,
-    SandboxShape, SecretRef,
+    SandboxShape,
 };
 use async_trait::async_trait;
 
 use crate::environment::Inner;
 use crate::exec::ExitStatus;
 use crate::invocation::{Invocation, Mode, is_env_name};
-
-/// The name the model key has for [`EnvSession::secret_ref`].
-const MODEL_KEY: &str = "model-key";
-
-/// The variable the template sets from the deployment's Secret, and a process reads the model key
-/// from.
-const MODEL_KEY_VARIABLE: &str = "MODEL_API_KEY";
-
-/// The program the coder brings along (the name [`EnvSession::tool_path`] is asked for).
-const OPENCODE: &str = "opencode";
 
 /// A run's pod.
 pub(crate) struct KubeSession {
@@ -200,19 +190,7 @@ impl EnvSession for KubeSession {
         }
     }
 
-    fn tool_path(&self, name: &str) -> Option<PathBuf> {
-        let settings = &self.inner.settings;
-        // The coder's own OpenCode, which the template's init container put in the tools directory.
-        (name == OPENCODE && settings.opencode)
-            .then(|| PathBuf::from(format!("{}/{OPENCODE}", settings.tools_dir)))
-    }
-
     fn sandbox_shape(&self) -> Option<SandboxShape> {
         Some(self.inner.template.sandbox_shape())
-    }
-
-    fn secret_ref(&self, name: &str) -> Option<SecretRef> {
-        (name == MODEL_KEY && self.inner.settings.model_key)
-            .then(|| SecretRef::Env(MODEL_KEY_VARIABLE.to_owned()))
     }
 }

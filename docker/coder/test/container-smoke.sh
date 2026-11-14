@@ -97,15 +97,15 @@ if docker exec "$name" bash -lc 'test "$(devcontainer --version)" = 0.89.0 && po
 else
   bad "the devcontainer CLI or podman-remote is missing or not the pinned version (0.89.0, 5.8.7)"
 fi
-# DEVCONTAINER_RUNTIME=podman mounts the coder's OpenCode into every devcontainer, so the
-# configuration checks that it is a native executable (not the npm package's script) and resolves
-# the link of the PATH entry to the file: with only the runtime set, the problems listed must not
-# name OpenCode (they name the database, the model and so on).
-out=$(docker run --rm -e DEVCONTAINER_RUNTIME=podman -e CONTAINER_HOST=unix:///run/podman/podman.sock "$image" 2>&1 || true)
+# DEVCONTAINER_RUNTIME=podman needs no OpenCode (ADR 0038): with only the runtime set, the problems listed
+# name the database, the model and so on, and never OpenCode. The three removed variables are not refused
+# either: each one set is ignored (the warning that says so is logged once the configuration is valid).
+out=$(docker run --rm -e DEVCONTAINER_RUNTIME=podman -e CONTAINER_HOST=unix:///run/podman/podman.sock \
+  -e OPENCODE_BINARY=/no/such/opencode "$image" 2>&1 || true)
 if echo "$out" | grep -q "invalid configuration" && ! echo "$out" | grep -qi "opencode"; then
-  ok "DEVCONTAINER_RUNTIME=podman finds the image's OpenCode as a native executable"
+  ok "DEVCONTAINER_RUNTIME=podman starts without an OpenCode (OPENCODE_BINARY is ignored)"
 else
-  bad "DEVCONTAINER_RUNTIME=podman does not accept the image's OpenCode: $out"
+  bad "DEVCONTAINER_RUNTIME=podman asks for an OpenCode, or refuses OPENCODE_BINARY: $out"
 fi
 # Local-process MCP servers are the deployment's to allow: the image sets no MCP_ALLOW_STDIO (an `adam-agent`
 # run from it refuses such servers unless its own deployment opts in), and the coder above did not need it:

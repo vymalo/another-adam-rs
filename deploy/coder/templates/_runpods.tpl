@@ -70,12 +70,6 @@ refuses more than one replica with it, because a run pod can mount one claim.
 {{- end -}}
 
 {{/*
-The one key of the coder's Secret a run pod reads: the model key OpenCode uses (secret_ref "model-key"). The pod template
-sets it and the admission policy allows exactly this reference, by the Secret's name (coder.secretName) and this key.
-*/}}
-{{- define "coder.runPodSecretKey" -}}MODEL_API_KEY{{- end -}}
-
-{{/*
 The git sandbox (values runPods.gitSandbox, ADR 0041 open decision 6): the directory of an emptyDir that the coder container
 and the git-sandbox container both mount, and the socket the server makes in it (GIT_SANDBOX_LISTEN there, GIT_SANDBOX_SOCKET
 in the coder). Nothing else is shared between the two containers but the work volume.
@@ -213,9 +207,9 @@ spec:
     - name: tools
       image: {{ include "coder.runPodToolsImage" . | quote }}
       imagePullPolicy: {{ .Values.image.pullPolicy }}
-      # adam-exec and the native OpenCode, out of the coder's image, into the directory the run container mounts
-      # read-only: the layout of a devcontainer's tools directory.
-      command: ["sh", "-c", "cp -L /opt/adam/bin/adam-exec /opt/adam/bin/opencode /tools/ && chmod 0755 /tools/adam-exec /tools/opencode"]
+      # adam-exec, out of the coder's image, into the directory the run container mounts read-only: the layout of
+      # a devcontainer's tools directory. Nothing else: a run pod holds no agent binary and no secret (ADR 0038).
+      command: ["sh", "-c", "cp -L /opt/adam/bin/adam-exec /tools/ && chmod 0755 /tools/adam-exec"]
       securityContext:
         {{- toYaml .Values.containerSecurityContext | nindent 8 }}
       resources:
@@ -251,14 +245,6 @@ spec:
         {{- range $name, $value := .Values.runPods.extraEnv }}
         - name: {{ $name }}
           value: {{ $value | quote }}
-        {{- end }}
-        {{- if .Values.externalSecrets.enabled }}
-        {{- /* The model key OpenCode reads (secret_ref "model-key"): the one reference to a Secret the admission policy lets a run pod have, by name and key. */}}
-        - name: {{ include "coder.runPodSecretKey" . }}
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "coder.secretName" . }}
-              key: {{ include "coder.runPodSecretKey" . }}
         {{- end }}
       resources:
         {{- toYaml .Values.runPods.resources | nindent 8 }}
