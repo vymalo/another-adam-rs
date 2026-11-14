@@ -9,6 +9,8 @@ the same day: see [The owner's answers](#the-owners-answers-2026-11-14). Nothing
 either (*verified 2026-11-14*: no `Plugin`, `Rule`, `doom_loop`, `Conversation::turns`, `step_all`, `compact:` step or
 `revert_to` in `crates/` or `bin/`; `delegate_to_opencode` is still registered, `bin/adam-coder/src/tools/mod.rs:765`).
 
+*Built 2026-11-14:* slice 1 (the loop survives), with two changes from the text above: the closing turn keeps its tools and sends `tool_choice: none`, and a complete body without `finish_reason` stays a protocol error.
+
 ## Context
 
 The goal is the owner's: adam-rs "as stable as possible", as good as OpenCode 2 "and even above". Two of the directions are
