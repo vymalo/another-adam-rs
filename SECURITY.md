@@ -22,7 +22,7 @@ or change other people's data.
 
 ## Scope
 
-In scope: the code in this repository, the coder image (it also carries `adam-agent`), the operator image, and the Helm
+In scope: the code in this repository, the coder image (it also carries `adam-agent`), and the Helm
 charts in `deploy/`. Of particular interest: a run reading or changing another run's files, a command reaching the
 coder's secrets, a way round the access tier or the checks a tool enforces, and a secret in a log or a file. A weakness
 in a third-party component we use is best reported to that project; tell us too if our configuration makes it worse.

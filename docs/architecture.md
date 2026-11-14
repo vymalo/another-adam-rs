@@ -135,7 +135,6 @@ flowchart TB
 | Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Binaries | [`adam-coder`](../bin/adam-coder/README.md), [`adam-agent`](../bin/adam-agent/README.md), [`adam-egress`](../bin/adam-egress/README.md) | The two agents you can run, library and binary each, over `adam-service`; and the HTTPS-only egress proxy for run pods, which uses only `adam-error` and is in the same image; the chart deploys it with the run pods, whose network policy allows nothing else out ([ADR 0042](decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)). |
-| Operator | [`adam-operator-api`](../crates/adam-operator-api/README.md), [`adam-operator-domain`](../crates/adam-operator-domain/README.md), [`adam-operator-ports`](../crates/adam-operator-ports/README.md), [`adam-operator-controller`](../crates/adam-operator-controller/README.md), [`adam-operator-runtime-kubernetes`](../crates/adam-operator-runtime-kubernetes/README.md), [`adam-operator-store-cnpg`](../crates/adam-operator-store-cnpg/README.md), [`adam-operator-store-secret`](../crates/adam-operator-store-secret/README.md), [`adam-operator-registry`](../crates/adam-operator-registry/README.md), binary [`adam-operator`](../bin/adam-operator/README.md) | Runs agents on Kubernetes from `AgentService` and `AgentConfig`; it has its own ports (`RuntimeProvider`, `StoreProvisioner`, `AgentDirectory`) and is separate from the run path above. See [ADR 0029](decisions/0029-adam-rs-has-an-operator.md) and [Run agents with the operator](guides/run-agents-with-the-operator.md). |
 
 `adam-env-kubernetes` also ships the `adam-kube-exec` binary. `adam-git-sandbox` ships the server `adam-git-sandbox` and
 the relay `adam-git`, and its client is what `adam-workspace` sends the coder's local `git` through: the git commands that
@@ -1075,7 +1074,7 @@ Slots, the environments' sequences and states, and the mirror lock are in
 
 The **package caches** (npm, pnpm, cargo) are not part of a workspace: they are one deployment-level volume at `/cache`, mounted
 by every pod that runs toolchains (the coder, its run pods, a devcontainer) and shared by all of them, off by default
-([ADR 0040](decisions/0040-a-shared-package-cache-at-cache.md); chart value `cache`, operator field `environment.cache`,
+([ADR 0040](decisions/0040-a-shared-package-cache-at-cache.md); chart value `cache`,
 `DEVCONTAINER_CACHE_DIR`). Installed trees (`node_modules`, `target/`) stay in the workspace.
 
 ## The two agents

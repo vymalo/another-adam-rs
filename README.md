@@ -54,30 +54,13 @@ The stream ends in `TASK_STATE_COMPLETED` with a `pull_request` artifact. More: 
 Both ship in one image, `ghcr.io/vymalo/another-adam-rs/coder`, and share the process in
 [`adam-service`](crates/adam-service/README.md).
 
-## The operator
-
-[`adam-operator`](bin/adam-operator/README.md) runs agents on Kubernetes from two custom resources, `AgentService` and
-`AgentConfig` (`agents.vymalo.com/v1alpha1`): it makes the coder or an agent folder as pods, a Service and a database, and serves
-the agent registry. Image `ghcr.io/vymalo/another-adam-rs/operator`, charts [`deploy/operator`](deploy/operator/README.md) and
-[`deploy/operator-crds`](deploy/operator-crds/README.md); why it is here: [ADR 0029](docs/decisions/0029-adam-rs-has-an-operator.md).
-
-| Crate | Job |
-|---|---|
-| [`adam-operator-api`](crates/adam-operator-api/README.md) | the CRD types and their CEL rules |
-| [`adam-operator-domain`](crates/adam-operator-domain/README.md) | validate and resolve a service into a runtime spec, and the env contract of the agents |
-| [`adam-operator-ports`](crates/adam-operator-ports/README.md) | `RuntimeProvider`, `StoreProvisioner`, `AgentDirectory` and their testkit |
-| [`adam-operator-controller`](crates/adam-operator-controller/README.md) | the reconcilers |
-| [`adam-operator-runtime-kubernetes`](crates/adam-operator-runtime-kubernetes/README.md) | the runtime provider on native Kubernetes |
-| [`adam-operator-store-cnpg`](crates/adam-operator-store-cnpg/README.md), [`adam-operator-store-secret`](crates/adam-operator-store-secret/README.md) | a CloudNativePG cluster, or a referenced Secret, as the agent's store |
-| [`adam-operator-registry`](crates/adam-operator-registry/README.md) | the `agent-registry/v1` document and its HTTP router |
-
 ## Documentation
 
 | | |
 |---|---|
 | [`docs/`](docs/README.md) | the index |
 | [Architecture](docs/architecture.md) | the crate map, the path of a task, the run lifecycle, the data schema |
-| [Guides](docs/guides/) | [run locally](docs/guides/run-locally.md), [write an agent](docs/guides/write-an-agent.md), [deploy the coder](docs/guides/deploy-the-coder.md), [run agents with the operator](docs/guides/run-agents-with-the-operator.md), [embed adam](docs/guides/embed-adam.md), [testing](docs/guides/testing.md) |
+| [Guides](docs/guides/) | [run locally](docs/guides/run-locally.md), [write an agent](docs/guides/write-an-agent.md), [deploy the coder](docs/guides/deploy-the-coder.md), [embed adam](docs/guides/embed-adam.md), [testing](docs/guides/testing.md) |
 | [Reference](docs/reference/) | [environment variables](docs/reference/environment.md), [agent files](docs/reference/agent-files.md), [errors](docs/reference/errors.md), [store adapters](docs/reference/store-adapters.md), [the local stack](docs/reference/dev-stack.md) |
 | [Decisions](docs/decisions/) | ADRs: why it is the way it is |
 | [Crates](docs/architecture.md#the-crate-map) | every crate has a `README.md` next to its `Cargo.toml` |

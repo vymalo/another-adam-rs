@@ -239,9 +239,9 @@ Things to know:
   value in the upgrade.
 * A deployment that pins `image.tag` to a new image under an **older chart** has no value to set and crash-loops: set
   `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` in `config.extraEnv` first, or move the chart first.
-* The operator makes no run pods ([ADR 0029](../decisions/0029-adam-rs-has-an-operator.md)), so an `AgentConfig` with
-  `github.app` needs `spec.extraEnv.ALLOW_COMMANDS_NEXT_TO_SECRETS: "true"` before its image moves to this revision; the operator
-  does not check for it, the pod exits 78 until it is there ([`examples/coder.yaml`](../../deploy/operator/examples/coder.yaml)).
+* Under an operator (see the platform repository, https://github.com/vymalo/another-agentic-platform/blob/main/deploy/operator/README.md), an `AgentConfig` with
+  `github.app` and no run pods needs `spec.extraEnv.ALLOW_COMMANDS_NEXT_TO_SECRETS: "true"` before its image moves to this
+  revision, or the pod exits 78.
   Compose and any other deployment set the variable themselves.
 * A key given **inline** (`GITHUB_APP_PRIVATE_KEY`) is not a file and is not refused. The chart never uses it.
 * To see whether a release is affected, run `helm template` with its values: it fails if it is. A pod that is already failing
@@ -254,9 +254,7 @@ ReadWriteMany claim you manage, shared with other releases) or `cache.create` mo
 coder pods and the run pods, where npm, pnpm and cargo keep their caches
 ([ADR 0040](../decisions/0040-a-shared-package-cache-at-cache.md)). Off by default, and then invisible. It is one
 trust domain, cargo takes no lock on NFS, and the volume's root must be writable by uid 10001:
-[chart README, "The package cache"](../../deploy/coder/README.md#the-package-cache). The operator mounts the
-same claim from `AgentConfig` `environment.cache`
-([Run agents with the operator](run-agents-with-the-operator.md)).
+[chart README, "The package cache"](../../deploy/coder/README.md#the-package-cache).
 
 ## A folder agent instead of the coder
 
@@ -264,7 +262,8 @@ The same image carries `adam-agent`. The chart deploys the coder only. For a fol
 the entrypoint `tini -- adam-agent`, the folder mounted read-only at `ADAM_AGENT_DIR` and readable by uid 10001,
 and write your own manifest using the chart's StatefulSet as a model for the variables
 ([Write an agent](write-an-agent.md), [`bin/adam-agent`](../../bin/adam-agent/README.md#image-and-compose)).
-Or let the operator make it from an `AgentService`: [Run agents with the operator](run-agents-with-the-operator.md).
+Or let an operator make it from an `AgentService`: the operator lives in
+[vymalo/another-agentic-platform](https://github.com/vymalo/another-agentic-platform/blob/main/deploy/operator/README.md).
 
 ## How a change reaches the chart
 
