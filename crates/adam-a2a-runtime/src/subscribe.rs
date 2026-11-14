@@ -19,7 +19,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
-use crate::convert::{StatusKey, artifact_id, artifact_of, status_key, status_of, task_from_view};
+use crate::convert::{StatusKey, artifact_key, artifact_of, status_key, status_of, task_from_view};
 use crate::steps::step_message;
 use crate::text_stream;
 use crate::tier;
@@ -83,7 +83,7 @@ impl Tracker {
     fn sync(&mut self, view: &RunView, backend: &RuntimeTaskBackend) -> Vec<TaskEvent> {
         let mut events = Vec::new();
         for artifact in &view.artifacts {
-            if self.seen_artifacts.insert(artifact_id(artifact)) {
+            if self.seen_artifacts.insert(artifact_key(artifact)) {
                 events.push(self.artifact_event(artifact));
             }
         }
@@ -209,6 +209,7 @@ impl Tracker {
                 vec![working(Message::new(Role::Agent, vec![part]))]
             }
             RunEvent::Artifact {
+                id,
                 name,
                 mime_type,
                 data,
@@ -216,7 +217,8 @@ impl Tracker {
             } => {
                 let mut artifact = adam_runtime::Artifact::new(name, mime_type, data);
                 artifact.file = file;
-                if self.seen_artifacts.insert(artifact_id(&artifact)) {
+                artifact.id = id;
+                if self.seen_artifacts.insert(artifact_key(&artifact)) {
                     vec![self.artifact_event(&artifact)]
                 } else {
                     Vec::new()
@@ -300,7 +302,7 @@ async fn pump(
     let mut tracker = Tracker {
         task_id: task.id.clone(),
         context_id,
-        seen_artifacts: view.artifacts.iter().map(artifact_id).collect(),
+        seen_artifacts: view.artifacts.iter().map(artifact_key).collect(),
         last: status_key(&task.status),
         steps: caller.has_extension(STEPS_EXTENSION),
         reported: HashMap::new(),

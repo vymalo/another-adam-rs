@@ -521,6 +521,18 @@ pub struct ToolCtx {
     sandbox: Arc<Mutex<SandboxUsage>>,
     /// The conversation's plan as the call starts ([`plan`](Self::plan)).
     plan: Option<Arc<Plan>>,
+    /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
+    scrub: Option<Scrubber>,
+}
+
+/// A function from a text to the same text with its secrets replaced.
+#[derive(Clone)]
+struct Scrubber(Arc<dyn Fn(&str) -> String + Send + Sync>);
+
+impl std::fmt::Debug for Scrubber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Scrubber")
+    }
 }
 
 impl ToolCtx {
@@ -558,6 +570,30 @@ impl ToolCtx {
             files_left: MAX_RUN_FILE_BYTES as u64,
             sandbox: Arc::default(),
             plan: None,
+            scrub: None,
+        }
+    }
+
+    /// Give the call a function that scrubs secrets out of a text. A layer that scrubs the results
+    /// of the tools it wraps (the coder's `Redacting`) sets it, so a tool can scrub **before** it
+    /// cuts, truncates, hashes or splits a text it makes: a secret cut in half is no longer a secret
+    /// the scrubber recognises, and the half that is left is durable. See [`scrub`](Self::scrub).
+    #[must_use]
+    pub fn with_scrub(mut self, scrub: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
+        self.scrub = Some(Scrubber(Arc::new(scrub)));
+        self
+    }
+
+    /// `text` with its secrets replaced, as the layer around this tool would; `text` itself when
+    /// there is no such layer.
+    ///
+    /// **The rule for a tool that shortens a text it puts in its result** (a label cut to a
+    /// limit, a line cut to a width): call this on the whole text first, then shorten what it
+    /// returns. The layer scrubs the finished result as well, but only a secret still whole in it.
+    pub fn scrub(&self, text: &str) -> String {
+        match &self.scrub {
+            Some(scrubber) => (scrubber.0)(text),
+            None => text.to_owned(),
         }
     }
 

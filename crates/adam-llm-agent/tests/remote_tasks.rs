@@ -568,3 +568,49 @@ async fn the_default_poll_refuses_and_a_user_message_queues_behind_the_result() 
         );
     }
 }
+
+fn one_item_plan() -> adam_llm_agent::Plan {
+    adam_llm_agent::Plan {
+        title: Some("from afar".into()),
+        items: vec![adam_llm_agent::PlanItem {
+            id: 1,
+            text: "a remote step".into(),
+            status: adam_llm_agent::PlanStatus::Doing,
+            note: None,
+        }],
+    }
+}
+
+/// The answer of a remote task is applied like any tool result: a plan it carries becomes the
+/// conversation's, and an error answer changes no plan (the `poll_remote` path of the loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_result_that_carries_a_plan_sets_it_and_an_error_result_leaves_it() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new("noted");
+        let output = ToolOutput::text("remote says 42").with_plan(one_item_plan());
+        let tool = RemoteTool::new(script(vec![Ok(RemotePoll::Ready(output))]));
+        let rt = rig.runtime(&store, rig.agent(tool));
+        let run = rt.start(&rig.name, user_message("go"), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        wait_for(&rt, run, "parked", |v| v.status == RunStatus::Parked).await;
+        rig.clock.advance(Duration::from_secs(61));
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(conversation(&done).plan, Some(one_item_plan()), "{backend}");
+
+        // The same answer, but an error: no plan.
+        let rig = Rig::new("noted");
+        let mut failed = ToolOutput::error("it failed");
+        failed.plan = Some(Box::new(one_item_plan()));
+        let tool = RemoteTool::new(script(vec![Ok(RemotePoll::Ready(failed))]));
+        let rt = rig.runtime(&store, rig.agent(tool));
+        let run = rt.start(&rig.name, user_message("go"), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        wait_for(&rt, run, "parked", |v| v.status == RunStatus::Parked).await;
+        rig.clock.advance(Duration::from_secs(61));
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(conversation(&done).plan, None, "{backend}");
+        assert!(done.state.get("plan").is_none(), "{backend}");
+    }
+}

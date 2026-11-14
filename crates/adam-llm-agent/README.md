@@ -414,8 +414,16 @@ decision 5). `adam-ui` has the three tools that write it (`plan_work`, `plan_che
 * **A task that continues another** (`Conversation::continued`) keeps the plan.
 * **The prefix (ADR 0044 decision 1).** The plan is never put in the system prompt and no earlier message is rewritten with it:
   the model reads it in the result of each plan call, so the newest plan is the last one in the history.
-* **Breaking.** `Conversation` and `ToolOutput` gain a public field `plan`: a struct literal of either must name it (build a
-  `ToolOutput` with its constructors, a `Conversation` with `Conversation::new`).
+* **Artifacts with an id.** A tool whose artifact changes while the run works (the plan's drawing) gives it an id
+  (`Artifact::with_id`, `adam-runtime`): the run keeps **one** artifact for an id, the newest, in the place of the first, and
+  the loop's list of references (`Conversation::artifacts`, the Done output's `artifacts`) does the same. `ArtifactRef::id`
+  is `None` for state written before ids existed.
+* **Scrubbing before cutting.** `ToolCtx::scrub(&str) -> String` is what a layer that redacts secrets (the coder's
+  `Redacting`) hands the tools it wraps (`ToolCtx::with_scrub`; without a layer it returns the text as it is). **A tool that
+  shortens a text it puts in its result calls it on the whole text first**: a secret cut in half is not recognised by the
+  scrubber that runs on the finished result, and the front half stays in what is durable.
+* **Breaking.** `Conversation` and `ToolOutput` gain a public field `plan`, and `ArtifactRef` a public field `id`: a struct
+  literal of any must name it (build a `ToolOutput` with its constructors, a `Conversation` with `Conversation::new`).
 
 ## Child runs
 
@@ -614,7 +622,10 @@ of its model message are all answered first, and a refused one ends nothing), an
 `tests/plan_state.rs` is the suite of *The plan* (real `Runtime`, scripted `MockModel`, `MemoryStore`): a plan a tool wrote is in
 the state, an error result changes none, two plan calls in one turn see each other, a replay after a crash keeps the journaled
 plan and does not call the tool again, a continued run starts with the plan before, state and journals without a plan load,
-and across the requests of a run the system prompt and tool specs are identical and each request starts with the one before.
+and across the requests of a run the system prompt and tool specs are identical and each request starts with the one before;
+twenty changes of a plan drawn under one artifact id are one artifact in the run and one reference in its output (also after
+a replay), and a state with a member it does not know loads. `tests/remote_tasks.rs` also holds that a remote task's answer
+that carries a plan sets it and an error answer does not.
 
 `tests/withheld_tools.rs` covers `withhold`: a held-back tool (own or a source's) is not shown and a call to it is refused with the reason while the others run, a limit a later message lifts holds no more from the next turn, and a source that holds nothing changes nothing. `tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
 the context of the start message reaching a tool, replace/delete/keep across messages, a continued run carrying the

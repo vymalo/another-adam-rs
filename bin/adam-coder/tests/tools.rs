@@ -4543,6 +4543,134 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
     );
 }
 
+/// The context of a message that carried the catalog `document` (locked by `lock`) inline.
+fn screen_with(document: &str, lock: &str) -> serde_json::Map<String, Value> {
+    let lock: Value = serde_json::from_str(lock).unwrap();
+    let catalog_id = "https://agents.vymalo.com/a2ui/catalogs/chat";
+    let claimed =
+        json!({"catalogId": catalog_id, "version": lock["version"], "digest": lock["digest"]});
+    let mut inline = claimed.clone();
+    inline["catalog"] = serde_json::from_str(document).unwrap();
+    json!({
+        adam_a2a_runtime::CONTEXT_UI_REF: claimed,
+        adam_a2a_runtime::CONTEXT_UI_CATALOG: inline,
+    })
+    .as_object()
+    .cloned()
+    .unwrap()
+}
+
+/// A secret in the title or an item of a plan, or in a note: the surface cuts the text it draws to
+/// the catalog's limits, and a secret cut in half is no longer one the redactor recognises. The text
+/// is scrubbed first, so nothing of the secret, no prefix longer than three characters, reaches the
+/// message the model reads, the plan the state keeps or the artifact (which is durable); and the
+/// plan block of the `Redacting` layer is what scrubs the plan itself.
+#[tokio::test]
+async fn a_secret_in_a_plan_is_scrubbed_before_the_surface_cuts_it() {
+    use adam_coder::{Redactor, coder_tools};
+    use adam_workspace::Workspaces;
+
+    const TOKEN: &str = "Zq9#kL2mWx7RvT4pNc8YbH1sJd5FgA3eUo6iXz0Q";
+    let catalogs = [
+        (
+            "no checklist",
+            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v5.json"),
+            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v5.lock.json"),
+        ),
+        (
+            "checklist, no note",
+            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v6.json"),
+            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v6.lock.json"),
+        ),
+        (
+            "checklist with note",
+            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v7.json"),
+            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v7.lock.json"),
+        ),
+    ];
+    for (name, document, lock) in catalogs {
+        let fx = Fixture::new().await;
+        let redactor = Redactor::default();
+        redactor.add(TOKEN);
+        let env = Arc::new(
+            ToolEnv::new(
+                Workspaces::new(fx.tmp.path().join("plan-work"), Arc::new(Minting)),
+                fx.env.code_host.clone(),
+                fx.env.settings.clone(),
+            )
+            .with_redactor(redactor),
+        );
+        let ctx = ToolCtx::detached("tool", "call-1", Arc::new(CollectingSink::new()))
+            .with_state(env.clone())
+            .with_context(screen_with(document, lock));
+        env.notes
+            .save(
+                &ctx.run_id().to_string(),
+                &adam_coder::tools::notes::RunNotes {
+                    tier: Some(adam_coder::tier::DEFAULT),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let tools: Vec<_> = coder_tools(&env).into_iter().collect();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.spec().name == name)
+                .unwrap_or_else(|| panic!("no tool {name}"))
+                .clone()
+        };
+        let everything = |out: &ToolOutput| {
+            format!(
+                "{}\n{}\n{}",
+                out.content,
+                serde_json::to_string(&out.plan).unwrap(),
+                serde_json::to_string(&out.artifacts.iter().map(|a| &a.data).collect::<Vec<_>>())
+                    .unwrap()
+            )
+        };
+        let assert_clean = |out: &ToolOutput, what: &str| {
+            assert!(!out.is_error, "{name} {what}: {}", out.content);
+            let all = everything(out);
+            for start in 0..=TOKEN.len() - 4 {
+                let piece = &TOKEN[start..start + 4];
+                assert!(!all.contains(piece), "{name} {what}: `{piece}` is in {all}");
+            }
+        };
+
+        let made = tool("plan_work")
+            .call(
+                &ctx,
+                json!({
+                    "title": format!("Fix {TOKEN}"),
+                    "items": ["x".repeat(180), format!("use {TOKEN} here")]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_clean(&made, "plan_work");
+        assert!(made.content.contains("[redacted]"), "{name}");
+        // The reviewer's input: an item of 180 characters and a note of 40, which the label
+        // `item (note: ...)` cut at 199 characters on a catalog with no `note`.
+        let noted = tool("plan_check")
+            .call(
+                &ctx.clone().with_plan(*made.plan.clone().unwrap()),
+                json!({"id": 1, "status": "doing", "note": TOKEN}),
+            )
+            .await
+            .unwrap();
+        assert_clean(&noted, "plan_check");
+        let plan = noted.plan.clone().unwrap();
+        assert_eq!(plan.items[0].note.as_deref(), Some("[redacted]"), "{name}");
+        assert_eq!(plan.items[1].text, "use [redacted] here", "{name}");
+        assert!(
+            plan.title.as_deref().unwrap().contains("[redacted]"),
+            "{name}"
+        );
+    }
+}
+
 // -------------------------------------------------------------- create_repository
 
 /// A rig whose host creates repositories for the owner `acme` (an organisation), for `me` (a user

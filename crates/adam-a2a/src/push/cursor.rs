@@ -10,7 +10,10 @@
 //! * **Status.** Identified by its state and a digest of its message, so a status that changes
 //!   only in its timestamp is not news.
 //! * **Artifacts.** Identified by `artifactId`. An artifact the webhook has been told about is
-//!   not sent again.
+//!   not sent again, unless it was replaced since (an artifact keeps its id when the run changes it,
+//!   as a plan does): the cursor then also holds a digest of the content the webhook was told, and
+//!   a different one is news. A cursor written before digests existed has none and treats a known
+//!   id as told.
 //! * **Pending.** An event that was sent and not acknowledged (the webhook answered 500, or did
 //!   not answer) is kept whole, so the retry sends *that* event even if the task has moved on
 //!   since: a webhook that was down for a while still hears each state it was meant to hear, in
@@ -21,6 +24,8 @@
 use a2a::{
     StreamResponse, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,6 +40,10 @@ pub struct PushCursor {
     /// The artifacts delivered (or present when the config was created), by id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    /// A digest of the content of each artifact delivered, by id: what tells an artifact that was
+    /// replaced under its id from one the webhook has.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub revisions: BTreeMap<String, String>,
     /// The event being delivered: sent, not acknowledged, to be sent again as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<StreamResponse>,
@@ -68,6 +77,16 @@ fn state_name(state: &TaskState) -> String {
         .unwrap_or_default()
 }
 
+/// The key that tells two contents of one artifact apart: a digest of its name and parts.
+fn revision(artifact: &a2a::Artifact) -> String {
+    let bytes = serde_json::to_vec(&(&artifact.name, &artifact.parts)).unwrap_or_default();
+    Sha256::digest(&bytes)
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 impl PushCursor {
     /// The cursor of a config created while the task is `task`: what the task already says is
     /// not news to the webhook, only what changes after.
@@ -79,6 +98,12 @@ impl PushCursor {
                 .iter()
                 .flatten()
                 .map(|a| a.artifact_id.clone())
+                .collect(),
+            revisions: task
+                .artifacts
+                .iter()
+                .flatten()
+                .map(|a| (a.artifact_id.clone(), revision(a)))
                 .collect(),
             pending: None,
             failing_since: None,
@@ -93,12 +118,13 @@ impl PushCursor {
         if let Some(pending) = &self.pending {
             return Some(pending.clone());
         }
-        if let Some(artifact) = task
-            .artifacts
-            .iter()
-            .flatten()
-            .find(|a| !self.artifacts.contains(&a.artifact_id))
-        {
+        if let Some(artifact) = task.artifacts.iter().flatten().find(|a| {
+            !self.artifacts.contains(&a.artifact_id)
+                || self
+                    .revisions
+                    .get(&a.artifact_id)
+                    .is_some_and(|told| *told != revision(a))
+        }) {
             return Some(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
                 task_id: task.id.clone(),
                 context_id: task.context_id.clone(),
@@ -128,6 +154,8 @@ impl PushCursor {
                 if !self.artifacts.contains(id) {
                     self.artifacts.push(id.clone());
                 }
+                self.revisions
+                    .insert(id.clone(), revision(&update.artifact));
             }
             StreamResponse::Task(task) => *self = Self::baseline(task),
             StreamResponse::Message(_) => {}

@@ -98,6 +98,7 @@ impl Emitter {
     /// (dropped again if the transition is retried).
     pub async fn emit(&self, event: RunEvent) {
         if let RunEvent::Artifact {
+            id,
             name,
             mime_type,
             data,
@@ -106,6 +107,7 @@ impl Emitter {
         {
             let mut artifact = Artifact::new(name.clone(), mime_type.clone(), data.clone());
             artifact.file.clone_from(file);
+            artifact.id.clone_from(id);
             self.artifacts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -588,6 +590,7 @@ mod tests {
                 .await;
             emitter
                 .emit(RunEvent::Artifact {
+                    id: None,
                     name: "report".into(),
                     mime_type: None,
                     data: serde_json::json!(1),
@@ -628,6 +631,7 @@ mod tests {
             .emit_for(
                 root,
                 RunEvent::Artifact {
+                    id: None,
                     name: "not mine".into(),
                     mime_type: None,
                     data: serde_json::json!(1),

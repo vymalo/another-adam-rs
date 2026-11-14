@@ -1,6 +1,6 @@
 {
   "name": "plan_check",
-  "description": "Set one item of the plan: `doing` when you start it, `done` when it is finished, `dropped` when it is no longer needed (say why in `note`). `id` is the number shown before the item. Returns the whole plan.",
+  "description": "Set one item of the plan: `doing` when you start it, `done` when it is finished, `dropped` when it is no longer needed (say why in `note`), `pending` to put it back. `id` is the number shown before the item. `note` replaces the item's note; an empty `note` clears it, and leaving it out keeps it. With no arguments the plan comes back unchanged, to read it again. Returns the whole plan.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,6 +11,7 @@
       },
       "status": {
         "enum": [
+          "pending",
           "doing",
           "done",
           "dropped"
@@ -19,13 +20,9 @@
       "note": {
         "type": "string",
         "maxLength": 200,
-        "description": "Why, or where the work is"
+        "description": "Why, or where the work is; empty clears the note"
       }
     },
-    "required": [
-      "id",
-      "status"
-    ],
     "additionalProperties": false
   }
 }

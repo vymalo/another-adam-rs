@@ -833,7 +833,9 @@ fn build_update(
         _ => wake_at,
     };
     let mut artifacts = cur.artifacts.clone();
-    artifacts.extend(next.artifacts.iter().cloned());
+    for artifact in &next.artifacts {
+        add_artifact(&mut artifacts, artifact);
+    }
     let env = Envelope {
         v: cur.v,
         agent: next.agent.clone(),
@@ -857,6 +859,21 @@ fn build_update(
     let mut update = RunUpdate::new(status, env.encode()?);
     update.wake_at = wake_at;
     Ok(update)
+}
+
+/// `artifact` added to the run's `artifacts`: after the others, unless it has an id
+/// ([`Artifact::id`]) that one of them has, which it replaces where it stands. Journaled artifacts
+/// with no id never match, so a run written before ids existed reads and grows as it did.
+fn add_artifact(artifacts: &mut Vec<Artifact>, artifact: &Artifact) {
+    if let Some(id) = &artifact.id
+        && let Some(held) = artifacts
+            .iter_mut()
+            .find(|held| held.id.as_deref() == Some(id.as_str()))
+    {
+        *held = artifact.clone();
+        return;
+    }
+    artifacts.push(artifact.clone());
 }
 
 /// Whether a `Done` is committed as a step that goes on: the agent asked for it

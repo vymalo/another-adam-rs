@@ -193,6 +193,11 @@ impl PendingWait {
 /// lives in `RunView::artifacts`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactRef {
+    /// The id the artifact is kept under, if it has one ([`Artifact::id`](adam_runtime::Artifact::id)):
+    /// a later artifact with the same id replaces this one in the list. Absent from state written
+    /// before ids existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Artifact name.
     pub name: String,
     /// Media type, if known.
@@ -1128,6 +1133,7 @@ mod tests {
         prior.tool_calls = 5;
         prior.usage = Usage::new(10, 20);
         prior.artifacts = vec![ArtifactRef {
+            id: None,
             name: "report".into(),
             mime_type: None,
             bytes: None,

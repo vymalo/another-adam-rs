@@ -1386,7 +1386,7 @@ impl LlmAgent {
                 }
             };
             state.messages.push(message);
-            state.artifacts.extend(artifacts);
+            add_artifact_refs(&mut state.artifacts, artifacts);
             state.pending_calls.remove(0);
         }
         Ok(Flow::Next)
@@ -1874,7 +1874,7 @@ impl LlmAgent {
                     used,
                 )
                 .await;
-                state.artifacts.extend(artifacts);
+                add_artifact_refs(&mut state.artifacts, artifacts);
                 if let Some(answer) = answer {
                     state.announce(answer);
                 }
@@ -1908,6 +1908,22 @@ impl LlmAgent {
                 );
                 Ok(Some(StepState::Failed))
             }
+        }
+    }
+}
+
+/// `new` added to `refs`: after the others, except one with an id that one of them has, which
+/// takes its place (the run holds one artifact for an id, see
+/// [`Artifact::id`](adam_runtime::Artifact::id)).
+fn add_artifact_refs(refs: &mut Vec<ArtifactRef>, new: Vec<ArtifactRef>) {
+    for one in new {
+        match one
+            .id
+            .as_ref()
+            .and_then(|id| refs.iter_mut().find(|r| r.id.as_ref() == Some(id)))
+        {
+            Some(held) => *held = one,
+            None => refs.push(one),
         }
     }
 }
@@ -1973,6 +1989,7 @@ async fn output_message(
         .artifacts
         .iter()
         .map(|a| ArtifactRef {
+            id: a.id.clone(),
             name: a.name.clone(),
             mime_type: a.mime_type.clone(),
             bytes: a.file.as_ref().map(|f| f.bytes.len() as u64),

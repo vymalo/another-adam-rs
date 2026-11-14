@@ -123,7 +123,7 @@ Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandl
   caller first (another caller's task is `TaskNotFound`), keeps at most 16 configs per task and returns configs
   **without** `token` and `credentials` (write-only; the store holds them as given, in clear). `PushDeliverer::run` is
   what delivers: it claims due configs from the `PushStore` (a lease), reads the task as its owner, sends the first event the
-  webhook has not heard (`statusUpdate`/`artifactUpdate`, `Content-Type: application/a2a+json`,
+  webhook has not heard (an artifact it was told of is sent again when its content changed under the same id: the cursor keeps a digest per artifact id, `revisions`; a cursor stored without them treats a known id as told) (`statusUpdate`/`artifactUpdate`, `Content-Type: application/a2a+json`,
   `Authorization: <scheme> <credentials>`, `A2A-Notification-Token: <token>`), and records the progress (compare-and-swap);
   a failed event is kept whole and sent again with capped exponential backoff until `give_up_after`, then the config is
   `GaveUp` with the reason. At least once and in order for what it saw; a state between two polls is not sent. The

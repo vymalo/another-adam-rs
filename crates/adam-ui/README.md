@@ -181,7 +181,7 @@ is not an error, a replay takes the journaled one, and a task that continues ano
 | Tool | Arguments | Result (ASCII, built only from the state, so the same plan gives the same bytes) |
 |---|---|---|
 | `plan_work` | `{title?: string (80), items: string[1..50]}` (each 1 to 200 characters) | `Plan saved (4 items).` or `Plan replaced (4 items).`, then the plan; replaces any earlier plan, ids start at 1 |
-| `plan_check` | `{id: integer, status: doing \| done \| dropped, note?: string (200)}` | `Item 2: doing.`, then the plan |
+| `plan_check` | `{id?: integer, status?: pending \| doing \| done \| dropped, note?: string (200)}` | `Item 2: doing.`, then the plan. `pending` puts an item back; `note` replaces the note, `""` clears it and leaving it out keeps it; **with no arguments** `Plan unchanged.` and the plan, to read it again after the history was shortened (a third identical call in a row is refused by the loop's repeated-call guard where that exists, and shows nothing new) |
 | `plan_add` | `{items: string[1..50], after?: integer}` | `Added 2 items: 5, 6.`, then the plan |
 
 ```text
@@ -194,11 +194,14 @@ Plan: Fix the date parser          ("Plan" alone when there is no title)
 1 of 5 done, 1 doing, 2 to do, 1 dropped.
 ```
 
-* **Ids** are creation numbers (1 to n), never reused, never shifted: `plan_add`'s `after` only changes where the new items
-  are shown. Nothing is deleted (a dropped item stays), so the ids are always `1..=n`. `id` and `after` also accept a
-  numeric string (`"3"`), because small models send one.
+* **Ids** are creation numbers, never reused, never shifted: `plan_add` numbers the new items from the highest id plus one,
+  and its `after` only changes where they are shown. Nothing is deleted (a dropped item stays), so the ids are always
+  `1..=n`. `id` and `after` also accept a string of ASCII digits (`"3"`, `" 3 "`, `"03"`), because small models send one;
+  anything else (`"+3"`, `"3.0"`, `-1`, `3.5`) is an error result in the plan's words (`` `+3` is not an item number: write
+  a whole number from 1 to 5. ``, and the plan), never a parser's. `after: 0` is `There is no item 0`.
 * **Limits** (refused with the number in the message, never cut): at most 50 items; an item is 1 to 200 characters after
-  trimming, with newlines and control characters turned into one space; the title at most 80, a note at most 200.
+  trimming, with newlines and control characters turned into one space (a note and a title too, so none can forge a line of
+  the result); the title at most 80, a note at most 200; a blank title is no title.
   Errors, each leaving the plan, the state and the surface as they were: `There is no plan yet: start one with plan_work.`,
   `There is no item 7: the items are 1 to 5.` (and the plan), `The plan would have 53 items; at most 50. ...`,
   `Item 3 is 240 characters; at most 200.`
@@ -206,25 +209,38 @@ Plan: Fix the date parser          ("Plan" alone when there is no title)
   what is left in your answer.`).
 * **Nothing volatile in the prompt.** The tools' specs are fixed; the plan is only ever in the results of these calls, so the
   newest plan is at the end of the history and the provider's cached prefix is never broken by it.
-* **What the person sees.** Each call also draws the plan on the screen, as one surface `plan-<run id>` (the same id on every
-  call of a run, so each call replaces the surface the one before drew), decided **from the resolved catalog alone, never from
-  a version number**:
+* **What the person sees.** Each call also draws the plan on the screen, as **one** surface `plan-<12 hex digits of a hash
+  of the conversation's id>`: the same id on every call of the **conversation** (a task that continues another draws on the
+  same surface, so the person's screen updates the plan it has instead of keeping a stale one), and the id of the **artifact**
+  that carries it (`Artifact::with_id`), so the run keeps one plan artifact, the newest, in the place of the first, however
+  often the plan changed (`adam-runtime` replaces an artifact whose id the run holds; the task lists it once; the stream
+  sends each change under the same `artifactId`, with no `append`; the Done output has one reference). What it draws is
+  decided **from the resolved catalog alone, never from a version number**:
   1. a catalog that validates a `Checklist` gets one `Checklist`, the root: `title` is the plan's title (or `Plan`), items in
      display order, `pending` is `todo`, `doing` is `doing`, `done` is `done`. A `dropped` item uses the state `dropped` if the
      catalog's `Checklist` allows that value, and is otherwise **left out** with the title saying so (`Fix the date parser (1
      dropped)`); when every item is dropped and the state is not allowed, the next rule applies. An item's note is the item's
-     `note` if the catalog allows one, and otherwise is appended to the label as ` (note: ...)`, the label being cut to the
-     catalog's limit for it, at a character boundary, with `…`. The capabilities are found by asking the catalog's schema
-     (a probe item is validated), not by reading its version;
-  2. else a catalog that validates a `Column` of `Text`s gets one `Text` per line of the result (a plan of 49 items or more
-     does not fit the `Column`'s 50 children of version 5, and then the next rule applies);
+     `note` if the catalog allows one, and otherwise is appended to the label as ` (note: ...)`. **The label, the note and the
+     title are each cut to the catalog's own `maxLength` for them** (read from its schema), at a character boundary, with
+     `…`: a text over a limit never makes the whole `Checklist` fall back to lines. The capabilities are found by asking the
+     catalog's schema (a probe item is validated), not by reading its version;
+  2. else a catalog that validates a `Column` of `Text`s gets the lines of the result, packed into at most as many `Text`s as
+     the `Column` holds children (50 in version 5): a plan of 49 or 50 items has 51 or 52 lines, and then two lines share a
+     `Text`;
   3. else no surface: the result text in the step is the whole display. The call never fails for lack of a screen.
 
-  The `Checklist` is a component of version 6 of the orchestration layer's catalog (*unverified*: the fixtures of this
-  repository stop at version 5, and `tests/fixtures/catalog-v6.json` and `catalog-v7.json` are hand-written subsets, see
-  `tests/fixtures/README.md`). Nothing else in this crate draws two surfaces with one id (`show` and `ask_user` make one per
-  call), so that a renderer accepts `createSurface` for an id it already has is *unverified*; the A2A layer gives each
-  artifact an id from its content, so a changed plan is a new artifact of the same surface.
+  **The client rule** (written by the orchestration layer's UI catalog version 8, *unverified* against the published page,
+  2026-11-14, as that version is in review there): a `createSurface` for a surface that exists starts it over, and a surface
+  whose id starts with `plan-` (and has at least one more character) is a plan, drawn once and updated in place; a plan may
+  hold no form, input or button, and this crate draws only `Checklist`, `Column` and `Text`. The `Checklist` is a component of
+  version 6 of that catalog (*unverified*: the fixtures of this repository stop at version 5, and
+  `tests/fixtures/catalog-v6.json` and `catalog-v7.json` are hand-written subsets, see `tests/fixtures/README.md`).
+* **Scrub, then cut.** The surface is a pure function of `(plan, catalog)` (`plan_surface`), and the plan it is given has
+  **already been scrubbed**: each call runs `ToolCtx::scrub` (the redaction layer around the tool sets it, the coder's
+  `Redacting`) over the title, every item and every note, then builds the result, the state's plan and the surface from that.
+  Cutting first would leave the front of a secret that no scrubber recognises, in a durable artifact. **The rule for any tool
+  of this crate (or yours) that shortens a text it puts in its result: call `ToolCtx::scrub` on the whole text, then
+  shorten what it returns.** The layer scrubs the finished result as well, but only a secret still whole in it.
 * The step of each call is titled "Write the plan", "Update the plan" or "Add to the plan", drawn with the `think` icon.
 * **Breaking.** A folder agent's `tools:` that lists the screen's tools must now list `plan_*` (or `*`) to keep the plan.
 

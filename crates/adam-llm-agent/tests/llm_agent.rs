@@ -610,6 +610,7 @@ async fn artifacts_progress_and_context_reach_observers() {
                     .with_detail("halfway")
             ),
             RunEvent::Artifact {
+                id: None,
                 name: "report.md".into(),
                 mime_type: Some("text/markdown".into()),
                 data: json!("# hi"),

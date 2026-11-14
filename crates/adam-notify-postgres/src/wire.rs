@@ -208,12 +208,14 @@ mod tests {
                 payload: json!({"a": [1, 2]}),
             },
             RunEvent::Artifact {
+                id: None,
                 name: "n".into(),
                 mime_type: None,
                 data: json!("x"),
                 file: None,
             },
             RunEvent::Artifact {
+                id: None,
                 name: "logo".into(),
                 mime_type: Some("image/svg+xml".into()),
                 data: serde_json::Value::Null,
@@ -565,6 +567,7 @@ mod tests {
                 payload: json!(big.clone()),
             },
             RunEvent::Artifact {
+                id: None,
                 name: "n".into(),
                 mime_type: None,
                 data: json!(big.clone()),

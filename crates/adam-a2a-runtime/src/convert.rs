@@ -325,11 +325,31 @@ fn link_of(data: &Value) -> Option<&str> {
     (!rest.is_empty() && !url.chars().any(char::is_whitespace)).then_some(url)
 }
 
+/// The A2A id of a run artifact: the id it was given ([`adam_runtime::Artifact::id`]), else the
+/// content-derived `<name>-<12 hex digits>`.
+///
+/// An artifact with an id of its own is **one artifact however often it changes**: the run holds
+/// the newest, the task lists it once, and the stream sends each change under that id with no
+/// `append`, which in A2A replaces the artifact with that id on the client.
+pub fn artifact_id(artifact: &adam_runtime::Artifact) -> String {
+    artifact.id.clone().unwrap_or_else(|| derived_id(artifact))
+}
+
+/// What a subscriber has been sent of an artifact: its id and its content. Two artifacts with the
+/// same id and different content are two things to say; the same twice is one.
+pub(crate) fn artifact_key(artifact: &adam_runtime::Artifact) -> String {
+    format!(
+        "{}|{}",
+        artifact.id.as_deref().unwrap_or_default(),
+        derived_id(artifact)
+    )
+}
+
 /// Content-derived artifact id: `<name>-<12 hex digits>`.
 ///
 /// For a file the digest covers its filename and the digest of its bytes, so two files that differ
 /// by one byte have two ids and the same file twice has one.
-pub fn artifact_id(artifact: &adam_runtime::Artifact) -> String {
+fn derived_id(artifact: &adam_runtime::Artifact) -> String {
     let digest = match &artifact.file {
         Some(file) => Sha256::digest(
             serde_json::to_vec(&(

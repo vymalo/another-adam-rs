@@ -2597,6 +2597,7 @@ mod cases {
                         })
                         .await;
                         ctx.emit(RunEvent::Artifact {
+                            id: None,
                             name: "report".into(),
                             mime_type: Some("text/markdown".into()),
                             data: json!("# hi"),
@@ -2648,6 +2649,7 @@ mod cases {
                     message: "working".into()
                 },
                 RunEvent::Artifact {
+                    id: None,
                     name: "report".into(),
                     mime_type: Some("text/markdown".into()),
                     data: json!("# hi"),

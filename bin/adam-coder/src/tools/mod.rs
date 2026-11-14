@@ -966,7 +966,12 @@ impl Tool for Redacting {
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let r = &self.redactor;
-        match self.inner.call(ctx, args).await {
+        // The tool may scrub what it is about to cut: a secret cut in half escapes the scrub below.
+        let hook = r.clone();
+        let hooked = ctx
+            .clone()
+            .with_scrub(move |text| hook.scrub(text).into_owned());
+        match self.inner.call(&hooked, args).await {
             Ok(mut out) => {
                 out.content = r.scrub_string(out.content);
                 // The plan is state the loop keeps and the next plan call prints: it is scrubbed
@@ -1358,5 +1363,64 @@ mod grant_tests {
             full.said("word0")
                 && !full.said(&format!("word{}", crate::tools::notes::MAX_SAID_WORDS + 10))
         );
+    }
+}
+
+#[cfg(test)]
+mod redacting_tests {
+    //! What the redaction layer does to a plan a tool returns, whichever tool it is.
+
+    use adam_llm_agent::{Plan, PlanItem, PlanStatus};
+    use adam_runtime::CollectingSink;
+
+    use super::*;
+
+    const TOKEN: &str = "Zq9#kL2mWx7RvT4pNc8YbH1sJd5FgA3eUo6iXz0Q";
+
+    /// Returns a plan that holds the secret everywhere it can, and a line made with the hook its
+    /// context carries.
+    struct Planner;
+
+    #[async_trait::async_trait]
+    impl Tool for Planner {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "planner".to_owned(),
+                description: "test".to_owned(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            let item = |id, text: &str, note: Option<&str>| PlanItem {
+                id,
+                text: text.to_owned(),
+                status: PlanStatus::Pending,
+                note: note.map(str::to_owned),
+            };
+            let plan = Plan {
+                title: Some(format!("T {TOKEN}")),
+                items: vec![
+                    item(1, &format!("use {TOKEN}"), Some(TOKEN)),
+                    item(2, "plain", None),
+                ],
+            };
+            Ok(ToolOutput::text(ctx.scrub(&format!("hook: {TOKEN}"))).with_plan(plan))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_plan_a_tool_returns_is_scrubbed_and_the_tool_is_given_the_hook() {
+        let redactor = Redactor::default();
+        redactor.add(TOKEN);
+        let tool = Redacting::layer(redactor)(Arc::new(Planner));
+        let ctx = ToolCtx::detached("planner", "c1", Arc::new(CollectingSink::new()));
+        let out = tool.call(&ctx, serde_json::json!({})).await.unwrap();
+        assert_eq!(out.content, "hook: [redacted]");
+        let plan = out.plan.unwrap();
+        assert_eq!(plan.title.as_deref(), Some("T [redacted]"));
+        assert_eq!(plan.items[0].text, "use [redacted]");
+        assert_eq!(plan.items[0].note.as_deref(), Some("[redacted]"));
+        assert_eq!(plan.items[1].text, "plain");
     }
 }

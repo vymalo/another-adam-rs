@@ -83,7 +83,15 @@ impl Tool for PlanSet {
             refused.plan = Some(Box::new(plan));
             return Ok(refused);
         }
-        Ok(ToolOutput::text(text).with_plan(plan))
+        let mut out = ToolOutput::text(text).with_plan(plan.clone());
+        if args["draw"] == json!(true) {
+            // What a plan tool does with a screen: one artifact, under one id, whatever changed.
+            out = out.with_artifact(
+                adam_runtime::Artifact::new("plan", None, json!({"items": plan.items.len()}))
+                    .with_id("plan-test"),
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -290,7 +298,7 @@ async fn a_plan_survives_a_replay_from_the_journal() {
     // The plan is recorded, then the worker dies inside the second tool of the message.
     rig.mock
         .push_tool_calls(vec![
-            call("c1", "plan_set", json!({"items": ["a", "b"]})),
+            call("c1", "plan_set", json!({"items": ["a", "b"], "draw": true})),
             call("c2", "slow", json!({})),
         ])
         .push_text("Closing line.");
@@ -319,6 +327,13 @@ async fn a_plan_survives_a_replay_from_the_journal() {
         "the recorded result, plan included, is replayed and the tool does not run again"
     );
     assert_eq!(conversation(&view).plan, Some(plan_of(&["a", "b"])));
+    assert_eq!(
+        view.artifacts.len(),
+        1,
+        "the replay holds the plan's artifact once: {:?}",
+        view.artifacts
+    );
+    assert_eq!(view.artifacts[0].id.as_deref(), Some("plan-test"));
 }
 
 #[tokio::test]
@@ -353,6 +368,51 @@ async fn a_continued_run_starts_with_the_plan_before() {
     handle.await.unwrap().unwrap();
     assert_eq!(rig.saw.lock().unwrap()[1], Some(plan_of(&["a", "b"])));
     assert_eq!(conversation(&view).plan, Some(plan_of(&["a", "b", "c"])));
+}
+
+/// A plan that changes twenty times is one artifact in the run and one reference in its output,
+/// holding the newest drawing, in the place of the first.
+#[tokio::test]
+async fn twenty_changes_of_the_plan_leave_one_artifact_and_one_reference() {
+    let rig = Rig::new();
+    for turn in 0..4 {
+        rig.mock.push_tool_calls(
+            (0..5)
+                .map(|n| {
+                    call(
+                        &format!("c{turn}-{n}"),
+                        "plan_set",
+                        json!({"items": [format!("item {turn}-{n}")], "draw": true}),
+                    )
+                })
+                .collect(),
+        );
+    }
+    rig.mock.push_text("Done.");
+    let view = finish(&rig, "go").await;
+    assert_eq!(conversation(&view).plan.unwrap().items.len(), 20);
+    assert_eq!(view.artifacts.len(), 1, "{:?}", view.artifacts);
+    assert_eq!(view.artifacts[0].id.as_deref(), Some("plan-test"));
+    assert_eq!(view.artifacts[0].data, json!({"items": 20}), "the newest");
+    let output = view.output.expect("an output");
+    assert_eq!(output["artifacts"].as_array().unwrap().len(), 1, "{output}");
+    assert_eq!(output["artifacts"][0]["id"], "plan-test");
+}
+
+#[test]
+fn a_state_with_a_member_it_does_not_know_still_loads() {
+    let state: Conversation = serde_json::from_value(json!({
+        "messages": [], "turns": 2, "tool_calls": 1,
+        "plan": {"title": "t", "items": [], "later": 1},
+        "a_member_of_a_later_version": {"x": 1}
+    }))
+    .unwrap();
+    assert_eq!(state.plan.unwrap().title.as_deref(), Some("t"));
+    // An artifact reference from before ids existed, and one from after.
+    let old: adam_llm_agent::ArtifactRef =
+        serde_json::from_value(json!({"name": "n", "mime_type": null})).unwrap();
+    assert_eq!(old.id, None);
+    assert!(serde_json::to_value(&old).unwrap().get("id").is_none());
 }
 
 #[test]
