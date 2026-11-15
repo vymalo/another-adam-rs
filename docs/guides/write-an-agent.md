@@ -43,6 +43,7 @@ agent/
 ├── instructions/            optional: more .md files, appended in filename order
 ├── skills/<name>/SKILL.md   Agent Skills (or skills/<name>.md); loaded on demand
 ├── subagents/<name>.md      one tool of the parent; a child run (or <name>/instructions.md)
+├── commands/<name>.md       a prompt template a message invokes by name: `/review acme/app`
 └── mcp.json                 MCP servers whose tools the agent gets
 ```
 
@@ -80,6 +81,11 @@ Rules worth knowing:
   person as files of the run, the model reading one line each. Which kinds of server are allowed is the
   **deployment's** decision (`MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS`), not the file's.
   `ADAM_EXTRA_MCP_FILE` adds servers without copying the folder.
+* **Commands** are templates for the messages people send often. `commands/review.md` with a `description`,
+  an optional `argument-hint` and a body that uses `$ARGUMENTS` or `$1` to `$9` is listed on the card, and a
+  client (or a person typing `/review acme/app`) invokes it; the agent expands it before the run starts. A
+  `/word` that is not one of yours stays plain text, and nothing in a template is ever executed
+  ([format and limits](../reference/agent-files.md#commands-commandsnamemd)).
 * **Edits apply at the next start.** The folder is read once; restart, no rebuild.
 
 ## When it does not start

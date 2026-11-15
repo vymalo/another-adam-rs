@@ -1,6 +1,6 @@
 ---
 name: adam-agent-folder
-description: "Write or change an adam-rs agent that is only a folder (agent/instructions.md, card, vars, tools, skills/, subagents/, mcp.json) and serve it with the adam-agent binary from the coder image. Use for 'add an agent', 'change an agent's instructions or MCP servers', 'why does adam-agent exit 78'. Not Docker Agent (cagent) agent.yaml."
+description: "Write or change an adam-rs agent that is only a folder (agent/instructions.md, card, vars, tools, skills/, subagents/, commands/, mcp.json) and serve it with the adam-agent binary from the coder image. Use for 'add an agent', 'change an agent's instructions or MCP servers', 'why does adam-agent exit 78'. Not Docker Agent (cagent) agent.yaml."
 ---
 
 # Write an adam agent as a folder
@@ -52,6 +52,7 @@ before you rely on a detail here.
    remote under a subagent's directory (`subagents/researcher/subagents/browser.md`) is that subagent's tool.
    `files: true` in a remote's file shares the file parts of its answer (a browser's screenshot) as files of the
    calling run; without it they are described and dropped. A subagent's files never reach the person.
+   Optional `commands/<name>.md` are prompt templates the agent serves (`description`, `argument-hint`, a body with `$ARGUMENTS` and `$1` to `$9`; at most 50, never executed, the shell form is refused): the card lists them (`commands/v1`) and a message `/name arguments` or its metadata invokes one; a subagent's `commands/` is ignored.
    Formats: `docs/reference/agent-files.md`; the short version is `docs/guides/write-an-agent.md`.
 4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog` and the plan,
    `plan_work`, `plan_check`, `plan_add` (`crates/adam-ui/README.md`; a checklist of at most 50 items kept in the

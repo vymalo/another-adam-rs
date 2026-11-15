@@ -41,7 +41,7 @@ applies at the next start, and a restart is a deploy.
 | `subagents/` | assembled and **registered beside the agent** (`<name>/<subagent>`): one tool per subagent, a child run with its own prompt and tools. A subagent gets only the tools it lists, and not `ask_user` (nobody would answer it) |
 | `mcp.json` | MCP servers whose tools the agent gets, see [below](#mcp-servers-from-the-folder). Connected by the **workers** |
 | `schedules/` | read, not run: a warning says so |
-| `commands/` | prompt templates (`commands/<name>.md`: `description`, optional `argument-hint`, a body with `$ARGUMENTS` and `$1` to `$9`). The card lists `commands/v1` with them, and a message that names one (in its metadata, or as `/name arguments` at the start of its text) is expanded before it is stored: [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#commands), [`a2a-server.md`](../../docs/reference/a2a-server.md#commands-commandsv1). A folder without `commands/` lists nothing |
+| `commands/` | prompt templates (`commands/<name>.md`: `description`, optional `argument-hint`, a body with `$ARGUMENTS` and `$1` to `$9`). The card lists `commands/v1` with them, and a message that names one (in its metadata, or as `/name arguments` at the start of its text) is expanded before it is stored: [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#commands-commandsnamemd), [`a2a-server.md`](../../docs/reference/a2a-server.md#commands-commandsv1). A folder without `commands/` lists nothing |
 
 The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/README.md)), and the same ones
 `adam-coder` has, with descriptions that fit any agent:

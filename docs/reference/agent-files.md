@@ -41,6 +41,7 @@ my-agent/                       # a normal Cargo package
 │   │   ├── reviewer.md                  # or reviewer.agent.md: a Claude Code / Copilot agent file
 │   │   ├── researcher/instructions.md   # directory form: own skills/, mcp.json, subagents/
 │   │   └── billing.md                   # `a2a: <agent-card URL>` makes it a remote subagent
+│   ├── commands/review.md      # a prompt template a message invokes by name (`/review ...`)
 │   ├── mcp.json                # {"mcpServers": {...}}; secrets only as ${VAR}
 │   └── schedules/daily.md      # frontmatter `cron:`; body = prompt (roadmap 5, sketch)
 └── src/
@@ -60,7 +61,7 @@ both `agent/` and `agents/` is a **build error** (eve silently prefers `agent/`)
 * Ignored: dotfiles, `*.test.md`, `__tests__/`, and a directory under `skills/` without `SKILL.md`.
 * Names come from paths: `skills/<name>/SKILL.md` or `skills/<name>.md` is skill `<name>`;
   `subagents/<name>.md`, `subagents/<name>.agent.md` or `subagents/<name>/instructions.md` is subagent
-  `<name>`; `schedules/a/b.md` is schedule `a/b`. For a subagent file, the name is the file name minus
+  `<name>`; `schedules/a/b.md` is schedule `a/b`; `commands/<name>.md` is command `<name>`. For a subagent file, the name is the file name minus
   `.md` or `.agent.md` (as Copilot does), unless the frontmatter sets `name`.
 * Subagents nest through `subagents/<name>/subagents/...`. Cycles are impossible by construction.
 
@@ -166,6 +167,38 @@ embedded up to 1 MiB per skill. What the model sees of a skill at run time is
 
 The repository's own `.agents/skills/` is a corpus of 75 vendored `SKILL.md` files. The parser must read
 all of them with no error; that is a conformance test.
+
+### Commands (`commands/<name>.md`)
+
+A command is a prompt template the **agent serves**: a client lists it from the card (`commands/v1`,
+[the A2A server](a2a-server.md#commands-commandsv1)) and a message that names it is expanded by the agent
+before it is stored. It is root-agent only: `subagents/<n>/commands/` is a warning and ignored, and each
+`agents/<name>/` has its own.
+
+```markdown
+---
+description: Review the open pull request of a repository you name.   # required, at most 200 characters
+argument-hint: "<repository> [pull request number]"                   # optional, at most 100; quote it
+---
+Review an open pull request. Do not change anything.
+
+What to review: $ARGUMENTS
+First word: $1
+```
+
+| | |
+|---|---|
+| Name | the file stem, the agent-name rule (`a-z0-9_-`, 1 to 64, not starting with `_` or `-`) |
+| `$ARGUMENTS` | what the person typed after the name, trimmed |
+| `$1` to `$9` | that text split on whitespace, double quotes respected (`"a b" c` is `a b` and `c`); a missing one is empty; `$10` is `$1` and a `0` |
+| Any other `$` | itself |
+| Limits | 50 commands per agent; a template at most 32 KiB; at expansion, arguments at most 4 KiB and the text at most 32 KiB, and not empty |
+| Refused at load | the shell form `` !`...` `` (anything with `!` then a backtick): nothing in a template is ever run. A missing `description`, a template with no body, and a name or size over the limits are errors too |
+| Digest | a folder without `commands/` has the digest it had before commands existed |
+
+Commands are not in the prompt and not in the tool list: they change nothing the model is sent except the
+message that invokes one. [The coder's](../../bin/adam-coder/agent/commands) are `review`, `fix-checks` and
+`explain`.
 
 ### `mcp.json`
 

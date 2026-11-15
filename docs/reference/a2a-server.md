@@ -272,6 +272,65 @@ task says `metadata[URI] = {"tier": ..}`: on the answer of `SendMessage`, on `Ge
 status update when it changes. `RuntimeTaskBackend::with_access_tiers` is the backend side; what the coder does with each tier is
 its README, *Access tiers*.
 
+## Commands (`commands/v1`)
+
+An agent that has prompt templates ([`commands/<name>.md`](agent-files.md#commands-commandsnamemd)) lists
+`https://agents.vymalo.com/a2a/extensions/commands/v1` on its card, and **only then**: an agent with no commands
+lists no such extension. The contract page for clients, `docs/api/commands-v1.md` of `vymalo/another-agentic-system`
+([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 9),
+is not written yet; this is the agent's side.
+
+The card's `params`, sorted by `name` (`argumentHint` only when the file has one):
+
+```json
+{"commands": [
+  {"name": "explain", "description": "Explain a file, a function or a change in plain words, with no edits.",
+   "argumentHint": "<repository> <file, function or change>"},
+  {"name": "review", "description": "Review the open pull request of a repository you name, and say what to change."}
+]}
+```
+
+A message invokes one in either of two forms, and both give the same stored text:
+
+| Form | When it is read | Shape |
+|---|---|---|
+| metadata | only when the request **activated** the extension | `metadata[URI] = {"command": "review", "arguments": "acme/app 12"}` (`arguments` optional, a string). The message still carries a text part, which the member replaces: send `/review acme/app 12` there, so an agent that does not know the extension reads the same words |
+| text | always | the text starts with `/review`, then the end of the text or whitespace, and the rest (trimmed) is the arguments |
+
+* **An unknown command in the metadata** is `InvalidParams` (`-32602`), like a `command` that is not a string, `arguments` that
+  are not text, arguments over 4 KiB or an expansion over 32 KiB or empty: nothing is written.
+* **A `/word` that is not a command is plain text**: `/tmp is full` reaches the agent as written. To send text that starts with a
+  command's name, double the slash: `//review` is the literal `/review`.
+* **Expansion** is plain substitution, once: `$ARGUMENTS` and `$1` to `$9` as in
+  [the format](agent-files.md#commands-commandsnamemd). What is substituted is never read again, and nothing is executed.
+  A line of the result that begins as a form's answer is marked `(typed) `, as in any message.
+* **The expansion is what is stored.** It is the text of the run's first message, with `command = {name, arguments}` beside it.
+  A replay, or a restart with an edited folder, never expands again, and a message sent again with the same `messageId` joins the
+  run it made. The same holds for a follow-up and for a steering message.
+* Commands change **no system prompt and no tool list**: the model sees the expanded text as the person's message.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as A2A server
+  participant B as RuntimeTaskBackend.submit
+  participant S as Store
+  C->>A: GET agent card
+  A-->>C: extensions: commands/v1 with params.commands
+  C->>A: SendMessage, A2A-Extensions commands/v1, metadata {command, arguments}
+  A->>B: submit(caller, message)
+  B->>B: inbound function, then expand the template
+  alt unknown command, bad arguments or too long
+    B-->>C: InvalidParams, nothing written
+  else a command the agent serves
+    B->>S: start the run with the expanded text and command
+    B-->>C: the task
+  end
+```
+
+Backend side: `RuntimeTaskBackend::with_commands` and `Commands` in `crates/adam-a2a-runtime/src/commands.rs`; the card entry is
+`ExtensionConfig::commands`; the coder and `adam-agent` read the folder's `commands/` for both.
+
 ## Tokens of each model call
 
 Every agent's card lists `https://agents.vymalo.com/a2a/extensions/usage/v1` (optional, no `params`; the contract is the
