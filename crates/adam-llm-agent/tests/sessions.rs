@@ -120,6 +120,10 @@ impl ModelClient for GateModel {
 
 /// A tool that calls another and then fails its first try transiently: the retry runs the tool
 /// again, as a replay would, and must find what the first try did.
+///
+/// It wraps the tools whose calls are committed before they run (start, send and close: the ones
+/// with an effect). A read is not one of them: its turn and its call are one transition, so a try
+/// of it that fails asks the model again, which a scripted model cannot answer twice.
 struct Blip {
     inner: DynTool,
 }
@@ -1206,7 +1210,16 @@ mod cases {
                 .push_text("answer one")
                 .push_text("answer two");
             let (inner, dynamic) = faulty(store.clone());
-            let parent_agent = rig.parent_with(|t| Arc::new(Blip { inner: t }));
+            let parent_agent = rig.parent_with(|t| {
+                if matches!(
+                    t.spec().name.as_str(),
+                    "subagent_start" | "subagent_send" | "subagent_close"
+                ) {
+                    Arc::new(Blip { inner: t })
+                } else {
+                    t
+                }
+            });
             let child_agent = rig.child();
             let rt = rig.together(&dynamic, &parent_agent, &child_agent);
             let conv = conv_id();
@@ -1955,7 +1968,18 @@ mod cases {
         // The version is read first; only then does the clock move.
         wait_waiting_on_a_session(&rt, parent).await;
         rig.clock.advance(Duration::from_secs(31 * 60));
+        // The parent's timer and the round's time limit are both due now. A parent that looks
+        // before the runtime has failed the round parks until its next look, a minute later by
+        // the clock: time goes on until it has looked again.
+        let clock = rig.clock.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                clock.advance(Duration::from_secs(61));
+            }
+        });
         wait_done(&rt, parent).await;
+        ticker.abort();
         rig.child_gate.release.notify_one();
         worker.stop().await;
         let results = tool_results(&state_of(&rt, parent).await);
@@ -2014,6 +2038,74 @@ mod cases {
         assert!(*is_error, "{text}");
         assert!(text.contains("no session"), "in words: {text}");
         assert!(text.contains("subagent_list"), "it says what to do: {text}");
+    }
+
+    /// A round that only closes a session is not work: a run that ends its turn while that round
+    /// has not run yet neither waits for it (it would read the last report a second time and ask
+    /// the model again) nor cancels it when it ends. The round closes the session when it runs.
+    pub async fn a_round_that_only_closes_a_session_is_neither_waited_for_nor_cancelled(
+        store: DynStore,
+    ) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("answer one");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let front = rig.front(&store, &parent_agent);
+        let back = rig.back(&store, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&front, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_tool_calls(vec![close_call("c3", session, false)])
+            .push_text("finished");
+        // The parent parks on the round; the round runs to its end; nobody steps the children after.
+        let front_worker = spawn_worker(&front);
+        wait_waiting_on_a_session(&front, parent).await;
+        front_worker.stop().await;
+        let back_worker = spawn_worker(&back);
+        wait_done(&back, session).await;
+        back_worker.stop().await;
+        // The parent reads the report, closes the session (a round that only closes it, which
+        // nobody steps) and says its last words: the run ends there.
+        let front_worker = spawn_worker(&front);
+        let done = wait_done(&front, parent).await;
+        front_worker.stop().await;
+        assert_eq!(
+            done.output.expect("output")["text"],
+            "finished",
+            "nothing was cancelled, so nothing is said about it"
+        );
+        assert_eq!(
+            rig.parent_mock.requests().len(),
+            4,
+            "no turn after the last"
+        );
+        let state = state_of(&front, parent).await;
+        assert!(
+            !state
+                .messages
+                .iter()
+                .flat_map(|m| m.tool_calls())
+                .any(|c| c.id.starts_with("wait")),
+            "the closing round was not waited for"
+        );
+        let listed = front
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        let closing = listed.sessions[0].latest_run;
+        assert_eq!(listed.sessions[0].round, 2);
+        // The round was left to run: it closes the session.
+        let back_worker = spawn_worker(&back);
+        wait_done(&back, closing).await;
+        back_worker.stop().await;
+        let listed = front
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(listed.sessions[0].state, SessionState::Closed);
+        assert_eq!(rig.child_mock.requests().len(), 1, "it called no model");
     }
 
     /// The wait at the end of a turn is for the rounds **this task** started. A kept-open session an
@@ -2632,6 +2724,7 @@ macro_rules! session_suite {
                 a_blipped_start_of_the_last_session_still_answers_started,
                 a_round_past_its_deadline_reads_as_failed_with_the_reason,
                 a_purged_session_wakes_a_parked_parent_with_an_error,
+                a_round_that_only_closes_a_session_is_neither_waited_for_nor_cancelled,
                 the_turn_end_wait_is_for_this_tasks_rounds_only,
                 a_task_that_only_sends_waits_for_its_round,
                 two_waiting_reads_in_one_turn_each_get_their_own_report,

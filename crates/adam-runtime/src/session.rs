@@ -228,6 +228,9 @@ pub struct SessionSummary {
     /// Whether the session takes no more messages, even if its latest round still works (it was
     /// asked to close and is finishing).
     pub closed: bool,
+    /// Whether the latest round only closes the session: it calls no model and reports nothing
+    /// new, so nobody needs to wait for it.
+    pub closing: bool,
     /// The run that started the latest round: the parent run of that round.
     pub started_by: Option<RunId>,
 }
@@ -336,6 +339,7 @@ pub(crate) fn page_of_sessions(
                     .unwrap_or_default(),
                 keep_open: read.header.as_ref().is_none_or(|h| h.keep_open),
                 closed: read.closed,
+                closing: read.header.as_ref().is_some_and(|h| h.closing),
                 started_by: latest.parent_id,
             })
         })

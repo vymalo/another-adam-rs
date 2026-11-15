@@ -465,7 +465,9 @@ parks the run and returns.
 * **The turn-end wait.** When the model answers with no tool call while a session this run started still works, the run does not
   end: a journaled step `sessions:<turn>` (only when the history holds a `subagent_start` or `subagent_send` call) finds it,
   and the turn goes on with a call to `subagent_read` with `wait: true`, id `wait_<turn>` (every id the loop invents matches `^[a-zA-Z0-9_-]{1,64}$`), appended to the model's own message
-  (its words stay). The report then reaches the model, which is called again. Not done at a limit turn, or at
+  (its words stay). The report then reaches the model, which is called again. **A round that only closes a session is not
+  work** (`SessionSummary::closing`): it calls no model and reports nothing new, so the run neither waits for it here (it would
+  read the last report again and ask the model once more) nor cancels it when it ends. Not done at a limit turn, or at
   `max_tool_calls`.
 * **Tokens.** Every round a run started or sent to is counted **once** in its `usage_totals`, whether its report is read once,
   twice or never. `Conversation::rounds_started` lists the call ids (`subagent_start`, `subagent_send`) whose round is not yet

@@ -13,8 +13,8 @@ use adam_model::{
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, ChildStatus, Ctx,
     Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE, RUN_FINISHED_KIND, RunEvent,
-    SESSION_CLOSE_KIND, SandboxUsage, SessionState, StepState, Transition, UsageEvent, UsageTotals,
-    child_run_id,
+    SESSION_CLOSE_KIND, SandboxUsage, SessionState, SessionSummary, StepState, Transition,
+    UsageEvent, UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -44,6 +44,13 @@ fn has_started_session(state: &Conversation) -> bool {
 /// Whether a call of `tool` acts on a session (an effect outside the run's own state).
 fn has_effect(tool: &str) -> bool {
     matches!(tool, SUBAGENT_START | SUBAGENT_SEND | SUBAGENT_CLOSE)
+}
+
+/// Whether a round of the session is doing work somebody will want to read. A round that only
+/// closes the session is not: it calls no model, ends by itself and reports nothing new, so a run
+/// neither waits for it at the end of a turn nor cancels it when it ends.
+fn does_work(session: &SessionSummary) -> bool {
+    session.state == SessionState::Working && !session.closing
 }
 use crate::source::{
     DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined, withheld,
@@ -1288,7 +1295,7 @@ impl LlmAgent {
                 Ok(list
                     .sessions
                     .into_iter()
-                    .find(|s| s.state == SessionState::Working && s.started_by == Some(me))
+                    .find(|s| does_work(s) && s.started_by == Some(me))
                     .map(|s| s.id))
             })
             .await?;
@@ -1332,7 +1339,7 @@ impl LlmAgent {
                     for s in list
                         .sessions
                         .iter()
-                        .filter(|s| s.state == SessionState::Working && s.started_by == Some(me))
+                        .filter(|s| does_work(s) && s.started_by == Some(me))
                     {
                         starter
                             .cancel_listed(s, "the run that started it ended")

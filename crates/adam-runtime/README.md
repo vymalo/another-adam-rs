@@ -196,8 +196,10 @@ the latest round: its `SessionHeader` (`session` in the round's agent state: id,
 the conversation of the run they were made for, so a later run of the conversation reaches a session an earlier one started
 and no run reaches another conversation's. A close request is not counted as unread input (`Ctx::arrived`), so it costs no
 model turn; one that lands while a round finishes stays in its inbox, where `read_latest` finds it.
-**Breaking:** `SessionState` has a third variant, `Closed`, and `SessionSummary` four fields (`description`, `keep_open`,
-`closed`, `started_by`); `list_sessions` orders working, then idle, then closed.
+**Breaking:** `SessionState` has a third variant, `Closed`, and `SessionSummary` five fields (`description`, `keep_open`,
+`closed`, `closing`, `started_by`); `list_sessions` orders working, then idle, then closed. `closing` says that the latest
+round only closes the session (it calls no model and reports nothing new), so a caller that waits for working sessions can
+leave it alone.
 
 **Breaking:** cancelling a parent cancels its children. A subagent run stops after 30 minutes unless its file says
 otherwise (`limits.max_minutes`). Take the inbox in every step that can park, including the

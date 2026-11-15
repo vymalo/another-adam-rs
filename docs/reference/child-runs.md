@@ -271,7 +271,8 @@ parent closes such a session, and leaves a kept-open one idle).
 **The turn-end wait.** A turn whose model answers with no tool call while a session this run started still works does not end
 the run: the loop reads the sessions in a journaled step `sessions:<turn>` (skipped when no call of the history started a
 session) and goes on with a call to `subagent_read` that waits, appended to the model's own message. The report reaches the model
-before the run ends. At a limit turn, or at `max_tool_calls`, the run ends and the round goes on without anyone to read it.
+before the run ends. A round that only closes a session is not waited for and not cancelled: it reports nothing new. At a
+limit turn, or at `max_tool_calls`, the run ends and the round goes on without anyone to read it.
 
 ### Session interleavings
 
