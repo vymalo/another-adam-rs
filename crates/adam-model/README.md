@@ -84,7 +84,9 @@ The persisted JSON shapes of `Message` are shown in the crate docs
 error as their `source`, and their message does not repeat it. Build them with
 `ModelError::transient(msg)`, `invalid_request(msg)` and `protocol(msg)`, then
 `.with_source(err)`; a variant that has no source ignores `with_source`.
-`retry_after()` is set only by `RateLimited`. `ModelError` is no longer `Clone`
+`retry_after()` is set only by `RateLimited`. `is_context_overflow()` is true for
+`ContextLength` alone: its class stays `Invalid` (the same request never succeeds), and the
+agent loop decides from the predicate that a shorter history is worth one more try. `ModelError` is no longer `Clone`
 or `PartialEq`: match on the variant or the class.
 
 ## Features and environment

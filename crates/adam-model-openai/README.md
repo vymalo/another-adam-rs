@@ -131,6 +131,11 @@ Failures map onto `adam_model::ModelError`, which is classified (see
 | any other 4xx; a request that cannot be built | `InvalidRequest` | `Invalid` |
 | 1xx/3xx (redirects are not followed); malformed (complete) JSON, wrong shape, a tool call with no name | `Protocol` | `Corrupt` |
 
+`ModelError::is_context_overflow()` is true for exactly these two shapes (the code
+`context_length_exceeded` and the words "maximum context length"); the agent loop compacts its
+history once on it. The bodies of other providers (Anthropic-style, Gemini, llama.cpp, Ollama) are
+*unverified* and none is mapped without a captured body.
+
 An error object inside a `200` or a stream is `RateLimited` for a
 `rate_limit` type, `ContextLength` for a context-length code, `InvalidRequest`
 for `invalid_request` or `authentication`, and `Transient` for anything else.

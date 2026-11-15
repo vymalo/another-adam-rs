@@ -80,6 +80,15 @@ impl ModelError {
         }
     }
 
+    /// Whether the provider rejected the prompt as too long for the model's context window
+    /// ([`ContextLength`](Self::ContextLength)). The class stays [`ErrorClass::Invalid`] (the same
+    /// request never succeeds), so a caller that can shorten the request and ask again decides from
+    /// this predicate, and every other caller from the class.
+    #[must_use]
+    pub fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::ContextLength(_))
+    }
+
     /// Attach the lower error as the source. Variants that carry no source are returned as is.
     #[must_use]
     pub fn with_source(mut self, err: impl std::error::Error + Send + Sync + 'static) -> Self {
@@ -150,6 +159,21 @@ mod tests {
             assert_eq!(e.class(), class, "{e}");
             assert_eq!(e.is_retryable(), retryable, "{e}");
         }
+    }
+
+    #[test]
+    fn is_context_overflow_follows_the_variant() {
+        for e in samples() {
+            assert_eq!(
+                e.is_context_overflow(),
+                matches!(e, ModelError::ContextLength(_)),
+                "{e}"
+            );
+        }
+        assert_eq!(
+            ModelError::ContextLength("x".into()).class(),
+            ErrorClass::Invalid
+        );
     }
 
     #[test]
