@@ -281,6 +281,16 @@ pub struct ToolOutput {
     /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reported: Vec<adam_core::RunId>,
+    /// The result is **pinned**: a compaction that drops it from the history copies it into the
+    /// marker that stands in for what was dropped (up to 32 KiB, and 64 KiB for all the results that
+    /// were pinned), so what the model must keep knowing (a workspace's path and branch, the
+    /// instructions of a repository) outlives the summary. Set it only for a small result that is
+    /// the tool's own and whose loss would leave the model not knowing where it is: it is copied as
+    /// text into a user message. Never read from an error result.
+    ///
+    /// Absent from a journal written before it existed, and not written while it is `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -301,6 +311,7 @@ impl ToolOutput {
             plan: None,
             kept: None,
             reported: Vec::new(),
+            pinned: false,
         }
     }
 
@@ -318,6 +329,7 @@ impl ToolOutput {
             plan: None,
             kept: None,
             reported: Vec::new(),
+            pinned: false,
         }
     }
 
@@ -358,6 +370,13 @@ impl ToolOutput {
     #[must_use]
     pub fn with_repeat_key(mut self, key: impl Into<String>) -> Self {
         self.repeat_key = Some(Box::new(key.into()));
+        self
+    }
+
+    /// Pin the result: see [`pinned`](Self::pinned).
+    #[must_use]
+    pub fn pinned(mut self) -> Self {
+        self.pinned = true;
         self
     }
 

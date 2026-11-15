@@ -313,7 +313,8 @@ async fn the_prefix_holds_across_prepare_and_nested_reads() {
 }
 
 /// A model that refuses the summary request of a compaction: the history is then shortened, as the
-/// tests that were written before compaction existed expect (`coder_with_history`).
+/// tests that were written before compaction existed expect (`coder_with_history`). Those that want a
+/// summary use `coder_with_history_and_summaries`.
 struct NoSummaries(Arc<MockModel>);
 
 fn is_summary(request: &ModelRequest) -> bool {
@@ -358,6 +359,16 @@ fn coder_with_history(
         store,
         max_history_tokens,
     )
+}
+
+/// The same, with a model that summarises: the scripted responses include the summary.
+fn coder_with_history_and_summaries(
+    fx: &Fixture,
+    mock: &Arc<MockModel>,
+    store: DynStore,
+    max_history_tokens: u32,
+) -> Coder {
+    history_coder(fx, mock.clone(), store, max_history_tokens)
 }
 
 fn history_coder(fx: &Fixture, model: DynModel, store: DynStore, max_history_tokens: u32) -> Coder {
@@ -934,4 +945,77 @@ async fn a_loaded_repository_skill_replays_from_the_journal_after_the_file_chang
     assert!(!c2.contains("EDITED"), "{c2}");
     let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
     assert_eq!(notes.repo_skills["remote"].call_id, "c1");
+}
+
+/// A long run is compacted (a budget of 3,000 tokens, a 12 KB read at the fourth turn): the result of
+/// `prepare_workspace` (the slot, the branch, the listing of the repository's skills and its
+/// instructions) is pinned, so the marker that replaces the turns it was in still holds it, as the
+/// repository's text and not as a message of the person.
+#[tokio::test]
+async fn the_prepare_result_survives_a_compaction() {
+    let fx = Fixture::new().await;
+    repository_with_a_skill(&fx);
+    let notes: String = (0..200)
+        .map(|n| format!("note {n:04}: {}\n", "w".repeat(50)))
+        .collect();
+    fx.commit_to_main("notes.txt", &notes);
+    fx.commit_to_main("small.txt", "small\n");
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![prepare("c1", &fx)])
+        .push_tool_calls(vec![read("c2", "small.txt")])
+        .push_tool_calls(vec![read("c3", "small.txt")])
+        .push_tool_calls(vec![read("c4", "notes.txt")])
+        .push_text("SUMMARY: prepared the workspace and read the notes")
+        .push_text("done");
+    let coder = coder_with_history_and_summaries(&fx, &mock, Arc::new(MemoryStore::new()), 3000);
+    let task_text = format!("look at {}", fx.remote_url());
+    let (_, run) = submit(&coder, &task_text).await;
+    let worker = spawn_worker(&coder);
+    let view = settled(&coder, run).await;
+    worker.stop().await;
+    assert_ne!(view.status, RunStatus::Failed, "{view:#?}");
+
+    let requests = mock.requests();
+    assert_eq!(
+        requests.len(),
+        6,
+        "four turns, the summary and the last turn"
+    );
+    let after = &requests[5];
+    // Whoever reads what the person said sees the task and nothing else: the marker is the second
+    // part of the first message and holds the repository's text.
+    let Message::User { content } = &after.messages[0] else {
+        panic!("the first message is the person's");
+    };
+    assert_eq!(content[0].as_text(), task_text);
+    let marker = content[1].as_text();
+    assert!(
+        marker.starts_with(adam_llm_agent::OMITTED_MARKER_PREFIX),
+        "{marker}"
+    );
+    assert!(
+        marker.contains("SUMMARY: prepared the workspace"),
+        "{marker}"
+    );
+    assert!(marker.contains("Kept earlier results"), "{marker}");
+    assert!(
+        marker.contains("Skills in this repository (slot `remote`)"),
+        "{marker}"
+    );
+    assert!(
+        marker.contains("remote/release-notes: Drafts release notes."),
+        "{marker}"
+    );
+    assert!(marker.contains("root rules"), "{marker}");
+    assert!(
+        marker.contains("agent/"),
+        "the branch of the checkout: {marker}"
+    );
+    assert_eq!(
+        content.len(),
+        2,
+        "no other part: the person said nothing else"
+    );
+    // The cache's head did not move.
+    assert_eq!(head(&requests[3]), head(&requests[5]));
 }

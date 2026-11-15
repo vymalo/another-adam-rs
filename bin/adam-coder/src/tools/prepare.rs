@@ -216,7 +216,9 @@ pub async fn prepare_workspace(
         text.push_str("\n\n");
         text.push_str(&block);
     }
-    Ok(ToolOutput::text(text))
+    // Pinned: a compaction of the history copies this result into its marker, so the slot, the
+    // branch, the skills and the instructions outlive the summary of the turns around it.
+    Ok(ToolOutput::text(text).pinned())
 }
 
 /// The branch to start from when the model gave none: the one this run's workspace already uses

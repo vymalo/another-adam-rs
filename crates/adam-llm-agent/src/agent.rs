@@ -1851,7 +1851,11 @@ impl LlmAgent {
                     plan,
                     kept,
                     reported,
+                    pinned,
                 } => {
+                    if pinned {
+                        state.pinned_calls.push(call.id.clone());
+                    }
                     if let Some(answer) = answer {
                         state.announce(answer);
                     }
@@ -2046,6 +2050,7 @@ impl LlmAgent {
                 plan: None,
                 kept: None,
                 reported: Vec::new(),
+                pinned: false,
             };
             return Ok((answered, SandboxUsage::new()));
         }
@@ -2124,6 +2129,7 @@ impl LlmAgent {
                     plan: None,
                     kept: None,
                     reported: Vec::new(),
+                    pinned: false,
                 };
                 return Ok((answered, SandboxUsage::new()));
             }
@@ -2180,6 +2186,7 @@ impl LlmAgent {
                 } else {
                     std::mem::take(&mut output.reported)
                 };
+                let pinned = output.pinned && !output.is_error;
                 let (message, artifacts, answer, plan, outcome, kept) = output_message(
                     ctx,
                     &call.id,
@@ -2210,6 +2217,7 @@ impl LlmAgent {
                     plan,
                     kept,
                     reported,
+                    pinned,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -2236,6 +2244,7 @@ impl LlmAgent {
                     plan: None,
                     kept: None,
                     reported: Vec::new(),
+                    pinned: false,
                 }
             }
             Err(ToolError::Transient(reason)) => {
@@ -2488,6 +2497,9 @@ impl LlmAgent {
                 } else {
                     std::mem::take(&mut output.reported)
                 };
+                if output.pinned && !output.is_error {
+                    state.pinned_calls.push(wait.call_id.clone());
+                }
                 if !reported.is_empty() {
                     Self::count_rounds(ctx, state, false).await?;
                 }
@@ -2823,6 +2835,8 @@ enum ToolResult {
         /// The rounds of sessions whose reports the result gives, from a result that is not an
         /// error.
         reported: Vec<RunId>,
+        /// The result is pinned ([`ToolOutput::pinned`]), from a result that is not an error.
+        pinned: bool,
     },
     NeedsInput {
         question: String,
