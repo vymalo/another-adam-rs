@@ -655,6 +655,66 @@ sequenceDiagram
 * **Defaults** (`runtime.rs`, `retry.rs`): lease 30 s, poll 250 ms, 4 concurrent runs per worker loop,
   5 tries per transition, backoff 1 s doubling to 60 s.
 
+### Compaction: a long history is summarised once
+
+A history that reaches its budget is summarised at a journaled step, so the run goes on in a context
+that fits and the requests after it keep one cached prefix again ([ADR 0044](decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)
+decision 11, [ADR 0039](decisions/0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md)
+decision 5). It is decided at the start of `LlmAgent::step`, from the committed state, and only with no call
+and no wait open (`crates/adam-llm-agent/src/agent.rs`, `compact_if_due`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as LlmAgent::step
+    participant C as Ctx journal
+    participant M as ModelClient
+    S->>S: compact_if_due: estimate reaches the budget, two turns can leave
+    S->>C: step compact:n
+    C->>M: complete(the request as it stands + COMPACTION_TURN, tool_choice none)
+    M-->>C: the summary and its usage
+    C-->>S: Summarised (journaled: a replay calls no model)
+    S->>S: apply: marker of the first message, newest turns kept
+    S->>S: report_usage under the call's own id
+    S-->>C: Continue (committed)
+    S->>M: next step: model:turn, from the new history
+    M--xS: ContextLength (a prompt the provider refuses)
+    S->>S: rejected_as_too_long: compact_next = overflow
+    S->>C: next step: compact:n without the oversized tail, then model:turn again
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Growing
+    Growing --> Due: estimate reaches the budget and two turns can leave
+    Due --> Summarising: compact:n
+    Summarising --> Summarised: a summary was made (or recorded)
+    Summarising --> Shortened: no summary could be made (compact_failed)
+    Summarised --> Growing: the new prefix starts at the next request
+    Shortened --> Growing: record_shortenings, retried after 8 turns
+    Growing --> Rejected: the provider says the prompt is too long
+    Rejected --> Summarising: once per turn, without the oversized tail
+    Rejected --> [*]: a second rejection fails the run
+    Summarising --> Summarised: no summary after a rejection: the turns go anyway
+```
+
+| Part | Rule |
+|---|---|
+| **Budget** | the smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens`, and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
+| **Estimate** | the last call's reported prompt tokens plus characters / 4 of what came after; with no report, characters / 4 of the instructions, the tools and every message |
+| **Cut** | at the start of a turn (an assistant message, never the first message), so a call is never parted from its result; the newest 1 to 8 turns worth at most a quarter of the budget stay verbatim; fewer than two turns to drop, or eight compactions in the run, shortens instead |
+| **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, 4,096 output tokens, capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |
+| **New history** | the task (the first part of the first message) verbatim, then the marker (its second part, `Conversation::is_omission_marker`), then the person's later messages verbatim (2 KiB each, 8 KiB in all, as parts of that message), then the turns that stayed |
+| **The marker's lines** | the summary, then lines **written by code** from what left: the plan, the results a tool pinned, a pointer to each kept output (built from the call's own output id), the names of the skills loaded earlier, a line that sessions exist. Text that is copied has each line that starts with `[` written `\x5b`, so it cannot forge a loop line |
+| **Sessions** | a run whose `subagent_start` was cut still waits for, and cancels, the sessions it started (`Compaction::sessions`) |
+| **A subagent** | compacts against its own limits; one on another alias has no window, so its `max_history_tokens` applies |
+
+The summary request is the previous request plus one message, so the provider serves it from its cache
+(*unverified* without a provider: whether a changed `tool_choice` keeps the match). The request after a
+compaction is the first of a new prefix, and `Conversation::compactions` lists those turns beside
+`shortenings`; `tests/prefix.rs` holds the rule. Rolling back to a build without compaction turns a run that
+has compacted into a `NonDeterminism` error.
+
 ### The access tier: which tools a step may use
 
 The person picks a tier for each message (`plan`, `edits`, `auto`, `bypass`; the A2A extension `access-tier/v1`, [ADR 0036](decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)).

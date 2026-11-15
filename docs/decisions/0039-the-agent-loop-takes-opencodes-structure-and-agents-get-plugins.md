@@ -118,6 +118,7 @@ a crash, transitions committed to a store, and fail-closed composition.
    * **What the summary replaces.** It replaces the messages before a cut point. The last turns are kept as they were, and a
      call never loses its result. The replaced messages leave the state; their journal records stay.
    * **Without a window** there is no summary, only `fit_history`, as OpenCode does without a context limit.
+     *Amended 2026-11-15:* compaction also runs without a declared window, at `max_history_tokens` (ADR 0044 decision 1 retires the shortening on every request, so a run without a window would otherwise carry its whole history), and with the smaller of the two when both are set. It is built with a built-in prompt only: the folder's `compaction` subagent and the `compacting` hook are not built ([ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), slice 9).
    * **Plugins** may add context through `compacting`.
    * **Replay** returns the recorded summary.
 6. **Snapshots and revert belong to the coder, as a plugin.**

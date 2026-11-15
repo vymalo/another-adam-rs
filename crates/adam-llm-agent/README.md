@@ -21,9 +21,9 @@ instructions + a model + a toolset. It is served over A2A by
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
-| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below) |
+| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) |
-| `ToolOutput` | `text`, `error`, `with_artifact`. A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
+| `ToolOutput` | `text`, `error`, `with_artifact`, `pinned()` (a compaction that drops the result copies it into its marker, see *Compaction*). A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
 | `StepIo` | how a call's step reports its input and output: `StepIo::default().redact(\|text\| ..).input_max(n).output_max(n)`, or `StepIo::off()`; given to the builder with `step_io(..)` (see *Steps*) |
 | `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `root_run_id()` (the run whose work this one serves: the top of the chain of parents for a child run, the run itself otherwise), `with_root_run(id)` for tests, `step_id()` (`tool:<call id>`), `note()` (what the source that offered the tool said of it, `ToolNote`), `parent_step_id()` / `under_step(id)` (the step this call runs under; none for a call of the model's own), `report_step(StepEvent)` (a step that runs under this call's), `emit_progress` (an update of the call's own step, the text in its detail), `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), `files_left()` (the bytes of files the run may still share: 6 MiB less what it kept, as the call began; the loop sets it with `with_files_left` for every call and poll, a detached context has the whole 6 MiB), `report_sandbox(&SandboxUsage)` (the time this call's commands ran in a sandbox, see *Sandbox time*) with `reported_sandbox()` to read it back, and for tests `detached(..).with_state(..).with_context(..)` |
@@ -44,6 +44,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
+| `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8) |
 | `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
 | `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
@@ -809,6 +810,7 @@ changes; everything else only appends):
 | Break | Where |
 |---|---|
 | A recorded shortening | `record_shortenings`, the turns in `Conversation::shortenings` |
+| A recorded compaction: the request after it is the first of a new prefix (the summary request itself extends the one before it and is no model turn) | `compact_if_due`, the turns in `Conversation::compactions` |
 | The closing turn: appended to the request only, never kept, so a run reopened after it does not start with that request | `model_turn` (`CLOSING_TURN`) |
 | A source's tools change: its listing, `refine` (the `show` description once the conversation's catalog is held), `withhold` (the access tier) | `offered`, `refined`, `withheld` in `src/source.rs` |
 | The cap pushes a tool out when a new one sorts before it | `offered` (`MAX_SOURCE_TOOLS`) |
@@ -844,4 +846,53 @@ sent is the client's choice (`MODEL_PROMPT_CACHE_KEY`, `adam-service`).
 
 Proof: `tests/prefix.rs`, `a_session_report_keeps_the_prefix` and
 `the_start_result_survives_a_history_far_over_budget` in `tests/sessions.rs`, the tests of
-`src/history.rs`.
+`src/history.rs`. The rule the test holds: `system`, `tools` and `tool_choice` are the same bytes in every
+request that is not a summary request; a summary request (`tool_choice: none`, its last message ends with
+`COMPACTION_TURN`) extends the request before it; the requests that do not extend the one before are exactly
+the recorded shortenings and the recorded compactions; every request after a compaction extends the first one
+after it.
+
+## Compaction (ADR 0044 slice 9)
+
+A history that reaches its budget is summarised once, at a journaled step `compact:<n>`, and a prompt the
+provider rejects as too long is compacted and tried once more. The picture, with the sequence and the states,
+is in [the architecture](../../docs/architecture.md#compaction-a-long-history-is-summarised-once).
+
+* **When.** At the start of a step, from the committed state, with no call and no wait open: the estimate (the
+  last call's reported `input_tokens`, `Conversation::last_prompt`, plus characters / 4 of what came after;
+  with no report, characters / 4 of the instructions, the tools and every message) reaches the budget, the
+  smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens`, and `Limits::max_history_tokens`.
+  With neither set there is none. Fewer than two turns to drop, a compaction at this very turn already, or
+  eight in the run: no compaction, and `record_shortenings` does what it always did.
+* **The cut** is at a turn start, so a call keeps its result; the newest 1 to 8 turns worth at most a quarter
+  of the budget stay verbatim.
+* **The summary** is the agent's own model (no tool, 4,096 output tokens), the request as it stands plus
+  `COMPACTION_TURN`; its usage is reported under its own call id. A transient failure retries the
+  transition; any other failure shortens instead (`Conversation::compact_failed`: not tried again for eight
+  turns). The outcome is journaled, so a replay applies it and calls no model.
+* **The new history.** Message 0 keeps the task (its first part) verbatim, then the marker
+  (`OMITTED_MARKER_PREFIX`, so `is_omission_marker` is true and the coder's reader of what the person said
+  skips it), then the person's later messages verbatim (2 KiB each, 8 KiB in all) as parts of that message,
+  then the turns that stayed. After the summary the marker's lines are **written by code**: the plan, the
+  results a tool pinned (`ToolOutput::pinned`; 32 KiB each, 64 KiB in all), a pointer (`pointer_line`) for each
+  kept output of a dropped call (built from the call's own output id), the names of the skills loaded earlier,
+  a line that sessions exist. Copied text has each line that starts with `[` written `\x5b`.
+* **Carried.** `Conversation::summary` is the marker's body: a run that continues this one carries it into the
+  marker of its own first message (`Conversation::continued`).
+* **Sessions.** `Compaction::sessions` says a `subagent_start` or `subagent_send` was cut: the run still waits
+  for, and cancels, its working sessions.
+* **Overflow.** `ModelError::is_context_overflow()` (the class stays `Invalid`) sets
+  `Conversation::compact_next`; the next transition compacts, from the turns before the newest ones with every
+  tool output over 2,000 characters shortened in the summary request, and the turn is asked again. A second
+  rejection of the same turn (`overflow_turn`) fails the run with both messages. A rejected summary request
+  drops the turns without a summary (the marker says so). Only the two bodies `adam-model-openai` maps are
+  recognised; others are *unverified*.
+* **Not built:** the folder's `compaction` subagent and the `compacting` hook (ADR 0039 decision 5): a
+  built-in prompt only.
+* **Breaking.** `Conversation` gains the public fields `last_prompt`, `summary`, `compactions`,
+  `overflow_turn`, `overflow_message`, `compact_next`, `compact_failed` and `pinned_calls`, and `ToolOutput`
+  gains `pinned` (struct literals need `..Default::default()`); a run whose prompt was rejected as too long
+  compacts once instead of failing; the request after a compaction breaks the prefix on purpose. A run that has
+  compacted does not replay on a build without this slice.
+
+Proof: `tests/compaction.rs`, `tests/prefix.rs`, the units of `src/compaction.rs` and `src/conversation.rs`.

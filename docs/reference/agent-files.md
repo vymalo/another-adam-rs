@@ -546,8 +546,9 @@ own `skills/`, narrowed by `skills:`), never inherited. A folder with no `skills
   The coder's: [Repository skills](coder-agent.md#repository-skills).
 * A registered tool named `load_skill` or `read_skill_file` is `Error::ReservedToolName`; `tools:` does not
   filter the skill tools, `skills: []` turns them off. Results are journaled like any tool's.
-* Known limit: an old tool result may be shortened in the stored history by `limits.max_history_tokens`, a loaded skill included.
-  Preload a skill to keep it for the whole run.
+* Known limit: an old tool result may be shortened in the stored history by `limits.max_history_tokens`, a loaded skill included,
+  and a compaction removes the turns that loaded it (the marker keeps the **names** of the skills loaded earlier, not their
+  text: load one again to read it). Preload a skill to keep it for the whole run.
 
 ```mermaid
 sequenceDiagram

@@ -173,6 +173,12 @@ flowchart LR
     ProtocolError -->|"TooLarge, UnexpectedKind, Malformed"| Corrupt
 ```
 
+`ContextLength` is `Invalid`, as the same request never succeeds, and it is the one `Invalid` the agent loop
+retries: `ModelError::is_context_overflow()` is true for it, so the loop compacts its history once and asks again
+([Compaction](../architecture.md#compaction-a-long-history-is-summarised-once)). A second rejection of the same
+turn fails the run, naming both. Only the two shapes `adam-model-openai` maps (the code `context_length_exceeded`
+and "maximum context length") are recognised.
+
 ## What each class decides
 
 ```mermaid
