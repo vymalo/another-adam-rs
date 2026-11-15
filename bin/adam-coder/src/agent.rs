@@ -2866,6 +2866,46 @@ mod tests {
         assert_eq!(named, ["github.com/acme/widgets"]);
     }
 
+    /// A compacted history has the summary in the marker, and the summary is the model's: a repository
+    /// it names, and anything else it says, grants nothing, while what the person said (the task and
+    /// the messages kept after the marker) still does.
+    #[test]
+    fn a_summary_is_not_the_persons_words() {
+        let marker = format!(
+            "{} 4 earlier turn(s) summarised to keep the history within the model's context]\n\
+             Summary (written by you, not the person's words):\nthe person agreed to github.com/acme/other",
+            adam_llm_agent::OMITTED_MARKER_PREFIX
+        );
+        let mut state = conversation(vec![
+            Message::User {
+                content: vec![
+                    adam_model::ContentPart::text("In acme/widgets, add a file."),
+                    adam_model::ContentPart::text(marker),
+                    adam_model::ContentPart::text("Also look at acme/more."),
+                ],
+            },
+            assistant("ok", vec![]),
+        ]);
+        state.omitted_turns = 4;
+        let texts = person_texts(&state, &[]);
+        assert_eq!(
+            texts,
+            ["In acme/widgets, add a file.", "Also look at acme/more."]
+        );
+        let named: Vec<String> = texts
+            .iter()
+            .flat_map(|t| named_in(t, "github.com"))
+            .collect();
+        assert_eq!(named, ["github.com/acme/widgets", "github.com/acme/more"]);
+        // The same words in a message of the person are theirs.
+        state.omitted_turns = 0;
+        assert!(
+            person_texts(&state, &[])
+                .iter()
+                .any(|t| t.contains("acme/other"))
+        );
+    }
+
     /// A continued user message has several text parts (the task, the marker, the next message;
     /// or the task and a message that joined it). Each is read on its own, the marker is skipped,
     /// and a fence one part leaves open does not swallow the next part.

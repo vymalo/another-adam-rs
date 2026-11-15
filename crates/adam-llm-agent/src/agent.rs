@@ -13,14 +13,18 @@ use adam_model::{
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, ChildStatus, Ctx,
     Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE, RUN_FINISHED_KIND, RunEvent,
-    SESSION_CLOSE_KIND, SandboxUsage, SessionState, SessionSummary, StepState, Transition,
-    UsageEvent, UsageTotals, child_run_id,
+    SESSION_CLOSE_KIND, SandboxUsage, SessionState, SessionSummary, StepEvent, StepIcon, StepKind,
+    StepState, Transition, UsageEvent, UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::compaction::{
+    self, COMPACTION_TURN, CompactionReason, MAX_COMPACTIONS, OVERFLOW_OUTPUT_CHARS, PromptSize,
+    RETRY_AFTER_TURNS, SUMMARY_OUTPUT_TOKENS,
+};
 use crate::conversation::{
     ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
     PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_root_run,
@@ -34,11 +38,93 @@ use crate::sessions::{SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_STA
 
 /// Whether the history holds a call that started a session or sent to one.
 fn has_started_session(state: &Conversation) -> bool {
-    state.messages.iter().any(|m| {
-        m.tool_calls()
-            .iter()
-            .any(|c| c.name == SUBAGENT_START || c.name == SUBAGENT_SEND)
-    })
+    // A compaction that cut the call away says so: the run still waits for, and cancels, the
+    // sessions it started.
+    state.compactions.iter().any(|c| c.sessions)
+        || state.messages.iter().any(|m| {
+            m.tool_calls()
+                .iter()
+                .any(|c| c.name == SUBAGENT_START || c.name == SUBAGENT_SEND)
+        })
+}
+
+/// What the tool sources add to a request: their tools (refined, minus what a source holds back) and
+/// their instructions. The one place both the model turn and the summary request read them, so the
+/// head of the two is the same bytes. Returns what the sources said of the tools they offered.
+async fn apply_sources(
+    sources: &[DynToolSource],
+    source_ctx: Option<&SourceCtx>,
+    request: &mut ModelRequest,
+) -> Vec<ToolNote> {
+    let Some(source_ctx) = source_ctx else {
+        return Vec::new();
+    };
+    let (more, notes) = offered(sources, source_ctx, &request.tools).await;
+    request.tools.extend(more);
+    refined(sources, source_ctx, &mut request.tools).await;
+    // What a source holds back is not shown, the agent's own tools included.
+    let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+    let held = withheld(sources, source_ctx, &names).await;
+    if !held.is_empty() {
+        request
+            .tools
+            .retain(|t| !held.iter().any(|h| h.tool == t.name));
+    }
+    // What the sources add to the instructions (the agents a person mentioned).
+    if let Some(more) = instructed(sources, source_ctx).await {
+        request.system = Some(match request.system.take() {
+            Some(own) if !own.trim().is_empty() => format!("{own}\n\n{more}"),
+            _ => more,
+        });
+    }
+    notes
+}
+
+/// The summary call of a compaction as the journal records it: the summary (none when the model said
+/// nothing), the cut it was made for, and the call's tokens and id for its usage report.
+#[derive(Debug, Serialize, Deserialize)]
+struct Summarised {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    cut: usize,
+    usage: adam_model::Usage,
+    call: String,
+}
+
+/// The id of the summary call `n` of `run` in its usage report: made inside the journaled step, like
+/// [`call_id`], and apart from every model turn's.
+fn compaction_call_id(run: RunId, n: usize) -> String {
+    let mut suffix = uuid::Uuid::new_v4().simple().to_string();
+    suffix.truncate(8);
+    format!("{run}-k{n}-{suffix}")
+}
+
+/// `messages` with every tool output over [`OVERFLOW_OUTPUT_CHARS`] shortened, for the summary
+/// request that follows a rejection: the history was too long for the provider once already.
+fn shortened_for_overflow(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| match m {
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+            } => {
+                let len = content.chars().count();
+                let short = (len > OVERFLOW_OUTPUT_CHARS)
+                    .then(|| {
+                        crate::history::shorten_output(content, len - OVERFLOW_OUTPUT_CHARS, None)
+                    })
+                    .flatten();
+                Message::Tool {
+                    call_id: call_id.clone(),
+                    content: short.unwrap_or_else(|| content.clone()),
+                    is_error: *is_error,
+                }
+            }
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// Whether a call of `tool` acts on a session (an effect outside the run's own state).
@@ -959,29 +1045,7 @@ impl LlmAgent {
                 // The sources are read here, inside the step, so that a replay of a turn whose model
                 // call is recorded does not read them again: only the answer is journaled, not the
                 // tools it was given.
-                let mut notes = Vec::new();
-                if let Some(source_ctx) = &source_ctx {
-                    let (more, said) = offered(&sources, source_ctx, &request.tools).await;
-                    request.tools.extend(more);
-                    notes = said;
-                    refined(&sources, source_ctx, &mut request.tools).await;
-                    // What a source holds back is not shown, the agent's own tools included.
-                    let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
-                    let held = withheld(&sources, source_ctx, &names).await;
-                    if !held.is_empty() {
-                        request
-                            .tools
-                            .retain(|t| !held.iter().any(|h| h.tool == t.name));
-                    }
-                    // What the sources add to the instructions (the agents a person mentioned): read
-                    // here with the tools, so a replay of a recorded turn reads nothing.
-                    if let Some(more) = instructed(&sources, source_ctx).await {
-                        request.system = Some(match request.system.take() {
-                            Some(own) if !own.trim().is_empty() => format!("{own}\n\n{more}"),
-                            _ => more,
-                        });
-                    }
-                }
+                let notes = apply_sources(&sources, source_ctx.as_ref(), &mut request).await;
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
@@ -1039,6 +1103,7 @@ impl LlmAgent {
             return Ok(Flow::Fail(CANCELLED.into()));
         }
         let answered_stale: bool;
+        let seen_at: usize;
         let (response, stream) = match recorded {
             Ok(Recorded {
                 response,
@@ -1047,6 +1112,7 @@ impl LlmAgent {
                 seen,
                 call: _,
             }) => {
+                seen_at = seen.unwrap_or(state.messages.len());
                 // The calls this turn asks for are the ones its listing described.
                 state.source_notes = notes;
                 // An answer recorded before a message that this transition read did not read it.
@@ -1078,6 +1144,11 @@ impl LlmAgent {
         state
             .usage_totals
             .add(self.model.provider(), &self.model_alias, usage);
+        // What the provider counted of the prompt this call sent: the next estimate starts from it.
+        state.last_prompt = (usage.input_tokens > 0).then_some(PromptSize {
+            input_tokens: usage.input_tokens,
+            messages: seen_at,
+        });
         if !matches!(message, Message::Assistant { .. }) {
             return Ok(Flow::Fail(
                 "model call failed: the response is not an assistant message".into(),
@@ -1217,6 +1288,202 @@ impl LlmAgent {
         state.tool_calls += requested;
         state.pending_calls = calls;
         Ok(Flow::Next)
+    }
+
+    /// The budget of the history, in tokens (see [`compaction::budget`]).
+    fn history_budget(&self) -> Option<usize> {
+        compaction::budget(
+            self.model.context_window(&self.model_alias),
+            self.limits.max_output_tokens,
+            self.limits.max_history_tokens,
+        )
+    }
+
+    /// Characters a request holds besides the history: the instructions and the tools.
+    fn fixed_chars(&self) -> usize {
+        self.instructions
+            .as_deref()
+            .map_or(0, |s| s.chars().count())
+            + serde_json::to_string(&self.specs).map_or(0, |s| s.chars().count())
+    }
+
+    /// The estimate of the next request, in tokens.
+    fn estimated_tokens(&self, state: &Conversation) -> usize {
+        compaction::estimate(
+            &state.messages,
+            state.last_prompt.as_ref(),
+            self.fixed_chars(),
+        )
+    }
+
+    /// Where a compaction of `state` would cut, if it could: fewer than two turns to drop, or
+    /// [`MAX_COMPACTIONS`] already made, is none (the history is shortened instead).
+    fn cut_for(&self, state: &Conversation, reason: CompactionReason) -> Option<compaction::Cut> {
+        if state.compactions.len() >= MAX_COMPACTIONS {
+            return None;
+        }
+        let estimate = self.estimated_tokens(state);
+        let limit = match (reason, self.history_budget()) {
+            (CompactionReason::Budget, budget) => budget.unwrap_or(estimate),
+            (CompactionReason::Overflow, budget) => budget.unwrap_or(estimate).min(estimate),
+        };
+        compaction::cut_point(&state.messages, limit)
+    }
+
+    /// Whether the committed state is due for a compaction: the estimate has reached the budget, and
+    /// nothing says otherwise (a compaction at this very turn, a summary that failed a few turns ago).
+    fn compaction_due(&self, state: &Conversation) -> bool {
+        let Some(budget) = self.history_budget() else {
+            return false;
+        };
+        state
+            .compactions
+            .last()
+            .is_none_or(|c| c.turn != state.turns)
+            && state
+                .compact_failed
+                .is_none_or(|at| state.turns >= at.saturating_add(RETRY_AFTER_TURNS))
+            && self.estimated_tokens(state) >= budget
+            && self.cut_for(state, CompactionReason::Budget).is_some()
+    }
+
+    /// Compact the history of the committed `state` when it is due (or when a rejected prompt asked
+    /// for it), and say whether it did: the transition then ends there, and the model is asked in the
+    /// next one. Only with no call and no wait open. A summary that cannot be made leaves the history
+    /// to be shortened (`false`), except after a rejection, which drops the turns without one.
+    async fn compact_if_due(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        output_id_of: &(dyn Fn(&str) -> Option<String> + Sync),
+    ) -> Result<bool, AgentError> {
+        let reason = match state.compact_next.take() {
+            Some(reason) => reason,
+            None => {
+                if !state.pending_calls.is_empty()
+                    || state.pending_wait.is_some()
+                    || state.limit.is_some()
+                    || !self.compaction_due(state)
+                {
+                    return Ok(false);
+                }
+                CompactionReason::Budget
+            }
+        };
+        let Some(cut) = self.cut_for(state, reason) else {
+            return Ok(false);
+        };
+        let n = state.compactions.len();
+        let before_tokens = self.estimated_tokens(state);
+        let id = format!("compact:{n}");
+        let step = |state_of: StepState| {
+            StepEvent::new(&id, StepKind::Tool, "Summarise the conversation", state_of)
+                .with_icon(StepIcon::Think)
+        };
+        ctx.emit(RunEvent::Step(step(StepState::Running))).await;
+
+        let mut request = ModelRequest::new(self.model_alias.clone());
+        request.system = self.instructions.clone();
+        request.messages = match reason {
+            CompactionReason::Budget => state.messages.clone(),
+            CompactionReason::Overflow => shortened_for_overflow(&state.messages[..cut.index]),
+        };
+        request.messages.push(Message::user_text(COMPACTION_TURN));
+        request.tools = self.specs.clone();
+        request.tool_choice = ToolChoice::None;
+        request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
+        request.max_output_tokens = Some(SUMMARY_OUTPUT_TOKENS);
+        let model = self.model.clone();
+        let sources = self.sources.clone();
+        let source_ctx = (!sources.is_empty()).then(|| {
+            SourceCtx::new(
+                ctx.run_id(),
+                state.root_run.unwrap_or_else(|| ctx.run_id()),
+                ctx.conversation_id().map(str::to_owned),
+                Arc::new(state.context.clone()),
+            )
+        });
+        let run = ctx.run_id();
+        let cancel = ctx.cancel_token();
+        let at = cut.index;
+        let recorded: Result<Summarised, ModelFailure> = ctx
+            .step(&id, move || async move {
+                apply_sources(&sources, source_ctx.as_ref(), &mut request).await;
+                let answer = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
+                    answer = model.complete(request) => answer.map_err(ModelFailure::from)?,
+                };
+                let text = answer.message.text();
+                Ok(Summarised {
+                    summary: (!text.trim().is_empty()).then_some(text),
+                    cut: at,
+                    usage: answer.usage.accounted(),
+                    call: compaction_call_id(run, n),
+                })
+            })
+            .await?;
+        let (summary, cut_at, rejected) = match recorded {
+            Ok(done) => {
+                // The call was made and counts, whatever its summary is worth.
+                self.report_usage(ctx, state, done.call.clone(), done.usage)
+                    .await;
+                state.usage = state.usage.saturating_add(done.usage);
+                state
+                    .usage_totals
+                    .add(self.model.provider(), &self.model_alias, done.usage);
+                (done.summary, done.cut, state.overflow_message.take())
+            }
+            Err(f) if f.retryable => {
+                let error = AgentError::transient(format!("summary call failed: {}", f.message));
+                return Err(match f.retry_after_ms {
+                    Some(ms) => error.with_retry_after(Duration::from_millis(ms)),
+                    None => error,
+                });
+            }
+            // The summary could not be made. A prompt that was rejected still has to shrink, so its
+            // turns go without one; a history that only neared its budget is shortened instead, and
+            // this is not tried again for a few turns.
+            Err(_) if reason == CompactionReason::Overflow => {
+                (None, cut.index, state.overflow_message.take())
+            }
+            Err(f) => {
+                tracing::warn!(run = %run, "the summary call failed: the history is shortened instead");
+                state.compact_failed = Some(state.turns);
+                ctx.emit(RunEvent::Step(step(StepState::Failed).with_detail(
+                    format!(
+                        "no summary could be made ({}); the history is shortened instead",
+                        f.message
+                    ),
+                )))
+                .await;
+                return Ok(false);
+            }
+        };
+        // The recorded cut is the one to apply; it must still be a turn start of this history.
+        let valid = cut_at >= 1
+            && cut_at < state.messages.len()
+            && matches!(state.messages[cut_at], Message::Assistant { .. });
+        if !valid {
+            state.compact_failed = Some(state.turns);
+            return Ok(false);
+        }
+        compaction::apply(
+            state,
+            cut_at,
+            summary.as_deref(),
+            reason,
+            rejected,
+            output_id_of,
+        );
+        let dropped = state.compactions.last().map_or(0, |c| c.dropped_turns);
+        ctx.emit(RunEvent::Step(step(StepState::Completed).with_detail(
+            format!(
+                "Summarised {dropped} earlier turns (the history was about {before_tokens} tokens)"
+            ),
+        )))
+        .await;
+        Ok(true)
     }
 
     /// Report a completed model call of this run (`usage/v1`): as an event of the **root** run, the
@@ -2856,12 +3123,18 @@ impl Agent for LlmAgent {
             };
             Some(crate::kept::output_id(&root.to_string(), &key))
         };
+        // A history that has reached the budget is summarised first, at a journaled step of its own;
+        // the model is asked in the next transition, from the new history.
+        if self.compact_if_due(ctx, &mut state, &output_id_of).await? {
+            return Ok(Transition::Continue(state));
+        }
         if record_shortenings(
             &mut state.messages,
             self.limits.max_history_tokens,
             &output_id_of,
         ) {
             state.shortenings.push(state.turns);
+            state.last_prompt = None;
         }
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx
             .take_inbox()

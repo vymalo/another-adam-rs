@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Conversation, Limits, LlmAgent, LlmAgentBuilder, MAX_SOURCE_TOOLS, ReadOutput, Tool, ToolCtx,
-    ToolError, ToolOutput, ToolSource, user_message,
+    COMPACTION_TURN, Conversation, Limits, LlmAgent, LlmAgentBuilder, MAX_SOURCE_TOOLS, ReadOutput,
+    Tool, ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
 };
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
@@ -103,6 +103,19 @@ struct Arm {
     run: Mutex<Option<RunId>>,
     on: Mutex<Option<(usize, bool)>>,
     calls: AtomicUsize,
+    /// Answer a summary request with a refusal that no script has to know about: the history is then
+    /// shortened, as it was before compaction existed (the tests of the shortening rely on it).
+    refuse_summaries: bool,
+}
+
+/// Whether `request` is the summary request of a compaction: no tool may be called, and it ends with
+/// the instruction.
+fn is_summary(request: &ModelRequest) -> bool {
+    request.tool_choice == ToolChoice::None
+        && request
+            .messages
+            .last()
+            .is_some_and(|m| m.text().ends_with(COMPACTION_TURN))
 }
 
 impl Arm {
@@ -127,6 +140,9 @@ impl Arm {
 #[async_trait]
 impl ModelClient for Arm {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        if self.refuse_summaries && is_summary(&req) {
+            return Err(ModelError::invalid_request("this test makes no summaries"));
+        }
         let answer = self.inner.complete(req).await;
         self.armed();
         answer
@@ -136,6 +152,9 @@ impl ModelClient for Arm {
         &self,
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        if self.refuse_summaries && is_summary(&req) {
+            return Err(ModelError::invalid_request("this test makes no summaries"));
+        }
         let answer = self.inner.stream(req).await;
         self.armed();
         answer
@@ -155,6 +174,22 @@ impl Rig {
         max_history_tokens: u32,
         configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
     ) -> Self {
+        Self::build(max_history_tokens, false, configure)
+    }
+
+    /// A rig whose model summarises: the scripted responses include the summaries.
+    fn summarising(
+        max_history_tokens: u32,
+        configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
+    ) -> Self {
+        Self::build(max_history_tokens, true, configure)
+    }
+
+    fn build(
+        max_history_tokens: u32,
+        summaries: bool,
+        configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
+    ) -> Self {
         let mock = Arc::new(MockModel::new());
         let store = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
         let arm = Arc::new(Arm {
@@ -163,6 +198,7 @@ impl Rig {
             run: Mutex::new(None),
             on: Mutex::new(None),
             calls: AtomicUsize::new(0),
+            refuse_summaries: !summaries,
         });
         let model: DynModel = arm.clone();
         let agent = configure(
@@ -286,7 +322,10 @@ fn open_messages(request: &ModelRequest) -> String {
 }
 
 /// The requests that do not start with the one before: their indices (the turn each was made at).
+/// A summary request (a compaction's) is no turn and has its own rule (`the_summary_request_...`); it
+/// is left out here, so the index of a request is the number of model turns made before it.
 fn breaks(requests: &[ModelRequest]) -> Vec<u32> {
+    let requests: Vec<&ModelRequest> = requests.iter().filter(|r| !is_summary(r)).collect();
     let mut found = Vec::new();
     for (n, pair) in requests.windows(2).enumerate() {
         let (a, b) = (&pair[0], &pair[1]);
@@ -844,4 +883,66 @@ async fn the_tools_that_survive_the_cap_do_not_depend_on_the_listing_order() {
     for request in &requests {
         assert_eq!(names_of(request), want);
     }
+}
+
+/// Four results of 1,200 letters in a budget of 1,200 tokens (4,800 characters): the history is
+/// under it at the third request and over it at the fifth, where the run is compacted, and the
+/// request that follows is the first of a new prefix.
+#[tokio::test]
+async fn a_compaction_is_the_only_break_besides_shortenings() {
+    let rig = Rig::summarising(SIX_TURNS_BUDGET, |b| b);
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_text("SUMMARY: the task and four results")
+        .push_tool_calls(vec![big("c4", 100)])
+        .push_tool_calls(vec![big("c5", 100)])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+
+    assert_eq!(state.compactions.len(), 1, "{:?}", state.compactions);
+    let at = state.compactions[0].turn;
+    let mut expected: Vec<u32> = state.shortenings.clone();
+    expected.push(at);
+    expected.sort_unstable();
+    assert_eq!(
+        breaks(&requests),
+        expected,
+        "the breaks are the recorded ones"
+    );
+
+    // The summary request is the request before it, then the instruction: served from the cache.
+    let summaries: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| is_summary(r))
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    let summary = &requests[summaries[0]];
+    let before = &requests[summaries[0] - 1];
+    assert_eq!(summary.system, before.system);
+    assert_eq!(summary.tools, before.tools);
+    assert!(open_messages(summary).starts_with(&open_messages(before)));
+    assert_eq!(summary.max_output_tokens, Some(4096));
+
+    // Every request after the compaction extends the first one after it.
+    let turns: Vec<&ModelRequest> = requests.iter().filter(|r| !is_summary(r)).collect();
+    let first_after = turns[at as usize];
+    for later in &turns[at as usize..] {
+        assert!(open_messages(later).starts_with(&open_messages(first_after)));
+    }
+    // The task stays first, and the marker with the summary is its second part.
+    let Message::User { content } = &first_after.messages[0] else {
+        panic!("the first message is the person's");
+    };
+    assert_eq!(content[0].as_text(), "go");
+    assert!(
+        content[1].as_text().contains("SUMMARY: the task"),
+        "{content:?}"
+    );
+    assert!(state.is_omission_marker(0, 1));
 }

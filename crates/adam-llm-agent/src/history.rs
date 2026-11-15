@@ -140,7 +140,7 @@ pub(crate) fn shorten_output(content: &str, excess: usize, id: Option<&str>) -> 
 }
 
 /// Characters a message contributes to the estimate.
-fn message_chars(m: &Message) -> usize {
+pub(crate) fn message_chars(m: &Message) -> usize {
     match m {
         Message::User { content } => content.iter().map(|p| p.as_text().chars().count()).sum(),
         Message::Assistant {

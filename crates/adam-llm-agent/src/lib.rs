@@ -136,6 +136,7 @@
 #[path = "private.rs"]
 pub mod __private;
 mod agent;
+mod compaction;
 mod conversation;
 mod fn_tool;
 mod history;
@@ -157,6 +158,7 @@ pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, Step
 pub use agent::{
     BuildError, CLOSING_TURN, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
 };
+pub use compaction::{COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize};
 pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit, LimitKind,
     MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MESSAGE_KIND,

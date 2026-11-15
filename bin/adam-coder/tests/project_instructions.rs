@@ -312,13 +312,55 @@ async fn the_prefix_holds_across_prepare_and_nested_reads() {
     assert_eq!(notes.instructions_shown["remote/sub/deep"], "c3");
 }
 
-/// A coder whose history budget is `max_history_tokens` (the shipped files with one line changed).
+/// A model that refuses the summary request of a compaction: the history is then shortened, as the
+/// tests that were written before compaction existed expect (`coder_with_history`).
+struct NoSummaries(Arc<MockModel>);
+
+fn is_summary(request: &ModelRequest) -> bool {
+    request.tool_choice == adam_model::ToolChoice::None
+        && request
+            .messages
+            .last()
+            .is_some_and(|m| m.text().ends_with(adam_llm_agent::COMPACTION_TURN))
+}
+
+#[async_trait]
+impl ModelClient for NoSummaries {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        if is_summary(&req) {
+            return Err(ModelError::invalid_request("this test makes no summaries"));
+        }
+        self.0.complete(req).await
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        if is_summary(&req) {
+            return Err(ModelError::invalid_request("this test makes no summaries"));
+        }
+        self.0.stream(req).await
+    }
+}
+
+/// A coder whose history budget is `max_history_tokens` (the shipped files with one line changed),
+/// and whose model makes no summary: a history over the budget is shortened.
 fn coder_with_history(
     fx: &Fixture,
     mock: &Arc<MockModel>,
     store: DynStore,
     max_history_tokens: u32,
 ) -> Coder {
+    history_coder(
+        fx,
+        Arc::new(NoSummaries(mock.clone())),
+        store,
+        max_history_tokens,
+    )
+}
+
+fn history_coder(fx: &Fixture, model: DynModel, store: DynStore, max_history_tokens: u32) -> Coder {
     let folder = common::plain_folder();
     common::edit_instructions(&folder, |text| {
         assert!(text.contains("max_history_tokens: 100000"));
@@ -328,7 +370,6 @@ fn coder_with_history(
         )
     });
     let files = adam_coder::AgentFiles::load(Some(folder.path())).expect("the folder loads");
-    let model: DynModel = mock.clone();
     let def = files
         .def()
         .expect("a definition")
