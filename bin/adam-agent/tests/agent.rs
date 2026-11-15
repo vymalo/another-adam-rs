@@ -1328,7 +1328,12 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
             "plan_work",
             "plan_check",
             "plan_add",
-            "reviewer"
+            "reviewer",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
         ]
     );
     // The child: its own prompt, and no tool (a subagent gets none it does not list).

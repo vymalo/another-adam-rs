@@ -3,7 +3,7 @@
 Status: **Accepted** (2026-11-14), the owner's decision: *"we need to add the capability that opencode has to create child
 session, and exchange messages with it. At creation, there should be a button to auto-close after work is done, so that the
 child session can further be reused."* The six defaults under [What was put to the owner](#what-was-put-to-the-owner) are
-recommendations the owner was told the work proceeds with. Only slice 1 is built (below). Reverses "one-shot child runs" and "no
+recommendations the owner was told the work proceeds with. Slices 1 and 2 are built (below). Reverses "one-shot child runs" and "no
 resume" of [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md); amends
 [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md), [ADR 0003](0003-a-new-task-continues-the-task-it-references.md),
 [ADR 0016](0016-a-message-sent-to-a-working-task-is-steered-into-it.md) and
@@ -23,7 +23,37 @@ run counts as a session's only when its round 1 exists with a parent; `start_chi
 not a round of the session and a round of another agent (`InvalidSession`), but an open `prior` of the session is
 `ConversationBusy`, which a caller tells apart with `RuntimeError::is_busy()`; the listing says how the latest round
 ended (`Done`, `Failed`, `Cancelled`); until slice 2 a report is not read by any agent (`LlmAgent` drops it, and
-`Ctx::arrived` does not count it).
+`Ctx::arrived` does not count it). Slice 2 breaks the first of those deviations on purpose: `SessionState::Closed` exists now.
+
+*Built 2026-11-14:* slice 2 (the five tools): `SessionTools` in `crates/adam-llm-agent` (`sessions.rs`), given to a root with local
+subagents by `adam-assembly`; `ToolError::AwaitSession` and `PendingWait::Session`; the session header (`Conversation::session`, a
+`SessionHeader` the runtime reads from the round's state); `Conversation::rounds_started`; the turn-end wait. Departures from the
+decisions above, each for a reason found while building:
+
+* **`closed` is derived** from the latest round (its header, a close request in its inbox, or an ended round of a session
+  that is not kept open), so a round the runtime cancels or fails (which no agent commits) closes a not-kept-open session
+  too. Closing an idle session is a round that calls no model; closing a working one delivers `adam.session.close`, which the
+  round reads and which is not counted as unread input. `SessionHeader` has a `closing` field the ADR does not list.
+* **`PendingWait::Session` is looked at through `Tool::poll_remote`**, the session id as the `task`, in the journaled step
+  `poll:<call id>`: no new `Tool` method, so wrappers that forward `poll_remote` need no change.
+* **The report is text, not a JSON object**: a header line, `report: done|failed`, the report as a numbered page, and the
+  convention's final line. The `background` member of the report in the table is not built (it belongs to the reports of
+  slice 3). `subagent_read` with `wait` returns the first page.
+* **The turn-end wait** appends a `subagent_read` call (id `wait_<turn>`) to the model's own message and waits for one session at
+  a time, in the order the listing gives; it is skipped when the history has no `subagent_start` or `subagent_send` call, so a run
+  that never uses sessions journals what it always did.
+* **Two bounds of slice 4 are constants here** because a missing one is unsafe: 16 open sessions per conversation and 20 rounds
+  per session (a close counts as a round). `idle_ttl`, `max_working` and the settings are slice 4.
+* **`subagent_start` lists remote subagents in the enum** and refuses them in words (slice 5 builds them); a session tool is given
+  only to a root with at least one local subagent.
+* **The coder's tier**: the five are `plan` tier, like the helpers they run.
+* **Also departures:** results are text, not rows (`subagent_list`, `subagent_close` too); `BoundDef::scrub` exists so the coder's
+  redactor reaches the tools the assembly makes; every round a run started or sent to is counted once in its totals (`Conversation::rounds_started`, a journaled step `usage:<call id>`),
+  when a report is read and at the latest when the run ends, read or not (a store error is retried); the open sessions are still found by scanning the conversation's rounds (known limit, 5,000 rounds of one subagent);
+  `SessionHeader` has `closing` and a round number `round` (rounds are ordered by it, not by timestamp); a closing round has no report:
+  a read of a closed session gives the last round that worked; a close request survives `Runtime::cancel`, and a round whose state
+  cannot be read closes its session; a call that acts on a session is committed before it runs; a run that ends cancels rounds it
+  could not wait for; at most 4 rounds work at once (`max_working` as a constant); retention must outlast a session's idle life.
 
 ## Context
 
@@ -76,7 +106,7 @@ idle; a later message to that id continues it with its context; child sessions r
      (`Ctx::child_status`) and the loop appends it as a `subagent_read` call with its result, behind any result it owes. It is
      data, never the person's words, and it is only appended.
    * A journaled step `children:<turn>` reads every working round before a model call, so a lost notice costs one turn at most.
-     `Conversation::reported` (new) maps a session to the last round reported, so a notice delivered twice matches nothing.
+     a notice delivered twice matches nothing (the usage of a round is counted from `Conversation::rounds_started`).
    * `subagent_read { wait: true }` parks with `PendingWait::Session` (new) and the poll timer, as `PendingWait::Run` does.
    * **A parent's turn does not end while a round it started in that task still works**: it parks on those sessions. A report
      that arrives during the final model call reopens the turn, as a steered message does.

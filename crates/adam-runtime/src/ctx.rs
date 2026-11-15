@@ -448,7 +448,11 @@ impl Ctx {
     /// A handle for starting children of this run on the runtime that steps it: owned and cloneable,
     /// so it can be moved into a [`Ctx::step`] closure (see [`ChildStarter`]).
     pub fn child_starter(&self) -> ChildStarter {
-        ChildStarter::new(self.runtime.clone(), self.run)
+        ChildStarter::new(
+            self.runtime.clone(),
+            self.run,
+            self.conversation_id.as_deref(),
+        )
     }
 
     /// A handle on this transition's cancellation signal, cloneable and

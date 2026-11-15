@@ -1044,7 +1044,19 @@ fn a_remote_subagent_is_a_tool_in_the_order_of_the_manifest_beside_local_ones() 
         .model(Arc::new(MockModel::new()), "default")
         .unwrap();
     // Own tools first, then the subagents by file name: `audit` (local) before `billing` (remote).
-    assert_eq!(assembly.info()[0].tools, ["read", "audit", "billing"]);
+    assert_eq!(
+        assembly.info()[0].tools,
+        [
+            "read",
+            "audit",
+            "billing",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     // The remote is not an agent of the assembly: nothing to register on the runtime.
     assert_eq!(assembly.agents().len(), 2);
 }
@@ -1106,7 +1118,18 @@ async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory(
                 .tools
                 .clone()
         };
-        assert_eq!(tools_of(&root), ["researcher"], "{backend}");
+        assert_eq!(
+            tools_of(&root),
+            [
+                "researcher",
+                "subagent_start",
+                "subagent_send",
+                "subagent_read",
+                "subagent_close",
+                "subagent_list"
+            ],
+            "{backend}"
+        );
         assert_eq!(
             tools_of(&format!("{root}/researcher")),
             ["browser"],

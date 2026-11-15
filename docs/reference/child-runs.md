@@ -182,12 +182,13 @@ the next step read `take_inbox()` for messages of kind `adam.run.finished` (`Chi
 already in the inbox when a step starts is not "arrived during the step", so an agent that parks without
 reading it sleeps until its timer.
 
-## Sessions (ADR 0045, slice 1)
+## Sessions (ADR 0045, slices 1 and 2)
 
 [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) lets a subagent run in the
-background as a session that is sent more messages. Only the runtime half exists so far (`crates/adam-runtime`).
+background as a session that is sent more messages. The runtime half (slice 1) is in `crates/adam-runtime`; the five tools
+(slice 2) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to a root with local subagents by `adam-assembly`.
 
-**What exists.**
+**What the runtime has.**
 
 * `Runtime::start_child_continuing` starts a child run **with a conversation id**: the parent's id (with `%` and
   `/` escaped, so a client's context id cannot spell another session's), then `/s/` and the session id
@@ -200,23 +201,100 @@ background as a session that is sent more messages. Only the runtime half exists
   that is not a session's or is over 1024 bytes. A repeat with the same ids answers `false`; a round purged
   before its repeat is not recognised (retention must outlast retries).
 * A child with a conversation reports its end with **`adam.child.reported`** instead of `adam.run.finished`.
-  Same id, same payload, same standing: a wake-up, and the parent reads the round with `Ctx::child_status`, so
-  the lost-notice cases above hold for a round. A child without a conversation is unchanged.
-  **No agent reads a report yet.** `LlmAgent` drops it instead of making it a person's message, and `Ctx::arrived`
-  and the reopen-on-arrival rule do not count it, as they do not count a finished notice, so a report that lands
-  while a run finishes does not reopen it. Slices 2 and 3 make a report reopen a turn on purpose (decision 4).
-* `Runtime::list_sessions` lists a parent's sessions over `list_runs` with the conversation prefix: the latest
-  round of each with its state (`Working` or `Idle`) and how it ended (`Done`, `Failed`, `Cancelled`). A run counts
-  only if the session's round 1 exists with a parent, so a top-level run in a session-shaped conversation is not
-  listed, and a parent never sees another's (the prefix ends in `/s/`, so `ctx1` does not match `ctx10`).
-
+  Same id, same payload, same standing: a wake-up, and the parent reads the round with `Ctx::child_status` or
+  `ChildStarter::session`, so the lost-notice cases above hold for a round. A child without a conversation is unchanged.
+  The loop never shows the notice to the model, and `Ctx::arrived` and the reopen-on-arrival rule do not count it.
+* `Runtime::list_sessions` lists a parent's sessions over `list_runs` with the conversation prefix, `Runtime::session_view`
+  reads one by its id. Both read **the latest round** and its `SessionHeader` (`session` in the round's agent state): working,
+  idle or closed, and how it ended. A run counts only if the session's round 1 exists with a parent, so a top-level run in a
+  session-shaped conversation is not listed, and a parent never sees another's.
 * A round takes the same time limit as any child (`start_child_continuing_within`, per round), and a cancelled or failed
   parent fails the round that is open (`cancelled: the parent run ended`) while the session stays usable: a later parent
-  run continues it from that round (`a_cancelled_parent_fails_the_open_round_and_the_session_continues`).
+  run continues it from that round.
 
-**What does not exist yet.** The tools (`subagent_start` and the others), `Conversation::session`, closing (so no
-`Closed` state), a reader of `adam.child.reported` in `LlmAgent` or the coder, `PendingWait::Session`, remote
-sessions and the A2A extension.
+**What the tools do.** `subagent_start` creates round 1 and returns at once. `subagent_send` steers a working round
+(`Runtime::deliver`, the message id is the call id, so a repeat is read once) or starts the next round from the latest one.
+`subagent_read` reads the latest round: working, or its report as a numbered page; with `wait: true` and a working round it
+returns `ToolError::AwaitSession` and the parent parks on a `PendingWait::Session`. `subagent_close` asks a working round to be
+the last (`SESSION_CLOSE_KIND` in its inbox: it finishes, then the session takes no more) or, with `cancel`, cancels it; an idle
+session is closed by a round that calls no model (`header.closing`) and ends with the last answer again.
+`subagent_list` pages the sessions of the conversation. The sessions are reached by **the conversation**, not by the task: a
+later task finds the sessions an earlier one started, and no run reaches another conversation's (an id that is not one of
+this conversation's is "no session"). At most 16 sessions that are not closed and 20 rounds per session (decision 5's
+`max_open` and `max_rounds` as constants for now).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as model
+    participant P as parent run<br/>LlmAgent
+    participant RT as Runtime<br/>ChildStarter
+    participant DB as Store
+    participant C as round run<br/>LlmAgent
+    M->>P: call subagent_start(agent, description, prompt, keep_open)
+    P->>RT: tool:c1 start_round(session = child_run_id(parent, c1))
+    RT->>DB: create_run, parent_id = parent, the session's conversation
+    P-->>M: {session, state: working}, the parent keeps working
+    M->>P: call subagent_read(session, wait: true)
+    P->>RT: tool:c2 session(session)
+    RT->>DB: list the rounds, read the latest
+    P->>P: AwaitSession: park with PendingWait::Session and the wait_poll timer
+    C->>DB: the round's final commit
+    RT->>P: adam.child.reported, a wake-up only
+    P->>RT: poll:c2 (a journaled step) session(session)
+    RT->>DB: read the latest round
+    P-->>M: the report as the result of c2, the parent resumes once
+    M->>P: call subagent_send(session, message)
+    P->>RT: tool:c3 start_round(prior = the latest round)
+    M->>P: the model answers while round 2 works
+    P->>P: sessions:3 (a journaled step) finds it, the turn goes on with wait_3, a read that waits
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Working: subagent_start, round 1
+    Working --> Working: subagent_send steers the open round
+    Working --> Idle: the round ended and keep_open
+    Working --> Closed: the round ended and not keep_open
+    Working --> Working: subagent_close without cancel (a request in the inbox; the session takes no more messages)
+    Working --> Closed: the round ended after a close request, or was cancelled after one
+    Working --> Working: the closing round of an idle session runs (header closing, no model, no report)
+    Idle --> Working: subagent_send starts the next round
+    Idle --> Closed: subagent_close starts a round that calls no model
+    Closed --> [*]
+```
+
+A closed session is **never reopened**, and `Closed` is derived, not stored: the latest round's header says `closed`, or a close
+request waits in its inbox, or the round has ended in a session that is not kept open (which is why a round cancelled by its
+parent closes such a session, and leaves a kept-open one idle).
+
+**The turn-end wait.** A turn whose model answers with no tool call while a session this run started still works does not end
+the run: the loop reads the sessions in a journaled step `sessions:<turn>` (skipped when no call of the history started a
+session) and goes on with a call to `subagent_read` that waits, appended to the model's own message. The report reaches the model
+before the run ends. At a limit turn, or at `max_tool_calls`, the run ends and the round goes on without anyone to read it.
+
+### Session interleavings
+
+Each has a test in `crates/adam-llm-agent/tests/sessions.rs` (memory, PostgreSQL and MongoDB, with no fixed sleeps; the report
+is read from the store, the notice is only a wake-up).
+
+| # | What happens | What the design does | Test |
+|---|---|---|---|
+| S1 | The parent's start call is made again (a replay, a retry after the call acted) | The id of the session is derived from the call: a repeat finds the round, so one child ran, and the tool answers what it answered | `a_retried_try_starts_nothing_twice` |
+| S2 | A worker takes over between any two steps | Every read of the store or the clock in the loop is a journaled step (`tool:`, `poll:`, `sessions:`): a copy of the journal gives the same history with no child started and no model asked | `every_step_replays_from_the_journal_to_the_same_history` |
+| S3 | The round's notice is lost | The parent is parked on its timer, and the step that wakes it reads the session through the tool | `a_lost_notice_is_recovered_by_the_timer` |
+| S4 | The notice arrives again, or a forged one arrives | It wakes the parent, which looks, finds the round still working and parks again with no model call; the report is never taken from a notice | `a_duplicate_notice_is_ignored` |
+| S5 | `subagent_read` waits and the round ends | One resume, with the report as the call's result; three reads that do not wait and say "working" are refused on the third | `a_read_with_wait_parks_and_resumes_once_with_the_report`, `polling_is_refused_and_waiting_is_not` |
+| S6 | The model answers while a session works | The run waits for it and calls the model again with the report | `a_start_returns_at_once_and_the_turn_end_waits_for_the_report` |
+| S7 | The parent is cancelled while a session works | The round is failed by the cascade; a kept-open session is idle and a later task of the conversation reads it and sends it a round that continues it | `cancelling_the_parent_leaves_a_kept_open_session_idle` |
+| S8 | A message reaches a working round, or a close request does | The message is read as a steer (the round's next request ends with it); the request makes the round the last and costs no model turn | `a_message_to_a_working_round_is_steered`, `closing_a_working_session_lets_the_round_finish` |
+| S9 | An id that is unknown, malformed or another conversation's, or a remote subagent | An error result in words that say what to do; nothing is started | `a_session_that_is_not_ours_is_refused_in_words`, `a_remote_subagent_is_refused_in_words` |
+
+**Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start is refused.
+
+**Not built yet** (slices 3 to 8): reports that reach the model in the middle of a turn without a read, the limits as settings
+(`idle_ttl`, `max_working`), remote sessions, the `child-sessions/v1` extension, the coder's kept-open helpers, a child that asks
+the person.
 
 ## Remote tasks: the same wait without a message
 

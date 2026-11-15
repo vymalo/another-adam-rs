@@ -17,6 +17,7 @@ use adam_core::{RunId, RunRecord, RunStatus};
 use crate::agent::Inbound;
 use crate::envelope::Envelope;
 use crate::runtime::{Runtime, RuntimeError};
+use crate::session::SESSION_CLOSE_KIND;
 
 /// [`Inbound::kind`] of the message a finished child sends its parent.
 ///
@@ -35,9 +36,10 @@ pub const RUN_FINISHED_KIND: &str = "adam.run.finished";
 pub const CHILD_REPORTED_KIND: &str = "adam.child.reported";
 
 /// How many of the messages in `inbox` after its first `base` a run that is finishing has to read:
-/// all of them but the [`RUN_FINISHED_KIND`] notices and, for now, the [`CHILD_REPORTED_KIND`]
-/// ones. No agent reads a report before ADR 0045 slice 2, so counting it would reopen a run that
-/// has nothing to do with it; slices 2 and 3 make a report reopen a turn on purpose (decision 4). A notice only saves a waiting parent its
+/// all of them but the [`RUN_FINISHED_KIND`] notices, the [`CHILD_REPORTED_KIND`] ones (a report
+/// is read from the store by a tool, and slice 3 will make one reopen a turn on purpose) and the
+/// [`SESSION_CLOSE_KIND`] requests (a round finishes its work and says so in its header; one that
+/// lands while the round finishes stays in its inbox, where a reader of the session finds it). A notice only saves a waiting parent its
 /// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
 /// store), and the same notice delivered just after its commit is refused, so one that lands during
 /// the step must not keep the run going either.
@@ -45,7 +47,11 @@ pub(crate) fn news_since(inbox: &[Inbound], base: usize) -> usize {
     inbox
         .iter()
         .skip(base)
-        .filter(|i| i.kind != RUN_FINISHED_KIND && i.kind != CHILD_REPORTED_KIND)
+        .filter(|i| {
+            i.kind != RUN_FINISHED_KIND
+                && i.kind != CHILD_REPORTED_KIND
+                && i.kind != SESSION_CLOSE_KIND
+        })
         .count()
 }
 
@@ -94,6 +100,9 @@ pub fn child_run_id(parent: RunId, key: &str) -> RunId {
 pub struct ChildStarter {
     runtime: Runtime,
     parent: RunId,
+    /// The conversation the sessions of this run live in: the run's own, or one made from its id
+    /// when it has none.
+    conversation: String,
 }
 
 impl std::fmt::Debug for ChildStarter {
@@ -105,8 +114,13 @@ impl std::fmt::Debug for ChildStarter {
 }
 
 impl ChildStarter {
-    pub(crate) fn new(runtime: Runtime, parent: RunId) -> Self {
-        Self { runtime, parent }
+    pub(crate) fn new(runtime: Runtime, parent: RunId, conversation: Option<&str>) -> Self {
+        let conversation = conversation.map_or_else(|| format!("run:{parent}"), str::to_owned);
+        Self {
+            runtime,
+            parent,
+            conversation,
+        }
     }
 
     /// The run whose children this starts.
@@ -144,6 +158,164 @@ impl ChildStarter {
         self.runtime
             .start_child_within(self.parent, id, agent, input, within)
             .await
+    }
+}
+
+/// The sessions of a run's conversation (ADR 0045): each method reads or acts on a session of the
+/// conversation of [`parent`](ChildStarter::parent) and on nothing else, so a tool cannot reach the
+/// rounds of another conversation, and a session of the conversation can be reached by a later
+/// run of it.
+impl ChildStarter {
+    /// The conversation the sessions of this run belong to: the run's own conversation id, or, for
+    /// a run that has none, `run:<run id>`, so that such a run still has sessions of its own.
+    pub fn session_conversation(&self) -> &str {
+        &self.conversation
+    }
+
+    /// Start a round of `session` as a child of [`parent`](Self::parent) under `id`:
+    /// [`Runtime::start_child_continuing_within`] with the session's conversation id.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::start_child_continuing_within`].
+    pub async fn start_round(
+        &self,
+        session: RunId,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+        prior: Option<RunId>,
+        within: Option<std::time::Duration>,
+    ) -> Result<bool, RuntimeError> {
+        let conversation = crate::session::session_conversation_id(&self.conversation, session);
+        self.runtime
+            .start_child_continuing_within(
+                self.parent,
+                id,
+                agent,
+                input,
+                &conversation,
+                prior,
+                within,
+            )
+            .await
+    }
+
+    /// The session `session` of this conversation: [`Runtime::session_view`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::session_view`].
+    pub async fn session(
+        &self,
+        session: RunId,
+    ) -> Result<Option<crate::SessionView>, RuntimeError> {
+        self.runtime.session_view(&self.conversation, session).await
+    }
+
+    /// The sessions of this conversation: [`Runtime::list_sessions`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::list_sessions`].
+    pub async fn sessions(
+        &self,
+        agents: &[&str],
+        offset: usize,
+        limit: usize,
+    ) -> Result<crate::SessionList, RuntimeError> {
+        self.runtime
+            .list_sessions(&self.conversation, agents, offset, limit)
+            .await
+    }
+
+    /// Deliver `inbound` to the latest round of `session`, which a working round reads at its next
+    /// step ([`Runtime::deliver`]).
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Finished`] when the round has ended meanwhile, and the errors of
+    /// [`Runtime::deliver`].
+    pub async fn steer(
+        &self,
+        session: &crate::SessionView,
+        inbound: Inbound,
+    ) -> Result<(), RuntimeError> {
+        self.runtime.deliver(session.latest_run, inbound).await
+    }
+
+    /// Cancel the latest round of `session` ([`Runtime::cancel`]): a no-op for a round that has
+    /// ended.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::cancel`].
+    pub async fn cancel_round(
+        &self,
+        session: &crate::SessionView,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        self.runtime.cancel(session.latest_run, reason).await
+    }
+
+    /// Cancel the latest round of a session of this conversation's listing ([`Runtime::cancel`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::cancel`].
+    pub async fn cancel_listed(
+        &self,
+        session: &crate::SessionSummary,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        self.runtime.cancel(session.latest_run, reason).await
+    }
+
+    /// The agent state a round of a session of this conversation last committed (what its agent
+    /// serialized): for a parent that keeps what a round kept, the tokens its model calls took.
+    /// `None` when the run is not there; **not journaled**, a live read like
+    /// [`Ctx::child_state`](crate::Ctx::child_state), which answers for children of the run only
+    /// where this answers for the rounds of its conversation.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidSession`] when `round` is not a round of a session of this
+    /// conversation, [`RuntimeError::Corrupt`] when its record does not decode, and the store's
+    /// errors.
+    pub async fn round_state(
+        &self,
+        round: RunId,
+    ) -> Result<Option<serde_json::Value>, RuntimeError> {
+        Ok(self.round_record(round).await?.map(|(_, state)| state))
+    }
+
+    /// [`round_state`](Self::round_state) with the round's status: what a parent needs to count the
+    /// tokens of a round only once it has ended (`Done` or `Failed`, a cancel included). Not journaled.
+    ///
+    /// # Errors
+    ///
+    /// As [`round_state`](Self::round_state).
+    pub async fn round_record(
+        &self,
+        round: RunId,
+    ) -> Result<Option<(adam_core::RunStatus, serde_json::Value)>, RuntimeError> {
+        let Some(rec) = self.runtime.store().load_run(round).await? else {
+            return Ok(None);
+        };
+        let ours = rec
+            .conversation_id
+            .as_deref()
+            .and_then(|c| crate::session::session_of(&self.conversation, c))
+            .is_some();
+        if !ours {
+            return Err(RuntimeError::InvalidSession {
+                reason: format!("run {round} is not a round of a session of this conversation"),
+            });
+        }
+        Ok(Some((
+            rec.status,
+            Envelope::decode(round, &rec.state)?.agent,
+        )))
     }
 }
 

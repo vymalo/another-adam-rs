@@ -1,0 +1,133 @@
+[
+  {
+    "name": "subagent_start",
+    "description": "Start a subagent in the background and get its session id at once; you keep working while it works. Use it instead of the subagent's own tool when you have other work to do meanwhile or want to ask it again. The subagent does not see this conversation: put everything it needs in `prompt`. Read its report with subagent_read (pass wait: true to wait for it; never poll), and send it more with subagent_send. With keep_open false (the default) the session closes when its round has ended; set keep_open true only when another message will follow, and close what you kept open with subagent_close. Subagents:\n- explorer: Reads the repository and answers where and how.\n- reviewer: Reviews a diff.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "enum": [
+            "explorer",
+            "reviewer"
+          ],
+          "description": "Which subagent to start."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "What the session is for, in a few words: it is how you and the person find it again."
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 20000,
+          "description": "The task, with everything the subagent needs to do it."
+        },
+        "keep_open": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep the session open after its first report, to send it more. By default it closes when its round has ended."
+        }
+      },
+      "required": [
+        "agent",
+        "description",
+        "prompt"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "subagent_send",
+    "description": "Send a message to a session. When its round has ended, the message starts the next round, which continues the session's conversation: the subagent remembers the rounds before. While a round is working, the message is steered into it. A closed session takes no message. Read the answer with subagent_read.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "description": "The session id."
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 20000,
+          "description": "What to tell the subagent."
+        }
+      },
+      "required": [
+        "session",
+        "message"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "subagent_read",
+    "description": "Read the report of a session's latest round: its state, its round number and, once the round has ended, the subagent's answer (paged: `offset` and `limit` are lines). While the round works the result says so. To wait for it, call again with wait: true, which returns when the round has ended: never poll by calling again and again, which gets the same answer and is refused after two. A wait returns the first page. Closing is subagent_close.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "description": "The session id."
+        },
+        "wait": {
+          "type": "boolean",
+          "default": false,
+          "description": "Wait for a working round to end instead of answering at once."
+        },
+        "offset": {
+          "type": "integer",
+          "description": "The report line to start at, from 1; negative counts from the end."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "The most report lines to return."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "subagent_close",
+    "description": "Close a session: it takes no more messages, and is never reopened. A round that is working is left to finish (read its report with subagent_read), unless you pass cancel: true, which stops it. Closing a closed session does nothing.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "description": "The session id."
+        },
+        "cancel": {
+          "type": "boolean",
+          "default": false,
+          "description": "Stop a working round instead of letting it finish."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "subagent_list",
+    "description": "List the sessions of this conversation, the open ones first: working, then idle, then closed. Paged: `offset` and `limit` count sessions. Each line is the session id, the subagent, the state, the round and whether it is kept open, then what it is for. Use an id with subagent_read, subagent_send or subagent_close.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "offset": {
+          "type": "integer",
+          "description": "The session to start at, from 1; negative counts from the end."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "The most sessions to return."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+]

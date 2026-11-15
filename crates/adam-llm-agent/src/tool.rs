@@ -8,8 +8,8 @@ use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
 use adam_model::ToolSpec;
 use adam_runtime::{
-    Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, MAX_RUN_FILE_BYTES, RunEvent,
-    SandboxUsage, StepEvent, StepIcon, StepKind, StepState,
+    Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, Inbound, MAX_RUN_FILE_BYTES,
+    RunEvent, SandboxUsage, StepEvent, StepIcon, StepKind, StepState,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -269,6 +269,18 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept: Option<Box<KeptOutput>>,
+    /// The rounds of child sessions whose reports this result gives the model ([ADR 0045]), as run
+    /// ids. A result that gives one is the moment the loop counts the tokens of the rounds **this
+    /// run started** that have ended, in the run's totals, once each
+    /// ([`Conversation::rounds_started`](crate::Conversation::rounds_started)); only whether the list
+    /// is empty is read, because a run id differs between a run and a copy of its journal. Set by
+    /// the session tools only. Never read from an error result.
+    ///
+    /// Absent from a journal written before it existed, and not written while empty.
+    ///
+    /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reported: Vec<adam_core::RunId>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -288,6 +300,7 @@ impl ToolOutput {
             repeat_key: None,
             plan: None,
             kept: None,
+            reported: Vec::new(),
         }
     }
 
@@ -304,6 +317,7 @@ impl ToolOutput {
             repeat_key: None,
             plan: None,
             kept: None,
+            reported: Vec::new(),
         }
     }
 
@@ -438,6 +452,18 @@ pub enum ToolError {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
     },
+    /// The answer is the report of the round a child session is working on ([ADR 0045]). The agent
+    /// parks with a timer, records a [`PendingWait::Session`](crate::PendingWait::Session), and each
+    /// time it wakes (the round's end wakes it, the timer is the fallback) asks the tool how the
+    /// session stands with [`Tool::poll_remote`], the session id as the `task`, in a journaled step,
+    /// until the tool answers [`RemotePoll::Ready`] with the report.
+    ///
+    /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+    #[error("tool awaits session {session}")]
+    AwaitSession {
+        /// The session whose round is awaited: the run id of its first round.
+        session: RunId,
+    },
 }
 
 impl ToolError {
@@ -494,9 +520,10 @@ impl Classify for ToolError {
         match self {
             Self::Transient(_) => ErrorClass::Transient,
             Self::Permanent(_) => ErrorClass::Invalid,
-            Self::NeedsInput { .. } | Self::AwaitRun { .. } | Self::AwaitRemote { .. } => {
-                ErrorClass::Rejected
-            }
+            Self::NeedsInput { .. }
+            | Self::AwaitRun { .. }
+            | Self::AwaitRemote { .. }
+            | Self::AwaitSession { .. } => ErrorClass::Rejected,
         }
     }
 }
@@ -868,12 +895,28 @@ impl ToolCtx {
         message: &str,
         within: Option<Duration>,
     ) -> Result<RunId, ToolError> {
-        let Some(children) = &self.children else {
-            return Err(ToolError::Permanent(
-                "this tool context belongs to no runtime, so it cannot start a child run".into(),
-            ));
-        };
+        let children = self.child_starter()?;
         let child = self.child_run_id();
+        let first = self.child_message(message);
+        children
+            .start_within(child, agent, first, within)
+            .await
+            .map_err(|e| ToolError::from_classified(&e))?;
+        Ok(child)
+    }
+
+    /// The handle for starting children and reading sessions on the runtime that steps this run.
+    pub(crate) fn child_starter(&self) -> Result<&ChildStarter, ToolError> {
+        self.children.as_ref().ok_or_else(|| {
+            ToolError::Permanent(
+                "this tool context belongs to no runtime, so it cannot start a child run".into(),
+            )
+        })
+    }
+
+    /// The first message of a child of this run (or of a session's round): `message`, the run and
+    /// step the child works under, and the protected context keys of this run.
+    pub(crate) fn child_message(&self, message: &str) -> Inbound {
         let mut first = user_message(message);
         if let Some(payload) = first.payload.as_object_mut() {
             payload.insert(
@@ -901,11 +944,7 @@ impl ToolCtx {
                 payload.insert("context".to_owned(), Value::Object(inherited));
             }
         }
-        children
-            .start_within(child, agent, first, within)
-            .await
-            .map_err(|e| ToolError::from_classified(&e))?;
-        Ok(child)
+        first
     }
 
     /// A value of the run's inbound context ([`Conversation::context`](crate::Conversation::context)):

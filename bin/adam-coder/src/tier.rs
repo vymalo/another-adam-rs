@@ -114,6 +114,13 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "ask_agent"
         | "explorer"
         | "reviewer"
+        // The tools that run those helpers in the background: they start, read and close the
+        // same read-only subagents, which keep to the tier of the run they serve.
+        | "subagent_start"
+        | "subagent_send"
+        | "subagent_read"
+        | "subagent_close"
+        | "subagent_list"
         | "load_skill"
         | "read_skill_file"
         | "turn_output" => AccessTier::Plan,

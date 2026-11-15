@@ -111,6 +111,9 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/README.md.
 * Skipping a commit marked `!` because the build still compiles: runtime behaviour (leases,
   claims, A2A states) can change without a compile error; read the ADRs the log names.
 * Files copied from the repository drift: re-copy them from B and diff them against yours.
+* Child sessions (ADR 0045, slice 2): a run parked on a session wait fails on an old worker ("stored agent state does not decode"), and
+  an old worker drops the round header. Stop every worker of the old revision before a run uses sessions; a rolling deploy is safe
+  only while no run has started one.
 
 ## See also
 

@@ -12,8 +12,9 @@ use adam_model::{
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, ChildStatus, Ctx,
-    Emitter, Inbound, MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, SandboxUsage, StepState,
-    Transition, UsageEvent, UsageTotals,
+    Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE, RUN_FINISHED_KIND, RunEvent,
+    SESSION_CLOSE_KIND, SandboxUsage, SessionState, StepState, Transition, UsageEvent, UsageTotals,
+    child_run_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -22,12 +23,28 @@ use serde_json::{Map, Value, json};
 
 use crate::conversation::{
     ArtifactRef, Conversation, LimitHit, LimitKind, PendingQuestion, PendingRemote, PendingRun,
-    PendingWait, Repeats, parse_context, parse_root_run, parse_root_step, parse_user_text,
+    PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_root_run,
+    parse_root_step, parse_session, parse_user_text,
 };
 use crate::history::fit_history;
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
 use crate::paging::backstop;
 use crate::plan::Plan;
+use crate::sessions::{SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START};
+
+/// Whether the history holds a call that started a session or sent to one.
+fn has_started_session(state: &Conversation) -> bool {
+    state.messages.iter().any(|m| {
+        m.tool_calls()
+            .iter()
+            .any(|c| c.name == SUBAGENT_START || c.name == SUBAGENT_SEND)
+    })
+}
+
+/// Whether a call of `tool` acts on a session (an effect outside the run's own state).
+fn has_effect(tool: &str) -> bool {
+    matches!(tool, SUBAGENT_START | SUBAGENT_SEND | SUBAGENT_CLOSE)
+}
 use crate::source::{
     DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined, withheld,
 };
@@ -250,6 +267,7 @@ pub struct LlmAgentBuilder {
     wait_poll: Duration,
     stream_text: bool,
     step_io: StepIo,
+    session_agents: Vec<String>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -366,6 +384,22 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// Make the agent wait, at the end of a turn, for the sessions it started in this task
+    /// ([ADR 0045]): `agents` are the registration names of the subagents the session tools
+    /// ([`SessionTools`](crate::SessionTools)) can start. A model answer with no tool call, while a
+    /// session of one of them that this run started still works, does not end the run: the run
+    /// parks on the session as if the model had called `subagent_read` with `wait: true`, and the
+    /// report reaches the model before the run ends. The agent needs the tools of
+    /// [`SessionTools::tools`](crate::SessionTools::tools) registered, or the wait has nothing to
+    /// read the report with and is skipped. The default is none, which waits for nothing.
+    ///
+    /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+    #[must_use]
+    pub fn session_agents(mut self, agents: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.session_agents = agents.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// How the step of a tool call reports what the tool was given and what it answered: the
     /// arguments on the report that starts the step, the result (or the error) on the one that ends
     /// it, each scrubbed by [`StepIo::redact`] and then cut to the contract's bounds (4 KiB in, 8 KiB
@@ -466,6 +500,7 @@ impl LlmAgentBuilder {
             wait_poll: self.wait_poll,
             stream_text: self.stream_text,
             step_io: self.step_io,
+            session_agents: self.session_agents.into(),
         }
     }
 }
@@ -619,6 +654,8 @@ pub struct LlmAgent {
     wait_poll: Duration,
     stream_text: bool,
     step_io: StepIo,
+    /// The registered names of the subagents whose sessions the turn-end wait looks at.
+    session_agents: Arc<[String]>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -688,6 +725,7 @@ impl LlmAgent {
             wait_poll: DEFAULT_WAIT_POLL,
             stream_text: true,
             step_io: StepIo::default(),
+            session_agents: Vec::new(),
         }
     }
 
@@ -1035,7 +1073,7 @@ impl LlmAgent {
         if closing && let Message::Assistant { tool_calls, .. } = &mut message {
             tool_calls.clear();
         }
-        let calls: Vec<ToolCall> = message.tool_calls().to_vec();
+        let mut calls: Vec<ToolCall> = message.tool_calls().to_vec();
         // An answer that was recorded before a message this transition has read (the commit of the
         // transition that recorded it was lost, and the message arrived before this one began) did
         // not read it: it is dropped and the model answers again, with the message in front of it.
@@ -1052,6 +1090,25 @@ impl LlmAgent {
         // (`steer/v1`: an accepted message is never lost). What arrives after this check is caught
         // by the commit (`Ctx::reopen_on_arrival`).
         let unread = calls.is_empty() && ctx.arrived().await? > 0;
+        // The turn ends here, but a session this run started still works: its report must reach
+        // the model before the run ends, so the turn goes on with a read that waits for it, as if
+        // the model had asked for one (the words it said stay, and are said as words before a call).
+        if calls.is_empty()
+            && !unread
+            && state.limit.is_none()
+            && state.tool_calls < self.limits.max_tool_calls
+            && let Some(session) = self.session_to_wait_for(ctx, state, turn).await?
+        {
+            let wait = ToolCall::new(
+                format!("wait_{turn}"),
+                SUBAGENT_READ,
+                json!({ "session": session, "wait": true }),
+            );
+            if let Message::Assistant { tool_calls, .. } = &mut message {
+                tool_calls.push(wait.clone());
+            }
+            calls.push(wait);
+        }
         if !text.is_empty() {
             let mut payload = json!({ "text": text, "turn": turn });
             // The words before a tool call are said whole, under the stream they were sent as, because
@@ -1198,6 +1255,176 @@ impl LlmAgent {
         Ok(())
     }
 
+    /// The session, if any, that this run started in this task and whose round still works, read
+    /// from the store in a journaled step so that a replay and a takeover decide the same: the
+    /// model has answered, and the run may not end while this one works. `None` for an agent that
+    /// has no session tools. A failure to list is a retry when the store says so, and no wait
+    /// otherwise.
+    async fn session_to_wait_for(
+        &self,
+        ctx: &mut Ctx,
+        state: &Conversation,
+        turn: u32,
+    ) -> Result<Option<RunId>, AgentError> {
+        if self.session_agents.is_empty() || self.tool(SUBAGENT_READ).is_none() {
+            return Ok(None);
+        }
+        // A round this run started is the result of a call to one of these two, so a history
+        // without such a call has nothing to wait for and the store is not asked: a run that never
+        // uses sessions journals what it always did.
+        if !has_started_session(state) {
+            return Ok(None);
+        }
+        let starter = ctx.child_starter();
+        let me = ctx.run_id();
+        let agents = self.session_agents.clone();
+        let found: Result<Option<RunId>, (bool, String)> = ctx
+            .step(&format!("sessions:{turn}"), move || async move {
+                let names: Vec<&str> = agents.iter().map(String::as_str).collect();
+                let list = starter
+                    .sessions(&names, 0, MAX_SESSION_PAGE)
+                    .await
+                    .map_err(|e| (e.is_retryable(), report(&e)))?;
+                Ok(list
+                    .sessions
+                    .into_iter()
+                    .find(|s| s.state == SessionState::Working && s.started_by == Some(me))
+                    .map(|s| s.id))
+            })
+            .await?;
+        match found {
+            Ok(session) => Ok(session),
+            Err((true, why)) => Err(AgentError::transient(format!(
+                "listing the sessions failed: {why}"
+            ))),
+            Err((false, why)) => Err(AgentError::transient(format!(
+                "listing the sessions failed: {why}"
+            ))),
+        }
+    }
+
+    /// The run is about to end: a round it started or sent to that still works is cancelled (the
+    /// turn-end wait could not wait for it: a limit, the last turn), so that a done run never leaves
+    /// a round working with nobody to read it. A kept-open session goes idle, another closes; the
+    /// answer says so. A listing that fails fails the try.
+    async fn end_sessions(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        output: &mut Value,
+    ) -> Result<(), AgentError> {
+        if self.session_agents.is_empty() || !has_started_session(state) {
+            return Ok(());
+        }
+        let starter = ctx.child_starter();
+        let me = ctx.run_id();
+        let agents = self.session_agents.clone();
+        let cancelled: Result<usize, String> = ctx
+            .step(
+                &format!("sessions_end:{}", state.turns),
+                move || async move {
+                    let names: Vec<&str> = agents.iter().map(String::as_str).collect();
+                    let list = starter
+                        .sessions(&names, 0, MAX_SESSION_PAGE)
+                        .await
+                        .map_err(|e| report(&e))?;
+                    let mut n = 0;
+                    for s in list
+                        .sessions
+                        .iter()
+                        .filter(|s| s.state == SessionState::Working && s.started_by == Some(me))
+                    {
+                        starter
+                            .cancel_listed(s, "the run that started it ended")
+                            .await
+                            .map_err(|e| report(&e))?;
+                        n += 1;
+                    }
+                    Ok(n)
+                },
+            )
+            .await?;
+        match cancelled {
+            Ok(0) => {}
+            Ok(n) => {
+                let note = format!(
+                    "(The run ended while {n} subagent round(s) it started were still working: they were cancelled.)"
+                );
+                if let Some(Value::String(text)) = output.get_mut("text") {
+                    text.push_str("\n\n");
+                    text.push_str(&note);
+                }
+            }
+            Err(why) => {
+                return Err(AgentError::transient(format!(
+                    "ending the sessions failed: {why}"
+                )));
+            }
+        }
+        // Every round this run started is in its totals before it ends, read or not.
+        Self::count_rounds(ctx, state, true).await
+    }
+
+    /// Count the tokens of the rounds this run started ([`Conversation::rounds_started`]) that have
+    /// ended, each once. The read of a round is the journaled step `usage:<call id>`, named by the
+    /// call and not by the round's run id, so a replay (of this run, or of a copy of its journal)
+    /// counts what the first try counted. A round that works is left owed, unless `ending` (the run
+    /// is over: a round the cancel could not stop is given up). A store error on the read is
+    /// retried, never swallowed; a round that cannot be read for another reason is warned about and
+    /// given up.
+    async fn count_rounds(
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        ending: bool,
+    ) -> Result<(), AgentError> {
+        let me = ctx.run_id();
+        for call in state.rounds_started.clone() {
+            let round = child_run_id(me, &call);
+            let starter = ctx.child_starter();
+            let read: Result<RoundUsage, (bool, String)> = ctx
+                .step(&format!("usage:{call}"), move || async move {
+                    match starter.round_record(round).await {
+                        Ok(None) => Ok(RoundUsage::Gone),
+                        Ok(Some((status, _))) if !status.is_terminal() => Ok(RoundUsage::Working),
+                        Ok(Some((_, child_state))) => Ok(RoundUsage::Counted {
+                            totals: child_state
+                                .get("usage_totals")
+                                .cloned()
+                                .and_then(|t| serde_json::from_value::<UsageTotals>(t).ok()),
+                            sandbox: child_state
+                                .get("sandbox_usage")
+                                .cloned()
+                                .and_then(|u| serde_json::from_value::<SandboxUsage>(u).ok()),
+                        }),
+                        Err(e) => Err((e.is_retryable(), report(&e))),
+                    }
+                })
+                .await?;
+            match read {
+                Ok(RoundUsage::Working) if !ending => continue,
+                Ok(RoundUsage::Working | RoundUsage::Gone) => {}
+                Ok(RoundUsage::Counted { totals, sandbox }) => {
+                    if let Some(totals) = totals {
+                        state.usage_totals.merge(&totals);
+                    }
+                    if let Some(sandbox) = sandbox {
+                        state.sandbox_usage.merge(&sandbox);
+                    }
+                }
+                Err((true, why)) => {
+                    return Err(AgentError::transient(format!(
+                        "reading a round to count its tokens failed: {why}"
+                    )));
+                }
+                Err((false, why)) => {
+                    tracing::warn!(%round, error = %why, "a round's tokens cannot be counted");
+                }
+            }
+            state.rounds_started.retain(|c| *c != call);
+        }
+        Ok(())
+    }
+
     /// Run the owed tool calls in order, each as its own journaled step.
     ///
     /// `notices` are the finished-child messages this transition received: a call that starts a
@@ -1267,6 +1494,12 @@ impl LlmAgent {
                 }
                 continue;
             }
+            // The round this call starts, if it starts one, is this run's to count.
+            if matches!(call.name.as_str(), SUBAGENT_START | SUBAGENT_SEND)
+                && !state.rounds_started.contains(&call.id)
+            {
+                state.rounds_started.push(call.id.clone());
+            }
             let used = files_kept(&state.artifacts);
             let (result, reported) = self
                 .run_tool(
@@ -1296,6 +1529,7 @@ impl LlmAgent {
                     repeat_key,
                     plan,
                     kept,
+                    reported,
                 } => {
                     if let Some(answer) = answer {
                         state.announce(answer);
@@ -1307,6 +1541,9 @@ impl LlmAgent {
                     // What the call asked the run to keep, within what the run may keep: the call was
                     // told its room (`ToolCtx::kept_left`), so a result over it was never offered.
                     state.keep_output(kept);
+                    if !reported.is_empty() {
+                        Self::count_rounds(ctx, state, false).await?;
+                    }
                     (message, artifacts)
                 }
                 ToolResult::NeedsInput { question, ui } => {
@@ -1362,6 +1599,31 @@ impl LlmAgent {
                     .await;
                     continue;
                 }
+                ToolResult::AwaitSession(session) => {
+                    state.repeats = None;
+                    ctx.emit(RunEvent::Custom {
+                        kind: "awaiting_session".into(),
+                        payload: json!({ "call_id": call.id, "session": session }),
+                    })
+                    .await;
+                    say(
+                        ctx,
+                        silent_call(self, state, &call.name),
+                        self.step_event(
+                            &call.name,
+                            &call.id,
+                            StepState::Waiting,
+                            &state.source_notes,
+                        ),
+                    )
+                    .await;
+                    state.pending_wait = Some(PendingWait::Session(PendingSession {
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        session,
+                    }));
+                    return Ok(Flow::Wait);
+                }
                 ToolResult::AwaitRemote { task, timeout_ms } => {
                     state.repeats = None;
                     // The deadline is fixed now, from the journaled clock, so that every replay
@@ -1395,9 +1657,14 @@ impl LlmAgent {
                     return Ok(Flow::Wait);
                 }
             };
+            let effect = has_effect(&call.name);
             state.messages.push(message);
             add_artifact_refs(&mut state.artifacts, artifacts);
             state.pending_calls.remove(0);
+            // Its result is committed before the next call runs (see `step`).
+            if effect && !state.pending_calls.is_empty() {
+                return Ok(Flow::Next);
+            }
         }
         Ok(Flow::Next)
     }
@@ -1457,6 +1724,7 @@ impl LlmAgent {
                 repeat_key: None,
                 plan: None,
                 kept: None,
+                reported: Vec::new(),
             };
             return Ok((answered, SandboxUsage::new()));
         }
@@ -1534,6 +1802,7 @@ impl LlmAgent {
                     repeat_key: None,
                     plan: None,
                     kept: None,
+                    reported: Vec::new(),
                 };
                 return Ok((answered, SandboxUsage::new()));
             }
@@ -1583,8 +1852,13 @@ impl LlmAgent {
                 .clone(),
         };
         let answered = match outcome {
-            Ok(output) => {
+            Ok(mut output) => {
                 let repeat_key = output.repeat_key.as_deref().cloned();
+                let reported = if output.is_error {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut output.reported)
+                };
                 let (message, artifacts, answer, plan, outcome, kept) = output_message(
                     ctx,
                     &call.id,
@@ -1614,6 +1888,7 @@ impl LlmAgent {
                     repeat_key,
                     plan,
                     kept,
+                    reported,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -1639,6 +1914,7 @@ impl LlmAgent {
                     repeat_key: None,
                     plan: None,
                     kept: None,
+                    reported: Vec::new(),
                 }
             }
             Err(ToolError::Transient(reason)) => {
@@ -1666,6 +1942,7 @@ impl LlmAgent {
             // No end event yet: `run_pending` says "waiting", or the final state when the
             // child's message is already here.
             Err(ToolError::AwaitRun { run }) => ToolResult::AwaitRun(run),
+            Err(ToolError::AwaitSession { session }) => ToolResult::AwaitSession(session),
             Err(ToolError::AwaitRemote { task, timeout_ms }) => {
                 ToolResult::AwaitRemote { task, timeout_ms }
             }
@@ -1884,7 +2161,15 @@ impl LlmAgent {
             .await?;
         match polled {
             Ok(RemotePoll::Working) => Ok(None),
-            Ok(RemotePoll::Ready(output)) => {
+            Ok(RemotePoll::Ready(mut output)) => {
+                let reported = if output.is_error {
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut output.reported)
+                };
+                if !reported.is_empty() {
+                    Self::count_rounds(ctx, state, false).await?;
+                }
                 let used = files_kept(&state.artifacts);
                 let (message, artifacts, answer, plan, outcome, kept) = output_message(
                     ctx,
@@ -2049,6 +2334,7 @@ fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     let mut conversation = Conversation::new(text);
     conversation.root_run = parse_root_run(&input.payload);
     conversation.root_step = parse_root_step(&input.payload);
+    conversation.session = parse_session(&input.payload);
     if let Some(context) = parse_context(&input.payload) {
         conversation.merge_context(context);
     }
@@ -2071,8 +2357,34 @@ fn continue_conversation(
     prior: &Conversation,
     prior_run: RunId,
 ) -> Result<Conversation, AgentError> {
+    // A round that only closes its session has no message: it carries the conversation as it is.
+    // It keeps only the last answer, which it ends with again, so that a report read after the
+    // close is still the last one.
+    if asks_to_close(&input.payload) {
+        let last = prior
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m, Message::Assistant { .. }))
+            .cloned();
+        return Ok(Conversation {
+            messages: last.into_iter().collect(),
+            continued_from: Some(prior_run),
+            context: prior.context.clone(),
+            plan: prior.plan.clone(),
+            session: parse_session(&input.payload).or_else(|| prior.session.clone()),
+            ..Conversation::default()
+        });
+    }
     let text = start_text(input)?;
     let mut conversation = prior.continued(text, prior_run);
+    // A round of a session works for the run that started it, as the first one did, and says what
+    // the session is.
+    conversation.root_run = parse_root_run(&input.payload);
+    conversation.root_step = parse_root_step(&input.payload);
+    if let Some(header) = parse_session(&input.payload) {
+        conversation.session = Some(header);
+    }
     // The context of the run before comes along; what this message says about its sender is
     // newer, and replaces it key by key.
     if let Some(context) = parse_context(&input.payload) {
@@ -2161,6 +2473,20 @@ fn with_reported_sandbox(
     }
 }
 
+/// What a journaled step read of a round this run started, to count its tokens.
+#[derive(Serialize, Deserialize)]
+enum RoundUsage {
+    /// The round still works: nothing to count yet.
+    Working,
+    /// The round is not there (a call that started none, or one purged): nothing to count.
+    Gone,
+    /// The round has ended: what its state kept.
+    Counted {
+        totals: Option<UsageTotals>,
+        sandbox: Option<SandboxUsage>,
+    },
+}
+
 enum ToolResult {
     Answered {
         message: Message,
@@ -2173,12 +2499,16 @@ enum ToolResult {
         plan: Option<Box<Plan>>,
         /// A long output the tool asks the run to keep in its state.
         kept: Option<Box<KeptOutput>>,
+        /// The rounds of sessions whose reports the result gives, from a result that is not an
+        /// error.
+        reported: Vec<RunId>,
     },
     NeedsInput {
         question: String,
         ui: Option<Value>,
     },
     AwaitRun(RunId),
+    AwaitSession(RunId),
     AwaitRemote {
         task: String,
         timeout_ms: Option<u64>,
@@ -2413,7 +2743,7 @@ fn invalid_arguments(name: &str, raw: &str, output_cut: bool) -> String {
 /// A child's output as the text of the tool result. An `LlmAgent` child finishes with
 /// `{"text": ..., "artifacts": [...]}` and the parent's model gets the text (the same reading the
 /// A2A adapter has of an output); another string is passed as it is, and anything else as JSON.
-fn render_output(output: Option<&Value>) -> String {
+pub(crate) fn render_output(output: Option<&Value>) -> String {
     let text = match output {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => s.clone(),
@@ -2478,13 +2808,35 @@ impl Agent for LlmAgent {
         // A message that arrives while this step finishes the run is read, not dropped: see
         // `Ctx::reopen_on_arrival`.
         ctx.reopen_on_arrival();
+        // A round that only closes its session calls no model: it ends with the last answer again.
+        if state.session.as_ref().is_some_and(|h| h.closing) {
+            let text = state
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m, Message::Assistant { .. }))
+                .map(Message::text)
+                .unwrap_or_default();
+            let output = json!({ "text": text, "artifacts": [], "closed": true });
+            return Ok(Transition::Done { state, output });
+        }
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx
             .take_inbox()
             .into_iter()
-            // A session round's report (ADR 0045) is a wake-up, not a person's words: until the
-            // loop reads reports it is dropped, never shown to the model.
+            // A session round's report (ADR 0045) is a wake-up, not a person's words: it is
+            // dropped, never shown to the model, and the report is read from the store.
             .filter(|i| i.kind != CHILD_REPORTED_KIND)
             .partition(|i| i.kind == RUN_FINISHED_KIND);
+        // A request to close the session this round belongs to: the round goes on and finishes its
+        // work, and the session takes no more messages after it.
+        let (closes, inbox): (Vec<_>, Vec<_>) = inbox
+            .into_iter()
+            .partition(|i| i.kind == SESSION_CLOSE_KIND);
+        if !closes.is_empty()
+            && let Some(header) = &mut state.session
+        {
+            header.closed = true;
+        }
         let notices: Vec<(RunId, ChildStatus)> = finished
             .iter()
             .filter_map(|i| {
@@ -2554,12 +2906,46 @@ impl Agent for LlmAgent {
             }
         }
 
+        // A wait on a session ends when its round has: the round's report woke the run, or the timer
+        // did, and either way the tool says whether the report is there (the same look as a remote
+        // task's, with the session as the task).
+        if let Some(PendingWait::Session(wait)) = state.pending_wait.clone() {
+            let looking = PendingRemote {
+                call_id: wait.call_id,
+                tool: wait.tool,
+                task: wait.session.to_string(),
+                deadline: None,
+            };
+            match self.poll_remote(ctx, &mut state, &looking).await? {
+                Some(outcome) => {
+                    ctx.emit(self.step_end_with_result(
+                        &state,
+                        &looking.tool,
+                        &looking.call_id,
+                        outcome,
+                    ))
+                    .await;
+                }
+                None => {
+                    let wake_at = Some(self.next_poll(ctx));
+                    return Ok(Transition::Park { state, wake_at });
+                }
+            }
+        }
+
         // Owed tool results (the run was parked on a question) come first;
         // otherwise this step is a fresh model turn.
         let mut flow = Flow::Next;
         if state.pending_calls.is_empty() {
             state.messages.append(&mut state.deferred);
             flow = self.model_turn(ctx, &mut state).await?;
+            // A call that starts, sends to or closes a session has an effect no failed try can undo:
+            // the turn and its calls are committed first, so a retry never asks the model again
+            // (new call ids, so a second session) and the call runs under the id the history holds.
+            if matches!(flow, Flow::Next) && state.pending_calls.iter().any(|c| has_effect(&c.name))
+            {
+                return Ok(Transition::Continue(state));
+            }
         }
         if matches!(flow, Flow::Next) {
             flow = self.run_pending(ctx, &mut state, &notices).await?;
@@ -2576,7 +2962,8 @@ impl Agent for LlmAgent {
                         && state.deferred.is_empty()
                         && ctx.arrived().await? == 0
                     {
-                        let output = json!({ "text": text, "artifacts": state.artifacts });
+                        let mut output = json!({ "text": text, "artifacts": state.artifacts });
+                        self.end_sessions(ctx, &mut state, &mut output).await?;
                         return Ok(Transition::Done { state, output });
                     }
                     state.announced_final = false;
@@ -2592,7 +2979,10 @@ impl Agent for LlmAgent {
                 wake_at: Some(self.next_poll(ctx)),
                 state,
             },
-            Flow::Done(output) => Transition::Done { state, output },
+            Flow::Done(mut output) => {
+                self.end_sessions(ctx, &mut state, &mut output).await?;
+                Transition::Done { state, output }
+            }
             Flow::Fail(error) => Transition::Fail { state, error },
         })
     }

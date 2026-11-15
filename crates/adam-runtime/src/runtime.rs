@@ -25,8 +25,8 @@ use crate::events::{Artifact, DynEventSink, EventSink, NoopSink, RunEvent};
 use crate::notify::{DynNotifier, Notifier, Signal};
 use crate::retry::RetryPolicy;
 use crate::session::{
-    MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_ROUNDS_SCANNED, SessionList, page_of_sessions,
-    parse_session_conversation_id, session_conversation_prefix, session_of,
+    MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_ROUNDS_SCANNED, SessionList, SessionView,
+    page_of_sessions, parse_session_conversation_id, session_conversation_prefix, session_of,
 };
 
 /// How often a commit that lost a CAS race is retried before giving up.
@@ -354,7 +354,8 @@ impl Inner {
             let mut env = Envelope::decode(run, &rec.state)?;
             let error = format!("cancelled: {reason}");
             env.error = Some(error.clone());
-            env.inbox.clear();
+            // A request to close the session survives: a cancel must not reopen it.
+            env.inbox.retain(|i| i.kind == crate::SESSION_CLOSE_KIND);
             let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(committed) => {
@@ -1152,6 +1153,60 @@ impl Runtime {
         Err(RuntimeError::Contended(format!(
             "the sessions of {parent_conversation:?} changed while they were listed"
         )))
+    }
+
+    /// One session of `parent_conversation`, read from its rounds: `None` when `session` is not
+    /// the first round of a session of that conversation (an unknown id, another conversation's
+    /// session, a run that merely spells a session's conversation id). The only way to a session
+    /// by its id; the caller needs no agent name, because round 1 says it.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::TooManyRounds`] when the session has more than
+    /// [`MAX_SESSION_ROUNDS_SCANNED`](crate::MAX_SESSION_ROUNDS_SCANNED) rounds, and the store's
+    /// errors.
+    #[tracing::instrument(skip(self))]
+    pub async fn session_view(
+        &self,
+        parent_conversation: &str,
+        session: RunId,
+    ) -> Result<Option<SessionView>, RuntimeError> {
+        const SCAN_PAGE: usize = 200;
+        let Some(first) = self.inner.store.load_run(session).await? else {
+            return Ok(None);
+        };
+        let Some(conversation) = first.conversation_id.clone() else {
+            return Ok(None);
+        };
+        if first.parent_id.is_none()
+            || session_of(parent_conversation, &conversation) != Some(session)
+        {
+            return Ok(None);
+        }
+        let mut query = RunQuery::new(
+            first.agent.clone(),
+            ConversationScope::Exact(conversation),
+            SCAN_PAGE,
+        );
+        let expected = self.inner.store.count_runs(&query).await?;
+        if expected > MAX_SESSION_ROUNDS_SCANNED as u64 {
+            return Err(RuntimeError::TooManyRounds {
+                runs: expected,
+                max: MAX_SESSION_ROUNDS_SCANNED,
+            });
+        }
+        let mut rounds: Vec<RunRecord> = Vec::new();
+        loop {
+            let page = self.inner.store.list_runs(&query).await?;
+            let after = page.last().map(|r| (r.updated_at, r.id));
+            let full = page.len() == SCAN_PAGE;
+            rounds.extend(page);
+            match after {
+                Some(after) if full => query.after = Some(after),
+                _ => break,
+            }
+        }
+        Ok(SessionView::from_rounds(session, rounds))
     }
 
     /// The record of a new run. With `prior` (the run continued and its stored agent state) the

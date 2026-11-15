@@ -177,8 +177,18 @@ fn the_catalog_follows_the_prompt_and_escapes_the_descriptions() {
     assert_eq!(info(&assembly, "coder").skills, ["alpha", "beta", "gamma"]);
     assert_eq!(
         info(&assembly, "coder").tools,
-        // The skills' tools, then the tool that runs the subagent.
-        [LOAD_SKILL, READ_SKILL_FILE, "helper"]
+        // The skills' tools, then the tool that runs the subagent, then the five that run one in
+        // the background.
+        [
+            LOAD_SKILL,
+            READ_SKILL_FILE,
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
     );
 }
 
@@ -204,7 +214,17 @@ fn without_a_skill_there_is_no_catalog_and_no_tool() {
     let none = info(&assembly, "coder");
     assert_eq!(none.prompt, "You are the coder.");
     // No skill tools, and no catalog; the subagent's tool stays.
-    assert_eq!(none.tools, ["helper"]);
+    assert_eq!(
+        none.tools,
+        [
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     assert!(none.skills.is_empty());
     // The subagent has its own selection, which is the default (all of its own).
     assert_eq!(info(&assembly, "coder/helper").skills, ["delta"]);
@@ -445,7 +465,16 @@ async fn the_model_loads_a_skill_then_reads_one_of_its_files() {
     );
     assert_eq!(
         tool_names(&requests[0]),
-        [LOAD_SKILL, READ_SKILL_FILE, "helper"]
+        [
+            LOAD_SKILL,
+            READ_SKILL_FILE,
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
     );
 
     // The schemas: an enum of what each tool takes.
@@ -635,21 +664,50 @@ async fn preloading_everything_leaves_no_loader_and_no_catalog() {
     let assembly = assemble(def_of(&dir), model.clone());
     let coder = info(&assembly, "coder");
     assert_eq!(coder.preloaded, ["alpha", "beta"]);
-    assert_eq!(coder.tools, [READ_SKILL_FILE, "helper"]);
+    assert_eq!(
+        coder.tools,
+        [
+            READ_SKILL_FILE,
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     assert!(!coder.prompt.contains("<available_skills>"));
     assert!(coder.prompt.contains("<skill_content name=\"alpha\">"));
     assert!(coder.prompt.contains("<skill_content name=\"beta\">"));
     run(&assembly, "coder").await;
     assert_eq!(
         tool_names(&model.requests()[0]),
-        [READ_SKILL_FILE, "helper"]
+        [
+            READ_SKILL_FILE,
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
     );
 
     // Nothing to read either: no skill tool at all (the subagent's stays).
     let dir = tree("skills: [beta]\npreload_skills: [beta]");
     let assembly = assemble(def_of(&dir), Arc::new(MockModel::new()));
     let coder = info(&assembly, "coder");
-    assert_eq!(coder.tools, ["helper"]);
+    assert_eq!(
+        coder.tools,
+        [
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     assert!(
         coder
             .prompt

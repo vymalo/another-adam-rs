@@ -27,7 +27,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
 | `StepIo` | how a call's step reports its input and output: `StepIo::default().redact(\|text\| ..).input_max(n).output_max(n)`, or `StepIo::off()`; given to the builder with `step_io(..)` (see *Steps*) |
 | `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `root_run_id()` (the run whose work this one serves: the top of the chain of parents for a child run, the run itself otherwise), `with_root_run(id)` for tests, `step_id()` (`tool:<call id>`), `note()` (what the source that offered the tool said of it, `ToolNote`), `parent_step_id()` / `under_step(id)` (the step this call runs under; none for a call of the model's own), `report_step(StepEvent)` (a step that runs under this call's), `emit_progress` (an update of the call's own step, the text in its detail), `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), `files_left()` (the bytes of files the run may still share: 6 MiB less what it kept, as the call began; the loop sets it with `with_files_left` for every call and poll, a detached context has the whole 6 MiB), `report_sandbox(&SandboxUsage)` (the time this call's commands ran in a sandbox, see *Sandbox time*) with `reported_sandbox()` to read it back, and for tests `detached(..).with_state(..).with_context(..)` |
-| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question, ui }` (parks the run; A2A reports `input-required`; `ui` is an interface that comes with the question; build one with `ToolError::needs_input(q)` or `needs_input_with_ui(q, ui)`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer); `#[non_exhaustive]`, see *Errors* |
+| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question, ui }` (parks the run; A2A reports `input-required`; `ui` is an interface that comes with the question; build one with `ToolError::needs_input(q)` or `needs_input_with_ui(q, ui)`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer), `AwaitSession { session }` (the result is the report of a child session's round; the run parks on a `PendingWait::Session`, see *Child sessions*); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
 | `ToolSet`, `tools!` | an ordered group of tools: `tools![Clock, Search::new()]`, `.extend(..)`, `.wrap(\|tool\| ..)` for middleware, `names()`, `get(..)` |
@@ -39,7 +39,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source lists its tools at every model turn (`specs(&SourceCtx)`, or `listing` for the tools **and their notes**), may rewrite how the tools of that turn are described (`refine(&SourceCtx, &mut [ToolSpec])`, default: nothing), may add words to the agent's instructions for the turn (`instructions(&SourceCtx) -> Option<String>`, default: nothing), **holds tools back** (`withhold(&SourceCtx, tools: &[&str]) -> Vec<Withheld>`, default: none: the tools of `tools` it names, the agent's own and the MCP servers' included, are not shown to the model on that turn, and a call to one is refused with the `Withheld::reason` when it would run) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
 | `Listing`, `ToolNote`, `Conversation::source_notes` | what a source says about a tool it lists: the system behind it **reports each call as a step itself** (`reports_step`, so the agent reports none), how long a call may run (`timeout_ms`) and what its step is called (`label`); kept in the run's state with the model's answer, so a later call, on another worker, reads it without listing again |
 | `Conversation::context`, `merge_context`, `drop_expired_context`, `MAX_CONTEXT_BYTES` | what the messages of the run say about their sender, merged key by key (`null` deletes), bounded, with expiring entries; see *Context and tool sources* |
-| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed) |
+| `SessionTools`, `SessionAgent`, `SESSION_TOOLS`, `SUBAGENT_START` .. `SUBAGENT_LIST`, `MAX_OPEN_SESSIONS`, `MAX_SESSION_ROUNDS`, `LlmAgentBuilder::session_agents` | the five tools that run a subagent in the background as a session (ADR 0045), and the wait a turn makes for the sessions it started: see *Child sessions* |
+| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `PendingSession`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed) |
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
@@ -107,7 +108,7 @@ the conversation of the run before:
 |---|---|
 | **Carried** | the history, oldest first, and the user messages that were waiting behind an owed tool result (`deferred`), in arrival order; then the new user message |
 | **Answered** | the tool calls of a last assistant message that did not all get a result: a run that ended mid-turn (a cancel, a limit, a question nobody answered) leaves them, and a provider rejects a call without a result. Each owed call gets an error result, `STOPPED_BY_THE_PERSON`, after the results that did arrive: the model keeps what it asked for and is told which calls did not finish. The run state cannot tell a cancel from another ending, so a run that failed gets the same text. So `pending_calls` and `pending_wait` are always empty: a continued run never answers a question or a child run of the run before, and never runs a stopped call. The side effects of the calls are not undone |
-| **Reset** | `turns`, `tool_calls`, `usage`, `usage_totals` and `sandbox_usage` (`Limits` are per run, and a new task counts its tokens afresh), `root_run` and `root_step`, and `artifacts` (the final output lists what this run produced) |
+| **Reset** | `turns`, `tool_calls`, `usage`, `usage_totals` and `sandbox_usage` (`Limits` are per run, and a new task counts its tokens afresh), `root_run` and `root_step`, `artifacts` (the final output lists what this run produced), `kept_outputs` (the texts a run keeps are the run's own) and `rounds_started` (a task counts its own rounds, ADR 0045); the `session` header of a round is carried |
 | **Recorded** | `continued_from: Option<RunId>`, not written while `None`; `omitted_turns: u32`, not written while zero |
 | **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON), in this order and only as far as needed: **(1) the tool outputs of the turns older than the newest are shortened**, oldest first, each keeping its head and ending in the `TRUNCATION_MARKER_PREFIX` marker (the same truncation `max_history_tokens` does when a history is sent); **(2) whole old turns are dropped** (a turn is a user message and what follows it up to the next), one marker standing in for them; **(3) the newest prior turn's tool outputs are shortened, last**. Never dropped: **the first user message of the chain** (the task; kept verbatim as the first text part of the first message) and the **newest prior turn**. A newest turn whose own text is over the cap is carried over it. The waiting messages and the new one are counted, never cut |
 | **The marker** | the **second text part of the first user message**, starting with `OMITTED_MARKER_PREFIX` and naming the number of turns; `omitted_turns` (not the text) is what says the part is a marker, so a user message that merely starts with the prefix is an ordinary one. It is always the second part: before anything is dropped, a first message that has several parts (`[task, next]`, from a run that ended before the model answered) is reduced to its task, and the rest becomes a user message of its own (a turn like any other), then merged behind the marker. A rule that reads what the user said should read user messages part by part and skip that part (`Conversation::is_omission_marker`) |
@@ -427,9 +428,81 @@ decision 5). `adam-ui` has the three tools that write it (`plan_work`, `plan_che
 * **Breaking.** `Conversation` and `ToolOutput` gain a public field `plan`, and `ArtifactRef` a public field `id` (a reference to a file never has one): an exhaustive pattern on `RunEvent::Artifact` outside this crate must also name or `..` its new `id`; a struct
   literal of any must name it (build a `ToolOutput` with its constructors, a `Conversation` with `Conversation::new`).
 
+## Child sessions
+
+[ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md), slice 2. `SessionTools::new(roster)`
+makes five tools, in this order, for the subagents of an agent (`adam-assembly` gives them to the root of an agent that has
+local subagents; `LlmAgentBuilder::session_agents(names)` turns on the wait below). The schemas are fixed for a run and the
+only enum is the subagent names, sorted, so the specs do not depend on what happens in a run
+(`tests/fixtures/session-tools.json` pins them). Each declares a time limit of 60 s: none does long work, a read that waits
+parks the run and returns.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working |
+| `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered"}`; an error result when the session is closed |
+| `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line, `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works |
+| `subagent_close` | `session`, `cancel` (default `false`) | `{"session", "state": "closed"}` |
+| `subagent_list` | `offset`, `limit` | one line per session, working then idle then closed, paged |
+
+* **A session** is a conversation of child runs ("rounds") of one subagent, in **the parent's own conversation** (so a later
+  task of it finds the session, and no other conversation does). Its id is round 1's run id. A round carries the session's
+  header (`Conversation::session`, a `SessionHeader`) in its first message and every later round carries it on.
+* **Auto-close.** With `keep_open: false` the session is closed as soon as its round has ended (the report can still be read;
+  a send is refused, in words that tell the model to start a new one). With `keep_open: true` it stays idle for the next
+  `subagent_send`, whose round **continues the session's conversation** (round 2 sees round 1). Closing an idle session starts a
+  round that calls no model and ends with the last answer again; closing a working one leaves the round to finish (the
+  session takes no more messages) unless `cancel: true`, which stops it. A closed session is never reopened. A remote
+  (`a2a:`) subagent is refused in words (use its own tool).
+* **Waiting.** `subagent_read` with `wait: true` and a working round returns `ToolError::AwaitSession`: the loop parks with a
+  `PendingWait::Session` and the `wait_poll` timer. The round's end wakes the run (a notice), and what it does on waking is
+  ask the tool how the session stands (`Tool::poll_remote`, the session id as the `task`) in a journaled step `poll:<call id>`,
+  so the report comes from the store (Rule 5), and a lost or duplicated notice changes nothing. The description tells the model
+  to wait instead of polling: three reads without `wait` that all say "working" meet the repeated-call rule on the third.
+* **The turn-end wait.** When the model answers with no tool call while a session this run started still works, the run does not
+  end: a journaled step `sessions:<turn>` (only when the history holds a `subagent_start` or `subagent_send` call) finds it,
+  and the turn goes on with a call to `subagent_read` with `wait: true`, id `wait_<turn>` (every id the loop invents matches `^[a-zA-Z0-9_-]{1,64}$`), appended to the model's own message
+  (its words stay). The report then reaches the model, which is called again. Not done at a limit turn, or at
+  `max_tool_calls`.
+* **Tokens.** Every round a run started or sent to is counted **once** in its `usage_totals`, whether its report is read once,
+  twice or never. `Conversation::rounds_started` lists the call ids (`subagent_start`, `subagent_send`) whose round is not yet
+  counted; the round of a call is `child_run_id(run, call id)`. The read of a round's state is the journaled step
+  `usage:<call id>` (named by the call, so a replay and a copy of a journal agree), made when a result gives the model a report
+  (`ToolOutput::reported` non-empty: every ended round owed is counted then) and, at the latest, in the step that ends the run
+  (`sessions_end`, after it cancelled what still works). A store error on that read is retried; a round that cannot be read for
+  another reason is warned about and given up. A round another task started is that task's to count. The list is this task's
+  and is not carried to a later one. A synchronous child's tokens are counted as before (`count_child`).
+* **Limits (until their slice makes them settings).** At most `MAX_OPEN_SESSIONS` (16) sessions that are not closed per
+  conversation and `MAX_SESSION_ROUNDS` (20) rounds per session, a close included: the smallest hard bounds that keep a model
+  from starting rounds without end.
+* **Not here yet** (slices 3 to 8): a report that reaches the model in the middle of a turn without a read, the session limits as
+  settings, remote sessions, the A2A extension, the coder's kept-open helpers, a child that asks the person.
+
+* **Effects are committed first.** A turn that calls `subagent_start`, `_send` or `_close` is committed before the call runs, and
+  each such call is its own transition, so a failed try never asks the model again (new call ids would start a second session)
+  and no round works without its owner call in the committed history. A run that is about to end while a round it started still
+  works waits for it when it can; at a limit or the last turn it cancels the round (`sessions_end:<turn>`, a kept-open session
+  goes idle, another closes) and the answer says so. **Cost:** the turn-end wait is one model turn per working session, and
+  `max_turns` can end the run before it has read them all (they are then cancelled). **Known limit:** the listing behind the cap check, the turn-end wait and `sessions_end` scans every round of the
+  conversation on each call (200 per page), and refuses in words once one subagent has more than 5,000 rounds in it
+  (`MAX_SESSION_ROUNDS_SCANNED`; at 20 rounds a session, 250 sessions): the conversation can then start nothing and must go on in
+  a new one. An index of the open sessions in the conversation's state would remove the scan; it needs the state to reach the
+  tools and a way to drop closed sessions from it, and is not built. Also at most `MAX_WORKING_ROUNDS` (4) rounds work at once,
+  `prompt` and `message` are at most `MAX_TEXT_CHARS`.
+* **Retention.** A session lives as its rounds: `purge_finished` must outlast a session's idle life, and a purged first round makes the
+  session vanish ("no session").
+
+**Breaking:** `PendingWait` has a new variant (`Session`; a `match` with no wildcard stops compiling), `ToolOutput` has a field
+(`reported`: build it with its constructors), `Conversation` has `rounds_started` and the journal has the steps `sessions:<turn>` and `sessions_end:<turn>` for a run that
+started a session (`ToolError::AwaitSession` is a new variant of a `#[non_exhaustive]` enum: not breaking). **No mixed versions** for a
+run that uses sessions: an old worker that leases a run parked on a session fails it ("stored agent state does not decode") and its
+rounds are cancelled, and one that steps a round drops `session` and `reported` from its state and calls the model on a closing round.
+Stop every worker of the old revision before a run uses sessions; a rolling deploy is safe only while no run has started one.
+
 ## Child runs
 
-An `adam.child.reported` message (the end of a child *session* round, ADR 0045) is dropped by the loop, never shown to the model, until slice 2 reads it.
+An `adam.child.reported` message (the end of a child *session* round, ADR 0045) is a wake-up only: the loop drops it and
+reads the round from the store (see *Child sessions*).
 
 A tool that delegates returns `Err(ToolError::AwaitRun { run })` after starting the child:
 

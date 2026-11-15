@@ -10,7 +10,7 @@ use adam_agent_fs::{
     AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
     ManifestSource, McpConfig, ModelRef, Strictness, Subagent, ToolList,
 };
-use adam_llm_agent::{DynTool, Limits, ToolSet};
+use adam_llm_agent::{DynTool, Limits, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet};
 use secrecy::SecretString;
 
 use crate::assembly::BoundDef;
@@ -484,6 +484,9 @@ pub(crate) struct Node {
     pub(crate) skills: Vec<String>,
     /// The skills whose body is in the prompt.
     pub(crate) preloaded: Vec<String>,
+    /// The registration names of the subagents a session can be started on, when the agent has the
+    /// session tools; empty otherwise.
+    pub(crate) session_agents: Vec<String>,
 }
 
 /// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
@@ -578,7 +581,8 @@ impl Walk<'_> {
         // The tools `add_skills` appended, so a clash can say whose tool it hit.
         let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
         let mcp_names: Vec<String> = own_mcp.iter().map(|(n, _)| n.clone()).collect();
-        add_subagent_tools(
+        // The session tools (ADR 0045) go to the root only: sessions are one level deep.
+        let session_agents = add_subagent_tools(
             &origin,
             manifest,
             &Taken {
@@ -587,6 +591,7 @@ impl Walk<'_> {
             },
             self.remote,
             &mut tools,
+            parent.is_none(),
         )?;
         let index = self.nodes.len();
         self.nodes.push(Node {
@@ -604,6 +609,7 @@ impl Walk<'_> {
             limits: limits(manifest.frontmatter.limits.as_ref()),
             skills,
             preloaded,
+            session_agents,
         });
         for sub in &manifest.subagents {
             match sub {
@@ -744,7 +750,8 @@ fn add_subagent_tools(
     taken: &Taken<'_>,
     remote: &RemoteSettings,
     tools: &mut Vec<(String, DynTool)>,
-) -> Result<(), Error> {
+    sessions: bool,
+) -> Result<Vec<String>, Error> {
     // The subagent tools added so far, by name, with the file of the subagent that owns each.
     let mut subagents: Vec<(&str, &std::path::Path)> = Vec::new();
     for sub in &manifest.subagents {
@@ -796,7 +803,60 @@ fn add_subagent_tools(
         subagents.push((name, file));
         tools.push((name.to_owned(), tool));
     }
-    Ok(())
+    if !sessions
+        || !manifest
+            .subagents
+            .iter()
+            .any(|s| matches!(s, Subagent::Local(_)))
+    {
+        return Ok(Vec::new());
+    }
+    // The tools that run a subagent in the background: after the one tool per subagent, and named
+    // so that a clash with a tool or a subagent is found now.
+    let roster: Vec<SessionAgent> = manifest
+        .subagents
+        .iter()
+        .map(|sub| match sub {
+            Subagent::Local(child) => SessionAgent {
+                name: child.name.clone(),
+                agent: format!("{}/{}", origin.agent, child.name),
+                description: child.frontmatter.description.clone().unwrap_or_default(),
+                within: run_limit(child.frontmatter.limits.as_ref()),
+                remote: false,
+            },
+            Subagent::Remote(agent) => SessionAgent {
+                name: agent.name.clone(),
+                agent: agent.name.clone(),
+                description: agent.description.clone(),
+                within: None,
+                remote: true,
+            },
+        })
+        .collect();
+    let session_tools = SessionTools::new(roster);
+    for name in SESSION_TOOLS {
+        if tools.iter().any(|(n, _)| n == name) {
+            let clash = manifest
+                .subagents
+                .iter()
+                .find_map(|sub| match sub {
+                    Subagent::Local(child) if child.name == name => Some(child.path.clone()),
+                    Subagent::Remote(agent) if agent.name == name => Some(agent.path.clone()),
+                    _ => None,
+                })
+                .map_or(ToolClash::Tool, |file| ToolClash::Subagent { file });
+            return Err(Error::SubagentToolClash {
+                origin: origin.clone(),
+                parent: origin.agent.clone(),
+                tool: name.to_owned(),
+                clash,
+            });
+        }
+    }
+    for tool in session_tools.tools() {
+        tools.push((tool.spec().name, tool));
+    }
+    Ok(session_tools.session_agents())
 }
 
 /// The time limit of a subagent's run: `limits.max_minutes` of its file, 30 minutes when it says

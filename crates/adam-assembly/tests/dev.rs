@@ -534,7 +534,17 @@ async fn a_removed_subagent_stays_registered_with_its_last_version() {
         [ToolChange {
             agent: name.clone(),
             added: vec![],
-            removed: vec!["sub".into()],
+            // The five tools that run a subagent in the background go with its last subagent.
+            removed: [
+                "sub",
+                "subagent_close",
+                "subagent_list",
+                "subagent_read",
+                "subagent_send",
+                "subagent_start"
+            ]
+            .map(String::from)
+            .to_vec(),
         }]
     );
     assert_eq!(live.retired(), std::slice::from_ref(&sub));

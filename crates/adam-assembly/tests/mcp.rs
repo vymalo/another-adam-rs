@@ -173,7 +173,16 @@ async fn each_agent_gets_its_own_mcp_json() {
     // Each agent selected its own server's tools; the subagent inherited nothing.
     assert_eq!(
         info_tools(&assembly, &root),
-        ["linear__echo", "read_output", "researcher"]
+        [
+            "linear__echo",
+            "read_output",
+            "researcher",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
     );
     assert_eq!(
         info_tools(&assembly, &format!("{root}/researcher")),

@@ -792,6 +792,18 @@ A child run has an id of its own, so the tools key by the **root run** (`ToolCtx
 
 The janitor and the run pods look at the root's directory and run only: a child never has a workspace of its own.
 
+**In the background.** Because the coder has subagents, its assembly also gives it the five session tools of
+[ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) slice 2 (`subagent_start`,
+`subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`, after `explorer` and `reviewer`), so that it can start a helper,
+keep working and read the report, and send a kept-open helper another question. They are made by the assembly, not by
+`coder_tools`, so `Gated` and `Redacting` do not wrap them: they are **`plan` tier** in `tier::known` (the helpers are read-only
+and keep to the tier of the run they serve), and `AgentDef::bind(..).scrub(..)` gives them the coder's redactor, so a report
+passes through it like any tool result. They are not in the coder's tool-spec goldens (those pin `coder_tools`); the five specs
+are pinned in `crates/adam-llm-agent/tests/fixtures/session-tools.json`. A round is a child of the **task that started it**,
+so it works in that task's worktree and, in a later task of the conversation, `subagent_send` starts the next round in the
+worktree of the later task. The prompt is not changed: the descriptions carry the guidance, and `explorer` and `reviewer` stay
+the way to ask and wait.
+
 ### Scratch projects
 
 A task that names no repository ("write a script that prints the first seven Fibonacci numbers; I'll give you the

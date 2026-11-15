@@ -5,12 +5,15 @@
 //! holds the derivation and what a listing reads back from the runs alone.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use std::collections::HashMap;
 
 use adam_core::{RunId, RunRecord, RunStatus};
 
 use crate::child::ChildStatus;
+use crate::envelope::Envelope;
 
 /// The separator between the (escaped) parent conversation id and the session id.
 const SESSION_SEGMENT: &str = "/s/";
@@ -109,17 +112,81 @@ pub(crate) fn session_of(parent_conversation: &str, conversation_id: &str) -> Op
     (parent == parent_conversation).then_some(session)
 }
 
-/// What a session is doing, as the runs alone tell.
+/// The key under which an agent keeps a round's [`SessionHeader`] in its own state, and under which
+/// the first message of a round carries it. The runtime reads a round's header from there.
+pub const SESSION_STATE_KEY: &str = "session";
+
+/// [`Inbound::kind`](crate::Inbound) of the message that asks a working round to be the last of its
+/// session: the round finishes its work, and the session then takes no more messages.
+pub const SESSION_CLOSE_KIND: &str = "adam.session.close";
+
+/// What a round of a session says about the session, in the state of the round's agent (ADR 0045).
 ///
-/// The enum is closed on purpose (Rule 3): whether a session is closed is written in its header
-/// (ADR 0045, slice 2), which a listing over runs does not read, so a `Closed` state arrives with
-/// slice 2 as a deliberate breaking addition that fails to compile in every consumer.
+/// **The truth is the latest round's header** (nothing else stores a session). A session whose
+/// rounds carry no header, such as one an embedder made with `Runtime::start_child_continuing`, is
+/// kept open and never closes by itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHeader {
+    /// The session: round 1's run id.
+    pub id: RunId,
+    /// The registration name of the agent whose runs the rounds are.
+    pub agent: String,
+    /// What the session is for, in the words of whoever started it (a line, at most 80 characters).
+    pub description: String,
+    /// Whether the session waits for another message after a round (`true`) or closes when its
+    /// round has ended (`false`, the default of the tools).
+    pub keep_open: bool,
+    /// The session takes no more messages: set by the round that closes it, or by a close request
+    /// that a working round has read. Absent when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+    /// This round only closes the session: it calls no model and its report is not a report. Absent
+    /// when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closing: bool,
+    /// The round's number, from 1: what orders the rounds of a session (timestamps tie, ids are
+    /// hashes). `0` for a header written before it existed.
+    #[serde(default)]
+    pub round: u32,
+}
+
+/// The header a round's agent state holds, if it holds one.
+pub(crate) fn header_of(agent_state: &Value) -> Option<SessionHeader> {
+    serde_json::from_value(agent_state.get(SESSION_STATE_KEY)?.clone()).ok()
+}
+
+fn header_of_record(rec: &RunRecord) -> Option<SessionHeader> {
+    Envelope::decode(rec.id, &rec.state)
+        .ok()
+        .and_then(|e| header_of(&e.agent))
+}
+
+/// The rounds of a session in the order they ran: by the round number the header carries, then
+/// by creation time and id. Each with its header.
+fn ordered(runs: Vec<RunRecord>) -> Vec<(RunRecord, Option<SessionHeader>)> {
+    let mut keyed: Vec<(RunRecord, Option<SessionHeader>)> = runs
+        .into_iter()
+        .map(|r| {
+            let h = header_of_record(&r);
+            (r, h)
+        })
+        .collect();
+    keyed.sort_by_key(|(r, h)| (h.as_ref().map_or(0, |h| h.round), r.created_at, r.id.0));
+    keyed
+}
+
+/// What a session is doing, as its latest round and header tell.
+///
+/// The enum is closed on purpose (Rule 3): a new state must fail to compile in every consumer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
     /// Its latest round is open (runnable or parked).
     Working,
-    /// Its latest round is finished, so a message starts the next round.
+    /// Its latest round is finished and the session is open, so a message starts the next round.
     Idle,
+    /// Its latest round is finished and the session takes no more messages: it was closed
+    /// (`closed` in the header), or it was not kept open and its round has ended.
+    Closed,
 }
 
 /// How a round ended.
@@ -153,6 +220,16 @@ pub struct SessionSummary {
     pub outcome: Option<RoundOutcome>,
     /// When the latest round was last updated.
     pub updated_at: DateTime<Utc>,
+    /// What the session is for (empty for a session with no header).
+    pub description: String,
+    /// Whether the session waits for another message after a round (`true` for a session with no
+    /// header).
+    pub keep_open: bool,
+    /// Whether the session takes no more messages, even if its latest round still works (it was
+    /// asked to close and is finishing).
+    pub closed: bool,
+    /// The run that started the latest round: the parent run of that round.
+    pub started_by: Option<RunId>,
 }
 
 /// One page of [`Runtime::list_sessions`](crate::Runtime::list_sessions).
@@ -171,6 +248,61 @@ pub const MAX_SESSION_PAGE: usize = 100;
 /// listing; more is [`RuntimeError::TooManyRounds`](crate::RuntimeError::TooManyRounds).
 pub const MAX_SESSION_ROUNDS_SCANNED: usize = 5000;
 
+/// The newest round of a session, read: what both a listing and a single session's view say.
+pub(crate) struct Latest {
+    pub state: SessionState,
+    pub outcome: Option<RoundOutcome>,
+    pub header: Option<SessionHeader>,
+    pub closed: bool,
+    pub status: ChildStatus,
+}
+
+/// Read `latest`, the newest round of a session.
+pub(crate) fn read_latest(latest: &RunRecord) -> Latest {
+    let open = latest.status.is_open();
+    let (header, close_asked) = match Envelope::decode(latest.id, &latest.state) {
+        Ok(env) => {
+            let asked = env.inbox.iter().any(|i| i.kind == SESSION_CLOSE_KIND);
+            (header_of(&env.agent), asked)
+        }
+        // A round whose state cannot be read is a session nobody can continue: closed, not open for ever.
+        Err(_) => (None, true),
+    };
+    let keep_open = header.as_ref().is_none_or(|h| h.keep_open);
+    let closed = close_asked || header.as_ref().is_some_and(|h| h.closed) || (!open && !keep_open);
+    let status = ChildStatus::from_record(latest);
+    let (state, outcome) = if open {
+        (SessionState::Working, None)
+    } else {
+        let outcome = match (status.status, status.error.as_deref()) {
+            (RunStatus::Done, _) => RoundOutcome::Done,
+            (_, Some(e)) if e.starts_with("cancelled:") => RoundOutcome::Cancelled,
+            _ => RoundOutcome::Failed,
+        };
+        let state = if closed {
+            SessionState::Closed
+        } else {
+            SessionState::Idle
+        };
+        (state, Some(outcome))
+    };
+    Latest {
+        state,
+        outcome,
+        header,
+        closed,
+        status,
+    }
+}
+
+fn rank(state: SessionState) -> u8 {
+    match state {
+        SessionState::Working => 0,
+        SessionState::Idle => 1,
+        SessionState::Closed => 2,
+    }
+}
+
 /// Build one page from the rounds of each `(agent, conversation id)`.
 pub(crate) fn page_of_sessions(
     parent_conversation: &str,
@@ -180,39 +312,37 @@ pub(crate) fn page_of_sessions(
 ) -> SessionList {
     let mut sessions: Vec<SessionSummary> = rounds
         .into_iter()
-        .filter_map(|((agent, conversation_id), mut runs)| {
+        .filter_map(|((agent, conversation_id), runs)| {
             let id = session_of(parent_conversation, &conversation_id)?;
             // Round 1 is the run whose id is the session id, started as a child.
             runs.iter().find(|r| r.id == id && r.parent_id.is_some())?;
-            runs.sort_by_key(|r| (r.created_at, r.id.0));
+            let mut runs: Vec<RunRecord> = ordered(runs).into_iter().map(|(r, _)| r).collect();
             let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
             let latest = runs.pop()?;
-            let (state, outcome) = if latest.status.is_open() {
-                (SessionState::Working, None)
-            } else {
-                let status = ChildStatus::from_record(&latest);
-                let outcome = match (status.status, status.error.as_deref()) {
-                    (RunStatus::Done, _) => RoundOutcome::Done,
-                    (_, Some(e)) if e.starts_with("cancelled:") => RoundOutcome::Cancelled,
-                    _ => RoundOutcome::Failed,
-                };
-                (SessionState::Idle, Some(outcome))
-            };
+            let read = read_latest(&latest);
             Some(SessionSummary {
                 id,
                 agent,
                 conversation_id,
                 latest_run: latest.id,
                 round,
-                state,
-                outcome,
+                state: read.state,
+                outcome: read.outcome,
                 updated_at: latest.updated_at,
+                description: read
+                    .header
+                    .as_ref()
+                    .map(|h| h.description.clone())
+                    .unwrap_or_default(),
+                keep_open: read.header.as_ref().is_none_or(|h| h.keep_open),
+                closed: read.closed,
+                started_by: latest.parent_id,
             })
         })
         .collect();
     sessions.sort_by(|a, b| {
-        (a.state != SessionState::Working)
-            .cmp(&(b.state != SessionState::Working))
+        rank(a.state)
+            .cmp(&rank(b.state))
             .then(b.updated_at.cmp(&a.updated_at))
             .then(a.id.0.cmp(&b.id.0))
     });
@@ -221,6 +351,70 @@ pub(crate) fn page_of_sessions(
     SessionList {
         sessions: sessions.into_iter().skip(offset).take(limit).collect(),
         total,
+    }
+}
+
+/// One session, read by [`ChildStarter::session`](crate::ChildStarter::session): what a tool needs
+/// to answer a read, a send or a close.
+///
+/// It cannot be built outside this crate, so holding one proves the session belongs to the
+/// conversation it was read for.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct SessionView {
+    /// The session: round 1's run id.
+    pub id: RunId,
+    /// The agent whose runs the rounds are.
+    pub agent: String,
+    /// The conversation id its rounds share.
+    pub conversation_id: String,
+    /// The latest round's header; `None` for a session an embedder made with no header.
+    pub header: Option<SessionHeader>,
+    /// How many rounds the session has in the store.
+    pub round: u32,
+    /// The latest round's run.
+    pub latest_run: RunId,
+    /// What the session is doing.
+    pub state: SessionState,
+    /// How the latest round ended; `None` while it is open.
+    pub outcome: Option<RoundOutcome>,
+    /// Whether the session takes no more messages (it may still be finishing a round).
+    pub closed: bool,
+    /// The report: the last round **that did work** (a round that only closed the session has none),
+    /// as a parent reads a child: its status and output.
+    pub latest: ChildStatus,
+    /// The run of the round the report is of.
+    pub report_run: RunId,
+    /// The run that started the latest round.
+    pub started_by: Option<RunId>,
+}
+
+impl SessionView {
+    pub(crate) fn from_rounds(session: RunId, runs: Vec<RunRecord>) -> Option<Self> {
+        let runs = ordered(runs);
+        let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
+        let (latest, _) = runs.last()?.clone();
+        let worked = runs
+            .iter()
+            .rev()
+            .find(|(_, h)| !h.as_ref().is_some_and(|h| h.closing))
+            .map_or_else(|| latest.clone(), |(r, _)| r.clone());
+        let mut read = read_latest(&latest);
+        read.status = ChildStatus::from_record(&worked);
+        Some(Self {
+            id: session,
+            agent: latest.agent.clone(),
+            conversation_id: latest.conversation_id.clone().unwrap_or_default(),
+            header: read.header,
+            round,
+            latest_run: latest.id,
+            state: read.state,
+            outcome: read.outcome,
+            closed: read.closed,
+            latest: read.status,
+            report_run: worked.id,
+            started_by: latest.parent_id,
+        })
     }
 }
 
@@ -396,6 +590,165 @@ mod tests {
             list.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![real]
         );
+    }
+
+    fn with_header(
+        id: RunId,
+        header: Option<SessionHeader>,
+        status: RunStatus,
+        inbox: Vec<crate::agent::Inbound>,
+    ) -> RunRecord {
+        let agent = header.map_or(
+            serde_json::json!({}),
+            |h| serde_json::json!({ SESSION_STATE_KEY: h }),
+        );
+        let mut env = crate::envelope::Envelope::new(agent);
+        env.inbox = inbox;
+        let mut rec = record(
+            id,
+            &session_conversation_id("p", id),
+            Some(RunId::new()),
+            status,
+            None,
+            1,
+        );
+        rec.state = env.encode().unwrap();
+        rec
+    }
+
+    fn header(id: RunId, keep_open: bool, closed: bool) -> SessionHeader {
+        SessionHeader {
+            id,
+            agent: "a".into(),
+            description: "look".into(),
+            keep_open,
+            closed,
+            closing: false,
+            round: 1,
+        }
+    }
+
+    #[test]
+    fn a_header_decides_whether_a_session_is_closed() {
+        let state = |h: Option<SessionHeader>, status, inbox| {
+            let id = h.as_ref().map_or_else(RunId::new, |h| h.id);
+            let rec = with_header(id, h, status, inbox);
+            let read = read_latest(&rec);
+            (read.state, read.closed)
+        };
+        let id = RunId::new();
+        let close = crate::agent::Inbound::new(SESSION_CLOSE_KIND, serde_json::json!({}));
+        // No header: kept open, never closes by itself.
+        assert_eq!(
+            state(None, RunStatus::Done, vec![]),
+            (SessionState::Idle, false)
+        );
+        // Not kept open: closed once its round has ended, and not before.
+        let once = || Some(header(id, false, false));
+        assert_eq!(
+            state(once(), RunStatus::Done, vec![]),
+            (SessionState::Closed, true)
+        );
+        assert_eq!(
+            state(once(), RunStatus::Failed, vec![]),
+            (SessionState::Closed, true)
+        );
+        assert_eq!(
+            state(once(), RunStatus::Parked, vec![]),
+            (SessionState::Working, false)
+        );
+        // Kept open: idle, until its header says closed or a close request is waiting in the inbox
+        // (a working round is then still working, and takes no more messages).
+        let kept = || Some(header(id, true, false));
+        assert_eq!(
+            state(kept(), RunStatus::Done, vec![]),
+            (SessionState::Idle, false)
+        );
+        assert_eq!(
+            state(Some(header(id, true, true)), RunStatus::Done, vec![]),
+            (SessionState::Closed, true)
+        );
+        assert_eq!(
+            state(kept(), RunStatus::Runnable, vec![close.clone()]),
+            (SessionState::Working, true)
+        );
+        assert_eq!(
+            state(kept(), RunStatus::Done, vec![close]),
+            (SessionState::Closed, true)
+        );
+    }
+
+    #[test]
+    fn rounds_are_ordered_by_their_number_when_timestamps_tie_and_a_close_has_no_report() {
+        let first = RunId::new();
+        let mut ids = [first, RunId::new(), RunId::new()];
+        ids.sort_by_key(|i| std::cmp::Reverse(i.0));
+        // Hashed ids in the reverse order of the rounds, all created in the same instant.
+        let mk = |id: RunId, round: u32, closing: bool, status: RunStatus, err: Option<&str>| {
+            let mut h = header(first, true, closing);
+            h.round = round;
+            h.closing = closing;
+            let mut rec = with_header(id, Some(h), status, vec![]);
+            rec.conversation_id = Some(session_conversation_id("p", first));
+            let mut env = crate::envelope::Envelope::decode(id, &rec.state).unwrap();
+            env.error = err.map(str::to_owned);
+            rec.state = env.encode().unwrap();
+            rec
+        };
+        let runs = vec![
+            mk(ids[2], 3, true, RunStatus::Done, None),
+            mk(ids[0], 1, false, RunStatus::Done, None),
+            mk(ids[1], 2, false, RunStatus::Failed, Some("cancelled: stop")),
+        ];
+        let view = SessionView::from_rounds(first, runs).unwrap();
+        assert_eq!(
+            view.latest_run, ids[2],
+            "the highest round number is the latest"
+        );
+        assert_eq!(
+            view.report_run, ids[1],
+            "the closing round has no report: the last that worked"
+        );
+        assert_eq!(view.latest.status, RunStatus::Failed);
+        assert_eq!(view.round, 3);
+        assert!(view.closed);
+    }
+
+    #[test]
+    fn a_round_that_cannot_be_decoded_closes_its_session() {
+        let id = RunId::new();
+        let mut rec = with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]);
+        rec.state = serde_json::json!("garbage");
+        let read = read_latest(&rec);
+        assert!(read.closed);
+        assert_eq!(read.state, SessionState::Closed);
+    }
+
+    #[test]
+    fn open_sessions_come_before_closed_ones() {
+        let (working, idle, closed) = (RunId::new(), RunId::new(), RunId::new());
+        let mk = |id: RunId, h: SessionHeader, status| {
+            let mut rec = with_header(id, Some(h), status, vec![]);
+            // Closed sessions are the most recently updated: still last.
+            rec.updated_at += chrono::Duration::seconds(if id == closed { 10 } else { 0 });
+            rec
+        };
+        let list = page_of_sessions(
+            "p",
+            rounds(vec![
+                mk(closed, header(closed, false, false), RunStatus::Done),
+                mk(idle, header(idle, true, false), RunStatus::Done),
+                mk(working, header(working, true, false), RunStatus::Runnable),
+            ]),
+            0,
+            10,
+        );
+        assert_eq!(
+            list.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![working, idle, closed]
+        );
+        assert_eq!(list.sessions[0].description, "look");
+        assert!(list.sessions[0].keep_open && !list.sessions[2].keep_open);
     }
 
     #[test]

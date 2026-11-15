@@ -310,6 +310,16 @@ impl CoderAgent {
             // What a call was given and what it answered go into its step: the process's secrets
             // are scrubbed from both first (ADR 0011).
             .step_io(env.redactor.step_io())
+            // The tools that run a subagent in the background are made by the assembly, not wrapped
+            // with the coder's own: what they hand the model (a report) is scrubbed the same way.
+            .scrub({
+                let redactor = env.redactor.clone();
+                move |text| redactor.scrub(text).into_owned()
+            })
+            .scrub_longest({
+                let redactor = env.redactor.clone();
+                move || redactor.longest()
+            })
             .model(model, model_alias)?;
         Ok(Self { assembly, env })
     }

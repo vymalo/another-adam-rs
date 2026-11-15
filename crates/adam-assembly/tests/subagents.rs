@@ -205,7 +205,18 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
         };
         // The parent: its own tool, and one for the subagent, described by the subagent's file.
         assert_eq!(r0.system.as_deref(), Some("You are the root."));
-        assert_eq!(offered(r0), ["parent_only", "researcher"]);
+        assert_eq!(
+            offered(r0),
+            [
+                "parent_only",
+                "researcher",
+                "subagent_start",
+                "subagent_send",
+                "subagent_read",
+                "subagent_close",
+                "subagent_list"
+            ]
+        );
         assert_eq!(
             r0.tools[1].description,
             format!("Researches a topic. {NOTE}")
@@ -332,7 +343,18 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
             .tools
             .clone()
     };
-    assert_eq!(tools_of(&root), ["parent_only", "helper"]);
+    assert_eq!(
+        tools_of(&root),
+        [
+            "parent_only",
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     assert_eq!(tools_of(&format!("{root}/helper")), ["fetch"]);
 
     let rt = runtime_on(&assembly, Arc::new(MemoryStore::new()));
@@ -342,7 +364,18 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
 
     let requests = model.requests();
     // What the model was offered.
-    assert_eq!(offered(&requests[0]), ["parent_only", "helper"]);
+    assert_eq!(
+        offered(&requests[0]),
+        [
+            "parent_only",
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     assert_eq!(offered(&requests[1]), ["fetch"]);
     // The refusal the child's model got, and that the tool did not run.
     let (text, is_error) = last_tool_result(&requests[2], "x1");
@@ -365,7 +398,19 @@ fn a_subagent_does_not_inherit_a_tool_unless_it_lists_it() {
     // The root (no `tools:`) gets everything; the helper with no `tools:` gets nothing.
     let assembly = assemble(&files, tools(&["a", "b"]), &Arc::new(MockModel::new()));
     let info = assembly.info();
-    assert_eq!(info[0].tools, ["a", "b", "helper"]);
+    assert_eq!(
+        info[0].tools,
+        [
+            "a",
+            "b",
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     assert!(info[1].tools.is_empty());
     // And listing one gives it exactly that one.
     let files = with_helper(&root, "", "tools: [b]");
@@ -650,6 +695,36 @@ fn a_subagent_named_like_a_tool_of_its_parent_is_refused() {
 }
 
 #[test]
+fn a_tool_named_like_a_session_tool_is_refused() {
+    let files = with_helper("coder", "", "");
+    let error = bind_error(&files, tools(&["subagent_read"]));
+    let Error::SubagentToolClash {
+        parent,
+        tool,
+        clash,
+        ..
+    } = &error
+    else {
+        panic!("wrong variant: {error}");
+    };
+    assert_eq!((parent.as_str(), tool.as_str()), ("coder", "subagent_read"));
+    assert_eq!(*clash, ToolClash::Tool);
+}
+
+#[test]
+fn only_the_root_gets_the_session_tools() {
+    let files = with_helper("coder", "", "");
+    let assembly = assemble(&files, ToolSet::new(), &Arc::new(MockModel::new()));
+    let info = assembly.info();
+    assert!(info[0].tools.iter().any(|t| t == "subagent_start"));
+    assert!(
+        info[1].tools.iter().all(|t| !t.starts_with("subagent_")),
+        "a subagent's tools: {:?}",
+        info[1].tools
+    );
+}
+
+#[test]
 fn a_registered_tool_the_parent_does_not_list_is_no_clash() {
     let files = with_helper("coder", "tools: [other]", "");
     let assembly = assemble(
@@ -657,7 +732,18 @@ fn a_registered_tool_the_parent_does_not_list_is_no_clash() {
         tools(&["other", "helper"]),
         &Arc::new(MockModel::new()),
     );
-    assert_eq!(assembly.info()[0].tools, ["other", "helper"]);
+    assert_eq!(
+        assembly.info()[0].tools,
+        [
+            "other",
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
 }
 
 #[test]
@@ -688,7 +774,18 @@ fn a_subagent_named_like_a_skill_tool_is_refused() {
     files.pop();
     files.retain(|(path, _)| !path.starts_with("agent/skills"));
     let assembly = assemble(&files, ToolSet::new(), &Arc::new(MockModel::new()));
-    assert_eq!(assembly.info()[0].tools, ["helper", "load_skill"]);
+    assert_eq!(
+        assembly.info()[0].tools,
+        [
+            "helper",
+            "load_skill",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
 }
 
 #[test]
@@ -830,7 +927,18 @@ fn the_root_may_ask_and_a_subagent_that_does_not_is_fine() {
         ToolSet::new().tool(asking("ask_user")).tool(stub("fetch")),
         &Arc::new(MockModel::new()),
     );
-    assert_eq!(assembly.info()[0].tools, ["ask_user", "helper"]);
+    assert_eq!(
+        assembly.info()[0].tools,
+        [
+            "ask_user",
+            "helper",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     assert_eq!(assembly.info()[1].tools, ["fetch"]);
 }
 

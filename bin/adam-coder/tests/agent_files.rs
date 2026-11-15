@@ -95,7 +95,7 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 31] = [
+const TOOLS: [&str; 36] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -127,6 +127,12 @@ const TOOLS: [&str; 31] = [
     "plan_add",
     "explorer",
     "reviewer",
+    // The five that run a subagent in the background (ADR 0045), after the one tool per subagent.
+    "subagent_start",
+    "subagent_send",
+    "subagent_read",
+    "subagent_close",
+    "subagent_list",
 ];
 
 /// A step of the person's activity panel says "Run the checks", never `run_checks`: every tool of
@@ -139,7 +145,7 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     })
     .await;
     let tools = coder_tools(&fx.env);
-    assert_eq!(tools.len(), TOOLS.len() - 2, "the coder's and the screen's");
+    assert_eq!(tools.len(), TOOLS.len() - 7, "the coder's and the screen's");
     let mut titles = Vec::new();
     for tool in tools.iter() {
         let name = tool.spec().name;
@@ -747,8 +753,19 @@ async fn a_folder_may_narrow_the_tools() {
     let agent = coder_from(&files_of(&tmp), &fx, &mock);
     assert_eq!(
         agent.assembly().info()[0].tools,
-        ["run_command", "ask_user", "explorer", "reviewer"],
-        "the tools of the folder's `tools:`, then one per subagent"
+        [
+            "run_command",
+            "ask_user",
+            "explorer",
+            "reviewer",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ],
+        "the tools of the folder's `tools:`, then one per subagent, then the five that run one in \
+         the background"
     );
 }
 
@@ -879,7 +896,10 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
         ]
     );
     assert_eq!(agent.subagents().len(), 3);
-    assert_eq!(info[0].tools.last().map(String::as_str), Some("summariser"));
+    // The subagents' tools, in the order of the files, and the five session tools after them.
+    let tools = &info[0].tools;
+    assert_eq!(tools[tools.len() - 6], "summariser");
+    assert_eq!(tools.last().map(String::as_str), Some("subagent_list"));
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
     run_to_a_stop(&coder, "have it summarised").await;
@@ -1118,8 +1138,8 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     )
     .expect("the folder assembles with its MCP tools");
     let tools = &agent.assembly().info()[0].tools;
-    // The coder's own tools, the server's, then one per subagent.
-    let own = TOOLS.len() - 2;
+    // The coder's own tools, the server's, then one per subagent and the five session tools.
+    let own = TOOLS.len() - 7;
     assert_eq!(tools.len(), TOOLS.len() + 1, "{tools:?}");
     assert_eq!(&tools[..own], &TOOLS[..own]);
     assert_eq!(tools[own], "test__echo");

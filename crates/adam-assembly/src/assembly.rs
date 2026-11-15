@@ -5,12 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
-use adam_llm_agent::{DynToolSource, Limits, LlmAgent, LlmAgentBuilder, StepIo, ToolSource};
+use adam_llm_agent::{
+    DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder, SESSION_TOOLS, StepIo, ToolSource,
+};
 use adam_model::DynModel;
 use adam_runtime::RuntimeBuilder;
 
 use crate::def::{Node, Remote};
 use crate::error::{AliasProblem, Error, Origin};
+use crate::scrub::{Scrub, Scrubbed};
 use crate::suggest::closest;
 
 /// Hands one shared value to an agent under construction.
@@ -31,6 +34,8 @@ pub struct BoundDef {
     aliases: Option<Vec<String>>,
     wait_poll: Option<Duration>,
     step_io: Option<StepIo>,
+    scrub: Option<Scrub>,
+    scrub_longest: Option<crate::scrub::Longest>,
 }
 
 impl std::fmt::Debug for BoundDef {
@@ -62,6 +67,8 @@ impl BoundDef {
             aliases: None,
             wait_poll: None,
             step_io: None,
+            scrub: None,
+            scrub_longest: None,
         }
     }
 
@@ -117,6 +124,29 @@ impl BoundDef {
     #[must_use]
     pub fn step_io(mut self, step_io: StepIo) -> Self {
         self.step_io = Some(step_io);
+        self
+    }
+
+    /// Scrub secrets out of what the tools that run a subagent in the background give the model:
+    /// the report of a session, and every error. The five session tools (`subagent_start` and the
+    /// others, given to an agent that has subagents) are made here, not by the deployment, so the
+    /// deployment's own wrapper around its tools never sees them; this is the same hook for them,
+    /// and `scrub` is what that wrapper would apply (the coder's redactor). Without it the report is
+    /// given as the subagent wrote it. The function is applied to a text and must return the same
+    /// text with its secrets replaced.
+    #[must_use]
+    pub fn scrub(mut self, scrub: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
+        self.scrub = Some(Arc::new(scrub));
+        self
+    }
+
+    /// How long, in bytes, the longest value [`scrub`](Self::scrub) replaces is (the coder's
+    /// `Redactor::longest`): the session tools' [`ToolCtx::scrub_margin`](adam_llm_agent::ToolCtx::scrub_margin)
+    /// is then the same as for the deployment's own tools. A session report is a text a child wrote,
+    /// scrubbed whole; it is never a cut text, so no open edge is kept back for it.
+    #[must_use]
+    pub fn scrub_longest(mut self, longest: impl Fn() -> usize + Send + Sync + 'static) -> Self {
+        self.scrub_longest = Some(Arc::new(longest));
         self
     }
 
@@ -207,6 +237,18 @@ impl BoundDef {
         }
     }
 
+    /// The tool as the agent gets it: a session tool is scrubbed when the deployment gave a scrub.
+    fn guarded(&self, name: &str, tool: &DynTool) -> DynTool {
+        match &self.scrub {
+            Some(scrub) if SESSION_TOOLS.contains(&name) => Arc::new(Scrubbed::new(
+                Arc::clone(tool),
+                Arc::clone(scrub),
+                self.scrub_longest.clone(),
+            )),
+            _ => Arc::clone(tool),
+        }
+    }
+
     /// One `LlmAgent` from one bound node.
     ///
     /// This is the seam the next slices extend. `bind` has already made the prompt and the tool
@@ -233,8 +275,11 @@ impl BoundDef {
         if let Some(step_io) = &self.step_io {
             builder = builder.step_io(step_io.clone());
         }
-        for (_, tool) in &node.tools {
-            builder = builder.dyn_tool(Arc::clone(tool));
+        for (name, tool) in &node.tools {
+            builder = builder.dyn_tool(self.guarded(name, tool));
+        }
+        if !node.session_agents.is_empty() {
+            builder = builder.session_agents(node.session_agents.clone());
         }
         for apply in &self.state {
             builder = apply(builder);

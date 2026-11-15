@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use adam_core::RunId;
 use adam_model::{Message, ToolCall, Usage};
-use adam_runtime::{Inbound, SandboxUsage, UsageTotals};
+use adam_runtime::{Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, UsageTotals};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -53,6 +53,21 @@ pub(crate) fn parse_root_step(payload: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|step| !step.is_empty())
         .map(str::to_owned)
+}
+
+/// The session header a round's first message carries under [`SESSION_STATE_KEY`], if it is there
+/// and reads as one. Written by the session tools only, like [`ROOT_RUN_KEY`].
+pub(crate) fn parse_session(payload: &Value) -> Option<SessionHeader> {
+    serde_json::from_value(payload.get(SESSION_STATE_KEY)?.clone()).ok()
+}
+
+/// Whether an inbound payload asks for a round that only closes its session: `close_session: true`,
+/// which only `subagent_close` writes.
+pub(crate) fn asks_to_close(payload: &Value) -> bool {
+    payload
+        .get("close_session")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The text of an inbound payload: `{"text": "..."}` or a bare JSON string.
@@ -163,13 +178,34 @@ pub struct PendingRemote {
     pub deadline: Option<DateTime<Utc>>,
 }
 
+/// A tool call that waits for the round of a child session to end ([ADR 0045]).
+///
+/// One kind of [`PendingWait`]. The run is parked with a timer. The round's end tells the run
+/// ([`CHILD_REPORTED_KIND`](adam_runtime::CHILD_REPORTED_KIND)), which only wakes it: what it
+/// does next is ask the tool that made the call how the session stands
+/// ([`Tool::poll_remote`](crate::Tool::poll_remote), with the session id as the `task`), in a
+/// journaled step `poll:<call id>`, until the tool answers with the report. The timer is the
+/// guarantee, as for a child run.
+///
+/// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingSession {
+    /// The tool call the report will be returned for.
+    pub call_id: String,
+    /// The tool that waits (`subagent_read`), and that is asked how the session stands.
+    pub tool: String,
+    /// The session: the run id of its first round.
+    pub session: RunId,
+}
+
 /// What a parked run is waiting for, so that one result can complete the call
 /// that owes it.
 ///
 /// Serialized without a tag, by its fields: `{call_id, tool, question}` for a
 /// [`Question`](Self::Question) (the shape the field had when it could only hold
 /// a question), `{call_id, tool, run}` for a [`Run`](Self::Run) and
-/// `{call_id, tool, task}` for a [`Remote`](Self::Remote).
+/// `{call_id, tool, task}` for a [`Remote`](Self::Remote) and `{call_id, tool, session}` for a
+/// [`Session`](Self::Session).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PendingWait {
@@ -179,6 +215,8 @@ pub enum PendingWait {
     Question(PendingQuestion),
     /// The tool started a task on another system; polling it gives the tool result.
     Remote(PendingRemote),
+    /// The tool waits for the round of a child session to end; its report is the tool result.
+    Session(PendingSession),
 }
 
 impl PendingWait {
@@ -188,6 +226,7 @@ impl PendingWait {
             Self::Run(w) => &w.call_id,
             Self::Question(w) => &w.call_id,
             Self::Remote(w) => &w.call_id,
+            Self::Session(w) => &w.call_id,
         }
     }
 }
@@ -438,6 +477,26 @@ pub struct Conversation {
     /// `None`; a run that continues another does not inherit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_step: Option<String>,
+    /// What this round says about its session, when it is a round of one ([ADR 0045]): the header the
+    /// parent's `subagent_start` put in the round's first message, carried into every later round.
+    /// **The truth about a session is its latest round's header.** Absent from state written before
+    /// it existed, and not written while it is `None`.
+    ///
+    /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionHeader>,
+    /// The call ids of the `subagent_start` and `subagent_send` calls of **this task** whose round's
+    /// tokens are not yet in [`usage_totals`](Self::usage_totals) ([ADR 0045]): the round of a call
+    /// is `child_run_id(run, call id)`, so a replay names the same ones. A round is counted once,
+    /// when the report of it is read or, at the latest, when the run ends, in a journaled step
+    /// `usage:<call id>`, and then leaves this list: a report read twice, or never, counts once.
+    /// A call that started no round (a refusal, a steer) names a run that does not exist and leaves
+    /// the list uncounted. Not carried to a later task, which counts afresh. Absent from state
+    /// written before it existed, and not written while empty.
+    ///
+    /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rounds_started: Vec<String>,
     /// The ids (`Inbound::id`, an A2A `messageId`) of the messages the run has read after its first,
     /// the last [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them
     /// (the same one sent twice, as the orchestration layer does after a lost lease) is not read a
@@ -890,6 +949,7 @@ impl Conversation {
             continued_from: Some(from),
             context: self.context.clone(),
             plan: self.plan.clone(),
+            session: self.session.clone(),
             ..Self::default()
         }
     }

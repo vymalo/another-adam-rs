@@ -164,7 +164,21 @@ fn default_tool_access_follows_the_owner_decision_d3() {
     };
     // The root with no `tools:` gets everything, then a tool for each subagent; a subagent with
     // none listed gets none (and not the parent's, nor the parent's subagent tools).
-    assert_eq!(tools_of("coder"), ["a", "b", "all", "none", "quiet"]);
+    assert_eq!(
+        tools_of("coder"),
+        [
+            "a",
+            "b",
+            "all",
+            "none",
+            "quiet",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
     assert!(tools_of("coder/quiet").is_empty());
     assert_eq!(tools_of("coder/all"), ["a", "b"]);
     assert!(tools_of("coder/none").is_empty());
@@ -566,8 +580,14 @@ fn hand_supplied_mcp_tools_bind_like_connected() {
                     "ask_user".to_owned(),
                     // After the tools it selected: a long MCP result is read with it.
                     "read_output".to_owned(),
-                    // The tool that calls the subagent, after the agent's own tools.
-                    "researcher".to_owned()
+                    // The tool that calls the subagent, after the agent's own tools, then the
+                    // five that run a subagent in the background.
+                    "researcher".to_owned(),
+                    "subagent_start".to_owned(),
+                    "subagent_send".to_owned(),
+                    "subagent_read".to_owned(),
+                    "subagent_close".to_owned(),
+                    "subagent_list".to_owned()
                 ]
             ),
             // A subagent inherits nothing, and lists no tools: its own MCP tools are not selected.
@@ -595,7 +615,12 @@ fn hand_supplied_mcp_tools_bind_like_connected() {
                     "ask_user".to_owned(),
                     "linear__list".to_owned(),
                     "read_output".to_owned(),
-                    "researcher".to_owned()
+                    "researcher".to_owned(),
+                    "subagent_start".to_owned(),
+                    "subagent_send".to_owned(),
+                    "subagent_read".to_owned(),
+                    "subagent_close".to_owned(),
+                    "subagent_list".to_owned()
                 ]
             ),
             (

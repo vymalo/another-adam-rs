@@ -148,6 +148,7 @@ mod error;
 mod folder;
 mod mcp;
 mod remote;
+mod scrub;
 mod skills;
 mod subagent;
 mod suggest;

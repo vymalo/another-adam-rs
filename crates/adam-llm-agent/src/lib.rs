@@ -144,6 +144,7 @@ pub mod paging;
 mod plan;
 #[cfg(feature = "schema")]
 mod schema;
+mod sessions;
 mod source;
 mod state;
 mod step_io;
@@ -160,7 +161,7 @@ pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit, LimitKind,
     MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MESSAGE_KIND,
     OMITTED_MARKER_PREFIX, PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun,
-    PendingWait, Repeats, STOPPED_BY_THE_PERSON, user_message,
+    PendingSession, PendingWait, Repeats, STOPPED_BY_THE_PERSON, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
@@ -176,6 +177,11 @@ pub use kept::{
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
+pub use sessions::{
+    MAX_DESCRIPTION_CHARS, MAX_OPEN_SESSIONS, MAX_SESSION_ROUNDS, MAX_TEXT_CHARS,
+    MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_LIST,
+    SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionTools,
+};
 pub use source::{
     DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource, Withheld,
 };

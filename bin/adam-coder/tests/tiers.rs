@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 
 /// The tools of the coder in the order they are offered, with the two subagents, as the model is
 /// shown them at the highest tier.
-const ALL: [&str; 31] = [
+const ALL: [&str; 36] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -70,6 +70,11 @@ const ALL: [&str; 31] = [
     "plan_add",
     "explorer",
     "reviewer",
+    "subagent_start",
+    "subagent_send",
+    "subagent_read",
+    "subagent_close",
+    "subagent_list",
 ];
 
 fn tier_message(text: &str, tier: Option<AccessTier>) -> Inbound {
@@ -182,6 +187,11 @@ async fn the_model_is_shown_only_the_tools_the_tier_of_the_message_allows() {
         "plan_add",
         "explorer",
         "reviewer",
+        "subagent_start",
+        "subagent_send",
+        "subagent_read",
+        "subagent_close",
+        "subagent_list",
     ];
     let edits_drop = [
         "create_repository",

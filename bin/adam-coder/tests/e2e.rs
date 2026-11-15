@@ -492,7 +492,12 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "plan_check",
             "plan_add",
             "explorer",
-            "reviewer"
+            "reviewer",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
         ]
     );
 }
@@ -4123,7 +4128,7 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 8..],
+        offered[offered.len() - 13..],
         [
             "ask_user",
             "show",
@@ -4132,7 +4137,12 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
             "plan_check",
             "plan_add",
             "explorer",
-            "reviewer"
+            "reviewer",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
         ],
         "{offered:?}"
     );
@@ -4233,8 +4243,17 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 3..],
-        ["explorer", "reviewer", "relay__search"],
+        offered[offered.len() - 8..],
+        [
+            "explorer",
+            "reviewer",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list",
+            "relay__search"
+        ],
         "the endpoint's tools come after the coder's own and its subagents': {offered:?}"
     );
     assert!(

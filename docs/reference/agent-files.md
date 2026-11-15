@@ -539,6 +539,14 @@ as `<root>/<sub>`; the parent sees **one tool per subagent** (D5) with input `{ 
 sees the parent's history. The sequence and the states of the wait are in
 [Architecture](../architecture.md#child-runs).
 
+### The session tools
+
+A root with a local subagent also gets five tools that run a subagent **in the background** as a session
+(`subagent_start`, `subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`; [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md),
+[child runs](child-runs.md#sessions-adr-0045-slices-1-and-2)). No file declares them: they follow the folder's subagents,
+whose names are the enum of `agent`, and they are not given to a subagent. A subagent file needs nothing for them; a remote
+(`a2a:`) subagent is refused by `subagent_start` in words. A tool or a subagent named like one of the five is refused at bind.
+
 ### The subagent tool
 
 * **Name and shape.** Named after the subagent. Input `{ "message": string }`, required. Description: the
