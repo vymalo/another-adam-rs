@@ -130,6 +130,7 @@ mod sandbox;
 pub mod scratch;
 pub mod share;
 pub mod shell;
+pub mod skills;
 
 pub use notes::{NotesStore, RunNotes};
 

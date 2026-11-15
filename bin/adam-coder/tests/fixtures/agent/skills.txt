@@ -1,0 +1,1 @@
+Other skills may be listed to you during the run, named `<source>/<skill>`; load them with load_skill the same way.

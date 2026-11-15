@@ -202,6 +202,14 @@ pub async fn prepare_workspace(
         text.push('\n');
         text.push_str(&note);
     }
+    // The skills the repository ships, before its instructions: a result that ends with the
+    // instructions block stays that way (see `skills`). Absent when the folder says `skills: []`.
+    if let Some(skills) = ctx.state::<super::skills::RepoSkills>()
+        && let Some(block) = skills.at_prepare(ctx, &slot).await?
+    {
+        text.push_str("\n\n");
+        text.push_str(&block);
+    }
     // What the repository says about itself, as the result of this call and not as a message: it
     // is the repository's text, never the person's (see `project`).
     if let Some(block) = super::project::at_prepare(&env, ctx, &slot).await? {

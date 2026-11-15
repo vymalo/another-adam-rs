@@ -491,6 +491,8 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "plan_work",
             "plan_check",
             "plan_add",
+            "load_skill",
+            "read_skill_file",
             "explorer",
             "reviewer",
             "subagent_start",
@@ -4128,7 +4130,7 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 13..],
+        offered[offered.len() - 15..],
         [
             "ask_user",
             "show",
@@ -4136,6 +4138,8 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
             "plan_work",
             "plan_check",
             "plan_add",
+            "load_skill",
+            "read_skill_file",
             "explorer",
             "reviewer",
             "subagent_start",

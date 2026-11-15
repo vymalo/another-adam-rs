@@ -30,6 +30,7 @@ use crate::tools::consent::{
 use crate::tools::named::{key_of_argument, listed, without_untrusted};
 use crate::tools::notes::{Consent, Heard, PushedBranch, RunNotes, When};
 use crate::tools::publish::{COMMIT_AND_PUSH, pushed_in};
+use crate::tools::skills::{self, RepoSkills};
 use crate::tools::{ToolEnv, coder_tools};
 
 /// The agent's name, as stored in `RunRecord::agent`. It is the `name` in `agent/instructions.md`
@@ -294,7 +295,16 @@ impl CoderAgent {
         } else {
             def
         };
-        let assembly = def
+        // The skills of the repositories the run prepares: listed in the result of
+        // `prepare_workspace` and loaded by `load_skill`, which then always exists (ADR 0044,
+        // decision 8). `skills: []` turns all of it off.
+        let repo_skills =
+            (!skills::skills_off(def.manifest())).then(|| Arc::new(RepoSkills::new(env.clone())));
+        let def = match &repo_skills {
+            Some(found) => def.run_skills(found.clone()),
+            None => def,
+        };
+        let bound = def
             .var("max_check_cycles", env.settings.max_check_cycles)
             .bind(tools.into_iter().collect::<ToolSet>())?
             // The tools of the conversation's endpoint, offered at every model turn.
@@ -319,8 +329,13 @@ impl CoderAgent {
             .scrub_longest({
                 let redactor = env.redactor.clone();
                 move || redactor.longest()
-            })
-            .model(model, model_alias)?;
+            });
+        // Where `prepare_workspace` finds it: absent, nothing of a repository's skills is listed.
+        let bound = match repo_skills {
+            Some(found) => bound.state(found),
+            None => bound,
+        };
+        let assembly = bound.model(model, model_alias)?;
         Ok(Self { assembly, env })
     }
 

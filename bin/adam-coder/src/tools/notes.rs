@@ -466,6 +466,38 @@ pub struct RunNotes {
     /// the run is shown ([`MAX_NESTED_INSTRUCTIONS`]). The same call says it again (a retry).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions_cap_noted: Option<String>,
+    /// The skills of each prepared repository that `prepare_workspace` listed to this run's model,
+    /// by slot, with the id of the call that listed them. Written by `prepare_workspace`, in the
+    /// notes of the run that made the call. A call with the recorded id lists them again, from
+    /// this record and not from the file system (a retry of a step whose result was not journaled
+    /// gives the same bytes); any other prepare of the slot lists nothing. `load_skill` and
+    /// `read_skill_file` take only the names recorded here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repo_skills: BTreeMap<String, RepoSkillsNote>,
+}
+
+/// One skill of a repository, as `prepare_workspace` listed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSkill {
+    /// The skill's name: its directory's name, which passes `is_skill_name`.
+    pub name: String,
+    /// Where it was found, from the slot's root, as spelled in the listing (`.agents/skills/x`).
+    pub dir: String,
+    /// Its description as shown: scrubbed, on one line, cut.
+    pub description: String,
+}
+
+/// What `prepare_workspace` listed of a repository's skills (see [`RunNotes::repo_skills`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSkillsNote {
+    /// The call that listed them.
+    pub call_id: String,
+    /// The skills listed, in the order of the listing.
+    pub skills: Vec<RepoSkill>,
+    /// Each skill directory that was found and not listed, and why, in one line.
+    pub skipped: Vec<String>,
+    /// How many more were not listed, for want of room.
+    pub more: u32,
 }
 
 /// Most directories below a slot's root whose instruction files a run is shown (a root does not
