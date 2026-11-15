@@ -12,6 +12,7 @@ rust-version.workspace = true
 adam-error.workspace = true
 a2a-lf.workspace = true
 adam-a2a = { path = "../adam-a2a", version = "0.1.0" }
+adam-agent-fs.workspace = true
 adam-core.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true

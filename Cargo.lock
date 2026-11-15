@@ -151,6 +151,7 @@ dependencies = [
  "a2a-client-lf",
  "a2a-lf",
  "adam-a2a",
+ "adam-agent-fs",
  "adam-core",
  "adam-error",
  "adam-llm-agent",

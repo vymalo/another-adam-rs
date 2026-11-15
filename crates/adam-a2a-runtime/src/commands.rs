@@ -9,9 +9,14 @@
 //!   text, trimmed, is the arguments. A `/word` that is not a command is plain text, so "/tmp is
 //!   full" still reaches the agent as it was written. `//<name>`, for a command the agent serves,
 //!   is the literal text `/<name>`: one slash is dropped and nothing is expanded.
+//! * A message that carries a form's answer (an A2UI `action` part) is never a command: its text is
+//!   not read as `/name`, and a metadata command beside it is `invalid params`.
 //! * The expansion is plain substitution in one pass: `$ARGUMENTS` is the trimmed argument string,
 //!   `$1` to `$9` the arguments split on whitespace with double quotes respected (a missing one is
-//!   empty). What is substituted is never read again, and nothing is executed.
+//!   empty; a digit after is literal, so `$10` is `$1` and `0`), `$$` is one literal `$` (so `$$1`
+//!   is the text `$1`) and any other `$` is literal. What is substituted is never read again, and
+//!   nothing is executed. Every line of the result that begins as a form's answer is marked
+//!   `(typed)`, a template's own line included.
 //! * It happens here, in the request, right after the inbound function: the expanded text is the
 //!   payload's text and `command: {name, arguments}` is kept beside it. The inbound is what is
 //!   stored, so a replay never expands again and a later edit of the folder changes no old run.
@@ -37,6 +42,18 @@ pub struct Commands {
 }
 
 impl Commands {
+    /// The commands of an agent's manifest (`commands/<name>.md`): the one place a manifest becomes
+    /// what the backend expands, for `adam-agent` and `adam-coder` alike, so the card
+    /// (`adam-assembly`'s `card_of`, from the same manifest) and the backend cannot list different
+    /// commands. It lives here because this is the lowest crate that has both types.
+    pub fn from_manifest(commands: &[adam_agent_fs::Command]) -> Self {
+        Self::new(
+            commands
+                .iter()
+                .map(|c| (c.name.as_str(), c.template.as_str())),
+        )
+    }
+
     /// The commands `(name, template)`. A name given twice keeps the last.
     pub fn new<N: Into<String>, T: Into<String>>(items: impl IntoIterator<Item = (N, T)>) -> Self {
         Self {
@@ -59,7 +76,8 @@ impl Commands {
 
     fn unknown(&self, name: &str) -> String {
         format!(
-            "unknown command `{name}`; this agent serves: {}",
+            "unknown command `{}`; this agent serves: {}",
+            shown(name),
             self.templates
                 .keys()
                 .map(String::as_str)
@@ -91,7 +109,10 @@ impl Commands {
         while let Some(at) = rest.find('$') {
             out.push_str(&rest[..at]);
             let after = &rest[at + 1..];
-            if let Some(tail) = after.strip_prefix("ARGUMENTS") {
+            if let Some(tail) = after.strip_prefix('$') {
+                out.push('$');
+                rest = tail;
+            } else if let Some(tail) = after.strip_prefix("ARGUMENTS") {
                 out.push_str(arguments);
                 rest = tail;
             } else if let Some(digit) = after.bytes().next().filter(|b| matches!(b, b'1'..=b'9')) {
@@ -119,6 +140,17 @@ impl Commands {
         }
         Ok(out)
     }
+}
+
+/// A name a client sent, as an error may repeat it: at most 64 characters, escaped.
+fn shown(name: &str) -> String {
+    let cut: String = name.chars().take(64).collect();
+    let more = if name.chars().nth(64).is_some() {
+        "…"
+    } else {
+        ""
+    };
+    format!("{}{more}", cut.escape_debug())
 }
 
 fn too_long(name: &str) -> String {
@@ -220,6 +252,9 @@ fn named(message: &Message, commands: &Commands) -> Result<Option<(String, Strin
     if !commands.contains(name) {
         return Err(commands.unknown(name));
     }
+    if arguments.contains('\0') {
+        return Err("the arguments of the command hold a NUL character".to_owned());
+    }
     Ok(Some((name.to_owned(), arguments.to_owned())))
 }
 
@@ -247,12 +282,19 @@ pub(crate) fn apply(
     commands: &Commands,
     activated: bool,
 ) -> Result<(), String> {
-    let reading = match activated
+    // A form's answer is the person's click, never a typed command: its text is not read as
+    // `/name`, and a command named beside it is refused rather than dropped or merged.
+    let answers_form = crate::vymalo::carries_form_answer(message);
+    let by_metadata = activated
         .then(|| named(message, commands))
         .transpose()?
-        .flatten()
-    {
+        .flatten();
+    let reading = match by_metadata {
+        Some(_) if answers_form => {
+            return Err("a message that answers a form cannot also name a command".to_owned());
+        }
         Some((name, arguments)) => Reading::Command { name, arguments },
+        None if answers_form => Reading::Plain,
         None => match text_of(&inbound.payload) {
             Some(text) => slash(text, commands),
             None => Reading::Plain,
@@ -331,7 +373,7 @@ mod tests {
         );
         assert_eq!(
             c.expand("pair", "one two").unwrap(),
-            "two then one,  missing, cost  and $$ and $0 and $"
+            "two then one,  missing, cost  and $ and $0 and $"
         );
         assert_eq!(c.expand("echo", "  padded  ").unwrap(), "[padded]");
     }
@@ -473,5 +515,136 @@ mod tests {
         // No arguments is empty arguments.
         let p = applied("x", Some(json!({"command": "echo"})), true).unwrap();
         assert_eq!(p["text"], "[]");
+    }
+
+    #[test]
+    fn the_placeholder_grammar_is_the_documented_one() {
+        let nine = (1..=9)
+            .map(|n| format!("a{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expand = |template: &str, arguments: &str| {
+            Commands::new([("t", template)])
+                .expand("t", arguments)
+                .unwrap()
+        };
+        // `$1` to `$9`.
+        assert_eq!(expand("$9", &nine), "a9");
+        assert_eq!(expand("$1 $5", &nine), "a1 a5");
+        // One digit: `$10` is `$1` then `0`.
+        assert_eq!(expand("$10", &nine), "a10");
+        // `$$` is one `$`, so `$$1` is the text `$1` and `$$$1` is `$` and the first argument.
+        assert_eq!(expand("$$1", &nine), "$1");
+        assert_eq!(expand("$$$1", &nine), "$a1");
+        assert_eq!(expand("$$ARGUMENTS", "x"), "$ARGUMENTS");
+        // `$ARGUMENTSX` is the arguments then `X`; the rest of `$` is literal.
+        assert_eq!(expand("$ARGUMENTSX", "x"), "xX");
+        assert_eq!(expand("$0 $a $ $", "x"), "$0 $a $ $");
+        assert_eq!(expand("cost: 5$", "x"), "cost: 5$");
+    }
+
+    #[test]
+    fn a_name_in_an_error_is_cut_and_escaped() {
+        let long = "n".repeat(500);
+        let err = commands().expand(&long, "").unwrap_err();
+        assert!(err.contains(&"n".repeat(64)), "{err}");
+        assert!(!err.contains(&"n".repeat(65)), "{err}");
+        assert!(err.contains("…"), "{err}");
+        let err = commands().expand("a\u{1b}[31m\nb", "").unwrap_err();
+        assert!(!err.contains('\u{1b}') && !err.contains('\n'), "{err:?}");
+        assert!(err.contains("\\u{1b}") && err.contains("\\n"), "{err}");
+        // The same through the metadata member.
+        let err = applied("x", Some(json!({"command": "evil\u{7}"})), true).unwrap_err();
+        assert!(!err.contains('\u{7}'), "{err:?}");
+    }
+
+    #[test]
+    fn a_nul_in_metadata_arguments_is_refused() {
+        let err = applied(
+            "x",
+            Some(json!({"command": "echo", "arguments": "a\u{0}b"})),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.contains("NUL"), "{err}");
+    }
+
+    #[test]
+    fn metadata_arguments_are_trimmed_in_what_is_stored() {
+        let p = applied(
+            "x",
+            Some(json!({"command": "echo", "arguments": "  x  "})),
+            true,
+        )
+        .unwrap();
+        assert_eq!(p["command"], json!({"name": "echo", "arguments": "x"}));
+        assert_eq!(p["text"], "[x]");
+        // The slash form stores the same.
+        let q = applied("/echo   x  ", None, false).unwrap();
+        assert_eq!(q["command"], p["command"]);
+    }
+
+    #[test]
+    fn metadata_wins_over_the_text_form_of_the_same_message() {
+        let p = applied(
+            "/review b",
+            Some(json!({"command": "echo", "arguments": "a"})),
+            true,
+        )
+        .unwrap();
+        assert_eq!(p["text"], "[a]");
+        assert_eq!(p["command"], json!({"name": "echo", "arguments": "a"}));
+    }
+
+    #[test]
+    fn an_expansion_of_only_whitespace_is_refused() {
+        let c = Commands::new([("b", " \n$ARGUMENTS")]);
+        let err = c.expand("b", "").unwrap_err();
+        assert!(err.contains("needs arguments"), "{err}");
+        assert_eq!(c.expand("b", "x").unwrap(), " \nx");
+    }
+
+    #[test]
+    fn the_final_size_check_bounds_a_template_that_is_long_by_itself() {
+        // The substitutions stay small; only the template's tail takes the result over the limit.
+        let c = Commands::new([(
+            "t",
+            format!("$ARGUMENTS{}", "y".repeat(MAX_COMMAND_EXPANSION)),
+        )]);
+        let err = c.expand("t", "x").unwrap_err();
+        assert!(err.contains("more than 32768"), "{err}");
+        let fits = Commands::new([(
+            "t",
+            format!("$ARGUMENTS{}", "y".repeat(MAX_COMMAND_EXPANSION - 1)),
+        )]);
+        assert_eq!(fits.expand("t", "x").unwrap().len(), MAX_COMMAND_EXPANSION);
+    }
+
+    #[test]
+    fn a_plain_string_payload_is_handled() {
+        let m = message("/echo hi", None);
+        let mut inbound = Inbound::new("message", json!("/echo hi"));
+        apply(&m, &mut inbound, &commands(), false).unwrap();
+        assert_eq!(
+            inbound.payload,
+            json!({"text": "[hi]", "command": {"name": "echo", "arguments": "hi"}})
+        );
+        // Not a command: left as the string it was.
+        let mut plain = Inbound::new("message", json!("hello"));
+        apply(&message("hello", None), &mut plain, &commands(), false).unwrap();
+        assert_eq!(plain.payload, json!("hello"));
+    }
+
+    #[test]
+    fn a_manifests_commands_are_the_backends() {
+        let manifest = [adam_agent_fs::Command {
+            name: "go".into(),
+            description: "d".into(),
+            argument_hint: None,
+            template: "Go $1".into(),
+            path: "commands/go.md".into(),
+        }];
+        let from = Commands::from_manifest(&manifest);
+        assert_eq!(from, Commands::new([("go", "Go $1")]));
     }
 }

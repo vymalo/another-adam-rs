@@ -621,3 +621,105 @@ async fn a2a_docs_false_turns_the_docs_off() {
     }
     running.finish().await;
 }
+
+/// `Agents::commands` reaches the backend through `serve` itself: a message `/name x` is stored as
+/// the expansion, and the card lists `commands/v1` exactly when commands were given.
+#[tokio::test]
+async fn serve_expands_the_commands_it_is_given_and_the_card_lists_them() {
+    use std::sync::Arc;
+
+    use a2a::{GetTaskRequest, SendMessageRequest, SendMessageResponse};
+    use a2a_client::A2AClientFactory;
+    use a2a_client::agent_card::AgentCardResolver;
+    use a2a_client::auth::AuthInterceptor;
+    use adam_a2a::{COMMANDS_EXTENSION, CommandInfo, ExtensionConfig};
+    use adam_a2a_runtime::Commands;
+
+    let Some(url) = database() else { return };
+
+    for served in [true, false] {
+        let name = unique("serve-commands");
+        let port = free_port().await;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let cfg = config(&url, "all", port);
+        let mut card = AgentCardConfig::new(
+            &name,
+            "A test agent.",
+            format!("http://{addr}/").parse().unwrap(),
+            "0.0.1",
+        );
+        let mut agents = agents(&name, &cfg);
+        if served {
+            let info = CommandInfo {
+                name: "echo".into(),
+                description: "Echo.".into(),
+                argument_hint: None,
+            };
+            card = card.with_extension(ExtensionConfig::commands(&[info]).unwrap());
+            agents = agents.commands(Commands::new([("echo", "[$ARGUMENTS]")]));
+        }
+        let running = Running::start(cfg, agents.card(card));
+        until_ok(addr, "/healthz", &running.handle).await;
+
+        let public = AgentCardResolver::new(None)
+            .resolve(&format!("http://{addr}"))
+            .await
+            .unwrap();
+        let listed = public
+            .capabilities
+            .extensions
+            .as_ref()
+            .is_some_and(|all| all.iter().any(|e| e.uri == COMMANDS_EXTENSION));
+        assert_eq!(
+            listed, served,
+            "the card lists the extension iff commands are served"
+        );
+
+        let client = A2AClientFactory::builder()
+            .with_interceptor(Arc::new(AuthInterceptor::bearer("serve-test-token")))
+            .build()
+            .create_from_card(&public)
+            .await
+            .unwrap();
+        let sent = client
+            .send_message(&SendMessageRequest {
+                message: Message::new(Role::User, vec![Part::text("/echo x")]),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let SendMessageResponse::Task(task) = sent else {
+            panic!("expected a task")
+        };
+        let mut answer = None;
+        for _ in 0..600 {
+            let got = client
+                .get_task(&GetTaskRequest {
+                    id: task.id.clone(),
+                    history_length: None,
+                    tenant: None,
+                })
+                .await
+                .unwrap();
+            if got.status.state == TaskState::Completed {
+                answer = got
+                    .status
+                    .message
+                    .as_ref()
+                    .and_then(Message::text)
+                    .map(str::to_owned);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let wanted = if served {
+            format!("{name} says: [x]")
+        } else {
+            format!("{name} says: /echo x")
+        };
+        assert_eq!(answer.as_deref(), Some(wanted.as_str()), "served: {served}");
+        running.finish().await;
+    }
+}

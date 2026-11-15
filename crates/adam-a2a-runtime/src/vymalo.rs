@@ -142,6 +142,14 @@ pub(crate) fn typed_text(text: &str) -> String {
         .collect()
 }
 
+/// Whether `message` carries a form's answer: an A2UI part with an `action`.
+pub(crate) fn carries_form_answer(message: &Message) -> bool {
+    message.parts.iter().any(|part| {
+        matches!(&part.content, PartContent::Data(data)
+            if claims_a2ui(part) && !action_texts(data).is_empty())
+    })
+}
+
 /// Whether `part` says it carries A2UI: the A2A 1.0 `mediaType`, or the extension's
 /// `metadata.mimeType`, is `application/a2ui+json` (parameters and case ignored).
 pub(crate) fn claims_a2ui(part: &Part) -> bool {

@@ -40,14 +40,6 @@ pub(crate) fn embedded_commands() -> adam_a2a_runtime::Commands {
     adam_a2a_runtime::Commands::new(AGENT.commands.iter().map(|c| (c.name, c.template)))
 }
 
-fn commands_of(commands: &[adam::agent_fs::Command]) -> adam_a2a_runtime::Commands {
-    adam_a2a_runtime::Commands::new(
-        commands
-            .iter()
-            .map(|c| (c.name.as_str(), c.template.as_str())),
-    )
-}
-
 /// Why the agent files cannot be used. Always [`ErrorClass::Invalid`]: the same folder never
 /// works, so a supervisor must not restart the process (exit code 78).
 #[derive(Debug, thiserror::Error)]
@@ -189,7 +181,9 @@ impl AgentFiles {
     pub fn commands(&self) -> adam_a2a_runtime::Commands {
         match self {
             Self::Embedded => embedded_commands(),
-            Self::Folder(folder) => commands_of(&folder.def.manifest().commands),
+            Self::Folder(folder) => {
+                adam_a2a_runtime::Commands::from_manifest(&folder.def.manifest().commands)
+            }
         }
     }
 
