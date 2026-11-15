@@ -4982,8 +4982,9 @@ mod cases {
 
         // Two hours of waiting for the answer.
         for _ in 0..2 {
-            clock.advance(Duration::from_secs(60 * 60));
+            // The version is read before the clock moves, so the look it causes is the one waited for.
             let seen = rt.view(child).await.unwrap().unwrap().version;
+            clock.advance(Duration::from_secs(60 * 60));
             wait_for(&rt, child, "looked at", |v| v.version > seen).await;
         }
         assert_eq!(
