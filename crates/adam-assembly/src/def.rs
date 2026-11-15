@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use adam_agent_fs::{
     AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
-    ManifestSource, McpConfig, ModelRef, Strictness, Subagent, ToolList,
+    ManifestSource, McpConfig, ModelRef, SkillSelection, Strictness, Subagent, ToolList,
 };
 use adam_llm_agent::{DynTool, Limits, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet};
 use secrecy::SecretString;
@@ -17,7 +17,7 @@ use crate::assembly::BoundDef;
 use crate::error::{Error, Origin, ToolClash};
 use crate::mcp::{self, McpBinding};
 use crate::remote::{RemoteSettings, RemoteSubagentTool};
-use crate::skills::{self, SkillFiles};
+use crate::skills::{self, RunSkills, RunSkillsHandle, SkillFiles, SkillSet};
 use crate::subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 use crate::suggest::closest;
 use crate::template::{self, Piece};
@@ -108,6 +108,8 @@ pub struct AgentDef {
     remote: RemoteSettings,
     /// The MCP tools of each agent: connected from its `mcp.json`, or supplied by hand.
     mcp: McpBinding,
+    /// The skills the root's run finds on the way ([`run_skills`](Self::run_skills)).
+    run_skills: Option<RunSkillsHandle>,
 }
 
 impl AgentDef {
@@ -125,6 +127,7 @@ impl AgentDef {
             files,
             remote: RemoteSettings::default(),
             mcp: McpBinding::default(),
+            run_skills: None,
         })
     }
 
@@ -312,6 +315,21 @@ impl AgentDef {
         self
     }
 
+    /// Let the **root** agent load skills that its run finds on the way (the skills of a
+    /// repository it prepared), through `skills`: a name with a `/` (`<source>/<skill>`) goes to
+    /// it, a name without never does. With it set the root always has `load_skill` and
+    /// `read_skill_file`, and its prompt gets one fixed sentence about them (also when the folder
+    /// has no skill of its own), so what a run finds is a tool result and never changes the
+    /// system prompt or the tool list. Subagents get none. `skills: []` in the root's
+    /// frontmatter turns skills off altogether: no tool, no sentence, and `skills` is never called.
+    ///
+    /// Calling this again replaces it.
+    #[must_use]
+    pub fn run_skills(mut self, skills: Arc<dyn RunSkills>) -> Self {
+        self.run_skills = Some(RunSkillsHandle(skills));
+        self
+    }
+
     /// Give an agent the tools of its MCP servers, made by code of your own: a client other than
     /// `adam-mcp`, or a test double. `agent` is the name the agent is registered under (`coder`,
     /// `coder/researcher`); each tool must be named `<server>__<tool>` after a server of **that
@@ -447,6 +465,7 @@ impl AgentDef {
             files: &self.files,
             remote: &self.remote,
             mcp: &self.mcp,
+            run_skills: self.run_skills.as_ref(),
             nodes: Vec::new(),
             remotes: Vec::new(),
         };
@@ -539,6 +558,8 @@ struct Walk<'a> {
     files: &'a SkillFiles,
     remote: &'a RemoteSettings,
     mcp: &'a McpBinding,
+    /// What the root's run finds ([`AgentDef::run_skills`]); a subagent has none.
+    run_skills: Option<&'a RunSkillsHandle>,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -576,8 +597,14 @@ impl Walk<'_> {
             ));
         }
         let registered = tools.len();
-        let (skills, preloaded) =
-            add_skills(&origin, manifest, self.files, &mut prompt, &mut tools)?;
+        let (skills, preloaded) = add_skills(
+            &origin,
+            manifest,
+            self.files,
+            self.run_skills.filter(|_| parent.is_none()),
+            &mut prompt,
+            &mut tools,
+        )?;
         // The tools `add_skills` appended, so a clash can say whose tool it hit.
         let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
         let mcp_names: Vec<String> = own_mcp.iter().map(|(n, _)| n.clone()).collect();
@@ -695,14 +722,23 @@ fn add_skills(
     origin: &Origin,
     manifest: &AgentManifest,
     files: &SkillFiles,
+    run: Option<&RunSkillsHandle>,
     prompt: &mut String,
     tools: &mut Vec<(String, DynTool)>,
 ) -> Result<(Vec<String>, Vec<String>), Error> {
-    let Some(set) = skills::resolve(origin, manifest, files)? else {
-        return Ok((Vec::new(), Vec::new()));
+    // `skills: []` is off for everything: what the run finds too.
+    let off = matches!(
+        &manifest.frontmatter.skills,
+        Some(SkillSelection::Named(names)) if names.is_empty()
+    );
+    let run = run.filter(|_| !off);
+    let set = match skills::resolve(origin, manifest, files)? {
+        Some(set) => set,
+        None if run.is_some() => SkillSet::empty(),
+        None => return Ok((Vec::new(), Vec::new())),
     };
     let set = Arc::new(set);
-    let added = set.tools();
+    let added = set.tools(run);
     for tool in &added {
         let name = tool.spec().name;
         if tools.iter().any(|(n, _)| *n == name) {
@@ -713,9 +749,9 @@ fn add_skills(
         }
     }
     tools.extend(added.into_iter().map(|tool| (tool.spec().name, tool)));
-    let section = set.prompt_section();
+    let section = set.prompt_section(run.is_some());
     // A prompt is never empty (the loader refuses an agent without instructions), and a set
-    // with skills always has a section.
+    // with skills, or an agent given `RunSkills`, always has a section.
     prompt.push_str("\n\n");
     prompt.push_str(&section);
     Ok((set.names(), set.preloaded()))

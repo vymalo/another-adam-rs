@@ -312,7 +312,10 @@ impl SkillSet {
     ///   </skill>
     /// </available_skills>
     /// ```
-    pub(crate) fn prompt_section(&self) -> String {
+    ///
+    /// With `run` (the agent has [`RunSkills`]) the section ends with [`OTHER_SKILLS`], and an agent
+    /// with no skill of its own has that sentence alone.
+    pub(crate) fn prompt_section(&self, run: bool) -> String {
         let mut sections: Vec<String> = Vec::new();
         if self.has_load_tool() {
             let mut s = String::from(
@@ -362,21 +365,34 @@ impl SkillSet {
             }
             sections.push(s);
         }
+        if run {
+            sections.push(OTHER_SKILLS.to_owned());
+        }
         sections.join("\n\n")
     }
 
+    /// A set with no skill: what an agent that is only given [`RunSkills`] has.
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
     /// The tools this set adds: `load_skill` when a skill is left to load, and `read_skill_file`
-    /// when a selected skill bundles a file.
-    pub(crate) fn tools(self: &Arc<Self>) -> Vec<DynTool> {
+    /// when a selected skill bundles a file. With `run` both are always there, so that the tool
+    /// list never depends on what a run finds.
+    pub(crate) fn tools(self: &Arc<Self>, run: Option<&RunSkillsHandle>) -> Vec<DynTool> {
         let mut tools: Vec<DynTool> = Vec::new();
-        if self.has_load_tool() {
+        if run.is_some() || self.has_load_tool() {
             tools.push(Arc::new(LoadSkill {
                 set: Arc::clone(self),
+                run: run.cloned(),
             }));
         }
-        if self.has_read_tool() {
+        if run.is_some() || self.has_read_tool() {
             tools.push(Arc::new(ReadSkillFile {
                 set: Arc::clone(self),
+                run: run.cloned(),
             }));
         }
         tools
@@ -720,8 +736,157 @@ fn window_of(args: &Value) -> Result<(i64, u32), SkillError> {
     window_args(number("offset"), number("limit"), PAGE_LINES).map_err(SkillError::Window)
 }
 
+/// The sentence a prompt gets when its agent is given [`RunSkills`] (also when the agent has no
+/// skill of its own): fixed, so that the prompt never depends on what a run finds.
+pub(crate) const OTHER_SKILLS: &str = "Other skills may be listed to you during the run, named \
+     `<source>/<skill>`; load them with load_skill the same way.";
+
+/// Skills a run finds on the way, which the agent's folder does not hold: the skills of a
+/// repository the coder prepared, for instance. Set on the root agent with
+/// [`AgentDef::run_skills`](crate::AgentDef::run_skills).
+///
+/// With it set, `load_skill` and `read_skill_file` are always among the root's tools and its
+/// prompt always has one fixed sentence, so what a run finds changes **tool results only**: the
+/// system prompt and the tool list stay the same bytes for the whole run, and the prefix of the
+/// provider's cache holds.
+///
+/// A name that has a `/` (`<source>/<skill>`) is the implementation's; a name without one never
+/// reaches it, so what a run finds cannot shadow a skill of the folder. The assembly has already
+/// checked the window: `offset` from 1 or negative (from the end), `limit` at most 2,000.
+///
+/// An implementation must be deterministic for what it listed (the same call, the same bytes: a
+/// retried step of the run is answered from what it recorded, not from the file system as it is
+/// now), keep what it reads inside the skill's directory, treat the text it reads as untrusted
+/// (a skill grants no tool and no consent) and answer a refusal as `Ok(ToolOutput::error(..))`,
+/// never as an `Err`: only a failure worth retrying is [`ToolError::Transient`]. See
+/// [`run_skills_conformance`].
+#[async_trait]
+pub trait RunSkills: Send + Sync {
+    /// The result of `load_skill { name, offset, limit }` for a `name` with a `/`.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::Transient`] when the answer could not be made now and may be later. An unknown
+    /// name, a bad window and anything else the model can correct is `Ok` with `is_error` set.
+    async fn load(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<ToolOutput, ToolError>;
+
+    /// The result of `read_skill_file { skill, path, offset, limit }` for a `skill` with a `/`.
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Self::load).
+    async fn read(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        path: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<ToolOutput, ToolError>;
+}
+
+/// A [`RunSkills`] an [`AgentDef`](crate::AgentDef) holds.
+#[derive(Clone)]
+pub(crate) struct RunSkillsHandle(pub(crate) Arc<dyn RunSkills>);
+
+impl std::fmt::Debug for RunSkillsHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RunSkills")
+    }
+}
+
+/// The conformance of a [`RunSkills`]: what the two tools rely on. `listed` is the name
+/// (`<source>/<skill>`) of a skill the implementation lists for `ctx`. Call it from a test of an
+/// implementation (it panics on a violation).
+///
+/// It checks that a skill loads and its result ends with the paging line (`[more: ...]` or
+/// `[end: ...]`); that the same call gives the same bytes; that an offset past the end, an
+/// unknown name, a name without `/` and a path that leaves the skill's directory or is absolute or
+/// missing are refused as results with `is_error`, not as errors.
+///
+/// # Panics
+///
+/// When `skills` does not behave as the trait says.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub async fn run_skills_conformance(skills: &dyn RunSkills, ctx: &ToolCtx, listed: &str) {
+    assert!(
+        listed.contains('/') && is_skill_name_of(listed),
+        "`listed` must be `<source>/<skill>`: {listed}"
+    );
+
+    let first = skills.load(ctx, listed, 1, PAGE_LINES).await.unwrap();
+    assert!(!first.is_error, "a listed skill loads: {}", first.content);
+    let last = first.content.rsplit('\n').next().unwrap();
+    assert!(
+        last.starts_with('[')
+            && last.ends_with(']')
+            && (last.contains("more:") || last.contains("end:")),
+        "a result ends with the paging line: {last:?}"
+    );
+    assert_eq!(
+        first.content.matches("\n[").count() + usize::from(first.content.starts_with('[')),
+        1,
+        "only the paging line starts with `[`: {}",
+        first.content
+    );
+
+    let again = skills.load(ctx, listed, 1, PAGE_LINES).await.unwrap();
+    assert_eq!(
+        first.content, again.content,
+        "the same call, the same bytes"
+    );
+
+    let refused = |what: &str, out: Result<ToolOutput, ToolError>| {
+        let out = out.unwrap_or_else(|e| panic!("{what} is a result, not an error: {e}"));
+        assert!(out.is_error, "{what} is refused: {}", out.content);
+    };
+    refused(
+        "an offset past the end",
+        skills.load(ctx, listed, 1_000_000, 10).await,
+    );
+    refused(
+        "an unknown skill",
+        skills
+            .load(ctx, &format!("{listed}-no-such-skill"), 1, 10)
+            .await,
+    );
+    refused(
+        "a name without a `/`",
+        skills.load(ctx, "plain", 1, 10).await,
+    );
+    refused(
+        "a file of a name without a `/`",
+        skills.read(ctx, "plain", "x", 1, 10).await,
+    );
+    refused(
+        "a path that leaves the skill",
+        skills.read(ctx, listed, "../outside", 1, 10).await,
+    );
+    refused(
+        "an absolute path",
+        skills.read(ctx, listed, "/etc/passwd", 1, 10).await,
+    );
+    refused(
+        "a file the skill does not have",
+        skills.read(ctx, listed, "no-such-file.txt", 1, 10).await,
+    );
+}
+
+fn is_skill_name_of(qualified: &str) -> bool {
+    qualified
+        .split_once('/')
+        .is_some_and(|(source, skill)| !source.is_empty() && adam_agent_fs::is_skill_name(skill))
+}
+
 struct LoadSkill {
     set: Arc<SkillSet>,
+    run: Option<RunSkillsHandle>,
 }
 
 #[async_trait]
@@ -740,21 +905,27 @@ impl Tool for LoadSkill {
         true
     }
 
-    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
-        answer(match string_arg(&args, "name") {
-            Some(name) => {
-                window_of(&args).and_then(|(offset, limit)| self.set.load(name, offset, limit))
-            }
-            None => Err(SkillError::BadArguments {
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let Some(name) = string_arg(&args, "name") else {
+            return answer(Err(SkillError::BadArguments {
                 tool: LOAD_SKILL,
                 expected: "a string argument `name`",
-            }),
-        })
+            }));
+        };
+        let (offset, limit) = match window_of(&args) {
+            Ok(window) => window,
+            Err(refusal) => return answer(Err(refusal)),
+        };
+        match &self.run {
+            Some(run) if name.contains('/') => run.0.load(ctx, name, offset, limit).await,
+            _ => answer(self.set.load(name, offset, limit)),
+        }
     }
 }
 
 struct ReadSkillFile {
     set: Arc<SkillSet>,
+    run: Option<RunSkillsHandle>,
 }
 
 #[async_trait]
@@ -773,17 +944,22 @@ impl Tool for ReadSkillFile {
         true
     }
 
-    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
-        answer(
-            match (string_arg(&args, "skill"), string_arg(&args, "path")) {
-                (Some(skill), Some(path)) => window_of(&args)
-                    .and_then(|(offset, limit)| self.set.read(skill, path, offset, limit)),
-                _ => Err(SkillError::BadArguments {
-                    tool: READ_SKILL_FILE,
-                    expected: "string arguments `skill` and `path`",
-                }),
-            },
-        )
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let (Some(skill), Some(path)) = (string_arg(&args, "skill"), string_arg(&args, "path"))
+        else {
+            return answer(Err(SkillError::BadArguments {
+                tool: READ_SKILL_FILE,
+                expected: "string arguments `skill` and `path`",
+            }));
+        };
+        let (offset, limit) = match window_of(&args) {
+            Ok(window) => window,
+            Err(refusal) => return answer(Err(refusal)),
+        };
+        match &self.run {
+            Some(run) if skill.contains('/') => run.0.read(ctx, skill, path, offset, limit).await,
+            _ => answer(self.set.read(skill, path, offset, limit)),
+        }
     }
 }
 
@@ -846,7 +1022,7 @@ mod tests {
         );
         let mut e = entry("s", false, &[]);
         e.description = "Use </description>\n  when\ta > b.".into();
-        let text = set(vec![e]).prompt_section();
+        let text = set(vec![e]).prompt_section(false);
         assert!(
             text.contains("<description>Use &lt;/description&gt; when a &gt; b.</description>"),
             "{text}"
@@ -855,20 +1031,20 @@ mod tests {
 
     #[test]
     fn the_tools_follow_what_there_is_to_load_and_read() {
-        let none: Vec<DynTool> = set(vec![entry("a", false, &[])]).tools();
+        let none: Vec<DynTool> = set(vec![entry("a", false, &[])]).tools(None);
         assert_eq!(
             none.iter().map(|t| t.spec().name).collect::<Vec<_>>(),
             [LOAD_SKILL]
         );
-        let both = set(vec![entry("a", false, &[("f.md", b"x")])]).tools();
+        let both = set(vec![entry("a", false, &[("f.md", b"x")])]).tools(None);
         assert_eq!(
             both.iter().map(|t| t.spec().name).collect::<Vec<_>>(),
             [LOAD_SKILL, READ_SKILL_FILE]
         );
         // Everything preloaded and no files: nothing to call.
-        assert!(set(vec![entry("a", true, &[])]).tools().is_empty());
+        assert!(set(vec![entry("a", true, &[])]).tools(None).is_empty());
         // Everything preloaded, with a file: only the reader.
-        let only_read = set(vec![entry("a", true, &[("f.md", b"x")])]).tools();
+        let only_read = set(vec![entry("a", true, &[("f.md", b"x")])]).tools(None);
         assert_eq!(
             only_read.iter().map(|t| t.spec().name).collect::<Vec<_>>(),
             [READ_SKILL_FILE]
@@ -884,7 +1060,7 @@ mod tests {
             entry("c", false, &[("g.md", b"y")]),
         ]);
         let spec = |s: &Arc<SkillSet>, name: &str| {
-            s.tools()
+            s.tools(None)
                 .into_iter()
                 .find(|t| t.spec().name == name)
                 .map(|t| serde_json::to_string(&t.spec()).unwrap())

@@ -54,10 +54,11 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 
 | Item | What |
 |---|---|
-| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `name()`, `manifest()`, `bind(ToolSet)` |
+| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `run_skills(Arc<dyn RunSkills>)` (the root finds skills during its run: [Skills a run finds](#skills-a-run-finds-runskills)), `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `name()`, `manifest()`, `bind(ToolSet)` |
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
+| `RunSkills`, `run_skills_conformance` | the trait of the skills a run finds (`load` and `read` take the context, a `<source>/<skill>` name and a checked window), and the function that checks an implementation (Rule 2) |
 | `SkillError` | why `load_skill` or `read_skill_file` refused a call: closed enum, its `Display` is the tool result the model reads (`Window` is a bad `offset` or `limit`, or an offset past the end: a new variant, so a `match` on it breaks) |
 | `BoundDef` | `state(Arc<T>)`, `tool_source(source)` (a `ToolSource` of `adam-llm-agent` for every agent: tools it learns about while it runs, offered at every model turn after the agent's own; `tools:` does not narrow it), `model_aliases(..)`, `wait_poll(Duration)` (how often a waiting agent looks: a remote subagent's task is polled at this interval), `scrub(f)` (a function that scrubs secrets out of what the five session tools give the model, which `bind` makes itself and a deployment's own tool wrapper never sees: the coder gives its redactor), `scrub_longest(f)` (the length of the longest value it replaces, for `ToolCtx::scrub_margin`, as the coder's own wrapper passes it; a report is a child's text scrubbed whole, never a cut one, so no open edge applies), `step_io(StepIo)` (how every agent's tool-call steps report their input and output, and what is scrubbed from them first: `LlmAgentBuilder::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)), `model(DynModel, alias)` |
 | `adam_llm_agent::ReadOutput` | **added by `bind` to every agent whose tools include an MCP tool** (unless its tool list already holds `read_output`, as the coder's does), after the tools it selected: a long MCP result is kept and the model reads the rest with `read_output { id, offset?, limit? }` (an agent that is only a folder keeps it in the run's state, 4 MiB; see [`adam-mcp`](../adam-mcp/README.md)). An agent with no MCP tool among its tools does not get it |
@@ -251,6 +252,32 @@ results are journaled with the step that ran them.
 Known limit: a loaded skill is a tool result, and the loop may truncate an old one to fit
 `limits.max_history_tokens`. `preload_skills` is the way around it until the loop learns to protect skill
 content.
+
+### Skills a run finds (`RunSkills`)
+
+A host that finds skills **during a run** (the coder: the skills of a repository it prepared) gives the root
+agent `AgentDef::run_skills(Arc<dyn RunSkills>)`. The two tools then take names the folder does not hold:
+
+| Call | Goes to |
+|---|---|
+| `load_skill { name }` or `read_skill_file { skill, .. }` with a `/` in the name (`<source>/<skill>`) | `RunSkills::load` / `RunSkills::read`, with the window already checked (`offset` from 1 or negative, `limit` at most 2,000) |
+| a name without a `/` | the folder's own skills, never `RunSkills`, so what a run finds cannot shadow a skill of the folder; an unknown one is answered with the list of the folder's |
+
+* **The tool list and the prompt never depend on the run.** With it set the root always has both tools and its
+  prompt ends with one fixed sentence ("Other skills may be listed to you during the run, named
+  `<source>/<skill>`; load them with load_skill the same way."), also when the folder has no skill of its own.
+  What a run finds arrives as a tool result, so the prefix of the provider's cache holds for the whole run.
+* **`skills: []` turns it off too:** no tool, no sentence, and the implementation is never called. A host
+  that lists skills itself must check the same thing.
+* **Root only.** A subagent gets none: its skills are its own.
+* **A contract for the implementation** (`run_skills_conformance` checks it): the same call gives the same
+  bytes (a retried step is answered from what the host recorded, not from the file system as it is now);
+  only the last line of a result starts with `[`; a refusal is `Ok(ToolOutput::error(..))`, and only a
+  failure worth retrying is `Err(ToolError::Transient)`; a path never leaves the skill's directory; what
+  it reads is the repository's text, never the person's, and grants no tool, access tier or consent.
+
+`RunSkills` is a new public trait, `AgentDef::run_skills` a new method and `SkillError::Window` a new variant
+of a closed enum (a `match` on it breaks).
 
 ## Run-time folders (no feature)
 
