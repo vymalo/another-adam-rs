@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Ten extensions, each optional (a client that does not know one ignores it), detected by the
+//! Eleven extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -15,6 +15,7 @@
 //! | `build/v1` | [`BUILD_EXTENSION`] | the card says which build of the agent answers (`revision`) and which agent files it runs (`folderDigest`); nothing to activate |
 //! | `usage/v1` | [`USAGE_EXTENSION`] | the agent reports the tokens of each model call, to a client whose request activated it, and writes a task's totals on the task when it ends or waits |
 //! | `access-tier/v1` | [`ACCESS_TIER_EXTENSION`] | the person picks how much the agent may do alone for each message (`plan`, `edits`, `auto`, `bypass`); the agent keeps to it and says which tier it worked under |
+//! | `commands/v1` | [`COMMANDS_EXTENSION`] | the card lists the prompt templates the agent serves; a message names one and the agent expands it before it is stored |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
@@ -86,6 +87,25 @@ pub const USAGE_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/usag
 /// layer's (`docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`); ADR 0036 is this
 /// repository's side.
 pub const ACCESS_TIER_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/access-tier/v1";
+
+/// The URI of the `commands/v1` extension: the card's `params` are `{"commands": [{"name",
+/// "description", "argumentHint"?}]}`, sorted by name, and a message that activates the extension
+/// may carry `{"command": "<name>", "arguments": "<text>"}` in its metadata under this URI. The agent
+/// expands the template before the message is stored (ADR 0044, decision 9); the contract is the
+/// orchestration layer's (`docs/api/commands-v1.md` of `vymalo/another-agentic-system`, not written
+/// yet).
+pub const COMMANDS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/commands/v1";
+
+/// One command of the card's `commands/v1` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandInfo {
+    /// The name a message invokes: `/name`.
+    pub name: String,
+    /// What it does.
+    pub description: String,
+    /// What follows the name, for a client to show.
+    pub argument_hint: Option<String>,
+}
 
 /// What a build's revision, and the `+<revision>` of its card version, say when none was baked in.
 pub const UNKNOWN_REVISION: &str = "unknown";
@@ -237,6 +257,38 @@ impl ExtensionConfig {
             .params
             .insert("default".into(), json!(tiers.default_tier().as_str()));
         extension
+    }
+
+    /// The `commands/v1` extension: the card lists the commands the agent serves, as
+    /// `params.commands`, sorted by name (`argumentHint` only when the command has one).
+    /// `None` when there are no commands: an agent without commands does not list the extension.
+    pub fn commands(commands: &[CommandInfo]) -> Option<Self> {
+        if commands.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<&CommandInfo> = commands.iter().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut extension = Self::new(COMMANDS_EXTENSION);
+        extension.description =
+            Some("Serves prompt templates a message can invoke by name.".into());
+        extension.params.insert(
+            "commands".into(),
+            serde_json::Value::Array(
+                sorted
+                    .into_iter()
+                    .map(|c| {
+                        let mut entry = serde_json::Map::new();
+                        entry.insert("name".into(), json!(c.name));
+                        entry.insert("description".into(), json!(c.description));
+                        if let Some(hint) = &c.argument_hint {
+                            entry.insert("argumentHint".into(), json!(hint));
+                        }
+                        serde_json::Value::Object(entry)
+                    })
+                    .collect(),
+            ),
+        );
+        Some(extension)
     }
 
     /// The `mentions/v1` extension: the agent reads the agents a person mentioned in a message and
@@ -398,5 +450,37 @@ mod tests {
             ExtensionConfig::usage().description.as_deref(),
             Some("Reports the tokens of each model call and the task's totals.")
         );
+    }
+
+    fn info(name: &str, hint: Option<&str>) -> CommandInfo {
+        CommandInfo {
+            name: name.into(),
+            description: format!("does {name}"),
+            argument_hint: hint.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn card_lists_commands_sorted() {
+        let e = ExtensionConfig::commands(&[info("review", Some("<repo>")), info("explain", None)])
+            .expect("commands are listed");
+        assert_eq!(e.uri, COMMANDS_EXTENSION);
+        assert_eq!(
+            COMMANDS_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/commands/v1"
+        );
+        assert!(!e.required);
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({"commands": [
+                {"name": "explain", "description": "does explain"},
+                {"name": "review", "description": "does review", "argumentHint": "<repo>"},
+            ]})
+        );
+    }
+
+    #[test]
+    fn a_card_without_commands_does_not_list_the_extension() {
+        assert!(ExtensionConfig::commands(&[]).is_none());
     }
 }

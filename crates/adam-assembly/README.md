@@ -168,7 +168,7 @@ frontmatter `description`, else `Error::MissingCardDescription`), `card.skills` 
 `AgentCardConfig::extended`, and `extended: {}` declares nothing). The public URL and the
 version are the deployment's, so they are arguments. A2A card skills are not Agent Skills. The card is a fact
 about the files, so `AgentDef::card(url, version)` gives the same card before any tool, state or model is
-bound: a process that only serves A2A (a control plane, with no model) needs it, and the coder uses it.
+bound: a process that only serves A2A (a control plane, with no model) needs it, and the coder uses it. When the agent has `commands/`, the card also lists the `commands/v1` extension (`ExtensionConfig::commands`, sorted by name); an agent without commands lists none. The templates are not on the card and not in the prompt: the A2A backend expands them (`adam-a2a-runtime`).
 
 ## Skills
 

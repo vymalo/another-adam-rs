@@ -64,9 +64,12 @@ fn service_over(agents: Agents, store: &DynStore) -> Service {
         register,
         options,
         inbound,
+        commands,
         ..
     } = agents;
-    Service::new(register(Runtime::builder(store.clone())), name, &options).with_inbound(inbound)
+    Service::new(register(Runtime::builder(store.clone())), name, &options)
+        .with_inbound(inbound)
+        .with_commands(commands)
 }
 
 fn alice() -> Caller {
@@ -195,6 +198,62 @@ async fn the_card_is_the_one_the_folder_declares() {
     // A folder that renames itself changes the card, with no code involved.
     let card = card_of(&def_of(&chat()), &url()).unwrap();
     assert_eq!(card.name, "Chat");
+}
+
+/// A folder with `commands/` lists them on the card (`commands/v1`, sorted) and the agent expands
+/// a message that names one, as `/name arguments`, before it is stored.
+#[tokio::test]
+async fn a_folder_serves_its_commands() {
+    let folder = assistant();
+    for (name, text) in [
+        (
+            "greet",
+            "---\ndescription: Greet a person.\nargument-hint: \"<name>\"\n---\nSay hi to $1.\n",
+        ),
+        (
+            "bye",
+            "---\ndescription: Say goodbye.\n---\nSay goodbye to $ARGUMENTS.\n",
+        ),
+    ] {
+        let path = folder
+            .path()
+            .join("agent/commands")
+            .join(format!("{name}.md"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let card = card_of(&def_of(&folder), &url()).unwrap();
+    let entry = card
+        .extensions
+        .iter()
+        .find(|e| e.uri == adam_a2a::COMMANDS_EXTENSION)
+        .expect("the card lists commands/v1");
+    assert_eq!(
+        serde_json::Value::Object(entry.params.clone()),
+        json!({"commands": [
+            {"name": "bye", "description": "Say goodbye."},
+            {"name": "greet", "description": "Greet a person.", "argumentHint": "<name>"},
+        ]})
+    );
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("hello");
+    let dynamic: DynModel = mock.clone();
+    let agents = build(
+        def_of(&folder),
+        None,
+        Some(worker(dynamic, McpPolicy::default())),
+    )
+    .await
+    .unwrap();
+    let service = service_over(agents, &store());
+    let worker = Worker::start(&service);
+    ask(&service, "/greet Bob").await;
+    worker.stop().await;
+    assert_eq!(
+        mock.requests()[0].messages[0],
+        adam_model::Message::user_text("Say hi to Bob.")
+    );
 }
 
 /// The card of a folder says which build answers and which files it runs, in `build/v1`: the digest

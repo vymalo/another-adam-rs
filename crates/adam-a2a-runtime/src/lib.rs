@@ -33,6 +33,7 @@
 
 mod backend;
 mod caller;
+mod commands;
 mod convert;
 mod ids;
 mod list;
@@ -48,6 +49,7 @@ mod words;
 
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use caller::{CONTEXT_CALLER, UNREADABLE_CALLER, asked_by_an_agent};
+pub use commands::{Commands, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_EXPANSION};
 pub use convert::{
     InboundFn, PromptFn, artifact_id, artifact_of, default_inbound, default_prompt, task_state,
 };

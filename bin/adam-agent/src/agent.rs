@@ -171,6 +171,13 @@ pub async fn agents(
     workers: Option<WorkerParts<'_>>,
 ) -> Result<Agents, AgentError> {
     let name = def.name().to_owned();
+    // The commands the card lists (`commands/v1`): the backend expands a message that names one.
+    let commands = adam_a2a_runtime::Commands::new(
+        def.manifest()
+            .commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.template.as_str())),
+    );
     let agents = match workers {
         Some(parts) => {
             let assembly =
@@ -186,7 +193,8 @@ pub async fn agents(
     // the conversation, reach the run (the extensions the card lists).
     Ok(agents
         .card_if(card)
-        .inbound(adam_a2a_runtime::vymalo_inbound))
+        .inbound(adam_a2a_runtime::vymalo_inbound)
+        .commands(commands))
 }
 
 #[cfg(test)]

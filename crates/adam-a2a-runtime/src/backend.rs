@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{
-    ACCESS_TIER_EXTENSION, AccessTiers, BackendError, Caller, STEER_EXTENSION, TaskBackend,
-    TaskEvent, TaskPage, TaskQuery,
+    ACCESS_TIER_EXTENSION, AccessTiers, BackendError, COMMANDS_EXTENSION, Caller, STEER_EXTENSION,
+    TaskBackend, TaskEvent, TaskPage, TaskQuery,
 };
 use adam_core::{RunId, StoreError};
 use adam_error::ErrorClass;
@@ -146,6 +146,15 @@ pub const MAX_REFERENCES: usize = 8;
 /// it again in a status update when it changes. The state of the run is the truth: the tier said is
 /// the one in its context, else the agent's default.
 ///
+/// # Commands (`commands/v1`)
+///
+/// With [`with_commands`](Self::with_commands), a message that names a command the agent serves is
+/// expanded in this request, right after the inbound function, and the expansion is what is
+/// stored (see [`Commands`](crate::Commands)): in the metadata under [`COMMANDS_EXTENSION`] when the
+/// request activated the extension (an unknown name is `InvalidParams`, before anything is
+/// written), or as `/name arguments` at the start of the text, always. A `/word` that is no
+/// command is plain text.
+///
 /// "The caller" is the authenticated subject ([`Caller::subject`]). The anonymous caller of an
 /// unauthenticated server is every client at once, so **a message from it never continues
 /// anything**: references are ignored (debug log) and the task starts fresh. With token
@@ -194,6 +203,8 @@ pub struct RuntimeTaskBackend {
     pub(crate) inbound: InboundFn,
     /// The tiers of `access-tier/v1` this agent honours, when its card declares them.
     pub(crate) access_tiers: Option<AccessTiers>,
+    /// The commands of `commands/v1` this agent serves, when its card lists them.
+    pub(crate) commands: Option<crate::Commands>,
 }
 
 impl std::fmt::Debug for RuntimeTaskBackend {
@@ -216,6 +227,7 @@ impl RuntimeTaskBackend {
             prompt: Arc::new(default_prompt),
             inbound: Arc::new(default_inbound),
             access_tiers: None,
+            commands: None,
         }
     }
 
@@ -265,6 +277,15 @@ impl RuntimeTaskBackend {
     #[must_use]
     pub fn with_access_tiers(mut self, tiers: AccessTiers) -> Self {
         self.access_tiers = Some(tiers);
+        self
+    }
+
+    /// Serve `commands/v1` for an agent whose card lists `commands`
+    /// ([`ExtensionConfig::commands`](adam_a2a::ExtensionConfig::commands)): see "Commands" in the
+    /// type's documentation. Without it a message is never read as a command, whatever it says.
+    #[must_use]
+    pub fn with_commands(mut self, commands: crate::Commands) -> Self {
+        self.commands = Some(commands).filter(|c| !c.is_empty());
         self
     }
 
@@ -744,6 +765,18 @@ impl TaskBackend for RuntimeTaskBackend {
         context_id: Option<String>,
     ) -> Result<Task, BackendError> {
         let mut inbound = (self.inbound)(&message).map_err(BackendError::InvalidParams)?;
+        // A command is expanded here, once, and the expansion is what is stored: a replay never
+        // reads the folder again. A name the agent does not serve in the metadata is refused
+        // before anything is written.
+        if let Some(commands) = &self.commands {
+            crate::commands::apply(
+                &message,
+                &mut inbound,
+                commands,
+                caller.has_extension(COMMANDS_EXTENSION),
+            )
+            .map_err(BackendError::InvalidParams)?;
+        }
         // A message that activated the extension names a tier the agent honours, or nothing is
         // written. One that did not is read as it always was.
         if let Some(tiers) = &self.access_tiers

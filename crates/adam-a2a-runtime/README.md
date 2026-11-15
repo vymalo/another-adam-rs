@@ -26,6 +26,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `RuntimeTaskBackend::list` (`TaskBackend::list`), `MAX_SCAN` | `ListTasks`: the caller's tasks, newest update first, by keyset cursor; see *Listing tasks* |
 | `MAX_TOKEN_COUNT` | the largest count a `usage/v1` report or total carries (2^53 - 1); see *Usage* |
 | `RuntimeTaskBackend::with_access_tiers(AccessTiers)`, `CONTEXT_ACCESS_TIER` | `access-tier/v1`: the backend reads the tier of a message that activated the extension, refuses a bad one, and says the tier a task works under; the tier is the run's context key `vymalo.accessTier` = `{"tier": ..}`; see *The access tier* |
+| `RuntimeTaskBackend::with_commands(Commands)`, `Commands`, `MAX_COMMAND_ARGUMENTS`, `MAX_COMMAND_EXPANSION` | `commands/v1`: the backend expands a message that names a command the agent serves, in this request, and stores the expansion; see *Commands*. An empty `Commands` is the same as none |
 | `RuntimeTaskBackend::push_store()`, `StorePushStore::new(store, agent)` | the `adam_a2a::push::PushStore` over the run `Store`: configs and delivery progress next to the runs, so a restart or another replica loses nothing; see *Push notifications* |
 
 ```rust
@@ -359,6 +360,21 @@ neither carries no metadata, and a task with tokens only carries the object it a
 | a backend with no `with_access_tiers` | never reads or says a tier |
 
 Unit tests in `src/tier.rs` (the validation sentences, the context) and `tests/access_tier.rs` (a real `Runtime` and `LlmAgent`: the tier reaches the run and the task, the first frame and `GetTask` say it, a caller that did not activate it reads none, every kind of bad tier is `InvalidParams` and writes no run, a message that did not activate it carries no tier and an activated reader is told the default, a backend with no tiers reads none, and a tier changed by a message sent while the task works is said once on the stream).
+
+## Commands
+
+`commands/v1` (ADR 0044, decision 9; the consumer's contract page `docs/api/commands-v1.md` of `vymalo/another-agentic-system` is not written yet). With `with_commands(commands)`, for an agent whose card lists the extension (`ExtensionConfig::commands`), `submit` reads every message right after the inbound function, once, and the expansion is what is stored:
+
+| | |
+|---|---|
+| the metadata form | when the request **activated** the extension, `metadata[URI] = {"command": "<name>", "arguments": "<text>"}` (`arguments` optional, a string). A `command` the agent does not serve, a `command` that is not a string, `arguments` that are not text: `InvalidParams`, nothing written. Not activated: the member is not read, whatever it names. The message still needs a text part (the inbound function refuses none); when the member is read, it decides and the text is replaced |
+| the text form | any message, activated or not, whose text starts with `/name` followed by the end of the text or whitespace, for a command the agent serves: the rest of the text, trimmed, is the arguments. **A `/word` that is not a command is plain text** (`/tmp is full`). `//name` for a command the agent serves is the literal `/name` (one slash dropped, nothing expanded) |
+| the expansion | plain substitution in one pass: `$ARGUMENTS` (the arguments, trimmed), `$1` to `$9` (the arguments split on whitespace, double quotes respected, quotes dropped, an unclosed quote runs to the end, `""` is an empty argument, a missing one is empty). A `$` followed by anything else is a `$`. What is substituted is never read again; nothing is executed. A line of the result that begins as the answer of a form is marked `(typed) `, as in any message |
+| the limits | arguments at most `MAX_COMMAND_ARGUMENTS` (4 KiB) bytes before; the expansion at most `MAX_COMMAND_EXPANSION` (32 KiB) bytes, and not empty, after: otherwise `InvalidParams`, nothing written |
+| what is stored | the inbound payload's `text` is the expansion and `command` = `{"name", "arguments"}` is beside it. The inbound is the truth: a replay, or a restart with an edited folder, never expands again, and a message sent again with the same `messageId` joins the run it made |
+| a backend with no `with_commands` | never reads a command: `/review x` is the text `/review x` |
+
+Unit tests in `src/commands.rs` (the splitter, the placeholders, the readings) and `tests/commands.rs` (a real `Runtime` and `LlmAgent`: both forms give one text, an unknown name writes nothing, a restart with an edited template changes no stored run).
 
 ## Stable ids
 

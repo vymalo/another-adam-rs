@@ -1,6 +1,6 @@
 //! The root agent's A2A card (feature `a2a`).
 
-use adam_a2a::{AgentCardConfig, ExtendedCardConfig, SkillConfig};
+use adam_a2a::{AgentCardConfig, CommandInfo, ExtendedCardConfig, ExtensionConfig, SkillConfig};
 use url::Url;
 
 use adam_agent_fs::AgentManifest;
@@ -76,6 +76,19 @@ fn card_of(manifest: &AgentManifest, url: Url, version: String) -> Result<AgentC
         if !extra.is_empty() {
             config = config.with_extended_card(extra);
         }
+    }
+    // `commands/`: the card lists the extension when, and only when, the agent has commands.
+    let commands: Vec<CommandInfo> = manifest
+        .commands
+        .iter()
+        .map(|c| CommandInfo {
+            name: c.name.clone(),
+            description: c.description.clone(),
+            argument_hint: c.argument_hint.clone(),
+        })
+        .collect();
+    if let Some(extension) = ExtensionConfig::commands(&commands) {
+        config = config.with_extension(extension);
     }
     Ok(config)
 }

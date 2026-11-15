@@ -161,6 +161,16 @@ impl Service {
         self
     }
 
+    /// Serve `commands/v1` for an agent whose card lists `commands`
+    /// ([`RuntimeTaskBackend::with_commands`]); `None` changes nothing.
+    #[must_use]
+    pub fn with_commands(mut self, commands: Option<adam_a2a_runtime::Commands>) -> Self {
+        if let Some(commands) = commands {
+            self.backend = self.backend.with_commands(commands);
+        }
+        self
+    }
+
     /// Advance runs until `shutdown` resolves; in-flight steps finish first.
     ///
     /// # Errors

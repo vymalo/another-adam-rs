@@ -41,6 +41,7 @@ applies at the next start, and a restart is a deploy.
 | `subagents/` | assembled and **registered beside the agent** (`<name>/<subagent>`): one tool per subagent, a child run with its own prompt and tools. A subagent gets only the tools it lists, and not `ask_user` (nobody would answer it) |
 | `mcp.json` | MCP servers whose tools the agent gets, see [below](#mcp-servers-from-the-folder). Connected by the **workers** |
 | `schedules/` | read, not run: a warning says so |
+| `commands/` | prompt templates (`commands/<name>.md`: `description`, optional `argument-hint`, a body with `$ARGUMENTS` and `$1` to `$9`). The card lists `commands/v1` with them, and a message that names one (in its metadata, or as `/name arguments` at the start of its text) is expanded before it is stored: [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#commands), [`a2a-server.md`](../../docs/reference/a2a-server.md#commands-commandsv1). A folder without `commands/` lists nothing |
 
 The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/README.md)), and the same ones
 `adam-coder` has, with descriptions that fit any agent:
@@ -79,7 +80,7 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)).
 
 The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1`,
-`text-stream/v1` and `usage/v1` (`card_of`), and `build/v1` (`card_of_folder`: the build's revision and the folder's digest, [ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
+`text-stream/v1` and `usage/v1` (`card_of`; and `commands/v1` when the folder has `commands/`), and `build/v1` (`card_of_folder`: the build's revision and the folder's digest, [ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
 whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with a
 title a person reads (`Ask you`, an MCP tool's own `title`, a subagent's name capitalised, [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its-step.md)); running, then completed, failed or waiting for the person; with the
 call's arguments as `input` and its result as `output`, cut to 4 KiB and 8 KiB and **scrubbed of this process's secrets first**: the model's
