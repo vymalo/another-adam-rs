@@ -104,7 +104,7 @@ pub enum Access {
 }
 
 /// Whether `name` is a `.git` (any case).
-fn is_dot_git(name: &std::ffi::OsStr) -> bool {
+pub(super) fn is_dot_git(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().eq_ignore_ascii_case(".git")
 }
 
@@ -857,7 +857,18 @@ pub async fn read_file(
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     Ok(match read {
-        Ok(text) => ToolOutput::text(text),
+        // The first read below a directory that has instructions shows them, before the page.
+        Ok(text) => {
+            return super::project::with_nested(
+                &env,
+                ctx,
+                &slot,
+                Some(path),
+                super::project::Target::File,
+                text,
+            )
+            .await;
+        }
         Err(reason) if reason == does_not_exist(path) => {
             let at = GitAt::slot(&slot);
             let wanted = path.to_owned();

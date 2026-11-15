@@ -202,6 +202,12 @@ pub async fn prepare_workspace(
         text.push('\n');
         text.push_str(&note);
     }
+    // What the repository says about itself, as the result of this call and not as a message: it
+    // is the repository's text, never the person's (see `project`).
+    if let Some(block) = super::project::at_prepare(&env, ctx, &slot).await? {
+        text.push_str("\n\n");
+        text.push_str(&block);
+    }
     Ok(ToolOutput::text(text))
 }
 

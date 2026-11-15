@@ -124,6 +124,7 @@ pub mod notes;
 mod output;
 mod preexisting;
 pub mod prepare;
+mod project;
 pub mod publish;
 mod sandbox;
 pub mod scratch;

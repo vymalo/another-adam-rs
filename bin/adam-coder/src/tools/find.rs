@@ -71,6 +71,7 @@ use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 
 use super::files::{Access, confine};
 use super::gitcli::{self, GitAt, ListError};
+use super::project::Target;
 use super::{Outcome, ToolEnv, non_empty};
 use crate::redact::Redactor;
 
@@ -359,15 +360,18 @@ pub async fn list_files(
     .await;
     let root = Arc::clone(slot.root());
     let stop = Arc::new(AtomicBool::new(false));
+    let dir = path.clone();
     let work = async {
         tokio::task::spawn_blocking(move || list_in(&root, path.as_deref(), offset, limit))
             .await
             .map_err(|e| format!("the listing was interrupted: {e}"))?
     };
-    Ok(match within(DEADLINE, &stop, work).await {
-        Ok(text) => ToolOutput::text(text),
-        Err(reason) => ToolOutput::error(reason),
-    })
+    match within(DEADLINE, &stop, work).await {
+        Ok(text) => {
+            super::project::with_nested(&env, ctx, &slot, dir.as_deref(), Target::Dir, text).await
+        }
+        Err(reason) => Ok(ToolOutput::error(reason)),
+    }
 }
 
 // ------------------------------------------------------------------ find_files
@@ -453,10 +457,12 @@ pub async fn find_files(
         limit,
         Arc::clone(&stop),
     );
-    Ok(match within(DEADLINE, &stop, work).await {
-        Ok(text) => ToolOutput::text(text),
-        Err(reason) => ToolOutput::error(reason),
-    })
+    match within(DEADLINE, &stop, work).await {
+        Ok(text) => {
+            super::project::with_nested(&env, ctx, &slot, path.as_deref(), Target::Dir, text).await
+        }
+        Err(reason) => Ok(ToolOutput::error(reason)),
+    }
 }
 
 // ------------------------------------------------------------------ search_files
@@ -755,10 +761,13 @@ pub async fn search_files(
         limit,
         Arc::clone(&stop),
     );
-    Ok(match within(DEADLINE, &stop, work).await {
-        Ok(text) => ToolOutput::text(text),
-        Err(reason) => ToolOutput::error(reason),
-    })
+    match within(DEADLINE, &stop, work).await {
+        Ok(text) => {
+            super::project::with_nested(&env, ctx, &slot, path.as_deref(), Target::Either, text)
+                .await
+        }
+        Err(reason) => Ok(ToolOutput::error(reason)),
+    }
 }
 
 #[cfg(test)]

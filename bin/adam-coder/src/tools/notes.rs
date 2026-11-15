@@ -11,6 +11,7 @@
 //! rename). Counting is keyed by tool call id, so replaying a call never counts
 //! a failure twice.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -452,7 +453,18 @@ pub struct RunNotes {
     /// The repositories this run deleted (`owner/name`, lowercase), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted_repos: Vec<String>,
+    /// The directories whose project instructions (`AGENTS.md`, `CLAUDE.md`, or the root's
+    /// `README.md`) this run's model was shown, as `<slot>` for a slot's root and `<slot>/<dir>`
+    /// below it, each with the id of the call that showed it. Written by the tools that show them,
+    /// in the notes of the run that made the call (a subagent's history is not its root's). A
+    /// call with the recorded id shows the text again (a retry of a step that was not journaled);
+    /// any other call does not. At most [`MAX_INSTRUCTIONS_SHOWN`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instructions_shown: BTreeMap<String, String>,
 }
+
+/// Most directories [`RunNotes::instructions_shown`] lists.
+pub const MAX_INSTRUCTIONS_SHOWN: usize = 256;
 
 /// Most shared files [`RunNotes::shared`] lists.
 pub const MAX_SHARED: usize = 64;
@@ -849,6 +861,26 @@ impl RunNotes {
     /// [`CoderSettings::cycle_limit`](super::CoderSettings::cycle_limit)).
     pub fn cycles_exhausted(&self, scratch: bool, max: u32) -> bool {
         self.failures_in(scratch) >= max && self.last_in(scratch).is_some_and(|c| !c.passed)
+    }
+
+    /// Whether the call `call` may show the instructions of `key` (see
+    /// [`instructions_shown`](Self::instructions_shown)): none was shown yet, or this very call
+    /// showed them. Past [`MAX_INSTRUCTIONS_SHOWN`] directories no new one is shown.
+    pub fn may_show_instructions(&self, key: &str, call: &str) -> bool {
+        match self.instructions_shown.get(key) {
+            Some(shown) => shown == call,
+            None => self.instructions_shown.len() < MAX_INSTRUCTIONS_SHOWN,
+        }
+    }
+
+    /// Note that the call `call` showed the instructions of `key`; returns whether that is new.
+    pub fn record_instructions_shown(&mut self, key: &str, call: &str) -> bool {
+        if self.instructions_shown.get(key).is_some_and(|c| c == call) {
+            return false;
+        }
+        self.instructions_shown
+            .insert(key.to_owned(), call.to_owned());
+        true
     }
 
     /// Note that the run shared `entry` (`<slot>/<path>`); returns whether it was new. A repeat, or
