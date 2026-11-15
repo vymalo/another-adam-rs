@@ -853,3 +853,48 @@ fn an_extra_body_may_not_set_what_the_client_owns() {
         assert_eq!(error.class(), ErrorClass::Invalid);
     }
 }
+
+#[tokio::test]
+async fn the_prompt_cache_key_is_sent_only_by_a_client_built_to_send_it() {
+    for (on, streaming) in [(true, false), (false, false), (true, true), (false, true)] {
+        let server = MockServer::start().await;
+        if streaming {
+            mount(
+                &server,
+                sse(&[
+                    r#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+                    "[DONE]",
+                ]),
+            )
+            .await;
+        } else {
+            mount(
+                &server,
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}]
+                })),
+            )
+            .await;
+        }
+        let client = client(&server).with_prompt_cache_key(on);
+        let mut req = request();
+        req.prompt_cache_key = Some("0123456789abcdef0123456789abcdef".into());
+        if streaming {
+            collect(client.stream(req).await.unwrap()).await;
+        } else {
+            client.complete(req).await.unwrap();
+        }
+        let body = sent_body(&server).await;
+        if on {
+            assert_eq!(
+                body["prompt_cache_key"], "0123456789abcdef0123456789abcdef",
+                "on, streaming {streaming}"
+            );
+        } else {
+            assert!(
+                body.get("prompt_cache_key").is_none(),
+                "off, streaming {streaming}: {body}"
+            );
+        }
+    }
+}

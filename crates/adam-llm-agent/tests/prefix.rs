@@ -4,20 +4,23 @@
 //! was shortened, which the state records (`Conversation::shortenings`).
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Conversation, Limits, LlmAgent, LlmAgentBuilder, ReadOutput, Tool, ToolCtx, ToolError,
-    ToolOutput, user_message,
+    Conversation, Limits, LlmAgent, LlmAgentBuilder, MAX_SOURCE_TOOLS, ReadOutput, Tool, ToolCtx,
+    ToolError, ToolOutput, ToolSource, user_message,
 };
 use adam_model::{
-    DynModel, Message, MockModel, ModelError, ModelRequest, ToolCall, ToolChoice, ToolSpec,
+    DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
+    ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{CollectingSink, ManualClock, RetryPolicy, RunView, Runtime};
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -69,12 +72,79 @@ impl Tool for Wordy {
     }
 }
 
+/// Answers a small structured result, of the kind that holds an id nothing else repeats.
+struct Handle;
+
+#[async_trait]
+impl Tool for Handle {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "handle".into(),
+            description: "answers a small result with an id".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(
+            r#"{"session":"3f9c2a17","state":"working"}"#,
+        ))
+    }
+}
+
 fn big(id: &str, n: u64) -> ToolCall {
     call(id, "big", json!({"n": n, "tag": id}))
 }
 
+/// The model of a run: the mock, and after the call number `on` it arms a lost commit, so that the
+/// commit of the step that made that call is the one that fails.
+struct Arm {
+    inner: Arc<MockModel>,
+    store: Arc<FaultyStore>,
+    run: Mutex<Option<RunId>>,
+    on: Mutex<Option<(usize, bool)>>,
+    calls: AtomicUsize,
+}
+
+impl Arm {
+    fn armed(&self) {
+        let n = self.calls.fetch_add(1, SeqCst);
+        let Some((on, after_apply)) = *self.on.lock().unwrap() else {
+            return;
+        };
+        let Some(run) = *self.run.lock().unwrap() else {
+            return;
+        };
+        if n == on {
+            if after_apply {
+                self.store.fail_run_after_apply(Method::CommitRun, run, 1);
+            } else {
+                self.store.fail_run(Method::CommitRun, run, 1);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ModelClient for Arm {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let answer = self.inner.complete(req).await;
+        self.armed();
+        answer
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        let answer = self.inner.stream(req).await;
+        self.armed();
+        answer
+    }
+}
+
 struct Rig {
     mock: Arc<MockModel>,
+    arm: Arc<Arm>,
     store: Arc<FaultyStore>,
     clock: ManualClock,
     rt: Runtime,
@@ -86,7 +156,15 @@ impl Rig {
         configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
     ) -> Self {
         let mock = Arc::new(MockModel::new());
-        let model: DynModel = mock.clone();
+        let store = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+        let arm = Arc::new(Arm {
+            inner: mock.clone(),
+            store: store.clone(),
+            run: Mutex::new(None),
+            on: Mutex::new(None),
+            calls: AtomicUsize::new(0),
+        });
+        let model: DynModel = arm.clone();
         let agent = configure(
             LlmAgent::builder("llm", model, "test-model")
                 .instructions("be brief")
@@ -94,10 +172,10 @@ impl Rig {
                     max_history_tokens,
                     ..Limits::default()
                 })
-                .tool(Big),
+                .tool(Big)
+                .tool(Handle),
         )
         .build();
-        let store = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
         let dynamic: DynStore = store.clone();
         let clock = ManualClock::new();
         let rt = Runtime::builder(dynamic)
@@ -116,21 +194,45 @@ impl Rig {
             .build();
         Self {
             mock,
+            arm,
             store,
             clock,
             rt,
         }
     }
 
-    async fn start(&self) -> RunId {
-        self.rt
-            .start("llm", user_message("go"), None)
-            .await
-            .expect("start")
+    /// Lose the commit of the step that makes the model call number `call` (0-based), before it
+    /// applies or, with `after_apply`, after it did.
+    fn lose_the_commit_after_call(&self, call: usize, after_apply: bool) {
+        *self.arm.on.lock().unwrap() = Some((call, after_apply));
     }
 
-    /// Work `run` to its end: the requests the model got and the state the run ended with.
-    async fn finish(&self, run: RunId) -> (Vec<ModelRequest>, Conversation) {
+    async fn start_in(&self, conversation: Option<&str>) -> RunId {
+        let run = self
+            .rt
+            .start("llm", user_message("go"), conversation)
+            .await
+            .expect("start");
+        *self.arm.run.lock().unwrap() = Some(run);
+        run
+    }
+
+    async fn start(&self) -> RunId {
+        self.start_in(None).await
+    }
+
+    /// A failed commit is retried after a backoff of the runtime's clock, which only this moves.
+    fn ticker(&self) -> tokio::task::JoinHandle<()> {
+        let clock = self.clock.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                clock.advance(Duration::from_millis(200));
+            }
+        })
+    }
+
+    fn worker(&self) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         let (stop, rx) = oneshot::channel::<()>();
         let rt = self.rt.clone();
         let worker = tokio::spawn(async move {
@@ -138,19 +240,19 @@ impl Rig {
                 let _ = rx.await;
             })
             .await
+            .expect("worker result");
         });
-        // A failed commit is retried after a backoff of the runtime's clock, which only this moves.
-        let clock = self.clock.clone();
-        let ticker = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(15)).await;
-                clock.advance(Duration::from_millis(200));
-            }
-        });
+        (stop, worker)
+    }
+
+    /// Work `run` to its end: the requests the model got and the state the run ended with.
+    async fn finish(&self, run: RunId) -> (Vec<ModelRequest>, Conversation) {
+        let (stop, worker) = self.worker();
+        let ticker = self.ticker();
         let view = wait_terminal(&self.rt, run).await;
         ticker.abort();
         let _ = stop.send(());
-        worker.await.expect("worker task").expect("worker result");
+        worker.await.expect("worker task");
         assert_eq!(view.status, RunStatus::Done, "{view:#?}");
         (self.mock.requests(), conversation(&view))
     }
@@ -201,24 +303,32 @@ fn breaks(requests: &[ModelRequest]) -> Vec<u32> {
     found
 }
 
-/// Six turns: five tool calls and the answer. The third result is big, and the fourth makes the
-/// history go over the budget with it no longer the newest.
-async fn six_turns(max_history_tokens: u32) -> (Vec<ModelRequest>, Conversation) {
-    let rig = Rig::new(max_history_tokens, |b| b);
-    rig.mock
-        .push_tool_calls(vec![big("c0", 200)])
-        .push_tool_calls(vec![big("c1", 200)])
+/// A budget of 1200 tokens is 4800 characters. The results are 700, 700, 3000, 600 and 700
+/// letters, so the history is about 4,500 characters at request 3 (under it, the 3000 result being
+/// the newest) and about 5,200 at request 4, where the 3000 result is no longer the newest: the
+/// first request over the budget, and so the only one that shortens (to 3,600).
+const SIX_TURNS_BUDGET: u32 = 1200;
+
+fn push_six_turns(mock: &MockModel) {
+    mock.push_tool_calls(vec![big("c0", 700)])
+        .push_tool_calls(vec![big("c1", 700)])
         .push_tool_calls(vec![big("c2", 3000)])
         .push_tool_calls(vec![big("c3", 600)])
-        .push_tool_calls(vec![big("c4", 200)])
+        .push_tool_calls(vec![big("c4", 700)])
         .push_text("done");
+}
+
+/// Six turns: five tool calls and the answer.
+async fn six_turns(max_history_tokens: u32) -> (Vec<ModelRequest>, Conversation) {
+    let rig = Rig::new(max_history_tokens, |b| b);
+    push_six_turns(&rig.mock);
     let run = rig.start().await;
     rig.finish(run).await
 }
 
 #[tokio::test]
 async fn each_request_starts_with_the_one_before() {
-    let (requests, state) = six_turns(925).await;
+    let (requests, state) = six_turns(SIX_TURNS_BUDGET).await;
     assert_eq!(requests.len(), 6);
     assert_eq!(state.turns, 6);
     let cut = breaks(&requests);
@@ -240,7 +350,7 @@ async fn without_a_budget_nothing_is_shortened_and_the_state_has_no_member_for_i
 
 #[tokio::test]
 async fn a_shortening_is_sent_the_same_way_after() {
-    let (requests, state) = six_turns(925).await;
+    let (requests, state) = six_turns(SIX_TURNS_BUDGET).await;
     let [at] = state.shortenings[..] else {
         panic!("one shortening: {:?}", state.shortenings);
     };
@@ -248,10 +358,9 @@ async fn a_shortening_is_sent_the_same_way_after() {
     // The request that shortened is the history as the state now holds it, and every later request
     // carries those messages, byte for byte.
     for later in &requests[at..] {
-        assert_eq!(
-            serde_json::to_string(&later.messages[..]).unwrap()
-                [..open_messages(&requests[at]).len()],
-            open_messages(&requests[at]),
+        assert!(
+            open_messages(later).starts_with(&open_messages(&requests[at])),
+            "a later request carries the shortened messages as they were sent"
         );
     }
     assert_eq!(
@@ -278,13 +387,14 @@ async fn a_shortening_is_sent_the_same_way_after() {
     );
     assert_eq!(
         texts[4],
-        format!("c4:{}", "x".repeat(200)),
+        format!("c4:{}", "x".repeat(700)),
         "the newest result is whole"
     );
     // The request before it was the long history, which the shortening replaced.
-    assert!(requests[at - 1].messages.len() < requests[at].messages.len());
-    let old = &requests[at - 1].messages[2];
-    assert_eq!(old.text(), format!("c0:{}", "x".repeat(200)));
+    assert_eq!(
+        requests[at - 1].messages[2].text(),
+        format!("c0:{}", "x".repeat(700))
+    );
 }
 
 #[tokio::test]
@@ -307,28 +417,35 @@ async fn a_state_written_before_shortenings_loads_and_one_without_them_writes_no
 }
 
 /// A model call that failed and is made again (the runtime retries it with the committed state)
-/// is sent the same bytes, shortening included.
+/// is sent the same bytes, shortening included, however many times it is retried.
 #[tokio::test]
 async fn a_retried_model_call_sends_the_same_request_after_a_shortening() {
-    let rig = Rig::new(925, |b| b);
+    let rig = Rig::new(SIX_TURNS_BUDGET, |b| b);
     rig.mock
-        .push_tool_calls(vec![big("c0", 200)])
-        .push_tool_calls(vec![big("c1", 200)])
+        .push_tool_calls(vec![big("c0", 700)])
+        .push_tool_calls(vec![big("c1", 700)])
         .push_tool_calls(vec![big("c2", 3000)])
         .push_tool_calls(vec![big("c3", 600)])
         .push_error(ModelError::transient("blip"))
-        .push_tool_calls(vec![big("c4", 200)])
+        .push_error(ModelError::transient("blip again"))
+        .push_tool_calls(vec![big("c4", 700)])
         .push_text("done");
     let run = rig.start().await;
     let (requests, state) = rig.finish(run).await;
-    assert_eq!(requests.len(), 7, "one call was made twice");
-    let (failed, retried) = (&requests[4], &requests[5]);
+    assert_eq!(requests.len(), 8, "the call at turn 4 was made three times");
+    let first = serde_json::to_string(&requests[4]).unwrap();
+    for retried in &requests[5..=6] {
+        assert_eq!(
+            serde_json::to_string(retried).unwrap(),
+            first,
+            "the same request, byte for byte"
+        );
+    }
     assert_eq!(
-        serde_json::to_string(failed).unwrap(),
-        serde_json::to_string(retried).unwrap(),
-        "the same request, byte for byte"
+        state.shortenings,
+        [4],
+        "recorded once, at the turn it was made"
     );
-    assert_eq!(state.shortenings, [4], "recorded once");
     assert!(
         state
             .messages
@@ -337,32 +454,31 @@ async fn a_retried_model_call_sends_the_same_request_after_a_shortening() {
     );
 }
 
-/// A commit lost at any point (before it applied, or after, with the acknowledgement lost) leaves
-/// the run to be stepped again from the state before it: it ends with the history, the shortenings
-/// and the requests of a run that lost nothing.
+/// The commit of the step that records a shortening is lost (before it applied, or after, with the
+/// acknowledgement lost) and so is the one after it: the run is stepped again from the state before
+/// and ends with the history, the shortenings and the requests of a run that lost nothing.
 #[tokio::test]
 async fn a_lost_commit_replays_the_same_requests() {
-    let baseline = six_turns(925).await;
-    for n in [1, 3, 5, 6, 8] {
+    let baseline = six_turns(SIX_TURNS_BUDGET).await;
+    let [at] = baseline.1.shortenings[..] else {
+        panic!("one shortening: {:?}", baseline.1.shortenings);
+    };
+    // The commit of the shortening's own transition, and the one after it.
+    for call in [at as usize, at as usize + 1] {
         for after in [false, true] {
-            let rig = Rig::new(925, |b| b);
-            rig.mock
-                .push_tool_calls(vec![big("c0", 200)])
-                .push_tool_calls(vec![big("c1", 200)])
-                .push_tool_calls(vec![big("c2", 3000)])
-                .push_tool_calls(vec![big("c3", 600)])
-                .push_tool_calls(vec![big("c4", 200)])
-                .push_text("done");
+            let rig = Rig::new(SIX_TURNS_BUDGET, |b| b);
+            push_six_turns(&rig.mock);
+            rig.lose_the_commit_after_call(call, after);
             let run = rig.start().await;
-            if after {
-                rig.store.fail_run_after_apply(Method::CommitRun, run, n);
-            } else {
-                rig.store.fail_run(Method::CommitRun, run, n);
-            }
             let (requests, state) = rig.finish(run).await;
-            let label = format!("commit {n}, after apply: {after}");
+            let label = format!("after call {call}, commit applied before the loss: {after}");
+            assert_eq!(
+                rig.store.injected(Method::CommitRun),
+                1,
+                "{label}: the fault fired"
+            );
+            assert_eq!(state.shortenings, [at], "{label}: the cut is recorded once");
             assert_eq!(state.messages, baseline.1.messages, "{label}");
-            assert_eq!(state.shortenings, baseline.1.shortenings, "{label}");
             assert_eq!(requests.len(), baseline.0.len(), "{label}");
             for (got, want) in requests.iter().zip(&baseline.0) {
                 assert_eq!(
@@ -375,13 +491,73 @@ async fn a_lost_commit_replays_the_same_requests() {
     }
 }
 
+/// A message that arrives between a lost commit and the replay does not move the cut. The
+/// shortening is decided from the committed state, before the message is read: the replayed turn
+/// finds the cut it would have made without the message (none), the message counts toward the
+/// budget one turn later, and `shortenings` names the turn of the first request that carries the
+/// cut, which is the first request that carries the message.
+#[tokio::test]
+async fn a_message_that_arrives_before_a_replay_does_not_move_the_cut() {
+    // 850 tokens is 3,400 characters: the history is about 3,100 at request 3, and 5,100 with the
+    // message, which is 2,000 characters.
+    let rig = Rig::new(850, |b| b);
+    rig.mock
+        .push_tool_calls(vec![big("c0", 700)])
+        .push_tool_calls(vec![big("c1", 700)])
+        .push_tool_calls(vec![big("c2", 1500)])
+        .push_text("finished") // request 3: the answer whose commit is lost
+        .push_tool_calls(vec![big("c3", 100)]) // request 4: the answer to the message
+        .push_text("done");
+    rig.lose_the_commit_after_call(3, false);
+    let run = rig.start().await;
+    let (stop, worker) = rig.worker();
+    // Nothing moves until the clock does: wait for the lost commit, then the message arrives.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rig.store.injected(Method::CommitRun) < 1 {
+        assert!(Instant::now() < deadline, "the commit was never lost");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let message = "m".repeat(2000);
+    rig.rt
+        .deliver(run, adam_llm_agent::user_message(message.clone()))
+        .await
+        .expect("deliver");
+    let ticker = rig.ticker();
+    let view = wait_terminal(&rig.rt, run).await;
+    ticker.abort();
+    let _ = stop.send(());
+    worker.await.expect("worker task");
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    let (requests, state) = (rig.mock.requests(), conversation(&view));
+    assert_eq!(requests.len(), 6, "{requests:#?}");
+    // The first try's request (3) has no message and no cut; the replay answered from the journal,
+    // which asked nothing; the model answers again at request 4, the first with the message, and
+    // that is the first with the cut.
+    assert!(!requests[3].messages.iter().any(|m| m.text() == message));
+    assert!(requests[4].messages.iter().any(|m| m.text() == message));
+    assert_eq!(breaks(&requests[..4]), Vec::<u32>::new());
+    // The message keeps the history at the budget, so more cuts follow (the README says when); the
+    // first is at request 4 and every one is recorded at the turn of its request.
+    let cut = breaks(&requests);
+    assert_eq!(
+        cut.first(),
+        Some(&4),
+        "the first cut is in request 4: {cut:?}"
+    );
+    assert_eq!(
+        state.shortenings, cut,
+        "`shortenings` names the turns of the requests, not the replayed one"
+    );
+}
+
 /// A kept output and the reads of it: the long text is in the state beside the history, and the
-/// history a read adds extends the one before; a shortening of the shown first page does not touch
-/// what `read_output` reads.
+/// history a read adds extends the one before; a shortening of the shown first page does not
+/// take the id away, and the reads that follow it still work.
 #[tokio::test]
 async fn a_kept_output_and_its_reads_keep_the_prefix() {
     let text: String = (0..7000).map(|i| format!("row-{i:06}\n")).collect();
-    // A budget the pages of a read go over: one shortening, at a read.
+    // 2600 tokens is 10,400 characters; the first page alone is 22,000, so the history is over
+    // the budget from the first request after it and is cut at the next reads.
     let rig = Rig::new(2600, |b| b.tool(Wordy(text.clone())).tool(ReadOutput));
     let run = rig.start().await;
     let id = adam_llm_agent::output_id(&run.to_string(), "c1");
@@ -407,7 +583,22 @@ async fn a_kept_output_and_its_reads_keep_the_prefix() {
         Some(&text),
         "what is kept is whole"
     );
-    // The last page of the output is in the newest result, whole.
+    // The first result was cut (a page is far over the floor and the budget), and still says
+    // how to read the rest.
+    let first = state
+        .messages
+        .iter()
+        .find(|m| matches!(m, Message::Tool { .. }))
+        .unwrap()
+        .text();
+    assert!(
+        first.contains(adam_llm_agent::TRUNCATION_MARKER_PREFIX),
+        "cut: {}",
+        &first[..200]
+    );
+    let pointer = adam_llm_agent::read_pointer(&first).expect("the pointer survived the cut");
+    assert!(pointer.contains(&id), "{pointer}");
+    // The last page of the output is in the newest result, whole: the read still worked.
     let last = state
         .messages
         .iter()
@@ -417,12 +608,37 @@ async fn a_kept_output_and_its_reads_keep_the_prefix() {
     assert!(last.text().contains("row-006999"), "{}", last.text());
 }
 
-/// The closing turn is appended to the request and not kept, so a run that goes on after it (a
-/// message that arrives, which reopens the run) does not start with the closing turn's request:
-/// the one place the rule does not hold. The request that has the closing turn still starts with the
-/// one before it.
+/// A small structured result (a session's id, a plan's, a shared file's) is never shortened, whatever
+/// the history is: it holds an id nothing else repeats.
 #[tokio::test]
-async fn the_closing_turn_is_the_end_of_the_prefix() {
+async fn a_small_result_with_an_id_survives_a_history_far_over_budget() {
+    let rig = Rig::new(100, |b| b);
+    rig.mock
+        .push_tool_calls(vec![call("h", "handle", json!({}))])
+        .push_tool_calls(vec![big("c0", 3000)])
+        .push_tool_calls(vec![big("c1", 3000)])
+        .push_tool_calls(vec![big("c2", 3000)])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert!(
+        !state.shortenings.is_empty(),
+        "the history was far over budget"
+    );
+    let handle = &state.messages[2];
+    assert_eq!(
+        handle.text(),
+        r#"{"session":"3f9c2a17","state":"working"}"#,
+        "{handle:?}"
+    );
+    assert_eq!(requests[4].messages[2], *handle);
+}
+
+/// The closing turn is appended to the request and not kept in the history. The request that
+/// has it still starts with the one before it; a run reopened after it would not start with the
+/// closing request, which this does not do (documented in the README as the one exception).
+#[tokio::test]
+async fn the_closing_request_extends_the_one_before_and_its_turn_is_not_kept() {
     let rig = Rig::new(0, |b| b);
     let model: DynModel = rig.mock.clone();
     let agent = LlmAgent::builder("llm", model, "test-model")
@@ -446,7 +662,10 @@ async fn the_closing_turn_is_the_end_of_the_prefix() {
         .push_tool_calls(vec![big("c0", 50)])
         .push_tool_calls(vec![big("c1", 50)])
         .push_text("here is what I did");
-    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let run = rt
+        .start("llm", user_message("go"), Some("alice:thread-7"))
+        .await
+        .unwrap();
     let (stop, rx) = oneshot::channel::<()>();
     let worker = {
         let rt = rt.clone();
@@ -484,35 +703,36 @@ async fn the_closing_turn_is_the_end_of_the_prefix() {
             .any(|m| m.text() == adam_llm_agent::CLOSING_TURN),
         "the closing turn is not in the history"
     );
+    // It carries the conversation's key like every request of the run.
+    assert_eq!(
+        requests[2].prompt_cache_key, requests[0].prompt_cache_key,
+        "the closing turn's request has the key too"
+    );
+    assert!(requests[2].prompt_cache_key.is_some());
 }
 
-/// The loop says the cache key of every request: the hex of a SHA-256 of the conversation id, 32
-/// characters, the same for every request of the conversation, and none for a run with no
-/// conversation id; the id itself is not in it.
+/// The loop says the cache key of every request of a run that has a conversation id: the first 32
+/// hex digits of the SHA-256 of the id (`printf alice:thread-7 | sha256sum`), so every run of the
+/// conversation has the same key; none for a run with no conversation id; the id itself is not in it.
 #[tokio::test]
 async fn the_loop_gives_every_request_of_a_conversation_the_same_cache_key() {
     let rig = Rig::new(0, |b| b);
     rig.mock
         .push_tool_calls(vec![big("c0", 5)])
-        .push_text("done");
-    let run = rig
-        .rt
-        .start("llm", user_message("go"), Some("alice:thread-7"))
-        .await
-        .unwrap();
-    let (requests, _) = rig.finish(run).await;
-    let keys: Vec<&str> = requests
-        .iter()
-        .map(|r| r.prompt_cache_key.as_deref().expect("a key"))
-        .collect();
-    assert_eq!(keys[0], keys[1]);
-    assert_eq!(keys[0].len(), 32);
-    assert!(
-        keys[0]
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    );
-    assert!(!keys[0].contains("alice"));
+        .push_text("done")
+        .push_text("done again");
+    let first = rig.start_in(Some("alice:thread-7")).await;
+    rig.finish(first).await;
+    let second = rig.start_in(Some("alice:thread-7")).await;
+    let (requests, _) = rig.finish(second).await;
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_eq!(
+            request.prompt_cache_key.as_deref(),
+            Some("de9e4a5612b838c5c8dfe872afe6cf72"),
+            "the same key for every request of every run of the conversation"
+        );
+    }
 
     let rig = Rig::new(0, |b| b);
     rig.mock.push_text("done");
@@ -524,51 +744,104 @@ async fn the_loop_gives_every_request_of_a_conversation_the_same_cache_key() {
     );
 }
 
-/// The tools a source offers are in the model's request by name, whatever order it listed them in.
-#[tokio::test]
-async fn the_tools_of_a_source_are_offered_in_name_order() {
-    struct Shuffled(std::sync::atomic::AtomicBool);
-    #[async_trait]
-    impl adam_llm_agent::ToolSource for Shuffled {
-        async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
-            let flip = self.0.fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
-            let mut names = ["delta", "alpha", "charlie", "bravo"];
-            if flip {
-                names.reverse();
-            }
-            names
-                .iter()
-                .map(|n| ToolSpec {
-                    name: (*n).into(),
-                    description: format!("the {n} tool"),
-                    parameters: json!({"type": "object"}),
-                })
-                .collect()
-        }
-        async fn call(
-            &self,
-            _ctx: &ToolCtx,
-            _name: &str,
-            _args: Value,
-        ) -> Option<Result<ToolOutput, ToolError>> {
-            Some(Ok(ToolOutput::text("ok")))
+/// What a source lists, in an order that changes every turn.
+struct Shuffled {
+    flip: AtomicBool,
+    names: Vec<String>,
+    /// Descriptions in the opposite order to the names.
+    describe_backwards: bool,
+}
+
+impl Shuffled {
+    fn new(names: Vec<String>, describe_backwards: bool) -> Self {
+        Self {
+            flip: AtomicBool::new(false),
+            names,
+            describe_backwards,
         }
     }
-    let rig = Rig::new(0, |b| b.tool_source(Shuffled(Default::default())));
+}
+
+#[async_trait]
+impl ToolSource for Shuffled {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        let flip = self.flip.fetch_xor(true, SeqCst);
+        let count = self.names.len();
+        let mut specs: Vec<ToolSpec> = self
+            .names
+            .iter()
+            .enumerate()
+            .map(|(n, name)| ToolSpec {
+                name: name.clone(),
+                description: if self.describe_backwards {
+                    format!("{:04} the {name} tool", count - n)
+                } else {
+                    format!("the {name} tool")
+                },
+                parameters: json!({"type": "object"}),
+            })
+            .collect();
+        if flip {
+            specs.reverse();
+        }
+        specs
+    }
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        Some(Ok(ToolOutput::text("ok")))
+    }
+}
+
+fn names_of(request: &ModelRequest) -> Vec<String> {
+    request.tools.iter().map(|t| t.name.clone()).collect()
+}
+
+/// The tools of a source are offered in name order, whatever order it lists them in, and by name
+/// and not by description.
+#[tokio::test]
+async fn the_tools_of_a_source_are_offered_in_name_order() {
+    let names = ["delta", "alpha", "charlie", "bravo"]
+        .map(str::to_owned)
+        .to_vec();
+    let rig = Rig::new(0, |b| b.tool_source(Shuffled::new(names, true)));
     rig.mock
         .push_tool_calls(vec![big("c0", 5)])
         .push_tool_calls(vec![big("c1", 5)])
         .push_text("done");
     let run = rig.start().await;
     let (requests, _) = rig.finish(run).await;
-    let names = |r: &ModelRequest| r.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
     assert_eq!(
-        names(&requests[0]),
-        ["big", "alpha", "bravo", "charlie", "delta"]
+        names_of(&requests[0]),
+        ["big", "handle", "alpha", "bravo", "charlie", "delta"]
     );
     assert_eq!(
         breaks(&requests),
         Vec::<u32>::new(),
         "the listing flipped, the request did not"
     );
+}
+
+/// The sort comes before the cap: a source that lists more tools than `MAX_SOURCE_TOOLS` offers
+/// the same ones in every request, the first by name, whatever order it lists them in.
+#[tokio::test]
+async fn the_tools_that_survive_the_cap_do_not_depend_on_the_listing_order() {
+    let names: Vec<String> = (0..MAX_SOURCE_TOOLS + 2)
+        .map(|n| format!("t{n:03}"))
+        .collect();
+    let rig = Rig::new(0, |b| b.tool_source(Shuffled::new(names.clone(), false)));
+    rig.mock
+        .push_tool_calls(vec![big("c0", 5)])
+        .push_tool_calls(vec![big("c1", 5)])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, _) = rig.finish(run).await;
+    let mut want = vec!["big".to_owned(), "handle".to_owned()];
+    want.extend(names.iter().take(MAX_SOURCE_TOOLS).cloned());
+    for request in &requests {
+        assert_eq!(names_of(request), want);
+    }
 }

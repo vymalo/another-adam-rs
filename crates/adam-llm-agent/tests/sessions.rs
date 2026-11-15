@@ -241,6 +241,8 @@ struct Rig {
     hold_child_on: Option<usize>,
     flaky: bool,
     max_tool_calls: Option<u32>,
+    /// The history budget of the parent, in tokens.
+    history_tokens: Option<u32>,
     /// The time limit of each round of `helper`.
     within: Option<Duration>,
     /// A tool the parent can call that waits for the test.
@@ -260,6 +262,7 @@ impl Rig {
             hold_child_on: None,
             flaky: false,
             max_tool_calls: None,
+            history_tokens: None,
             within: None,
             hold: None,
             sink: CollectingSink::new(),
@@ -310,10 +313,12 @@ impl Rig {
         if let Some(hold) = &self.hold {
             builder = builder.tool(HoldHandle(hold.clone()));
         }
-        if let Some(max) = self.max_tool_calls {
+        if self.max_tool_calls.is_some() || self.history_tokens.is_some() {
+            let defaults = adam_llm_agent::Limits::default();
             builder = builder.limits(adam_llm_agent::Limits {
-                max_tool_calls: max,
-                ..Default::default()
+                max_tool_calls: self.max_tool_calls.unwrap_or(defaults.max_tool_calls),
+                max_history_tokens: self.history_tokens.unwrap_or(defaults.max_history_tokens),
+                ..defaults
             });
         }
         builder.build()
@@ -678,6 +683,38 @@ mod cases {
             requests[2].messages.last(),
             Some(Message::Tool { call_id, .. }) if call_id == "wait_1"
         ));
+    }
+
+    /// A history far over budget leaves the result of `subagent_start` alone: it is a small
+    /// structured result that holds the session's id, which nothing else repeats.
+    pub async fn the_start_result_survives_a_history_far_over_budget(store: DynStore) {
+        let mut rig = Rig::new().holding(0);
+        rig.history_tokens = Some(1);
+        rig.child_mock.push_text("child says 42");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_text("started it")
+            .push_text("the helper said 42");
+        let worker = spawn_worker(&rt);
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        wait_waiting_on_a_session(&rt, parent).await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let state = state_of(&rt, parent).await;
+        let results = tool_results(&state);
+        let started = as_json(&result_of(&results, "c1").1);
+        assert_eq!(started["session"], session.to_string());
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[2].messages[2], state.messages[2],
+            "the third request still shows the start result as it was"
+        );
     }
 
     /// A read that does not wait answers "working" and parks nothing; the model carries on.
@@ -2738,6 +2775,7 @@ macro_rules! session_suite {
             session_suite!(@cases $make;
                 a_start_returns_at_once_and_the_turn_end_waits_for_the_report,
                 a_session_report_keeps_the_prefix,
+                the_start_result_survives_a_history_far_over_budget,
                 a_read_without_wait_answers_working_and_parks_nothing,
                 a_read_with_wait_parks_and_resumes_once_with_the_report,
                 a_session_closes_by_default_and_refuses_a_send,

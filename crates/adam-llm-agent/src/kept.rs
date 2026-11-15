@@ -283,6 +283,29 @@ pub fn kept_header(id: &str, info: &KeptInfo, total_bytes: u64) -> String {
     line
 }
 
+/// The first line of `text` that tells the model how to read a kept output back: one that holds
+/// `read_output {"id":"o-…"}` with a well-formed id (the header of [`kept_header`], and the line a
+/// command's head-and-tail view ends with). The line is returned without its newline. A shortening
+/// of a history keeps this line, so the id outlives the cut.
+pub fn read_pointer(text: &str) -> Option<&str> {
+    const NEEDLE: &str = "read_output {\"id\":\"";
+    let mut from = 0;
+    while let Some(at) = text[from..].find(NEEDLE) {
+        let id_start = from + at + NEEDLE.len();
+        let id = text.get(id_start..id_start + 18).unwrap_or_default();
+        let closed = text.get(id_start + 18..id_start + 20) == Some("\"}");
+        if closed && is_output_id(id) {
+            let line_start = text[..id_start].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = text[id_start..]
+                .find('\n')
+                .map_or(text.len(), |i| id_start + i);
+            return Some(&text[line_start..line_end]);
+        }
+        from = id_start;
+    }
+    None
+}
+
 /// What the model is shown of a text that was kept: [`kept_header`], the first page, and the
 /// page's final line (`[more: ...; next page: offset=N]`).
 pub fn kept_view(id: &str, kept: &str, info: &KeptInfo, total_bytes: u64) -> String {

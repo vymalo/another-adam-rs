@@ -924,13 +924,6 @@ impl LlmAgent {
             });
         }
         let closing = state.limit.is_some();
-        // The history is shortened here, in the state, and not only in the copy that is sent, so
-        // that each request starts with the one before it. This is a function of the state the
-        // transition began with, which is the committed one: a retry or a replay after a crash
-        // shortens the same way and sends the same request.
-        if record_shortenings(&mut state.messages, self.limits.max_history_tokens) {
-            state.shortenings.push(state.turns);
-        }
         let mut request = ModelRequest::new(self.model_alias.clone());
         request.system = self.instructions.clone();
         request.messages.clone_from(&state.messages);
@@ -2845,6 +2838,14 @@ impl Agent for LlmAgent {
                 .unwrap_or_default();
             let output = json!({ "text": text, "artifacts": [], "closed": true });
             return Ok(Transition::Done { state, output });
+        }
+        // The history is shortened here, in the state, from the state as it was committed: before
+        // this step appends a message that arrived since (an inbox message, a deferred one, the
+        // answer to a question), so a replay after a crash shortens the same way whatever arrived
+        // in between, and each request starts with the one before it. What arrives counts toward the
+        // budget one turn later. `state.turns` is the turn of the next request.
+        if record_shortenings(&mut state.messages, self.limits.max_history_tokens) {
+            state.shortenings.push(state.turns);
         }
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx
             .take_inbox()

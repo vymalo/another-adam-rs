@@ -569,9 +569,9 @@ fn has_expired(value: &Value, now: DateTime<Utc>) -> bool {
 ///
 /// 1. **The tool outputs of the turns older than the newest are shortened**, oldest first, each
 ///    keeping its head and ending in the
-///    [`TRUNCATION_MARKER_PREFIX`](crate::TRUNCATION_MARKER_PREFIX) marker: what the model
-///    already does to a long history when it is sent ([`Limits::max_history_tokens`](crate::Limits)),
-///    and the output of a tool is the bulk of a coding run. No call loses its result.
+///    [`TRUNCATION_MARKER_PREFIX`](crate::TRUNCATION_MARKER_PREFIX) marker: what a run does to its
+///    own history when it goes over [`Limits::max_history_tokens`](crate::Limits), and the output of
+///    a tool is the bulk of a coding run. No call loses its result.
 /// 2. **Whole old turns are dropped**, oldest first (a turn is a user message and everything that
 ///    followed it up to the next user message), and one marker text
 ///    ([`OMITTED_MARKER_PREFIX`]) says how many. This is what the model is *not* already shown in

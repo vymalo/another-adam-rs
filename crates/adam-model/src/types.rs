@@ -33,7 +33,7 @@ pub struct ModelRequest {
     /// where the backend has one that takes it (`prompt_cache_key` of OpenAI's chat completions).
     /// The agent loop always says it when the run has a conversation id; whether it goes on the
     /// wire is the client's choice. Never the id itself.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
 }
 

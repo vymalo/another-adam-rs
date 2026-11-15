@@ -219,7 +219,9 @@ impl Withheld {
 /// * The agent's own tools come first and win a name clash: a listed tool whose name an own tool
 ///   (or an earlier source) already has is left out, with a warning (at debug level when the source
 ///   [expects the repeat](Self::expects_repeat)). At most [`MAX_SOURCE_TOOLS`]
-///   are offered.
+///   are offered. A source's tools are sorted by name before that cap and those clashes, so the
+///   tools that survive the cap, and which of two same-named tools of one source is offered (the
+///   first in the listing), do not depend on the order the source lists in.
 /// * A tool of a source cannot wait on a task of another system
 ///   ([`ToolError::AwaitRemote`]): the wait is answered with an error result, because the agent
 ///   asks the tool that started it how it stands, and a source's tool is not known by then. It can
@@ -336,8 +338,10 @@ pub(crate) async fn offered(
             notes: offered_notes,
         } = source.listing(ctx).await;
         let first = out.len();
-        // By name, a stable sort: the order a source lists in (an MCP server's, across reconnects)
-        // is not one to build the cached start of a request on.
+        // By name, a stable sort, and before the cap and the name clashes below: the order a source
+        // lists in (an MCP server's, across reconnects) is not one to build the cached start of a
+        // request on, and it decides which tools survive `MAX_SOURCE_TOOLS` and which of two
+        // same-named tools of one source is offered (the first of them in the listing).
         let mut specs = specs;
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         for spec in specs {
