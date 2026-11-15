@@ -211,3 +211,125 @@ fn each_agent_of_a_package_has_its_own_commands() {
     assert_eq!(agents[0].commands.len(), 1);
     assert!(agents[1].commands.is_empty());
 }
+
+const GOOD: &str = "---\ndescription: d\n---\nGo.\n";
+
+fn errors(report: &Report) -> Vec<&adam_agent_fs::Diagnostic> {
+    report
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect()
+}
+
+#[test]
+fn a_file_that_is_not_markdown_is_skipped_with_a_warning() {
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        ("agent/commands/ok.md", GOOD),
+        ("agent/commands/notes.txt", "scratch"),
+        ("agent/commands/LOUD.MD", GOOD),
+    ]);
+    let report = load(dir.path());
+    assert!(errors(&report).is_empty(), "{:#?}", report.diagnostics);
+    assert_eq!(report.package.agents[0].commands.len(), 1);
+    let warned: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .collect();
+    assert_eq!(warned.len(), 2, "{:#?}", report.diagnostics);
+}
+
+#[test]
+fn the_md_suffix_is_stripped_once() {
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        ("agent/commands/foo.md", GOOD),
+        ("agent/commands/foo.md.md", GOOD),
+    ]);
+    let report = load(dir.path());
+    let errors = errors(&report);
+    assert_eq!(errors.len(), 1, "{:#?}", report.diagnostics);
+    assert!(errors[0].message.contains("not a command name"));
+    let names: Vec<_> = report.package.agents[0]
+        .commands
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["foo"]);
+}
+
+#[test]
+fn a_command_file_over_40_kib_is_refused_before_it_is_read() {
+    let big = "z".repeat(40 * 1024);
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        (
+            "agent/commands/a.md",
+            &format!("---\ndescription: d\n---\n{big}"),
+        ),
+    ]);
+    let report = load(dir.path());
+    let errors = errors(&report);
+    assert_eq!(errors.len(), 1, "{:#?}", report.diagnostics);
+    assert!(errors[0].message.contains("at most 40960"), "{errors:?}");
+    assert!(report.package.agents[0].commands.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_commands_is_an_error_not_a_hang() {
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        ("agent/commands/ok.md", GOOD),
+    ]);
+    let fifo = dir.path().join("agent/commands/pipe.md");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    if !made.is_ok_and(|s| s.success()) {
+        return; // no mkfifo here
+    }
+    let report = load(dir.path());
+    let errors = errors(&report);
+    assert_eq!(errors.len(), 1, "{:#?}", report.diagnostics);
+    assert!(errors[0].message.contains("regular file"), "{errors:?}");
+    assert_eq!(report.package.agents[0].commands.len(), 1);
+}
+
+#[test]
+fn the_argument_hint_takes_100_characters() {
+    for (len, ok) in [(100, true), (101, false)] {
+        let hint = "h".repeat(len);
+        let dir = write(&[
+            ("agent/instructions.md", ROOT),
+            (
+                "agent/commands/a.md",
+                &format!("---\ndescription: d\nargument-hint: \"{hint}\"\n---\nGo.\n"),
+            ),
+        ]);
+        let report = load(dir.path());
+        assert_eq!(
+            errors(&report).is_empty(),
+            ok,
+            "{len}: {:#?}",
+            report.diagnostics
+        );
+    }
+}
+
+#[test]
+fn commands_are_sorted_by_name_not_by_file_order() {
+    // `a-b.md` sorts before `a.md` as a file name (`-` is below `.`), not as a command name.
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        ("agent/commands/a.md", GOOD),
+        ("agent/commands/a-b.md", GOOD),
+    ]);
+    let report = load(dir.path());
+    let names: Vec<_> = report.package.agents[0]
+        .commands
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["a", "a-b"]);
+}

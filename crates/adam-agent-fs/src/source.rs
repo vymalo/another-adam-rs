@@ -140,6 +140,9 @@ struct Entry {
     linked: bool,
 }
 
+/// The most bytes a command file may have: the template's cap and room for its frontmatter.
+const COMMAND_FILE_MAX: u64 = 40 * 1024;
+
 struct Loader<'a> {
     root: &'a Path,
     diagnostics: Vec<Diagnostic>,
@@ -647,13 +650,51 @@ impl Loader<'_> {
             }
             match entry.kind {
                 EntryKind::File if is_markdown(&entry.name) => {
-                    let name = entry.name.trim_end_matches(".md");
+                    let rel = self.rel(&entry.path);
+                    // `foo.md.md` is the name `foo.md`, which is not a command name.
+                    let name = entry.name.strip_suffix(".md").unwrap_or(&entry.name);
+                    // Look before reading: a FIFO or a device would hang the load, a huge file
+                    // would fill the memory.
+                    match fs::metadata(&entry.path) {
+                        Ok(meta) if !meta.is_file() => {
+                            self.error(&rel, None, "a command is a regular file");
+                            continue;
+                        }
+                        Ok(meta) if meta.len() > COMMAND_FILE_MAX => {
+                            self.error(
+                                &rel,
+                                None,
+                                format!(
+                                    "the file has {} bytes; a command file takes at most \
+                                     {COMMAND_FILE_MAX}",
+                                    meta.len()
+                                ),
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(Error::io(&entry.path, e)),
+                    }
                     let Some(text) = self.read(&entry.path)? else {
                         continue;
                     };
-                    let rel = self.rel(&entry.path);
                     let mut sink = self.sink(&rel);
-                    out.extend(load::parse_command(&mut sink, &rel, &text, name));
+                    let Some(command) = load::parse_command(&mut sink, &rel, &text, name) else {
+                        continue;
+                    };
+                    if let Some(first) = out.iter().find(|c| c.name == command.name) {
+                        let first = first.path.display().to_string();
+                        self.error(
+                            &rel,
+                            None,
+                            format!(
+                                "the command `{}` is already defined by `{first}`",
+                                command.name
+                            ),
+                        );
+                        continue;
+                    }
+                    out.push(command);
                 }
                 EntryKind::Dir => {
                     let rel = self.rel(&entry.path);
@@ -662,7 +703,10 @@ impl Loader<'_> {
                         "ignored: commands are flat files, `commands/<name>.md`",
                     );
                 }
-                EntryKind::File => {}
+                EntryKind::File => {
+                    let rel = self.rel(&entry.path);
+                    self.warn(&rel, "ignored: a command is `commands/<name>.md`");
+                }
             }
         }
         if out.len() > MAX_COMMANDS {
