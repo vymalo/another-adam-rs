@@ -1,1 +1,14 @@
+The following skills provide specialized instructions for specific tasks.
+When a task matches a skill's description, call the load_skill tool with the skill's name to load its full instructions.
+<available_skills>
+  <skill>
+    <name>discover-checks</name>
+    <description>Find the checks a repository really runs (format, lint, types, tests, build) before you change code, and choose the exact commands for run_checks. Use it when the repository's own text does not list them.</description>
+  </skill>
+  <skill>
+    <name>pull-request-text</name>
+    <description>Write the title and body of a pull request a reviewer can act on: follow the repository's template and title style, say what and why, list the exact verification commands, and report failures that were already there.</description>
+  </skill>
+</available_skills>
+
 Other skills may be listed to you during the run, named `<source>/<skill>`; load them with load_skill the same way.

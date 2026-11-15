@@ -417,7 +417,9 @@ async fn the_assembled_agent_is_what_the_hand_written_one_was() {
         info.tools, TOOLS,
         "the tools, in the order they are offered"
     );
-    assert!(info.skills.is_empty() && info.preloaded.is_empty());
+    // Its two skills, both left to `load_skill`: none is preloaded.
+    assert_eq!(info.skills, ["discover-checks", "pull-request-text"]);
+    assert!(info.preloaded.is_empty());
     // What `coder_limits()` returned.
     assert_eq!(
         info.limits,
@@ -1502,5 +1504,85 @@ async fn the_model_reads_a_long_command_back_through_the_real_coder_agent() {
             "2001\n2002\n2003\n[more: 27997 lines left; next page: offset=2004]".to_owned(),
             false
         )
+    );
+}
+
+/// The coder ships two skills of its own (ADR 0044, decision 8), written for it: each parses as the
+/// loader reads a skill with no finding, is short, says only what it can do (every tool it names is
+/// one the coder has) and is in the catalog of the prompt, which the pinned `skills.txt` holds.
+#[tokio::test]
+async fn the_coders_skills_parse_and_are_in_the_catalog() {
+    use adam::agent_fs::{SkillLayout, parse_skill};
+
+    let shipped = [
+        (
+            "discover-checks",
+            include_str!("../agent/skills/discover-checks/SKILL.md"),
+        ),
+        (
+            "pull-request-text",
+            include_str!("../agent/skills/pull-request-text/SKILL.md"),
+        ),
+    ];
+    let (_fx, agent) = coder(3).await;
+    let info = &agent.assembly().info()[0];
+    assert_eq!(
+        info.skills,
+        shipped.map(|(name, _)| name),
+        "the folder's skills, by name"
+    );
+    let tool_names: Vec<String> = info.tools.clone();
+    for (name, text) in shipped {
+        let mut findings = Vec::new();
+        let skill = parse_skill(
+            std::path::Path::new(&format!("agent/skills/{name}/SKILL.md")),
+            text,
+            name,
+            SkillLayout::Directory,
+            &mut findings,
+        )
+        .unwrap_or_else(|| panic!("{name} does not parse: {findings:?}"));
+        assert!(findings.is_empty(), "{name}: {findings:?}");
+        assert_eq!(skill.name, name);
+        assert!(
+            (40..=300).contains(&skill.description.chars().count()),
+            "{name}: a description the catalog can carry on every request: {}",
+            skill.description
+        );
+        assert!(
+            text.lines().count() <= 150,
+            "{name}: about 150 lines at most"
+        );
+        assert!(
+            !skill.body.to_lowercase().contains("opencode") && skill.body.contains("\n## "),
+            "{name}"
+        );
+        assert!(
+            info.prompt.contains(&format!(
+                "<name>{name}</name>\n    <description>{}</description>",
+                skill.description
+            )),
+            "{name} is in the catalog"
+        );
+        // The tools a skill names are the coder's: `snake_case` words in backticks.
+        for word in skill.body.split('`').skip(1).step_by(2) {
+            let is_name =
+                word.contains('_') && word.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+            // `pull_request` is the name of a CI event, not a tool.
+            if is_name && word != "pull_request" {
+                assert!(
+                    tool_names.iter().any(|t| t == word),
+                    "{name} names `{word}`, which is not a tool of the coder"
+                );
+            }
+        }
+    }
+    // Neither skill bundles a file: the catalog is the whole section but for the fixed sentence.
+    assert!(!info.prompt.contains("<skill_resources>"));
+    assert!(info.prompt.ends_with(SKILLS.trim_end()));
+    // And no line was added to the instructions: the body is the snapshot.
+    assert_eq!(
+        info.prompt,
+        format!("{}\n\n{}", expected_body(3), SKILLS.trim_end())
     );
 }
