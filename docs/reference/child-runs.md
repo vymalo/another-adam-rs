@@ -159,8 +159,8 @@ What the design refuses to do, and why:
   agent directory. A tool that returns `NeedsInput` without declaring it still parks its child, and a child
   can still be cancelled by id: the parent then gets the error result.
 * **The output travels whole.** The child's output is the payload of the message, then the text of the tool
-  result in the parent's history. Long histories are shortened for the model by `max_history_tokens` as for any
-  tool output, but the stored conversation keeps it.
+  result in the parent's history. Long histories are shortened by `max_history_tokens` as for any tool output,
+  in the stored conversation too (the journal keeps the whole output).
 * **No guarantee for a child purged early.** `purge_finished` deletes a finished run with its journal. A
   parent that has not looked yet then reads `None` and reports "the child run no longer exists". Keep the
   retention above the parent's longest wait plus one `wait_poll`.

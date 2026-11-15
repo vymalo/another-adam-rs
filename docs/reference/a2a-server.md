@@ -354,4 +354,5 @@ becomes `RunEvent::ReasoningDelta` in a stream of its own that ends before the w
 It is **never stored**: dropped before the journal, in no output, `turn_output` or step, and a replay
 sends none. The model is sent its earlier reasoning only if its client is set to
 (`MODEL_ECHO_REASONING`, which DeepSeek's thinking mode with tools needs). `MODEL_EXTRA_BODY` is how a
-deployment asks a model that needs a flag to think.
+deployment asks a model that needs a flag to think. `MODEL_PROMPT_CACHE_KEY=conversation` sends a
+`prompt_cache_key` made from the conversation id (a member of `MODEL_EXTRA_BODY` of the same name wins).

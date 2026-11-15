@@ -21,7 +21,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
-| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output |
+| `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`. A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
@@ -115,7 +115,7 @@ the conversation of the run before:
 | **Alternating** | user messages that would be adjacent become one message with several text parts (the marker and what follows it, the new message after a history that ends with the user's, the waiting ones before the new one), because chat templates that insist on alternating roles reject two user messages in a row |
 
 The cap is not "history the model would be cut anyway": `max_history_tokens` (`src/history.rs`) only ever
-shortens tool output in what is sent, so shortening tool output first is the loss the loop already accepts, and
+shortens tool output, so shortening tool output first is the loss the loop already accepts, and
 dropping turns is the last resort. The cap is about what is stored and carried. **An agent that wraps an
 `LlmAgent` and delegates `init` must delegate `init_continuing` too.** Breaking for code that builds a
 `Conversation` with a struct literal (two new public fields) and for `AgentStarter` implementors (`State` now
@@ -766,3 +766,31 @@ as a `ToolOutput::error`; `src/schema.rs` tests the generated schema (run them w
 [`adam-model`](../adam-model/README.md),
 [`adam-coder`](../../bin/adam-coder/README.md),
 [`adam-error`](../adam-error/README.md).
+
+## The prefix holds (ADR 0044, slice 4)
+
+Every request of a run starts with the one before it, so a provider's prompt cache keeps hitting.
+
+* **Shortenings are recorded once, in the state.** When the history goes over `Limits::max_history_tokens`
+  (characters / 4), the oldest tool outputs are shortened **in `Conversation::messages`**, down to three
+  quarters of the budget (so it happens rarely), each keeping its head and the `TRUNCATION_MARKER_PREFIX`
+  marker; the turn is pushed onto `Conversation::shortenings` (not written while empty, so an agent that never
+  shortens writes the bytes it did, and old state loads). The request's messages are the state's messages. It is
+  a function of the state the transition began with, so a retry or a replay after a crash sends the same bytes.
+  **Behaviour change: the stored history is no longer the complete history**; the journal still holds each
+  tool's original output. The only requests that do not start with the one before are the ones at the turns in
+  `shortenings`.
+* **Fixed order.** The agent's own tools are in registration order; each source's tools are sorted by name
+  (`offered`). Nothing in `system` or `tools` is a clock or a counter. What changes them is the person's
+  context, on purpose: the access tier or the agents mentioned (a source's `instructions`), the `show` tool's
+  description once the conversation's catalog is held (`refine`), and a thread-tools endpoint that lists other
+  tools.
+* **Known exception.** The closing turn is appended to the request and not kept, so a run reopened after its
+  closing answer does not start with that request.
+* **Cache key.** The loop sets `ModelRequest::prompt_cache_key` on every request of a run that has a
+  conversation id: the first 32 hex digits of the SHA-256 of the id (the id itself never leaves). Whether it is
+  sent is the client's choice (`MODEL_PROMPT_CACHE_KEY`, `adam-service`).
+* **Breaking:** `ModelRequest` has a new public field (`prompt_cache_key`, breaks struct literals);
+  `Conversation` has a new public field (`shortenings`, breaks struct literals).
+
+Proof: `tests/prefix.rs`, and `a_session_report_keeps_the_prefix` in `tests/sessions.rs`.

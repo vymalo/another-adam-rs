@@ -26,7 +26,7 @@ use crate::conversation::{
     PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_root_run,
     parse_root_step, parse_session, parse_user_text,
 };
-use crate::history::fit_history;
+use crate::history::record_shortenings;
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
 use crate::paging::backstop;
 use crate::plan::Plan;
@@ -98,9 +98,11 @@ pub struct Limits {
     /// Passed to the model as `max_output_tokens`; `0` leaves it to the model.
     pub max_output_tokens: u32,
     /// Budget for the history sent to the model, estimated as characters / 4.
-    /// Old tool outputs are truncated (with an explicit marker) to fit; the
-    /// results the model has not seen yet are never touched, and the stored
-    /// history stays complete. `0` disables truncation.
+    /// Over it, old tool outputs are truncated **in the stored history**, with an explicit marker,
+    /// down to three quarters of the budget (so that it happens rarely and each request starts with
+    /// the one before: [`Conversation::shortenings`] says when); the results the model has not seen
+    /// yet are never touched, and the journal still holds the original outputs. `0` disables
+    /// truncation.
     pub max_history_tokens: u32,
 }
 
@@ -113,6 +115,15 @@ impl Default for Limits {
             max_history_tokens: 100_000,
         }
     }
+}
+
+/// The key the loop gives a model client to route the requests of one conversation to the same cache:
+/// the first 32 hex digits of the SHA-256 of the conversation id. The id itself never leaves, and the
+/// length is bounded whatever the id is.
+fn prompt_cache_key(conversation_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(conversation_id.as_bytes());
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 /// What a turn that a cancel ended says. The run is `Failed` with the reason the canceller gave
@@ -913,10 +924,18 @@ impl LlmAgent {
             });
         }
         let closing = state.limit.is_some();
+        // The history is shortened here, in the state, and not only in the copy that is sent, so
+        // that each request starts with the one before it. This is a function of the state the
+        // transition began with, which is the committed one: a retry or a replay after a crash
+        // shortens the same way and sends the same request.
+        if record_shortenings(&mut state.messages, self.limits.max_history_tokens) {
+            state.shortenings.push(state.turns);
+        }
         let mut request = ModelRequest::new(self.model_alias.clone());
         request.system = self.instructions.clone();
-        request.messages = fit_history(&state.messages, self.limits.max_history_tokens);
+        request.messages.clone_from(&state.messages);
         request.tools = self.specs.clone();
+        request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         if closing {
             // The tools stay, so the prefix of the request is the one the provider has cached and
             // the calls in the history still have their tools; only the choice changes.

@@ -636,6 +636,50 @@ mod cases {
         assert_eq!(rig.child_mock.requests().len(), 1, "one child ran");
     }
 
+    /// The requests of a parent that starts a session, waits for it and reads its report each start
+    /// with the one before: the synthetic `wait_<turn>` call and the report are appended like any
+    /// other call and result (ADR 0044, slice 4).
+    pub async fn a_session_report_keeps_the_prefix(store: DynStore) {
+        let rig = Rig::new().holding(0);
+        rig.child_mock.push_text("child says 42");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_text("started it")
+            .push_text("the helper said 42");
+        let worker = spawn_worker(&rt);
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        wait_waiting_on_a_session(&rt, parent).await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let state = state_of(&rt, parent).await;
+        assert!(state.shortenings.is_empty());
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            assert_eq!(
+                serde_json::to_string(&(&pair[0].system, &pair[0].tools)).unwrap(),
+                serde_json::to_string(&(&pair[1].system, &pair[1].tools)).unwrap(),
+                "system and tools are the same bytes"
+            );
+            let (a, b) = (
+                serde_json::to_string(&pair[0].messages).unwrap(),
+                serde_json::to_string(&pair[1].messages).unwrap(),
+            );
+            assert!(
+                b.starts_with(a.trim_end_matches(']')),
+                "a request starts with the one before it:\n{a}\n{b}"
+            );
+        }
+        assert!(matches!(
+            requests[2].messages.last(),
+            Some(Message::Tool { call_id, .. }) if call_id == "wait_1"
+        ));
+    }
+
     /// A read that does not wait answers "working" and parks nothing; the model carries on.
     pub async fn a_read_without_wait_answers_working_and_parks_nothing(store: DynStore) {
         let rig = Rig::new().holding(0);
@@ -2693,6 +2737,7 @@ macro_rules! session_suite {
         mod $module {
             session_suite!(@cases $make;
                 a_start_returns_at_once_and_the_turn_end_waits_for_the_report,
+                a_session_report_keeps_the_prefix,
                 a_read_without_wait_answers_working_and_parks_nothing,
                 a_read_with_wait_parks_and_resumes_once_with_the_report,
                 a_session_closes_by_default_and_refuses_a_send,

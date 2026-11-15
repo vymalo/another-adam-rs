@@ -21,11 +21,13 @@ pub(crate) const RESERVED_BODY_KEYS: [&str; 5] =
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RequestOptions<'a> {
     pub(crate) max_tokens_field: MaxTokensField,
-    /// Members merged into the body (they win over what the runtime wrote, except
+    /// Members merged into the body (they win over what the runtime wrote, `prompt_cache_key` included, except
     /// [`RESERVED_BODY_KEYS`], which are refused when the client is built).
     pub(crate) extra_body: Option<&'a serde_json::Map<String, Value>>,
     /// Send the reasoning an assistant message keeps, under this name; `None` sends none.
     pub(crate) echo_reasoning: Option<ReasoningField>,
+    /// Send [`ModelRequest::prompt_cache_key`] as the body's `prompt_cache_key` (when the request has one).
+    pub(crate) prompt_cache_key: bool,
 }
 
 // ---------------------------------------------------------------- request --
@@ -50,6 +52,8 @@ struct WireRequest<'a> {
     stream_options: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<&'a BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -140,6 +144,10 @@ pub(crate) fn build_request(
         stream: stream.then_some(true),
         stream_options: stream.then(|| json!({"include_usage": true})),
         metadata: (!req.metadata.is_empty()).then_some(&req.metadata),
+        prompt_cache_key: req
+            .prompt_cache_key
+            .as_deref()
+            .filter(|key| options.prompt_cache_key && !key.is_empty()),
     };
     let not_serializable =
         |e| ModelError::invalid_request("request is not serializable").with_source(e);
@@ -804,6 +812,111 @@ mod tests {
             build_request(&req, false, with(Some(json!({})), None)).unwrap(),
             build_request(&req, false, with(None, None)).unwrap()
         );
+    }
+
+    fn cached(on: bool, extra: Option<Value>) -> RequestOptions<'static> {
+        RequestOptions {
+            prompt_cache_key: on,
+            ..with(extra, None)
+        }
+    }
+
+    #[test]
+    fn prompt_cache_key_is_sent_only_when_set() {
+        let mut req = request();
+        let key = |req: &ModelRequest, on: bool| -> Option<Value> {
+            let sent: Value =
+                serde_json::from_slice(&build_request(req, false, cached(on, None)).unwrap())
+                    .unwrap();
+            sent.get("prompt_cache_key").cloned()
+        };
+        // No key on the request: nothing is sent, whatever the client is set to.
+        assert_eq!(key(&req, true), None);
+        assert_eq!(key(&req, false), None);
+        req.prompt_cache_key = Some("0123456789abcdef0123456789abcdef".into());
+        assert_eq!(
+            key(&req, true),
+            Some(json!("0123456789abcdef0123456789abcdef"))
+        );
+        // A client that is not set to send it drops it, and the body is the one without.
+        assert_eq!(key(&req, false), None);
+        assert_eq!(
+            build_request(&req, false, cached(false, None)).unwrap(),
+            build_request(&request(), false, cached(false, None)).unwrap()
+        );
+        // An empty key is no key.
+        req.prompt_cache_key = Some(String::new());
+        assert_eq!(key(&req, true), None);
+        // A request with no key serialises as it did before the field existed (no new member).
+        assert!(
+            !String::from_utf8(build_request(&request(), true, cached(true, None)).unwrap())
+                .unwrap()
+                .contains("prompt_cache_key")
+        );
+    }
+
+    #[test]
+    fn an_extra_body_member_of_the_same_name_wins_over_the_cache_key() {
+        let mut req = request();
+        req.prompt_cache_key = Some("from-the-loop".into());
+        let sent: Value = serde_json::from_slice(
+            &build_request(
+                &req,
+                false,
+                cached(
+                    true,
+                    Some(json!({"prompt_cache_key": "from-the-deployment"})),
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent["prompt_cache_key"], "from-the-deployment");
+        // And with the client off, the deployment's member is still sent as written.
+        let sent: Value = serde_json::from_slice(
+            &build_request(
+                &req,
+                false,
+                cached(
+                    false,
+                    Some(json!({"prompt_cache_key": "from-the-deployment"})),
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent["prompt_cache_key"], "from-the-deployment");
+    }
+
+    /// The body of a request that appends messages to another's starts with the other's bytes
+    /// (through the last of the shared messages), and what follows the messages is the same.
+    #[test]
+    fn appending_messages_keeps_the_body_prefix() {
+        let first = request();
+        let mut second = request();
+        second.messages.push(Message::assistant_text("it is sunny"));
+        second.messages.push(Message::user_text("and tomorrow?"));
+        for stream in [false, true] {
+            let a = String::from_utf8(
+                build_request(&first, stream, options(MaxTokensField::MaxTokens)).unwrap(),
+            )
+            .unwrap();
+            let b = String::from_utf8(
+                build_request(&second, stream, options(MaxTokensField::MaxTokens)).unwrap(),
+            )
+            .unwrap();
+            let end_a = a.find("],\"tools\":").expect("the messages end");
+            let end_b = b.find("],\"tools\":").expect("the messages end");
+            assert!(
+                b[..end_b].starts_with(&a[..end_a]),
+                "the shared messages are the same bytes: {a}\n{b}"
+            );
+            assert_eq!(
+                a[end_a..],
+                b[end_b..],
+                "what follows the messages is the same"
+            );
+        }
     }
 
     fn thinking_history() -> ModelRequest {

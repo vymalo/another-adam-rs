@@ -495,7 +495,7 @@ own `skills/`, narrowed by `skills:`), never inherited.
   `read_skill_file`; with no skills, neither tool and no catalog.
 * A registered tool named `load_skill` or `read_skill_file` is `Error::ReservedToolName`; `tools:` does not
   filter the skill tools, `skills: []` turns them off. Results are journaled like any tool's.
-* Known limit: an old tool result may be truncated by `limits.max_history_tokens`, a loaded skill included.
+* Known limit: an old tool result may be shortened in the stored history by `limits.max_history_tokens`, a loaded skill included.
   Preload a skill to keep it for the whole run.
 
 ```mermaid

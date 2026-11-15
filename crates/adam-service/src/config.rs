@@ -23,6 +23,7 @@
 //! | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning (`{"reasoning_effort":"medium"}`); **not secret**; an invalid value is a startup error ([`ModelConfig::extra_body`]) | unset (nothing added) |
 //! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
 //! | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (no `contextWindow`) |
+//! | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: with `conversation` each request carries a `prompt_cache_key` that is the same for every request of one conversation (a SHA-256 of its id cut to 32 hex digits), so that a gateway with a prompt cache routes them together; anything else is a startup error ([`ModelConfig::prompt_cache_key`]) | `off` |
 //! | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the MCP servers of an agent folder may be ([`McpSettings`], feature `mcp`) | `false` each |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400; [`McpSettings`], feature `mcp`) | `3600` |
 //!
@@ -538,6 +539,20 @@ pub struct ModelConfig {
     /// so a call report says how full the context is; an agent whose files name another alias
     /// reports none. `None` when unset.
     pub context_window: Option<u64>,
+    /// `MODEL_PROMPT_CACHE_KEY`: whether the client sends the conversation's `prompt_cache_key`.
+    pub prompt_cache_key: PromptCacheKey,
+}
+
+/// `MODEL_PROMPT_CACHE_KEY`: whether the requests of a conversation carry a key that routes them to
+/// the same prompt cache. Off by default: a gateway that rejects members it does not know would
+/// fail every call (*unverified* for each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptCacheKey {
+    /// Send none.
+    #[default]
+    Off,
+    /// Send `prompt_cache_key`, the same for every request of one conversation.
+    Conversation,
 }
 
 impl std::fmt::Debug for ModelConfig {
@@ -556,6 +571,7 @@ impl std::fmt::Debug for ModelConfig {
             )
             .field("echo_reasoning", &self.echo_reasoning)
             .field("context_window", &self.context_window)
+            .field("prompt_cache_key", &self.prompt_cache_key)
             .finish_non_exhaustive()
     }
 }
@@ -590,6 +606,7 @@ impl ModelConfig {
             extra_body: parse_extra_body(&get("MODEL_EXTRA_BODY"), problems),
             echo_reasoning: parse_echo_reasoning(&get("MODEL_ECHO_REASONING"), problems),
             context_window: parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems),
+            prompt_cache_key: parse_prompt_cache_key(&get("MODEL_PROMPT_CACHE_KEY"), problems),
         }
     }
 
@@ -604,7 +621,8 @@ impl ModelConfig {
             self.base_url.clone(),
             self.api_key.clone(),
         ))?
-        .with_echo_reasoning(self.echo_reasoning);
+        .with_echo_reasoning(self.echo_reasoning)
+        .with_prompt_cache_key(self.prompt_cache_key == PromptCacheKey::Conversation);
         if let Some(window) = self.context_window {
             client = client.with_context_window(self.alias.clone(), window);
         }
@@ -686,6 +704,18 @@ fn parse_echo_reasoning(
                 "MODEL_ECHO_REASONING must be `reasoning_content`, `reasoning` or `false`".into(),
             );
             None
+        }
+    }
+}
+
+/// `MODEL_PROMPT_CACHE_KEY`: `off` (also unset) or `conversation`, or a problem.
+fn parse_prompt_cache_key(raw: &Option<String>, problems: &mut Vec<String>) -> PromptCacheKey {
+    match raw.as_deref().map(str::trim) {
+        None | Some("off") => PromptCacheKey::Off,
+        Some("conversation") => PromptCacheKey::Conversation,
+        Some(_) => {
+            problems.push("MODEL_PROMPT_CACHE_KEY must be `off` or `conversation`".into());
+            PromptCacheKey::Off
         }
     }
 }
@@ -1272,6 +1302,39 @@ mod tests {
             assert!(mentions(&problems, "MODEL_EXTRA_BODY"), "{problems:?}");
             assert!(!problems[0].contains("a string"), "{}", problems[0]);
             assert!(model.extra_body.is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn model_prompt_cache_key_parses_off_and_conversation_only() {
+        let mut vars = model_vars();
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            model.prompt_cache_key,
+            PromptCacheKey::Off,
+            "off by default"
+        );
+        for (value, want) in [
+            ("off", PromptCacheKey::Off),
+            (" conversation ", PromptCacheKey::Conversation),
+            ("", PromptCacheKey::Off),
+        ] {
+            vars.insert("MODEL_PROMPT_CACHE_KEY", value);
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{value:?}: {problems:?}");
+            assert_eq!(model.prompt_cache_key, want, "{value:?}");
+            model.client().expect("a usable client");
+        }
+        for bad in ["on", "true", "Conversation", "run", "conversation,off"] {
+            vars.insert("MODEL_PROMPT_CACHE_KEY", bad);
+            let (model, problems) = model_problems(&vars);
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert!(
+                mentions(&problems, "MODEL_PROMPT_CACHE_KEY"),
+                "{problems:?}"
+            );
+            assert_eq!(model.prompt_cache_key, PromptCacheKey::Off, "{bad}");
         }
     }
 

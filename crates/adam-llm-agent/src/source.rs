@@ -320,7 +320,7 @@ pub(crate) async fn refined(sources: &[DynToolSource], ctx: &SourceCtx, specs: &
     }
 }
 
-/// The tools `sources` offer for this turn, in order, without the names in `taken` (the agent's
+/// The tools `sources` offer for this turn, source by source and each source's by name, without the names in `taken` (the agent's
 /// own tools) or offered by an earlier source, and at most [`MAX_SOURCE_TOOLS`] of them, with the
 /// notes of the ones that were kept (the meaningful ones only).
 pub(crate) async fn offered(
@@ -336,6 +336,10 @@ pub(crate) async fn offered(
             notes: offered_notes,
         } = source.listing(ctx).await;
         let first = out.len();
+        // By name, a stable sort: the order a source lists in (an MCP server's, across reconnects)
+        // is not one to build the cached start of a request on.
+        let mut specs = specs;
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
         for spec in specs {
             if spec.name.trim().is_empty() {
                 tracing::warn!("a tool source offered a tool with no name: left out");

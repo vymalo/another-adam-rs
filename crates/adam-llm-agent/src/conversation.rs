@@ -322,12 +322,24 @@ pub struct LimitHit {
 /// still loads.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Conversation {
-    /// The history, oldest first. Nothing is removed from it while the run goes on: history
-    /// limits only shape what is sent to the model. A run that continues another starts from a
-    /// bounded copy of the earlier history instead ([`Conversation::continued`]: old tool
-    /// outputs shortened, and as a last resort old turns left out).
+    /// The history, oldest first. Nothing is removed from it while the run goes on, but **old tool
+    /// outputs are shortened in it** once the history goes over
+    /// [`Limits::max_history_tokens`](crate::Limits): down to three quarters of the budget, oldest
+    /// first, each keeping its head and a marker ([`TRUNCATION_MARKER_PREFIX`](crate::TRUNCATION_MARKER_PREFIX)),
+    /// the turn recorded in [`shortenings`](Self::shortenings). So the history is what the model
+    /// is sent (a request is this, then at most the closing turn), and each request starts with the
+    /// one before; the journal still holds the original outputs of the steps that ran the tools.
+    /// A run that continues another starts from a bounded copy of the earlier history instead
+    /// ([`Conversation::continued`]: old tool outputs shortened, and as a last resort old turns left
+    /// out).
     #[serde(default)]
     pub messages: Vec<Message>,
+    /// The turns (the value of [`turns`](Self::turns) when the model was asked) at whose request the
+    /// history was shortened ([`messages`](Self::messages)): the only requests of a run that do not
+    /// start with the one before. Absent from state written before it existed, and not written
+    /// while empty, so a run that never shortens writes the bytes it always did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortenings: Vec<u32>,
     /// Model calls made so far.
     #[serde(default)]
     pub turns: u32,

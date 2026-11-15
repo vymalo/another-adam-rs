@@ -719,8 +719,8 @@ async fn a_source_is_read_at_every_model_turn_and_its_tools_are_called() {
     );
     assert_eq!(
         names_of(&requests[1]),
-        ["own", "ask", "relay__search", "relay__fetch"],
-        "read again at the next turn: a tool offered since is there"
+        ["own", "ask", "relay__fetch", "relay__search"],
+        "read again at the next turn: a tool offered since is there, the source's by name"
     );
     assert_eq!(listed.load(SeqCst), 3, "once per model call");
     assert_eq!(

@@ -56,6 +56,8 @@
 //!   completion as [`ModelResponse::reasoning`]; a value that is not a string is ignored. It is
 //!   never the answer's text and, unless [`with_echo_reasoning`](OpenAiCompatible::with_echo_reasoning)
 //!   is set, never in the history and never sent back.
+//! * **[`with_prompt_cache_key`](OpenAiCompatible::with_prompt_cache_key)** (off by default) sends
+//!   a request's `prompt_cache_key`; a member of the extra body of the same name wins.
 //! * **[`with_extra_body`](OpenAiCompatible::with_extra_body)** merges a JSON object into every
 //!   request, for a flag that makes a model emit reasoning.
 
@@ -226,6 +228,7 @@ pub struct OpenAiCompatible {
     max_tokens_field: MaxTokensField,
     extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     echo_reasoning: Option<ReasoningField>,
+    prompt_cache_key: bool,
     context_windows: BTreeMap<String, u64>,
 }
 
@@ -248,6 +251,7 @@ impl fmt::Debug for OpenAiCompatible {
                     .map(|m| m.keys().collect::<Vec<_>>()),
             )
             .field("echo_reasoning", &self.echo_reasoning)
+            .field("prompt_cache_key", &self.prompt_cache_key)
             .field("context_windows", &self.context_windows)
             .finish_non_exhaustive()
     }
@@ -301,6 +305,7 @@ impl OpenAiCompatible {
             max_tokens_field: MaxTokensField::default(),
             extra_body: None,
             echo_reasoning: None,
+            prompt_cache_key: false,
             context_windows: BTreeMap::new(),
         })
     }
@@ -352,11 +357,23 @@ impl OpenAiCompatible {
         self
     }
 
+    /// Send [`ModelRequest::prompt_cache_key`](adam_model::ModelRequest::prompt_cache_key), when a
+    /// request has one, as the body's `prompt_cache_key`: OpenAI's way to route the requests of one
+    /// conversation to the same prompt cache. **Off by default**: a gateway or a server that
+    /// rejects an unknown member would fail every call (*unverified* for each: most ignore
+    /// it). A member of [`with_extra_body`](Self::with_extra_body) of the same name wins.
+    #[must_use]
+    pub fn with_prompt_cache_key(mut self, on: bool) -> Self {
+        self.prompt_cache_key = on;
+        self
+    }
+
     fn options(&self) -> wire::RequestOptions<'_> {
         wire::RequestOptions {
             max_tokens_field: self.max_tokens_field,
             extra_body: self.extra_body.as_ref(),
             echo_reasoning: self.echo_reasoning,
+            prompt_cache_key: self.prompt_cache_key,
         }
     }
 

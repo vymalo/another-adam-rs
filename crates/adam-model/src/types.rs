@@ -29,6 +29,12 @@ pub struct ModelRequest {
     /// Forwarded as request metadata where the backend supports it.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    /// A stable key for the requests of one conversation, to route them to the same prompt cache
+    /// where the backend has one that takes it (`prompt_cache_key` of OpenAI's chat completions).
+    /// The agent loop always says it when the run has a conversation id; whether it goes on the
+    /// wire is the client's choice. Never the id itself.
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
 }
 
 impl ModelRequest {

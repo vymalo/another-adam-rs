@@ -15,7 +15,7 @@ fn marker(removed: usize) -> String {
 /// `content` shortened by at least `excess` characters, keeping its head and ending in the
 /// truncation marker ([`TRUNCATION_MARKER_PREFIX`]); `None` when that would not make it shorter
 /// (it is already about as short as the marker, or already nothing but a marker, whose count of
-/// what was omitted is not to be overwritten by the marker's own length). Both [`fit_history`] and
+/// what was omitted is not to be overwritten by the marker's own length). Both [`record_shortenings`] and
 /// the history a continued run carries shorten tool outputs this way.
 pub(crate) fn shorten_output(content: &str, excess: usize) -> Option<String> {
     if content
@@ -70,49 +70,59 @@ fn estimate_tokens(messages: &[Message]) -> usize {
         .div_ceil(4)
 }
 
-/// A copy of `messages` that fits `max_tokens` (estimated as chars / 4), by
-/// truncating old tool outputs; `0` means no limit.
+/// Shorten old tool outputs **in place** when the history is over `max_tokens` (estimated as
+/// chars / 4), down to three quarters of the budget, and say whether anything was shortened; `0`
+/// means no limit.
 ///
-/// * Only tool outputs are shortened, oldest first, and only as much as
-///   needed. Each keeps its head and gets an explicit marker
-///   ([`TRUNCATION_MARKER_PREFIX`]): truncated, never dropped, so the call/result
-///   pairing the model API requires stays intact.
-/// * The tool outputs after the last assistant message (the results the model
-///   has not seen yet) are never touched.
-/// * If that is not enough, the rest is sent as is: better an over-long
-///   prompt (which the model may reject, failing the run with a clear error)
-///   than silently losing conversation.
-pub(crate) fn fit_history(messages: &[Message], max_tokens: u32) -> Vec<Message> {
-    let mut out = messages.to_vec();
+/// The history is what the next request starts with, so a shortening is written into the state
+/// once (and the turn recorded in [`Conversation::shortenings`](crate::Conversation::shortenings)),
+/// and the requests after it extend it unchanged: cutting only the copy that is sent would cut
+/// again on every call and move the cached prefix each time. Going below the budget, not to it,
+/// is what makes that rare.
+///
+/// * Only tool outputs are shortened, oldest first, and only as much as needed. Each keeps its
+///   head and gets an explicit marker ([`TRUNCATION_MARKER_PREFIX`]): truncated, never dropped, so
+///   the call/result pairing the model API requires stays intact.
+/// * The tool outputs after the last assistant message (the results the model has not seen yet)
+///   are never touched.
+/// * If that is not enough, the rest is sent as is: better an over-long prompt (which the model
+///   may reject, failing the run with a clear error) than silently losing conversation.
+///
+/// A pure function of `messages` and `max_tokens`, so a replay of a turn from the committed state
+/// shortens the same way.
+pub(crate) fn record_shortenings(messages: &mut [Message], max_tokens: u32) -> bool {
     if max_tokens == 0 {
-        return out;
+        return false;
     }
     let budget = usize::try_from(max_tokens)
         .unwrap_or(usize::MAX)
         .saturating_mul(4);
-    let mut total: usize = out.iter().map(message_chars).sum();
+    let mut total: usize = messages.iter().map(message_chars).sum();
     if total <= budget {
-        return out;
+        return false;
     }
-    let protected_from = out
+    let target = budget - budget / 4;
+    let protected_from = messages
         .iter()
         .rposition(|m| matches!(m, Message::Assistant { .. }))
         .map_or(0, |i| i + 1);
-    for m in &mut out[..protected_from] {
-        if total <= budget {
+    let mut shortened_any = false;
+    for m in &mut messages[..protected_from] {
+        if total <= target {
             break;
         }
         let Message::Tool { content, .. } = m else {
             continue;
         };
         let len = content.chars().count();
-        let Some(shortened) = shorten_output(content, total - budget) else {
+        let Some(shortened) = shorten_output(content, total - target) else {
             continue; // would not get shorter
         };
         total = total - len + shortened.chars().count();
         *content = shortened;
+        shortened_any = true;
     }
-    out
+    shortened_any
 }
 
 #[cfg(test)]
@@ -120,6 +130,13 @@ mod tests {
     use super::*;
     use adam_model::ToolCall;
     use serde_json::json;
+
+    /// `messages` after [`record_shortenings`], as a copy.
+    fn fit_history(messages: &[Message], max_tokens: u32) -> Vec<Message> {
+        let mut out = messages.to_vec();
+        record_shortenings(&mut out, max_tokens);
+        out
+    }
 
     fn call(id: &str) -> Message {
         Message::Assistant {
@@ -175,10 +192,13 @@ mod tests {
     #[test]
     fn truncates_oldest_first_keeps_newest_and_marks() {
         let m = convo();
-        // ~3000 tokens of content, budget 2500 tokens = 10000 chars.
-        let fit = fit_history(&m, 2500);
+        // ~3000 tokens of content, budget 2750 tokens = 11000 chars.
+        let fit = fit_history(&m, 2750);
         assert_eq!(fit.len(), m.len(), "nothing is dropped");
-        assert!(estimate_tokens(&fit) <= 2500);
+        assert!(
+            estimate_tokens(&fit) <= 2750 * 3 / 4 + 10,
+            "down to three quarters"
+        );
         // Newest results intact.
         assert_eq!(fit[6], m[6]);
         assert_eq!(fit[4], m[4]);
@@ -193,6 +213,23 @@ mod tests {
         assert!(
             matches!(&fit[2], Message::Tool { call_id, is_error: false, .. } if call_id == "c1")
         );
+    }
+
+    #[test]
+    fn it_says_whether_it_shortened_and_does_not_shorten_twice() {
+        let mut m = convo();
+        assert!(!record_shortenings(&mut m.clone(), 0));
+        assert!(!record_shortenings(&mut m.clone(), 10_000));
+        assert!(record_shortenings(&mut m, 2750));
+        let once = m.clone();
+        // Under three quarters of the budget now: the next call has nothing to do, and the
+        // history is what it was (the requests after a shortening extend it unchanged).
+        assert!(!record_shortenings(&mut m, 2750));
+        assert_eq!(m, once);
+        // Over budget with nothing left to shorten is not a shortening either.
+        let mut floor = convo();
+        assert!(record_shortenings(&mut floor, 10));
+        assert!(!record_shortenings(&mut floor, 10));
     }
 
     #[test]
@@ -310,6 +347,11 @@ mod tests {
                         _ => prop_assert_eq!(before, after, "only tool outputs may change"),
                     }
                 }
+
+                // A second pass has nothing to do: the next request extends this history as it is.
+                let mut again = fitted.clone();
+                prop_assert!(!record_shortenings(&mut again, max_tokens));
+                prop_assert_eq!(&again, &fitted);
 
                 if max_tokens == 0 {
                     prop_assert_eq!(&fitted, &messages);

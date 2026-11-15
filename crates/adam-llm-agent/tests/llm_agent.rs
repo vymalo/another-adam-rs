@@ -2430,10 +2430,16 @@ async fn history_truncates_old_tool_outputs_and_keeps_the_newest() {
     assert!(matches!(&third[2], Message::Tool { call_id, .. } if call_id == "c1"));
     assert_eq!(third[4].text(), big('b'), "newest output intact");
 
-    // The durable history is lossless.
+    // The stored history is what was sent: shortened once, at the turn that did it (ADR 0044
+    // slice 4); the newest output is whole.
     let state = conversation(&view);
-    assert_eq!(state.messages[2].text(), big('a'));
+    assert_eq!(
+        state.messages[2].text(),
+        old,
+        "the state holds the shortened output"
+    );
     assert_eq!(state.messages[4].text(), big('b'));
+    assert_eq!(state.shortenings, [2]);
 }
 
 #[tokio::test]
