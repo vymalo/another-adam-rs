@@ -1,6 +1,6 @@
 //! The skills a prepared repository ships, listed by `prepare_workspace` and loaded by `load_skill`
 //! and `read_skill_file` (ADR 0044, decision 8). The coder gives its root agent a [`RepoSkills`] as
-//! [`RunSkills`](adam::assembly::RunSkills), so the tool list and the system prompt never depend on
+//! [`RunSkills`], so the tool list and the system prompt never depend on
 //! what a repository holds: what a run finds arrives as a tool result.
 //!
 //! * **Listing.** A successful `prepare_workspace` of a repository looks in `.agents/skills`,
@@ -11,7 +11,7 @@
 //!   description. At most [`MAX_LISTED`] skills and [`LISTING_CAP`] bytes are listed; the rest is
 //!   counted. The block comes **before** the project instructions of the same call and is the
 //!   result's, never a message.
-//! * **Recorded.** What was listed is in [`RunNotes::repo_skills`] with the id of the call: a retry
+//! * **Recorded.** What was listed is in [`RunNotes::repo_skills`](super::notes::RunNotes::repo_skills) with the id of the call: a retry
 //!   of that call renders the same bytes from the record, not from the files as they are now; any
 //!   other prepare of the slot lists nothing; `load_skill` takes only recorded names.
 //! * **Loading.** `load_skill name=<slot>/<skill>` shows the skill's `SKILL.md` the way `read_file`
