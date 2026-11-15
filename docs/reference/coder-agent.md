@@ -149,6 +149,22 @@ with repository work to deliver ends only with a pull request, a failure (a limi
 among them: the run gets one closing turn without tools, and its answer is the failure's text), or `CancelTask`; a run
 without any ends when the model answers and asks nothing, and so does one that reached a limit with no repository or scratch project.
 
+### Project instructions
+
+What a repository says about itself reaches the model as a **tool result**, not as a message of the person and never in the system prompt ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 10).
+
+| When | What is read | Where it goes | Size |
+|---|---|---|---|
+| `prepare_workspace` on a repository | `AGENTS.md` at the slot root, else `CLAUDE.md`, else `README.md` (one of them) | after the lines of the result | 32 KiB, cut at a whole line |
+| the first read call below a directory with its own file (`read_file`, `list_files`, `find_files`, `search_files` with a `path`) | `AGENTS.md`, else `CLAUDE.md` (never `README.md`); the shallowest directory not yet shown, one per call | before the page, so the paging line stays last | 8 KiB |
+
+* Each block starts with a header line that names the file and says whose text it is. A cut text ends with `[more: N lines left; next page: read_file path=<file> repo=<slot> offset=K]`. When `AGENTS.md` is read and a different `CLAUDE.md` exists, the block says so.
+* **It can never** name a repository the run may use, grant an access tier or approve anything: the gates read the notes the agent fills from the person's own messages, and this text is not one.
+* Read through the slot's descriptor. A link that stays in the slot is followed (`AGENTS.md -> CLAUDE.md`); one that leaves it, a non-regular file, text that is not UTF-8 and a file over 4 MiB count as absent, with a note. Scrubbed like any output, before it is cut.
+* **Shown once**: `RunNotes::instructions_shown` records the call id. The same call (a retry) shows it again; a later call does not. The text is read once: a later change to the file, the model's own included, is not shown again, and a replay returns the journaled bytes.
+* **A shortened history** cuts an old instructions result like any other result over 512 characters. The head, with the header, stays; the model reads the file again with `read_file`.
+* A folder agent has no slots and is unchanged.
+
 ## Rules in code
 
 | Rule | Where |

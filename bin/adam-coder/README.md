@@ -597,6 +597,22 @@ exit code 0
 * **Bounds.** One output keeps at most 16 MiB (the first bytes; the result says `only the first N of M bytes are kept`), a run at most 64 MiB of the files **this process names** (`o-<16 hex>.txt`; a file of another name that a command put there is not counted, a temporary file left by a crash is not counted and is removed after ten minutes; the check and the write are one at a time in a process, so two workers on one volume can overshoot by one output each); past that the result says `NOT kept (...)` and shows head and tail alone. An output over 16 MiB is **kept cut**: the shell captures 64 KiB past it and the keeper cuts that margin back (see Redaction), the view says `only the first N of M bytes are kept` (N counts the scrubbed text, M the output: the note says so); an output that is long as printed and short once scrubbed is shown whole and not kept, the last page ends with `(output cut: only the first N of M bytes are kept)`, and the count of hidden bytes says `about` when the output outgrew the capture. A line over 2,000 characters is folded onto several lines and a NUL becomes U+FFFD, so the pages reassemble the output.
 * **MCP results over 64 KiB** (the GitHub server's, a tool server's) are kept in the same place and the model gets the first page and the same id (`adam-mcp` README).
 
+### Project instructions
+
+What a repository says about itself reaches the model as a **tool result**, not as a message of the person and never in the system prompt ([ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 10).
+
+| When | What is read | Where it goes | Size |
+|---|---|---|---|
+| `prepare_workspace` on a repository | `AGENTS.md` at the slot root, else `CLAUDE.md`, else `README.md` (one of them) | after the lines of the result | 32 KiB, cut at a whole line |
+| the first read call below a directory with its own file (`read_file`, `list_files`, `find_files`, `search_files` with a `path`) | `AGENTS.md`, else `CLAUDE.md` (never `README.md`); the shallowest directory not yet shown, one per call | before the page, so the paging line stays last | 8 KiB |
+
+* Each block starts with a header line that names the file and says whose text it is. A cut text ends with `[more: N lines left; next page: read_file path=<file> repo=<slot> offset=K]`. When `AGENTS.md` is read and a different `CLAUDE.md` exists, the block says so.
+* **It can never** name a repository the run may use, grant an access tier or approve anything: the gates read the notes the agent fills from the person's own messages, and this text is not one.
+* Read through the slot's descriptor. A link that stays in the slot is followed (`AGENTS.md -> CLAUDE.md`); one that leaves it, a non-regular file, text that is not UTF-8 and a file over 4 MiB count as absent, with a note. Scrubbed like any output, before it is cut.
+* **Shown once**: `RunNotes::instructions_shown` records the call id. The same call (a retry) shows it again; a later call does not. The text is read once: a later change to the file, the model's own included, is not shown again, and a replay returns the journaled bytes.
+* **A shortened history** cuts an old instructions result like any other result over 512 characters. The head, with the header, stays; the model reads the file again with `read_file`.
+* A folder agent has no slots and is unchanged. Code: `src/tools/project.rs`; tests: `tests/tools.rs`, `tests/project_instructions.rs`.
+
 ### Paged reads: `read_file`, `list_files`, `find_files`, `search_files`
 
 [ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)
