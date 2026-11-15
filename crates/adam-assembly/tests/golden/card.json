@@ -1,6 +1,25 @@
 {
   "description": "Turns a coding task into a verified pull request.",
-  "extensions": [],
+  "extensions": [
+    {
+      "description": "Serves prompt templates a message can invoke by name.",
+      "params": {
+        "commands": [
+          {
+            "argumentHint": "<branch>",
+            "description": "Ship a branch, open the pull request and say what changed.",
+            "name": "ship"
+          },
+          {
+            "description": "Sort an incoming issue into a queue.",
+            "name": "triage"
+          }
+        ]
+      },
+      "required": false,
+      "uri": "https://agents.vymalo.com/a2a/extensions/commands/v1"
+    }
+  ],
   "name": "adam-coder",
   "skills": [
     {
