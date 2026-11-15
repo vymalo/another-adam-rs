@@ -350,7 +350,10 @@ middle of a call. What is new is the end of the run:
   the words of a turn that goes on (`agent_text` with its stream's id), the step returns `Continue`, and the next one reads the
   message and calls the model again: the answer to a message sent during the final model call reflects it. **The window between
   that check and the commit** is closed by the runtime: the agent calls `Ctx::reopen_on_arrival()` in every step, so a `Done`
-  committed past a message that arrived after the check becomes a `Continue` (see `adam-runtime`).
+  committed past a message that arrived after the check becomes a `Continue` (see `adam-runtime`). **A copy of a message the
+  run has read is not such a message**: a sender that was not told its delivery worked sends it again under the same id (the
+  orchestration layer after a lost lease, `subagent_send` after a failed try), and the step names the ids the state remembers
+  (`Ctx::read_already`), so the copy costs no turn and no model call. It is dropped when the inbox is next read.
 * **An answer recorded before a message the run read is dropped.** The recorded model step carries `seen`, how long the history
   was when the call was made (`Recorded`, a serde default: a journal written before it reads as "current"). A transition that
   replays the step (the commit that followed the recording was lost) and has read a message that came in between sees a longer

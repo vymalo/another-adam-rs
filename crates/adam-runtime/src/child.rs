@@ -43,7 +43,11 @@ pub const CHILD_REPORTED_KIND: &str = "adam.child.reported";
 /// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
 /// store), and the same notice delivered just after its commit is refused, so one that lands during
 /// the step must not keep the run going either.
-pub(crate) fn news_since(inbox: &[Inbound], base: usize) -> usize {
+///
+/// Neither is a message whose id is in `read`: the run has read one with that id, and the copy a
+/// sender delivered again (its first try was not acknowledged) says nothing new. An empty id is
+/// nobody's.
+pub(crate) fn news_since(inbox: &[Inbound], base: usize, read: &[String]) -> usize {
     inbox
         .iter()
         .skip(base)
@@ -51,6 +55,7 @@ pub(crate) fn news_since(inbox: &[Inbound], base: usize) -> usize {
             i.kind != RUN_FINISHED_KIND
                 && i.kind != CHILD_REPORTED_KIND
                 && i.kind != SESSION_CLOSE_KIND
+                && (i.id.is_empty() || !read.contains(&i.id))
         })
         .count()
 }

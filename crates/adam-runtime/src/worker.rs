@@ -470,6 +470,8 @@ struct Next {
     /// The agent asked that a `Done` not end the run past a message that arrived while it stepped
     /// ([`Ctx::reopen_on_arrival`]).
     reopen: bool,
+    /// The ids of the messages the agent says the run has read ([`Ctx::read_already`]).
+    read: Vec<String>,
     /// The deadline and what is left of the time limit to store (set once, when the run is made, or
     /// restored from what was left after a wait for a person: never recomputed from the commit).
     deadline: Option<DateTime<Utc>>,
@@ -635,6 +637,7 @@ fn plan(
         seq,
         consumed,
         reopen,
+        read,
         artifacts,
     } = out;
     // Starting point for a transition that made progress.
@@ -650,6 +653,7 @@ fn plan(
         artifacts: artifacts.clone(),
         retry_detail: None,
         reopen,
+        read: read.clone(),
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
     };
@@ -666,6 +670,7 @@ fn plan(
         artifacts: artifacts.clone(),
         retry_detail: None,
         reopen: false,
+        read: Vec::new(),
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
     };
@@ -709,6 +714,7 @@ fn plan(
                     policy.max_attempts
                 )),
                 reopen: false,
+                read: Vec::new(),
                 deadline: base.deadline,
                 remaining_secs: base.remaining_secs,
             }
@@ -883,9 +889,12 @@ fn add_artifact(artifacts: &mut Vec<Artifact>, artifact: &Artifact) {
 }
 
 /// Whether a `Done` is committed as a step that goes on: the agent asked for it
-/// ([`Ctx::reopen_on_arrival`]) and a message other than a child's notice arrived while it stepped.
+/// ([`Ctx::reopen_on_arrival`]) and a message other than a child's notice, or a copy of one the run
+/// has read ([`Ctx::read_already`]), arrived while it stepped.
 fn reopens(next: &Next, cur: &Envelope, base_inbox_len: usize) -> bool {
-    next.reopen && next.status == RunStatus::Done && news_since(&cur.inbox, base_inbox_len) > 0
+    next.reopen
+        && next.status == RunStatus::Done
+        && news_since(&cur.inbox, base_inbox_len, &next.read) > 0
 }
 
 /// Commit with CAS. A conflict caused only by messages delivered while we

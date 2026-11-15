@@ -385,6 +385,62 @@ async fn the_same_message_is_read_once() {
     }
 }
 
+/// A copy of a message the run has read, delivered again while the model writes its final answer,
+/// costs no turn: the answer is the last word, and the model is not called again with nothing new
+/// in front of it. (A sender that was not told its delivery worked sends the message again.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_of_a_read_message_sent_during_the_final_model_call_costs_no_turn() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new();
+        rig.mock
+            .push_tool_calls(vec![gate_call("c1")])
+            .push_text("done");
+        let tool_gate = Arc::new(Gate::default());
+        let model_gate = Arc::new(Gate::default());
+        let model: DynModel = Arc::new(GateModel {
+            inner: rig.mock.clone(),
+            hold_on: 1,
+            calls: AtomicUsize::new(0),
+            gate: model_gate.clone(),
+        });
+        let rt = rig.runtime(
+            &store,
+            model,
+            Some(GateTool {
+                gate: tool_gate.clone(),
+            }),
+        );
+        let run = rt.start(&rig.name, user_message("go"), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+
+        // Read at the step after the tool's.
+        tool_gate.wait_reached().await;
+        rt.deliver(run, steer("m-1", "use blue")).await.unwrap();
+        tool_gate.release.notify_one();
+        // The same message again, while the model writes the answer that read it.
+        model_gate.wait_reached().await;
+        rt.deliver(run, steer("m-1", "use blue")).await.unwrap();
+        model_gate.release.notify_one();
+        let done = wait_done(&rt, run).await;
+        stop(worker).await;
+
+        assert_eq!(answer(&done), "done", "{backend}");
+        assert_eq!(
+            rig.mock.requests().len(),
+            2,
+            "{backend}: no model call for the copy"
+        );
+        let state = conversation(&done);
+        let said = state
+            .messages
+            .iter()
+            .filter(|m| **m == Message::user_text("use blue"))
+            .count();
+        assert_eq!(said, 1, "{backend}");
+        assert_eq!(state.read_ids, ["m-1"], "{backend}");
+    }
+}
+
 /// An answer that was recorded before a message the next transition read (the commit that
 /// followed the recording was lost, and the message came in between) did not read it: it is
 /// dropped, and the model answers again with the message in front of it.

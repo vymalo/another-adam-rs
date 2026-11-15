@@ -89,6 +89,14 @@ fn late() -> Inbound {
     Inbound::new("message", json!({"text": "late"}))
 }
 
+/// The id of a message the agent of the "finishing" cases says it has read (`Ctx::read_already`).
+const READ_BEFORE: &str = "read-before";
+
+/// A copy of a message the run has read, delivered again under the same id.
+fn copy_of_a_read_message() -> Inbound {
+    Inbound::new("message", json!({"text": "copy"})).with_id(READ_BEFORE)
+}
+
 /// The notice of a child that finished, as the runtime sends it to the parent.
 fn finished_notice() -> Inbound {
     Inbound::new(RUN_FINISHED_KIND, json!({"status": "done", "output": "42"}))
@@ -1173,7 +1181,7 @@ mod cases {
     /// One agent for the cases below: phase 0 holds at a gate (so `deliver` is delivered *during*
     /// the step), says what `Ctx::arrived` reported, and returns `Done`; phase 1 reads the inbox and
     /// returns `Done` with the texts it read (a child's notice has none). `reopen` is whether it
-    /// asked to go on.
+    /// asked to go on. It says it has read the message `READ_BEFORE`.
     async fn finishing_agent(
         store: &DynStore,
         name: &str,
@@ -1206,6 +1214,7 @@ mod cases {
                             if reopen {
                                 ctx.reopen_on_arrival();
                             }
+                            ctx.read_already(&[READ_BEFORE.to_owned()]);
                             started.notify_one();
                             notified(&gate, "the message to be delivered").await;
                             arrived.store(ctx.arrived().await.expect("arrived"), SeqCst);
@@ -1310,6 +1319,33 @@ mod cases {
         assert_eq!(view.output, Some(json!(["late"])));
         assert_eq!(count(&phase0_runs), 1);
         assert_eq!(arrived.load(SeqCst), 1, "only the message counts");
+    }
+
+    /// A copy of a message the run has read, delivered again while the run finishes, is not news:
+    /// `Ctx::arrived` does not count it and the commit does not reopen the run, so the run does not
+    /// take a turn (a model call) with nothing new to answer.
+    pub async fn a_copy_of_a_message_the_run_read_does_not_reopen_it(store: DynStore) {
+        let name = uniq("reopen-copy");
+        let (rt, run, phase0_runs, arrived) =
+            finishing_agent(&store, &name, true, &[copy_of_a_read_message()]).await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(view.output, Some(json!("first")), "the first answer stands");
+        assert_eq!(count(&phase0_runs), 1);
+        assert_eq!(arrived.load(SeqCst), 0, "a copy is not an arrival");
+        assert_eq!(view.pending_inbox, 1, "it stays in a run that is over");
+    }
+
+    /// A copy beside a new message does not hide it: the new one counts and reopens the run.
+    pub async fn a_message_beside_a_copy_still_reopens_the_run(store: DynStore) {
+        let name = uniq("reopen-copy-both");
+        let (rt, run, phase0_runs, arrived) =
+            finishing_agent(&store, &name, true, &[copy_of_a_read_message(), late()]).await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(view.output, Some(json!(["copy", "late"])));
+        assert_eq!(count(&phase0_runs), 1);
+        assert_eq!(arrived.load(SeqCst), 1, "only the new message counts");
     }
 
     /// An agent that did not ask is committed exactly as before: it finishes, and the message that
@@ -6830,6 +6866,8 @@ macro_rules! runtime_suite {
                 a_done_that_did_not_ask_finishes_past_a_message,
                 a_childs_notice_that_lands_while_a_run_finishes_does_not_reopen_it,
                 a_message_beside_a_childs_notice_still_reopens_the_run,
+                a_copy_of_a_message_the_run_read_does_not_reopen_it,
+                a_message_beside_a_copy_still_reopens_the_run,
                 timers,
                 timers_with_manual_clock,
                 retries_back_off_then_fail,

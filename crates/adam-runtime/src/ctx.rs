@@ -39,6 +39,8 @@ pub struct Ctx {
     base_inbox: usize,
     consumed: usize,
     reopen: bool,
+    /// See [`Ctx::read_already`].
+    read: Vec<String>,
     store: DynStore,
     clock: DynClock,
     cancel: CancelToken,
@@ -137,6 +139,8 @@ pub(crate) struct CtxOutcome {
     pub consumed: usize,
     /// See [`Ctx::reopen_on_arrival`].
     pub reopen: bool,
+    /// See [`Ctx::read_already`].
+    pub read: Vec<String>,
     pub artifacts: Vec<Artifact>,
 }
 
@@ -166,6 +170,7 @@ impl Ctx {
             inbox: p.inbox,
             consumed: 0,
             reopen: false,
+            read: Vec::new(),
             store: p.store,
             clock: p.clock,
             cancel: p.cancel,
@@ -184,6 +189,7 @@ impl Ctx {
             seq: self.seq,
             consumed: self.consumed,
             reopen: self.reopen,
+            read: self.read,
             artifacts: std::mem::take(
                 &mut *self
                     .emitter
@@ -368,7 +374,21 @@ impl Ctx {
         };
         let env = Envelope::decode(self.run, &rec.state)
             .map_err(|e| AgentError::permanent(format!("the run's record is unreadable: {e}")))?;
-        Ok(news_since(&env.inbox, self.base_inbox))
+        Ok(news_since(&env.inbox, self.base_inbox, &self.read))
+    }
+
+    /// Say which messages the run has read, by id: a copy of one that arrives while this
+    /// transition runs is not news.
+    ///
+    /// A sender whose delivery was not acknowledged delivers the same message again, under the
+    /// same id. The agent drops the copy when it reads its inbox, but a copy that lands while the
+    /// transition runs would otherwise count in [`arrived`](Self::arrived) and reopen a `Done`
+    /// ([`reopen_on_arrival`](Self::reopen_on_arrival)): the run would take a turn with nothing new
+    /// to answer. After this call neither counts a message whose id is in `ids` (an empty id is
+    /// never matched). The copy stays in the inbox; the next transition, if there is one, drops it.
+    /// Each call replaces the ids of the call before.
+    pub fn read_already(&mut self, ids: &[String]) {
+        self.read = ids.to_vec();
     }
 
     /// Ask the runtime not to finish the run past a message that arrives while this transition

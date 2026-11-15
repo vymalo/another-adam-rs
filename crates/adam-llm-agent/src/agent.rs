@@ -2858,6 +2858,9 @@ impl Agent for LlmAgent {
                 wake_at: None,
             });
         }
+        // A copy of a message the run has read, delivered again while this step runs, is not a
+        // reason for another turn.
+        ctx.read_already(&state.read_ids);
         // The person answered: the step of the call that asked, which has been `waiting` since, ends.
         if let Some((tool, call_id)) = asked
             && state.pending_wait.is_none()

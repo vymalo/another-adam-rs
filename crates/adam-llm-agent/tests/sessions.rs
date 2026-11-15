@@ -2185,8 +2185,10 @@ mod cases {
         }
     }
 
-    /// A send that steered a working round is tried again after the round has ended: the message
-    /// reached the child once, and no round is made for its text.
+    /// A send that steered a working round is tried again: the message reached the child once, and
+    /// no round is made for its text. The second try can find the round ended (it reads the id in
+    /// the round's state) or still working (it steers again, and the child drops the copy without
+    /// a turn of its own); the worker decides which, and both end the same way.
     pub async fn a_steer_retried_after_the_round_ended_reaches_the_child_once(store: DynStore) {
         let rig = Rig::new().holding(0);
         rig.child_mock
