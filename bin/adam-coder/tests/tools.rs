@@ -7520,9 +7520,10 @@ async fn a_linked_duplicate_dir_counts_once() {
         listing_of(&out.content),
         skills_block(&[
             "- remote/a: Does a. (.agents/skills/a)",
-            "- remote/b: Does b. (.agents/skills/b)"
+            "- remote/b: Does b. (.agents/skills/b)",
+            "Not listed: .opencode/skills/a: its directory is a link"
         ]),
-        "each skill once, and nothing said of the links"
+        "each skill once, and nothing said of a link to a whole directory"
     );
 }
 
@@ -7635,7 +7636,7 @@ async fn sixty_five_skills_list_sixty_four_and_count_the_rest() {
     assert_eq!(listed, 64, "{listing}");
     assert!(
         listing.ends_with(
-            "… and 1 more are not listed: read their SKILL.md with read_file.\n\
+            "… and 1 more entries of .agents/skills were not examined\n\
              [end of skills of slot remote]"
         ),
         "{listing}"
@@ -7989,7 +7990,291 @@ async fn an_unprepared_slot_is_refused() {
     assert!(before.is_error);
     // A repository without skills lists none, so there is nothing to load.
     let plain = Rig::new().await;
-    plain.prepare().await;
+    let prepared = plain.prepare().await;
+    assert!(!prepared.content.contains("Skills in this repository"));
     let out = load_skill_in(&plain, "remote/s").await;
     assert!(out.is_error, "{}", out.content);
+    // ... and a prepared slot is not called unprepared.
+    assert!(
+        out.content.contains(
+            "no skill `remote/s` was listed for the repository `remote` in this run; listed: none"
+        ),
+        "{}",
+        out.content
+    );
+    assert!(!out.content.contains("is not prepared"), "{}", out.content);
+}
+
+// ---- the fix round of the review of slice 8
+
+/// `n` skills' worth of files: `.agents/skills/<name>/SKILL.md` for each of `names`.
+fn commit_skills(rig: &Rig, label: &str, skills: &[(&str, String, String)]) {
+    let files: Vec<(String, String)> = skills
+        .iter()
+        .map(|(name, description, body)| {
+            (
+                format!(".agents/skills/{name}/SKILL.md"),
+                skill_md(name, description, body),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_bytes()))
+        .collect();
+    commit_bytes(&rig.fx, label, &refs);
+}
+
+#[tokio::test]
+async fn the_bundled_files_line_is_bounded_and_the_page_keeps_its_paging_line() {
+    let rig = Rig::new().await;
+    let body: String = (0..5000)
+        .map(|n| format!("line {n:05} of the body\n"))
+        .collect();
+    let names: Vec<String> = (0..200)
+        .map(|n| format!("references/{}{n:03}.md", "p".repeat(200)))
+        .collect();
+    let mut files: Vec<(String, Vec<u8>)> = names
+        .iter()
+        .map(|n| (format!(".agents/skills/s/{n}"), b"x\n".to_vec()))
+        .collect();
+    files.push((
+        ".agents/skills/s/SKILL.md".to_owned(),
+        skill_md("s", "Has files.", &body).into_bytes(),
+    ));
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    commit_bytes(&rig.fx, "bundled", &refs);
+    rig.prepare().await;
+    let out = load_skill_in(&rig, "remote/s").await;
+    assert!(!out.is_error, "{}", out.content);
+    let line = out
+        .content
+        .lines()
+        .find(|l| l.starts_with("Files it bundles"))
+        .expect("the files line");
+    assert!(line.len() < 4 * 1024 + 200, "{}", line.len());
+    assert!(line.contains(", and "), "{line}");
+    assert!(line.ends_with(" more"), "{line}");
+    let last = out.content.lines().last().unwrap();
+    assert!(
+        last.starts_with("[more:") || last.starts_with("[end:"),
+        "{last}"
+    );
+    assert!(!out.content.contains("[cut by the loop"));
+    assert!(matches!(
+        adam_llm_agent::paging::backstop(&out.content, "load_skill", true),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_skills_directory_with_more_entries_than_the_cap_says_so() {
+    let rig = Rig::new().await;
+    let files: Vec<(String, Vec<u8>)> = (0..1030)
+        .map(|n| (format!(".agents/skills/note-{n:04}.txt"), b"x".to_vec()))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    commit_bytes(&rig.fx, "wide", &refs);
+    let out = rig.prepare().await;
+    assert_eq!(
+        listing_of(&out.content),
+        skills_block(&["… and at least 1 more entries of .agents/skills were not examined"])
+    );
+}
+
+#[tokio::test]
+async fn a_skill_that_is_a_link_to_the_repository_is_not_listed_or_readable() {
+    let rig = Rig::new().await;
+    commit_bytes(
+        &rig.fx,
+        "skills",
+        &[
+            (
+                ".agents/skills/fine/SKILL.md",
+                skill_md("fine", "Stays.", "Fine.\n").as_bytes(),
+            ),
+            ("src/secret.rs", b"REPO-FILE\n"),
+        ],
+    );
+    commit_links(
+        &rig.fx,
+        "wide",
+        &[
+            (".agents/skills/everything", "../.."),
+            (".agents/skills/here", "."),
+        ],
+    );
+    let out = rig.prepare().await;
+    assert_eq!(
+        listing_of(&out.content),
+        skills_block(&[
+            "- remote/fine: Stays. (.agents/skills/fine)",
+            "Not listed: .agents/skills/everything: its directory is a link",
+            "Not listed: .agents/skills/here: its directory is a link",
+        ])
+    );
+    for name in ["remote/everything", "remote/here"] {
+        assert!(load_skill_in(&rig, name).await.is_error);
+        let read = read_skill_in(&rig, name, "src/secret.rs").await;
+        assert!(
+            read.is_error && !read.content.contains("REPO-FILE"),
+            "{}",
+            read.content
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_skill_that_is_a_link_to_another_skill_lists_the_target_once() {
+    let rig = Rig::new().await;
+    commit_skills(&rig, "b", &[("b", "Does b.".into(), "B.\n".into())]);
+    commit_links(&rig.fx, "ab", &[(".agents/skills/a", "b")]);
+    let out = rig.prepare().await;
+    assert_eq!(
+        listing_of(&out.content),
+        skills_block(&[
+            "- remote/b: Does b. (.agents/skills/b)",
+            "Not listed: .agents/skills/a: its directory is a link"
+        ])
+    );
+    assert!(load_skill_in(&rig, "remote/a").await.is_error);
+    assert!(!load_skill_in(&rig, "remote/b").await.is_error);
+}
+
+#[tokio::test]
+async fn a_bidirectional_control_in_a_description_is_written_out() {
+    let rig = Rig::new().await;
+    commit_skills(
+        &rig,
+        "bidi",
+        &[("bidi", "a\u{202e}b\u{2066}c".into(), "B.\n".into())],
+    );
+    let out = rig.prepare().await;
+    assert_eq!(
+        listing_of(&out.content),
+        skills_block(&["- remote/bidi: a\\u{202e}b\\u{2066}c (.agents/skills/bidi)"])
+    );
+    assert!(!out.content.contains('\u{202e}') && !out.content.contains('\u{2066}'));
+}
+
+#[tokio::test]
+async fn a_loaded_body_is_escaped() {
+    let rig = Rig::new().await;
+    commit_skills(
+        &rig,
+        "esc",
+        &[("esc", "Has an escape.".into(), "red \u{1b}[31mx\n".into())],
+    );
+    rig.prepare().await;
+    let out = load_skill_in(&rig, "remote/esc").await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("\\x1b[31mx"), "{}", out.content);
+    assert!(!out.content.contains('\u{1b}'), "{:?}", out.content);
+}
+
+#[tokio::test]
+async fn a_bundled_file_with_a_nul_is_not_text() {
+    let rig = Rig::new().await;
+    commit_bytes(
+        &rig.fx,
+        "nul",
+        &[
+            (
+                ".agents/skills/s/SKILL.md",
+                skill_md("s", "Has a file.", "Read it.\n").as_bytes(),
+            ),
+            (".agents/skills/s/nul.txt", b"a\0b"),
+        ],
+    );
+    rig.prepare().await;
+    let out = read_skill_in(&rig, "remote/s", "nul.txt").await;
+    assert!(
+        out.is_error && out.content.contains("is not UTF-8 text"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn a_skill_file_over_the_size_bound_is_not_listed() {
+    let rig = Rig::new().await;
+    let body = "x".repeat(256 * 1024);
+    commit_skills(&rig, "big", &[("big", "Too big.".into(), body)]);
+    let out = rig.prepare().await;
+    assert_eq!(
+        listing_of(&out.content),
+        skills_block(&["Not listed: .agents/skills/big: SKILL.md is larger than 262144 bytes"])
+    );
+}
+
+#[tokio::test]
+async fn the_listing_block_is_at_most_sixteen_kib() {
+    let rig = Rig::new().await;
+    let skills: Vec<(String, String, String)> = (0..64)
+        .map(|n| (format!("skill-{n:02}"), "d".repeat(1024), "B.\n".to_owned()))
+        .collect();
+    let refs: Vec<(&str, String, String)> = skills
+        .iter()
+        .map(|(a, b, c)| (a.as_str(), b.clone(), c.clone()))
+        .collect();
+    commit_skills(&rig, "fat", &refs);
+    let out = rig.prepare().await;
+    let block = listing_of(&out.content);
+    assert!(block.len() <= 16 * 1024, "{}", block.len());
+    assert!(
+        block.contains(" more are not listed: read their SKILL.md with read_file."),
+        "{block}"
+    );
+    let listed = block
+        .lines()
+        .filter(|l| l.starts_with("- remote/skill-"))
+        .count();
+    assert!(listed < 64 && listed > 0, "{listed}");
+}
+
+#[tokio::test]
+async fn a_long_description_is_cut_at_three_hundred_characters() {
+    let rig = Rig::new().await;
+    commit_skills(&rig, "long", &[("long", "d".repeat(400), "B.\n".into())]);
+    let out = rig.prepare().await;
+    assert_eq!(
+        listing_of(&out.content),
+        skills_block(&[&format!(
+            "- remote/long: {}… (.agents/skills/long)",
+            "d".repeat(300)
+        )])
+    );
+}
+
+#[tokio::test]
+async fn at_most_sixteen_skip_lines_are_written_then_a_count() {
+    let rig = Rig::new().await;
+    let files: Vec<(String, Vec<u8>)> = (0..20)
+        .map(|n| (format!(".agents/skills/Bad-{n:02}/readme"), b"x".to_vec()))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    commit_bytes(&rig.fx, "bad", &refs);
+    let out = rig.prepare().await;
+    let block = listing_of(&out.content);
+    assert_eq!(
+        block
+            .lines()
+            .filter(|l| l.starts_with("Not listed:"))
+            .count(),
+        16,
+        "{block}"
+    );
+    assert!(
+        block.contains("\n… and 4 more are not listed: read their SKILL.md with read_file.\n"),
+        "{block}"
+    );
 }

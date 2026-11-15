@@ -498,6 +498,10 @@ pub struct RepoSkillsNote {
     pub skipped: Vec<String>,
     /// How many more were not listed, for want of room.
     pub more: u32,
+    /// One line for each skills directory whose entries were not all opened (more than the
+    /// limits allow), as `… and N more entries of <dir> were not examined`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unexamined: Vec<String>,
 }
 
 /// Most directories below a slot's root whose instruction files a run is shown (a root does not

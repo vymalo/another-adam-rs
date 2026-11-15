@@ -7,11 +7,14 @@
 //!   `.claude/skills` and `.opencode/skills`, in that order, for `<name>/SKILL.md`. A directory
 //!   that is reached twice (a link to the same files) counts once, a name an earlier directory has
 //!   is skipped and said so, and so is anything that cannot be read as a skill: a link that leaves
-//!   the slot, a file that is not a regular one, a file over [`MAX_SKILL_FILE`], a bad name or no
-//!   description. At most [`MAX_LISTED`] skills and [`LISTING_CAP`] bytes are listed; the rest is
-//!   counted. The block comes **before** the project instructions of the same call and is the
+//!   the slot, a skill whose directory is a link (it must be `<base>/<name>` itself, so a link to
+//!   `.` or to another skill is not one), a file that is not a regular one, a file over
+//!   [`MAX_SKILL_FILE`], a bad name or no description. At most [`MAX_LISTED`] skills and
+//!   [`LISTING_CAP`] bytes are listed; the rest is counted, and entries of a skills directory that
+//!   were never opened are said so (`… and N more entries of <dir> were not examined`). A
+//!   directory is read at most [`MAX_ENTRIES`] entries deep. The block comes **before** the project instructions of the same call and is the
 //!   result's, never a message.
-//! * **Recorded.** What was listed is in [`RunNotes::repo_skills`](super::notes::RunNotes::repo_skills) with the id of the call: a retry
+//! * **Recorded.** What was listed (an empty note for a slot with nothing to list, so that a slot never prepared can be told from one that was) is in [`RunNotes::repo_skills`](super::notes::RunNotes::repo_skills) with the id of the call: a retry
 //!   of that call renders the same bytes from the record, not from the files as they are now; any
 //!   other prepare of the slot lists nothing; `load_skill` takes only recorded names.
 //! * **Loading.** `load_skill name=<slot>/<skill>` shows the skill's `SKILL.md` the way `read_file`
@@ -69,10 +72,10 @@ const MAX_ENTRIES: usize = 1024;
 const MAX_SKIPPED_LINES: usize = 16;
 /// A description is cut here, after it was scrubbed and put on one line.
 const DESCRIPTION_CHARS: usize = 300;
-/// The raw description kept for scrubbing and cutting.
-const RAW_DESCRIPTION_CHARS: usize = 2048;
 /// Most bundled files a first page names.
 const MAX_BUNDLED_LISTED: usize = 200;
+/// Most bytes of escaped paths in the line that names them.
+const MAX_BUNDLED_LINE: usize = 4 * 1024;
 /// Most entries the walk over a skill's directory looks at.
 const MAX_BUNDLED_WALK: usize = 2000;
 /// Deepest directory the walk over a skill's directory enters.
@@ -125,15 +128,16 @@ impl RepoSkills {
             .map_err(|e| notes_error(&e))?;
         if let Some(note) = notes.repo_skills.get(&key) {
             // The call that listed them lists them again, from the record.
-            return Ok((note.call_id == ctx.call_id()).then(|| render(&key, note)));
+            return Ok(
+                (note.call_id == ctx.call_id() && !is_empty(note)).then(|| render(&key, note))
+            );
         }
         let root = Arc::clone(slot.root());
         let found = tokio::task::spawn_blocking(move || discover(&root))
             .await
             .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
-        if found.skills.is_empty() && found.skipped.is_empty() && found.more == 0 {
-            return Ok(None);
-        }
+        // A slot with nothing to list is recorded too (an empty note), so that `load_skill` can tell
+        // a prepared slot from one that was never prepared; nothing is rendered for it.
         let note = fit(&key, shape(ctx, ctx.call_id(), found));
         notes.repo_skills.insert(key.clone(), note.clone());
         self.env
@@ -141,7 +145,7 @@ impl RepoSkills {
             .save(&run, &notes)
             .await
             .map_err(|e| notes_error(&e))?;
-        Ok(Some(render(&key, &note)))
+        Ok((!is_empty(&note)).then(|| render(&key, &note)))
     }
 
     /// The skill `name` (`<slot>/<skill>`) names, if this run's `prepare_workspace` listed it.
@@ -179,7 +183,7 @@ impl RepoSkills {
                 .map(|s| format!("`{slot_shown}/{}`", s.name))
                 .collect();
             return refusal(format!(
-                "no skill `{shown}` was listed for the repository `{slot_shown}`; listed: {}",
+                "no skill `{shown}` was listed for the repository `{slot_shown}` in this run; listed: {}",
                 if listed.is_empty() {
                     "none".to_owned()
                 } else {
@@ -259,18 +263,7 @@ impl RunSkills for RepoSkills {
                 .await
                 .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
             if !files.is_empty() {
-                out.push_str(&format!(
-                    "\nFiles it bundles (read one with read_skill_file skill={qualified} \
-                     path=<path>): {}",
-                    files
-                        .iter()
-                        .map(|f| paging::escape_name(f.as_bytes()))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                if more > 0 {
-                    out.push_str(&format!(", and {more} more"));
-                }
+                out.push_str(&bundled_line(&qualified, &files, more));
             }
         }
         out.push('\n');
@@ -332,6 +325,50 @@ impl RunSkills for RepoSkills {
              no tool, no access tier and no consent.\n{page}"
         )))
     }
+}
+
+/// The line that names the files a skill bundles: at most [`MAX_BUNDLED_LINE`] bytes of escaped
+/// paths, the rest counted.
+fn bundled_line(qualified: &str, files: &[String], more: usize) -> String {
+    let mut out = format!(
+        "\nFiles it bundles (read one with read_skill_file skill={qualified} path=<path>): "
+    );
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for file in files {
+        let text = listing_text(&paging::escape_name(file.as_bytes()));
+        let cost = text.len() + if shown == 0 { 0 } else { 2 };
+        if used + cost > MAX_BUNDLED_LINE {
+            break;
+        }
+        if shown > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&text);
+        used += cost;
+        shown += 1;
+    }
+    let left = files.len() - shown + more;
+    if shown == 0 {
+        out.push_str(&format!("{left} files, whose paths are too long to list"));
+    } else if left > 0 {
+        out.push_str(&format!(", and {left} more"));
+    }
+    out
+}
+
+/// `text` for a listing: the bidirectional controls (U+202A to U+202E, U+2066 to U+2069), which
+/// `escape_text` leaves alone and which can reorder what is shown, are written `\u{..}`.
+fn listing_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
+            out.push_str(&format!("\\u{{{:x}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The path the model gave to `read_skill_file`, checked and normalised (a leading `./` is
@@ -514,10 +551,9 @@ fn walk(
     visited: &mut usize,
     files: &mut Vec<String>,
 ) {
-    let Ok(mut entries) = dir.entries() else {
+    let Ok((entries, _)) = dir.entries_capped(MAX_ENTRIES) else {
         return;
     };
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, meta) in entries {
         *visited += 1;
         if *visited > MAX_BUNDLED_WALK {
@@ -547,10 +583,11 @@ fn walk(
 struct Found {
     skills: Vec<Candidate>,
     skipped: Vec<String>,
+    unexamined: Vec<String>,
     more: u32,
 }
 
-/// A skill found, with its description as written (cut at [`RAW_DESCRIPTION_CHARS`]).
+/// A skill found, with its description as written (scrubbed and cut by [`shape`]).
 #[derive(Debug)]
 struct Candidate {
     name: String,
@@ -572,7 +609,6 @@ impl Found {
 fn discover(root: &SlotDir) -> Found {
     let mut found = Found::default();
     let mut bases: BTreeSet<Vec<OsString>> = BTreeSet::new();
-    let mut dirs: BTreeSet<Vec<OsString>> = BTreeSet::new();
     let mut names: BTreeMap<String, String> = BTreeMap::new();
     let mut examined = 0usize;
     for base in SKILL_DIRS {
@@ -592,11 +628,11 @@ fn discover(root: &SlotDir) -> Found {
         let Ok(dir) = root.dir_below(&path) else {
             continue;
         };
-        let Ok(mut entries) = dir.entries() else {
+        let Ok((entries, capped)) = dir.entries_capped(MAX_ENTRIES) else {
             continue;
         };
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (entry, meta) in entries.into_iter().take(MAX_ENTRIES) {
+        let mut unopened = 0usize;
+        for (entry, meta) in entries {
             // Only a directory (or a link, which may lead to one) can be a skill.
             if !(meta.is_dir() || meta.is_symlink()) {
                 continue;
@@ -621,8 +657,12 @@ fn discover(root: &SlotDir) -> Found {
                 }
                 Err(_) => continue,
             };
-            // The same files reached by another path count once.
-            if !dirs.insert(at) {
+            // A skill's directory is its own: a link to `.`, to a wide directory or to another
+            // skill is not one (the skill it leads to is listed under its own name).
+            let mut own = resolved.clone();
+            own.push(OsString::from(name));
+            if at != own {
+                found.skip(format!("{rel}: its directory is a link"));
                 continue;
             }
             if let Some(first) = names.get(name) {
@@ -630,7 +670,7 @@ fn discover(root: &SlotDir) -> Found {
                 continue;
             }
             if found.skills.len() >= MAX_LISTED || examined >= MAX_EXAMINED {
-                found.more += 1;
+                unopened += 1;
                 continue;
             }
             examined += 1;
@@ -661,12 +701,18 @@ fn discover(root: &SlotDir) -> Found {
             found.skills.push(Candidate {
                 name: name.to_owned(),
                 dir: rel,
-                description: skill
-                    .description
-                    .chars()
-                    .take(RAW_DESCRIPTION_CHARS)
-                    .collect(),
+                description: skill.description,
             });
+        }
+        if capped {
+            found.unexamined.push(format!(
+                "… and at least {} more entries of {base} were not examined",
+                unopened + 1
+            ));
+        } else if unopened > 0 {
+            found.unexamined.push(format!(
+                "… and {unopened} more entries of {base} were not examined"
+            ));
         }
     }
     found
@@ -691,18 +737,28 @@ fn shape(ctx: &ToolCtx, call: &str, found: Found) -> RepoSkillsNote {
             .collect(),
         skipped: found.skipped,
         more: found.more,
+        unexamined: found.unexamined,
     }
 }
 
 /// `note` with the last skills left out until its listing fits [`LISTING_CAP`] (they are counted).
 fn fit(slot: &str, mut note: RepoSkillsNote) -> RepoSkillsNote {
     while render(slot, &note).len() > LISTING_CAP {
-        if note.skills.pop().is_none() && note.skipped.pop().is_none() {
+        if note.skills.pop().is_some() || note.skipped.pop().is_some() {
+            note.more += 1;
+        } else if note.unexamined.pop().is_none() {
             break;
         }
-        note.more += 1;
     }
     note
+}
+
+/// Whether `note` has nothing to show.
+fn is_empty(note: &RepoSkillsNote) -> bool {
+    note.skills.is_empty()
+        && note.skipped.is_empty()
+        && note.unexamined.is_empty()
+        && note.more == 0
 }
 
 /// `text` cut at `max` characters, with an ellipsis when it was.
@@ -728,12 +784,16 @@ fn render(slot: &str, note: &RepoSkillsNote) -> String {
         out.push_str(&format!(
             "\n- {slot}/{}: {} ({})",
             skill.name,
-            paging::escape_text(skill.description.as_bytes()),
-            skill.dir
+            listing_text(&paging::escape_text(skill.description.as_bytes())),
+            listing_text(&skill.dir)
         ));
     }
     for why in &note.skipped {
-        out.push_str(&format!("\nNot listed: {why}"));
+        out.push_str(&format!("\nNot listed: {}", listing_text(why)));
+    }
+    for line in &note.unexamined {
+        out.push('\n');
+        out.push_str(&listing_text(line));
     }
     if note.more > 0 {
         out.push_str(&format!(
@@ -763,6 +823,7 @@ mod tests {
                 .collect(),
             skipped: Vec::new(),
             more: 0,
+            unexamined: Vec::new(),
         }
     }
 
