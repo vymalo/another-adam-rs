@@ -529,7 +529,7 @@ pub struct Conversation {
     /// from state written before it existed, and not written while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// The compactions of this run, oldest first (at most [`MAX_COMPACTIONS`]): the requests that
+    /// The compactions of this run, oldest first (at most [`MAX_COMPACTIONS`](crate::MAX_COMPACTIONS)): the requests that
     /// start a new prefix, beside [`shortenings`](Self::shortenings). Absent from state written
     /// before it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
