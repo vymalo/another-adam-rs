@@ -216,9 +216,9 @@ each agent made (name, alias, rendered prompt, tools, skills, limits); with the 
 anything is bound).
 
 An agent's `skills/` need no code: the prompt gets a catalog (name and description of each skill) and the
-agent gets a `load_skill` tool (the body of `SKILL.md`) and a `read_skill_file` tool (a bundled text file),
+agent gets a `load_skill` tool (a page of the body of `SKILL.md`, by a plain string `name`) and a `read_skill_file` tool (a page of a bundled text file),
 the [Agent Skills](https://agentskills.io/specification) progressive disclosure. `preload_skills:` puts a
-body in the prompt instead. It works the same for the embedded agent and for a directory read with
+body in the prompt instead; `AgentDef::run_skills` lets the root load skills a run finds (`<source>/<skill>`). It works the same for the embedded agent and for a directory read with
 `AgentDef::from_source`.
 
 ### Compile errors

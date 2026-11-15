@@ -476,23 +476,38 @@ stateDiagram-v2
 
 Progressive disclosure, the three tiers of the Agent Skills client guide (*verified 2026-09-29*,
 <https://agentskills.io/client-implementation/adding-skills-support.md>). Each agent has its own skills (its
-own `skills/`, narrowed by `skills:`), never inherited.
+own `skills/`, narrowed by `skills:`), never inherited. A folder with no `skills:` has every skill it holds;
+`skills: []` turns skills off.
 
 | Tier | The model sees | Cost |
 |---|---|---|
 | 1. Catalog | `name` and `description` of each selected skill, in the prompt after the instructions | about 50 to 100 tokens per skill, on every request |
-| 2. `load_skill { name }` | the body of `SKILL.md`, frontmatter stripped, in `<skill_content name="...">`, with bundled files listed in `<skill_resources>` | once, in the tool result; it stays in the conversation |
-| 3. `read_skill_file { skill, path }` | one bundled file as text | once per file read |
+| 2. `load_skill { name, offset?, limit? }` | a page of the body of `SKILL.md`, frontmatter stripped, in `<skill_content name="...">`, with bundled files listed in `<skill_resources>`; the last line says where the next page starts | once, in the tool result; it stays in the conversation |
+| 3. `read_skill_file { skill, path, offset?, limit? }` | a page of one bundled file as text | once per file read |
 
 * The catalog is pinned by a golden file (`crates/adam-assembly/tests/golden/coder-prompt.txt`). Descriptions
-  are collapsed to one line and XML-escaped. `name` of `load_skill` and `skill` of `read_skill_file` are JSON
-  Schema enums; an unknown, unselected or made-up name gets the same refusal, listing what is available.
+  are collapsed to one line and XML-escaped. **`name` of `load_skill` and `skill` of `read_skill_file` are plain
+  strings, not enums**: the two tools' descriptions and schemas are the same whatever skills exist, so adding a
+  skill never changes the tools a provider caches. An unknown, unselected or made-up name gets the same refusal,
+  listing what is available.
+* **Both tools page like `read_file`**: `offset` from 1 (negative from the end) and `limit` at most 2,000 lines, at
+  most 50 KiB a page, and every result ends with `[more: N lines left; next page: offset=K]` or `[end: N lines]`.
+  A body that goes on names its bundled files in one line on the first page; the `<skill_resources>` list comes
+  with the last page. A line of the text that starts with `[` is shown as `\x5b`, so only the last line does.
 * **`read_skill_file` is a lookup, not a file read**: the path is normalised, refused when empty, absolute, with
   `..`, a backslash or a control character, then matched **exactly** against the skill's bundled list. There is
   no filesystem access at run time. Text only (no NUL), at most 1 MiB per skill.
 * **`preload_skills:`** puts the whole skill into the prompt instead of leaving it to `load_skill`; it is out of
-  the catalog and the enum. With every skill preloaded there is no `load_skill`; with none bundling a file, no
+  the catalog. With every skill preloaded there is no `load_skill`; with none bundling a file, no
   `read_skill_file`; with no skills, neither tool and no catalog.
+* **Skills a run finds.** A host that finds skills while a run goes on (the coder: the skills of a repository it
+  prepared) gives the root agent `AgentDef::run_skills(Arc<dyn RunSkills>)`. A name with a `/`
+  (`<source>/<skill>`) goes to it and a name without never does, so it cannot shadow a skill of the folder.
+  With it set the root always has both tools and one fixed sentence in its prompt ("Other skills may be listed to
+  you during the run, named `<source>/<skill>`; load them with load_skill the same way."), also when the folder
+  has no skill of its own: what a run finds is a **tool result**, and the system prompt and the tool list stay the
+  same bytes for the whole run. `skills: []` installs neither the tools nor the sentence. Subagents get none.
+  The coder's: [Repository skills](coder-agent.md#repository-skills).
 * A registered tool named `load_skill` or `read_skill_file` is `Error::ReservedToolName`; `tools:` does not
   filter the skill tools, `skills: []` turns them off. Results are journaled like any tool's.
 * Known limit: an old tool result may be shortened in the stored history by `limits.max_history_tokens`, a loaded skill included.
@@ -504,19 +519,26 @@ sequenceDiagram
   participant A as LlmAgent
   participant L as load_skill
   participant R as read_skill_file
+  participant H as RunSkills of the host
   A->>M: prompt with the catalog, tools load_skill and read_skill_file
   M->>A: call load_skill(name: release-notes)
   A->>L: journaled step tool:CALL_ID
-  L-->>A: skill_content: the body and skill_resources
-  A->>M: the body is a tool result in the conversation
+  L-->>A: a page of skill_content: the body and skill_resources, then the paging line
+  A->>M: the page is a tool result in the conversation
   M->>A: call read_skill_file(skill, path: references/style.md)
   A->>R: journaled step tool:CALL_ID
   alt the path is relative, has no .., and is a bundled text file
-    R-->>A: the file's text
+    R-->>A: a page of the file's text
   else refused
     R-->>A: is_error result: what is wrong and what is available
   end
   A->>M: the result, and the model carries on
+  opt the host has RunSkills and the name has a slash
+    M->>A: call load_skill(name: widgets/release-notes)
+    A->>H: load with the name and the checked window
+    H-->>A: numbered lines of the skill or a refusal
+    A->>M: a tool result and the prompt and the tools are the same bytes
+  end
 ```
 
 ```mermaid
@@ -526,6 +548,8 @@ stateDiagram-v2
   Cataloged --> Cataloged: load_skill refused, unknown or unselected name
   [*] --> Preloaded: bind, the skill is in preload_skills
   Preloaded --> Preloaded: load_skill answers already loaded
+  [*] --> Listed: the host lists a skill in a tool result
+  Listed --> Loaded: load_skill with its name of the form source/skill
   Loaded --> Loaded: read_skill_file, a bundled text file
   Preloaded --> Preloaded: read_skill_file, a bundled text file
   Loaded --> [*]: the run ends
