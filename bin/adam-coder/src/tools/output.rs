@@ -7,7 +7,9 @@
 //!   under an output id: `read_output { id, offset?, limit? }` reads it by lines
 //!   ([`FileKept`](crate::kept::FileKept); the files are on the workspace volume, not in the journal).
 //!   The whole output is scrubbed with the process's secrets **before** it is written, and the head
-//!   and the tail are cut from the scrubbed text: what is kept is as redacted as what is shown.
+//!   and the tail are cut from the scrubbed text: what is kept is as redacted as what is shown. A
+//!   capture that is only the start of the output (or a tail that is only the end of it) is cut back
+//!   where it was cut, at a place no secret straddles, whatever scrubbing did to the length.
 //!
 //! A result carries no duration: the result is journaled and a replay returns the same bytes, and a
 //! duration would make two runs of the same command differ for no reason the model can use.
@@ -72,18 +74,35 @@ pub(super) async fn settle(env: &ToolEnv, ctx: &ToolCtx, outcome: &mut ShellOutc
     let head_cap = cap / 4;
     let tail_cap = cap - head_cap;
     let whole = outcome.total <= captured.len() as u64;
+    let scrub = |text: &str| redactor.scrub(text).into_owned();
     // What the capture left out (nothing when it holds all of the output).
     let omitted = outcome.total.saturating_sub(captured.len() as u64);
-    // Scrubbed whole, before anything is cut: the captured text reaches a little past what is kept,
-    // so a secret at the cut is whole here and replaced.
-    let full = redactor.scrub_string(lossless(captured));
-    outcome.head = head_of(&full, head_cap).to_owned();
+    let captured = lossless(captured);
+    // The cuts below are of scrubbed text, which holds no secret to split. A capture that is only
+    // the start of the output ends wherever the limit fell: it goes to the keeper as it is, and the
+    // keeper cuts its end back (`KeptOutputs::keep`); the head is made from a part of it, cut back
+    // the same way.
+    let full = if whole {
+        scrub(&captured)
+    } else {
+        String::new()
+    };
+    let head_src = if whole {
+        None
+    } else {
+        let mut end = (head_cap + 2 * adam_llm_agent::SCRUB_OVERLAP).min(captured.len());
+        while !captured.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(adam_llm_agent::scrub_open_end(&captured[..end], scrub))
+    };
+    outcome.head = head_of(head_src.as_deref().unwrap_or(&full), head_cap).to_owned();
     outcome.tail = if whole {
         tail_of(&full, tail_cap).to_owned()
     } else {
-        // The output outgrew what is captured: the tail the shell tracked is the real one, with
-        // bytes before it that are cut only after the scrub.
-        let tail = redactor.scrub_string(lossless(tail_raw));
+        // The output outgrew what is captured: the tail the shell tracked is the real one. It
+        // starts wherever the buffer ended, so its start is cut back as the capture's end is.
+        let tail = adam_llm_agent::scrub_open_start(&lossless(tail_raw), scrub);
         tail_of(&tail, tail_cap).to_owned()
     };
     let hidden = if whole {
@@ -95,8 +114,13 @@ pub(super) async fn settle(env: &ToolEnv, ctx: &ToolCtx, outcome: &mut ShellOutc
     };
     let id = adam_llm_agent::output_id_of(ctx);
     let run = ctx.root_run_id().to_string();
-    let kept = adam_llm_agent::KeptOutputs::keep(&*env.kept, &run, &id, &full, omitted).await;
+    let kept = if whole {
+        adam_llm_agent::KeptOutputs::keep(&*env.kept, &run, &id, &full, 0).await
+    } else {
+        adam_llm_agent::KeptOutputs::keep(&*env.kept, &run, &id, &captured, omitted).await
+    };
     drop(full);
+    drop(captured);
     outcome.kept = Some(match kept {
         Ok(info) => KeptNote {
             id,

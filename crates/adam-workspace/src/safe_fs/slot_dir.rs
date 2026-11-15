@@ -416,6 +416,17 @@ impl Dir {
         Ok(())
     }
 
+    /// Remove the empty directory `name` of this one (`unlinkat` with `AT_REMOVEDIR`; a link is not
+    /// a directory and is refused).
+    ///
+    /// # Errors
+    ///
+    /// The errors of `unlinkat`.
+    pub fn rmdir(&self, name: &OsStr) -> io::Result<()> {
+        rustix::fs::unlinkat(&self.fd, single(name)?, AtFlags::REMOVEDIR)?;
+        Ok(())
+    }
+
     /// Make the link `name` to `target`.
     ///
     /// # Errors

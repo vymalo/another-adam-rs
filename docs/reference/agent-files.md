@@ -183,7 +183,7 @@ all of them with no error; that is a conformance test.
 
 * **A long result is kept and paged, not cut.** A text answer over 64 KiB is kept and the model is shown its first
   page and an output id; the agent gets a `read_output` tool (added when its tools include an MCP tool) that reads the rest by
-  lines. A folder agent has no volume, so it keeps the text **in the run's state, at most 4 MiB for the run**; a
+  lines. A folder agent has no volume, so it keeps the text **in the run's state, at most 4 MiB for the run** (as the tools gave it: a host that sets `ToolCtx::with_scrub` has it scrubbed before it is folded and at every read; the shipped `adam-agent` sets none and has no secrets registry, so it does not); a
   result that would go over is shown as its first page and `[not kept: ...]`. An error result is still cut at
   64 KiB, and images and blobs are not paged. See [`adam-mcp`](../../crates/adam-mcp/README.md).
 * Field names follow Claude Code's `.mcp.json` (*verified 2026-09-29*,

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 01f444fe4df8d1579f84c29a462d8ab24a030b678856590e18a528da836638d6 # shrinks to len = 93060, places = [(93008, true), (134600, false), (7937, true), (91358, true), (70641, true), (59671, false), (54451, false), (48009, true), (65821, true), (152815, false), (69490, true), (116703, false), (106454, false), (48851, true), (19779, true), (26863, false), (89812, true), (126221, false), (92427, true), (146675, false), (81899, true), (37640, true), (141922, true), (115139, false), (72674, true), (68191, false), (116531, false), (1769, false), (22674, true), (132121, false), (151236, false), (53615, false), (81217, false), (130608, false), (67875, false), (82662, true), (85041, false), (107884, true), (32647, false), (75367, false), (93031, true), (6720, true), (112952, false), (126314, true), (131187, false), (96402, true), (159536, true), (126550, true), (147734, false), (151856, false), (584, true), (11787, false), (118337, false), (95535, false), (10218, true), (75307, true), (108898, false), (21773, true), (133638, false), (3437, true), (144840, true), (62378, true), (120100, false), (56678, false)], cut = 95995, lines = false

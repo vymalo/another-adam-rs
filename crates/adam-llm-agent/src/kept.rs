@@ -45,9 +45,8 @@ use crate::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 pub const READ_OUTPUT: &str = "read_output";
 /// The most bytes of one kept text.
 pub const MAX_KEPT_BYTES: usize = 16 * 1024 * 1024;
-/// What a producer captures beyond [`MAX_KEPT_BYTES`] (and before a tail it shows), so that a secret
-/// that straddles a cut is whole in what a keeper scrubs: scrubbing comes before the cut. No secret
-/// is longer.
+/// What a producer captures beyond [`MAX_KEPT_BYTES`] (and before a tail it shows), and the margin a
+/// keeper cuts back at the edge of a text that was cut ([`scrub_open_end`]). No secret is longer.
 pub const SCRUB_OVERLAP: usize = 64 * 1024;
 /// The most bytes a run keeps in its own state ([`Conversation::kept_outputs`](crate::Conversation::kept_outputs)).
 pub const MAX_RUN_KEPT_BYTES: usize = 4 * 1024 * 1024;
@@ -110,6 +109,11 @@ pub trait KeptOutputs: Send + Sync + 'static {
     /// before it gave `text` (0 when it gave all of it): when it is not 0, the kept text ends with a
     /// line that says so, and [`KeptInfo::cut`] is set. (Scrubbing changes lengths, so the count is of
     /// what was left out and not of what was printed.)
+    ///
+    /// A `text` with `omitted` not 0 is the **first part** of a longer output, so it may end in the
+    /// first half of a secret that scrubbing cannot recognise. The keeper cuts such a text back at its
+    /// end with [`scrub_open_end`] (it keeps no more than the text less [`SCRUB_OVERLAP`] bytes), and
+    /// a producer gives it unscrubbed.
     ///
     /// # Errors
     ///
@@ -263,7 +267,7 @@ pub fn page_of(id: &str, text: &str, offset: i64, limit: u32) -> Result<String, 
 
 /// The line that opens what the model is shown of a kept text: the id, how long the text is, and
 /// that `read_output` reads it.
-pub fn kept_header(id: &str, info: &KeptInfo, total_bytes: usize) -> String {
+pub fn kept_header(id: &str, info: &KeptInfo, total_bytes: u64) -> String {
     let mut line = format!(
         "[kept as {id}: {} lines; read_output {{\"id\":\"{id}\"}} reads it",
         info.lines
@@ -281,7 +285,7 @@ pub fn kept_header(id: &str, info: &KeptInfo, total_bytes: usize) -> String {
 
 /// What the model is shown of a text that was kept: [`kept_header`], the first page, and the
 /// page's final line (`[more: ...; next page: offset=N]`).
-pub fn kept_view(id: &str, kept: &str, info: &KeptInfo, total_bytes: usize) -> String {
+pub fn kept_view(id: &str, kept: &str, info: &KeptInfo, total_bytes: u64) -> String {
     let first = page_of(id, kept, 1, PAGE_LINES).unwrap_or_default();
     kept_header(id, info, total_bytes) + &first
 }
@@ -317,34 +321,101 @@ fn lost_view(why: &KeptError) -> String {
     format!("[not kept: {why}; the result is lost and none of it is shown]")
 }
 
+/// `text`, which is only the **first part** of a longer output, scrubbed with `scrub` and cut back
+/// so that no part of a secret is left at its end.
+///
+/// The end of such a text may be the first half of a secret that `scrub` cannot recognise, and the
+/// scrubbed length says nothing about where in the raw text a cut falls (a replacement is shorter or
+/// longer than the value). So the text is scrubbed whole, and again without its last
+/// [`SCRUB_OVERLAP`] bytes (no secret is longer): what the two agree on is the text up to the first
+/// place where a secret straddles the new end, which is replaced in the one and cut in the other.
+/// The result is scrubbed, and never longer than the text scrubbed whole.
+pub fn scrub_open_end(text: &str, scrub: impl Fn(&str) -> String) -> String {
+    let mut keep = text.len().saturating_sub(SCRUB_OVERLAP);
+    while !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let whole = scrub(text);
+    let part = scrub(&text[..keep]);
+    let agree = whole
+        .bytes()
+        .zip(part.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut end = agree;
+    while !whole.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut whole = whole;
+    whole.truncate(end);
+    whole
+}
+
+/// [`scrub_open_end`] for a text that is only the **last part** of a longer output: scrubbed, and
+/// without a part of a secret at its start.
+pub fn scrub_open_start(text: &str, scrub: impl Fn(&str) -> String) -> String {
+    let mut from = SCRUB_OVERLAP.min(text.len());
+    while !text.is_char_boundary(from) {
+        from += 1;
+    }
+    let whole = scrub(text);
+    let part = scrub(&text[from..]);
+    let agree = whole
+        .bytes()
+        .rev()
+        .zip(part.bytes().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut start = whole.len() - agree;
+    while !whole.is_char_boundary(start) {
+        start += 1;
+    }
+    whole[start..].to_owned()
+}
+
 /// Keep a long `text` for the call of `ctx` and say what the model is shown: the first page and an
 /// id to read the rest with [`ReadOutput`], or, when it cannot be kept, the first page and why the
 /// rest is lost. The second value is what the loop keeps in the run's state
 /// ([`ToolOutput::kept`](crate::ToolOutput::kept)); it is `Some` only when no [`KeptStore`] is in the
 /// agent's state.
 pub async fn keep_long(ctx: &ToolCtx, text: &str) -> (String, Option<Box<KeptOutput>>) {
+    keep_long_cut(ctx, text, 0).await
+}
+
+/// [`keep_long`] for a `text` that is the first part of a result of which `omitted` more bytes were
+/// left out. A keeper cuts such a text back at its end ([`KeptOutputs::keep`]); with no keeper the
+/// context's scrub hook ([`ToolCtx::with_scrub`]) does.
+pub async fn keep_long_cut(
+    ctx: &ToolCtx,
+    text: &str,
+    omitted: u64,
+) -> (String, Option<Box<KeptOutput>>) {
     let id = output_id_of(ctx);
-    let (prepared, cut) = prepare(text, 0);
+    let total = text.len() as u64 + omitted;
     if let Some(store) = ctx.state::<KeptStore>() {
         let run = ctx.root_run_id().to_string();
-        return match store.0.keep(&run, &id, text, 0).await {
+        return match store.0.keep(&run, &id, text, omitted).await {
             Ok(info) => {
                 // The page is made from what was kept (and scrubbed by the keeper), never from `text`.
                 match store.0.page(&run, &id, 1, PAGE_LINES).await {
-                    Ok(first) => (kept_header(&id, &info, text.len()) + &first, None),
+                    Ok(first) => (kept_header(&id, &info, total) + &first, None),
                     Err(e) => (lost_view(&e), None),
                 }
             }
             Err(e) => (lost_view(&e), None),
         };
     }
+    // No keeper to scrub: the context's hook does it, before the fold, which could split a value
+    // across two lines.
+    let (scrubbed, omitted) = scrubbed_for_keeping(text, omitted, |t| ctx.scrub(t));
+    let (prepared, cut) = prepare(&scrubbed, omitted);
     if prepared.len() <= ctx.kept_left() {
         let info = KeptInfo {
             bytes: prepared.len() as u64,
             lines: count_lines(&prepared),
             cut,
         };
-        let view = kept_view(&id, &prepared, &info, text.len());
+        let view = kept_view(&id, &prepared, &info, total);
         return (
             view,
             Some(Box::new(KeptOutput {
@@ -359,6 +430,24 @@ pub async fn keep_long(ctx: &ToolCtx, text: &str) -> (String, Option<Box<KeptOut
         prepared.len()
     );
     (unkept_view(&prepared, &why), None)
+}
+
+/// What a keeper makes of the `text` it is given, before it cuts and folds it: scrubbed with
+/// `scrub`, and, when `omitted` is not 0 (the text is the first part of a longer output), cut back
+/// at its end by [`scrub_open_end`]. With the `omitted` to keep: what was left out, counted again
+/// for what the cut back took (never 0 for a text that was cut).
+pub fn scrubbed_for_keeping(
+    text: &str,
+    omitted: u64,
+    scrub: impl Fn(&str) -> String,
+) -> (String, u64) {
+    if omitted == 0 {
+        return (scrub(text), 0);
+    }
+    let scrubbed = scrub_open_end(text, scrub);
+    let total = text.len() as u64 + omitted;
+    let omitted = total.saturating_sub(scrubbed.len() as u64).max(1);
+    (scrubbed, omitted)
 }
 
 /// `read_output { id, offset?, limit? }`: reads a kept output page by page.
@@ -480,8 +569,11 @@ impl KeptOutputs for MemoryKept {
             return Err(KeptError::Malformed(id.to_owned()));
         }
         // Scrubbed first, then folded and cut: a secret is never split by either.
-        let scrubbed = self.scrub.as_ref().map(|scrub| scrub(text));
-        let (prepared, cut) = prepare(scrubbed.as_deref().unwrap_or(text), omitted);
+        let (scrubbed, omitted) = scrubbed_for_keeping(text, omitted, |t| match &self.scrub {
+            Some(scrub) => scrub(t),
+            None => t.to_owned(),
+        });
+        let (prepared, cut) = prepare(&scrubbed, omitted);
         let info = KeptInfo {
             bytes: prepared.len() as u64,
             lines: count_lines(&prepared),
@@ -597,13 +689,23 @@ pub async fn kept_outputs_conformance(store: &dyn KeptOutputs) {
     );
     assert!(body.lines().all(|l| !l.starts_with('[')), "{page}");
 
-    // An output that was cut by its caller says so, in its last lines.
+    // An output that was cut by its caller says so, in its last lines. Its end is not trusted (it
+    // may be the first half of a secret), so a keeper keeps no more than the text less the margin.
     let id4 = output_id(run, "call-4");
-    let info = store.keep(run, &id4, "x\ny\n", 996).await.unwrap();
+    let first_part = "x\n".repeat(SCRUB_OVERLAP);
+    let info = store.keep(run, &id4, &first_part, 996).await.unwrap();
     assert!(info.cut);
+    assert!(
+        info.bytes <= (first_part.len() - SCRUB_OVERLAP) as u64 + 128,
+        "{info:?}"
+    );
     let page = store.page(run, &id4, -2, 10).await.unwrap();
     assert!(
-        page.contains("(output cut: only the first 4 of 1000 bytes are kept)"),
+        page.contains("(output cut: only the first") && page.contains(" bytes are kept)"),
+        "{page}"
+    );
+    assert!(
+        page.contains(&format!(" of {} bytes are kept)", first_part.len() + 996)),
         "{page}"
     );
 
@@ -741,6 +843,156 @@ mod tests {
         // Nothing to fold: borrowed, byte for byte.
         let (same, _) = prepare("a\nb\n", 0);
         assert!(matches!(same, Cow::Borrowed("a\nb\n")));
+    }
+
+    const LONG_SECRET: &str = "SeCrEt-0123456789-ABCDEF-tail"; // 29 bytes, none of `xyz \n`
+    const SHORT_SECRET: &str = "QqQq"; // replacing it makes the text longer
+
+    fn scrubber(t: &str) -> String {
+        t.replace(LONG_SECRET, "[redacted]")
+            .replace(SHORT_SECRET, "[redacted]")
+    }
+
+    /// A text of filler with no secret in it, `n` bytes long.
+    fn filler(n: usize, lines: bool) -> String {
+        let unit = if lines { "xyxz yz\n" } else { "xyxzyzx" };
+        unit.repeat(n / unit.len() + 1)[..n].to_owned()
+    }
+
+    /// No 8-byte window of a secret is in `text`: a window cannot be in filler by chance.
+    fn assert_no_part(text: &str, what: &str) {
+        for secret in [LONG_SECRET, SHORT_SECRET] {
+            for w in secret.as_bytes().windows(secret.len().min(8)) {
+                let w = std::str::from_utf8(w).unwrap();
+                assert!(!text.contains(w), "{what}: `{w}` is left in the text");
+            }
+        }
+    }
+
+    /// The reviewer's case: many secrets early shrink the scrubbed text, and the first part of a
+    /// secret ends the text, which was cut there. Cutting the scrubbed text at its own length cannot
+    /// find it; the end is cut back by what scrubbing does at the raw offset.
+    #[test]
+    fn the_end_of_a_first_part_keeps_no_part_of_a_secret_that_was_cut() {
+        let mut text = format!("{LONG_SECRET}\n").repeat(3000);
+        text.push_str(&filler(300_000, true));
+        text.push_str(&LONG_SECRET[..20]);
+        let out = scrub_open_end(&text, scrubber);
+        assert_no_part(&out, "the capture's end");
+        assert!(out.starts_with("[redacted]\n[redacted]\n"), "scrubbed");
+        assert!(out.len() > 200_000, "the rest is kept: {}", out.len());
+    }
+
+    #[test]
+    fn a_secret_across_the_margin_is_replaced_not_cut_and_nothing_else_is_lost() {
+        for lines in [false, true] {
+            for offset in [-40i64, -29, -15, -1, 1, 15] {
+                let mut text = filler(200_000, lines);
+                let at = (text.len() as i64 - SCRUB_OVERLAP as i64 + offset) as usize;
+                text.replace_range(at..at + LONG_SECRET.len(), LONG_SECRET);
+                let out = scrub_open_end(&text, scrubber);
+                assert_no_part(&out, &format!("offset {offset}"));
+                assert!(out.len() > 100_000);
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_secret_that_makes_the_text_longer_leaves_no_part_either() {
+        let mut text = format!("{SHORT_SECRET}\n").repeat(40_000);
+        text.push_str(&filler(1000, true));
+        text.push_str(&LONG_SECRET[..20]);
+        let out = scrub_open_end(&text, scrubber);
+        assert_no_part(&out, "grown");
+        assert!(
+            out.len() > text.len() - SCRUB_OVERLAP,
+            "scrubbed text is longer"
+        );
+    }
+
+    #[test]
+    fn the_start_of_a_last_part_keeps_no_part_of_a_secret_that_was_cut() {
+        for lines in [false, true] {
+            let mut text = LONG_SECRET[9..].to_owned();
+            text.push_str(&format!("{LONG_SECRET}\n").repeat(3000));
+            text.push_str(&filler(100_000, lines));
+            let out = scrub_open_start(&text, scrubber);
+            assert_no_part(&out, "the start");
+            assert!(out.len() > 90_000, "{}", out.len());
+        }
+    }
+
+    #[test]
+    fn a_text_shorter_than_the_margin_keeps_nothing_of_its_end() {
+        assert_eq!(scrub_open_end("short", scrubber), "");
+        assert_eq!(scrub_open_start("short", scrubber), "");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Whatever the secrets and the cut: random filler with secrets of both lengths at random
+        /// offsets, and a random cut that may fall inside one, never leaves an 8-byte part of one at
+        /// the end (the start) of what is kept. Filler holds only `x`, `y`, `z`, space and newline, so
+        /// an 8-byte window of a secret is not there by chance.
+        #[test]
+        fn no_part_of_a_secret_survives_a_cut_at_either_end(
+            len in 70_000usize..160_000,
+            places in proptest::collection::vec((0usize..160_000, proptest::bool::ANY), 0..400),
+            cut in 66_000usize..160_000,
+            lines in proptest::bool::ANY,
+        ) {
+            let mut text = filler(len, lines);
+            // On a 64-byte grid, one secret to a slot: no two overlap (a half-overwritten secret
+            // is not a secret, and would be left by any scrubber).
+            let mut used = std::collections::HashSet::new();
+            for (at, long) in places {
+                let at = at / 64 * 64;
+                let secret = if long { LONG_SECRET } else { SHORT_SECRET };
+                if used.insert(at) && at + secret.len() <= text.len() {
+                    text.replace_range(at..at + secret.len(), secret);
+                }
+            }
+            let at = cut.min(text.len());
+            assert_no_part(&scrub_open_end(&text[..at], scrubber), "end");
+            assert_no_part(&scrub_open_start(&text[text.len() - at..], scrubber), "start");
+        }
+    }
+
+    /// A host with no keeper but a scrubbing layer: the text is scrubbed before it is folded at
+    /// column 2,000, so a secret across the fold is replaced and not split into two lines.
+    #[tokio::test]
+    async fn keep_long_without_a_keeper_scrubs_before_it_folds() {
+        let sink: adam_runtime::DynEventSink =
+            std::sync::Arc::new(adam_runtime::CollectingSink::new());
+        let line = format!("{}{LONG_SECRET}{}\n", "a".repeat(1990), "b".repeat(3000));
+        let text = line.repeat(30);
+        let ctx = ToolCtx::detached("t", "c1", sink)
+            .with_kept(MAX_RUN_KEPT_BYTES, std::sync::Arc::default())
+            .with_scrub(|t| t.replace(LONG_SECRET, "[redacted]"));
+        let (_, kept) = keep_long(&ctx, &text).await;
+        let kept = kept.expect("kept in the state").text;
+        assert!(
+            !kept.contains("SeCrEt") && !kept.contains("ABCDEF-tail"),
+            "a part of the secret is in the kept text"
+        );
+        assert!(kept.replace('\n', "").contains("[redacted]"));
+    }
+
+    /// An id never has a `.` or a `/` in it, nor a NUL: it is a file name.
+    #[test]
+    fn an_id_with_a_dot_a_slash_or_a_nul_is_not_an_id() {
+        for bad in [
+            "o-../../../etc/pas",
+            "o-../../../etc/pa",
+            "o-./aaaaaaaaaaaaaa",
+            "o-.aaaaaaaaaaaaaaa",
+            "o-aaaaaaaaaaaaaaa/",
+            "o-\0aaaaaaaaaaaaaaa",
+            "o-aaaaaaaaaaaaaaa\0",
+        ] {
+            assert!(!is_output_id(bad), "{bad:?}");
+        }
     }
 
     #[test]

@@ -12,7 +12,10 @@
 //! * **Scrubbed before it is written.** [`FileKept::keep`](adam_llm_agent::KeptOutputs::keep) scrubs
 //!   the whole text with the process's [`Redactor`] and then cuts and folds it, so no secret it knows
 //!   is ever on the volume, and a secret is never split by a cut, a fold or a page boundary (the
-//!   pages are made from the scrubbed file). A secret registered **after** the keep is not in the
+//!   pages are made from the scrubbed file). A text that was cut by its producer (`omitted` not 0)
+//!   ends wherever the limit fell, perhaps in the first half of a secret, and the scrubbed length says
+//!   nothing about where a raw offset falls: its end is cut back by [`adam_llm_agent::scrub_open_end`]
+//!   (scrubbed whole and without its last 64 KiB; what the two agree on is kept). A secret registered **after** the keep is not in the
 //!   file's text, and the tools' `Redacting` layer scrubs every page on its way out: that layer,
 //!   not the file, is the read-time guarantee.
 //! * **Private, and no link is followed on either side.** The directories are opened one component
@@ -31,7 +34,10 @@
 //!   in this process (two workers on one volume can overshoot by one output each). Temporary files
 //!   left by a crash are removed when they are over ten minutes old.
 //! * **Removed with the run.** [`Janitor`](crate::Janitor) removes `outputs/<run>` when the run's
-//!   workspace goes, and the directories of runs that have no workspace any more.
+//!   workspace goes, and the directories of runs that have no workspace any more. It lists and removes
+//!   through the same no-link directory handles (`SlotDir::walk`, entries unlinked relative to a held
+//!   descriptor, a link unlinked and never followed), so a command that made `outputs` a link to the
+//!   workspaces makes the janitor remove nothing (and the log says "not removed", with no path).
 
 use std::io::{self, BufReader, Write as _};
 use std::path::Path;
@@ -86,6 +92,47 @@ fn walk_error(e: &WalkError) -> KeptError {
     }
 }
 
+/// Where `outputs` is.
+enum Place {
+    Dir(Dir),
+    Missing,
+    /// A link or a file is where the directory should be.
+    Hijacked,
+}
+
+/// Said when `outputs` is a link or a file: a command of the local environment can make it one.
+fn warn_hijacked() {
+    tracing::warn!(
+        "the place for kept output is not a directory of its own (a link or a file is where it \
+         should be): kept output not removed"
+    );
+}
+
+/// How deep a run's directory may nest before removing it is refused: nothing of ours does.
+const MAX_REMOVE_DEPTH: usize = 32;
+
+/// Remove what is in `dir`, below it only: a directory is opened without following a link and
+/// emptied first, a link or a file is unlinked.
+fn remove_contents(dir: &Dir, depth: usize) -> io::Result<()> {
+    if depth > MAX_REMOVE_DEPTH {
+        return Err(io::Error::other("kept output is nested too deep to remove"));
+    }
+    for (name, meta) in dir.entries()? {
+        if meta.is_dir() {
+            let inner = dir.open_dir(&name)?;
+            remove_contents(&inner, depth + 1)?;
+            dir.rmdir(&name)?;
+        } else {
+            dir.unlink(&name)?;
+        }
+    }
+    Ok(())
+}
+
+fn not_regular() -> KeptError {
+    KeptError::Refused("that output file is not usable (it is not a regular file)".to_owned())
+}
+
 /// `o-<16 hex>.txt`: a file this process makes.
 fn is_ours(name: &str) -> bool {
     name.strip_suffix(".txt").is_some_and(is_output_id)
@@ -116,20 +163,61 @@ impl FileKept {
         usable_run(run).then(|| self.root().join(run))
     }
 
-    /// Remove every output of `run`. Idempotent. A link in the way is removed, not followed.
+    /// Remove every output of `run`. Idempotent. A link in the way is removed, not followed, and
+    /// nothing is removed through one: the directories are opened one component at a time without
+    /// following a link, and the entries are removed relative to the directory held. When `outputs`
+    /// itself is not a directory of its own, nothing is removed and the log says so.
     ///
     /// # Errors
     ///
     /// I/O errors other than the directory not being there.
     pub async fn remove_run(&self, run: &str) -> io::Result<()> {
-        let Some(dir) = self.run_dir(run) else {
+        if !usable_run(run) {
             return Ok(());
+        }
+        let (this, run) = (self.clone(), run.to_owned());
+        let removed = tokio::task::spawn_blocking(move || this.remove_run_blocking(&run))
+            .await
+            .map_err(io::Error::other)??;
+        if !removed {
+            warn_hijacked();
+        }
+        Ok(())
+    }
+
+    /// `false` when `outputs` is not a directory of its own (nothing was removed).
+    fn remove_run_blocking(&self, run: &str) -> io::Result<bool> {
+        let outputs = match self.outputs_dir()? {
+            Place::Dir(outputs) => outputs,
+            Place::Missing => return Ok(true),
+            Place::Hijacked => return Ok(false),
         };
-        match tokio::fs::symlink_metadata(&dir).await {
-            Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&dir).await,
-            Ok(_) => tokio::fs::remove_file(&dir).await,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+        let name = std::ffi::OsStr::new(run);
+        match outputs.lstat(name) {
+            Ok(meta) if meta.is_dir() => {
+                let dir = outputs.open_dir(name)?;
+                remove_contents(&dir, 0)?;
+                outputs.rmdir(name)?;
+            }
+            Ok(_) => outputs.unlink(name)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(true)
+    }
+
+    /// The directory `outputs`, opened below the root without following a link.
+    fn outputs_dir(&self) -> io::Result<Place> {
+        let root = match SlotDir::open(&self.root) {
+            Ok(root) => root,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Place::Missing),
+            Err(e) => return Err(e),
+        };
+        match root.walk(Path::new("outputs"), false) {
+            Ok(dir) => Ok(Place::Dir(dir)),
+            Err(WalkError::Missing(_)) => Ok(Place::Missing),
+            Err(WalkError::Link(_) | WalkError::NotDirectory(_)) => Ok(Place::Hijacked),
+            Err(WalkError::Io(e)) => Err(e),
         }
     }
 
@@ -139,21 +227,29 @@ impl FileKept {
     ///
     /// I/O errors listing the directory.
     pub async fn runs(&self) -> io::Result<Vec<String>> {
-        let mut runs = Vec::new();
-        let mut entries = match tokio::fs::read_dir(self.root()).await {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(runs),
-            Err(e) => return Err(e),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().into_owned();
+        let this = self.clone();
+        let listed = tokio::task::spawn_blocking(move || -> io::Result<Option<Vec<String>>> {
+            let outputs = match this.outputs_dir()? {
+                Place::Dir(outputs) => outputs,
+                Place::Missing => return Ok(Some(Vec::new())),
+                Place::Hijacked => return Ok(None),
+            };
             // A link is listed too: it is removed, not followed, with its run.
-            if usable_run(&name) {
-                runs.push(name);
-            }
-        }
-        runs.sort();
-        Ok(runs)
+            let mut runs: Vec<String> = outputs
+                .entries()?
+                .into_iter()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| usable_run(name))
+                .collect();
+            runs.sort();
+            Ok(Some(runs))
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok(listed.unwrap_or_else(|| {
+            warn_hijacked();
+            Vec::new()
+        }))
     }
 
     /// The directory `outputs/<run>` below the root, one component at a time, no link followed.
@@ -192,7 +288,9 @@ impl FileKept {
     ) -> Result<KeptInfo, KeptError> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         // Scrubbed first, then cut and folded: a secret is never split by either.
-        let scrubbed = self.redactor.scrub(text);
+        let (scrubbed, omitted) = adam_llm_agent::scrubbed_for_keeping(text, omitted, |t| {
+            self.redactor.scrub(t).into_owned()
+        });
         let (prepared, cut) = prepare(&scrubbed, omitted);
         let _one_at_a_time = KEEP_LOCK
             .lock()
@@ -274,11 +372,16 @@ impl FileKept {
         let (file, _) = match dir.open_regular(std::ffi::OsStr::new(&name)) {
             Ok(opened) => opened,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(missing()),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(not_regular()),
             Err(e) => return Err(io_error(&e)),
         };
+        let meta = file.metadata().map_err(|e| io_error(&e))?;
+        if !meta.is_file() {
+            return Err(not_regular());
+        }
         // A hard link planted by a command: not ours.
         #[cfg(unix)]
-        if std::os::unix::fs::MetadataExt::nlink(&file.metadata().map_err(|e| io_error(&e))?) != 1 {
+        if std::os::unix::fs::MetadataExt::nlink(&meta) != 1 {
             return Err(KeptError::Refused(
                 "that output file is not usable (it has been linked)".to_owned(),
             ));
@@ -331,6 +434,7 @@ impl KeptOutputs for FileKept {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     const RUN: &str = "00000000-0000-4000-8000-000000000001";
 
@@ -571,6 +675,357 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(malformed, KeptError::Malformed(_)));
+    }
+
+    const SECRET: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"; // 40 bytes: 30 more than its mark
+    const CAPTURE: usize = adam_llm_agent::MAX_KEPT_BYTES + adam_llm_agent::SCRUB_OVERLAP;
+
+    /// No 8-byte window of the secret is in `text`.
+    fn assert_no_part(text: &str, what: &str) {
+        for w in SECRET.as_bytes().windows(8) {
+            let w = std::str::from_utf8(w).unwrap();
+            assert!(!text.contains(w), "{what}: `{w}` is left");
+        }
+    }
+
+    fn file_of(root: &Path, id: &str) -> PathBuf {
+        root.join("outputs").join(RUN).join(format!("{id}.txt"))
+    }
+
+    /// Nothing of the secret in the file, nor on any page of it.
+    async fn assert_clean(store: &FileKept, root: &Path, id: &str, what: &str) {
+        assert_no_part(&std::fs::read_to_string(file_of(root, id)).unwrap(), what);
+        let mut offset = 1;
+        loop {
+            let page = store.page(RUN, id, offset, 2000).await.unwrap();
+            assert_no_part(&page, what);
+            let last = page.rsplit_once('\n').map_or(page.as_str(), |(_, l)| l);
+            match last.split("offset=").nth(1) {
+                Some(next) => offset = next.trim_end_matches(']').parse().unwrap(),
+                None => return,
+            }
+        }
+    }
+
+    /// The file, and the first and the last page (a page reads the file from its start: not all of
+    /// a file of many thousand lines).
+    async fn assert_clean_ends(store: &FileKept, root: &Path, id: &str, what: &str) {
+        assert_no_part(&std::fs::read_to_string(file_of(root, id)).unwrap(), what);
+        for offset in [1, -30] {
+            assert_no_part(&store.page(RUN, id, offset, 2000).await.unwrap(), what);
+        }
+    }
+
+    /// 3,000 secrets in the first lines shrink the scrubbed text under the bound, so nothing is cut
+    /// at 16 MiB of it, and the first 20 characters of the secret end the capture: the first half
+    /// that scrubbing cannot recognise must not be kept.
+    #[tokio::test]
+    async fn the_prefix_of_a_secret_at_the_end_of_the_capture_is_not_kept_when_scrubbing_shrinks_the_text()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::new([SECRET]));
+        let id = id("c1");
+        let mut text = format!("{SECRET}\n").repeat(3000);
+        text.push_str(&"a".repeat(CAPTURE - 20 - text.len()));
+        text.push_str(&SECRET[..20]);
+        assert_eq!(text.len(), CAPTURE);
+        let info = store.keep(RUN, &id, &text, 1_000_000).await.unwrap();
+        assert!(info.cut);
+        assert_clean(&store, root.path(), &id, "the capture's end").await;
+    }
+
+    /// The same where the scrubbed text grows (a 4-character secret becomes 10), and where the
+    /// secret straddles the 16 MiB mark or the capture's end, with and without newlines about.
+    #[tokio::test]
+    async fn no_cut_leaves_a_part_of_a_secret_whatever_the_scrubbing_does_to_the_length() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::new([SECRET, "wxyz"]));
+        let id = id("c1");
+        let end = CAPTURE - 20;
+        let cut = adam_llm_agent::MAX_KEPT_BYTES - 10;
+        // (the scrubbed text grows, newlines about, where the secret starts)
+        for (grow, lines, at) in [
+            (false, false, cut),
+            (false, true, end),
+            (true, false, end),
+            (true, true, cut),
+        ] {
+            let mut text = if grow {
+                "wxyz".repeat(900_000)
+            } else {
+                format!("{SECRET}\n").repeat(3000)
+            };
+            let unit = if lines {
+                "ab cd ".repeat(33) + "\n"
+            } else {
+                "abcdef".to_owned()
+            };
+            let room = at - text.len();
+            text.push_str(&unit.repeat(room / unit.len() + 1)[..room]);
+            text.push_str(&SECRET[..(CAPTURE - at).min(SECRET.len())]);
+            text.push_str(&"b".repeat(CAPTURE.saturating_sub(text.len())));
+            store.keep(RUN, &id, &text, 5).await.unwrap();
+            assert_clean_ends(&store, root.path(), &id, &format!("{grow} {lines} {at}")).await;
+        }
+    }
+
+    /// A line over the fold's column holds a secret across it: the keeper scrubs before it folds,
+    /// even when nothing before it scrubbed.
+    #[tokio::test]
+    async fn the_keeper_scrubs_before_it_folds_on_its_own() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::new([SECRET]));
+        let id = id("c1");
+        let text = format!("{}{SECRET}{}\n", "a".repeat(1990), "b".repeat(3000));
+        store.keep(RUN, &id, &text, 0).await.unwrap();
+        assert_clean(&store, root.path(), &id, "the fold").await;
+    }
+
+    #[tokio::test]
+    async fn an_id_that_is_not_an_id_is_malformed_for_a_keep_and_a_read() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        for bad in [
+            "o-../../../etc/pa",
+            "o-../../../etc/pas",
+            "o-./aaaaaaaaaaaaaa",
+            "o-\0aaaaaaaaaaaaaaa",
+        ] {
+            assert!(matches!(
+                store.keep(RUN, bad, "x\n", 0).await,
+                Err(KeptError::Malformed(_))
+            ));
+            assert!(matches!(
+                store.page(RUN, bad, 1, 10).await,
+                Err(KeptError::Malformed(_))
+            ));
+        }
+        assert!(!root.path().join("outputs").exists());
+    }
+
+    /// A command plants a hard link to a file of its own at every temporary name the next keep could
+    /// use: the keep refuses (the name is taken), and writes through none of them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_file_at_the_temporary_name_is_refused_and_never_written() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        let id = id("c1");
+        keep(&store, RUN, &id, "first\n").await.unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+        let dir = root.path().join("outputs").join(RUN);
+        let pid = std::process::id();
+        for n in 0..5000 {
+            std::fs::hard_link(&victim, dir.join(format!(".{id}.{pid}.{n}.tmp"))).unwrap();
+        }
+        let refused = keep(&store, RUN, &id, "second\n").await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert_eq!(
+            store.page(RUN, &id, 1, 10).await.unwrap(),
+            "first\n[end: 1 lines]"
+        );
+    }
+
+    /// `outputs` is swapped for a link between a keep and a read: the read refuses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_planted_for_outputs_between_a_keep_and_a_read_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        let id = id("c1");
+        keep(&store, RUN, &id, "kept\n").await.unwrap();
+        let real = root.path().join("elsewhere");
+        std::fs::rename(root.path().join("outputs"), &real).unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("outputs")).unwrap();
+        let refused = store.page(RUN, &id, 1, 10).await.unwrap_err();
+        assert!(matches!(refused, KeptError::Refused(_)), "{refused:?}");
+    }
+
+    /// A FIFO or a directory where the file should be is refused, and the read returns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pipe_or_a_directory_at_the_files_name_is_refused_and_does_not_block() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        keep(&store, RUN, &id("a"), "x\n").await.unwrap();
+        let (fifo, dir) = (id("fifo"), id("dir"));
+        let made = std::process::Command::new("mkfifo")
+            .arg(file_of(root.path(), &fifo))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        std::fs::create_dir(file_of(root.path(), &dir)).unwrap();
+        for bad in [fifo, dir] {
+            let read = tokio::time::timeout(Duration::from_secs(10), store.page(RUN, &bad, 1, 10))
+                .await
+                .expect("the read returns");
+            assert!(matches!(read, Err(KeptError::Refused(_))), "{read:?}");
+        }
+    }
+
+    /// Many keeps at once near the run's bound: the check and the write are one step, so what is
+    /// kept never passes the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_keeps_never_pass_the_runs_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        let text = Arc::new(("x".repeat(99) + "\n").repeat(95_000)); // about 9 MiB
+        let start = Arc::new(tokio::sync::Barrier::new(12));
+        let mut tasks = Vec::new();
+        for n in 0..12 {
+            let (store, text, start) = (store.clone(), text.clone(), start.clone());
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                store.keep(RUN, &id(&format!("call-{n}")), &text, 0).await
+            }));
+        }
+        let mut kept = 0;
+        for task in tasks {
+            kept += usize::from(task.await.unwrap().is_ok());
+        }
+        let total: u64 = std::fs::read_dir(root.path().join("outputs").join(RUN))
+            .unwrap()
+            .flatten()
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(total <= RUN_KEPT_MAX, "{total} bytes kept by {kept}");
+        assert!((1..12).contains(&kept), "{kept}");
+    }
+
+    /// The check of the bound and the write are one step: a keep waits while another holds the lock.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // holding it across the wait is the test
+    async fn a_keep_waits_for_the_lock_that_makes_the_check_and_the_write_one_step() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        let held = KEEP_LOCK.lock().unwrap();
+        let task = {
+            let store = store.clone();
+            tokio::spawn(async move { store.keep(RUN, &id("a"), "x\n", 0).await })
+        };
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!task.is_finished(), "the keep did not wait for the lock");
+        drop(held);
+        task.await.unwrap().unwrap();
+    }
+
+    /// A temporary file a crash left is removed by the next keep when it is old, and left when it is
+    /// fresh (a keep in another worker may be writing it).
+    #[tokio::test]
+    async fn an_old_temporary_file_is_removed_by_a_keep_and_a_fresh_one_is_left() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        keep(&store, RUN, &id("a"), "x\n").await.unwrap();
+        let dir = root.path().join("outputs").join(RUN);
+        let (old, fresh) = (
+            dir.join(".o-0123456789abcdef.1.1.tmp"),
+            dir.join(".o-0123456789abcdee.1.2.tmp"),
+        );
+        for path in [&old, &fresh] {
+            std::fs::write(path, "left\n").unwrap();
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_TMP - Duration::from_secs(60))
+            .unwrap();
+        keep(&store, RUN, &id("b"), "y\n").await.unwrap();
+        assert!(!old.exists(), "an old temporary file stays");
+        assert!(fresh.exists(), "a fresh one is removed");
+    }
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    fn capture_logs() -> (Sink, tracing::subscriber::DefaultGuard) {
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        (sink, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn logged(sink: &Sink) -> String {
+        String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned()
+    }
+
+    /// `outputs` is a link to the workspaces: the janitor lists and removes nothing there, and says
+    /// so without a path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_janitor_does_not_follow_a_link_for_outputs() {
+        let (sink, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("workspaces").join(RUN);
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("work.txt"), "a scratch project\n").unwrap();
+        std::os::unix::fs::symlink(root.path().join("workspaces"), root.path().join("outputs"))
+            .unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        assert!(store.runs().await.unwrap().is_empty());
+        store.remove_run(RUN).await.unwrap();
+        assert!(
+            victim.join("work.txt").exists(),
+            "the workspace was removed"
+        );
+        let log = logged(&sink);
+        assert!(log.contains("not removed"), "{log}");
+        assert!(!log.contains(root.path().to_str().unwrap()), "{log}");
+    }
+
+    /// `outputs/<run>` is a link, and a run's directory holds a link: each is unlinked, and what it
+    /// leads to is untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_janitor_unlinks_a_link_and_never_follows_it() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("keep.txt"), "mine\n").unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        let other = "00000000-0000-4000-8000-000000000002";
+        std::fs::create_dir_all(root.path().join("outputs")).unwrap();
+
+        // `outputs/<run>` is a link.
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("outputs").join(RUN))
+            .unwrap();
+        assert_eq!(store.runs().await.unwrap(), vec![RUN.to_owned()]);
+        store.remove_run(RUN).await.unwrap();
+        assert!(!root.path().join("outputs").join(RUN).exists());
+        assert!(elsewhere.path().join("keep.txt").exists());
+
+        // A link inside a run's directory, and a directory inside it.
+        keep(&store, other, &adam_llm_agent::output_id(other, "c"), "x\n")
+            .await
+            .unwrap();
+        let dir = root.path().join("outputs").join(other);
+        std::os::unix::fs::symlink(elsewhere.path(), dir.join("link")).unwrap();
+        std::fs::create_dir_all(dir.join("sub").join("deeper")).unwrap();
+        std::fs::write(dir.join("sub").join("deeper").join("f"), "f\n").unwrap();
+        store.remove_run(other).await.unwrap();
+        assert!(!dir.exists());
+        assert!(elsewhere.path().join("keep.txt").exists());
     }
 
     #[tokio::test]

@@ -370,7 +370,19 @@ async fn keep_overflow(ctx: &ToolCtx, mut output: ToolOutput) -> ToolOutput {
         output.content = cap_text(output.content, MAX_RESULT_BYTES);
         return output;
     }
-    let (shown, kept) = adam_llm_agent::keep_long(ctx, &output.content).await;
+    // Over what is kept: the keeper is given the first part, with the count of what is left out, and
+    // cuts its end back where no secret it knows straddles it (the end is not a place to trust).
+    let limit = MAX_KEPT_BYTES + adam_llm_agent::SCRUB_OVERLAP;
+    let (shown, kept) = if output.content.len() > limit {
+        let mut end = limit;
+        while !output.content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let omitted = (output.content.len() - end) as u64;
+        adam_llm_agent::keep_long_cut(ctx, &output.content[..end], omitted).await
+    } else {
+        adam_llm_agent::keep_long(ctx, &output.content).await
+    };
     output.content = shown;
     output.kept = kept;
     output
@@ -389,10 +401,9 @@ fn kind(value: &Value) -> &'static str {
 
 /// A server's answer as text for the model: the blocks joined by newlines, scrubbed of what
 /// `redactor` knows (a server that echoes a credential it was given must not hand it to the model
-/// and the journal), then cut at [`MAX_KEPT_BYTES`] (a text over [`MAX_RESULT_BYTES`] is kept and
-/// paged by the caller, [`keep_overflow`]); an error result when the server says
-/// `isError`. Scrubbing comes first, so that a cut cannot leave the first half of a value that
-/// the redactor would no longer recognise.
+/// and the journal), and **not cut** (a text over [`MAX_RESULT_BYTES`] is kept and paged by the
+/// caller, [`keep_overflow`], which cuts it at [`MAX_KEPT_BYTES`] and tells the keeper that it did);
+/// an error result when the server says `isError`.
 ///
 /// With `files` (the tool's name on a server with `files: true`), each image, audio clip and blob
 /// becomes a file artifact of the result and its block one line, [`Artifact::shared_line`] (see
@@ -424,12 +435,8 @@ pub(crate) fn map_result(
     } else {
         "(the tool returned no content)".to_owned()
     };
-    // Scrubbed whole, and cut a little past what is kept: the keeper scrubs with secrets of its own
-    // and cuts after, so a secret at the cut is never left in part.
-    let text = cap_text(
-        redactor.scrub(&text),
-        MAX_KEPT_BYTES + adam_llm_agent::SCRUB_OVERLAP,
-    );
+    // Scrubbed whole, before any cut.
+    let text = redactor.scrub(&text);
     let (artifacts, refused) = sharing.map_or((Vec::new(), false), |s| s.files.into_parts());
     let mut output = if result.is_error == Some(true) || refused {
         ToolOutput::error(text)
@@ -1111,6 +1118,48 @@ mod tests {
         let kept = output.kept.unwrap();
         assert!(!kept.text.contains("6d2f") && kept.text.contains("[REDACTED]"));
         assert!(!output.content.contains("6d2f"));
+    }
+
+    /// A secret of the keeper's only: 6,000 whole ones early make the keeper's scrubbed text shorter
+    /// than the bound, and the first half of one ends the part of the result that is kept (the
+    /// result goes on). Cutting the scrubbed text at its length finds nothing to cut.
+    #[tokio::test]
+    async fn the_first_half_of_a_keepers_secret_at_the_cut_of_a_huge_result_is_not_kept() {
+        use adam_llm_agent::{KeptStore, MAX_KEPT_BYTES, MemoryKept, SCRUB_OVERLAP};
+        let secret = "tok-coder-secret-123456";
+        let limit = MAX_KEPT_BYTES + SCRUB_OVERLAP;
+        let mut text = format!("{secret}\n").repeat(6000);
+        text.push_str(&"a".repeat(limit - 12 - text.len()));
+        text.push_str(secret); // 12 bytes before the limit, 11 after
+        text.push_str(&"b".repeat(5000));
+        let output = map_result(
+            &CallToolResult::success(vec![ContentBlock::text(text)]),
+            &Redactor::default(),
+            None,
+        );
+        let store = Arc::new(KeptStore(Arc::new(
+            MemoryKept::new().scrubbing(move |t| t.replace(secret, "[redacted]")),
+        )));
+        let ctx = ctx().with_state(store.clone());
+        let output = keep_overflow(&ctx, output).await;
+        assert!(output.content.contains("only the first"), "cut is said");
+        let id = adam_llm_agent::output_id_of(&ctx);
+        let run = ctx.root_run_id().to_string();
+        let mut offset = 1;
+        loop {
+            let page = store.0.page(&run, &id, offset, 2000).await.unwrap();
+            for w in secret.as_bytes().windows(8) {
+                let w = std::str::from_utf8(w).unwrap();
+                assert!(!page.contains(w), "`{w}` is kept");
+            }
+            match page
+                .rsplit_once('\n')
+                .and_then(|(_, last)| last.split("offset=").nth(1))
+            {
+                Some(next) => offset = next.trim_end_matches(']').parse().unwrap(),
+                None => break,
+            }
+        }
     }
 
     #[test]

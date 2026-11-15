@@ -382,7 +382,9 @@ async fn a_secret_across_the_16_mib_cut_is_not_left_in_part() {
                 !text.contains("ghp_") && !text.contains("FAKEtoken"),
                 "a part of the secret is kept"
             );
-            assert!(text.contains("[redacted]"));
+            // The secret straddles the margin the keeper cuts back (the capture less 64 KiB): the
+            // text ends before it, and it is neither kept whole nor in part.
+            assert!(text.contains("(output cut: only the first"));
         }
     }
 }
@@ -416,6 +418,111 @@ async fn an_output_over_the_bound_says_so_and_its_tail_shows_no_part_of_a_secret
     );
     let last = rig.read_wrapped(&id, -2).await.content;
     assert!(last.contains("(output cut: only the first 1677"), "{last}");
+}
+
+/// No 8-byte window of the GitHub token is in `text`.
+fn assert_no_part(text: &str, what: &str) {
+    for w in GITHUB_TOKEN.as_bytes().windows(8) {
+        let w = std::str::from_utf8(w).unwrap();
+        assert!(!text.contains(w), "{what}: `{w}` is left");
+    }
+}
+
+/// The first 20 characters of a secret end the capture (16 MiB and 64 KiB) after thousands of whole
+/// secrets that shrink the scrubbed text under the 16 MiB bound: nothing is cut at 16 MiB of it, and
+/// the half of a secret at the capture's end must still not be kept. From a real command, with the
+/// file's own bytes read from the disk and every page read as the tool gives it.
+#[tokio::test]
+async fn the_first_half_of_a_secret_at_the_end_of_the_capture_is_not_kept_when_scrubbing_shrinks_the_text()
+ {
+    let rig = Rig::new().await;
+    let capture = adam_llm_agent::MAX_KEPT_BYTES + adam_llm_agent::SCRUB_OVERLAP;
+    let fill = capture - 20 - 3000 * (GITHUB_TOKEN.len() + 1);
+    let command = format!(
+        "yes '{GITHUB_TOKEN}' | head -n 3000; head -c {fill} /dev/zero | tr '\\0' a; \
+         printf %s '{}'; head -c 100000 /dev/zero | tr '\\0' b",
+        &GITHUB_TOKEN[..20]
+    );
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(
+        out.content.contains("only the first"),
+        "{}",
+        &out.content[..400]
+    );
+    // (The echo of the command, above the output, holds the part of the token it prints.)
+    let shown = out.content.split_once("--- output").unwrap().1;
+    assert_no_part(shown, "the view");
+    let id = id_of(&out.content);
+    let mut offset = 1;
+    loop {
+        let page = rig.read(&id, offset).await.content;
+        assert_no_part(&page, "a page");
+        match page
+            .rsplit_once('\n')
+            .and_then(|(_, last)| last.split("offset=").nth(1))
+        {
+            Some(next) => offset = next.trim_end_matches(']').parse().unwrap(),
+            None => break,
+        }
+    }
+    for file in files_under(&rig.fx.root) {
+        if file.extension().is_some_and(|e| e == "txt") {
+            let text = String::from_utf8_lossy(&std::fs::read(&file).unwrap()).into_owned();
+            assert_no_part(&text, "the file");
+            assert!(text.contains("[redacted]"));
+        }
+    }
+}
+
+/// What the model is shown, from `settle` alone (no `Redacting` layer around the tool): a secret
+/// across the end of the head (byte 4096) or the start of the tail (12 KiB from the end), with no
+/// newline near, is not in the view in part.
+#[tokio::test]
+async fn a_secret_across_the_head_or_the_tail_of_the_view_is_not_shown_in_part() {
+    let rig = Rig::new().await;
+    for command in [
+        // The head is 4 KiB: the token starts at 4,080.
+        format!(
+            "head -c 4080 /dev/zero | tr '\\0' a; printf %s '{GITHUB_TOKEN}'; head -c 26000 /dev/zero | tr '\\0' b"
+        ),
+        // The tail is 12 KiB: the token starts 10 bytes before it.
+        format!(
+            "head -c 20000 /dev/zero | tr '\\0' a; printf %s '{GITHUB_TOKEN}'; head -c 12259 /dev/zero | tr '\\0' b"
+        ),
+    ] {
+        let out = RunCommand
+            .call(&rig.ctx, json!({"command": command}))
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("kept as o-"),
+            "{}",
+            &out.content[..300]
+        );
+        assert_no_part(&out.content, "the view");
+    }
+}
+
+/// The shell tracks the tail of an output that outgrew its capture with a lead-in before it, and the
+/// lead-in starts wherever the buffer ended. A lead-in of whole secrets scrubs to less than the tail
+/// that is shown, so the first, cut, secret would be the start of the tail.
+#[tokio::test]
+async fn the_tracked_tail_of_a_long_output_does_not_start_in_part_of_a_secret() {
+    let rig = Rig::with(|s| s.check_output_tail = 100_000).await;
+    let command = format!(
+        "head -c 16900000 /dev/zero | tr '\\0' a; yes '{GITHUB_TOKEN}' | tr -d '\\n' | head -c {}",
+        GITHUB_TOKEN.len() * 4300
+    );
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(out.content.contains("about "), "{}", &out.content[..300]);
+    assert!(out.content.contains("[redacted]"), "the tail is shown");
+    assert_no_part(&out.content, "the tail");
 }
 
 async fn tools_call(rig: &Rig, name: &str, args: Value) -> ToolOutput {

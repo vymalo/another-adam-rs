@@ -297,7 +297,12 @@ impl Endpoint {
         let _ = service.close_with_timeout(CLOSE_GRACE).await;
         match called {
             Ok(Ok(CallToolResponse::Complete(result))) => {
-                let output = map_result(&result, &self.recipe.redactor, None);
+                let mut output = map_result(&result, &self.recipe.redactor, None);
+                // Nothing keeps this text: it is cut a little past what a keeper would keep.
+                output.content = cap_text(
+                    output.content,
+                    adam_llm_agent::MAX_KEPT_BYTES + adam_llm_agent::SCRUB_OVERLAP,
+                );
                 let structured = result.structured_content.clone().map(|mut v| {
                     scrub_value(&self.recipe.redactor, &mut v);
                     v

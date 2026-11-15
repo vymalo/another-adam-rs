@@ -1112,8 +1112,9 @@ sequenceDiagram
     participant R as read_output
     M->>L: call run_command
     L->>T: journaled step tool:CALL_ID
-    Note over T: the output is captured from the pipes (the first 16 MiB, and the tail)
-    T->>K: keep(run, id, scrubbed whole output)
+    Note over T: the output is captured from the pipes (the first 16 MiB and 64 KiB, and the tail)
+    Note over K: scrubbed, a cut capture's end cut back at a place no secret straddles
+    T->>K: keep(run, id, the captured output, omitted)
     K-->>T: lines kept
     T-->>L: head, tail, output id
     L-->>M: the result (journaled: the same bytes on a replay)

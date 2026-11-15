@@ -169,8 +169,9 @@ pub use history::TRUNCATION_MARKER_PREFIX;
 pub use kept::{
     KeptError, KeptInfo, KeptMap, KeptOutput, KeptOutputs, KeptStore, MAX_KEPT_BYTES,
     MAX_RUN_KEPT_BYTES, MemoryKept, READ_OUTPUT, ReadOutput, SCRUB_OVERLAP, call_key, count_lines,
-    is_output_id, keep_long, kept_header, kept_outputs_conformance, kept_view, output_id,
-    output_id_of, page_of, prepare, unkept_view,
+    is_output_id, keep_long, keep_long_cut, kept_header, kept_outputs_conformance, kept_view,
+    output_id, output_id_of, page_of, prepare, scrub_open_end, scrub_open_start,
+    scrubbed_for_keeping, unkept_view,
 };
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 #[cfg(feature = "schema")]

@@ -36,9 +36,9 @@ const PIPE_GRACE: Duration = Duration::from_secs(2);
 /// beyond them is still tracked for the view.
 pub const KEPT_OUTPUT_MAX: usize = 16 * 1024 * 1024;
 
-/// What is captured beyond [`KEPT_OUTPUT_MAX`], and kept before the tail the model is shown: a secret
-/// that straddles either edge is whole inside the captured text, so scrubbing finds it before the
-/// text is cut. (No secret is longer.)
+/// What is captured beyond [`KEPT_OUTPUT_MAX`], and kept before the tail the model is shown: the
+/// margin that `adam_llm_agent::scrub_open_end` and `scrub_open_start` cut back at the edge of a
+/// capture, so that no part of a secret that the edge cut is kept. (No secret is longer.)
 pub const SCRUB_OVERLAP: usize = adam_llm_agent::SCRUB_OVERLAP;
 
 /// A command's output that was kept for `read_output`, or that could not be.
