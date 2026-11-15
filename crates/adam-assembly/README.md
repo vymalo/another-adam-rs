@@ -58,7 +58,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
-| `SkillError` | why `load_skill` or `read_skill_file` refused a call: closed enum, its `Display` is the tool result the model reads |
+| `SkillError` | why `load_skill` or `read_skill_file` refused a call: closed enum, its `Display` is the tool result the model reads (`Window` is a bad `offset` or `limit`, or an offset past the end: a new variant, so a `match` on it breaks) |
 | `BoundDef` | `state(Arc<T>)`, `tool_source(source)` (a `ToolSource` of `adam-llm-agent` for every agent: tools it learns about while it runs, offered at every model turn after the agent's own; `tools:` does not narrow it), `model_aliases(..)`, `wait_poll(Duration)` (how often a waiting agent looks: a remote subagent's task is polled at this interval), `scrub(f)` (a function that scrubs secrets out of what the five session tools give the model, which `bind` makes itself and a deployment's own tool wrapper never sees: the coder gives its redactor), `scrub_longest(f)` (the length of the longest value it replaces, for `ToolCtx::scrub_margin`, as the coder's own wrapper passes it; a report is a child's text scrubbed whole, never a cut one, so no open edge applies), `step_io(StepIo)` (how every agent's tool-call steps report their input and output, and what is scrubbed from them first: `LlmAgentBuilder::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)), `model(DynModel, alias)` |
 | `adam_llm_agent::ReadOutput` | **added by `bind` to every agent whose tools include an MCP tool** (unless its tool list already holds `read_output`, as the coder's does), after the tools it selected: a long MCP result is kept and the model reads the rest with `read_output { id, offset?, limit? }` (an agent that is only a folder keeps it in the run's state, 4 MiB; see [`adam-mcp`](../adam-mcp/README.md)). An agent with no MCP tool among its tools does not get it |
 | `SubagentTool` | the tool that runs a subagent as a child run: `new(tool_name, agent, description)`, `agent()`. `bind` adds one per local subagent, so a user never builds one. Its call is a `subagent` step drawn as an agent (`Tool::step_style`), as is a remote subagent's, **labelled with the tool's name as a person reads it** (`explorer` is "Explorer", `code_reviewer` is "Code reviewer"). `load_skill` and `read_skill_file` are "Load a skill" and "Read a skill file" |
@@ -196,7 +196,7 @@ Files a skill bundles are listed under <skill_resources> when it is loaded; read
 The third line is there only when a selected skill bundles a file. A description is collapsed to one line
 and `&`, `<`, `>` are escaped. Skills that are preloaded are not listed.
 
-**Tier 2, `load_skill { name }`.** `name` is an enum of the skills left to load. It returns
+**Tier 2, `load_skill { name, offset?, limit? }`.** `name` is a string, never an enum: the description and schema of the tool are the same whatever skills exist (an unknown name is answered with the list of those that do). It pages like `read_file`: at most 2,000 lines or 50 KiB a page, `offset` from 1 (negative from the end), and every result ends with the line that says where the next page starts, `[more: N lines left; next page: offset=K]` or `[end: N lines]`. The text it pages is
 
 ```text
 <skill_content name="release-notes">
@@ -210,13 +210,13 @@ Relative paths in this skill are relative to the skill's directory.
 </skill_content>
 ```
 
-(the last two blocks only for a skill with files; the list is sorted, and lists files without reading them).
+(the last two blocks only for a skill with files; the list is sorted, and lists files without reading them, and comes with the last page of a body that goes on; the first page of such a body names the files in one line before its paging line). A line of the body that starts with `[` is shown with `\x5b`, so that only the last line of a page starts with `[`.
 
-**Tier 3, `read_skill_file { skill, path }`.** `skill` is an enum of the skills that bundle a file. The
+**Tier 3, `read_skill_file { skill, path, offset?, limit? }`.** `skill` is a string (no enum). The
 path is normalised (a leading `./` is dropped) and refused when it is empty, absolute (`/x`, `\x`, `C:`), has
 a `..` component, a backslash or a control character. What passes is looked up by exact match in the
 skill's list of files, so nothing outside the list is reachable and there is no file system access at run
-time. A **text** file (UTF-8, no NUL byte) is returned as it is (an empty one as `(the file is empty)`); a
+time. A **text** file (UTF-8, no NUL byte) is paged like a body (an empty one is `(the file is empty)` and `[end: 0 lines]`); a
 **binary** file is refused with its size. A skill bundles at most 1 MiB (`SKILL_RESOURCE_LIMIT`, checked by
 the build script and again when the bytes are loaded), which bounds any result.
 
@@ -226,7 +226,7 @@ skill gets the same answer as a made-up one.
 
 **`preload_skills: [a]`** puts `<skill_content name="a">` in the prompt after the catalog, under the line
 "The following skills are already loaded. ...", instead of leaving it to `load_skill`. A preloaded skill
-must be selected by `skills:`; it leaves the catalog and the `load_skill` enum (asking for it says it is
+must be selected by `skills:`; it leaves the catalog (asking for it says it is
 already in the instructions), and its files stay readable. With every skill preloaded there is no
 `load_skill`, and with no skill bundling a file there is no `read_skill_file`.
 
