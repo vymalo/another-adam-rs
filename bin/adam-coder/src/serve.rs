@@ -386,7 +386,10 @@ pub async fn serve(
     .inbound(adam_a2a_runtime::vymalo_inbound)
     // The card lists `access-tier/v1` with all four tiers: the backend reads the tier a message
     // names, refuses a bad one and says the tier a task works under.
-    .access_tiers(crate::tier::honoured_up_to(config.max_access_tier));
+    .access_tiers(crate::tier::honoured_up_to(config.max_access_tier))
+    // The card lists the commands of the files (`commands/v1`); the backend expands a message
+    // that names one before it is stored.
+    .commands(files.commands());
     // The card of the files this process runs, like the workers' agent.
     let card = match &config.service.public_url {
         Some(public_url) => Some(

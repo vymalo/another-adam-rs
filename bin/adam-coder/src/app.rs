@@ -64,7 +64,8 @@ impl Coder {
         Self::from_service(
             Service::new_with(builder, AGENT_NAME, options, live)
                 .with_inbound(screen_inbound())
-                .with_access_tiers(Some(tiers)),
+                .with_access_tiers(Some(tiers))
+                .with_commands(Some(crate::files::embedded_commands())),
         )
     }
 
@@ -98,7 +99,8 @@ impl Coder {
         Self::from_service(
             Service::new_with(builder, AGENT_NAME, options, live)
                 .with_inbound(screen_inbound())
-                .with_access_tiers(Some(crate::tier::honoured_up_to(max))),
+                .with_access_tiers(Some(crate::tier::honoured_up_to(max)))
+                .with_commands(Some(crate::files::embedded_commands())),
         )
     }
 

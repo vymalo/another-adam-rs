@@ -35,6 +35,19 @@ pub enum AgentFiles {
     Folder(Box<AgentFolder>),
 }
 
+/// The commands of the embedded copy.
+pub(crate) fn embedded_commands() -> adam_a2a_runtime::Commands {
+    adam_a2a_runtime::Commands::new(AGENT.commands.iter().map(|c| (c.name, c.template)))
+}
+
+fn commands_of(commands: &[adam::agent_fs::Command]) -> adam_a2a_runtime::Commands {
+    adam_a2a_runtime::Commands::new(
+        commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.template.as_str())),
+    )
+}
+
 /// Why the agent files cannot be used. Always [`ErrorClass::Invalid`]: the same folder never
 /// works, so a supervisor must not restart the process (exit code 78).
 #[derive(Debug, thiserror::Error)]
@@ -171,6 +184,15 @@ impl AgentFiles {
         }
     }
 
+    /// The commands these files serve (`commands/`), as the backend expands them: the templates
+    /// of the folder's, or of the embedded copy. The card lists the same ones.
+    pub fn commands(&self) -> adam_a2a_runtime::Commands {
+        match self {
+            Self::Embedded => embedded_commands(),
+            Self::Folder(folder) => commands_of(&folder.def.manifest().commands),
+        }
+    }
+
     /// What a load warned about (always empty for the embedded copy, which the build checked
     /// strictly).
     pub fn warnings(&self) -> &[Diagnostic] {
@@ -241,6 +263,33 @@ mod tests {
         assert!(info.digest.starts_with("sha256:"), "{}", info.digest);
         assert!(files.warnings().is_empty());
         assert_eq!(files.def().unwrap().name(), AGENT_NAME);
+    }
+
+    /// The coder's three commands parse, are listed by name, and expand with what the person
+    /// typed after the name (`commands/v1`).
+    #[test]
+    fn the_coders_three_commands_parse_and_expand() {
+        let commands = AgentFiles::Embedded.commands();
+        for name in ["explain", "fix-checks", "review"] {
+            assert!(commands.contains(name), "{name}");
+            let text = commands.expand(name, "acme/widgets 12").unwrap();
+            assert!(text.contains("acme/widgets 12"), "{name}: {text}");
+        }
+        assert!(!commands.contains("deploy"));
+        let manifest = AgentFiles::Embedded.def().unwrap().manifest().clone();
+        let described: Vec<_> = manifest
+            .commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.argument_hint.is_some()))
+            .collect();
+        assert_eq!(
+            described,
+            [("explain", true), ("fix-checks", true), ("review", true)]
+        );
+        // The folder on disk gives the same commands as the embedded copy.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/agent");
+        let folder = AgentFiles::load(Some(Path::new(dir))).unwrap();
+        assert_eq!(folder.commands(), commands);
     }
 
     /// The shipped `agent/` read from disk is the embedded copy: the same digest.

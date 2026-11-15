@@ -60,6 +60,30 @@
   ],
   "extensions": [
     {
+      "uri": "https://agents.vymalo.com/a2a/extensions/commands/v1",
+      "description": "Serves prompt templates a message can invoke by name.",
+      "required": false,
+      "params": {
+        "commands": [
+          {
+            "name": "explain",
+            "description": "Explain a file, a function or a change in plain words, with no edits.",
+            "argumentHint": "<repository> <file, function or change>"
+          },
+          {
+            "name": "fix-checks",
+            "description": "Make the failing checks of a pull request pass.",
+            "argumentHint": "<pull request URL or repository and number>"
+          },
+          {
+            "name": "review",
+            "description": "Review the open pull request of a repository you name, and say what to change.",
+            "argumentHint": "<repository> [pull request number]"
+          }
+        ]
+      }
+    },
+    {
       "uri": "https://a2ui.org/a2a-extension/a2ui/v0.9.1",
       "description": "Draws A2UI surfaces; takes the screen's catalog inline",
       "required": false,

@@ -188,3 +188,26 @@ fn digest_unchanged_without_commands() {
     ]);
     assert_ne!(digest_of(dir.path()), without);
 }
+
+#[test]
+fn each_agent_of_a_package_has_its_own_commands() {
+    let dir = write(&[
+        (
+            "agents/a/instructions.md",
+            "---\nname: a\n---\nYou are a.\n",
+        ),
+        (
+            "agents/b/instructions.md",
+            "---\nname: b\n---\nYou are b.\n",
+        ),
+        (
+            "agents/a/commands/one.md",
+            "---\ndescription: d\n---\nGo.\n",
+        ),
+    ]);
+    let report = Dir::new(dir.path()).load().unwrap();
+    assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+    let agents = &report.package.agents;
+    assert_eq!(agents[0].commands.len(), 1);
+    assert!(agents[1].commands.is_empty());
+}
