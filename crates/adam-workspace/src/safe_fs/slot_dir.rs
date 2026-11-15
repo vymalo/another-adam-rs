@@ -248,6 +248,22 @@ impl Dir {
     ///
     /// The errors of `openat`, `getdents` and `lstat`.
     pub fn entries(&self) -> io::Result<Vec<(OsString, Meta)>> {
+        self.read_entries(usize::MAX).map(|(entries, _)| entries)
+    }
+
+    /// Like [`entries`](Self::entries), but stops reading after `max + 1` entries: the first
+    /// `max` that the directory yields (sorted by name among themselves, which are not
+    /// necessarily the `max` smallest names of the directory) and whether there were more. A
+    /// directory of a million names costs `max + 1` `lstat`s, not a million.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `openat`, `getdents` and `lstat`.
+    pub fn entries_capped(&self, max: usize) -> io::Result<(Vec<(OsString, Meta)>, bool)> {
+        self.read_entries(max)
+    }
+
+    fn read_entries(&self, max: usize) -> io::Result<(Vec<(OsString, Meta)>, bool)> {
         let fd = rustix::fs::openat(
             &self.fd,
             ".",
@@ -255,11 +271,16 @@ impl Dir {
             Mode::empty(),
         )?;
         let mut out = Vec::new();
+        let mut more = false;
         for entry in rustix::fs::Dir::read_from(&fd)? {
             let entry = entry?;
             let name = entry.file_name().to_bytes();
             if name == b"." || name == b".." {
                 continue;
+            }
+            if out.len() >= max {
+                more = true;
+                break;
             }
             let name = OsString::from_vec(name.to_vec());
             match self.lstat(&name) {
@@ -269,7 +290,7 @@ impl Dir {
             }
         }
         out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        Ok(out)
+        Ok((out, more))
     }
 
     /// The directory `name` of this one, opened as [`open_dir`](Self::open_dir) does, with the
@@ -1441,6 +1462,25 @@ mod tests {
         let below: Vec<_> = sub.entries().unwrap().into_iter().map(|e| e.0).collect();
         assert_eq!(below, [OsString::from("b.txt"), OsString::from("deep")]);
         assert_eq!(held.entries().unwrap(), entries);
+    }
+
+    #[test]
+    fn a_capped_listing_stops_reading_and_says_there_was_more() {
+        let tmp = slot();
+        for n in 0..10 {
+            std::fs::write(tmp.path().join(format!("slot/f{n}")), "").unwrap();
+        }
+        let held = open(&tmp, Backend::detect());
+        let total = held.entries().unwrap().len();
+        assert_eq!(total, 15);
+        let (cut, more) = held.entries_capped(4).unwrap();
+        assert_eq!(cut.len(), 4);
+        assert!(more);
+        assert!(cut.windows(2).all(|w| w[0].0 < w[1].0), "sorted");
+        let (all, more) = held.entries_capped(total).unwrap();
+        assert_eq!(all.len(), total);
+        assert!(!more, "exactly the cap is not more");
+        assert_eq!(all, held.entries().unwrap());
     }
 
     #[test]
