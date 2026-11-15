@@ -301,12 +301,27 @@ A message invokes one in either of two forms, and both give the same stored text
   are not text, arguments over 4 KiB or an expansion over 32 KiB or empty: nothing is written.
 * **A `/word` that is not a command is plain text**: `/tmp is full` reaches the agent as written. To send text that starts with a
   command's name, double the slash: `//review` is the literal `/review`.
-* **Expansion** is plain substitution, once: `$ARGUMENTS` and `$1` to `$9` as in
-  [the format](agent-files.md#commands-commandsnamemd). What is substituted is never read again, and nothing is executed.
-  A line of the result that begins as a form's answer is marked `(typed) `, as in any message.
+* **A form's answer is never a command.** A message with an A2UI `action` part (the person's click on a form) is stored as it is:
+  its text is not read as `/name`, even when the inbound function joins the parts into one text. A command named in the
+  metadata of such a message is `InvalidParams` and nothing is written. A NUL character in the metadata `arguments` is
+  `InvalidParams` too (the store cannot hold it), and an unknown name in an error is cut at 64 characters and escaped.
+* **Both forms agree.** The arguments are trimmed in what is stored (`command.arguments`) as in what is substituted; when a
+  message carries both forms the metadata wins and its text is not read; an expansion that is only whitespace is refused.
+* **Expansion** is plain substitution, once, with this grammar (tests: `crates/adam-a2a-runtime/src/commands.rs`):
+
+  | Template | Result |
+  |---|---|
+  | `$ARGUMENTS` | the trimmed argument string (`$ARGUMENTSX` is the arguments, then `X`) |
+  | `$1` to `$9` | that argument, split on whitespace with double quotes respected; a missing one is empty. One digit only: `$10` is `$1` then `0` |
+  | `$$` | one literal `$`, so `$$1` is the text `$1` (the way to write a literal placeholder) |
+  | any other `$` | itself (`$0`, `$a`, a `$` at the end) |
+
+  What is substituted is never read again, and nothing is executed. Every line of the whole result that begins as a form's
+  answer is marked `(typed) `, as in any message; that includes a template's own line that begins with that phrase.
 * **The expansion is what is stored.** It is the text of the run's first message, with `command = {name, arguments}` beside it.
   A replay, or a restart with an edited folder, never expands again, and a message sent again with the same `messageId` joins the
-  run it made. The same holds for a follow-up and for a steering message.
+  run it made. The same holds for a follow-up and for a steering message, and a typed reply to a pending question that starts with
+  `/name` is expanded too (tests: `crates/adam-a2a-runtime/tests/commands_flow.rs`); `//name` is the escape.
 * Commands change **no system prompt and no tool list**: the model sees the expanded text as the person's message.
 
 ```mermaid

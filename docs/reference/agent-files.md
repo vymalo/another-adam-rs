@@ -191,9 +191,12 @@ First word: $1
 | Name | the file stem, the agent-name rule (`a-z0-9_-`, 1 to 64, not starting with `_` or `-`) |
 | `$ARGUMENTS` | what the person typed after the name, trimmed |
 | `$1` to `$9` | that text split on whitespace, double quotes respected (`"a b" c` is `a b` and `c`); a missing one is empty; `$10` is `$1` and a `0` |
-| Any other `$` | itself |
+| `$$` | one literal `$`: `$$1` is the text `$1` |
+| Any other `$` | itself (`$ARGUMENTSX` is the arguments and an `X`) |
+| One file, one name | the name is the file name minus **one** `.md`, so `foo.md.md` is the invalid name `foo.md`; two files that give one command name are a load error naming both |
+| Files read | a file of `commands/` must be a regular file (a link is followed) of at most 40 KiB, checked before it is read: a FIFO, a device or a larger file is a load error naming it. A file that is not `*.md` (`notes.txt`, `X.MD`) is skipped with a warning |
 | Limits | 50 commands per agent; a template at most 32 KiB; at expansion, arguments at most 4 KiB and the text at most 32 KiB, and not empty |
-| Refused at load | the shell form `` !`...` `` (anything with `!` then a backtick): nothing in a template is ever run. A missing `description`, a template with no body, and a name or size over the limits are errors too |
+| Refused at load | the shell form: **any `!` immediately followed by a backtick, anywhere in the body, code fences and prose included** (a template never runs a command, and a lookalike is refused too). To write a literal `!` before a backtick, put a space between them (a `!`, a space, then the backtick). A missing `description`, a template with no body, and a name or size over the limits are errors too |
 | Digest | a folder without `commands/` has the digest it had before commands existed |
 
 Commands are not in the prompt and not in the tool list: they change nothing the model is sent except the
