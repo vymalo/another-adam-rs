@@ -874,7 +874,8 @@ async fn a_researcher_answers_with_its_source_through_a_stateless_mcp_server() {
                 "plan_work",
                 "plan_check",
                 "plan_add",
-                "search__web_search"
+                "search__web_search",
+                "read_output"
             ]
         );
     }

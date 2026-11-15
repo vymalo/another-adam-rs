@@ -5058,11 +5058,22 @@ mod cases {
 
         // Five seconds before the deadline a wake is due that the deadline did not set.
         clock.advance(Duration::from_secs(1795));
-        let rec = store.load_run(child).await.unwrap().unwrap();
-        let version = rec.version;
-        let mut update = adam_core::RunUpdate::new(RunStatus::Parked, rec.state.clone());
-        update.wake_at = Some(clock.now());
-        store.commit_run(child, rec.version, update).await.unwrap();
+        // The worker may look at the parked child at the same moment (the clock just moved): the
+        // write is tried again on the version it left, and the count starts from that version.
+        let version = loop {
+            let rec = store.load_run(child).await.unwrap().unwrap();
+            if rec.status != RunStatus::Parked {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            let mut update = adam_core::RunUpdate::new(RunStatus::Parked, rec.state.clone());
+            update.wake_at = Some(clock.now());
+            match store.commit_run(child, rec.version, update).await {
+                Ok(_) => break rec.version,
+                Err(adam_core::StoreError::Conflict { .. }) => {}
+                Err(err) => panic!("the wake was not written: {err}"),
+            }
+        };
         let parked = wait_for(&rt, child, "parked again", |v| v.version >= version + 2).await;
         assert_eq!(parked.status, RunStatus::Parked);
         let rec = store.load_run(child).await.unwrap().unwrap();
