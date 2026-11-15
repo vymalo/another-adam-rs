@@ -12,7 +12,7 @@
 //!   [`MAX_SKILL_FILE`], a bad name or no description. At most [`MAX_LISTED`] skills and
 //!   [`LISTING_CAP`] bytes are listed; the rest is counted, and entries of a skills directory that
 //!   were never opened are said so (`… and N more entries of <dir> were not examined`). A
-//!   directory is read at most [`MAX_ENTRIES`] entries deep. The block comes **before** the project instructions of the same call and is the
+//!   directory is read at most 1,024 entries deep. The block comes **before** the project instructions of the same call and is the
 //!   result's, never a message.
 //! * **Recorded.** What was listed (an empty note for a slot with nothing to list, so that a slot never prepared can be told from one that was) is in [`RunNotes::repo_skills`](super::notes::RunNotes::repo_skills) with the id of the call: a retry
 //!   of that call renders the same bytes from the record, not from the files as they are now; any
