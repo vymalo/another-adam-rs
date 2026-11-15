@@ -596,7 +596,7 @@ async fn a_kept_output_and_its_reads_keep_the_prefix() {
         "cut: {}",
         &first[..200]
     );
-    let pointer = adam_llm_agent::read_pointer(&first).expect("the pointer survived the cut");
+    let pointer = adam_llm_agent::read_pointer(&first, &id).expect("the pointer survived the cut");
     assert!(pointer.contains(&id), "{pointer}");
     // The last page of the output is in the newest result, whole: the read still worked.
     let last = state

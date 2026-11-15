@@ -458,13 +458,19 @@ pub struct RunNotes {
     /// below it, each with the id of the call that showed it. Written by the tools that show them,
     /// in the notes of the run that made the call (a subagent's history is not its root's). A
     /// call with the recorded id shows the text again (a retry of a step that was not journaled);
-    /// any other call does not. At most [`MAX_INSTRUCTIONS_SHOWN`].
+    /// any other call does not. The roots of slots are always shown; below them at most
+    /// [`MAX_NESTED_INSTRUCTIONS`] directories (see [`instructions_cap_noted`](Self::instructions_cap_noted)).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub instructions_shown: BTreeMap<String, String>,
+    /// The call that told the model, once, that more instruction files exist below the root than
+    /// the run is shown ([`MAX_NESTED_INSTRUCTIONS`]). The same call says it again (a retry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_cap_noted: Option<String>,
 }
 
-/// Most directories [`RunNotes::instructions_shown`] lists.
-pub const MAX_INSTRUCTIONS_SHOWN: usize = 256;
+/// Most directories below a slot's root whose instruction files a run is shown (a root does not
+/// count).
+pub const MAX_NESTED_INSTRUCTIONS: usize = 32;
 
 /// Most shared files [`RunNotes::shared`] lists.
 pub const MAX_SHARED: usize = 64;
@@ -865,12 +871,24 @@ impl RunNotes {
 
     /// Whether the call `call` may show the instructions of `key` (see
     /// [`instructions_shown`](Self::instructions_shown)): none was shown yet, or this very call
-    /// showed them. Past [`MAX_INSTRUCTIONS_SHOWN`] directories no new one is shown.
+    /// showed them. The cap on nested directories is [`nested_cap_reached`](Self::nested_cap_reached).
     pub fn may_show_instructions(&self, key: &str, call: &str) -> bool {
-        match self.instructions_shown.get(key) {
-            Some(shown) => shown == call,
-            None => self.instructions_shown.len() < MAX_INSTRUCTIONS_SHOWN,
-        }
+        self.instructions_shown
+            .get(key)
+            .is_none_or(|shown| shown == call)
+    }
+
+    /// How many directories below a root were shown (their keys have a `/`).
+    pub fn nested_instructions_shown(&self) -> usize {
+        self.instructions_shown
+            .keys()
+            .filter(|k| k.contains('/'))
+            .count()
+    }
+
+    /// The run was shown [`MAX_NESTED_INSTRUCTIONS`] nested directories.
+    pub fn nested_cap_reached(&self) -> bool {
+        self.nested_instructions_shown() >= MAX_NESTED_INSTRUCTIONS
     }
 
     /// Note that the call `call` showed the instructions of `key`; returns whether that is new.

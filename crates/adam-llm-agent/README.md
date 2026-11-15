@@ -785,9 +785,14 @@ original output.
 
 * **The count is cumulative.** An output that was cut and grows again is cut from its head; its single
   marker says how many characters of the original are gone, in all.
-* **A pointer stays.** A line that says how to read a kept output back (`read_pointer`: a line holding
-  `read_output {"id":"o-…"}`) is put after the marker when a cut removes it, so `read_output` stays
-  reachable whatever the cut.
+* **A pointer stays, if it is the call's own and exact.** The loop knows the output id of each tool
+  result's call (`output_id` of the root run and the call's key). A line of that result that is the
+  shape the kept-output code writes (it starts with `[`, ends with `]` and holds
+  `read_output {"id":"<that id>"}`: `find_pointer`) is replaced, when a cut removes it, by the one
+  canonical line (`pointer_line`) after the marker, so `read_output` stays reachable whatever the cut.
+  A line naming another id, or holding the words inside other text (a file's line, a command's
+  output), is text like the rest and is cut with it. A history carried into a new run keeps no
+  pointer of a cut result: the outputs of an earlier run are not readable by the new one.
 * **A small result is never cut.** A tool result under `SHORTENING_FLOOR` (512 characters) is left whole:
   small structured results hold ids nothing else repeats (a session's, a plan's, a shared file's).
 * **The marker says how to get more:** `[truncated: N chars of tool output omitted to fit the history

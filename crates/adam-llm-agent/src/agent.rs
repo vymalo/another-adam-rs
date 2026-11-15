@@ -2844,7 +2844,23 @@ impl Agent for LlmAgent {
         // answer to a question), so a replay after a crash shortens the same way whatever arrived
         // in between, and each request starts with the one before it. What arrives counts toward the
         // budget one turn later. `state.turns` is the turn of the next request.
-        if record_shortenings(&mut state.messages, self.limits.max_history_tokens) {
+        // A pointer to a kept output stays through a cut only for the id this very call kept
+        // (`kept::output_id`: the same one `keep_long` and the coder's tools write).
+        let root = state.root_run.unwrap_or_else(|| ctx.run_id());
+        let run = ctx.run_id();
+        let output_id_of = |call_id: &str| {
+            let key = if run == root {
+                call_id.to_owned()
+            } else {
+                format!("{run}/{call_id}")
+            };
+            Some(crate::kept::output_id(&root.to_string(), &key))
+        };
+        if record_shortenings(
+            &mut state.messages,
+            self.limits.max_history_tokens,
+            &output_id_of,
+        ) {
             state.shortenings.push(state.turns);
         }
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx

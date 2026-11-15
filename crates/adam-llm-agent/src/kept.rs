@@ -283,27 +283,44 @@ pub fn kept_header(id: &str, info: &KeptInfo, total_bytes: u64) -> String {
     line
 }
 
-/// The first line of `text` that tells the model how to read a kept output back: one that holds
-/// `read_output {"id":"o-…"}` with a well-formed id (the header of [`kept_header`], and the line a
-/// command's head-and-tail view ends with). The line is returned without its newline. A shortening
-/// of a history keeps this line, so the id outlives the cut.
-pub fn read_pointer(text: &str) -> Option<&str> {
-    const NEEDLE: &str = "read_output {\"id\":\"";
-    let mut from = 0;
-    while let Some(at) = text[from..].find(NEEDLE) {
-        let id_start = from + at + NEEDLE.len();
-        let id = text.get(id_start..id_start + 18).unwrap_or_default();
-        let closed = text.get(id_start + 18..id_start + 20) == Some("\"}");
-        if closed && is_output_id(id) {
-            let line_start = text[..id_start].rfind('\n').map_or(0, |i| i + 1);
-            let line_end = text[id_start..]
-                .find('\n')
-                .map_or(text.len(), |i| id_start + i);
-            return Some(&text[line_start..line_end]);
+/// The one line a shortened history keeps to say how to read the kept output `id`: written from
+/// the id alone, never copied from a result.
+pub fn pointer_line(id: &str) -> String {
+    format!("[kept as {id}; read_output {{\"id\":\"{id}\"}} reads it]")
+}
+
+/// The id of a line that is exactly [`pointer_line`] of a well-formed id.
+pub fn canonical_pointer_id(line: &str) -> Option<&str> {
+    let id = line.strip_prefix("[kept as ")?.get(..18)?;
+    (is_output_id(id) && line == pointer_line(id)).then_some(id)
+}
+
+/// Where in `text` the line is that points to the kept output `id`: the byte range (without the
+/// newline) of the first line with the shape of what the kept-output code writes
+/// ([`kept_header`], and the closing line of a command's view): it starts with `[`, ends with `]`
+/// and holds `read_output {"id":"<id>"}`. A line that only mentions the words, or names another
+/// id, is none. `id` is the one of the call whose result `text` is, so text that a tool copied from
+/// somewhere (a file, a page) cannot name one.
+pub fn find_pointer(text: &str, id: &str) -> Option<std::ops::Range<usize>> {
+    if !is_output_id(id) {
+        return None;
+    }
+    let needle = format!("read_output {{\"id\":\"{id}\"}}");
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.starts_with('[') && body.ends_with(']') && body.contains(&needle) {
+            return Some(start..start + body.len());
         }
-        from = id_start;
+        start += line.len();
     }
     None
+}
+
+/// The canonical pointer line ([`pointer_line`]) when `text` has a line for the kept output `id`
+/// ([`find_pointer`]). A shortening of a history keeps this line, so the id outlives the cut.
+pub fn read_pointer(text: &str, id: &str) -> Option<String> {
+    find_pointer(text, id).map(|_| pointer_line(id))
 }
 
 /// What the model is shown of a text that was kept: [`kept_header`], the first page, and the

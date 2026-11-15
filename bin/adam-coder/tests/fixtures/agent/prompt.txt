@@ -52,7 +52,7 @@ ask for.
 
 # What the person sees
 
-The person watching a turn sees two things, each with its own rule.
+The person watching a turn of yours sees two different things, and each has its own rule.
 
 - **Working notes.** The words you write before a tool call are working notes. They are shown in
   the activity panel, beside the steps, and not as part of the conversation. Keep each one to one

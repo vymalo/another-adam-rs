@@ -799,7 +799,8 @@ fn shorten_outputs(
         };
         // Two characters more than needed: the marker starts with a newline, which JSON writes
         // as two bytes, and this way one output is enough where one can be.
-        let Some(shortened) = crate::history::shorten_output(content, needed - cap + 2) else {
+        let Some(shortened) = crate::history::shorten_output(content, needed - cap + 2, None)
+        else {
             continue;
         };
         *content = shortened;

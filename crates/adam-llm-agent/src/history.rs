@@ -25,13 +25,17 @@ struct Cut<'a> {
     head: &'a str,
     /// What the marker at the end says was omitted: 0 when there is none.
     omitted: usize,
-    /// The pointer line that follows the marker ([`crate::read_pointer`]), when a cut moved it.
+    /// The pointer line that follows the marker, when a cut moved it: always the canonical line
+    /// ([`crate::kept::pointer_line`]).
     moved_pointer: Option<&'a str>,
     /// The marker and what follows it, in characters.
     tail_chars: usize,
 }
 
-fn parse(content: &str) -> Cut<'_> {
+/// `id` is the output id of the call whose result `content` is, when the loop knows it: a moved
+/// pointer is then valid only for that id. With none (a history carried into a new run), any
+/// canonical pointer line is.
+fn parse<'a>(content: &'a str, id: Option<&str>) -> Cut<'a> {
     let whole = Cut {
         head: content,
         omitted: 0,
@@ -53,7 +57,11 @@ fn parse(content: &str) -> Cut<'_> {
     let moved_pointer = match rest {
         "" => None,
         line => match line.strip_prefix('\n') {
-            Some(line) if !line.contains('\n') && crate::kept::read_pointer(line) == Some(line) => {
+            Some(line)
+                if !line.contains('\n')
+                    && crate::kept::canonical_pointer_id(line)
+                        .is_some_and(|found| id.is_none_or(|id| id == found)) =>
+            {
                 Some(line)
             }
             _ => return whole,
@@ -75,23 +83,28 @@ fn parse(content: &str) -> Cut<'_> {
 /// * **The count is cumulative.** An output that ends with a marker is cut from its head, and the
 ///   new marker says the old count plus what this cut removed, so the marker always says how much
 ///   of the original is missing (a pointer line, which stays, is not counted).
-/// * **The pointer stays.** A line that tells the model how to read a kept output back
-///   ([`crate::read_pointer`]) is put after the marker when the cut removes it, so `read_output`
-///   stays reachable whatever the cut.
-pub(crate) fn shorten_output(content: &str, excess: usize) -> Option<String> {
+/// * **The pointer stays, written afresh.** `id` is the output id of the call whose result this is
+///   (`None`: the loop does not know one). When the result has a line for that id with the shape of
+///   what the kept-output code writes ([`crate::kept::find_pointer`]), the canonical line
+///   ([`crate::kept::pointer_line`]) is put after the marker when a cut removes it, so `read_output`
+///   stays reachable whatever the cut. A line that names another id, or has the right words inside
+///   other text, is just text, and a cut removes it like the rest.
+pub(crate) fn shorten_output(content: &str, excess: usize, id: Option<&str>) -> Option<String> {
     let len = content.chars().count();
     if len < SHORTENING_FLOOR {
         return None;
     }
-    let cut = parse(content);
+    let cut = parse(content, id);
     let head_chars = cut.head.chars().count();
     if head_chars == 0 {
         return None; // nothing but a marker (and its pointer)
     }
-    let pointer = cut
+    let found = id.and_then(|id| crate::kept::find_pointer(cut.head, id).map(|at| (id, at)));
+    let canonical: Option<String> = cut
         .moved_pointer
-        .or_else(|| crate::kept::read_pointer(content));
-    let pointer_chars = pointer.map_or(0, |p| p.chars().count() + 1);
+        .map(str::to_owned)
+        .or_else(|| found.as_ref().map(|(id, _)| crate::kept::pointer_line(id)));
+    let pointer_chars = canonical.as_ref().map_or(0, |p| p.chars().count() + 1);
     // The marker is at most this long, for any count up to what the whole output holds.
     let marker_max = marker(cut.omitted.saturating_add(len)).chars().count();
     let wanted = excess
@@ -102,25 +115,26 @@ pub(crate) fn shorten_output(content: &str, excess: usize) -> Option<String> {
     // The pointer line was moved by an earlier cut, or sits in the head, or is not there.
     let mut relocated = cut.moved_pointer.is_some();
     let mut moved_chars = 0;
-    if let Some(line) = pointer.filter(|_| cut.moved_pointer.is_none())
-        && let Some(byte) = cut.head.find(line)
+    if cut.moved_pointer.is_none()
+        && let Some((_, at)) = &found
     {
-        let start = cut.head[..byte].chars().count();
-        let end = start + line.chars().count();
+        let start = cut.head[..at.start].chars().count();
+        let end = start + cut.head[at.clone()].chars().count();
         if keep < end {
-            // A cut through the line takes all of it: the line is shown once, after the marker.
+            // A cut through the line takes all of it: the canonical line is shown once, after the
+            // marker, and counted as kept.
             keep = keep.min(start);
             relocated = true;
-            moved_chars = end - start;
+            moved_chars = canonical.as_ref().map_or(0, |p| p.chars().count());
         }
     }
     let kept_head: String = cut.head.chars().take(keep).collect();
     let removed = head_chars - keep;
     let mut shortened = kept_head;
-    shortened.push_str(&marker(cut.omitted + removed - moved_chars));
-    if relocated && let Some(line) = pointer {
+    shortened.push_str(&marker(cut.omitted + removed - moved_chars.min(removed)));
+    if relocated && let Some(line) = canonical {
         shortened.push('\n');
-        shortened.push_str(line);
+        shortened.push_str(&line);
     }
     (shortened.chars().count() < len).then_some(shortened)
 }
@@ -179,7 +193,11 @@ fn estimate_tokens(messages: &[Message]) -> usize {
 ///
 /// A pure function of `messages` and `max_tokens`, so a replay of a turn from the committed state
 /// shortens the same way.
-pub(crate) fn record_shortenings(messages: &mut [Message], max_tokens: u32) -> bool {
+pub(crate) fn record_shortenings(
+    messages: &mut [Message],
+    max_tokens: u32,
+    output_id_of: &dyn Fn(&str) -> Option<String>,
+) -> bool {
     if max_tokens == 0 {
         return false;
     }
@@ -200,11 +218,15 @@ pub(crate) fn record_shortenings(messages: &mut [Message], max_tokens: u32) -> b
         if total <= target {
             break;
         }
-        let Message::Tool { content, .. } = m else {
+        let Message::Tool {
+            content, call_id, ..
+        } = m
+        else {
             continue;
         };
         let len = content.chars().count();
-        let Some(shortened) = shorten_output(content, total - target) else {
+        let id = output_id_of(call_id);
+        let Some(shortened) = shorten_output(content, total - target, id.as_deref()) else {
             continue; // would not get shorter
         };
         total = total - len + shortened.chars().count();
@@ -223,8 +245,18 @@ mod tests {
     /// `messages` after [`record_shortenings`], as a copy.
     fn fit_history(messages: &[Message], max_tokens: u32) -> Vec<Message> {
         let mut out = messages.to_vec();
-        record_shortenings(&mut out, max_tokens);
+        record_shortenings(&mut out, max_tokens, &no_ids);
         out
+    }
+
+    fn no_ids(_: &str) -> Option<String> {
+        None
+    }
+
+    const ID: &str = "o-0123456789abcdef";
+
+    fn one_id(_: &str) -> Option<String> {
+        Some(ID.to_owned())
     }
 
     fn call(id: &str) -> Message {
@@ -259,16 +291,16 @@ mod tests {
     #[test]
     fn shorten_output_keeps_the_head_removes_at_least_the_excess_and_never_grows() {
         let text = "h".repeat(1_000);
-        let shorter = shorten_output(&text, 300).unwrap();
+        let shorter = shorten_output(&text, 300, None).unwrap();
         assert!(shorter.starts_with("hhh") && shorter.contains(TRUNCATION_MARKER_PREFIX));
         assert!(shorter.chars().count() <= 1_000 - 300);
         // More than it has to give: only the marker is left.
-        let floor = shorten_output(&text, 10_000).unwrap();
+        let floor = shorten_output(&text, 10_000, None).unwrap();
         assert!(floor.starts_with('\n') && floor.contains(TRUNCATION_MARKER_PREFIX));
         assert!(floor.chars().count() < 1_000);
         // Already as short as a marker: not touched again.
-        assert_eq!(shorten_output("short", 3), None);
-        assert_eq!(shorten_output(&floor, 10), None);
+        assert_eq!(shorten_output("short", 3, None), None);
+        assert_eq!(shorten_output(&floor, 10, None), None);
     }
 
     #[test]
@@ -307,18 +339,18 @@ mod tests {
     #[test]
     fn it_says_whether_it_shortened_and_does_not_shorten_twice() {
         let mut m = convo();
-        assert!(!record_shortenings(&mut m.clone(), 0));
-        assert!(!record_shortenings(&mut m.clone(), 10_000));
-        assert!(record_shortenings(&mut m, 2750));
+        assert!(!record_shortenings(&mut m.clone(), 0, &no_ids));
+        assert!(!record_shortenings(&mut m.clone(), 10_000, &no_ids));
+        assert!(record_shortenings(&mut m, 2750, &no_ids));
         let once = m.clone();
         // Under three quarters of the budget now: the next call has nothing to do, and the
         // history is what it was (the requests after a shortening extend it unchanged).
-        assert!(!record_shortenings(&mut m, 2750));
+        assert!(!record_shortenings(&mut m, 2750, &no_ids));
         assert_eq!(m, once);
         // Over budget with nothing left to shorten is not a shortening either.
         let mut floor = convo();
-        assert!(record_shortenings(&mut floor, 10));
-        assert!(!record_shortenings(&mut floor, 10));
+        assert!(record_shortenings(&mut floor, 10, &no_ids));
+        assert!(!record_shortenings(&mut floor, 10, &no_ids));
     }
 
     #[test]
@@ -365,7 +397,7 @@ mod tests {
 
     /// What a marked output still says: the head, the count, a pointer moved after the marker.
     fn account(text: &str) -> (usize, usize, usize) {
-        let cut = parse(text);
+        let cut = parse(text, None);
         assert_eq!(
             text.matches(TRUNCATION_MARKER_PREFIX).count(),
             1,
@@ -381,29 +413,29 @@ mod tests {
     #[test]
     fn a_second_cut_adds_to_the_count_of_the_first() {
         let original = "h".repeat(100_000);
-        let once = shorten_output(&original, 86_000).unwrap();
+        let once = shorten_output(&original, 86_000, None).unwrap();
         let (head, omitted, _) = account(&once);
         assert_eq!(head + omitted, 100_000);
         // The output grew by nothing, and is cut again: the marker says what both cuts removed.
-        let twice = shorten_output(&once, 5_000).unwrap();
+        let twice = shorten_output(&once, 5_000, None).unwrap();
         let (head2, omitted2, _) = account(&twice);
         assert_eq!(head2 + omitted2, 100_000, "{twice:?}");
         assert!(omitted2 > omitted && head2 < head);
         // Down to the marker alone, the count still names everything that is gone.
-        let floor = shorten_output(&twice, usize::MAX / 4).unwrap();
+        let floor = shorten_output(&twice, usize::MAX / 4, None).unwrap();
         let (head3, omitted3, _) = account(&floor);
         assert_eq!((head3, omitted3), (0, 100_000));
-        assert_eq!(shorten_output(&floor, 10), None);
+        assert_eq!(shorten_output(&floor, 10, None), None);
     }
 
     #[test]
     fn a_result_under_the_floor_is_never_shortened() {
         let small = format!("{{\"session\":\"s\",\"pad\":\"{}\"}}", "p".repeat(300));
         assert!(small.chars().count() < SHORTENING_FLOOR);
-        assert_eq!(shorten_output(&small, 10_000), None);
+        assert_eq!(shorten_output(&small, 10_000, None), None);
         let edge = "e".repeat(SHORTENING_FLOOR - 1);
-        assert_eq!(shorten_output(&edge, 10_000), None);
-        assert!(shorten_output(&"e".repeat(SHORTENING_FLOOR + 600), 400).is_some());
+        assert_eq!(shorten_output(&edge, 10_000, None), None);
+        assert!(shorten_output(&"e".repeat(SHORTENING_FLOOR + 600), 400, None).is_some());
         // A history far over budget leaves such a result alone.
         let mut m = vec![
             Message::user_text("go"),
@@ -414,13 +446,13 @@ mod tests {
             call("c3"),
             big("c3", 10, 'y'),
         ];
-        assert!(record_shortenings(&mut m, 100));
+        assert!(record_shortenings(&mut m, 100, &no_ids));
         assert_eq!(m[2].text(), small);
     }
 
     #[test]
     fn the_marker_says_how_to_get_more() {
-        let cut = shorten_output(&"m".repeat(2_000), 100).unwrap();
+        let cut = shorten_output(&"m".repeat(2_000), 100, None).unwrap();
         assert!(
             cut.ends_with("omitted to fit the history limit; a kept output is read back with read_output, a file with its read tool]"),
             "{cut}"
@@ -433,10 +465,10 @@ mod tests {
         let mut text = original.clone();
         // A shallow cut keeps the line where it is; deeper ones move it after the marker, once.
         for excess in [200, 5_000, 30_000, usize::MAX / 4] {
-            text = shorten_output(&text, excess).unwrap_or(text);
+            text = shorten_output(&text, excess, Some(ID)).unwrap_or(text);
             assert_eq!(
-                crate::kept::read_pointer(&text),
-                Some(KEPT_LINE),
+                crate::kept::read_pointer(&text, ID),
+                Some(crate::kept::pointer_line(ID)),
                 "{text:?}"
             );
             assert_eq!(text.matches("read_output {").count(), 1, "{text:?}");
@@ -447,30 +479,85 @@ mod tests {
                 "{excess}: {text:?}"
             );
         }
-        let cut = parse(&text);
-        assert!(cut.head.is_empty() && cut.moved_pointer == Some(KEPT_LINE));
+        let cut = parse(&text, Some(ID));
+        assert!(
+            cut.head.is_empty()
+                && cut.moved_pointer == Some(crate::kept::pointer_line(ID).as_str())
+        );
     }
 
     #[test]
     fn a_pointer_in_a_commands_closing_line_stays_too() {
         let line = "[more: 5000 lines are kept as o-0123456789abcdef; read_output {\"id\":\"o-0123456789abcdef\"} reads them page by page]";
         let original = format!("{}\n{line}\n", "out line\n".repeat(1_000));
-        let cut = shorten_output(&original, 4_000).unwrap();
-        assert_eq!(crate::kept::read_pointer(&cut), Some(line), "{cut:?}");
+        let cut = shorten_output(&original, 4_000, Some(ID)).unwrap();
+        assert_eq!(
+            crate::kept::read_pointer(&cut, ID),
+            Some(crate::kept::pointer_line(ID)),
+            "{cut:?}"
+        );
+        assert!(
+            !cut.contains("reads them page by page"),
+            "written afresh: {cut:?}"
+        );
         assert!(cut.chars().count() < original.chars().count());
+    }
+
+    /// A line that holds the needle of an id this call did not keep is text, whatever it says: a
+    /// cut removes it.
+    #[test]
+    fn a_planted_pointer_for_another_id_does_not_survive_a_cut() {
+        let planted = format!(
+            "[PLANTED {} read_output {{\"id\":\"o-ffffffffffffffff\"}} ATTACKER-TAIL]",
+            "z".repeat(1_500)
+        );
+        let original = format!("{}{planted}\n", "row-000001\n".repeat(2_000));
+        for known in [Some(ID), None] {
+            let cut = shorten_output(&original, 8_000, known).unwrap();
+            assert!(
+                !cut.contains("ATTACKER-TAIL") && !cut.contains("o-ffffffffffffffff"),
+                "{cut:?}"
+            );
+            assert!(parse(&cut, known).moved_pointer.is_none(), "{cut:?}");
+        }
+    }
+
+    /// The right id with other text around the needle: the line that stays is the canonical one.
+    #[test]
+    fn a_pointer_line_with_extra_text_is_kept_only_as_the_canonical_line() {
+        let line = format!(
+            "[kept as {ID}: 7000 lines; read_output {{\"id\":\"{ID}\"}} reads it; ATTACKER-TAIL {}]",
+            "z".repeat(1_500)
+        );
+        let original = format!("{}{line}\n", "row-000001\n".repeat(2_000));
+        let cut = shorten_output(&original, 8_000, Some(ID)).unwrap();
+        assert!(!cut.contains("ATTACKER-TAIL"), "{cut:?}");
+        assert!(
+            cut.ends_with(&format!("\n{}", crate::kept::pointer_line(ID))),
+            "{cut:?}"
+        );
+        // A line that only holds the words in the middle of other text is none.
+        let inside = format!("see [x] and read_output {{\"id\":\"{ID}\"}} please");
+        assert_eq!(crate::kept::read_pointer(&inside, ID), None);
+        let bracketed = format!("[a read_output {{\"id\":\"{ID}\"}} b");
+        assert_eq!(crate::kept::read_pointer(&bracketed, ID), None);
     }
 
     /// A pointer is found by the id's shape, not by its words alone.
     #[test]
     fn a_line_that_only_mentions_read_output_is_no_pointer() {
         assert_eq!(
-            crate::kept::read_pointer("read_output {\"id\":\"nope\"}"),
+            crate::kept::read_pointer("read_output {\"id\":\"nope\"}", ID),
             None
         );
-        assert_eq!(crate::kept::read_pointer("read_output reads it"), None);
+        assert_eq!(crate::kept::read_pointer("read_output reads it", ID), None);
         assert_eq!(
-            crate::kept::read_pointer(&format!("a\n{KEPT_LINE}\nb")),
-            Some(KEPT_LINE)
+            crate::kept::read_pointer(&format!("a\n{KEPT_LINE}\nb"), ID),
+            Some(crate::kept::pointer_line(ID))
+        );
+        assert_eq!(
+            crate::kept::read_pointer(&format!("a\n{KEPT_LINE}\nb"), "o-ffffffffffffffff"),
+            None
         );
     }
 
@@ -484,7 +571,7 @@ mod tests {
         for turn in 0..5 {
             m.push(call(&format!("c{turn}")));
             m.push(big(&format!("c{turn}"), 5_000, 'x'));
-            cuts.push(record_shortenings(&mut m, 100));
+            cuts.push(record_shortenings(&mut m, 100, &no_ids));
         }
         assert_eq!(cuts, [false, true, true, true, true]);
     }
@@ -567,7 +654,7 @@ mod tests {
 
                 // A second pass has nothing to do: the next request extends this history as it is.
                 let mut again = fitted.clone();
-                prop_assert!(!record_shortenings(&mut again, max_tokens));
+                prop_assert!(!record_shortenings(&mut again, max_tokens, &no_ids));
                 prop_assert_eq!(&again, &fitted);
 
                 if max_tokens == 0 {
@@ -586,7 +673,7 @@ mod tests {
                             // Nothing was left to take: under the floor, or already only a marker.
                             prop_assert!(
                                 old.chars().count() < SHORTENING_FLOOR
-                                    || parse(old).head.is_empty(),
+                                    || parse(old, None).head.is_empty(),
                                 "{old:?} could have been shortened"
                             );
                         }
@@ -628,10 +715,10 @@ mod tests {
                     originals.push((messages.len(), text.clone()));
                     messages.push(Message::tool_result(format!("c{n}"), text.clone()));
                     // A pass after each growth, with the budget of that pass.
-                    record_shortenings(&mut messages, budgets[n % budgets.len()]);
+                    record_shortenings(&mut messages, budgets[n % budgets.len()], &one_id);
                     messages.push(call("last"));
                     messages.push(Message::tool_result("last", "tail"));
-                    record_shortenings(&mut messages, budgets[n % budgets.len()]);
+                    record_shortenings(&mut messages, budgets[n % budgets.len()], &one_id);
                     messages.truncate(messages.len() - 2);
                 }
                 for (at, original) in &originals {
@@ -640,7 +727,7 @@ mod tests {
                         continue;
                     }
                     prop_assert!(original.chars().count() >= SHORTENING_FLOOR);
-                    let cut = parse(&now);
+                    let cut = parse(&now, Some(ID));
                     prop_assert_eq!(now.matches(TRUNCATION_MARKER_PREFIX).count(), 1, "{:?}", now);
                     let moved = cut.moved_pointer.map_or(0, |p| p.chars().count());
                     prop_assert_eq!(
@@ -649,8 +736,8 @@ mod tests {
                         "{:?} of {:?}", now, original
                     );
                     prop_assert!(original.starts_with(cut.head));
-                    if let Some(pointer) = crate::kept::read_pointer(original) {
-                        prop_assert_eq!(crate::kept::read_pointer(&now), Some(pointer));
+                    if let Some(pointer) = crate::kept::read_pointer(original, ID) {
+                        prop_assert_eq!(crate::kept::read_pointer(&now, ID), Some(pointer));
                     }
                 }
             }
