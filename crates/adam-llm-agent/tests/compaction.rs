@@ -647,6 +647,75 @@ async fn the_person_sees_one_step_for_the_summary() {
     assert!(detail.starts_with("Summarised 3 earlier turns"), "{detail}");
 }
 
+#[tokio::test]
+async fn a_rejected_prompt_is_compacted_and_retried_once() {
+    // No budget at all: only the provider's rejection says the prompt is too long.
+    let rig = Rig::new(0);
+    for n in 0..4 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 3000)]);
+    }
+    rig.mock
+        .push_error(ModelError::ContextLength("prompt is too long (one)".into()))
+        .push_text("SUMMARY after the rejection")
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    // Four turns, the rejected fifth, the summary, the fifth again.
+    assert_eq!(requests.len(), 7);
+    let (rejected, summary, again) = (&requests[4], &requests[5], &requests[6]);
+    assert!(is_summary(summary));
+    assert!(
+        summary.messages.len() < rejected.messages.len(),
+        "the summary request leaves the newest turns out"
+    );
+    let longest = summary
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool { content, .. } => Some(content.chars().count()),
+            _ => None,
+        })
+        .max()
+        .unwrap();
+    assert!(longest < 2_500, "long outputs are shortened: {longest}");
+    assert!(again.messages.len() < rejected.messages.len());
+    assert!(
+        again.messages[0]
+            .text()
+            .contains("SUMMARY after the rejection")
+    );
+    assert_eq!(state.compactions.len(), 1);
+    let compaction = &state.compactions[0];
+    assert_eq!(compaction.reason, CompactionReason::Overflow);
+    assert_eq!(
+        compaction.rejected.as_deref().map(|r| r.contains("one")),
+        Some(true)
+    );
+    assert_eq!(state.turns, 5, "the rejected turn was asked again, once");
+}
+
+#[tokio::test]
+async fn a_second_rejection_fails_naming_both() {
+    let rig = Rig::new(0);
+    for n in 0..4 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 3000)]);
+    }
+    rig.mock
+        .push_error(ModelError::ContextLength("prompt is too long (one)".into()))
+        .push_text("SUMMARY")
+        .push_error(ModelError::ContextLength("prompt is too long (two)".into()));
+    let run = rig.start().await;
+    let view = rig.work(run).await;
+    assert_eq!(view.status, RunStatus::Failed, "{view:#?}");
+    let error = view.error.expect("an error");
+    assert!(error.contains("after compacting the history"), "{error}");
+    assert!(
+        error.contains("(two)") && error.contains("(one)"),
+        "{error}"
+    );
+    assert_eq!(rig.mock.requests().len(), 7, "no third try");
+}
+
 // ---------------------------------------------------------------------------
 // Sessions and subagents
 // ---------------------------------------------------------------------------

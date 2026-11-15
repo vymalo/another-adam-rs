@@ -233,6 +233,11 @@ struct ModelFailure {
     /// journals written before classes existed, which decode as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     class: Option<String>,
+    /// The provider rejected the prompt as too long ([`ModelError::is_context_overflow`]): the run
+    /// compacts its history once and asks again. Absent from journals written before, which decode
+    /// as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    context_length: bool,
 }
 
 impl ModelFailure {
@@ -243,6 +248,7 @@ impl ModelFailure {
             message: CANCELLED.to_owned(),
             retry_after_ms: None,
             class: None,
+            context_length: false,
         }
     }
 }
@@ -265,6 +271,7 @@ impl From<ModelError> for ModelFailure {
                 .retry_after()
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             class: Some(format!("{:?}", e.class())),
+            context_length: e.is_context_overflow(),
         }
     }
 }
@@ -1130,6 +1137,9 @@ impl LlmAgent {
                     None => error,
                 });
             }
+            // The provider rejected the prompt as too long: the history is compacted once, in the
+            // next transition, and the turn is tried again.
+            Err(f) if f.context_length => return Ok(self.rejected_as_too_long(state, &f.message)),
             Err(f) => return Ok(Flow::Fail(format!("model call failed: {}", f.message))),
         };
 
@@ -1345,6 +1355,31 @@ impl LlmAgent {
                 .is_none_or(|at| state.turns >= at.saturating_add(RETRY_AFTER_TURNS))
             && self.estimated_tokens(state) >= budget
             && self.cut_for(state, CompactionReason::Budget).is_some()
+    }
+
+    /// What a model call whose prompt the provider rejected as too long does: ask for one compaction
+    /// and a second try, the first time at this turn, and fail the run the second.
+    fn rejected_as_too_long(&self, state: &mut Conversation, message: &str) -> Flow {
+        if state.overflow_turn == Some(state.turns) {
+            let first = state
+                .compactions
+                .iter()
+                .rev()
+                .find(|c| c.reason == CompactionReason::Overflow)
+                .and_then(|c| c.rejected.clone())
+                .unwrap_or_default();
+            return Flow::Fail(format!(
+                "model call failed: context length exceeded after compacting the history: \
+                 {message} (the first rejection of this turn was: {first})"
+            ));
+        }
+        if self.cut_for(state, CompactionReason::Overflow).is_none() {
+            return Flow::Fail(format!("model call failed: {message}"));
+        }
+        state.overflow_turn = Some(state.turns);
+        state.overflow_message = Some(message.chars().take(1000).collect());
+        state.compact_next = Some(CompactionReason::Overflow);
+        Flow::Next
     }
 
     /// Compact the history of the committed `state` when it is due (or when a rejected prompt asked
