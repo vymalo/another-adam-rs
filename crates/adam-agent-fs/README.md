@@ -1,7 +1,7 @@
 # adam-agent-fs
 
 Parse and validate agent directories. An agent is a directory of Markdown and JSON
-(`agent/instructions.md`, `skills/`, `subagents/`, `mcp.json`, `schedules/`); this crate reads
+(`agent/instructions.md`, `skills/`, `subagents/`, `mcp.json`, `schedules/`, `commands/`); this crate reads
 it into an owned `AgentManifest` and reports every mistake as a `Diagnostic` with the file and
 the line. The layout, the file formats and the reasons are in
 [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md).
@@ -29,12 +29,13 @@ Directory walking uses `std::fs`, so there is no `walkdir` dependency either.
 | `Report`, `Package`, `Layout` | `report.package.agents`, `report.diagnostics`, `errors()`, `warnings()`, `is_ok()`, `into_package(Strictness)` |
 | `Diagnostic`, `Severity` | `{ severity: Error \| Warning, path, line: Option<u32>, message }`; `Display` is `path:line: severity: message` |
 | `Strictness` | `Lenient` (only errors fail) or `Strict` (warnings fail too) |
-| `AgentManifest` | `name`, `path`, `frontmatter`, `instructions` (`body`, `parts`, `prompt()`), `skills`, `subagents`, `mcp`, `schedules` |
+| `AgentManifest` | `name`, `path`, `frontmatter`, `instructions` (`body`, `parts`, `prompt()`), `skills`, `subagents`, `mcp`, `schedules`, `commands`. **Breaking:** `commands` is a new public field (a struct literal needs it); it is left out of the manifest's JSON when empty, so a folder without `commands/` keeps its digest |
 | `Subagent` | `Local(Box<AgentManifest>)` or `Remote(RemoteAgent)` (`a2a:` URL, `RemoteAuth::Bearer { env }`, `files`: the frontmatter's `files: true`, the file parts of its answer shared as files of the calling run). **Breaking:** `RemoteAgent` and `EmbeddedRemote` gained the field `files: bool` (a struct literal needs it); it is left out of a manifest's JSON when `false`, so a folder that does not use it keeps its digest |
 | `Skill`, `SkillLayout`, `SKILL_RESOURCE_LIMIT` | `name`, `description`, `license`, `compatibility`, `metadata`, `allowed_tools`, `body`, `resources` (paths, not contents; `SKILL_RESOURCE_LIMIT` is the 1 MiB one skill may bundle) |
 | `Schedule` | `name` (`a/b` from the path), `cron`, `timezone`, `agent`, `prompt` |
+| `Command`, `MAX_COMMANDS`, `COMMAND_DESCRIPTION_MAX`, `COMMAND_HINT_MAX`, `COMMAND_TEMPLATE_MAX` | `commands/<name>.md` (root agents only): `name` (the agent-name rule), `description` (at most 200 characters), `argument_hint`, `template` (the body: `$ARGUMENTS`, `$1` to `$9`), `path`. At most 50 per agent, a template at most 32 KiB; the shell form `` !`...` `` is refused. The agent serves them (`adam-a2a-runtime`'s `Commands`) |
 | `AgentFrontmatter`, `Limits`, `Card`, `ExtendedCard`, `ToolList`, `ModelRef`, `SkillSelection` | the shared agent and subagent schema; unknown keys are kept in `extra`. `Card.extended` (`ExtendedCard`: `description`, `skills`) is what an authenticated A2A caller sees on top of the public card |
-| `SkillFrontmatter`, `ScheduleFrontmatter` | the other two YAML schemas |
+| `SkillFrontmatter`, `ScheduleFrontmatter`, `CommandFrontmatter` | the other YAML schemas |
 | `McpConfig`, `McpServer`, `RemoteKind`, `EnvRef` | `mcp.json`; `env_references()` lists the `${VAR}` names, never values; `merged_with(extra)` adds the servers of another config and refuses a name both have (it returns the clashing names, nothing merged); `McpServer::is_optional()` is `optional: true` (a server that may be missing at startup; `McpServer`'s variants gained the field `optional`, so a struct pattern without `..` or a literal breaks); `McpServer::shares_files()` is `files: true` (the images, audio and blobs of its results are shared as files of the run, see `adam-mcp`). **Breaking:** both variants gained the field `files: bool`, so a literal or a struct pattern without `..` needs it |
 | `split_env_references(text)`, `Segment` | the one grammar of `${VAR}` / `${VAR:-default}`: a text cut into `Literal` and `Ref(EnvRef)` segments (a `${` that is not a reference stays in the literal text). `env_references()` is built on it, and so is the run-time expansion of `adam-mcp`; a property test checks that it agrees with the scanner it replaced and that the segments write back to the text. `EnvRef::written()` is the reference as written |
 | `split(text)` | the frontmatter splitter: `Split { frontmatter, body, .. }` or `SplitError::Unterminated` |
@@ -42,7 +43,7 @@ Directory walking uses `std::fs`, so there is no `walkdir` dependency either.
 | `is_agent_name`, `is_skill_name`, `is_tool_name`, `is_env_name` | the name patterns |
 | `Error` | `Io { path, source }` (the source could not be read), `Invalid { diagnostics }` (`into_package` refused) and `Codec { action, what, source }` (a manifest could not be encoded or decoded); implements `adam_error::Classify` (`NotFound`, `Internal`, `Invalid`) |
 | `Digest`, `digest_with`, `Dir::digest` | `sha256:...` of a normalised manifest and its skill resources: the same for a directory and for the embedded copy of it |
-| `EmbeddedPackage`, `EmbeddedAgent`, `EmbeddedSkill`, `EmbeddedSubagent`, ... | the `'static` form of a package, built by generated code; `EmbeddedPackage` is a `ManifestSource`, `EmbeddedAgent::{to_manifest, frontmatter, recompute_digest, verify, resource}` |
+| `EmbeddedPackage`, `EmbeddedAgent`, `EmbeddedSkill`, `EmbeddedSubagent`, `EmbeddedCommand`, ... | the `'static` form of a package, built by generated code (**breaking:** `EmbeddedAgent` gained the field `commands`; generated code is rewritten by the build, a hand-written literal needs it); `EmbeddedPackage` is a `ManifestSource`, `EmbeddedAgent::{to_manifest, frontmatter, recompute_digest, verify, resource}` |
 | `build(dir)`, `Build`, `BuildError`, `Emitted`, `Generated` (feature `build`) | the code generator for `build.rs` |
 
 ```rust
@@ -111,7 +112,7 @@ watch list without printing or writing anything. `BuildError`'s `Debug` prints i
 
 What is in the generated file:
 
-* Prompts, skill bodies, schedule prompts and `instructions/*.md` are raw string literals, already
+* Prompts, skill bodies, schedule prompts, command templates and `instructions/*.md` are raw string literals, already
   normalised (frontmatter removed, LF endings, trimmed): no parsing at startup.
 * The frontmatter is JSON, read back by `EmbeddedAgent::frontmatter()` into the same
   `AgentFrontmatter` the directory path uses, so there is no second schema.
@@ -165,11 +166,12 @@ both give a `Package`, and the two are equal for the same files, which the tests
 
 | File | Errors (the item is skipped or the build fails) | Warnings (kept) |
 |---|---|---|
-| directory | `agent/` and `agents/` together; neither (unless `.optional()`); no `instructions.md`; `agents/<name>` whose `name:` differs; two subagents or skills with one name; an empty prompt; a file that is not UTF-8 | an entry that is not part of an agent directory (`tools/`, ...); `agents/<x>` without `instructions.md`; `schedules/` in a subagent |
+| directory | `agent/` and `agents/` together; neither (unless `.optional()`); no `instructions.md`; `agents/<name>` whose `name:` differs; two subagents or skills with one name; an empty prompt; a file that is not UTF-8 | an entry that is not part of an agent directory (`tools/`, ...); `agents/<x>` without `instructions.md`; `schedules/` or `commands/` in a subagent; a directory inside `commands/` |
 | frontmatter | a `---` first line with no closing `---`; YAML that does not parse (line reported); `api_key`, `apiKey`, `token`, `secret`, `password`, `base_url` ("secrets and endpoints belong in the environment"); a `model` that is a URL; an invalid `vars` key; `a2a` on the root agent, a bad `a2a` URL or `auth`; a subagent with no `description` or no body; `limits.max_minutes` over 1,440 | unknown keys; Claude Code and Copilot keys adam ignores (`color`, `permissionMode`, `target`, ...); `mcpServers` / `mcp-servers` (use `mcp.json`); a `name` that is not a valid identifier (the file name is used, lower-cased when needed); tool names adam cannot bind (`Read`); `maxTurns` disagreeing with `limits.max_turns`; `limits.max_minutes` on an agent that is not a subagent; a prompt over Copilot's 30,000 characters; `files` on a file that is not a remote subagent (it is for `a2a`; an MCP server takes it in `mcp.json`) |
 | `SKILL.md` | no `description`; unparseable YAML or an unterminated frontmatter | `name` different from the directory, missing, or breaking the name rule; a description over 1024 or `compatibility` over 500 characters; a flat skill without frontmatter (its first line becomes the description) |
 | `mcp.json` | invalid JSON; a `url` without `type`; an unsupported `type`; `command` and `url` together; a key such as `apiKey`; a server or allow-listed tool name that cannot become `<server>__<tool>` within 64 characters (a server name has no `__` and does not end in `_`, a tool name does not start with `_`, so that `a` + `_x` and `a_` + `x` are never both `a___x`) | unknown keys; a header, environment value or URL that carries a literal credential (`Bearer sk-...`, `X-Api-Key: ...`, `user:pw@`); a `${` that is not a reference |
 | schedule | no `cron`, not five fields, a bad time zone, no body, `agent:` naming another agent | unknown keys |
+| command | no `description`, one over 200 characters, an `argument-hint` over 100, a name that breaks the agent-name rule, no body, a template over 32 KiB, a template with the shell form `` !`...` ``, more than 50 commands | unknown keys |
 
 The Agent Skills rules follow the spec's client guide (lenient: a name mismatch or an over-long
 field warns; a missing description or bad YAML skips the skill). Skipping is an *error* here

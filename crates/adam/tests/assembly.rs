@@ -51,6 +51,7 @@ fn manifest(tools: &[&str]) -> AgentManifest {
         subagents: vec![],
         mcp: None,
         schedules: vec![],
+        commands: vec![],
     }
 }
 

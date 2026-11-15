@@ -47,21 +47,23 @@ mod buildscript;
 pub use diagnostic::{Diagnostic, Severity};
 pub use digest::{Digest, digest_with};
 pub use embedded::{
-    EmbeddedAgent, EmbeddedAuth, EmbeddedFile, EmbeddedInstructions, EmbeddedMcp, EmbeddedPackage,
-    EmbeddedPart, EmbeddedRemote, EmbeddedSchedule, EmbeddedSkill, EmbeddedSubagent,
+    EmbeddedAgent, EmbeddedAuth, EmbeddedCommand, EmbeddedFile, EmbeddedInstructions, EmbeddedMcp,
+    EmbeddedPackage, EmbeddedPart, EmbeddedRemote, EmbeddedSchedule, EmbeddedSkill,
+    EmbeddedSubagent,
 };
 pub use error::Error;
 pub use frontmatter::{Split, SplitError, split};
 pub use load::{parse_mcp, parse_skill};
 pub use manifest::{
-    AgentManifest, InstructionPart, Instructions, Layout, Package, RemoteAgent, RemoteAuth, Report,
+    AgentManifest, COMMAND_DESCRIPTION_MAX, COMMAND_HINT_MAX, COMMAND_TEMPLATE_MAX, Command,
+    InstructionPart, Instructions, Layout, MAX_COMMANDS, Package, RemoteAgent, RemoteAuth, Report,
     SKILL_RESOURCE_LIMIT, Schedule, Skill, SkillLayout, Strictness, Subagent,
 };
 pub use schema::{
-    AgentFrontmatter, Card, CardSkill, EnvRef, ExtendedCard, Limits, MAX_MINUTES_LIMIT, McpConfig,
-    McpServer, ModelRef, RemoteKind, ScheduleFrontmatter, Segment, SkillFrontmatter,
-    SkillSelection, ToolList, is_agent_name, is_env_name, is_skill_name, is_tool_name,
-    split_env_references,
+    AgentFrontmatter, Card, CardSkill, CommandFrontmatter, EnvRef, ExtendedCard, Limits,
+    MAX_MINUTES_LIMIT, McpConfig, McpServer, ModelRef, RemoteKind, ScheduleFrontmatter, Segment,
+    SkillFrontmatter, SkillSelection, ToolList, is_agent_name, is_env_name, is_skill_name,
+    is_tool_name, split_env_references,
 };
 pub use source::{Dir, ManifestSource};
 

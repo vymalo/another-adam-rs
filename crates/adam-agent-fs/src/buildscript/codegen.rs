@@ -196,6 +196,24 @@ impl Gen<'_> {
             }
             self.close("],");
         }
+        if a.commands.is_empty() {
+            self.line("commands: &[],");
+        } else {
+            self.open("commands: &[");
+            for c in &a.commands {
+                self.open(format!("{p}::EmbeddedCommand {{"));
+                self.line(format!("name: {},", lit(&c.name)));
+                self.line(format!("description: {},", lit(&c.description)));
+                self.line(format!(
+                    "argument_hint: {},",
+                    option(c.argument_hint.as_deref())
+                ));
+                self.line(format!("template: {},", text(&c.template)));
+                self.line(format!("path: {},", self.rel(&c.path)?));
+                self.close("},");
+            }
+            self.close("],");
+        }
         self.close(format!("}}{close_suffix}"));
         Ok(())
     }

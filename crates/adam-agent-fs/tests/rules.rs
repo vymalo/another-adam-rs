@@ -708,6 +708,67 @@ fn cases() -> Vec<Case> {
             Warning,
             "unknown key `retries`",
         ),
+        // --- commands
+        with_root(
+            "command without a description",
+            vec![(
+                "agent/commands/a.md",
+                "---\nargument-hint: x\n---\nGo $1.\n",
+            )],
+            Error,
+            "needs a `description`",
+        ),
+        with_root(
+            "command with a bad name",
+            vec![("agent/commands/Bad.md", "---\ndescription: d\n---\nGo.\n")],
+            Error,
+            "is not a command name",
+        ),
+        with_root(
+            "command with an empty body",
+            vec![("agent/commands/a.md", "---\ndescription: d\n---\n")],
+            Error,
+            "needs a body",
+        ),
+        with_root(
+            "command with a shell form",
+            vec![(
+                "agent/commands/a.md",
+                "---\ndescription: d\n---\nBranch: !`git branch`\n",
+            )],
+            Error,
+            "shell form",
+        ),
+        with_root(
+            "command with an unknown key",
+            vec![(
+                "agent/commands/a.md",
+                "---\ndescription: d\nmodel: x\n---\nGo.\n",
+            )],
+            Warning,
+            "unknown key `model`",
+        ),
+        with_root(
+            "a directory inside commands",
+            vec![
+                ("agent/commands/a.md", "---\ndescription: d\n---\nGo.\n"),
+                ("agent/commands/sub/b.md", "---\ndescription: d\n---\nGo.\n"),
+            ],
+            Warning,
+            "commands are flat files",
+        ),
+        with_root(
+            "commands in a subagent directory",
+            vec![
+                ("agent/subagents/x/instructions.md", SUB),
+                (
+                    "agent/subagents/x/commands/a.md",
+                    "---\ndescription: d\n---\nGo.\n",
+                ),
+            ],
+            Warning,
+            "commands belong to the root agent",
+        ),
     ]
 }
 
@@ -800,6 +861,11 @@ fn the_valid_fixture_has_no_diagnostic_and_reads_completely() {
     assert_eq!(schedules, ["daily-digest", "team/weekly"]);
     assert_eq!(coder.schedules[0].timezone, "Europe/Berlin");
     assert_eq!(coder.schedules[1].timezone, "UTC");
+
+    let commands: Vec<_> = coder.commands.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(commands, ["ship", "triage"]);
+    assert_eq!(coder.commands[0].argument_hint.as_deref(), Some("<branch>"));
+    assert_eq!(coder.commands[1].argument_hint, None);
 }
 
 #[test]

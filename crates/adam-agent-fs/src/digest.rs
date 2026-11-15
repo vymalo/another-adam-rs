@@ -147,6 +147,7 @@ mod tests {
             subagents: Vec::new(),
             mcp: None,
             schedules: Vec::new(),
+            commands: Vec::new(),
         }
     }
 

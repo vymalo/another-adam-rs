@@ -2,6 +2,7 @@
 //! so the same code serves a directory today and an embedded manifest later.
 
 mod agent;
+mod command;
 mod mcp;
 mod schedule;
 mod skill;
@@ -15,6 +16,7 @@ pub use mcp::parse_mcp;
 pub use skill::parse_skill;
 
 pub(crate) use agent::{AgentFile, FileKind, RemoteSpec, check_prompt_length, parse_agent_file};
+pub(crate) use command::parse_command;
 pub(crate) use schedule::parse_schedule;
 
 /// A file's frontmatter, read, next to how the file was split.

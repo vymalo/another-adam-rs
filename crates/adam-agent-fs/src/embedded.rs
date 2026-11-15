@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use crate::digest::{Digest, digest_with};
 use crate::load::parse_mcp;
 use crate::manifest::{
-    AgentManifest, InstructionPart, Instructions, Layout, Package, RemoteAgent, RemoteAuth, Report,
-    Schedule, Skill, SkillLayout, Subagent,
+    AgentManifest, Command, InstructionPart, Instructions, Layout, Package, RemoteAgent,
+    RemoteAuth, Report, Schedule, Skill, SkillLayout, Subagent,
 };
 use crate::schema::{AgentFrontmatter, McpConfig};
 use crate::source::ManifestSource;
@@ -101,6 +101,8 @@ pub struct EmbeddedAgent {
     pub mcp: Option<EmbeddedMcp>,
     /// The agent's schedules, sorted by name.
     pub schedules: &'static [EmbeddedSchedule],
+    /// The agent's commands, sorted by name.
+    pub commands: &'static [EmbeddedCommand],
 }
 
 impl EmbeddedAgent {
@@ -158,6 +160,12 @@ impl EmbeddedAgent {
                 .iter()
                 .copied()
                 .map(EmbeddedSchedule::to_schedule)
+                .collect(),
+            commands: self
+                .commands
+                .iter()
+                .copied()
+                .map(EmbeddedCommand::to_command)
                 .collect(),
         })
     }
@@ -416,6 +424,33 @@ impl EmbeddedSchedule {
     }
 }
 
+/// A command (`commands/<name>.md`).
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddedCommand {
+    /// The file stem.
+    pub name: &'static str,
+    /// What it does.
+    pub description: &'static str,
+    /// What follows the name, for a client to show.
+    pub argument_hint: Option<&'static str>,
+    /// The template.
+    pub template: &'static str,
+    /// The file, relative to the source root.
+    pub path: &'static str,
+}
+
+impl EmbeddedCommand {
+    fn to_command(self) -> Command {
+        Command {
+            name: self.name.to_owned(),
+            description: self.description.to_owned(),
+            argument_hint: self.argument_hint.map(str::to_owned),
+            template: self.template.to_owned(),
+            path: PathBuf::from(self.path),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +469,7 @@ mod tests {
         subagents: &[],
         mcp: None,
         schedules: &[],
+        commands: &[],
     };
 
     static WITH_SKILL: EmbeddedAgent = EmbeddedAgent {

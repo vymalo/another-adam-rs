@@ -12,6 +12,15 @@ use crate::{Diagnostic, Error};
 /// (`adam-assembly`) refuse it again, whatever the source.
 pub const SKILL_RESOURCE_LIMIT: u64 = 1024 * 1024;
 
+/// The most commands one agent may have.
+pub const MAX_COMMANDS: usize = 50;
+/// The most characters of a command's `description`.
+pub const COMMAND_DESCRIPTION_MAX: usize = 200;
+/// The most characters of a command's `argument-hint`.
+pub const COMMAND_HINT_MAX: usize = 100;
+/// The most bytes of a command's template: the same cap as the text it expands to.
+pub const COMMAND_TEMPLATE_MAX: usize = 32 * 1024;
+
 /// How a skill is laid out on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SkillLayout {
@@ -175,6 +184,24 @@ pub struct Schedule {
     pub path: PathBuf,
 }
 
+/// A command (`commands/<name>.md`): a prompt template an agent serves, expanded by the agent
+/// when a message invokes it (`commands/v1`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Command {
+    /// The file stem; the agent-name rule.
+    pub name: String,
+    /// What it does, at most 200 characters.
+    pub description: String,
+    /// What follows the name, for a client to show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    /// The body, with `$ARGUMENTS` and `$1` to `$9`, LF line endings, trimmed.
+    pub template: String,
+    /// The file, relative to the source root.
+    #[serde(serialize_with = "portable_path")]
+    pub path: PathBuf,
+}
+
 /// One agent with everything that belongs to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentManifest {
@@ -195,6 +222,11 @@ pub struct AgentManifest {
     pub mcp: Option<McpConfig>,
     /// The agent's schedules (root agents only), sorted by name.
     pub schedules: Vec<Schedule>,
+    /// The agent's commands (root agents only), sorted by name. Left out of the JSON (and so of
+    /// the digest) when there are none, so the digest of a folder without `commands/` is what it
+    /// was before commands existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<Command>,
 }
 
 /// How the agents of a package are laid out.

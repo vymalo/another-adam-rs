@@ -65,7 +65,7 @@
 //! #     path: "agent/instructions.md".into(),
 //! #     frontmatter,
 //! #     instructions: Instructions { body: "Hi.".into(), parts: vec![] },
-//! #     skills: vec![], subagents: vec![], mcp: None, schedules: vec![],
+//! #     skills: vec![], subagents: vec![], mcp: None, schedules: vec![], commands: vec![],
 //! # };
 //! let error = AgentDef::from_manifest(manifest)?.bind(ToolSet::new()).unwrap_err();
 //! assert!(matches!(error, Error::UnknownTool { .. }));
