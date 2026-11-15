@@ -92,6 +92,15 @@ fn walk_error(e: &WalkError) -> KeptError {
     }
 }
 
+/// How the removal of a run's outputs ended.
+enum Removal {
+    Done,
+    /// `outputs` is a link or a file: nothing was removed.
+    Hijacked,
+    /// Something nested too deep was left.
+    TooDeep,
+}
+
 /// Where `outputs` is.
 enum Place {
     Dir(Dir),
@@ -113,20 +122,55 @@ const MAX_REMOVE_DEPTH: usize = 32;
 
 /// Remove what is in `dir`, below it only: a directory is opened without following a link and
 /// emptied first, a link or a file is unlinked.
-fn remove_contents(dir: &Dir, depth: usize) -> io::Result<()> {
-    if depth > MAX_REMOVE_DEPTH {
-        return Err(io::Error::other("kept output is nested too deep to remove"));
-    }
+///
+/// A directory that cannot be opened (a command made it `000`) is made private through the handle
+/// that holds it and opened again, once. `false` when something was left because it is nested too
+/// deep: what could be removed is.
+fn remove_contents(dir: &Dir, depth: usize) -> io::Result<bool> {
+    let mut complete = true;
     for (name, meta) in dir.entries()? {
-        if meta.is_dir() {
-            let inner = dir.open_dir(&name)?;
-            remove_contents(&inner, depth + 1)?;
-            dir.rmdir(&name)?;
-        } else {
+        if !meta.is_dir() {
             dir.unlink(&name)?;
+        } else if depth >= MAX_REMOVE_DEPTH {
+            complete = false;
+        } else {
+            let inner = match dir.open_dir(&name) {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    dir.make_private(&name)?;
+                    dir.open_dir(&name)?
+                }
+                other => other?,
+            };
+            if remove_contents(&inner, depth + 1)? {
+                dir.rmdir(&name)?;
+            } else {
+                complete = false;
+            }
         }
     }
-    Ok(())
+    Ok(complete)
+}
+
+/// The runs whose removal went wrong, so that the log says it once for a run in a process and not at
+/// every sweep.
+static WARNED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn warn_once(run: &str, what: &str) {
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.iter().any(|r| r == run) {
+        if warned.len() >= 1024 {
+            warned.clear();
+        }
+        warned.push(run.to_owned());
+        tracing::warn!(%run, "{what}");
+    }
+}
+
+/// A blocking task that did not finish: a fixed text, since the text of a panic can hold anything.
+fn join_failed() -> KeptError {
+    KeptError::Io("the volume could not be reached".to_owned())
 }
 
 fn not_regular() -> KeptError {
@@ -175,35 +219,52 @@ impl FileKept {
         if !usable_run(run) {
             return Ok(());
         }
-        let (this, run) = (self.clone(), run.to_owned());
-        let removed = tokio::task::spawn_blocking(move || this.remove_run_blocking(&run))
+        let (this, owned) = (self.clone(), run.to_owned());
+        let removed = tokio::task::spawn_blocking(move || this.remove_run_blocking(&owned))
             .await
-            .map_err(io::Error::other)??;
-        if !removed {
-            warn_hijacked();
+            .map_err(io::Error::other)?;
+        match removed {
+            Ok(Removal::Done) => {}
+            Ok(Removal::Hijacked) => warn_hijacked(),
+            Ok(Removal::TooDeep) => warn_once(
+                run,
+                "kept output is nested too deep to remove it all: what could be removed was",
+            ),
+            // Said once: a directory that cannot be removed would be said at every sweep.
+            Err(e) => warn_once(
+                run,
+                &format!("cannot remove the kept output of a run ({})", e.kind()),
+            ),
         }
         Ok(())
     }
 
-    /// `false` when `outputs` is not a directory of its own (nothing was removed).
-    fn remove_run_blocking(&self, run: &str) -> io::Result<bool> {
+    fn remove_run_blocking(&self, run: &str) -> io::Result<Removal> {
         let outputs = match self.outputs_dir()? {
             Place::Dir(outputs) => outputs,
-            Place::Missing => return Ok(true),
-            Place::Hijacked => return Ok(false),
+            Place::Missing => return Ok(Removal::Done),
+            Place::Hijacked => return Ok(Removal::Hijacked),
         };
         let name = std::ffi::OsStr::new(run);
         match outputs.lstat(name) {
             Ok(meta) if meta.is_dir() => {
-                let dir = outputs.open_dir(name)?;
-                remove_contents(&dir, 0)?;
+                let dir = match outputs.open_dir(name) {
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                        outputs.make_private(name)?;
+                        outputs.open_dir(name)?
+                    }
+                    other => other?,
+                };
+                if !remove_contents(&dir, 0)? {
+                    return Ok(Removal::TooDeep);
+                }
                 outputs.rmdir(name)?;
             }
             Ok(_) => outputs.unlink(name)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(true)
+        Ok(Removal::Done)
     }
 
     /// The directory `outputs`, opened below the root without following a link.
@@ -286,11 +347,16 @@ impl FileKept {
         text: &str,
         omitted: u64,
     ) -> Result<KeptInfo, KeptError> {
+        #[cfg(test)]
+        assert!(text != tests::PANIC_SEAM, "payload of a panic");
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         // Scrubbed first, then cut and folded: a secret is never split by either.
-        let (scrubbed, omitted) = adam_llm_agent::scrubbed_for_keeping(text, omitted, |t| {
-            self.redactor.scrub(t).into_owned()
-        });
+        let (scrubbed, omitted) = adam_llm_agent::scrubbed_for_keeping(
+            text,
+            omitted,
+            |t| self.redactor.scrub(t).into_owned(),
+            self.redactor.margin(),
+        );
         let (prepared, cut) = prepare(&scrubbed, omitted);
         let _one_at_a_time = KEEP_LOCK
             .lock()
@@ -305,13 +371,11 @@ impl FileKept {
             if is_ours(&entry_name) && *entry_name != *name && meta.is_file() {
                 used += meta.size();
             } else if is_tmp(&entry_name) && meta.is_file() {
-                let age = self
-                    .run_dir(run)
-                    .map(|d| d.join(&entry))
-                    .and_then(|p| std::fs::symlink_metadata(p).ok())
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| SystemTime::now().duration_since(t).ok());
-                if age.is_some_and(|age| age > STALE_TMP) {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let age = now.saturating_sub(u64::try_from(meta.mtime_secs()).unwrap_or(now));
+                if age > STALE_TMP.as_secs() {
                     let _ = dir.unlink(&entry);
                 }
             }
@@ -412,7 +476,7 @@ impl KeptOutputs for FileKept {
         let (this, run, id, text) = (self.clone(), run.to_owned(), id.to_owned(), text.to_owned());
         tokio::task::spawn_blocking(move || this.keep_blocking(&run, &id, &text, omitted))
             .await
-            .map_err(|e| KeptError::Io(e.to_string()))?
+            .map_err(|_| join_failed())?
     }
 
     async fn page(
@@ -425,7 +489,7 @@ impl KeptOutputs for FileKept {
         let (this, run, id) = (self.clone(), run.to_owned(), id.to_owned());
         tokio::task::spawn_blocking(move || this.page_blocking(&run, &id, offset, limit))
             .await
-            .map_err(|e| KeptError::Io(e.to_string()))?
+            .map_err(|_| join_failed())?
     }
 }
 
@@ -677,6 +741,8 @@ mod tests {
         assert!(matches!(malformed, KeptError::Malformed(_)));
     }
 
+    /// A text that makes `keep_blocking` panic (a seam for the test of a join failure).
+    pub(super) const PANIC_SEAM: &str = "\0\0panic-seam";
     const SECRET: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz"; // 40 bytes: 30 more than its mark
     const CAPTURE: usize = adam_llm_agent::MAX_KEPT_BYTES + adam_llm_agent::SCRUB_OVERLAP;
 
@@ -694,7 +760,13 @@ mod tests {
 
     /// Nothing of the secret in the file, nor on any page of it.
     async fn assert_clean(store: &FileKept, root: &Path, id: &str, what: &str) {
-        assert_no_part(&std::fs::read_to_string(file_of(root, id)).unwrap(), what);
+        let kept = std::fs::read_to_string(file_of(root, id)).unwrap();
+        assert_no_part(&kept, what);
+        // Something is kept (the secrets that are whole are replaced, and the filler is there).
+        assert!(
+            kept.contains("[redacted]"),
+            "{what}: the secret is not replaced"
+        );
         let mut offset = 1;
         loop {
             let page = store.page(RUN, id, offset, 2000).await.unwrap();
@@ -710,7 +782,12 @@ mod tests {
     /// The file, and the first and the last page (a page reads the file from its start: not all of
     /// a file of many thousand lines).
     async fn assert_clean_ends(store: &FileKept, root: &Path, id: &str, what: &str) {
-        assert_no_part(&std::fs::read_to_string(file_of(root, id)).unwrap(), what);
+        let kept = std::fs::read_to_string(file_of(root, id)).unwrap();
+        assert_no_part(&kept, what);
+        assert!(
+            kept.contains("[redacted]") && kept.len() > 8 * 1024 * 1024,
+            "{what}: little is kept"
+        );
         for offset in [1, -30] {
             assert_no_part(&store.page(RUN, id, offset, 2000).await.unwrap(), what);
         }
@@ -732,6 +809,8 @@ mod tests {
         let info = store.keep(RUN, &id, &text, 1_000_000).await.unwrap();
         assert!(info.cut);
         assert_clean(&store, root.path(), &id, "the capture's end").await;
+        let kept = std::fs::metadata(file_of(root.path(), &id)).unwrap().len();
+        assert!(kept > 15 * 1024 * 1024, "the filler is kept: {kept}");
     }
 
     /// The same where the scrubbed text grows (a 4-character secret becomes 10), and where the
@@ -969,6 +1048,111 @@ mod tests {
 
     fn logged(sink: &Sink) -> String {
         String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned()
+    }
+
+    /// A secret of 150 KiB, longer than any margin that is only assumed: it starts 100 KiB before the
+    /// end of the capture and goes beyond it. The margin is the longest value the redactor holds, so
+    /// none of it is kept (and a whole one earlier is replaced, and the filler is kept).
+    #[tokio::test]
+    async fn a_secret_longer_than_64_kib_is_not_kept_in_part_at_the_end_of_the_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let big = format!("BiG-{}", "0123456789ABCDEF".repeat(9400)); // 150,404 bytes
+        let store = FileKept::new(root.path(), Redactor::new([big.as_str()]));
+        let id = id("c1");
+        let len = adam_llm_agent::MAX_KEPT_BYTES + 250_000;
+        let mut text = format!("early {big} done\n");
+        let filler = "xyxzyzx".repeat(len / 7 + 1);
+        text.push_str(&filler[..len - 100_000 - text.len()]);
+        text.push_str(&big[..100_000]);
+        assert_eq!(text.len(), len);
+        let info = store.keep(RUN, &id, &text, 1_000_000).await.unwrap();
+        assert!(info.cut);
+        let kept = std::fs::read_to_string(file_of(root.path(), &id)).unwrap();
+        assert!(
+            !kept.contains("BiG-01234567"),
+            "the start of the secret is kept"
+        );
+        assert!(
+            kept.starts_with("early [redacted] done\nxyxz"),
+            "{}",
+            &kept[..60]
+        );
+        assert!(
+            kept.len() > 15 * 1024 * 1024,
+            "the filler is kept: {}",
+            kept.len()
+        );
+        let page = store.page(RUN, &id, -5, 10).await.unwrap();
+        assert!(
+            !page.contains("BiG-0123") && page.contains("xyxz"),
+            "{page}"
+        );
+    }
+
+    /// A blocking task that panics is a fixed text for the model: the text of a panic can hold anything.
+    #[tokio::test]
+    async fn a_keep_that_panics_says_nothing_of_the_panic() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        let err = store
+            .keep(RUN, &id("c1"), PANIC_SEAM, 0)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("payload") && !err.contains("panicked"),
+            "{err}"
+        );
+    }
+
+    /// A run directory nested deeper than the removal goes: what can be removed is, the rest is said
+    /// once for the run in this process, and the sweep that comes again says nothing more.
+    #[tokio::test]
+    async fn a_run_nested_too_deep_is_removed_as_far_as_it_goes_and_said_once() {
+        let (sink, _guard) = capture_logs();
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        let run = "00000000-0000-4000-8000-0000000000aa";
+        keep(&store, run, &adam_llm_agent::output_id(run, "c"), "x\n")
+            .await
+            .unwrap();
+        let mut deep = root.path().join("outputs").join(run);
+        std::fs::write(deep.join("top.txt"), "top\n").unwrap();
+        for _ in 0..40 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("bottom.txt"), "bottom\n").unwrap();
+        store.remove_run(run).await.unwrap();
+        let first = logged(&sink);
+        assert!(first.contains("nested too deep"), "{first}");
+        assert!(
+            !root
+                .path()
+                .join("outputs")
+                .join(run)
+                .join("top.txt")
+                .exists()
+        );
+        store.remove_run(run).await.unwrap();
+        assert_eq!(logged(&sink), first, "said again at the next sweep");
+    }
+
+    /// A directory a command made unreadable is made private through the handle that holds it and
+    /// removed (as any user but root can tell: root reads it anyway).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_made_unreadable_is_removed_all_the_same() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        keep(&store, RUN, &id("a"), "x\n").await.unwrap();
+        let dir = root.path().join("outputs").join(RUN).join("locked");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "f\n").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        store.remove_run(RUN).await.unwrap();
+        assert!(!root.path().join("outputs").join(RUN).exists());
     }
 
     /// `outputs` is a link to the workspaces: the janitor lists and removes nothing there, and says

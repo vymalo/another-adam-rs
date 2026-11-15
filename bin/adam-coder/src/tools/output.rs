@@ -82,19 +82,31 @@ pub(super) async fn settle(env: &ToolEnv, ctx: &ToolCtx, outcome: &mut ShellOutc
     // the start of the output ends wherever the limit fell: it goes to the keeper as it is, and the
     // keeper cuts its end back (`KeptOutputs::keep`); the head is made from a part of it, cut back
     // the same way.
+    let margin = redactor.margin();
     let full = if whole {
         scrub(&captured)
     } else {
         String::new()
     };
+    // Long as it was printed, short once scrubbed (a thousand secrets of 40 bytes): it fits the view,
+    // so it is shown whole, and nothing is kept.
+    if whole && full.len() <= cap {
+        outcome.truncated = false;
+        outcome.tail = full;
+        return;
+    }
     let head_src = if whole {
         None
     } else {
-        let mut end = (head_cap + 2 * adam_llm_agent::SCRUB_OVERLAP).min(captured.len());
+        let mut end = (head_cap + 2 * margin).min(captured.len());
         while !captured.is_char_boundary(end) {
             end -= 1;
         }
-        Some(adam_llm_agent::scrub_open_end(&captured[..end], scrub))
+        Some(adam_llm_agent::scrub_open_end(
+            &captured[..end],
+            scrub,
+            margin,
+        ))
     };
     outcome.head = head_of(head_src.as_deref().unwrap_or(&full), head_cap).to_owned();
     outcome.tail = if whole {
@@ -102,11 +114,12 @@ pub(super) async fn settle(env: &ToolEnv, ctx: &ToolCtx, outcome: &mut ShellOutc
     } else {
         // The output outgrew what is captured: the tail the shell tracked is the real one. It
         // starts wherever the buffer ended, so its start is cut back as the capture's end is.
-        let tail = adam_llm_agent::scrub_open_start(&lossless(tail_raw), scrub);
+        let tail = adam_llm_agent::scrub_open_start(&lossless(tail_raw), scrub, margin);
         tail_of(&tail, tail_cap).to_owned()
     };
     let hidden = if whole {
-        (full.len() - outcome.head.len() - outcome.tail.len()) as u64
+        full.len()
+            .saturating_sub(outcome.head.len() + outcome.tail.len()) as u64
     } else {
         outcome
             .total
@@ -232,7 +245,7 @@ pub(super) fn section(outcome: &ShellOutcome) -> String {
     if note.refused.is_none() {
         let cut = if note.cut {
             format!(
-                "; only the first {} of {} bytes are kept",
+                "; only the first {} of {} bytes are kept (the first number counts the scrubbed text, the second the output)",
                 note.stored, outcome.total
             )
         } else {

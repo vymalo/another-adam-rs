@@ -230,7 +230,7 @@ pub fn prepare(text: &str, omitted: u64) -> (Cow<'_, str>, bool) {
         }
         let _ = writeln!(
             out,
-            "(output cut: only the first {} of {} bytes are kept)",
+            "(output cut: only the first {} of {} bytes are kept; the first number counts the scrubbed text, the second the output)",
             text.len(),
             text.len() as u64 + omitted + tail_dropped
         );
@@ -275,7 +275,7 @@ pub fn kept_header(id: &str, info: &KeptInfo, total_bytes: u64) -> String {
     if info.cut {
         let _ = write!(
             line,
-            "; only the first {} of {total_bytes} bytes are kept",
+            "; only the first {} of {total_bytes} bytes are kept (the first number counts the scrubbed text, the second the output)",
             info.bytes
         );
     }
@@ -321,40 +321,53 @@ fn lost_view(why: &KeptError) -> String {
     format!("[not kept: {why}; the result is lost and none of it is shown]")
 }
 
+/// The most bytes a replacement of a secret can share with the secret's own bytes where the two
+/// scrubs of an open edge diverge (the replacement is `[redacted]`: 10 bytes, 9 of them could match a
+/// secret that starts `[red`). A cut that is not at the end of the agreement is backed off by this.
+const REPLACEMENT_SLACK: usize = 16;
+
 /// `text`, which is only the **first part** of a longer output, scrubbed with `scrub` and cut back
 /// so that no part of a secret is left at its end.
 ///
 /// The end of such a text may be the first half of a secret that `scrub` cannot recognise, and the
 /// scrubbed length says nothing about where in the raw text a cut falls (a replacement is shorter or
-/// longer than the value). So the text is scrubbed whole, and again without its last
-/// [`SCRUB_OVERLAP`] bytes (no secret is longer): what the two agree on is the text up to the first
-/// place where a secret straddles the new end, which is replaced in the one and cut in the other.
-/// The result is scrubbed, and never longer than the text scrubbed whole.
-pub fn scrub_open_end(text: &str, scrub: impl Fn(&str) -> String) -> String {
-    let mut keep = text.len().saturating_sub(SCRUB_OVERLAP);
+/// longer than its value). So the text is scrubbed whole, and again without its last `margin` bytes:
+/// what the two agree on is the text up to the first place where a secret straddles the new end,
+/// which is replaced in the one and cut in the other. `margin` is the length of the longest value
+/// `scrub` replaces, derived forms included, and at least [`SCRUB_OVERLAP`]: a caller that holds a
+/// longer value must say so, because a value longer than the margin can be kept in part. Where the
+/// two diverge the agreement is backed off a little (a secret that starts like the replacement
+/// agrees with it for a few bytes). The result is scrubbed.
+pub fn scrub_open_end(text: &str, scrub: impl Fn(&str) -> String, margin: usize) -> String {
+    let margin = margin.max(SCRUB_OVERLAP);
+    let mut keep = text.len().saturating_sub(margin);
     while !text.is_char_boundary(keep) {
         keep -= 1;
     }
-    let whole = scrub(text);
+    let mut whole = scrub(text);
     let part = scrub(&text[..keep]);
     let agree = whole
         .bytes()
         .zip(part.bytes())
         .take_while(|(a, b)| a == b)
         .count();
-    let mut end = agree;
+    let mut end = if agree < part.len() {
+        agree.saturating_sub(REPLACEMENT_SLACK)
+    } else {
+        agree
+    };
     while !whole.is_char_boundary(end) {
         end -= 1;
     }
-    let mut whole = whole;
     whole.truncate(end);
     whole
 }
 
 /// [`scrub_open_end`] for a text that is only the **last part** of a longer output: scrubbed, and
 /// without a part of a secret at its start.
-pub fn scrub_open_start(text: &str, scrub: impl Fn(&str) -> String) -> String {
-    let mut from = SCRUB_OVERLAP.min(text.len());
+pub fn scrub_open_start(text: &str, scrub: impl Fn(&str) -> String, margin: usize) -> String {
+    let margin = margin.max(SCRUB_OVERLAP);
+    let mut from = margin.min(text.len());
     while !text.is_char_boundary(from) {
         from += 1;
     }
@@ -366,7 +379,12 @@ pub fn scrub_open_start(text: &str, scrub: impl Fn(&str) -> String) -> String {
         .zip(part.bytes().rev())
         .take_while(|(a, b)| a == b)
         .count();
-    let mut start = whole.len() - agree;
+    let used = if agree < part.len() {
+        agree.saturating_sub(REPLACEMENT_SLACK)
+    } else {
+        agree
+    };
+    let mut start = whole.len() - used;
     while !whole.is_char_boundary(start) {
         start += 1;
     }
@@ -407,7 +425,8 @@ pub async fn keep_long_cut(
     }
     // No keeper to scrub: the context's hook does it, before the fold, which could split a value
     // across two lines.
-    let (scrubbed, omitted) = scrubbed_for_keeping(text, omitted, |t| ctx.scrub(t));
+    let (scrubbed, omitted) =
+        scrubbed_for_keeping(text, omitted, |t| ctx.scrub(t), ctx.scrub_margin());
     let (prepared, cut) = prepare(&scrubbed, omitted);
     if prepared.len() <= ctx.kept_left() {
         let info = KeptInfo {
@@ -434,17 +453,18 @@ pub async fn keep_long_cut(
 
 /// What a keeper makes of the `text` it is given, before it cuts and folds it: scrubbed with
 /// `scrub`, and, when `omitted` is not 0 (the text is the first part of a longer output), cut back
-/// at its end by [`scrub_open_end`]. With the `omitted` to keep: what was left out, counted again
+/// at its end by [`scrub_open_end`] with `margin` (the longest value `scrub` replaces). With the `omitted` to keep: what was left out, counted again
 /// for what the cut back took (never 0 for a text that was cut).
 pub fn scrubbed_for_keeping(
     text: &str,
     omitted: u64,
     scrub: impl Fn(&str) -> String,
+    margin: usize,
 ) -> (String, u64) {
     if omitted == 0 {
         return (scrub(text), 0);
     }
-    let scrubbed = scrub_open_end(text, scrub);
+    let scrubbed = scrub_open_end(text, scrub, margin);
     let total = text.len() as u64 + omitted;
     let omitted = total.saturating_sub(scrubbed.len() as u64).max(1);
     (scrubbed, omitted)
@@ -538,6 +558,7 @@ impl Tool for ReadOutput {
 pub struct MemoryKept {
     kept: Mutex<HashMap<(String, String), String>>,
     scrub: Option<Scrub>,
+    margin: usize,
 }
 
 type Scrub = Arc<dyn Fn(&str) -> String + Send + Sync>;
@@ -546,6 +567,14 @@ impl MemoryKept {
     /// An empty one.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The length of the longest value the scrubber replaces, when it is over [`SCRUB_OVERLAP`]: the
+    /// margin the end of a cut text is kept back by.
+    #[must_use]
+    pub fn with_margin(mut self, longest: usize) -> Self {
+        self.margin = longest;
+        self
     }
 
     /// Scrub what is kept with `scrub` first.
@@ -569,10 +598,15 @@ impl KeptOutputs for MemoryKept {
             return Err(KeptError::Malformed(id.to_owned()));
         }
         // Scrubbed first, then folded and cut: a secret is never split by either.
-        let (scrubbed, omitted) = scrubbed_for_keeping(text, omitted, |t| match &self.scrub {
-            Some(scrub) => scrub(t),
-            None => t.to_owned(),
-        });
+        let (scrubbed, omitted) = scrubbed_for_keeping(
+            text,
+            omitted,
+            |t| match &self.scrub {
+                Some(scrub) => scrub(t),
+                None => t.to_owned(),
+            },
+            self.margin,
+        );
         let (prepared, cut) = prepare(&scrubbed, omitted);
         let info = KeptInfo {
             bytes: prepared.len() as u64,
@@ -701,11 +735,11 @@ pub async fn kept_outputs_conformance(store: &dyn KeptOutputs) {
     );
     let page = store.page(run, &id4, -2, 10).await.unwrap();
     assert!(
-        page.contains("(output cut: only the first") && page.contains(" bytes are kept)"),
+        page.contains("(output cut: only the first") && page.contains(" bytes are kept;"),
         "{page}"
     );
     assert!(
-        page.contains(&format!(" of {} bytes are kept)", first_part.len() + 996)),
+        page.contains(&format!(" of {} bytes are kept;", first_part.len() + 996)),
         "{page}"
     );
 
@@ -847,10 +881,36 @@ mod tests {
 
     const LONG_SECRET: &str = "SeCrEt-0123456789-ABCDEF-tail"; // 29 bytes, none of `xyz \n`
     const SHORT_SECRET: &str = "QqQq"; // replacing it makes the text longer
+    /// One that is a prefix of another: the scrubber replaces the longer first, as the coder's does.
+    const NEST_SHORT: &str = "NeSt-0123456789";
+    const NEST_LONG: &str = "NeSt-0123456789-longer-tail-9876";
+    /// Secrets that start (end) like the replacement text.
+    const LIKE_START: &str = "[redactedXYZ-0123456789-secret";
+    const LIKE_END: &str = "secret-0123456789-XYZredacted]";
+
+    /// A secret longer than the margin everyone assumes.
+    fn big_secret() -> String {
+        format!("BiG-{}", "0123456789ABCDEF".repeat(4400)) // 70,404 bytes
+    }
 
     fn scrubber(t: &str) -> String {
-        t.replace(LONG_SECRET, "[redacted]")
-            .replace(SHORT_SECRET, "[redacted]")
+        let big = big_secret();
+        let mut out = t.to_owned();
+        // Longest first, as a redactor sorts its needles.
+        for secret in [
+            big.as_str(),
+            NEST_LONG,
+            LONG_SECRET,
+            LIKE_START,
+            LIKE_END,
+            NEST_SHORT,
+            SHORT_SECRET,
+        ] {
+            if out.contains(secret) {
+                out = out.replace(secret, "[redacted]");
+            }
+        }
+        out
     }
 
     /// A text of filler with no secret in it, `n` bytes long.
@@ -859,12 +919,31 @@ mod tests {
         unit.repeat(n / unit.len() + 1)[..n].to_owned()
     }
 
-    /// No 8-byte window of a secret is in `text`: a window cannot be in filler by chance.
+    /// No 8-byte window of a secret is in `text`: a window cannot be in filler by chance (the
+    /// replacement `[redacted]` holds none of them either).
     fn assert_no_part(text: &str, what: &str) {
-        for secret in [LONG_SECRET, SHORT_SECRET] {
-            for w in secret.as_bytes().windows(secret.len().min(8)) {
-                let w = std::str::from_utf8(w).unwrap();
-                assert!(!text.contains(w), "{what}: `{w}` is left in the text");
+        let big = big_secret();
+        for secret in [
+            LONG_SECRET,
+            SHORT_SECRET,
+            NEST_LONG,
+            LIKE_START,
+            LIKE_END,
+            big.as_str(),
+        ] {
+            let bytes = secret.as_bytes();
+            let edges = [
+                &bytes[..bytes.len().min(300)],
+                &bytes[bytes.len().saturating_sub(300)..],
+            ];
+            for part in edges {
+                for w in part.windows(part.len().min(8)) {
+                    let w = std::str::from_utf8(w).unwrap();
+                    assert!(
+                        !text.contains(w) || "[redacted]".contains(w),
+                        "{what}: `{w}` is left in the text"
+                    );
+                }
             }
         }
     }
@@ -877,10 +956,34 @@ mod tests {
         let mut text = format!("{LONG_SECRET}\n").repeat(3000);
         text.push_str(&filler(300_000, true));
         text.push_str(&LONG_SECRET[..20]);
-        let out = scrub_open_end(&text, scrubber);
+        let out = scrub_open_end(&text, scrubber, SCRUB_OVERLAP);
         assert_no_part(&out, "the capture's end");
         assert!(out.starts_with("[redacted]\n[redacted]\n"), "scrubbed");
         assert!(out.len() > 200_000, "the rest is kept: {}", out.len());
+    }
+
+    /// A secret longer than the margin: its first 70 KiB-minus-the-margin would be kept by a
+    /// margin that is only assumed, and the margin the caller states (the longest value) keeps none.
+    #[test]
+    fn a_secret_longer_than_the_default_margin_needs_the_margin_the_caller_states() {
+        let big = big_secret();
+        // The text ends 66,000 bytes into the secret: more than 64 KiB, less than it all.
+        let mut text = filler(200_000, true);
+        text.push_str(&big[..66_000]);
+        let weak = scrub_open_end(&text, scrubber, SCRUB_OVERLAP);
+        assert!(
+            weak.contains("BiG-0123456789"),
+            "the default margin keeps its start"
+        );
+        let strong = scrub_open_end(&text, scrubber, big.len());
+        assert_no_part(&strong, "the stated margin");
+        assert!(strong.len() > 100_000, "the filler before it is kept");
+        // The same at the start of a last part.
+        let mut text = big[big.len() - 66_000..].to_owned();
+        text.push_str(&filler(200_000, true));
+        let strong = scrub_open_start(&text, scrubber, big.len());
+        assert_no_part(&strong, "the start, stated margin");
+        assert!(strong.len() > 100_000);
     }
 
     #[test]
@@ -890,9 +993,38 @@ mod tests {
                 let mut text = filler(200_000, lines);
                 let at = (text.len() as i64 - SCRUB_OVERLAP as i64 + offset) as usize;
                 text.replace_range(at..at + LONG_SECRET.len(), LONG_SECRET);
-                let out = scrub_open_end(&text, scrubber);
+                let out = scrub_open_end(&text, scrubber, SCRUB_OVERLAP);
                 assert_no_part(&out, &format!("offset {offset}"));
                 assert!(out.len() > 100_000);
+            }
+        }
+    }
+
+    /// A secret that starts like the replacement (`[red...`) agrees with it for a few bytes where the
+    /// two scrubs diverge: the agreement is backed off, so none of it is kept. Mirrored at the start.
+    #[test]
+    fn a_secret_that_starts_or_ends_like_the_replacement_keeps_none_of_itself() {
+        for secret in [LIKE_START, LIKE_END] {
+            for cut_in in [3, 8, 14, secret.len() - 1] {
+                let mut text = filler(200_000, true);
+                let at = text.len() - SCRUB_OVERLAP - cut_in;
+                text.replace_range(at..at + secret.len(), secret);
+                let out = scrub_open_end(&text, scrubber, SCRUB_OVERLAP);
+                assert_no_part(&out, secret);
+                // Every `[redacted` is a whole replacement: none is the start of the secret.
+                assert_eq!(
+                    out.matches("[redacted").count(),
+                    out.matches("[redacted]").count()
+                );
+                let mut text = filler(200_000, true);
+                let at = SCRUB_OVERLAP - cut_in;
+                text.replace_range(at..at + secret.len(), secret);
+                let out = scrub_open_start(&text, scrubber, SCRUB_OVERLAP);
+                assert_no_part(&out, secret);
+                assert_eq!(
+                    out.matches("redacted]").count(),
+                    out.matches("[redacted]").count()
+                );
             }
         }
     }
@@ -902,7 +1034,7 @@ mod tests {
         let mut text = format!("{SHORT_SECRET}\n").repeat(40_000);
         text.push_str(&filler(1000, true));
         text.push_str(&LONG_SECRET[..20]);
-        let out = scrub_open_end(&text, scrubber);
+        let out = scrub_open_end(&text, scrubber, SCRUB_OVERLAP);
         assert_no_part(&out, "grown");
         assert!(
             out.len() > text.len() - SCRUB_OVERLAP,
@@ -916,7 +1048,7 @@ mod tests {
             let mut text = LONG_SECRET[9..].to_owned();
             text.push_str(&format!("{LONG_SECRET}\n").repeat(3000));
             text.push_str(&filler(100_000, lines));
-            let out = scrub_open_start(&text, scrubber);
+            let out = scrub_open_start(&text, scrubber, SCRUB_OVERLAP);
             assert_no_part(&out, "the start");
             assert!(out.len() > 90_000, "{}", out.len());
         }
@@ -924,38 +1056,77 @@ mod tests {
 
     #[test]
     fn a_text_shorter_than_the_margin_keeps_nothing_of_its_end() {
-        assert_eq!(scrub_open_end("short", scrubber), "");
-        assert_eq!(scrub_open_start("short", scrubber), "");
+        assert_eq!(scrub_open_end("short", scrubber, SCRUB_OVERLAP), "");
+        assert_eq!(scrub_open_start("short", scrubber, SCRUB_OVERLAP), "");
     }
 
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
 
-        /// Whatever the secrets and the cut: random filler with secrets of both lengths at random
-        /// offsets, and a random cut that may fall inside one, never leaves an 8-byte part of one at
-        /// the end (the start) of what is kept. Filler holds only `x`, `y`, `z`, space and newline, so
-        /// an 8-byte window of a secret is not there by chance.
+        /// Whatever the secrets and the cut: random filler with secrets at random offsets, and a
+        /// random cut, never leaves an 8-byte part of one at the end (the start) of what is kept.
+        /// The secrets are of both lengths, nested (one is a prefix of another), starting or ending
+        /// like the replacement, and one of 70 KiB (the margin stated is its length). **Half of the
+        /// cases (`straddle`) put one across the point the margin cuts at, by construction**, and the
+        /// others place them anywhere, a cut inside one then being by chance. Filler holds only `x`,
+        /// `y`, `z`, space and newline, so a window of a secret is not there by chance. Secrets sit on
+        /// a 64-byte grid from byte 64 (one to a slot: two overlapping are no secret), so that the
+        /// first bytes are filler and are kept.
         #[test]
         fn no_part_of_a_secret_survives_a_cut_at_either_end(
-            len in 70_000usize..160_000,
-            places in proptest::collection::vec((0usize..160_000, proptest::bool::ANY), 0..400),
-            cut in 66_000usize..160_000,
+            len in 160_000usize..260_000,
+            places in proptest::collection::vec((0usize..260_000, 0usize..8), 0..300),
+            cut in 150_000usize..260_000,
             lines in proptest::bool::ANY,
+            straddle in proptest::bool::ANY,
+            kind in 0usize..8,
+            inside in 0usize..400,
         ) {
-            let mut text = filler(len, lines);
-            // On a 64-byte grid, one secret to a slot: no two overlap (a half-overwritten secret
-            // is not a secret, and would be left by any scrubber).
-            let mut used = std::collections::HashSet::new();
-            for (at, long) in places {
-                let at = at / 64 * 64;
-                let secret = if long { LONG_SECRET } else { SHORT_SECRET };
-                if used.insert(at) && at + secret.len() <= text.len() {
-                    text.replace_range(at..at + secret.len(), secret);
+            let big = big_secret();
+            let secrets = [
+                LONG_SECRET, SHORT_SECRET, NEST_SHORT, NEST_LONG, LIKE_START, LIKE_END,
+                big.as_str(), LONG_SECRET,
+            ];
+            let margin = big.len();
+            let at = cut.min(len);
+            // Place on the text for the end (the slice [..at]) and, mirrored, for the start.
+            let place = |text: &mut String, wanted: Vec<(usize, usize)>| {
+                let mut used = std::collections::HashSet::new();
+                for (pos, k) in wanted {
+                    let secret = secrets[k];
+                    let pos = (pos / 64).max(1) * 64;
+                    let slots = secret.len() / 64 + 1;
+                    if (pos / 64..pos / 64 + slots).any(|s| used.contains(&s))
+                        || pos + secret.len() + 64 > text.len()
+                    {
+                        continue;
+                    }
+                    used.extend(pos / 64..pos / 64 + slots);
+                    text.replace_range(pos..pos + secret.len(), secret);
                 }
+            };
+            let mut wanted: Vec<(usize, usize)> = places.clone();
+            let secret = secrets[kind];
+            if straddle {
+                // Across the point a keeper cuts at: `margin` before the end of the slice.
+                let from = at.saturating_sub(margin + inside % (secret.len() + 1));
+                wanted.insert(0, (from, kind));
             }
-            let at = cut.min(text.len());
-            assert_no_part(&scrub_open_end(&text[..at], scrubber), "end");
-            assert_no_part(&scrub_open_start(&text[text.len() - at..], scrubber), "start");
+            let mut head = filler(at, lines);
+            place(&mut head, wanted.clone());
+            let out = scrub_open_end(&head, scrubber, margin);
+            assert_no_part(&out, "end");
+            assert!(out.starts_with(&head[..32]), "the first bytes are kept");
+            // The start: the same slice, cut so that the margin falls inside a secret.
+            let mut tail = filler(at, lines);
+            let mut wanted_tail: Vec<(usize, usize)> = places;
+            if straddle {
+                wanted_tail.insert(0, ((margin.saturating_sub(inside % (secret.len() + 1))).max(64), kind));
+            }
+            place(&mut tail, wanted_tail);
+            let out = scrub_open_start(&tail, scrubber, margin);
+            assert_no_part(&out, "start");
+            assert!(out.ends_with(&tail[tail.len() - 32..]), "the last bytes are kept");
         }
     }
 

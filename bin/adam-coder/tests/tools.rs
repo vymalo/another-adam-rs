@@ -687,6 +687,44 @@ async fn a_replayed_failing_check_counts_one_cycle() {
     }
 }
 
+/// The tail of a long output that the base commit's run keeps (and the notes and the model read) is
+/// cut at its start: a secret across that cut leaves no part of itself, as the first run's view and
+/// the notes show.
+#[tokio::test]
+async fn the_base_commits_output_tail_keeps_no_part_of_a_secret_cut_by_its_start() {
+    // A tail of 1,500 bytes (the base's own cut is 2,000, so all of the tail is shown): the token
+    // starts ten bytes before it, and no newline is near.
+    let tail = 1_500;
+    let rig = Rig::from(Fixture::with(|s| s.check_output_tail = tail).await);
+    rig.prepare().await;
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!(
+        "echo x >> {}; head -c 40000 /dev/zero | tr '\\0' a; printf %s '{}'; \
+         head -c {} /dev/zero | tr '\\0' b; exit 2",
+        counter.display(),
+        common::GITHUB_TOKEN,
+        tail - common::GITHUB_TOKEN.len() + 10
+    );
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert_eq!(runs_of(&counter), 2, "in the worktree, then on the base");
+    let notes = notes_of(&rig).await;
+    let base = &notes.checks.base[0].tail;
+    for w in common::GITHUB_TOKEN.as_bytes().windows(8) {
+        let w = std::str::from_utf8(w).unwrap();
+        assert!(!base.contains(w), "the base's tail holds `{w}`");
+        assert!(!out.content.contains(w), "the result holds `{w}`");
+    }
+    assert!(
+        base.contains("bbbbbbbb"),
+        "the tail is there: {base:?} {}",
+        out.content
+    );
+}
+
 /// A context for another call of the same run: a new call id, the same root run.
 fn another_call(rig: &Rig, id: &str) -> ToolCtx {
     ToolCtx::detached("tool", id, Arc::new(CollectingSink::new()))

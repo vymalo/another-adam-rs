@@ -63,6 +63,8 @@ struct Registered {
     /// Every needle of both, longest first, so that a secret that contains another is replaced
     /// whole.
     needles: Vec<String>,
+    /// The length of the longest needle (its base64 and other derived forms included).
+    longest: usize,
 }
 
 impl Registered {
@@ -80,6 +82,7 @@ impl Registered {
         }
         needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
         needles.dedup();
+        self.longest = needles.first().map_or(0, String::len);
         self.needles = needles;
     }
 }
@@ -234,6 +237,18 @@ impl Redactor {
     pub fn step_io(&self) -> StepIo {
         let redactor = self.clone();
         StepIo::default().redact(move |text| redactor.scrub(text).into_owned())
+    }
+
+    /// The length in bytes of the longest value this redactor replaces, derived forms included.
+    pub fn longest(&self) -> usize {
+        self.read().longest
+    }
+
+    /// How far from the edge of a cut text a secret may still be only half there: the longest value
+    /// it holds, and at least [`SCRUB_OVERLAP`](adam_llm_agent::SCRUB_OVERLAP). What a keeper cuts
+    /// back at the open edge of a text, and what a capture holds beyond what it keeps.
+    pub fn margin(&self) -> usize {
+        self.longest().max(adam_llm_agent::SCRUB_OVERLAP)
     }
 
     /// Whether nothing is registered.

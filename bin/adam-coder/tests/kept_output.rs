@@ -525,6 +525,174 @@ async fn the_tracked_tail_of_a_long_output_does_not_start_in_part_of_a_secret() 
     assert_no_part(&out.content, "the tail");
 }
 
+/// The longest value the redactor holds for a secret of `n` bytes: its base64 form of
+/// `x-access-token:<secret>` (padded), which is the margin a cut text is cut back by (at least 64 KiB).
+fn margin_for(n: usize) -> usize {
+    (4 * (n + 15).div_ceil(3)).max(adam_llm_agent::SCRUB_OVERLAP)
+}
+
+const BIG: usize = 150_000;
+
+/// A secret of 150,000 `S` that the process holds, and a command that prints `before` bytes of `a`,
+/// the secret, then `after` bytes of `b`.
+fn big_output(rig: &Rig, before: usize, after: usize) -> String {
+    rig.fx.env.redactor.add_fixed(&"S".repeat(BIG));
+    format!(
+        "head -c {before} /dev/zero | tr '\\0' a; head -c {BIG} /dev/zero | tr '\\0' S; \
+         head -c {after} /dev/zero | tr '\\0' b"
+    )
+}
+
+/// What the model is shown, what is on the volume and every page: no run of `S` (the secret is 150,000
+/// of them), and the filler (`a`) is kept.
+async fn assert_no_big_secret(rig: &Rig, view: &str, what: &str) {
+    let shown = view.split_once("--- output").unwrap().1;
+    assert!(
+        !shown.contains("SSSSSSSS"),
+        "{what}: the view holds the secret"
+    );
+    let id = id_of(view);
+    let mut offset = 1;
+    loop {
+        let page = rig.read(&id, offset).await.content;
+        assert!(
+            !page.contains("SSSSSSSS"),
+            "{what}: a page holds the secret"
+        );
+        match page
+            .rsplit_once('\n')
+            .and_then(|(_, last)| last.split("offset=").nth(1))
+        {
+            Some(next) => offset = next.trim_end_matches(']').parse().unwrap(),
+            None => break,
+        }
+    }
+    let mut kept = 0;
+    for file in files_under(&rig.fx.root) {
+        if file.extension().is_some_and(|e| e == "txt") {
+            let text = std::fs::read(&file).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&text).contains("SSSSSSSS"),
+                "{what}: the file holds the secret"
+            );
+            kept += text.iter().filter(|b| **b == b'a').count();
+        }
+    }
+    assert!(
+        kept > 15 * 1024 * 1024,
+        "{what}: the filler is kept: {kept}"
+    );
+}
+
+/// A secret longer than 64 KiB (150,000 bytes) that starts before the 16 MiB mark and goes past what
+/// the old assumed margin (64 KiB) captured: the margin is the longest value the redactor holds.
+#[tokio::test]
+async fn a_secret_longer_than_64_kib_across_the_16_mib_mark_is_not_kept_in_part() {
+    let rig = Rig::new().await;
+    let command = big_output(&rig, adam_llm_agent::MAX_KEPT_BYTES - 10_000, 100_000);
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(
+        out.content.contains("only the first"),
+        "{}",
+        &out.content[..300]
+    );
+    assert_no_big_secret(&rig, &out.content, "the 16 MiB mark").await;
+}
+
+/// The same across the end of the capture, which is 16 MiB and the margin of this redactor.
+#[tokio::test]
+async fn a_secret_longer_than_64_kib_across_the_end_of_the_capture_is_not_kept_in_part() {
+    let rig = Rig::new().await;
+    let capture = adam_llm_agent::MAX_KEPT_BYTES + margin_for(BIG);
+    let command = big_output(&rig, capture - 100_000, 100_000);
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert_no_big_secret(&rig, &out.content, "the capture's end").await;
+}
+
+/// The tracked tail of a long output: the secret ends 60,000 bytes before the end, so a tail that
+/// starts a margin before it (the old, 64 KiB) holds most of it; and one that starts inside it.
+#[tokio::test]
+async fn a_secret_longer_than_64_kib_across_the_start_of_the_tail_is_not_shown_in_part() {
+    for tail_zone in [60_000, 100_000] {
+        let rig = Rig::with(|s| s.check_output_tail = 100_000).await;
+        let hold = 100_000 + margin_for(BIG);
+        // The first run: the old hold (cap + 64 KiB) starts inside the secret; the second: this
+        // redactor's hold does.
+        let after = if tail_zone == 60_000 {
+            60_000
+        } else {
+            hold - 100_000
+        };
+        let command = big_output(&rig, 17_000_000, after);
+        let out = RunCommand
+            .call(&rig.ctx, json!({"command": command}))
+            .await
+            .unwrap();
+        let shown = out.content.split_once("--- output").unwrap().1;
+        assert!(
+            !shown.contains("SSSSSSSS"),
+            "{tail_zone}: the tail holds the secret"
+        );
+        assert!(shown.contains("bbbbbbbb"), "{tail_zone}: the tail is shown");
+    }
+}
+
+/// A thousand secrets are 41 KB printed and 11 KB scrubbed: the output is long as printed and short as
+/// shown, so it is shown whole (no head, no tail overlapping it, no count of bytes not shown).
+#[tokio::test]
+async fn an_output_that_scrubbing_shrinks_under_the_view_is_shown_whole() {
+    let rig = Rig::new().await;
+    let command = format!("yes '{GITHUB_TOKEN}' | head -n 1000");
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let view = out.content;
+    assert!(view.contains("--- output ---\n"), "{}", &view[..200]);
+    assert!(
+        !view.contains("not shown") && !view.contains("kept as"),
+        "{}",
+        &view[..200]
+    );
+    assert_eq!(
+        view.matches("[redacted]\n").count(),
+        1000,
+        "no line twice, none lost"
+    );
+}
+
+/// Invalid UTF-8 in an output over the bound: the kept text counts what scrubbed text is (3 bytes
+/// for each byte that is not text) and the output what it printed, and the result says which is which.
+#[tokio::test]
+async fn an_output_of_invalid_utf8_over_the_bound_says_what_its_counts_count() {
+    let rig = Rig::new().await;
+    let command = "head -c 17000000 /dev/zero | tr '\\0' '\\377'";
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    let view = out.content;
+    assert!(
+        view.contains(
+            " bytes are kept (the first number counts the scrubbed text, the second the output)"
+        ),
+        "{}",
+        &view[view.len() - 300..]
+    );
+    assert!(
+        view.contains(" of 17000000 bytes"),
+        "{}",
+        &view[view.len() - 300..]
+    );
+}
+
 async fn tools_call(rig: &Rig, name: &str, args: Value) -> ToolOutput {
     rig.tools()
         .get(name)

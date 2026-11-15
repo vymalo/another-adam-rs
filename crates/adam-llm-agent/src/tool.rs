@@ -544,7 +544,10 @@ pub struct ToolCtx {
 
 /// A function from a text to the same text with its secrets replaced.
 #[derive(Clone)]
-struct Scrubber(Arc<dyn Fn(&str) -> String + Send + Sync>);
+struct Scrubber(
+    Arc<dyn Fn(&str) -> String + Send + Sync>,
+    Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+);
 
 impl std::fmt::Debug for Scrubber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -599,8 +602,35 @@ impl ToolCtx {
     /// the scrubber recognises, and the half that is left is durable. See [`scrub`](Self::scrub).
     #[must_use]
     pub fn with_scrub(mut self, scrub: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
-        self.scrub = Some(Scrubber(Arc::new(scrub)));
+        self.scrub = Some(Scrubber(Arc::new(scrub), None));
         self
+    }
+
+    /// [`with_scrub`](Self::with_scrub), and a function that says how long the longest value the
+    /// scrubber replaces is, in bytes. A tool that cuts a text it may only half have (the first part
+    /// of a result) keeps back [`scrub_margin`](Self::scrub_margin) bytes of its end: a scrubber
+    /// that holds a value longer than [`SCRUB_OVERLAP`](crate::SCRUB_OVERLAP) must say so here, and
+    /// one that does not is taken to hold none.
+    #[must_use]
+    pub fn with_scrub_longest(
+        mut self,
+        scrub: impl Fn(&str) -> String + Send + Sync + 'static,
+        longest: impl Fn() -> usize + Send + Sync + 'static,
+    ) -> Self {
+        self.scrub = Some(Scrubber(Arc::new(scrub), Some(Arc::new(longest))));
+        self
+    }
+
+    /// How many bytes at the open end of a cut text may be the start of a secret:
+    /// [`SCRUB_OVERLAP`](crate::SCRUB_OVERLAP), or the longest value the scrubber says it holds when
+    /// that is more.
+    pub fn scrub_margin(&self) -> usize {
+        let longest = self
+            .scrub
+            .as_ref()
+            .and_then(|s| s.1.as_ref())
+            .map_or(0, |f| f());
+        longest.max(crate::SCRUB_OVERLAP)
     }
 
     /// `text` with its secrets replaced, as the layer around this tool would; `text` itself when

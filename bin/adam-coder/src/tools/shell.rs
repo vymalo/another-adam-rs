@@ -79,8 +79,9 @@ pub struct ShellOutcome {
     /// The first [`KEPT_OUTPUT_MAX`] and [`SCRUB_OVERLAP`] bytes of the output as captured (only for a
     /// call that settles it); taken by `output::settle`, which scrubs and keeps them.
     pub captured: Vec<u8>,
-    /// The last bytes of the output, the tail and [`SCRUB_OVERLAP`] before it, when the output is
-    /// longer than what was captured (so that scrubbing sees a secret at the start of the tail whole).
+    /// The last bytes of the output, the tail and the margin before it, when the output is longer
+    /// than the tail (and than what was captured, for a call that keeps it): so that scrubbing sees a
+    /// secret at the start of the tail whole.
     pub tail_raw: Vec<u8>,
     /// Where the whole output is kept, once it was settled.
     pub kept: Option<KeptNote>,
@@ -178,13 +179,16 @@ struct Tail {
     /// never filled) for a call that does not keep.
     all: Vec<u8>,
     capture: bool,
+    /// What is held before the tail, and captured beyond [`KEPT_OUTPUT_MAX`]: at least
+    /// [`SCRUB_OVERLAP`], and the longest value the redactor holds when that is more.
+    margin: usize,
 }
 
 impl Tail {
     fn push(&mut self, chunk: &[u8]) {
         self.total += chunk.len() as u64;
         if self.capture {
-            let room = (KEPT_OUTPUT_MAX + SCRUB_OVERLAP).saturating_sub(self.all.len());
+            let room = (KEPT_OUTPUT_MAX + self.margin).saturating_sub(self.all.len());
             self.all.extend_from_slice(&chunk[..room.min(chunk.len())]);
         }
         self.buf.extend_from_slice(chunk);
@@ -197,15 +201,13 @@ impl Tail {
         }
     }
 
+    /// The tail and the margin before it, for every run: a tail cut at its start may begin in the
+    /// middle of a secret, and whoever scrubs it needs the bytes before it to cut that back.
     fn hold(&self) -> usize {
-        if self.capture {
-            self.cap + SCRUB_OVERLAP
-        } else {
-            self.cap
-        }
+        self.cap + self.margin
     }
 
-    /// The last `cap + SCRUB_OVERLAP` bytes (what scrubbing needs), when keeping.
+    /// The last `cap + margin` bytes (what scrubbing needs).
     fn raw(&self) -> Vec<u8> {
         let start = self.buf.len().saturating_sub(self.hold());
         self.buf[start..].to_vec()
@@ -420,7 +422,9 @@ pub async fn run_in(
     tail_cap: usize,
     cancel: &CancelToken,
 ) -> Result<ShellOutcome, RunError> {
-    run_timed(session, spec, timeout, tail_cap, cancel).await.0
+    run_timed(session, spec, timeout, tail_cap, SCRUB_OVERLAP, cancel)
+        .await
+        .0
 }
 
 /// [`run_in`], and how long the process ran: from the moment it was spawned to its exit, or, for a
@@ -432,9 +436,10 @@ pub async fn run_timed(
     spec: ExecSpec,
     timeout: Duration,
     tail_cap: usize,
+    margin: usize,
     cancel: &CancelToken,
 ) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
-    run_with(session, spec, timeout, tail_cap, cancel, false).await
+    run_with(session, spec, timeout, tail_cap, margin, cancel, false).await
 }
 
 /// [`run_timed`] that also captures the output for keeping ([`ShellOutcome::captured`]): for a tool
@@ -444,9 +449,10 @@ pub async fn run_captured(
     spec: ExecSpec,
     timeout: Duration,
     tail_cap: usize,
+    margin: usize,
     cancel: &CancelToken,
 ) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
-    run_with(session, spec, timeout, tail_cap, cancel, true).await
+    run_with(session, spec, timeout, tail_cap, margin, cancel, true).await
 }
 
 #[tracing::instrument(skip(session, spec), fields(dir = %spec.cwd.display()))]
@@ -455,6 +461,7 @@ async fn run_with(
     spec: ExecSpec,
     timeout: Duration,
     tail_cap: usize,
+    margin: usize,
     cancel: &CancelToken,
     capture: bool,
 ) -> (Result<ShellOutcome, RunError>, Option<Duration>) {
@@ -485,6 +492,7 @@ async fn run_with(
         total: 0,
         all: Vec::new(),
         capture,
+        margin: margin.max(SCRUB_OVERLAP),
     }));
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -536,10 +544,15 @@ async fn run_with(
     let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
     let (text, truncated) = tail.finish();
     // Output that fits the tail is shown whole and not kept: nothing is held twice.
+    // A tail that is only the end of the output starts anywhere: its raw bytes, with the margin before
+    // them, go to whoever scrubs it (`output::settle`, or `ToolEnv::run` for a call that keeps
+    // nothing).
     let (captured, tail_raw) = if truncated && capture {
         let whole = tail.total <= tail.all.len() as u64;
         let raw = if whole { Vec::new() } else { tail.raw() };
         (std::mem::take(&mut tail.all), raw)
+    } else if truncated {
+        (Vec::new(), tail.raw())
     } else {
         (Vec::new(), Vec::new())
     };
@@ -692,6 +705,7 @@ mod tests {
             shell_spec(dir.path(), "seq 1 20000"),
             LONG,
             1024,
+            SCRUB_OVERLAP,
             &CancelToken::new(),
         )
         .await

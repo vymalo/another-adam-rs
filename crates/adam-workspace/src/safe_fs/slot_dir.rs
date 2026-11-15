@@ -106,6 +106,7 @@ fn kernel_has_openat2() -> bool {
 pub struct Meta {
     mode: RawMode,
     size: u64,
+    mtime: i64,
 }
 
 impl Meta {
@@ -113,6 +114,8 @@ impl Meta {
         Self {
             mode: stat.st_mode,
             size: u64::try_from(stat.st_size).unwrap_or(0),
+            #[allow(clippy::useless_conversion)]
+            mtime: i64::from(stat.st_mtime),
         }
     }
 
@@ -138,6 +141,11 @@ impl Meta {
     /// The size in bytes.
     pub fn size(self) -> u64 {
         self.size
+    }
+
+    /// The time of the last modification, in whole seconds since the epoch.
+    pub fn mtime_secs(self) -> i64 {
+        self.mtime
     }
 
     /// The permission bits (`0o7777`).
@@ -424,6 +432,23 @@ impl Dir {
     /// The errors of `unlinkat`.
     pub fn rmdir(&self, name: &OsStr) -> io::Result<()> {
         rustix::fs::unlinkat(&self.fd, single(name)?, AtFlags::REMOVEDIR)?;
+        Ok(())
+    }
+
+    /// Make the directory `name` of this one private to its user (`0700`), without following a link
+    /// (`fchmodat` with `AT_SYMLINK_NOFOLLOW`: a link is refused, not chmodded). For a caller that
+    /// must read a directory that something made unreadable.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `fchmodat`.
+    pub fn make_private(&self, name: &OsStr) -> io::Result<()> {
+        rustix::fs::chmodat(
+            &self.fd,
+            single(name)?,
+            Mode::from_raw_mode(0o700),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
         Ok(())
     }
 

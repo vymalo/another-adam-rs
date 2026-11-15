@@ -1146,8 +1146,10 @@ mod tests {
         let id = adam_llm_agent::output_id_of(&ctx);
         let run = ctx.root_run_id().to_string();
         let mut offset = 1;
+        let mut kept_text = String::new();
         loop {
             let page = store.0.page(&run, &id, offset, 2000).await.unwrap();
+            kept_text.push_str(&page);
             for w in secret.as_bytes().windows(8) {
                 let w = std::str::from_utf8(w).unwrap();
                 assert!(!page.contains(w), "`{w}` is kept");
@@ -1160,6 +1162,16 @@ mod tests {
                 None => break,
             }
         }
+        // Something is kept: the whole secrets are replaced and the filler is there.
+        assert!(
+            kept_text.starts_with("\\x5bredacted]\n\\x5bredacted]\n"),
+            "{}",
+            &kept_text[..40]
+        );
+        assert!(
+            kept_text.matches("aaaaaaaa").count() > 1000,
+            "the filler is kept"
+        );
     }
 
     #[test]

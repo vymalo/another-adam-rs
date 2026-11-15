@@ -484,11 +484,36 @@ impl ToolEnv {
         keep: bool,
     ) -> Result<shell::ShellOutcome, shell::RunError> {
         let cancel = ctx.cancel_token();
+        let margin = self.redactor.margin();
         let (outcome, ran) = if keep {
-            shell::run_captured(session, spec, timeout, tail_cap, &cancel).await
+            shell::run_captured(session, spec, timeout, tail_cap, margin, &cancel).await
         } else {
-            shell::run_timed(session, spec, timeout, tail_cap, &cancel).await
+            shell::run_timed(session, spec, timeout, tail_cap, margin, &cancel).await
         };
+        // A call that keeps nothing shows the tail of a long output: scrubbed here, with the bytes
+        // before it, so that a secret cut by the tail's start leaves no part of itself.
+        let outcome = outcome.map(|mut outcome| {
+            if !keep && !outcome.tail_raw.is_empty() {
+                let bytes = std::mem::take(&mut outcome.tail_raw);
+                let reaches_the_start = outcome.total <= bytes.len() as u64;
+                let raw = String::from_utf8_lossy(&bytes).into_owned();
+                let redactor = &self.redactor;
+                let scrub = |t: &str| redactor.scrub(t).into_owned();
+                // What was held reaches back to the start of the output: nothing was cut there,
+                // so it is scrubbed as it is; else its start is an edge, cut back.
+                let scrubbed = if reaches_the_start {
+                    scrub(&raw)
+                } else {
+                    adam_llm_agent::scrub_open_start(&raw, scrub, margin)
+                };
+                let mut start = scrubbed.len().saturating_sub(tail_cap.max(1));
+                while !scrubbed.is_char_boundary(start) {
+                    start += 1;
+                }
+                outcome.tail = scrubbed[start..].to_owned();
+            }
+            outcome
+        });
         if let (Some(meter), Some(ran)) = (Meter::of(session), ran) {
             meter.report_command(ctx, ran);
         }
@@ -991,10 +1016,11 @@ impl Tool for Redacting {
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let r = &self.redactor;
         // The tool may scrub what it is about to cut: a secret cut in half escapes the scrub below.
-        let hook = r.clone();
-        let hooked = ctx
-            .clone()
-            .with_scrub(move |text| hook.scrub(text).into_owned());
+        let (hook, size) = (r.clone(), r.clone());
+        let hooked = ctx.clone().with_scrub_longest(
+            move |text| hook.scrub(text).into_owned(),
+            move || size.longest(),
+        );
         match self.inner.call(&hooked, args).await {
             Ok(mut out) => {
                 out.content = r.scrub_string(out.content);
