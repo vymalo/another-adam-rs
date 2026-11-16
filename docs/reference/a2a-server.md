@@ -384,8 +384,8 @@ A message may carry pictures as standard A2A file parts. **Off by default**: wit
 | Part | Becomes |
 |---|---|
 | `raw` whose bytes are a PNG, JPEG, GIF or WebP (sniffed, whatever `mediaType` says) | an entry of the inbound payload's `images` (`{name, mediaType, data}`, base64); at most 4 images and 2 MiB a message (`MAX_INBOUND_IMAGES`, `MAX_INBOUND_IMAGE_BYTES`: the inbox is in the run's durable state until the message is read) |
-| the same, past either bound | the line `[image not shown: shot.png (image/png, 3.0 MiB) is over what one message may carry (4 images and 2 MiB)]` in the text |
-| any other `raw` part (a PDF; an SVG is text) | the line `[attached: report.pdf (application/pdf, 84.0 KiB); only images are read]` |
+| the same, past either bound | the line `[image not shown: shot.png (png, 3.0 MiB) is over what one message may carry (4 images and 2 MiB)]` in the text |
+| any other `raw` part (a PDF; an SVG is text) | the line `[attached: report.pdf (pdf, 84.0 KiB); only images are read]` |
 | a `url` part | the line `[linked: <url>]`: **a link is never fetched** |
 
 A message that is only a picture is accepted. A file name and a media type are untrusted: they are cut to letters, digits and `._-() ` and to a `type/subtype` before any line quotes them.

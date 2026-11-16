@@ -1805,6 +1805,48 @@ mod tests {
         notes.named_repos
     }
 
+    /// The lines about a picture or a file that a person's message carries are the framework's words
+    /// in the person's message: they name a type as a word (`png`), never as `image/png`, which would
+    /// read as the repository `image/png` the person named.
+    #[test]
+    fn the_lines_about_a_picture_name_no_repository() {
+        use adam_llm_agent::ImageGate;
+        use adam_model::{ImageLimits, ImageOrigin};
+        let png = {
+            let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            v.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 8, 8, 2, 0, 0, 0]);
+            v
+        };
+        let limits = ImageLimits {
+            max_bytes: 4,
+            max_count: 8,
+            max_side: 4096,
+            sources: [ImageOrigin::Person].into(),
+        };
+        let mut lines: Vec<String> = [
+            ImageGate::new(None, 0, None),
+            ImageGate::new(Some(limits), 0, None),
+        ]
+        .iter()
+        .filter_map(
+            |gate| match gate.check(ImageOrigin::Person, None, Some("shot.png"), &png) {
+                adam_llm_agent::Admission::StandIn(line) => Some(line),
+                adam_llm_agent::Admission::Admitted(_) => None,
+            },
+        )
+        .collect();
+        lines.push("[attached: report.pdf (pdf, 84.0 KiB); only images are read]".into());
+        assert_eq!(lines.len(), 3);
+        for line in lines {
+            let said = [Heard {
+                text: line.clone(),
+                defaults: None,
+                when: When::Past,
+            }];
+            assert!(named_by(&said).is_empty(), "{line}");
+        }
+    }
+
     /// In a run another agent started, the person's words are the ones the orchestrator carries
     /// (`vymalo.person`), read from the newest message that carries the key: never the ask's text,
     /// never what the asking model answers.

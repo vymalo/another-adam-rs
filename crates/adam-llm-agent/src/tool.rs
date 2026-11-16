@@ -421,8 +421,13 @@ pub struct ToolOutput {
     /// images.
     ///
     /// Absent from a journal written before it existed, and not written while empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub kept_images: Vec<KeptImage>,
+    #[serde(default, skip_serializing_if = "no_kept_images")]
+    pub kept_images: Box<[KeptImage]>,
+}
+
+/// `kept_images` is a boxed slice, which keeps a [`ToolOutput`] small: most results return none.
+fn no_kept_images(kept: &[KeptImage]) -> bool {
+    kept.is_empty()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -445,7 +450,7 @@ impl ToolOutput {
             reported: Vec::new(),
             pinned: false,
             images: Vec::new(),
-            kept_images: Vec::new(),
+            kept_images: Box::default(),
         }
     }
 
@@ -465,7 +470,7 @@ impl ToolOutput {
             reported: Vec::new(),
             pinned: false,
             images: Vec::new(),
-            kept_images: Vec::new(),
+            kept_images: Box::default(),
         }
     }
 
@@ -474,7 +479,11 @@ impl ToolOutput {
     #[must_use]
     pub fn with_image(mut self, outcome: ImageOutcome) -> Self {
         self.images.extend(outcome.image);
-        self.kept_images.extend(outcome.kept.map(|kept| *kept));
+        if let Some(kept) = outcome.kept {
+            let mut all = std::mem::take(&mut self.kept_images).into_vec();
+            all.push(*kept);
+            self.kept_images = all.into_boxed_slice();
+        }
         self
     }
 

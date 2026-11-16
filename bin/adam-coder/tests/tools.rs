@@ -8348,7 +8348,7 @@ async fn read_file_of_a_png_is_an_image_for_a_seeing_model() {
     assert!(wide.images.is_empty());
     assert!(
         wide.content.starts_with(
-            "[image not shown: wide.png (image/png, 29 bytes, 5000\u{d7}10) is over the 4096 px"
+            "[image not shown: wide.png (png, 29 bytes, 5000\u{d7}10) is over the 4096 px"
         ),
         "{}",
         wide.content

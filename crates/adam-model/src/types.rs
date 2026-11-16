@@ -334,18 +334,26 @@ impl ImageRef {
         )
     }
 
-    /// `shot.png (image/png, 120 KiB, 800×600)`: the name when there is one, then the type, the
-    /// size and the dimensions.
+    /// `shot.png (png, 120.0 KiB, 800×600)`: the name when there is one, then the type as a word
+    /// ([`type_word`]), the size and the dimensions.
     pub fn label(&self) -> String {
         let name = self.name.as_deref().unwrap_or("image");
         format!(
             "{name} ({}, {}, {}\u{d7}{})",
-            self.media_type,
+            type_word(&self.media_type),
             human_bytes(self.bytes),
             self.width,
             self.height
         )
     }
+}
+
+/// A media type as one word, its subtype: `png` for `image/png`. The lines a person's message
+/// carries about an image or a file name its type this way and never as `type/subtype`, which a
+/// reader of the person's words (the coder's rule about the repositories a task named) could take
+/// for an `owner/repo`.
+pub fn type_word(media_type: &str) -> &str {
+    media_type.rsplit('/').next().unwrap_or(media_type)
 }
 
 /// `1.4 MiB`, `120.0 KiB` or `812 bytes`.
@@ -1006,10 +1014,7 @@ mod tests {
 
     #[test]
     fn the_label_names_the_image_by_what_the_model_may_say() {
-        assert_eq!(
-            shot().label(),
-            "shot.png (image/png, 120.0 KiB, 800\u{d7}600)"
-        );
+        assert_eq!(shot().label(), "shot.png (png, 120.0 KiB, 800\u{d7}600)");
         assert_eq!(human_bytes(1_468_006), "1.4 MiB");
     }
 }

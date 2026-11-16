@@ -76,5 +76,5 @@ pub use mock::{MockModel, RecordedCall};
 pub use types::{
     ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,
     ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ToolCall,
-    ToolChoice, ToolSpec, Usage, human_bytes,
+    ToolChoice, ToolSpec, Usage, human_bytes, type_word,
 };

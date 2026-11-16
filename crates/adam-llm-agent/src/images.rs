@@ -311,7 +311,10 @@ impl ImageGate {
         let media_type = checked_media_type(claimed, bytes);
         let size = image_size(bytes);
         let label = |dims: Option<(u32, u32)>| {
-            let mut parts = vec![media_type.clone(), human_bytes(bytes.len() as u64)];
+            let mut parts = vec![
+                adam_model::type_word(&media_type).to_owned(),
+                human_bytes(bytes.len() as u64),
+            ];
             if let Some((w, h)) = dims {
                 parts.push(format!("{w}\u{d7}{h}"));
             }
@@ -796,6 +799,9 @@ impl KeptImages for MemoryImages {
     }
 }
 
+/// A function that rewrites what a keeper holds under `(scope, sha256)` the way a local command could.
+pub type Tamper<'a> = dyn Fn(&str, &str) + Sync + 'a;
+
 /// What every [`KeptImages`] does: keeps what it is given and gives it back, once for the same
 /// bytes; refuses an id that is not a hash, a scope that is not 32 hex digits, and bytes that are
 /// not the hash they come with; never serves one scope's image to another; and loads nothing it
@@ -806,10 +812,8 @@ impl KeptImages for MemoryImages {
 /// # Panics
 ///
 /// When the store breaks a rule.
-pub async fn kept_images_conformance(
-    store: &dyn KeptImages,
-    tamper: Option<&(dyn Fn(&str, &str) + Sync)>,
-) {
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub async fn kept_images_conformance(store: &dyn KeptImages, tamper: Option<&Tamper<'_>>) {
     let scope = image_scope(Some("conversation-a"), "run-a");
     let other = image_scope(Some("conversation-b"), "run-a");
     assert_ne!(scope, other);
@@ -957,7 +961,7 @@ mod tests {
         let blind = ImageGate::new(None, 0, None);
         let said = line(ImageOrigin::Person, None, Some("shot.png"), &ok, &blind);
         assert!(
-            said.starts_with("[image not shown: this model cannot see images; shot.png (image/png"),
+            said.starts_with("[image not shown: this model cannot see images; shot.png (png"),
             "{said}"
         );
         assert!(

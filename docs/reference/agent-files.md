@@ -883,7 +883,7 @@ The sequence and the states are in [`adam-mcp`](../../crates/adam-mcp/README.md#
 
 An image block of a result is **not** put in front of the model unless the deployment says so: `MODEL_INPUT_MODALITIES=text,image` (the model sees) **and** `mcp` in `MODEL_IMAGE_SOURCES` (default `person,workspace`: an MCP server's call can carry credentials that were expanded into it, and an image is not scrubbed). A server entry has no key for it; the deployment decides, for every server. When it does:
 
-* each image block is admitted by the run's limits (`MODEL_IMAGE_MAX_*`) and rides on the tool result; the result's text says `[image shown to you after this result: paint-1.png (image/png, 84.0 KiB, 800×600)]`, or why it is not (`[image not shown: ...]`);
+* each image block is admitted by the run's limits (`MODEL_IMAGE_MAX_*`) and rides on the tool result; the result's text says `[image shown to you after this result: paint-1.png (png, 84.0 KiB, 800×600)]`, or why it is not (`[image not shown: ...]`);
 * with `files: true` it is **also** shared as a file, as above: the two lines name the same SHA-256, and the run keeps the bytes once, by that hash;
 * with neither, the text is what it always was, `[image not included: image/png]`.
 

@@ -2961,7 +2961,7 @@ async fn output_message(
     } else {
         (
             std::mem::take(&mut output.images),
-            std::mem::take(&mut output.kept_images),
+            std::mem::take(&mut output.kept_images).into_vec(),
         )
     };
     let message = Message::Tool {

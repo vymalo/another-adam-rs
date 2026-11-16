@@ -1660,7 +1660,7 @@ mod tests {
         let sent = messages(&req);
         let text = sent[0]["content"][1]["text"].as_str().unwrap();
         assert!(
-            text.starts_with("[image not shown: shot.png (image/png"),
+            text.starts_with("[image not shown: shot.png (png"),
             "{text}"
         );
         assert!(!sent.iter().any(|m| m.to_string().contains("image_url")));

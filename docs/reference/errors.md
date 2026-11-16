@@ -267,20 +267,22 @@ result and the run was stopped (doom_loop)`.
 
 ### An image the model is not sent
 
+The lines name a type as a word (`png`), never as `image/png`: they stand in the person's own message, and a reader of the person's words (the coder's rule about the repositories a task named) would take `image/png` for the repository `image/png`.
+
 An image is never an error: it is one line of text in the image's place, in the message that carried it (a person's) or in the text of the tool result that returned it, recorded once when it enters the history. `adam_llm_agent::ImageGate::check` writes it, in this order of causes:
 
 | Cause | Text |
 |---|---|
-| The model is not declared to see (`MODEL_INPUT_MODALITIES`), or runs on another alias than `MODEL` | `[image not shown: this model cannot see images; shot.png (image/png, 120.0 KiB, 800×600). Ask the person to describe it if it matters]` |
+| The model is not declared to see (`MODEL_INPUT_MODALITIES`), or runs on another alias than `MODEL` | `[image not shown: this model cannot see images; shot.png (png, 120.0 KiB, 800×600). Ask the person to describe it if it matters]` |
 | The source is not in `MODEL_IMAGE_SOURCES` | `[image not shown: shot.png (…) comes from an MCP server and this deployment does not send that source to the model]` |
 | An SVG, or not a PNG, JPEG, GIF or WebP | `[image not shown: a.svg is an SVG, which is text: read it as a file]`, `[image not shown: x is not a PNG, JPEG, GIF or WebP image]` |
-| Over `MODEL_IMAGE_MAX_BYTES`, or no size in its header, or a side over `MODEL_IMAGE_MAX_SIDE` | `[image not shown: shot.png (image/png, 1.4 MiB, 800×600) is over the 1.0 MiB this deployment sends to the model]` |
+| Over `MODEL_IMAGE_MAX_BYTES`, or no size in its header, or a side over `MODEL_IMAGE_MAX_SIDE` | `[image not shown: shot.png (png, 1.4 MiB, 800×600) is over the 1.0 MiB this deployment sends to the model]` |
 | The history already holds `MODEL_IMAGE_MAX_COUNT` images | `[image not shown: … is past the 8 images this run sends to the model]` |
 | The run keeps no more in its state (an agent folder: 4 MiB with its long outputs), or the keeper refused | `[image not shown: … does not fit: a run keeps at most 4 MiB of images and long results here]`, `[image not shown: … could not be kept for the model: …]` |
 | The bytes cannot be read back when a request is built (not kept, changed on the volume: the hash is checked) | `[image not shown: shot.png (…) could not be loaded; read it again if it matters]` (the client's line, `ImageRef::missing_line`; the history still names the image) |
 | A shortening of the history took an old tool result's images out | `[image removed from the history: shot.png; read it again to see it]` |
 
-A message part that is not an image has its own line, from the A2A front: `[attached: report.pdf (application/pdf, 84.0 KiB); only images are read]`, `[linked: <url>]` (never fetched), and `[image not shown: … is over what one message may carry (4 images and 2 MiB)]`.
+A message part that is not an image has its own line, from the A2A front: `[attached: report.pdf (pdf, 84.0 KiB); only images are read]`, `[linked: <url>]` (never fetched), and `[image not shown: … is over what one message may carry (4 images and 2 MiB)]`.
 
 ## Retry
 

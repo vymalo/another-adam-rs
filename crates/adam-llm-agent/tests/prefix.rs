@@ -1150,7 +1150,7 @@ async fn a_text_only_model_gets_a_stand_in_and_completes() {
     assert!(
         content[1]
             .as_text()
-            .starts_with("[image not shown: this model cannot see images; me.png (image/png"),
+            .starts_with("[image not shown: this model cannot see images; me.png (png"),
         "{content:?}"
     );
     let tool = state

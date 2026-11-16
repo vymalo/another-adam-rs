@@ -1556,9 +1556,8 @@ async fn an_image_block_reaches_a_seeing_model_only_from_an_allowed_source() {
     assert_eq!(open.images[0].sha256, adam_llm_agent::sha256_hex(PNG));
     assert_eq!(open.images[0].name.as_deref(), Some("screenshot-1.png"));
     assert!(
-        open.content.contains(
-            "[image shown to you after this result: screenshot-1.png (image/png, 67 bytes"
-        ),
+        open.content
+            .contains("[image shown to you after this result: screenshot-1.png (png, 67 bytes"),
         "{}",
         open.content
     );

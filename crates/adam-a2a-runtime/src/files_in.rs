@@ -6,8 +6,8 @@
 //! | Part | Becomes |
 //! |---|---|
 //! | a `raw` part whose bytes are a PNG, JPEG, GIF or WebP | an entry of the payload's `images` (`{name, mediaType, data}`, base64), at most [`MAX_INBOUND_IMAGES`] and [`MAX_INBOUND_IMAGE_BYTES`] a message; the agent loop admits it (or says why not) and keeps its bytes |
-//! | the same, over either bound | the line `[image not shown: shot.png (image/png, 3.0 MiB) is over what one message may carry (4 images and 2 MiB)]` in the text |
-//! | any other `raw` part (an SVG is text, a PDF is not read) | the line `[attached: report.pdf (application/pdf, 84.0 KiB); only images are read]` |
+//! | the same, over either bound | the line `[image not shown: shot.png (png, 3.0 MiB) is over what one message may carry (4 images and 2 MiB)]` in the text |
+//! | any other `raw` part (an SVG is text, a PDF is not read) | the line `[attached: report.pdf (pdf, 84.0 KiB); only images are read]` |
 //! | a `url` part | the line `[linked: <url>]`: **a link is never fetched** |
 //!
 //! The bound exists because the inbox is in the run's durable state until the message is read, and a
@@ -54,10 +54,13 @@ impl Files {
         let name = part.filename.as_deref().and_then(clean_name);
         let claimed = part.media_type.as_deref().and_then(clean_type);
         let image = sniff_image(bytes).filter(|kind| *kind != "image/svg+xml");
+        // The type as a word, never `type/subtype`: a line of the person's message that held an
+        // `image/png` would read as an `owner/repo` to a reader of the person's words.
         let label = |kind: &str| {
             format!(
-                "{} ({kind}, {})",
+                "{} ({}, {})",
                 name.as_deref().unwrap_or("file"),
+                type_word(kind),
                 human_size(bytes.len())
             )
         };
@@ -110,6 +113,11 @@ fn clean_name(name: &str) -> Option<String> {
         .collect();
     let clean = clean.trim().trim_start_matches('.').trim().to_owned();
     (!clean.is_empty()).then_some(clean)
+}
+
+/// A media type as one word: its subtype (`png` for `image/png`).
+fn type_word(media_type: &str) -> &str {
+    media_type.rsplit('/').next().unwrap_or(media_type)
 }
 
 /// `claimed` as a bare `type/subtype` of token characters, at most 100 of them.
@@ -198,10 +206,10 @@ mod tests {
         ));
         assert_eq!(
             said.as_deref(),
-            Some("[attached: report.pdf (application/pdf, 13 bytes); only images are read]")
+            Some("[attached: report.pdf (pdf, 13 bytes); only images are read]")
         );
         let said = files.part(&raw(b"<svg xmlns='x'/>".to_vec(), "a.svg", "image/svg+xml"));
-        assert!(said.unwrap().starts_with("[attached: a.svg (image/svg+xml"));
+        assert!(said.unwrap().starts_with("[attached: a.svg (svg+xml"));
         assert_eq!(files.part(&Part::text("words")), None);
         assert!(files.has_images());
         let mut payload = json!({"text": "x"});
@@ -238,7 +246,7 @@ mod tests {
         }
         let said = files.part(&raw(png(), "five.png", "image/png")).unwrap();
         assert!(
-            said.starts_with("[image not shown: five.png (image/png"),
+            said.starts_with("[image not shown: five.png (png"),
             "{said}"
         );
         assert!(said.contains("4 images and 2 MiB"), "{said}");
@@ -297,10 +305,7 @@ mod tests {
             MAX_INBOUND_IMAGES
         );
         let text = said.payload["text"].as_str().unwrap();
-        assert!(
-            text.starts_with("[image not shown: 4.png (image/png"),
-            "{text}"
-        );
+        assert!(text.starts_with("[image not shown: 4.png (png"), "{text}");
     }
 
     #[test]
@@ -330,7 +335,7 @@ mod tests {
         let text = said.payload["text"].as_str().unwrap();
         assert_eq!(
             text,
-            "[attached: report.pdf (application/pdf, 17 bytes); only images are read]"
+            "[attached: report.pdf (pdf, 17 bytes); only images are read]"
         );
         assert!(said.payload.get("images").is_none());
     }
