@@ -306,7 +306,15 @@ impl CoderAgent {
         };
         let bound = def
             .var("max_check_cycles", env.settings.max_check_cycles)
-            .bind(tools.into_iter().collect::<ToolSet>())?
+            .bind(tools.into_iter().collect::<ToolSet>())?;
+        // The references the agent and the deployment declare: static for the process, so their
+        // names and descriptions are the same words on every turn, before any source whose words
+        // change with a message. With none this adds nothing and the prompt is what it was.
+        let bound = match env.references.source() {
+            Some(references) => bound.tool_source(references),
+            None => bound,
+        };
+        let bound = bound
             // The tools of the conversation's endpoint, offered at every model turn.
             .tool_source(env.ui.source())
             // The access tier of the message: tools above it are not shown and not run.

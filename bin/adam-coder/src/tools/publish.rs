@@ -71,7 +71,7 @@ pub async fn commit_and_push(
     let Some(message) = non_empty(&message) else {
         return Ok(ToolOutput::error("message is required"));
     };
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_write(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
@@ -289,7 +289,7 @@ pub async fn open_pull_request(
         return Ok(ToolOutput::error("title and body are required"));
     };
     let accept_red = accept_red_checks.unwrap_or(false);
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_write(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };

@@ -62,6 +62,7 @@
 //! | `RUN_POD_IDLE_SECS` | how long no command may have used a pod before it is deleted (the next command makes another; the files are on the volume); `0` keeps it until the run ends | `900` |
 //! | `RUN_POD_WAIT_SECS` | how long a run waits, trying again with a growing pause, for a pod the cluster cannot give now (the quota is used up, no node has room), before the tool fails | `600` |
 //! | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers, in the shape of `mcp.json`, added to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file, and a server name the agent already has is refused at startup (exit 78). A variable it names as `${VAR}` is hidden from every process the coder starts and its value is redacted from tool output, like the `mcp.json`'s own | unset: only the agent's own servers |
+//! | `ADAM_REFERENCES_FILE` | roles that run workers: a file of references, `{"references": [{"name", "url", "branch"?, "description"}]}`: repositories the agent may **read** beside the one it works on and never write, **added** to the `references:` of the agent's own files; it must be an existing file of valid references, and a name the agent already declares is refused at startup (exit 78). See [`tools::references`](crate::tools::references) | unset: only the agent's own references |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
 //!
 //! # Roles
@@ -219,6 +220,9 @@ pub struct WorkerConfig {
     /// `ADAM_EXTRA_MCP_FILE`: a file of MCP servers (the shape of `mcp.json`) added to the agent's
     /// own before they connect, an existing file. `None`: only the agent's own servers.
     pub extra_mcp_file: Option<PathBuf>,
+    /// `ADAM_REFERENCES_FILE`: a file of references (repositories read and never written) added to
+    /// the agent's own, an existing file. `None`: only the agent's own.
+    pub references_file: Option<PathBuf>,
     /// `DEVCONTAINER_*`: where the run's commands run.
     pub devcontainer: DevcontainerConfig,
     /// `RUN_ENVIRONMENT` and `RUN_POD_*`: this container (with the devcontainers above), or a pod of
@@ -872,6 +876,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("pr_draft", &self.pr_draft)
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
+            .field("references_file", &self.references_file)
             .field("devcontainer", &self.devcontainer)
             .field("run_environment", &self.run_environment)
             .field(
@@ -1064,6 +1069,8 @@ impl WorkerConfig {
         let flag_is_valid = problems.len() == before_flag;
         let mcp = McpSettings::parse(lookup, problems);
         let extra_mcp_file = adam_service::parse_file(get, adam::EXTRA_MCP_FILE_ENV, problems);
+        let references_file =
+            adam_service::parse_file(get, crate::tools::references::REFERENCES_FILE_ENV, problems);
         let allowed_repo_hosts = match get("ALLOWED_REPO_HOSTS") {
             None => vec![DEFAULT_REPO_HOST.to_owned()],
             Some(raw) => {
@@ -1175,6 +1182,7 @@ impl WorkerConfig {
             allow_commands_next_to_secrets,
             mcp,
             extra_mcp_file,
+            references_file,
         };
         // The default is the safe deployment: a key a command can read is a configuration error
         // (exit 78) that the deployment accepts by name, not a line in a log that somebody may read.

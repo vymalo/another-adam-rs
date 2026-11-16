@@ -95,7 +95,7 @@ pub async fn share_file(
     let Some(path) = non_empty(&path) else {
         return Ok(ToolOutput::error("path is required"));
     };
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };

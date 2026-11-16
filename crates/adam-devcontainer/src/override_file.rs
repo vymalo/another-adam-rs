@@ -34,6 +34,9 @@ pub(crate) struct SlotInfo {
     pub path: PathBuf,
     /// The bare mirror a repository slot's worktree is linked to; `None` for a scratch slot.
     pub mirror: Option<PathBuf>,
+    /// A reference (`Slot::writable` is false): the container gets the slot read-only, on top of
+    /// the run's directory.
+    pub read_only: bool,
 }
 
 /// What the file is made from.
@@ -101,6 +104,11 @@ pub(crate) fn build(input: &OverrideInput<'_>) -> Result<Override, EnvError> {
         }
         let git = slot.path.join(".git").display().to_string();
         readonly.push(Bind::new(&git, &git, true));
+        // A reference is read and never changed: its directory is a read-only mount of its own.
+        if slot.read_only {
+            let path = slot.path.display().to_string();
+            readonly.push(Bind::new(&path, &path, true));
+        }
     }
     let tools = input.tools_dir.display().to_string();
     readonly.push(Bind::new(tools, TOOLS_TARGET, true));
@@ -238,6 +246,7 @@ mod tests {
             dir: dir.to_owned(),
             path: PathBuf::from(format!("/work/workspaces/r1/{dir}")),
             mirror: mirror.then(|| PathBuf::from(format!("/work/git/h/o/{dir}.git"))),
+            read_only: false,
         }
     }
 
@@ -334,6 +343,29 @@ mod tests {
             );
             assert_eq!(o.value["workspaceFolder"], "/work/workspaces/r1/devbox");
         }
+    }
+
+    #[test]
+    fn a_reference_is_a_read_only_mount_of_its_own_on_top_of_the_runs_directory() {
+        let reference = SlotInfo {
+            read_only: true,
+            ..slot("design", true)
+        };
+        let slots = [slot("devbox", true), reference];
+        let o = make(&json!({"image": "x"}), &slots, Network::Inherit);
+        let mounts = mounts_of(&o);
+        assert!(
+            mounts.contains(
+                &"type=bind,source=/work/workspaces/r1/design,target=/work/workspaces/r1/design,readonly"
+            ),
+            "{mounts:?}"
+        );
+        assert!(
+            !mounts.contains(
+                &"type=bind,source=/work/workspaces/r1/devbox,target=/work/workspaces/r1/devbox,readonly"
+            ),
+            "the repository's slot stays writable: {mounts:?}"
+        );
     }
 
     #[test]
@@ -452,6 +484,7 @@ mod tests {
             dir: "a,b".into(),
             path: PathBuf::from("/work/workspaces/r1/a,b"),
             mirror: None,
+            read_only: false,
         }];
         let err = build(&OverrideInput {
             raw: &json!({"image": "x"}),

@@ -67,7 +67,7 @@ use super::create::{valid_name, valid_owner};
 use super::named::{default_host_key, key_of_argument, split_key};
 use super::notes::{RenamedRepo, RunNotes};
 use super::prepare::not_named;
-use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, resolve_slot};
+use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, references, resolve_slot};
 
 /// The tool's name.
 pub const MERGE_PULL_REQUEST: &str = "merge_pull_request";
@@ -143,6 +143,14 @@ async fn target(
             "{repo:?} is not a repository address"
         )));
     };
+    // A reference is read and never changed: not merged into, renamed, deleted or published to.
+    let slots = match env.workspaces.run(&ctx.root_run_id().to_string()) {
+        Ok(workspace) => workspace.slots().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    if references::is_reference_key(env, &slots, &key) {
+        return Err(ToolOutput::error(references::refusal_by_address(&address)));
+    }
     if let Err(e) = env.workspaces.check_repository(&at) {
         return Err(ToolOutput::error(format!(
             "{address} cannot be used here: {e}"

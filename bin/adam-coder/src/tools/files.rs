@@ -838,7 +838,7 @@ pub async fn read_file(
         Ok(window) => window,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
@@ -918,7 +918,7 @@ pub async fn write_file(
     let Some(path) = non_empty(&path) else {
         return Ok(ToolOutput::error("path is required"));
     };
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_write(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
@@ -961,7 +961,7 @@ pub async fn apply_patch(
     if non_empty(&patch).is_none() {
         return Ok(ToolOutput::error("patch is required"));
     }
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_write(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
@@ -1332,7 +1332,7 @@ pub async fn edit_file(
     let Some(path) = non_empty(&path) else {
         return Ok(ToolOutput::error("path is required"));
     };
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_write(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };

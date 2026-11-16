@@ -210,6 +210,12 @@ pub async fn prepare_workspace(
         text.push_str("\n\n");
         text.push_str(&block);
     }
+    // The references the repository declares, before its instructions: listed as its text, and
+    // nothing of them is fetched before the person says yes (see `references`).
+    if let Some(block) = super::references::at_prepare(&env, ctx, &slot).await? {
+        text.push_str("\n\n");
+        text.push_str(&block);
+    }
     // What the repository says about itself, as the result of this call and not as a message: it
     // is the repository's text, never the person's (see `project`).
     if let Some(block) = super::project::at_prepare(&env, ctx, &slot).await? {

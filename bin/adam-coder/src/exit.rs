@@ -51,6 +51,11 @@ fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     if let Some(e) = cause.downcast_ref::<AgentFilesError>() {
         return Some(e.class());
     }
+    // The references the agent and the deployment declare (`ADAM_REFERENCES_FILE`): a mistake in the
+    // deployment's files, 78.
+    if let Some(e) = cause.downcast_ref::<crate::tools::ReferencesError>() {
+        return Some(e.class());
+    }
     cause.downcast_ref::<AssemblyError>().map(Classify::class)
 }
 

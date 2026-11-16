@@ -348,7 +348,7 @@ pub async fn list_files(
     /// The slot to list in; leave out when there is one
     repo: Option<String>,
 ) -> Outcome {
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
@@ -441,7 +441,7 @@ pub async fn find_files(
     /// The slot to look in; leave out when there is one
     repo: Option<String>,
 ) -> Outcome {
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
@@ -742,7 +742,7 @@ pub async fn search_files(
     /// The slot to search in; leave out when there is one
     repo: Option<String>,
 ) -> Outcome {
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };

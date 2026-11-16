@@ -77,7 +77,7 @@ pub async fn run(
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     // A repository's worktree or a scratch project: the command works on either.
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_write(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };

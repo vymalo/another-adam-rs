@@ -126,6 +126,19 @@ async fn build_agent(
         tracing::info!(file = %file.display(), "extra MCP servers added to the agent's own");
         def = extended;
     }
+    // The repositories the agent may read and never write: its own (the frontmatter) with the
+    // deployment's file added; a name both declare is refused (exit 78). Read before the process
+    // serves anything, so a mistake is a startup error and not a run's.
+    let references = crate::tools::References::load(
+        &def.manifest().frontmatter.references,
+        worker.references_file.as_deref(),
+    )?;
+    if !references.is_empty() {
+        tracing::info!(
+            references = ?references.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            "repositories the agent may read and never write"
+        );
+    }
     let protected = crate::mcp_secrets::protect(&def.mcp_env_references(), &redactor, |name| {
         std::env::var(name).ok()
     });
@@ -146,6 +159,7 @@ async fn build_agent(
     let env = Arc::new(
         tool_env
             .with_redactor(redactor)
+            .with_references(references)
             // What a rejected credential tells the model to check depends on which kind they are.
             .with_credentials_hint(worker.github.check_hint())
             // The URL a message announces for the conversation's tools is an MCP server's: the

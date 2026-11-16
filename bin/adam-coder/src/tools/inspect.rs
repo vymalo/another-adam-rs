@@ -61,7 +61,7 @@ pub async fn run_command(
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     // A repository's worktree or a scratch project: both are looked at the same way.
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
@@ -279,7 +279,7 @@ impl Snapshot {
         }
         // The configuration and the refs are the mirror's, shared by every run: written by one at
         // a time. A scratch project's are its own: nobody shares them, so there is nothing to lock.
-        let _lock = match slot.worktree() {
+        let _lock = match slot.checkout() {
             Some(wt) => match wt.lock_mirror().await {
                 Ok(lock) => Some(lock),
                 Err(_) => return false,

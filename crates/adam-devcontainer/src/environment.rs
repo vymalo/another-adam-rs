@@ -985,13 +985,16 @@ impl Environment for DevContainer {
         let s = &self.inner.settings;
         let run = workspace.run();
         let _guard = self.lock_run(run, s.runtime == Runtime::Podman).await?;
-        let slots = workspace.slots_in_join_order().await.map_err(|e| {
+        let mut slots = workspace.slots_in_join_order().await.map_err(|e| {
             EnvError::Unavailable(format!(
                 "the workspace cannot be read: {}",
                 adam_error::report(&e)
             ))
         })?;
-        let Some(first) = slots.first() else {
+        // The first slot is the one whose devcontainer.json is used: a reference, which is read and
+        // never worked in, comes after the repositories and projects (the order is otherwise kept).
+        slots.sort_by_key(|slot| !slot.writable());
+        let Some(first) = slots.first().filter(|slot| slot.writable()) else {
             return Err(EnvError::Refused(
                 "the workspace has no repository or project yet: there is nothing to run in"
                     .to_owned(),
@@ -1125,7 +1128,8 @@ fn slot_info(slot: &Slot) -> SlotInfo {
     SlotInfo {
         dir: slot.dir().to_owned(),
         path: slot.path().to_owned(),
-        mirror: slot.worktree().map(|wt| wt.mirror().to_owned()),
+        mirror: slot.checkout().map(|wt| wt.mirror().to_owned()),
+        read_only: !slot.writable(),
     }
 }
 
@@ -1133,7 +1137,7 @@ fn slot_record(slot: &Slot) -> SlotRecord {
     SlotRecord {
         dir: slot.dir().to_owned(),
         seq: slot.seq(),
-        mirror: slot.worktree().map(|wt| wt.mirror().display().to_string()),
+        mirror: slot.checkout().map(|wt| wt.mirror().display().to_string()),
     }
 }
 

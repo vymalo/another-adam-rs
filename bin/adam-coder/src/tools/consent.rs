@@ -30,6 +30,13 @@
 //! the call's result, so it can answer them. A free-text answer still names whatever repository it
 //! names, as every answer of the person does.
 //!
+//! **A reference is asked the same way and grants less.** With `reference`, the tool asks whether a
+//! repository that a prepared repository's own `.agents/references.json` declared may be **read**
+//! (never written): the question says which repository declared it, quotes what the declaration says,
+//! and its yes is recorded under the subject `reference:<key>`, which never names the repository, so
+//! `prepare_workspace` still refuses it. The address asked about is the declaration's, recorded when the
+//! repository was prepared; one the model made up is refused.
+//!
 //! **No person, no question.** In a run another agent started (`ask_agent` of `thread-tools/v1`: a
 //! message's grant named an asked agent, `adam_a2a_runtime::asked_by_an_agent`; once one did, for the
 //! rest of the conversation), nobody can agree, so the consent tools ask nothing: `ask` returns an
@@ -87,9 +94,18 @@ pub(crate) fn asked_by(tool: &str, arguments: &Value) -> Option<Asked> {
     match tool {
         REQUEST_REPOSITORY => {
             let url = arguments.get("repo_url")?.as_str()?;
-            Some(Asked {
-                subject: key_of_argument(url)?,
-                yes: yes_label(&display_name(url)?),
+            let key = key_of_argument(url)?;
+            let display = display_name(url)?;
+            Some(if reference_of(arguments).is_some() {
+                Asked {
+                    subject: reference_subject(&key),
+                    yes: read_label(&display),
+                }
+            } else {
+                Asked {
+                    subject: key,
+                    yes: yes_label(&display),
+                }
             })
         }
         CREATE_REPOSITORY => consent_of(arguments),
@@ -106,7 +122,7 @@ pub(crate) const ALREADY_GRANTED: &str =
 /// person's words.
 pub(crate) fn is_tools_own_result(tool: &str, text: &str) -> bool {
     match tool {
-        REQUEST_REPOSITORY => text == ALREADY_GRANTED,
+        REQUEST_REPOSITORY => text == ALREADY_GRANTED || text == REFERENCE_ALREADY_AGREED,
         CREATE_REPOSITORY => text.starts_with(CREATED_PREFIX),
         _ => false,
     }
@@ -129,6 +145,36 @@ pub(crate) const NO_LABEL: &str = "No";
 pub(crate) fn yes_label(display: &str) -> String {
     format!("Yes, add {display}")
 }
+
+/// What a subject starts with when the question was about reading a repository as a reference.
+pub(crate) const REFERENCE_SUBJECT_PREFIX: &str = "reference:";
+
+/// The subject of the consent to read the repository with `key` as a reference.
+pub(crate) fn reference_subject(key: &str) -> String {
+    format!("{REFERENCE_SUBJECT_PREFIX}{key}")
+}
+
+/// Whether `subject` is the consent to read a repository as a reference.
+pub(crate) fn is_reference_subject(subject: &str) -> bool {
+    subject.starts_with(REFERENCE_SUBJECT_PREFIX)
+}
+
+/// The name of the declared reference a `request_repository` call asks about, if it asks about one.
+pub(crate) fn reference_of(arguments: &Value) -> Option<&str> {
+    arguments
+        .get("reference")?
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// The label of the option that says yes to reading `display`.
+pub(crate) fn read_label(display: &str) -> String {
+    format!("Yes, read {display}")
+}
+
+/// What `request_repository` says when a reference needs no question: the person agreed already.
+pub(crate) const REFERENCE_ALREADY_AGREED: &str = "That reference is already agreed: read it with the file tools, passing its name as `repo`. Nobody needs to be asked.";
 
 /// What an answer says to a question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,7 +431,10 @@ pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value, what: &str) -
 /// repository the person did not name: to read something from it, or to change it too. The person
 /// is asked a yes or no question that this tool writes, with your reason, and only a yes adds the
 /// repository: then call prepare_workspace with it. A no is final for this task: do not ask again
-/// for the same repository and do not look for another way to change it.
+/// for the same repository and do not look for another way to change it. To read a repository that a
+/// repository you prepared lists as a reference (its result says so), pass that reference's name as
+/// `reference` and its address as `repo_url`: a yes lets you read it with the file tools, passing the
+/// name as `repo`, and never lets you change it.
 #[tool(asks_user, label = "Ask to use a repository", icon = "think")]
 pub async fn request_repository(
     env: State<ToolEnv>,
@@ -394,6 +443,8 @@ pub async fn request_repository(
     repo_url: String,
     /// Why the task needs this repository, in one plain sentence (at most 300 characters). The person reads it.
     reason: String,
+    /// The name of a reference a prepared repository listed, to read it and never change it. Leave out to ask to add the repository to work on.
+    reference: Option<String>,
 ) -> Outcome {
     let Some(url) = non_empty(&repo_url) else {
         return Ok(ToolOutput::error("repo_url is required"));
@@ -414,6 +465,9 @@ pub async fn request_repository(
         return Ok(ToolOutput::error(
             "repo_url must be a repository address without spaces or control characters",
         ));
+    }
+    if let Some(name) = reference.as_deref().and_then(non_empty) {
+        return super::references::ask_to_read(&env, ctx, url, reason, name).await;
     }
     // A repository that could never be added is not worth asking about.
     if let Err(e) = env.workspaces.check_repository(&RepoRef::new(url, "main")) {

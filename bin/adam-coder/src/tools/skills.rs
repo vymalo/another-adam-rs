@@ -191,7 +191,7 @@ impl RepoSkills {
                 }
             ));
         };
-        let slot = self.env.slot(ctx, Some(slot_name)).await?;
+        let slot = self.env.slot_to_read(ctx, Some(slot_name)).await?;
         Ok(Resolved {
             slot,
             skill: skill.clone(),
@@ -359,7 +359,7 @@ fn bundled_line(qualified: &str, files: &[String], more: usize) -> String {
 
 /// `text` for a listing: the bidirectional controls (U+202A to U+202E, U+2066 to U+2069), which
 /// `escape_text` leaves alone and which can reorder what is shown, are written `\u{..}`.
-fn listing_text(text: &str) -> String {
+pub(super) fn listing_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
@@ -411,7 +411,7 @@ fn check_path(path: &str) -> Result<String, String> {
 
 /// Why a file of a skill could not be read.
 #[derive(Debug)]
-enum Fail {
+pub(super) enum Fail {
     Missing,
     Escapes,
     OutsideSkill,
@@ -423,7 +423,7 @@ enum Fail {
 
 impl Fail {
     /// The end of a sentence about the file.
-    fn why(&self) -> String {
+    pub(super) fn why(&self) -> String {
         match self {
             Self::Missing => "does not exist".to_owned(),
             Self::Escapes => "is a link that leaves the repository".to_owned(),
@@ -441,7 +441,7 @@ impl Fail {
 /// opened by the path that resolution found with no link allowed on it. A file that is not
 /// regular (a FIFO, a device) is refused after being opened without waiting, and a file over
 /// `max` is not read.
-fn read_inside(
+pub(super) fn read_inside(
     root: &SlotDir,
     rel: &Path,
     within: Option<&Path>,
@@ -762,7 +762,7 @@ fn is_empty(note: &RepoSkillsNote) -> bool {
 }
 
 /// `text` cut at `max` characters, with an ellipsis when it was.
-fn shorten(text: &str, max: usize) -> String {
+pub(super) fn shorten(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }

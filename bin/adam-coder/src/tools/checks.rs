@@ -566,7 +566,7 @@ pub async fn run_checks(
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
 
     // A repository's worktree or a scratch project: the checks run on either.
-    let slot = match env.slot(ctx, repo.as_deref()).await {
+    let slot = match env.slot_to_write(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
