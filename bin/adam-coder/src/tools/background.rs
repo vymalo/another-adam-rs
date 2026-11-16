@@ -2076,6 +2076,35 @@ mod tests {
     }
 
     #[test]
+    fn a_record_is_stale_after_three_sweeps_and_never_before_a_minute() {
+        assert_eq!(BEAT_STALE_FLOOR_SECS, 60);
+        assert_eq!(stale_after(Duration::from_millis(200)), 60);
+        assert_eq!(stale_after(Duration::from_secs(15)), 60);
+        assert_eq!(stale_after(Duration::from_secs(20)), 60);
+        assert_eq!(stale_after(Duration::from_secs(30)), 90);
+        assert_eq!(stale_after(Duration::from_secs(3600)), 10_800);
+        let record = |beat| Record {
+            command: String::new(),
+            slot: String::new(),
+            cwd: String::new(),
+            exec: String::new(),
+            owner: String::new(),
+            pid: None,
+            start: None,
+            started_at: 0,
+            state: CommandState::Running,
+            ran_secs: None,
+            lines: None,
+            git: None,
+            beat,
+            stop_requested: None,
+        };
+        assert!(record(940).is_fresh(1000, 60));
+        assert!(!record(939).is_fresh(1000, 60));
+        assert!(record(1005).is_fresh(1000, 60), "a clock a little ahead");
+    }
+
+    #[test]
     fn the_owner_tokens_of_two_registries_differ() {
         assert_ne!(Commands::new().owner(), Commands::new().owner());
         assert_eq!(Commands::new().owner().len(), 32);
