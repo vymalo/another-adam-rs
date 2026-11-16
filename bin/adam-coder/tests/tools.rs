@@ -8279,3 +8279,95 @@ async fn at_most_sixteen_skip_lines_are_written_then_a_count() {
         "{block}"
     );
 }
+
+/// A PNG whose header says `width` by `height`.
+fn png_of(width: u32, height: u32) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    v.extend_from_slice(&width.to_be_bytes());
+    v.extend_from_slice(&height.to_be_bytes());
+    v.extend_from_slice(&[8, 2, 0, 0, 0]);
+    v
+}
+
+fn seeing(sources: &[adam_model::ImageOrigin], max_side: u32) -> adam_model::ImageLimits {
+    adam_model::ImageLimits {
+        max_bytes: 1024 * 1024,
+        max_count: 8,
+        max_side,
+        sources: sources.iter().copied().collect(),
+    }
+}
+
+/// `read_file` of a PNG is an image for a model that sees and the source `workspace` is allowed; for
+/// every other model it is the binary file it always was.
+#[tokio::test]
+async fn read_file_of_a_png_is_an_image_for_a_seeing_model() {
+    use adam_model::ImageOrigin::{Mcp, Person, Workspace};
+
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("shot.png"), png_of(800, 600)).unwrap();
+    std::fs::write(wt.join("wide.png"), png_of(5000, 10)).unwrap();
+    std::fs::write(
+        wt.join("logo.svg"),
+        "<svg xmlns='http://www.w3.org/2000/svg'/>\n",
+    )
+    .unwrap();
+
+    // A model that cannot see: a binary file is not shown, as before.
+    let blind = ReadFile.call(&rig.ctx, json!({"path": "shot.png"})).await;
+    assert!(is_error(&blind), "{blind:?}");
+    assert!(text(blind).contains("binary file, 29 bytes"));
+
+    // A model that sees, and a deployment that sends the workspace.
+    let sees = rig
+        .ctx
+        .clone()
+        .with_image_limits(seeing(&[Person, Workspace], 4096));
+    let out = ReadFile
+        .call(&sees, json!({"path": "shot.png"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        "`shot.png` is an image (image/png, 29 bytes, 800\u{d7}600), shown to you after this result"
+    );
+    assert_eq!(out.images.len(), 1);
+    assert_eq!(out.images[0].origin, Workspace);
+    assert_eq!(out.images[0].name.as_deref(), Some("shot.png"));
+    assert_eq!(out.kept_images.len(), 1, "no image store in this context");
+
+    // Over a limit it is a line, not an error, and nothing rides.
+    let wide = ReadFile
+        .call(&sees, json!({"path": "wide.png"}))
+        .await
+        .unwrap();
+    assert!(!wide.is_error);
+    assert!(wide.images.is_empty());
+    assert!(
+        wide.content.starts_with(
+            "[image not shown: wide.png (image/png, 29 bytes, 5000\u{d7}10) is over the 4096 px"
+        ),
+        "{}",
+        wide.content
+    );
+
+    // A source the deployment does not send: the file is read as any other.
+    let closed = rig
+        .ctx
+        .clone()
+        .with_image_limits(seeing(&[Person, Mcp], 4096));
+    let refused = ReadFile.call(&closed, json!({"path": "shot.png"})).await;
+    assert!(is_error(&refused), "{refused:?}");
+    assert!(text(refused).contains("binary file"));
+
+    // An SVG is text: it is read, and never offered as an image.
+    let svg = ReadFile
+        .call(&sees, json!({"path": "logo.svg"}))
+        .await
+        .unwrap();
+    assert!(svg.images.is_empty());
+    assert!(svg.content.contains("<svg"), "{}", svg.content);
+}

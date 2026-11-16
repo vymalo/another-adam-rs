@@ -847,3 +847,55 @@ async fn the_janitor_signals_no_pid_of_another_machine() {
     other.kill().unwrap();
     other.wait().unwrap();
 }
+
+/// The images of a conversation (`<root>/images/<scope>`) go when its scratch projects would: the
+/// conversation has had no task for the idle time. An open task keeps them, and a run with no
+/// conversation takes its own with it.
+#[tokio::test]
+async fn images_go_with_an_idle_conversation() {
+    use adam_llm_agent::{KeptImages as _, image_scope, sha256_hex};
+
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let idle = run_of(&store, RunStatus::Done, Some("caller:idle"))
+        .await
+        .to_string();
+    let busy = run_of(&store, RunStatus::Done, Some("caller:busy"))
+        .await
+        .to_string();
+    let alone = run_in(&store, RunStatus::Done).await.to_string();
+    let png = b"\x89PNG\r\n\x1a\nan image".to_vec();
+    let scopes = [
+        image_scope(Some("caller:idle"), &idle),
+        image_scope(Some("caller:busy"), &busy),
+        image_scope(None, &alone),
+    ];
+    for (run, scope) in [&idle, &busy, &alone].into_iter().zip(&scopes) {
+        workspace_of(&fx, run).await;
+        fx.env
+            .images
+            .keep(scope, &sha256_hex(&png), "image/png", &png)
+            .await
+            .unwrap();
+    }
+    // The busy conversation has a task open.
+    run_of(&store, RunStatus::Parked, Some("caller:busy")).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let janitor = Janitor::new(fx.env.workspaces.clone(), None)
+        .with_scratch_idle(Some(Duration::from_millis(30)));
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(report.failed.is_empty(), "{report:?}");
+    let images = fx.root.join("images");
+    assert!(!images.join(&scopes[0]).exists(), "an idle conversation's");
+    assert!(
+        images.join(&scopes[1]).is_dir(),
+        "a busy conversation's stays"
+    );
+    assert!(
+        !images.join(&scopes[2]).exists(),
+        "a run with no conversation's"
+    );
+}

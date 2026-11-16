@@ -804,6 +804,16 @@ impl ToolCtx {
         self
     }
 
+    /// Say that the model of the call sees images within `limits`, with an empty history and no room
+    /// to count in a run's state: for a context made outside a run (a test of a tool that offers
+    /// images, [`keep_image`](crate::keep_image)). The agent loop does the same for every call, from
+    /// the model's own word and what the history holds.
+    #[must_use]
+    pub fn with_image_limits(self, limits: adam_model::ImageLimits) -> Self {
+        let scope = crate::images::image_scope(None, &self.root_run.to_string());
+        self.with_images(ImageGate::new(Some(limits), 0, None), scope)
+    }
+
     /// Whether the model of this run can see images at all: a tool that would read or fetch an
     /// image only to have it replaced by a line may say so instead, and not read it.
     pub fn sees_images(&self) -> bool {

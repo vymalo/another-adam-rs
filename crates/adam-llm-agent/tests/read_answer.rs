@@ -437,3 +437,80 @@ async fn a_run_that_is_loaded_again_refuses_from_the_question_it_stored() {
     assert_eq!(q.question, "\"still not\" was refused (\"n\"). which?");
     assert_eq!(refusals(&sink, run).len(), 2, "{:?}", refusals(&sink, run));
 }
+
+/// An answer that carries a picture gives the call's result the picture, through a step of its own
+/// that keeps it: the model is sent the answer's words and, after the result, the image. A model
+/// that cannot see is told in a line, and the answer stands.
+#[tokio::test]
+async fn an_answer_with_a_picture_gives_the_result_its_image() {
+    use adam_llm_agent::{ImageStore, InboundImage, MemoryImages, user_message_with_images};
+    use adam_model::{ImageLimits, ImageOrigin};
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    png.extend_from_slice(&[0, 0, 0, 16, 0, 0, 0, 16, 8, 2, 0, 0, 0, 1, 2, 3]);
+    for sees in [true, false] {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let mock = Arc::new(if sees {
+            MockModel::new().seeing_images(ImageLimits {
+                max_bytes: 1 << 20,
+                max_count: 8,
+                max_side: 4096,
+                sources: [ImageOrigin::Person].into(),
+            })
+        } else {
+            MockModel::new()
+        });
+        mock.push_tool_calls(vec![call("c1", "pick", json!({"note": "n"}))])
+            .push_text("thanks");
+        let model: DynModel = mock.clone();
+        let agent = LlmAgent::builder("llm", model, "test-model")
+            .state(Arc::new(ImageStore(Arc::new(MemoryImages::new()))))
+            .tool(Pick)
+            .build();
+        let sink = CollectingSink::new();
+        let rt = Runtime::builder(store)
+            .agent(agent)
+            .event_sink(sink)
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let run = rt.start("llm", user_message("go"), None).await.unwrap();
+        let (stop, worker) = spawn_worker(&rt);
+        until(&rt, run, "parked", |v| v.waiting).await;
+        rt.deliver(
+            run,
+            user_message_with_images(
+                "ok",
+                &[InboundImage::new(
+                    Some("proof.png"),
+                    Some("image/png"),
+                    &png,
+                )],
+            ),
+        )
+        .await
+        .unwrap();
+        let done = until(&rt, run, "done", |v| v.status == RunStatus::Done).await;
+        let _ = stop.send(());
+        worker.await.unwrap();
+        let state = conversation(&done);
+        let result = state
+            .messages
+            .iter()
+            .find(|m| matches!(m, Message::Tool { call_id, .. } if call_id == "c1"))
+            .unwrap();
+        if sees {
+            assert_eq!(result.text(), "ok");
+            assert_eq!(result.images().len(), 1);
+            let last = mock.requests().pop().unwrap();
+            assert_eq!(last.image_data.len(), 1);
+        } else {
+            assert!(result.images().is_empty());
+            assert!(
+                result
+                    .text()
+                    .starts_with("ok\n[image not shown: this model cannot see images"),
+                "{}",
+                result.text()
+            );
+        }
+    }
+}

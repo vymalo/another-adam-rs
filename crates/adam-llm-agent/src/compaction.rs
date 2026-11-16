@@ -571,6 +571,17 @@ pub(crate) fn apply(
         _ => None,
     }
     .unwrap_or_else(|| ContentPart::text(""));
+    // The pictures that came with the task stay with it, after everything else of the message, so
+    // that the marker is still its second part. The pictures of the turns that are dropped are
+    // summarised away with their words.
+    let task_images: Vec<ContentPart> = match dropped.first() {
+        Some(Message::User { content }) => content
+            .iter()
+            .filter(|p| matches!(p, ContentPart::Image(_)))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
     state.compactions.push(Compaction {
         turn: state.turns,
         dropped_turns,
@@ -593,6 +604,7 @@ pub(crate) fn apply(
         )),
     ];
     parts.extend(sayings.into_iter().map(ContentPart::text));
+    parts.extend(task_images);
     let tail = state.messages.split_off(cut);
     state.pinned_calls.retain(|id| {
         tail.iter()

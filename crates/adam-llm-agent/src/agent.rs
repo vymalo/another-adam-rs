@@ -1658,10 +1658,15 @@ impl LlmAgent {
 
         let mut request = ModelRequest::new(self.model_alias.clone());
         request.system = self.instructions.clone();
-        request.messages = described(&match reason {
+        // The summary request is the request before it and one more message, so a provider's cache
+        // serves it: its images are the ones the last request sent. A history that a provider
+        // rejected as too long is sent shorter, with each image said in a few words.
+        request.messages = match reason {
             CompactionReason::Budget => state.messages.clone(),
-            CompactionReason::Overflow => shortened_for_overflow(&state.messages[..cut.index]),
-        });
+            CompactionReason::Overflow => {
+                described(&shortened_for_overflow(&state.messages[..cut.index]))
+            }
+        };
         request.messages.push(Message::user_text(COMPACTION_TURN));
         request.tools = self.specs.clone();
         request.tool_choice = ToolChoice::None;
@@ -1680,8 +1685,31 @@ impl LlmAgent {
         let run = ctx.run_id();
         let cancel = ctx.cancel_token();
         let at = cut.index;
+        let sees = self
+            .model
+            .input_modalities(&self.model_alias)
+            .images
+            .is_some()
+            && reason == CompactionReason::Budget;
+        let named: Vec<adam_model::ImageRef> = state.image_refs().into_iter().cloned().collect();
+        let images_store = self.extensions.get::<ImageStore>().map(|s| (*s).clone());
+        let images_scope = image_scope(
+            ctx.conversation_id(),
+            &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
+        );
+        let images_state = Arc::clone(&state.images);
         let recorded: Result<Summarised, ModelFailure> = ctx
             .step(&id, move || async move {
+                if sees && !named.is_empty() {
+                    request.image_data = image_data(
+                        named.iter().collect(),
+                        true,
+                        images_store.as_ref(),
+                        &images_scope,
+                        &images_state,
+                    )
+                    .await;
+                }
                 apply_sources(&sources, source_ctx.as_ref(), &mut request).await;
                 let answer = tokio::select! {
                     biased;

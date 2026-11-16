@@ -8,14 +8,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
+use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store as _};
 use adam_llm_agent::{
-    COMPACTION_TURN, Conversation, Limits, LlmAgent, LlmAgentBuilder, MAX_SOURCE_TOOLS, ReadOutput,
-    Tool, ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
+    COMPACTION_TURN, Conversation, ImageStore, InboundImage, Limits, LlmAgent, LlmAgentBuilder,
+    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, Tool, ToolCtx, ToolError, ToolOutput, ToolSource,
+    keep_image, user_message, user_message_with_images,
 };
 use adam_model::{
-    DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
-    ToolCall, ToolChoice, ToolSpec,
+    DynModel, ImageLimits, ImageOrigin, InputModalities, Message, MockModel, ModelClient,
+    ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_runtime::{CollectingSink, ManualClock, RetryPolicy, RunView, Runtime};
 use adam_store_testkit::fault::{FaultyStore, Method};
@@ -139,6 +140,10 @@ impl Arm {
 
 #[async_trait]
 impl ModelClient for Arm {
+    fn input_modalities(&self, model: &str) -> InputModalities {
+        self.inner.input_modalities(model)
+    }
+
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         if self.refuse_summaries && is_summary(&req) {
             return Err(ModelError::invalid_request("this test makes no summaries"));
@@ -190,7 +195,30 @@ impl Rig {
         summaries: bool,
         configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
     ) -> Self {
-        let mock = Arc::new(MockModel::new());
+        Self::build_with(MockModel::new(), max_history_tokens, summaries, configure)
+    }
+
+    /// A rig whose model can see images within `limits`.
+    fn seeing(
+        max_history_tokens: u32,
+        limits: ImageLimits,
+        configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
+    ) -> Self {
+        Self::build_with(
+            MockModel::new().seeing_images(limits),
+            max_history_tokens,
+            false,
+            configure,
+        )
+    }
+
+    fn build_with(
+        mock: MockModel,
+        max_history_tokens: u32,
+        summaries: bool,
+        configure: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
+    ) -> Self {
+        let mock = Arc::new(mock);
         let store = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
         let arm = Arc::new(Arm {
             inner: mock.clone(),
@@ -986,4 +1014,384 @@ async fn the_summary_request_has_the_tools_of_the_sources_too() {
     assert_eq!(summary.system, before.system);
     assert_eq!(summary.prompt_cache_key, before.prompt_cache_key);
     assert!(summary.prompt_cache_key.is_some());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Images (ADR 0044, slice 15a)
+// ---------------------------------------------------------------------------------------------
+
+fn png(width: u32, height: u32, tag: u32) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    v.extend_from_slice(&width.to_be_bytes());
+    v.extend_from_slice(&height.to_be_bytes());
+    v.extend_from_slice(&[8, 2, 0, 0, 0]);
+    v.extend_from_slice(&tag.to_be_bytes());
+    v.extend(std::iter::repeat_n(0xAB, 200));
+    v
+}
+
+fn limits(max_count: usize) -> ImageLimits {
+    ImageLimits {
+        max_bytes: 1024 * 1024,
+        max_count,
+        max_side: 4096,
+        sources: [ImageOrigin::Person, ImageOrigin::Workspace].into(),
+    }
+}
+
+/// `snap { n }` answers an image of its own: a picture of `n`.
+struct Snap;
+
+#[async_trait]
+impl Tool for Snap {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "snap".into(),
+            description: "answers an image".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let n = args["n"].as_u64().unwrap_or(0) as u32;
+        let outcome = keep_image(
+            ctx,
+            &png(8, 8, n),
+            None,
+            Some(&format!("shot{n}.png")),
+            ImageOrigin::Workspace,
+        )
+        .await;
+        let said = outcome
+            .stand_in
+            .clone()
+            .unwrap_or_else(|| format!("shot{n}.png is an image, shown to you after this result"));
+        Ok(ToolOutput::text(said).with_image(outcome))
+    }
+}
+
+fn snap(n: u32) -> ToolCall {
+    call(&format!("s{n}"), "snap", json!({"n": n}))
+}
+
+fn with_store(builder: LlmAgentBuilder) -> LlmAgentBuilder {
+    builder
+        .state(Arc::new(ImageStore(Arc::new(MemoryImages::new()))))
+        .tool(Snap)
+}
+
+fn looking(png_tag: u32) -> adam_runtime::Inbound {
+    user_message_with_images(
+        "what is this?",
+        &[InboundImage::new(
+            Some("me.png"),
+            Some("image/png"),
+            &png(64, 64, png_tag),
+        )],
+    )
+}
+
+fn images_of(messages: &[Message]) -> Vec<&adam_model::ImageRef> {
+    messages.iter().flat_map(Message::images).collect()
+}
+
+/// A person's picture and three of a tool's: every request starts with the one before it, and the
+/// bytes of every image a request names are in its `image_data`, the same bytes each time.
+#[tokio::test]
+async fn images_keep_the_prefix() {
+    let rig = Rig::seeing(0, limits(8), with_store);
+    rig.mock
+        .push_tool_calls(vec![snap(1)])
+        .push_tool_calls(vec![snap(2)])
+        .push_tool_calls(vec![snap(3)])
+        .push_text("a cat");
+    let run = rig.rt.start("llm", looking(0), None).await.expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(breaks(&requests), Vec::<u32>::new());
+    assert_eq!(images_of(&state.messages).len(), 4);
+    for request in &requests {
+        for image in images_of(&request.messages) {
+            let bytes = request
+                .image_data
+                .get(&image.sha256)
+                .unwrap_or_else(|| panic!("no bytes for {}", image.sha256));
+            assert_eq!(adam_llm_agent::sha256_hex(bytes), image.sha256);
+        }
+    }
+    // The first image is the person's, in the first message after its words; what a tool returned
+    // is on the tool's message.
+    let Message::User { content } = &requests[0].messages[0] else {
+        panic!("a user message");
+    };
+    assert_eq!(content[0].as_text(), "what is this?");
+    assert!(matches!(content[1], adam_model::ContentPart::Image(_)));
+    assert_eq!(requests[3].image_data.len(), 4);
+    // An agent with a store keeps no byte in its state.
+    assert!(state.images.is_empty());
+    assert!(state.pending_images.is_empty());
+}
+
+/// A model that cannot see is given a line in place of every image, and the run completes: an
+/// image never fails a request.
+#[tokio::test]
+async fn a_text_only_model_gets_a_stand_in_and_completes() {
+    let rig = Rig::new(0, with_store);
+    rig.mock.push_tool_calls(vec![snap(1)]).push_text("ok");
+    let run = rig.rt.start("llm", looking(0), None).await.expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, state) = rig.finish(run).await;
+    assert!(images_of(&state.messages).is_empty());
+    assert!(requests.iter().all(|r| r.image_data.is_empty()));
+    let Message::User { content } = &state.messages[0] else {
+        panic!("a user message");
+    };
+    assert_eq!(content.len(), 2, "{content:?}");
+    assert!(
+        content[1]
+            .as_text()
+            .starts_with("[image not shown: this model cannot see images; me.png (image/png"),
+        "{content:?}"
+    );
+    let tool = state
+        .messages
+        .iter()
+        .find(|m| matches!(m, Message::Tool { .. }))
+        .unwrap();
+    assert!(
+        tool.text()
+            .starts_with("[image not shown: this model cannot see images; shot1.png"),
+        "{}",
+        tool.text()
+    );
+}
+
+/// The ninth image of a run is a stand-in, and the eight before it stay as they were.
+#[tokio::test]
+async fn the_ninth_image_is_a_stand_in_and_nothing_before_changes() {
+    let rig = Rig::seeing(0, limits(8), with_store);
+    for n in 1..=8 {
+        rig.mock.push_tool_calls(vec![snap(n)]);
+    }
+    rig.mock.push_text("done");
+    let run = rig.rt.start("llm", looking(0), None).await.expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(breaks(&requests), Vec::<u32>::new());
+    assert_eq!(images_of(&state.messages).len(), 8);
+    let last = state
+        .messages
+        .iter()
+        .rfind(|m| matches!(m, Message::Tool { .. }))
+        .unwrap();
+    assert!(last.images().is_empty());
+    assert!(
+        last.text()
+            .contains("is past the 8 images this run sends to the model"),
+        "{}",
+        last.text()
+    );
+    // The request before the stand-in holds the first eight; the last request the same eight.
+    assert_eq!(images_of(&requests[7].messages).len(), 8);
+    assert_eq!(
+        images_of(&requests[8].messages),
+        images_of(&requests[7].messages)
+    );
+}
+
+/// The commit of a step that kept an image is lost (before it applied, or after): the run replays
+/// the same references and is sent the same requests.
+#[tokio::test]
+async fn a_lost_commit_replays_the_same_image_refs() {
+    let run_it = |lose: Option<(usize, bool)>| async move {
+        let rig = Rig::seeing(0, limits(8), with_store);
+        rig.mock
+            .push_tool_calls(vec![snap(1)])
+            .push_tool_calls(vec![snap(2)])
+            .push_text("done");
+        if let Some((call, after)) = lose {
+            rig.lose_the_commit_after_call(call, after);
+        }
+        let run = rig.rt.start("llm", looking(7), None).await.expect("start");
+        *rig.arm.run.lock().unwrap() = Some(run);
+        let out = rig.finish(run).await;
+        let injected = rig.store.injected(Method::CommitRun);
+        (out, injected)
+    };
+    let ((base_requests, base), _) = run_it(None).await;
+    for call in [0usize, 1] {
+        for after in [false, true] {
+            let ((requests, state), injected) = run_it(Some((call, after))).await;
+            let label = format!("after call {call}, applied: {after}");
+            assert_eq!(injected, 1, "{label}");
+            assert_eq!(state.messages, base.messages, "{label}");
+            assert_eq!(requests.len(), base_requests.len(), "{label}");
+            for (got, want) in requests.iter().zip(&base_requests) {
+                assert_eq!(
+                    serde_json::to_string(got).unwrap(),
+                    serde_json::to_string(want).unwrap(),
+                    "{label}"
+                );
+                assert_eq!(got.image_data.len(), want.image_data.len(), "{label}");
+            }
+        }
+    }
+}
+
+/// An old result's images go when the history is shortened, once, as a line that names each; the
+/// newest result keeps its image and so does the person's.
+#[tokio::test]
+async fn a_shortening_replaces_old_tool_images_once() {
+    // Three images are 12,000 characters of the estimate: a budget of 4,000 tokens is 16,000, and
+    // the fourth image takes the history over it.
+    let rig = Rig::seeing(4000, limits(8), with_store);
+    for n in 1..=5 {
+        rig.mock.push_tool_calls(vec![snap(n)]);
+    }
+    rig.mock.push_text("done");
+    let run = rig.rt.start("llm", looking(0), None).await.expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, state) = rig.finish(run).await;
+    assert!(!state.shortenings.is_empty(), "{:?}", state.shortenings);
+    assert_eq!(breaks(&requests), state.shortenings);
+    let tools: Vec<&Message> = state
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::Tool { .. }))
+        .collect();
+    let removed = |m: &Message| {
+        m.text()
+            .matches("[image removed from the history: shot")
+            .count()
+    };
+    assert!(tools[0].images().is_empty());
+    assert_eq!(removed(tools[0]), 1, "{}", tools[0].text());
+    assert!(!tools.last().unwrap().images().is_empty());
+    // The person's picture is never shortened.
+    assert_eq!(state.messages[0].images().len(), 1);
+    // Once: no result has the line twice.
+    assert!(tools.iter().all(|m| removed(m) <= 1));
+}
+
+/// A message that is only a picture is a message, and starts a run.
+#[tokio::test]
+async fn an_image_only_message_starts_a_run() {
+    let rig = Rig::seeing(0, limits(8), with_store);
+    rig.mock.push_text("a cat");
+    let run = rig
+        .rt
+        .start(
+            "llm",
+            user_message_with_images("", &[InboundImage::new(None, None, &png(32, 32, 1))]),
+            None,
+        )
+        .await
+        .expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, state) = rig.finish(run).await;
+    let Message::User { content } = &requests[0].messages[0] else {
+        panic!("a user message");
+    };
+    assert_eq!(content.len(), 1, "{content:?}");
+    assert!(matches!(content[0], adam_model::ContentPart::Image(_)));
+    assert_eq!(requests[0].image_data.len(), 1);
+    assert_eq!(state.messages[0].text(), "");
+}
+
+/// No byte of an image is in the journal, and none is in the state of an agent that has a store.
+#[tokio::test]
+async fn the_journal_holds_no_image_bytes() {
+    use base64::Engine as _;
+    let rig = Rig::seeing(0, limits(8), with_store);
+    rig.mock
+        .push_tool_calls(vec![snap(1)])
+        .push_tool_calls(vec![snap(2)])
+        .push_text("done");
+    let run = rig.rt.start("llm", looking(5), None).await.expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (_, state) = rig.finish(run).await;
+    let wanted: Vec<String> = [png(64, 64, 5), png(8, 8, 1), png(8, 8, 2)]
+        .iter()
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(&bytes[..39]))
+        .collect();
+    let entries = rig.store.journal_list(run).await.unwrap();
+    assert!(entries.iter().any(|e| e.name.starts_with("image:")));
+    let journal =
+        serde_json::to_string(&entries.iter().map(|e| &e.payload).collect::<Vec<_>>()).unwrap();
+    let state_json = serde_json::to_string(&state).unwrap();
+    for piece in &wanted {
+        assert!(!journal.contains(piece), "the journal holds image bytes");
+        assert!(!state_json.contains(piece), "the state holds image bytes");
+    }
+    // The references are there.
+    assert!(journal.contains(&images_of(&state.messages)[0].sha256));
+}
+
+/// An agent with no store keeps the bytes in its own state, within what a run keeps there, and the
+/// model is sent them.
+#[tokio::test]
+async fn state_images_are_kept_in_the_state_within_the_bound() {
+    let rig = Rig::seeing(0, limits(8), |b| b.tool(Snap));
+    rig.mock.push_tool_calls(vec![snap(1)]).push_text("done");
+    let run = rig.rt.start("llm", looking(2), None).await.expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(state.images.len(), 2, "{:?}", state.images.keys());
+    // The control of the test above: here the bytes are in the state, by design.
+    {
+        use base64::Engine as _;
+        let piece = base64::engine::general_purpose::STANDARD.encode(&png(64, 64, 2)[..39]);
+        assert!(serde_json::to_string(&state).unwrap().contains(&piece));
+    }
+    assert!(state.kept_bytes() < adam_llm_agent::MAX_RUN_KEPT_BYTES);
+    assert_eq!(requests[1].image_data.len(), 2);
+    for image in images_of(&state.messages) {
+        let kept = &state.images[&image.sha256];
+        assert_eq!(kept.media_type, "image/png");
+    }
+    // Written before the field existed, or with no image: no member.
+    let plain = serde_json::to_value(Conversation::new("x")).unwrap();
+    assert!(plain.get("images").is_none() && plain.get("pending_images").is_none());
+}
+
+/// A compaction summarises the images of the turns it drops away with the rest: they leave the
+/// history, and the bytes a run kept in its state for them with them. The person's picture is in the
+/// first message, which is never dropped, and the turn that stays keeps its image. The break is the
+/// compaction's, recorded, and nothing else moves.
+#[tokio::test]
+async fn a_compaction_summarises_the_images_of_dropped_turns_and_keeps_the_rest() {
+    let rig = Rig::build_with(MockModel::new().seeing_images(limits(8)), 3500, true, |b| {
+        b.tool(Snap)
+    });
+    rig.mock
+        .push_tool_calls(vec![snap(1)])
+        .push_tool_calls(vec![snap(2)])
+        .push_tool_calls(vec![snap(3)])
+        .push_text("SUMMARY: two pictures")
+        .push_tool_calls(vec![snap(4)])
+        .push_text("done");
+    let run = rig.rt.start("llm", looking(9), None).await.expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "{:?}", state.compactions);
+    let mut expected = state.shortenings.clone();
+    expected.push(state.compactions[0].turn);
+    expected.sort_unstable();
+    assert_eq!(breaks(&requests), expected);
+    // The task's picture, the picture of the turn that stayed, and the one made after.
+    let names: Vec<&str> = images_of(&state.messages)
+        .iter()
+        .map(|i| i.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(names, ["me.png", "shot3.png", "shot4.png"], "{names:?}");
+    // The state keeps the bytes of what the history names and no more.
+    assert_eq!(state.images.len(), 3, "{:?}", state.images.keys());
+    // The summary request starts with the request before it and is sent the bytes of all four
+    // pictures of the history it summarises.
+    let at = requests.iter().position(is_summary).unwrap();
+    assert!(open_messages(&requests[at]).starts_with(&open_messages(&requests[at - 1])));
+    assert_eq!(requests[at].image_data.len(), 4);
+    // After it the summarised turns' images are not sent.
+    let last = requests.last().unwrap();
+    assert_eq!(last.image_data.len(), 3);
 }
