@@ -1041,4 +1041,70 @@ mod tests {
         assert_eq!(parse_inbound_images(&payload).len(), 1);
         assert!(parse_inbound_images(&json!("text")).is_empty());
     }
+
+    /// What every keeper does, for the run's own state (an agent with no [`ImageStore`]): what was
+    /// kept comes back by its hash, an image that was never kept is not sent, and bytes that are not
+    /// the hash they are kept under are never served.
+    #[tokio::test]
+    async fn state_images_conformance() {
+        let bytes = png(8, 8, 1);
+        let sha = sha256_hex(&bytes);
+        let named = ImageRef {
+            sha256: sha.clone(),
+            media_type: "image/png".into(),
+            bytes: bytes.len() as u64,
+            width: 8,
+            height: 8,
+            name: None,
+            origin: ImageOrigin::Person,
+        };
+        let never = ImageRef {
+            sha256: sha256_hex(b"never kept"),
+            ..named.clone()
+        };
+        let mut state: StateImages = StateImages::new();
+        state.insert(
+            sha.clone(),
+            StateImage {
+                media_type: "image/png".into(),
+                data: STANDARD.encode(&bytes),
+            },
+        );
+        let scope = image_scope(Some("c"), "r");
+        let data = image_data(vec![&named, &never], true, None, &scope, &state).await;
+        assert_eq!(data.len(), 1);
+        assert_eq!(data.get(&sha).map(|b| b.to_vec()), Some(bytes.clone()));
+        // A model that cannot see is given none.
+        assert!(
+            image_data(vec![&named], false, None, &scope, &state)
+                .await
+                .is_empty()
+        );
+        // What was changed in the state is not served: the hash is checked every time.
+        state.insert(
+            sha.clone(),
+            StateImage {
+                media_type: "image/png".into(),
+                data: STANDARD.encode(b"changed"),
+            },
+        );
+        assert!(
+            image_data(vec![&named], true, None, &scope, &state)
+                .await
+                .is_empty()
+        );
+        // And what is not base64 is nothing.
+        state.insert(
+            sha,
+            StateImage {
+                media_type: "image/png".into(),
+                data: "@@@".into(),
+            },
+        );
+        assert!(
+            image_data(vec![&named], true, None, &scope, &state)
+                .await
+                .is_empty()
+        );
+    }
 }

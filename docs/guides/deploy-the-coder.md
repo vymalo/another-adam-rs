@@ -145,6 +145,7 @@ The values you will actually set:
 | `a2a.push.allowedUrls`, `a2a.cardSigning.secretName` | optional A2A push notifications (the webhooks they may reach) and a signed agent card (a Secret with the key), both off by default ([the chart](../../deploy/coder/README.md#push-notifications-and-the-cards-signature-a2a)) |
 | `config.modelExtraBody`, `config.modelEchoReasoning` | to make a model emit its reasoning |
 | `config.modelContextWindow` | the model's context window in tokens (`MODEL_CONTEXT_WINDOW`), so a screen shows how full the context is |
+| pictures for the model | no chart key: `config.extraEnv` carries `MODEL_INPUT_MODALITIES=text,image` and the `MODEL_IMAGE_*` limits ([environment](../reference/environment.md)); off by default, and the chart renders what it always did. The coder keeps the pictures on its volume per conversation ([the coder](../reference/coder-agent.md#images)) |
 | `runPods.enabled` | [below](#run-pods). Production runs the commands of a run in run pods; [an example of the values](../../deploy/coder/examples/production.values.yaml) |
 | `runPods.allowCommandsNextToSecrets` | `false` (default). `true` accepts that, with an App and no run pods, a command can read the App's key file; only for an upgrade you cannot finish yet: [upgrading](#upgrading-an-app-deployment) |
 
