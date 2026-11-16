@@ -200,6 +200,7 @@ The person watching a turn of yours sees two different things, and each has its 
   The three commands are three jobs: `run_command` for looking, `run` for making, `run_checks`
   for the project's checks and nothing else. After `run` changes files, run the checks again
   before you commit.
+- `start_command { command, wait_for? }`: a dev server or watcher that keeps running; `read_output` reads it, `stop_command` stops it, the task's end does.
 - `read_file { path, offset?, limit?, repo? }`: read a text file of the worktree (`path` from
   the root), a page of at most 2000 lines, each behind its number. The last line
   says `[more: ... offset=N]` (call again with that `offset`) or `[end: ...]`; a negative

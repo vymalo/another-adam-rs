@@ -113,4 +113,4 @@ pub use redact::{RedactingCredentials, Redactor};
 pub use repos::workspaces_for;
 pub use serve::{environment_for, serve};
 pub use tier::TierSource;
-pub use tools::{CoderSettings, QUICK_TOOLS, ToolEnv, coder_tools};
+pub use tools::{BACKGROUND_TOOLS, CoderSettings, Commands, QUICK_TOOLS, ToolEnv, coder_tools};

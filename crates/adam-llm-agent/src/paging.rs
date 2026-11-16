@@ -115,6 +115,16 @@ pub fn more_line(left: u64, unit: &str, next_offset: u64) -> String {
     format!("[more: {left} {unit} left; next page: offset={next_offset}]")
 }
 
+/// `[running: <total> lines so far; next page: offset=<total + 1>]`: the last line of a page of the
+/// output of a process that is still running. Only this line moves between two reads of the same
+/// page; the lines above it are complete and stay as they are.
+pub fn running_line(total: u64) -> String {
+    format!(
+        "[running: {total} lines so far; next page: offset={}]",
+        total + 1
+    )
+}
+
 /// `[end: <total> <unit>]`, with each of `notes` after a `; `.
 pub fn end_line(total: u64, unit: &str, notes: &[&str]) -> String {
     let mut line = format!("[end: {total} {unit}");
@@ -175,6 +185,22 @@ impl Page {
             None => out.push_str(&end_line(self.total, "lines", &[])),
         }
         out
+    }
+}
+
+impl Page {
+    /// [`render`](Self::render) for the output of a process that is still running: the page's own
+    /// last line says how many lines there are so far ([`running_line`]) where `render` would say the
+    /// output ended. A page that is not the last has the `[more: ...]` line it always has.
+    pub fn render_live(&self) -> String {
+        if self.next_offset().is_some() {
+            return self.render();
+        }
+        let rendered = self.render();
+        match rendered.rfind('\n') {
+            Some(at) => format!("{}\n{}", &rendered[..at], running_line(self.total)),
+            None => running_line(self.total),
+        }
     }
 }
 

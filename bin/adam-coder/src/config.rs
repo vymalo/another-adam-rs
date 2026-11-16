@@ -37,6 +37,9 @@
 //! | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs; `0` turns it off | `300` |
 //! | `SCRATCH_IDLE_DAYS` | how many days a scratch project is kept after the last task of its conversation: a project lives for the thread, and the janitor removes it once the conversation has had no task for this long; `0` removes it with its run, as it was before | `7` |
 //! | `CHECK_TIMEOUT_SECS` | time limit of one `run_checks` command | `900` |
+//! | `BACKGROUND_COMMANDS_MAX` | commands of one run that keep running (`start_command`) at once, 1 to 16; `0` is refused (exit 78) | `4` |
+//! | `BACKGROUND_COMMAND_MAX_SECS` | how long a command that keeps running may run before it is stopped, 60 to 86400; `0` is refused (exit 78) | `3600` |
+//! | `BACKGROUND_SWEEP_SECS` | how often the sweep looks at the runs that have such commands and stops those of a run that is over (a cancel never calls the agent, so this is how long its commands can outlive it), 1 to 3600; `0` is refused (exit 78) | `15` |
 //! | `CHECK_OUTPUT_TAIL_BYTES` | output tail `run_checks` returns | `16384` |
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 //! | `PR_DRAFT` | open pull requests as drafts (`true`/`false`) | `false` |
@@ -208,6 +211,12 @@ pub struct WorkerConfig {
     pub scratch_idle: Option<Duration>,
     /// `CHECK_TIMEOUT_SECS`.
     pub check_timeout: Duration,
+    /// `BACKGROUND_COMMANDS_MAX`.
+    pub background_commands_max: usize,
+    /// `BACKGROUND_COMMAND_MAX_SECS`.
+    pub background_command_max: Duration,
+    /// `BACKGROUND_SWEEP_SECS`.
+    pub background_sweep: Duration,
     /// `CHECK_OUTPUT_TAIL_BYTES`.
     pub check_output_tail: usize,
     /// `GIT_AUTHOR_NAME`.
@@ -873,6 +882,9 @@ impl std::fmt::Debug for WorkerConfig {
             .field("workspace_sweep", &self.workspace_sweep)
             .field("scratch_idle", &self.scratch_idle)
             .field("check_timeout", &self.check_timeout)
+            .field("background_commands_max", &self.background_commands_max)
+            .field("background_command_max", &self.background_command_max)
+            .field("background_sweep", &self.background_sweep)
             .field("check_output_tail", &self.check_output_tail)
             .field("pr_draft", &self.pr_draft)
             .field("mcp", &self.mcp)
@@ -1062,6 +1074,29 @@ impl WorkerConfig {
             Duration::from_secs(parse_or(get, "CHECK_TIMEOUT_SECS", 900u64, problems).max(1));
         let check_output_tail =
             parse_or(get, "CHECK_OUTPUT_TAIL_BYTES", 16_384usize, problems).max(256);
+        // Commands that keep running: bounded in number and in time, and a sweep that a cancel
+        // depends on, so none of the three may be switched off with a `0`.
+        let background_commands_max = in_range(
+            parse_or(get, "BACKGROUND_COMMANDS_MAX", 4u64, problems),
+            "BACKGROUND_COMMANDS_MAX",
+            1,
+            16,
+            problems,
+        );
+        let background_command_max = in_range(
+            parse_or(get, "BACKGROUND_COMMAND_MAX_SECS", 3600u64, problems),
+            "BACKGROUND_COMMAND_MAX_SECS",
+            60,
+            86_400,
+            problems,
+        );
+        let background_sweep = in_range(
+            parse_or(get, "BACKGROUND_SWEEP_SECS", 15u64, problems),
+            "BACKGROUND_SWEEP_SECS",
+            1,
+            3600,
+            problems,
+        );
         let pr_draft = parse_flag(get, "PR_DRAFT", problems);
         let allow_local_repos = parse_flag(get, "ALLOW_LOCAL_REPOS", problems);
         let before_flag = problems.len();
@@ -1173,6 +1208,9 @@ impl WorkerConfig {
             workspace_sweep: workspace_sweep.map(Duration::from_secs),
             scratch_idle,
             check_timeout,
+            background_commands_max: usize::try_from(background_commands_max).unwrap_or(4),
+            background_command_max: Duration::from_secs(background_command_max),
+            background_sweep: Duration::from_secs(background_sweep),
             check_output_tail,
             git_author_name: get("GIT_AUTHOR_NAME").unwrap_or_else(|| "adam-coder".to_owned()),
             git_author_email: get("GIT_AUTHOR_EMAIL")
@@ -1282,6 +1320,18 @@ fn is_host_entry(entry: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
         && port.is_none_or(|p| !p.is_empty() && p.parse::<u16>().is_ok())
+}
+
+/// `value`, or a problem naming `name` when it is not from `low` to `high` (then `low` is returned, and
+/// the configuration is refused anyway).
+fn in_range(value: u64, name: &str, low: u64, high: u64, problems: &mut Vec<String>) -> u64 {
+    if (low..=high).contains(&value) {
+        return value;
+    }
+    problems.push(format!(
+        "{name} must be from {low} to {high} (it is {value}); 0 does not turn it off"
+    ));
+    low
 }
 
 #[cfg(test)]
@@ -1455,6 +1505,44 @@ mod tests {
             "{:?}",
             err.problems
         );
+    }
+
+    #[test]
+    fn the_limits_of_commands_that_keep_running_have_defaults_and_refuse_a_zero() {
+        let c = parse(&full()).expect("valid").worker.expect("a worker");
+        assert_eq!(
+            (
+                c.background_commands_max,
+                c.background_command_max,
+                c.background_sweep
+            ),
+            (4, Duration::from_secs(3600), Duration::from_secs(15))
+        );
+        let mut vars = full();
+        vars.insert("BACKGROUND_COMMANDS_MAX", "16");
+        vars.insert("BACKGROUND_COMMAND_MAX_SECS", "60");
+        vars.insert("BACKGROUND_SWEEP_SECS", "1");
+        let c = parse(&vars).expect("valid").worker.expect("a worker");
+        assert_eq!(c.background_commands_max, 16);
+        for (name, bad) in [
+            ("BACKGROUND_COMMANDS_MAX", "0"),
+            ("BACKGROUND_COMMANDS_MAX", "17"),
+            ("BACKGROUND_COMMAND_MAX_SECS", "0"),
+            ("BACKGROUND_COMMAND_MAX_SECS", "59"),
+            ("BACKGROUND_COMMAND_MAX_SECS", "86401"),
+            ("BACKGROUND_SWEEP_SECS", "0"),
+            ("BACKGROUND_SWEEP_SECS", "3601"),
+            ("BACKGROUND_SWEEP_SECS", "often"),
+        ] {
+            let mut vars = full();
+            vars.insert(name, bad);
+            let err = parse(&vars).unwrap_err();
+            assert!(
+                err.problems.iter().any(|p| p.starts_with(name)),
+                "{name}={bad}: {:?}",
+                err.problems
+            );
+        }
     }
 
     #[test]

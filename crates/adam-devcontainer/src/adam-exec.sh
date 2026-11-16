@@ -18,7 +18,7 @@
 # slot it does not mount: a command the run started to keep running (a development server, id
 # `bg-...`) keeps the pod from the idle sweep, and never from a new slot (the pod is made again and the
 # server ends with it). An older adam-exec has no `active-fg` and fails with the usage line: the caller
-# reads that as "cannot be asked" and waits, as it did before.
+# then asks `active`, as it did before, and every command holds the pod.
 #
 # Every word of the command after <cwd> carries a leading ":" that is removed here. The devcontainer
 # CLI reads its command line with an option parser, which would take an argument such as "--version"

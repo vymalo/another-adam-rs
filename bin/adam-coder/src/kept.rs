@@ -39,10 +39,11 @@
 //!   descriptor, a link unlinked and never followed), so a command that made `outputs` a link to the
 //!   workspaces makes the janitor remove nothing (and the log says "not removed", with no path).
 
+use std::collections::HashSet;
 use std::io::{self, BufReader, Write as _};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use adam_llm_agent::paging::{PageError, page_lines};
@@ -66,6 +67,9 @@ static KEEP_LOCK: Mutex<()> = Mutex::new(());
 pub struct FileKept {
     root: std::path::PathBuf,
     redactor: Redactor,
+    /// The outputs this process is writing now (`(run, id)`): a page of one ends with
+    /// `[running: ...]` and not `[end: ...]`, because more lines are coming.
+    live: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 /// A run id that cannot leave the directory.
@@ -187,6 +191,41 @@ fn is_tmp(name: &str) -> bool {
     name.starts_with(".o-") && name.ends_with(".tmp")
 }
 
+/// What the files this process names in `dir` take, the file `except` not counted.
+fn used_by_others(dir: &Dir, except: &str) -> Result<u64, KeptError> {
+    let mut used = 0u64;
+    for (entry, meta) in dir.entries().map_err(|e| io_error(&e))? {
+        let entry_name = entry.to_string_lossy();
+        if is_ours(&entry_name) && *entry_name != *except && meta.is_file() {
+            used += meta.size();
+        }
+    }
+    Ok(used)
+}
+
+/// The most a record of a command may be.
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
+fn read_record(dir: &Dir, name: &str) -> Result<Option<Vec<u8>>, KeptError> {
+    use std::io::Read as _;
+    let (file, meta) = match dir.open_regular(std::ffi::OsStr::new(name)) {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(not_regular()),
+        Err(e) => return Err(io_error(&e)),
+    };
+    if meta.size() > MAX_RECORD_BYTES {
+        return Err(KeptError::Refused(
+            "a record of a command is too large".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_error(&e))?;
+    Ok(Some(bytes))
+}
+
 impl FileKept {
     /// Outputs under `<workspace_root>/outputs`, scrubbed with `redactor` (clones of a redactor
     /// share what they know, so a secret added later is scrubbed too).
@@ -194,7 +233,158 @@ impl FileKept {
         Self {
             root: workspace_root.to_path_buf(),
             redactor,
+            live: Arc::default(),
         }
+    }
+
+    /// Whether this process is writing the output `id` of `run` now.
+    pub fn is_live(&self, run: &str, id: &str) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(run.to_owned(), id.to_owned()))
+    }
+
+    /// Make the file of the output `id` of `run` (replacing the one an earlier try left: a start step
+    /// that runs again begins its output again) for a writer that appends to it as the output
+    /// arrives, and mark it live until [`end_live`](Self::end_live). `room` is what the run must have
+    /// left of [`RUN_KEPT_MAX`] for it.
+    ///
+    /// # Errors
+    ///
+    /// [`KeptError::Refused`] when the run has less than `room` left or the place is not usable,
+    /// [`KeptError::Io`].
+    pub fn open_live(&self, run: &str, id: &str, room: u64) -> Result<std::fs::File, KeptError> {
+        if !is_output_id(id) {
+            return Err(KeptError::Malformed(id.to_owned()));
+        }
+        let dir = self.dir_of(run, true)?;
+        let name = format!("{id}.txt");
+        let used = used_by_others(&dir, &name)?;
+        if used + room > RUN_KEPT_MAX {
+            return Err(KeptError::Refused(format!(
+                "a run keeps at most {} MiB of output, and this run holds {} MiB already",
+                RUN_KEPT_MAX / (1024 * 1024),
+                used / (1024 * 1024)
+            )));
+        }
+        let name = std::ffi::OsString::from(name);
+        match dir.unlink(&name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_error(&e)),
+        }
+        let file = dir.create_new(&name).map_err(|e| io_error(&e))?;
+        #[cfg(unix)]
+        file.set_permissions(
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .map_err(|e| io_error(&e))?;
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((run.to_owned(), id.to_owned()));
+        Ok(file)
+    }
+
+    /// The output `id` of `run` is not being written any more.
+    pub fn end_live(&self, run: &str, id: &str) {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(run.to_owned(), id.to_owned()));
+    }
+
+    /// What the run's files take now, the output `id` not counted: for a writer that checks the
+    /// run's room as it appends.
+    ///
+    /// # Errors
+    ///
+    /// [`KeptError::Io`] and the errors of finding the run's directory.
+    pub fn run_used(&self, run: &str, id: &str) -> Result<u64, KeptError> {
+        let dir = self.dir_of(run, false)?;
+        used_by_others(&dir, &format!("{id}.txt"))
+    }
+
+    /// Write the record `<id>.cmd` of a command that keeps running: private (`0600`), written under a
+    /// temporary name and renamed, no link followed.
+    ///
+    /// # Errors
+    ///
+    /// [`KeptError::Io`], and the errors of finding the run's directory.
+    pub fn put_record(&self, run: &str, id: &str, bytes: &[u8]) -> Result<(), KeptError> {
+        if !is_output_id(id) {
+            return Err(KeptError::Malformed(id.to_owned()));
+        }
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = self.dir_of(run, true)?;
+        let tmp = std::ffi::OsString::from(format!(
+            ".{id}.{}.{}.tmp",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = dir.create_new(&tmp).and_then(|mut file| {
+            #[cfg(unix)]
+            file.set_permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )?;
+            file.write_all(bytes)?;
+            file.flush()
+        });
+        if let Err(e) = written {
+            let _ = dir.unlink(&tmp);
+            return Err(io_error(&e));
+        }
+        if let Err(e) = dir.rename(&tmp, std::ffi::OsStr::new(&format!("{id}.cmd"))) {
+            let _ = dir.unlink(&tmp);
+            return Err(io_error(&e));
+        }
+        Ok(())
+    }
+
+    /// The record `<id>.cmd`, at most 64 KiB, or `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// [`KeptError::Io`] and [`KeptError::Refused`] for a file that is not a regular one.
+    pub fn get_record(&self, run: &str, id: &str) -> Result<Option<Vec<u8>>, KeptError> {
+        let dir = match self.dir_of(run, false) {
+            Ok(dir) => dir,
+            Err(KeptError::NotFound(_)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        read_record(&dir, &format!("{id}.cmd"))
+    }
+
+    /// Every record of `run`: `(id, bytes)`, in the order of the ids.
+    ///
+    /// # Errors
+    ///
+    /// As [`get_record`](Self::get_record).
+    pub fn records(&self, run: &str) -> Result<Vec<(String, Vec<u8>)>, KeptError> {
+        let dir = match self.dir_of(run, false) {
+            Ok(dir) => dir,
+            Err(KeptError::NotFound(_)) => return Ok(Vec::new()),
+            Err(other) => return Err(other),
+        };
+        let mut names: Vec<String> = dir
+            .entries()
+            .map_err(|e| io_error(&e))?
+            .into_iter()
+            .filter_map(|(name, meta)| {
+                let name = name.into_string().ok()?;
+                let id = name.strip_suffix(".cmd")?;
+                (is_output_id(id) && meta.is_file()).then(|| id.to_owned())
+            })
+            .collect();
+        names.sort();
+        let mut out = Vec::new();
+        for id in names {
+            if let Some(bytes) = read_record(&dir, &format!("{id}.cmd"))? {
+                out.push((id, bytes));
+            }
+        }
+        Ok(out)
     }
 
     /// The directory that holds every run's outputs.
@@ -450,8 +640,17 @@ impl FileKept {
                 "that output file is not usable (it has been linked)".to_owned(),
             ));
         }
+        let live = self.is_live(run, id);
         match page_lines(BufReader::new(file), offset, limit, false) {
+            Ok(page) if live => Ok(page.render_live()),
             Ok(page) => Ok(page.render()),
+            // A command that is still running: the line after the last one is where the next page
+            // starts, and nothing is there yet.
+            Err(PageError::PastEnd { offset, total })
+                if live && i64::try_from(total).is_ok_and(|t| offset == t + 1) =>
+            {
+                Ok(adam_llm_agent::paging::running_line(total))
+            }
             Err(PageError::PastEnd { offset, total }) => Err(KeptError::Window(format!(
                 "output `{id}` has {total} lines: offset {offset} is past the end"
             ))),

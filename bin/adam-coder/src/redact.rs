@@ -251,6 +251,28 @@ impl Redactor {
         self.longest().max(adam_llm_agent::SCRUB_OVERLAP)
     }
 
+    /// How many bytes at the end of `text` are the first part of a value this redactor replaces (0
+    /// when none): what an output that is written as it arrives holds back until the next read
+    /// shows whether the value goes on ([`adam_llm_agent::StreamScrubber::release`]). A value that
+    /// ends `text` whole is held too when a longer one starts with it, so that the longer one is
+    /// replaced whole.
+    pub fn partial_secret_len(&self, text: &str) -> usize {
+        let bytes = text.as_bytes();
+        let known = self.read();
+        let mut best = 0;
+        for needle in &known.needles {
+            let needle = needle.as_bytes();
+            let longest = needle.len().saturating_sub(1).min(bytes.len());
+            for len in (best + 1..=longest).rev() {
+                if bytes.ends_with(&needle[..len]) {
+                    best = len;
+                    break;
+                }
+            }
+        }
+        best
+    }
+
     /// Whether nothing is registered.
     pub fn is_empty(&self) -> bool {
         self.read().needles.is_empty()

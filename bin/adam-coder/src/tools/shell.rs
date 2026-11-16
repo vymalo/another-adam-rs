@@ -472,14 +472,7 @@ async fn run_with(
         Ok(prepared) => prepared,
         Err(e) => return (Err(RunError::Prepare(e)), None),
     };
-    let mut cmd = prepared.command();
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let mut child = match cmd.spawn() {
+    let mut child = match spawn_prepared(&prepared) {
         Ok(child) => child,
         Err(e) => return (Err(RunError::Spawn(e)), None),
     };
@@ -573,11 +566,30 @@ async fn run_with(
     )
 }
 
+/// Spawn what an environment prepared: in a process group of its own, with stdin closed, stdout and
+/// stderr piped, and `kill_on_drop`. The caller owns the child, its pipes and its end.
+///
+/// # Errors
+///
+/// The error of spawning the process.
+pub(crate) fn spawn_prepared(
+    prepared: &adam_workspace::PreparedCommand,
+) -> io::Result<tokio::process::Child> {
+    let mut cmd = prepared.command();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.spawn()
+}
+
 /// SIGKILL the process group led by `pid` (it was started with
 /// `process_group(0)`, so its group id is its pid). Uses the shell's `kill`
 /// builtin: this crate forbids `unsafe`, and `kill(1)` may be absent from slim
 /// images.
-async fn kill_group(pid: Option<u32>) {
+pub(crate) async fn kill_group(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     let killed = Command::new("sh")
         .arg("-c")

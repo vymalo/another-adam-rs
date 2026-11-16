@@ -106,9 +106,13 @@ pub async fn run_command(
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("undid a change made by: {shown}"))
             .await;
-        return Ok(ToolOutput::error(changed_the_worktree(
-            &shown, &outcome, restored,
-        )));
+        let mut said = changed_the_worktree(&shown, &outcome, restored);
+        said.push_str(&super::background::slot_note(
+            &env.commands,
+            &ctx.root_run_id().to_string(),
+            slot.dir(),
+        ));
+        return Ok(ToolOutput::error(said));
     }
 
     if let Some(missing) = missing_tool(&outcome, command) {

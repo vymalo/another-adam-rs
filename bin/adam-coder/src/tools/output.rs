@@ -161,7 +161,7 @@ fn lossless(bytes: Vec<u8>) -> String {
 
 /// `part` with every line that starts with `[` written with `\x5b`, so that the line that ends the
 /// view of a long output is the only one that starts that way, whatever the command printed.
-fn escaped(part: &str) -> std::borrow::Cow<'_, str> {
+pub(super) fn escaped(part: &str) -> std::borrow::Cow<'_, str> {
     if !part.starts_with('[') && !part.contains("\n[") {
         return std::borrow::Cow::Borrowed(part);
     }
@@ -179,7 +179,7 @@ fn escaped(part: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// The first `cap` bytes of `text`, cut back to the end of a line when there is one.
-fn head_of(text: &str, cap: usize) -> &str {
+pub(super) fn head_of(text: &str, cap: usize) -> &str {
     if text.len() <= cap {
         return text;
     }
@@ -192,7 +192,7 @@ fn head_of(text: &str, cap: usize) -> &str {
 }
 
 /// The last `cap` bytes of `text`, started at the beginning of a line when there is one.
-fn tail_of(text: &str, cap: usize) -> &str {
+pub(super) fn tail_of(text: &str, cap: usize) -> &str {
     if text.len() <= cap {
         return text;
     }

@@ -38,6 +38,10 @@ pub async fn rebuild_environment(
     }
     let use_default = use_default.unwrap_or(false);
     let run = ctx.root_run_id().to_string();
+    // What runs in the environment ends with it.
+    env.commands
+        .stop_run(&run, "the run's environment was made again")
+        .await;
     let made_again = env
         .environment
         .rebuild(&run, use_default)

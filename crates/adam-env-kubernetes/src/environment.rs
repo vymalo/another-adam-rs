@@ -383,10 +383,14 @@ impl KubeEnvironment {
     /// in it. Otherwise the caller waits (it is not a failure of the run: the command ends).
     ///
     /// A command that was started to outlive its call (`bg-` ids: a development server) does not hold
-    /// the pod: it ends with it. A pod whose `adam-exec` has no `active-fg` cannot be asked, and the
-    /// caller waits.
+    /// the pod: it ends with it. A pod whose `adam-exec` has no `active-fg` (made by an older image)
+    /// is asked `active` instead, which counts every command, as it always did.
     async fn free_for_new_mount(&self, name: &str, missing: &str) -> Result<(), EnvError> {
-        match self.busy_with(name, "active-fg").await {
+        let busy = match self.busy_with(name, "active-fg").await {
+            Err(_) => self.busy_with(name, "active").await,
+            answered => answered,
+        };
+        match busy {
             Ok(false) => Ok(()),
             Ok(true) => Err(EnvError::Unavailable(format!(
                 "the run's workspace has {missing} as it is now, which its pod does not mount, and a command is running in the pod; the pod is made again when it ends"

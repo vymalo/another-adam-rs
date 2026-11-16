@@ -516,7 +516,10 @@ impl StreamScrubber {
         if self.pending.is_empty() {
             return String::new();
         }
-        let window = floor_boundary(&self.pending, self.pending.len().saturating_sub(self.margin));
+        let window = floor_boundary(
+            &self.pending,
+            self.pending.len().saturating_sub(self.margin),
+        );
         let held = partial(&self.pending[window..]);
         let cut = floor_boundary(&self.pending, self.pending.len().saturating_sub(held));
         if cut == 0 {
@@ -1539,7 +1542,7 @@ mod tests {
         written.push_str(&scrubber.release(&stream_scrub, &stream_partial));
         assert_eq!(written, "ready\nkey=", "the start of the secret stays held");
         assert!(!written.contains("sk-"), "{written}");
-        let mut more = scrubber.push(STREAM_SECRET[12..].as_bytes(), &stream_scrub);
+        let mut more = scrubber.push(&STREAM_SECRET.as_bytes()[12..], &stream_scrub);
         more.push_str(&scrubber.release(&stream_scrub, &stream_partial));
         more.push_str(&scrubber.push(b"\nafter\n", &stream_scrub));
         more.push_str(&scrubber.finish(&stream_scrub));

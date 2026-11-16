@@ -103,6 +103,8 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "find_files"
         | "search_files"
         | "read_output"
+        | "stop_command"
+        | "list_commands"
         | "share_file"
         | "rebuild_environment"
         | "ask_user"
@@ -125,7 +127,7 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "read_skill_file"
         | "turn_output" => AccessTier::Plan,
         // Change files, commit, push a branch, open a pull request: the work itself.
-        "start_scratch" | "publish_scratch" | "run" | "write_file" | "edit_file"
+        "start_scratch" | "publish_scratch" | "run" | "start_command" | "write_file" | "edit_file"
         | "apply_patch" | "run_checks" | "commit_and_push" | "open_pull_request" => {
             AccessTier::Edits
         }

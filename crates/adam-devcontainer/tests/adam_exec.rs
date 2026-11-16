@@ -303,12 +303,21 @@ fn active_fg_skips_background_records() {
     let (mut server, _) = start(state.path(), "bg-kp-1-1", "sleep 34", false);
     let (mut build, _) = start(state.path(), "kp-1-2", "sleep 34", false);
     assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "2\n");
-    assert_eq!(output(&mut adam_exec(state.path(), &["active-fg"])).1, "1\n");
-    assert_eq!(output(&mut adam_exec(state.path(), &["kill", "kp-1-2"])).0, 0);
+    assert_eq!(
+        output(&mut adam_exec(state.path(), &["active-fg"])).1,
+        "1\n"
+    );
+    assert_eq!(
+        output(&mut adam_exec(state.path(), &["kill", "kp-1-2"])).0,
+        0
+    );
     build.wait().unwrap();
     // Only the server is left: it keeps the pod from the idle sweep (`active`), not from a new slot.
     assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "1\n");
-    assert_eq!(output(&mut adam_exec(state.path(), &["active-fg"])).1, "0\n");
+    assert_eq!(
+        output(&mut adam_exec(state.path(), &["active-fg"])).1,
+        "0\n"
+    );
     assert_eq!(
         output(&mut adam_exec(state.path(), &["kill", "bg-kp-1-1"])).0,
         0
@@ -316,7 +325,10 @@ fn active_fg_skips_background_records() {
     server.wait().unwrap();
     assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "0\n");
     // It takes no arguments either.
-    assert_eq!(output(&mut adam_exec(state.path(), &["active-fg", "x"])).0, 2);
+    assert_eq!(
+        output(&mut adam_exec(state.path(), &["active-fg", "x"])).0,
+        2
+    );
 }
 
 /// What a development server starts is stopped with it: the tree, and the group a leader has.

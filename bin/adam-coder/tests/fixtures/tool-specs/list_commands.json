@@ -1,0 +1,8 @@
+{
+  "name": "list_commands",
+  "description": "List the commands this task started with start_command, in the order they started: each one's id, whether it runs or how it ended, the lines of output it has, its slot and the command. Read the output of one with read_output.",
+  "parameters": {
+    "properties": {},
+    "type": "object"
+  }
+}

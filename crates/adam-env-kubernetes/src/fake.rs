@@ -1425,12 +1425,13 @@ mod tests {
                 &[(&ma, &aa), (&mb, &ab)]
             )
         );
-        // It asked the old pod whether a command ran before it was deleted, and said why.
+        // It asked the old pod whether a command ran before it was deleted, and said why: the
+        // question leaves out the commands that outlive their call.
         let commands = fx.exec.lock().unwrap().commands.clone();
         assert_eq!(commands.len(), 1);
         assert_eq!(
             commands[0].1,
-            ["/opt/adam/bin/adam-exec", "active"].map(str::to_owned)
+            ["/opt/adam/bin/adam-exec", "active-fg"].map(str::to_owned)
         );
         assert!(steps.0.lock().unwrap().iter().any(|s| {
             s.detail.as_deref().is_some_and(|d| {
@@ -1704,7 +1705,11 @@ mod tests {
         let commands = fx.exec.lock().unwrap().commands.clone();
         assert_eq!(
             commands.last().map(|(_, argv)| argv.clone()),
-            Some(["/opt/adam/bin/adam-exec", "active-fg"].map(str::to_owned).to_vec()),
+            Some(
+                ["/opt/adam/bin/adam-exec", "active-fg"]
+                    .map(str::to_owned)
+                    .to_vec()
+            ),
             "the question for a new slot leaves the background commands out"
         );
 
@@ -1742,12 +1747,16 @@ mod tests {
         let commands = fx.exec.lock().unwrap().commands.clone();
         assert_eq!(
             commands.last().map(|(_, argv)| argv.clone()),
-            Some(["/opt/adam/bin/adam-exec", "active"].map(str::to_owned).to_vec())
+            Some(
+                ["/opt/adam/bin/adam-exec", "active"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
         );
     }
 
-    /// A pod made by an older image has an `adam-exec` that does not know `active-fg`: it cannot be
-    /// asked, and the caller waits as it did before.
+    /// A pod made by an older image has an `adam-exec` that does not know `active-fg`: the pod is
+    /// asked `active` instead, and behaves as it did before (every command holds the pod).
     #[tokio::test]
     async fn an_adam_exec_without_active_fg_waits_as_before() {
         let fx = fixture(settings());
@@ -1757,7 +1766,7 @@ mod tests {
         ws.add_repository(&fx.remote("beta")).await.unwrap();
         {
             let mut exec = fx.exec.lock().unwrap();
-            exec.active = Some(0);
+            exec.active = Some(1);
             exec.without_active_fg = true;
         }
         let error = fx
@@ -1765,11 +1774,24 @@ mod tests {
             .ensure(&ws, &Steps::default())
             .await
             .err()
-            .expect("it cannot be asked");
+            .expect("a command runs");
         assert!(matches!(error, EnvError::Unavailable(_)), "{error}");
         assert_eq!(error.class(), ErrorClass::Transient);
-        assert!(error.to_string().contains("active-fg"), "{error}");
+        assert!(error.to_string().contains("command is running"), "{error}");
         assert_eq!(fx.requests("DELETE"), 0, "the pod is not deleted unasked");
+        // The same older pod with nothing running is made again, as it was before `active-fg`.
+        fx.exec.lock().unwrap().active = Some(0);
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+        let asked: Vec<String> = fx
+            .exec
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .map(|(_, argv)| argv[1].clone())
+            .collect();
+        assert_eq!(asked, ["active-fg", "active", "active-fg", "active"]);
     }
 
     #[tokio::test]

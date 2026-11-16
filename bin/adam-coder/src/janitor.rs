@@ -47,6 +47,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::kept::FileKept;
 use crate::redact::Redactor;
+use crate::tools::Commands;
 
 /// What one sweep did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -73,6 +74,8 @@ pub struct Janitor {
     every: Option<Duration>,
     environment: DynEnvironment,
     scratch_idle: Option<Duration>,
+    /// The commands that keep running, stopped before what holds them is released.
+    commands: Commands,
     /// Runs whose environment was released and whose scratch projects stayed, so that the sweeps
     /// after the first do not ask the environment again. Lost with the process, which only costs
     /// one more (idempotent) release.
@@ -99,6 +102,7 @@ impl Janitor {
             every,
             environment: Arc::new(Local),
             scratch_idle: None,
+            commands: Commands::new(),
             released: Arc::default(),
         }
     }
@@ -119,6 +123,15 @@ impl Janitor {
     #[must_use]
     pub fn with_environment(mut self, environment: DynEnvironment) -> Self {
         self.environment = environment;
+        self
+    }
+
+    /// Stop the commands that keep running of the runs this janitor releases, before the environment
+    /// that holds them is released (`ToolEnv::commands`): the backstop for a process whose run ended
+    /// and was not seen to.
+    #[must_use]
+    pub fn with_commands(mut self, commands: Commands) -> Self {
+        self.commands = commands;
         self
     }
 
@@ -146,7 +159,9 @@ impl Janitor {
                     report.failed.push(run);
                 }
                 Ok(Standing::Over(record)) => {
-                    // What the environment holds goes first, and a workspace it could not let go of
+                    // What runs in the environment goes first: the commands that keep running.
+                    self.commands.stop_run(&run, "the run ended").await;
+                    // What the environment holds goes next, and a workspace it could not let go of
                     // stays for the next sweep.
                     if !self.was_released(&run)
                         && let Err(e) = self.environment.release(&run).await
@@ -156,6 +171,7 @@ impl Janitor {
                         continue;
                     }
                     released.insert(run.clone());
+                    self.commands.forget_run(&run);
                     let keep_scratch = match &record {
                         Some(record) => self.conversation_is_alive(store, record).await,
                         None => false,
@@ -293,6 +309,13 @@ impl Janitor {
             .remove(run);
     }
 
+    /// The commands that keep running of `run` are stopped, and then what the environment holds for
+    /// it is released.
+    async fn release_after_commands(&self, run: &str) -> Result<(), adam_workspace::EnvError> {
+        self.commands.stop_run(run, "the run ended").await;
+        self.environment.release(run).await
+    }
+
     /// Release what the environment holds for runs that are over and that the loop above did not
     /// see: the run has no workspace on this volume (it was removed, or the crash was in between).
     async fn release_orphans(
@@ -317,7 +340,7 @@ impl Janitor {
                 continue;
             }
             match is_over(store, &run).await {
-                Ok(Some(true)) => match self.environment.release(&run).await {
+                Ok(Some(true)) => match self.release_after_commands(&run).await {
                     Ok(()) => {
                         tracing::info!(%run, "released the environment of a finished run that has no workspace here");
                         report.orphans.push(run);
@@ -391,6 +414,12 @@ async fn standing(store: &dyn Store, run: &str) -> Result<Standing, StoreError> 
         Some(_) => Standing::Open,
         None => Standing::Over(None),
     })
+}
+
+/// Whether `run` is no longer open: finished (a cancel is a failure), or not known to the store.
+/// A name that is not a run id is not a run at all, and is over for no one: `false`.
+pub(crate) async fn run_is_over(store: &dyn Store, run: &str) -> Result<bool, StoreError> {
+    Ok(is_over(store, run).await?.unwrap_or(false))
 }
 
 /// Whether `run` is over: `Some(true)` when it is finished or the store does not know it,

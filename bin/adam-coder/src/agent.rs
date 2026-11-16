@@ -1270,6 +1270,27 @@ impl Agent for CoderAgent {
             Ok(t) => t,
             Err(e) => return Err(boundary_error(e, redactor)),
         };
+        // Nothing a run started outlives it: the commands that keep running end with its last step
+        // (a cancel never calls this, and the sweep of `BACKGROUND_SWEEP_SECS` reaches those), and
+        // when the run parks on the person, who may take a while: a server nobody can use is not
+        // kept for days.
+        match &transition {
+            Transition::Done { .. } | Transition::Fail { .. } => {
+                self.env.commands.stop_run(&run, "the run ended").await;
+            }
+            Transition::Park { state, .. }
+                if matches!(
+                    state.pending_wait,
+                    Some(adam_llm_agent::PendingWait::Question(_))
+                ) =>
+            {
+                self.env
+                    .commands
+                    .stop_run(&run, "the run waits for the person's answer")
+                    .await;
+            }
+            _ => {}
+        }
         match transition {
             Transition::Fail { state, error } => Ok(Transition::Fail {
                 state,

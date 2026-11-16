@@ -1,0 +1,33 @@
+{
+  "name": "start_command",
+  "description": "Start a command that keeps running after this call: a development server, a watcher, a build you look at later. It runs in the workspace's environment like `run`, and the files it writes stay. You get its id, the output so far and, if it ends within the wait, its exit code and output. Read more of its output with read_output (its last line says where the next page starts: `[running: N lines so far; next page: offset=N+1]`), list what runs with list_commands and stop it with stop_command. The call waits `wait` seconds (default 5, at most 120), or until a line of the output has the text `wait_for`, or until the command ends. A command ends when you stop it, when the task ends, when you ask the person a question, after the deployment's time limit, and when the run's pod is made again for a new repository; the answer names the limit of how many run at once. A port it opens is reachable from the run's other commands on localhost, never from outside the run; the person cannot reach it, and nothing is published. Without a pod, all runs of the worker share one network, so pick an unusual port. For a command that ends by itself use run; for the project's checks, run_checks. Example: {\"command\":\"npm run dev\",\"wait_for\":\"ready\"}",
+  "parameters": {
+    "properties": {
+      "command": {
+        "description": "Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment",
+        "type": "string"
+      },
+      "cwd": {
+        "description": "Optional sub-directory of the worktree to run in (relative, inside the worktree)",
+        "type": "string"
+      },
+      "repo": {
+        "description": "The slot to run in: its name, or the repository's address. Leave out when the workspace has one.",
+        "type": "string"
+      },
+      "wait": {
+        "description": "Seconds to wait before the call returns, 1 to 120 (default 5)",
+        "format": "int64",
+        "type": "integer"
+      },
+      "wait_for": {
+        "description": "Return as soon as a line of the output has this text (one line, at most 200 characters)",
+        "type": "string"
+      }
+    },
+    "required": [
+      "command"
+    ],
+    "type": "object"
+  }
+}

@@ -582,3 +582,83 @@ async fn the_janitor_removes_kept_output_with_the_run() {
     );
     assert!(outputs.join(&open).is_dir(), "an open run keeps its output");
 }
+
+/// An environment that says how many commands of the run still ran when it was asked to release it.
+struct Watching {
+    inner: Arc<FakeEnvironment>,
+    commands: adam_coder::Commands,
+    running_at_release: std::sync::Mutex<Vec<(String, usize)>>,
+}
+
+#[async_trait::async_trait]
+impl adam_workspace::Environment for Watching {
+    async fn ensure(
+        &self,
+        workspace: &adam_workspace::RunWorkspace,
+        progress: &dyn adam_workspace::EnvProgress,
+    ) -> Result<Arc<dyn adam_workspace::EnvSession>, adam_workspace::EnvError> {
+        self.inner.ensure(workspace, progress).await
+    }
+
+    async fn release(&self, run: &str) -> Result<(), adam_workspace::EnvError> {
+        self.running_at_release
+            .lock()
+            .unwrap()
+            .push((run.to_owned(), self.commands.running_count(run)));
+        self.inner.release(run).await
+    }
+
+    async fn held_runs(&self) -> Result<Vec<String>, adam_workspace::EnvError> {
+        self.inner.held_runs().await
+    }
+}
+
+/// A command that keeps running is stopped before the environment that holds it is released: the
+/// backstop for a run whose end nobody saw (a worker that was down).
+#[tokio::test]
+async fn the_sweep_stops_background_commands_before_release() {
+    use adam_coder::tools::background::{CommandState, StartCommand};
+    use adam_llm_agent::{Tool as _, ToolCtx};
+    use adam_runtime::CollectingSink;
+
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let run = run_in(&store, RunStatus::Failed).await;
+    workspace_of(&fx, &run.to_string()).await;
+    let ctx = ToolCtx::detached("tool", "c1", Arc::new(CollectingSink::new()))
+        .with_state(fx.env.clone())
+        .with_root_run(run);
+    let started = StartCommand
+        .call(&ctx, json!({"command": "sleep 600", "wait": 1}))
+        .await
+        .unwrap();
+    assert!(!started.is_error, "{}", started.content);
+    assert_eq!(fx.env.commands.running_count(&run.to_string()), 1);
+
+    let watching = Arc::new(Watching {
+        inner: FakeEnvironment::new(Some(&fx.root)),
+        commands: fx.env.commands.clone(),
+        running_at_release: std::sync::Mutex::default(),
+    });
+    let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)))
+        .with_environment(watching.clone())
+        .with_commands(fx.env.commands.clone());
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(
+        *watching.running_at_release.lock().unwrap(),
+        [(run.to_string(), 0)],
+        "none ran any more when the environment was released"
+    );
+    let states = fx.env.commands.states(&run.to_string());
+    assert!(
+        states.is_empty()
+            || states.iter().all(|(_, state)| matches!(
+                state,
+                CommandState::Stopped { why } if why == "the run ended"
+            )),
+        "{states:?}"
+    );
+}

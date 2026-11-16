@@ -8,6 +8,7 @@
 //! | `create_repository { owner, name, private?, description? }` | [`create`] |
 //! | `run_command { command, cwd?, repo?, timeout? }`: look around, changes undone | [`inspect`] |
 //! | `run { command, cwd?, repo?, timeout? }`: make something with a command, changes kept, never a check | [`make`] |
+//! | `start_command { command, cwd?, repo?, wait?, wait_for? }`, `stop_command { id }`, `list_commands {}`: a command that keeps running (a development server), read with `read_output`, gone with its run | [`background`] |
 //! | `read_output { id, offset?, limit? }`: a kept output (a command's, or a long MCP result), paged | `adam_llm_agent::ReadOutput`, kept by [`kept`](crate::kept) |
 //! | `list_files { path?, offset?, limit? }`, `find_files { pattern, path?, offset?, limit? }`, `search_files { pattern, path?, include?, literal?, offset?, limit? }`: paged, git-aware looking around | [`find`] |
 //! | `read_file { path, offset?, limit? }` (paged; `start_line` and `end_line` are aliases), `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
@@ -112,6 +113,7 @@ use sandbox::Meter;
 const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.";
 
 pub mod admin;
+pub mod background;
 pub mod checks;
 pub mod consent;
 pub mod create;
@@ -135,6 +137,7 @@ pub mod share;
 pub mod shell;
 pub mod skills;
 
+pub use background::{BACKGROUND_TOOLS, Commands};
 pub use notes::{NotesStore, RunNotes};
 pub use references::{References, ReferencesError, ReferencesSource};
 
@@ -200,6 +203,18 @@ pub struct CoderSettings {
     /// [`DEFAULT_MAX`](crate::tier::DEFAULT_MAX), `auto`: renaming and deleting a repository are
     /// the deployment's opt-in.
     pub max_access_tier: AccessTier,
+    /// Commands of one run that keep running at once (`BACKGROUND_COMMANDS_MAX`): `start_command` refuses
+    /// the next.
+    pub background_commands_max: usize,
+    /// How long a command that keeps running may run (`BACKGROUND_COMMAND_MAX_SECS`), whatever else.
+    pub background_command_max: Duration,
+    /// The most bytes of one command's output that are kept on the volume
+    /// (`adam_llm_agent::MAX_KEPT_BYTES`, 16 MiB): the file stops there, with the line `read_output`
+    /// shows for every cut output. A setting of its own so that a test reaches it with a little text.
+    pub background_output_max: u64,
+    /// How often the sweep looks at the runs that have commands (`BACKGROUND_SWEEP_SECS`): a cancel
+    /// never calls the agent, so this is how long a cancelled run's commands can outlive it.
+    pub background_sweep: Duration,
     /// The longest `ToolEnv::session` can take to make the run's environment ready: nothing for the
     /// coder's own container; for a devcontainer `DEVCONTAINER_UP_TIMEOUT_SECS` plus
     /// `DEVCONTAINER_SETUP_TIMEOUT_SECS`; for run pods `RUN_POD_WAIT_SECS` plus
@@ -246,6 +261,10 @@ impl CoderSettings {
             create_for_installed_owners: false,
             max_access_tier: crate::tier::DEFAULT_MAX,
             environment_start: Duration::ZERO,
+            background_commands_max: 4,
+            background_command_max: Duration::from_secs(3600),
+            background_sweep: Duration::from_secs(15),
+            background_output_max: adam_llm_agent::MAX_KEPT_BYTES as u64,
         }
     }
 }
@@ -290,6 +309,9 @@ pub struct ToolEnv {
     /// repository a run works on and never written ([`references`]). None until
     /// [`ToolEnv::with_references`].
     pub references: References,
+    /// The commands that keep running (`start_command`): the processes this worker holds, by output
+    /// id. Cloning shares them.
+    pub commands: Commands,
     /// What a tool wants to add to its own result without being the one that builds it (a slot
     /// made while reading: which commit it holds): by call, taken by [`Gated`] when the call ends.
     notices: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
@@ -312,6 +334,7 @@ impl ToolEnv {
             unavailable_wait: None,
             credentials_hint: "GITHUB_TOKEN is valid and may push and open pull requests for the repository",
             references: References::default(),
+            commands: Commands::new(),
             notices: std::sync::Mutex::default(),
         }
     }
@@ -932,6 +955,9 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
     let after = tools![
         inspect::RunCommand,
         make::Run,
+        background::StartCommand,
+        background::StopCommand,
+        background::ListCommands,
         files::ReadFile,
         find::ListFiles,
         find::FindFiles,
@@ -1101,6 +1127,7 @@ pub const QUICK_TOOLS: [&str; 16] = [
 /// |---|---|
 /// | `run_command`, `run`, `run_checks` | the environment is made ready (`environment_start`) and the command runs (`CHECK_TIMEOUT_SECS`) |
 /// | `rebuild_environment` | the environment is made ready (`environment_start`) |
+/// | `start_command` | the environment is made ready and the call waits for the command at most 120 s; `stop_command` waits for the process 60 s; `list_commands` asks for the session and reads records |
 /// | `read_file`, `list_files`, `find_files`, `search_files`, `read_output` | their own deadline (`find::DEADLINE`, 30 s) |
 /// | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | git: one network operation and the local ones around it |
 fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
@@ -1108,6 +1135,14 @@ fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
     let bound = match name {
         "run_command" | "run" | "run_checks" => environment + settings.check_timeout,
         "rebuild_environment" => environment,
+        // The environment is made ready, and the call waits at most 120 s for the command.
+        "start_command" => {
+            environment + Duration::from_secs(background::MAX_WAIT_SECS.unsigned_abs())
+        }
+        // The process is stopped and waited for (20 s), and the output is read.
+        "stop_command" => Duration::from_secs(60),
+        // The environment is asked for its session, and the records are read.
+        "list_commands" => environment + find::DEADLINE,
         "read_file" | "list_files" | "find_files" | "search_files" | "read_output" => {
             find::DEADLINE
         }

@@ -313,6 +313,7 @@ fn write_args(tool: &str) -> Value {
             "repo": "design"
         }),
         "run" => json!({"command": "echo made > made.txt", "repo": "design"}),
+        "start_command" => json!({"command": "echo made > made.txt", "repo": "design"}),
         "run_checks" => json!({"command": "echo made > made.txt", "repo": "design"}),
         "commit_and_push" => json!({"message": "work", "repo": "design"}),
         "open_pull_request" => json!({"title": "t", "body": "b", "repo": "design"}),
@@ -385,6 +386,7 @@ async fn write_tools_refuse_reference() {
         "edit_file",
         "apply_patch",
         "run",
+        "start_command",
         "run_checks",
         "commit_and_push",
         "open_pull_request",

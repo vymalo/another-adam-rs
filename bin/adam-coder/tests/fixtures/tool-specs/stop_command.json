@@ -1,0 +1,16 @@
+{
+  "name": "stop_command",
+  "description": "Stop a command started with start_command: its whole process group is killed. You get how it ended and the last 4 KiB of its output, and the id still reads the rest with read_output. It is safe to call again: for a command that has ended it says how it ended. Example: {\"id\":\"o-3f9c2a17b0d4e8a1\"}",
+  "parameters": {
+    "properties": {
+      "id": {
+        "description": "The command's id, from start_command or list_commands",
+        "type": "string"
+      }
+    },
+    "required": [
+      "id"
+    ],
+    "type": "object"
+  }
+}

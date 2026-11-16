@@ -108,7 +108,7 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 38] = [
+const TOOLS: [&str; 41] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -116,6 +116,9 @@ const TOOLS: [&str; 38] = [
     "create_repository",
     "run_command",
     "run",
+    "start_command",
+    "stop_command",
+    "list_commands",
     "read_file",
     "list_files",
     "find_files",
@@ -215,6 +218,9 @@ async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
         ("apply_patch", Edit),
         ("run_command", Execute),
         ("run", Execute),
+        ("start_command", Execute),
+        ("stop_command", Execute),
+        ("list_commands", Execute),
         ("run_checks", Execute),
         ("rebuild_environment", Execute),
         ("prepare_workspace", Git),
