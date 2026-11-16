@@ -110,7 +110,7 @@ fn an_invalid_question_is_refused_before_a_form_is_drawn() {
 fn the_contracts_examples_and_the_surfaces_it_draws_are_questions_the_agent_makes() {
     let document = document();
     for question in document["questions"].as_array().unwrap() {
-        let form = form_of(&[question.clone()], false).unwrap();
+        let form = form_of(std::slice::from_ref(question), false).unwrap();
         // A question that is a valid answer-able form judges something.
         assert!(spec_of(&form, false).judges_anything(), "{question}");
     }

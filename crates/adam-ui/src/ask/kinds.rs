@@ -419,18 +419,6 @@ pub(super) struct Kinds {
 }
 
 impl Kinds {
-    /// A screen that takes all five.
-    #[cfg(test)]
-    pub(super) fn all() -> Self {
-        Self {
-            confirm: true,
-            number: true,
-            scale: true,
-            date: true,
-            rank: true,
-        }
-    }
-
     /// Which of the five `catalog`'s `Choices` takes: each is asked of the schema with a question
     /// that has every member of its kind, because a screen that lists a type but not a member is as
     /// good as one that does not list it.

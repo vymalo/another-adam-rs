@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use adam_a2a_runtime::PAYLOAD_FORM;
+use adam_a2a_runtime::{PAYLOAD_FORM, is_format_or_control};
 use adam_llm_agent::{AnswerCheck, Refusal};
 use serde_json::{Value, json};
 
@@ -268,7 +268,12 @@ fn default_of(kind: &str, question: &Value, entry: &Value) -> Option<Value> {
             } else {
                 MAX_LONG_TEXT
             };
-            (!text.is_empty() && text.chars().count() <= most).then(|| json!(text))
+            // The words start the box again as long as they show: a typed default with a
+            // character nobody can see is refused when a form is drawn.
+            let hidden = text
+                .chars()
+                .any(|c| !matches!(c, '\t' | '\n' | '\r') && is_format_or_control(c));
+            (!text.is_empty() && text.chars().count() <= most && !hidden).then(|| json!(text))
         }
         ("confirm" | "number" | "scale" | "date", [one]) => Some(json!(one)),
         ("rank", list) if !list.is_empty() => Some(json!(list)),

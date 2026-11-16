@@ -668,6 +668,9 @@ impl LlmAgentBuilder {
 ///   answers (ADR 0032);
 /// * `Artifact` for each artifact a tool returns (also durable);
 /// * `Custom { kind: "input_required", payload: {question, call_id} }` before parking;
+/// * `Custom { kind: "answer_refused", payload: {call_id, question, rule} }` when the tool that asked read the
+///   answer and refused it ([`Tool::read_answer`]): the run stays parked on the question the tool asked in its
+///   place, and the model hears nothing (`question` is what the rule was about, `*` for the whole answer);
 /// * `Custom { kind: "awaiting_run", payload: {call_id, run} }` before parking on a child run,
 ///   followed by the call's step `waiting` (not final), and later by the final `completed` or
 ///   `failed` when the child's outcome becomes the result;
@@ -3301,7 +3304,7 @@ impl Agent for LlmAgent {
                 kind: "answer_refused".into(),
                 payload: json!({
                     "call_id": call_id,
-                    "question": refusal.subject,
+                    "question": refusal.subject.as_deref().unwrap_or("*"),
                     "rule": refusal.rule,
                 }),
             })
