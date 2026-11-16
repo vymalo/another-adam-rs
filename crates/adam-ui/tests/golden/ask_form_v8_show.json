@@ -1,0 +1,125 @@
+[
+  {
+    "createSurface": {
+      "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
+      "surfaceId": "ask-call-1"
+    },
+    "version": "v0.9.1"
+  },
+  {
+    "updateComponents": {
+      "components": [
+        {
+          "children": [
+            "ask"
+          ],
+          "component": "Column",
+          "id": "root"
+        },
+        {
+          "action": {
+            "event": {
+              "name": "answer"
+            }
+          },
+          "component": "Choices",
+          "id": "ask",
+          "questions": [
+            {
+              "id": "plan",
+              "options": [
+                {
+                  "label": "A",
+                  "value": "a"
+                },
+                {
+                  "label": "B",
+                  "value": "b"
+                }
+              ],
+              "question": "Which layout?",
+              "show": [
+                "q1-s1",
+                "q1-s2",
+                "q1-s3",
+                "q1-s4"
+              ]
+            },
+            {
+              "id": "risk",
+              "question": "Go on?",
+              "show": [
+                "q2-s1",
+                "q2-s2",
+                "q2-s3"
+              ],
+              "type": "confirm"
+            }
+          ]
+        },
+        {
+          "component": "Text",
+          "id": "q1-s1",
+          "text": "Two layouts fit."
+        },
+        {
+          "alt": "The page today",
+          "artifact": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "caption": "Today",
+          "component": "Image",
+          "id": "q1-s2"
+        },
+        {
+          "code": "graph TD; A-->B",
+          "component": "Mermaid",
+          "id": "q1-s3"
+        },
+        {
+          "code": "let x = 1;",
+          "component": "Code",
+          "id": "q1-s4",
+          "language": "rust"
+        },
+        {
+          "cards": [
+            {
+              "title": "Option A"
+            },
+            {
+              "title": "Option B"
+            }
+          ],
+          "component": "Cards",
+          "id": "q2-s1"
+        },
+        {
+          "component": "Callout",
+          "id": "q2-s2",
+          "text": "This cannot be undone.",
+          "title": "Heads up",
+          "tone": "warning"
+        },
+        {
+          "component": "Chart",
+          "id": "q2-s3",
+          "labels": [
+            "Mon",
+            "Tue"
+          ],
+          "series": [
+            {
+              "name": "Runs",
+              "values": [
+                3,
+                4
+              ]
+            }
+          ],
+          "type": "bar"
+        }
+      ],
+      "surfaceId": "ask-call-1"
+    },
+    "version": "v0.9.1"
+  }
+]

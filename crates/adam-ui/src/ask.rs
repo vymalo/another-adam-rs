@@ -15,10 +15,13 @@
 //! on version 2 to 4 it is sent as the subset that screen has (no types beyond radio buttons and
 //! checkboxes, at most 8 options, the description folded into the question's text) and, when a
 //! question needs more than that (a typed answer), as text.
+//!
+//! A question may `show` what it asks about (catalog version 8): see `ask/shown.rs`.
 
 mod answer;
 mod kinds;
 mod reask;
+mod shown;
 #[cfg(test)]
 mod vectors;
 
@@ -71,7 +74,7 @@ pub const DEFAULT_ASK_LEAD: &str = "Ask the person you are talking to a question
 
 /// What the description of `ask_user` says after the lead, about `choices`: the constraints the
 /// tool enforces, so that the first call is right.
-const CHOICES_GUIDE: &str = "`question` is always required, with or without `choices`: it is the sentence the person reads first. Whenever the answer is one of a few options, pass `choices` and never write the options as a list in your text: the person gets one form with a list of options per question and answers them together; their answers come back as the result. Give the form a short `title` and a `description` of why you ask (a sentence or two of plain text). Each entry of `choices` needs its own `question`; give every option a short `label` and a `description` that says what it means or what it costs, and mark the one you recommend with `recommended: true`. A question's `type` is `single` (radio buttons, the default; 2 to 12 options), `multiple` (checkboxes; 2 to 12; `min` and `max` say how many), `select` (a searchable list; 2 to 50 options), `images` (a deck of pictures; 2 to 16 options, each with `image` {sha256, alt}: the sha256 of an image file you shared in this conversation, never a URL) or `text` / `longText` (the person types the answer; no options). Five kinds fit what a list cannot: `confirm` (a yes or no, `yesLabel` and `noLabel` name the two buttons, `default` \"yes\" or \"no\" is the safe answer; use it for consent before something that cannot be undone), `number` (a decimal, `minValue`, `maxValue`, `step`, `unit`), `scale` (a rating of whole numbers from `from`, 0 or 1, to `to`, 2 to 10, with `fromLabel` and `toLabel` for the two ends), `date` (a day, YYYY-MM-DD, `minDate`, `maxDate`) and `rank` (the person puts 2 to 12 options in order, the best first). A number, a bound and a default are decimals, like 12.5; a screen that lacks a kind gets the nearest form. The answer to a form is checked against it: one that breaks a rule (a number out of range, a day outside its bounds, a rank that is not every option once) goes back to the person to fix, at most 5 times. Words the person typed instead of using the form reach you unchecked, and you read them. `help` is a line under the question, `default` is what is chosen at first, `allowOther` offers an \"Other\" the person can write, `freeInput` adds an \"anything else\" box. With a single possible answer, or none that you know, do not use `choices`: ask a plain question. There are at most 8 questions. An `id` or option `value` is 1 to 64 characters of letters, digits and `- _ . :`. Example: {\"question\": \"A few things I need before I start.\", \"title\": \"Before I start\", \"description\": \"The migration depends on the database, so I need to know which one.\", \"choices\": [{\"id\": \"db\", \"question\": \"Which database?\", \"options\": [{\"label\": \"Postgres\", \"description\": \"Relational, the default\", \"recommended\": true}, {\"label\": \"MongoDB\", \"description\": \"Documents, no schema\"}]}]} Without `choices` the question is plain text.";
+const CHOICES_GUIDE: &str = "`question` is always required, with or without `choices`: it is the sentence the person reads first. Whenever the answer is one of a few options, pass `choices` and never write the options as a list in your text: the person gets one form with a list of options per question and answers them together; their answers come back as the result. Give the form a short `title` and a `description` of why you ask (a sentence or two of plain text). Each entry of `choices` needs its own `question`; give every option a short `label` and a `description` that says what it means or what it costs, and mark the one you recommend with `recommended: true`. A question's `type` is `single` (radio buttons, the default; 2 to 12 options), `multiple` (checkboxes; 2 to 12; `min` and `max` say how many), `select` (a searchable list; 2 to 50 options), `images` (a deck of pictures; 2 to 16 options, each with `image` {sha256, alt}: the sha256 of an image file you shared in this conversation, never a URL) or `text` / `longText` (the person types the answer; no options). Five kinds fit what a list cannot: `confirm` (a yes or no, `yesLabel` and `noLabel` name the two buttons, `default` \"yes\" or \"no\" is the safe answer; use it for consent before something that cannot be undone), `number` (a decimal, `minValue`, `maxValue`, `step`, `unit`), `scale` (a rating of whole numbers from `from`, 0 or 1, to `to`, 2 to 10, with `fromLabel` and `toLabel` for the two ends), `date` (a day, YYYY-MM-DD, `minDate`, `maxDate`) and `rank` (the person puts 2 to 12 options in order, the best first). A number, a bound and a default are decimals, like 12.5; a screen that lacks a kind gets the nearest form. The answer to a form is checked against it: one that breaks a rule (a number out of range, a day outside its bounds, a rank that is not every option once) goes back to the person to fix, at most 5 times. Words the person typed instead of using the form reach you unchecked, and you read them. A question may `show` what it is about, drawn with it: 1 to 4 blocks `{component, ...}` in `show` (`Code` for a diff, a command or a file; also `Text`, `Image` with `artifact`, the sha256 of a file you shared, and `alt`, `Mermaid`, `Cards`, `Callout`, `Chart`), 8 in all the form. Use it above all before consent, so that the person sees what they allow; a screen that cannot draw a block gets it in words. `help` is a line under the question, `default` is what is chosen at first, `allowOther` offers an \"Other\" the person can write, `freeInput` adds an \"anything else\" box. With a single possible answer, or none that you know, do not use `choices`: ask a plain question. There are at most 8 questions. An `id` or option `value` is 1 to 64 characters of letters, digits and `- _ . :`. Example: {\"question\": \"A few things I need before I start.\", \"title\": \"Before I start\", \"description\": \"The migration depends on the database, so I need to know which one.\", \"choices\": [{\"id\": \"db\", \"question\": \"Which database?\", \"options\": [{\"label\": \"Postgres\", \"description\": \"Relational, the default\", \"recommended\": true}, {\"label\": \"MongoDB\", \"description\": \"Documents, no schema\"}]}]} Without `choices` the question is plain text.";
 
 /// The pattern of a question id and of an option value: the `Choices` component's own.
 const ID_PATTERN: &str = "^[A-Za-z0-9_.:-]{1,64}$";
@@ -162,6 +165,9 @@ struct ChoiceArg {
     id: Option<String>,
     question: String,
     help: Option<String>,
+    /// Components of the surface drawn with the question (catalog version 8); checked in
+    /// [`shown::parse`].
+    show: Option<Value>,
     #[serde(rename = "type")]
     kind: Option<Kind>,
     #[serde(default)]
@@ -254,6 +260,8 @@ pub(crate) struct Question {
     max: Option<u32>,
     /// The members of the five kinds of catalog version 7, checked.
     ext: kinds::Ext,
+    /// What the question shows (catalog version 8).
+    shown: Vec<shown::Shown>,
 }
 
 impl Question {
@@ -483,6 +491,7 @@ fn normalize_question(
     }
     let options = normalize_options(&id, choice.options)?;
     let help = trimmed(choice.help);
+    let shown = shown::parse(&id, n, choice.show)?;
     if let Some(help) = &help {
         kinds::plain(&id, "help", help, true)?;
     }
@@ -500,6 +509,7 @@ fn normalize_question(
         min: choice.min,
         max: choice.max,
         ext: kinds::Ext::default(),
+        shown,
     };
     let id = out.id.clone();
     let kind = out.kind();
@@ -679,13 +689,15 @@ fn normalize(args: Args) -> Result<Form, String> {
             placeholder: trimmed(placeholder),
         }),
     };
-    Ok(Form {
+    let form = Form {
         title: trimmed(title),
         description: trimmed(description),
         free_input,
         submit_label: trimmed(submit_label),
         questions,
-    })
+    };
+    shown::check_total(&form)?;
+    Ok(form)
 }
 
 /// The picture of an option as the component takes it.
@@ -727,6 +739,15 @@ fn choices_instance(form: &Form) -> Value {
             question.insert("question".into(), json!(q.question));
             if let Some(help) = &q.help {
                 question.insert("help".into(), json!(help));
+            }
+            let shown: Vec<&str> = q
+                .shown
+                .iter()
+                .filter(|s| s.placed == shown::Placed::Native)
+                .map(|s| s.id.as_str())
+                .collect();
+            if !shown.is_empty() {
+                question.insert("show".into(), json!(shown));
             }
             if let Some(kind) = q.declared {
                 question.insert("type".into(), json!(kind.as_str()));
@@ -905,6 +926,7 @@ fn as_text(question: &str, form: &Form) -> String {
             _ if q.takes_several() => text.push_str(" (any number of these)"),
             _ => {}
         }
+        text.push_str(&shown::as_text(q));
         for (m, option) in q.options.iter().enumerate() {
             // A rank is answered with numbers, the other questions with letters.
             let mark = if q.kind() == Kind::Rank {
@@ -998,6 +1020,18 @@ fn parameters() -> Value {
                         "id": {"type": "string", "pattern": ID_PATTERN, "description": "A short id for the question (1 to 64 letters, digits, - _ . :), used in the answer; defaults to q1, q2, ..."},
                         "question": {"type": "string", "minLength": 1, "description": "Required: the question"},
                         "help": {"type": "string", "description": "A line under the question: what the options mean, or what the answer is for"},
+                        "show": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": shown::MAX_PER_QUESTION,
+                            "description": "What the question is about, drawn with it: 1 to 4 blocks, 8 in all the form, each {component, ...its properties}: a Code block for a diff, a command or a file, Text, Image, Mermaid, Cards, Callout or Chart. A screen that cannot draw one gets it in words",
+                            "items": {
+                                "type": "object",
+                                "properties": {"component": {"enum": shown::SHOWABLE, "description": "One of the seven a question may show"}},
+                                "required": ["component"],
+                                "additionalProperties": true
+                            }
+                        },
                         "type": {"enum": ["single", "multiple", "select", "images", "text", "longText", "confirm", "number", "scale", "date", "rank"], "description": "How it is answered: single (radio buttons, the default), multiple (checkboxes), select (a searchable list), images (a deck of pictures), text (a short typed answer), longText (a longer one), confirm (yes or no), number (a decimal), scale (a rating between two ends), date (a day), rank (put the options in order)"},
                         "options": {
                             "type": "array",
@@ -1098,15 +1132,24 @@ impl Tool for AskUser {
                     );
                     return Err(ToolError::needs_input(as_text(&question, &form)));
                 };
+                // What the questions show is drawn where the screen can, and said in words where not.
+                let arranged = match shown::arrange(&catalog, &drawn) {
+                    Ok(arranged) => arranged,
+                    Err(problem) => return Ok(ToolOutput::error(problem)),
+                };
+                let (drawn, words) = match &arranged {
+                    Some(arranged) => (&arranged.form, arranged.words.as_str()),
+                    None => (&drawn, ""),
+                };
                 // The whole form for a screen that has it; else what that screen has, or words.
                 let (instance, lead) = if catalog.version() >= CATALOG_V5 {
-                    (choices_instance(&drawn), question)
-                } else if let Some(instance) = choices_instance_v4(&drawn) {
+                    (choices_instance(drawn), question)
+                } else if let Some(instance) = choices_instance_v4(drawn) {
                     tracing::debug!(
                         version = catalog.version(),
                         "the screen's Choices is older than version 5; the form is sent as that screen has it"
                     );
-                    (instance, lead_with_description(&question, &drawn))
+                    (instance, lead_with_description(&question, drawn))
                 } else {
                     tracing::debug!(
                         version = catalog.version(),
@@ -1119,9 +1162,18 @@ impl Tool for AskUser {
                         "the choices do not fit the screen's Choices component: {problem}"
                     )));
                 }
+                let components = match &arranged {
+                    Some(arranged) => arranged.assemble(instance),
+                    None => vec![instance],
+                };
                 let id = ask_surface_id(ctx.call_id());
-                let ui = surface(&id, catalog.catalog_id(), vec![instance]);
-                Err(ToolError::needs_input_with_ui(lead, ui))
+                let ui = surface(&id, catalog.catalog_id(), components);
+                if arranged.is_some()
+                    && let Err(problem) = shown::check_size(&ui)
+                {
+                    return Ok(ToolOutput::error(problem));
+                }
+                Err(ToolError::needs_input_with_ui(format!("{lead}{words}"), ui))
             }
             Resolved::Found(_) => {
                 tracing::debug!("the screen has no Choices component; the options go in the text");

@@ -13,6 +13,7 @@ use adam_llm_agent::{AnswerCheck, Refusal};
 use serde_json::{Value, json};
 
 use super::answer::{Check, FormSpec, Rule, Verdict, check_answer, whole};
+use super::shown;
 use super::{
     Args, Form, Kind, MAX_LONG_TEXT, MAX_TEXT, clipped, kinds, lead_with_description, normalize,
 };
@@ -220,8 +221,8 @@ impl Drawn {
     }
 }
 
-/// The `Choices` component of the interface: the component with the id `root` of its
-/// `updateComponents` message.
+/// The `Choices` component of the interface: the root of a form with nothing above it, or the
+/// form inside the `Column` that holds what a question shows.
 fn root_of(ui: &Value) -> Option<&Value> {
     ui.as_array()?.iter().find_map(|message| {
         message
@@ -229,7 +230,7 @@ fn root_of(ui: &Value) -> Option<&Value> {
             .get("components")?
             .as_array()?
             .iter()
-            .find(|c| c.get("id").and_then(Value::as_str) == Some("root"))
+            .find(|c| c.get("component").and_then(Value::as_str) == Some("Choices"))
     })
 }
 
@@ -240,7 +241,7 @@ fn root_of_mut(ui: &mut Value) -> Option<&mut Value> {
             .get_mut("components")?
             .as_array_mut()?
             .iter_mut()
-            .find(|c| c.get("id").and_then(Value::as_str) == Some("root"))
+            .find(|c| c.get("component").and_then(Value::as_str) == Some("Choices"))
     })
 }
 
@@ -311,6 +312,8 @@ fn ask_again(
     } else {
         question.to_owned()
     };
+    // What the form shows and the screen could not draw is still said, in the same words.
+    let lead = format!("{lead}{}", shown::undrawn_words(form, ui));
     let attempt = surface_of(ui)
         .and_then(|surface| ask_attempt(&surface))
         .map_or(1, |n| n + 1);

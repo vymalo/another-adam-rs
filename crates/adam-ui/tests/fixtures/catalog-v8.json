@@ -1,0 +1,1243 @@
+{
+  "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
+  "components": {
+    "Text": {
+      "type": "object",
+      "description": "Plain text, drawn as text (no HTML, no links).",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Text"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "variant": {
+          "enum": ["h1", "h2", "h3", "h4", "h5", "caption", "body"]
+        }
+      },
+      "required": ["id", "component", "text"],
+      "additionalProperties": false
+    },
+    "Column": {
+      "type": "object",
+      "description": "Stacks its children vertically.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Column"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "align": {
+          "enum": ["start", "center", "end", "stretch"]
+        }
+      },
+      "required": ["id", "component", "children"],
+      "additionalProperties": false
+    },
+    "Choices": {
+      "type": "object",
+      "description": "ask_user only: use it in the question you ask the person, never in a surface you show with show (nothing waits for its answer, so its form is dead). A form of up to 8 questions answered with one submit: a title, a description of why you ask, and per question a help line and a type: single (radio buttons, the default), multiple (checkboxes), select (a searchable list, up to 50 options), images (a deck of picture tiles, up to 16, each option's image an image file shared in this conversation), text or longText (the person types). Only when the thread's catalog is version 7 or more: confirm (yes or no, with yesLabel, noLabel and a safe default), number (a decimal string, with minValue, maxValue, step and unit), scale (a whole number from \"from\" to \"to\", with fromLabel and toLabel), date (a calendar day YYYY-MM-DD, with minDate and maxDate) and rank (the person puts every option in order). An option has a label, a description, an optional image {sha256, alt}, an icon and a recommended badge. freeInput adds an anything-else box. One submit sends one action: name = action.event.name (default \"answer\"), context = {answers:[{id, values:[option value, or the one yes/no, decimal, whole number or date, or every option value in the person's order for rank…], other?, text?}], note?} in question order. Read the answer again before you act on it: an out-of-range number, a date outside its bounds or a rank that is not every option once is refused. Only when the thread's catalog is version 8 or more: a question may carry show, 1 to 4 ids of components of the same surface (Text, Image, Mermaid, Code, Cards, Callout or Chart, each shown by one question only and placed nowhere else in the surface), drawn with the question between its text and its control; an image needs its alt.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Choices"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "freeInput": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120
+            },
+            "placeholder": {
+              "type": "string",
+              "maxLength": 200
+            }
+          },
+          "additionalProperties": false
+        },
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+              },
+              "question": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "help": {
+                "type": "string",
+                "maxLength": 300
+              },
+              "show": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "type": {
+                "enum": [
+                  "single",
+                  "multiple",
+                  "select",
+                  "images",
+                  "text",
+                  "longText",
+                  "confirm",
+                  "number",
+                  "scale",
+                  "date",
+                  "rank"
+                ]
+              },
+              "options": {
+                "type": "array",
+                "maxItems": 50,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+                    },
+                    "label": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 120
+                    },
+                    "description": {
+                      "type": "string",
+                      "maxLength": 300
+                    },
+                    "image": {
+                      "type": "object",
+                      "properties": {
+                        "sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        },
+                        "alt": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 300
+                        }
+                      },
+                      "required": ["sha256", "alt"],
+                      "additionalProperties": false
+                    },
+                    "icon": {
+                      "enum": [
+                        "agent",
+                        "read",
+                        "edit",
+                        "delete",
+                        "move",
+                        "search",
+                        "execute",
+                        "think",
+                        "fetch",
+                        "web",
+                        "git",
+                        "test",
+                        "file",
+                        "tool",
+                        "opencode"
+                      ]
+                    },
+                    "recommended": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["value", "label"],
+                  "additionalProperties": false
+                }
+              },
+              "multiple": {
+                "type": "boolean"
+              },
+              "allowOther": {
+                "type": "boolean"
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "default": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 2000
+                  },
+                  {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+                    }
+                  }
+                ]
+              },
+              "min": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 50
+              },
+              "max": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50
+              },
+              "yesLabel": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 40
+              },
+              "noLabel": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 40
+              },
+              "minValue": {
+                "type": "string",
+                "pattern": "^-?(0|[1-9][0-9]{0,14})(\\.[0-9]{1,6})?$"
+              },
+              "maxValue": {
+                "type": "string",
+                "pattern": "^-?(0|[1-9][0-9]{0,14})(\\.[0-9]{1,6})?$"
+              },
+              "step": {
+                "type": "string",
+                "pattern": "^-?(0|[1-9][0-9]{0,14})(\\.[0-9]{1,6})?$"
+              },
+              "unit": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 20
+              },
+              "from": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "to": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 10
+              },
+              "fromLabel": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 60
+              },
+              "toLabel": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 60
+              },
+              "minDate": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+              },
+              "maxDate": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+              }
+            },
+            "required": ["id", "question"],
+            "additionalProperties": false
+          }
+        },
+        "submitLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "action": {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "required": ["name"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["event"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["id", "component", "questions"],
+      "additionalProperties": false
+    },
+    "Cards": {
+      "type": "object",
+      "description": "A list (or grid) of up to 24 cards: title, optional subtitle, body text, an http(s) link and tags.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Cards"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "layout": {
+          "enum": ["list", "grid"]
+        },
+        "cards": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "subtitle": {
+                "type": "string",
+                "maxLength": 200
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 2000
+              },
+              "url": {
+                "type": "string",
+                "maxLength": 2048,
+                "pattern": "^https?://"
+              },
+              "tags": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 40
+                }
+              }
+            },
+            "required": ["title"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "cards"],
+      "additionalProperties": false
+    },
+    "Mermaid": {
+      "type": "object",
+      "description": "A mermaid diagram, drawn as an image (no links, no scripts).",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Mermaid"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 500
+        }
+      },
+      "required": ["id", "component", "code"],
+      "additionalProperties": false
+    },
+    "Image": {
+      "type": "object",
+      "description": "A picture from a file of this thread, by its sha256 (the artifact of a file an agent shared); never a URL. alt is required.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Image"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "artifact": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "alt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 500
+        }
+      },
+      "required": ["id", "component", "artifact", "alt"],
+      "additionalProperties": false
+    },
+    "Code": {
+      "type": "object",
+      "description": "Source code, drawn as text in a monospace block with a copy button. Never highlighted, never linked.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Code"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "filename": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "language": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000
+        }
+      },
+      "required": ["id", "component", "code"],
+      "additionalProperties": false
+    },
+    "Diff": {
+      "type": "object",
+      "description": "A unified diff: its added and removed lines and its file headers, drawn as text.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Diff"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "diff": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000
+        }
+      },
+      "required": ["id", "component", "diff"],
+      "additionalProperties": false
+    },
+    "FileCard": {
+      "type": "object",
+      "description": "A file the thread holds, by its sha256: its name, size, type and a download.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "FileCard"
+        },
+        "artifact": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": ["id", "component", "artifact"],
+      "additionalProperties": false
+    },
+    "Terminal": {
+      "type": "object",
+      "description": "A command and its output, with its exit code; a long output folds.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Terminal"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "output": {
+          "type": "string",
+          "maxLength": 20000
+        },
+        "exitCode": {
+          "type": "integer",
+          "minimum": -255,
+          "maximum": 255
+        }
+      },
+      "required": ["id", "component", "command"],
+      "additionalProperties": false
+    },
+    "PullRequest": {
+      "type": "object",
+      "description": "A pull request: repository, number, title, state, branch, checks and link.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "PullRequest"
+        },
+        "repo": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "state": {
+          "enum": ["open", "merged", "closed", "draft"]
+        },
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "checks": {
+          "type": "object",
+          "properties": {
+            "passed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000
+            },
+            "failed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000
+            },
+            "pending": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000
+            }
+          },
+          "required": ["passed", "failed", "pending"],
+          "additionalProperties": false
+        },
+        "url": {
+          "type": "string",
+          "maxLength": 2048,
+          "pattern": "^https?://"
+        }
+      },
+      "required": ["id", "component", "repo", "number", "title", "state"],
+      "additionalProperties": false
+    },
+    "Stack": {
+      "type": "object",
+      "description": "Lays children in a row that wraps, or one under another: use it instead of Column for a row.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Stack"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "direction": {
+          "enum": ["horizontal", "vertical"],
+          "default": "horizontal"
+        },
+        "gap": {
+          "enum": ["none", "small", "medium", "large"],
+          "default": "medium"
+        },
+        "align": {
+          "enum": ["start", "center", "end", "stretch"]
+        },
+        "justify": {
+          "enum": ["start", "center", "end", "between"]
+        },
+        "wrap": {
+          "type": "boolean",
+          "default": true
+        },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "required": ["id", "component", "children"],
+      "additionalProperties": false
+    },
+    "Tabs": {
+      "type": "object",
+      "description": "Tabs: a label and a child component for each, one tab open at a time.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Tabs"
+        },
+        "tabs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 60
+              },
+              "child": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "required": ["label", "child"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "tabs"],
+      "additionalProperties": false
+    },
+    "Accordion": {
+      "type": "object",
+      "description": "Collapsible sections: a title and a child component for each, opened one at a time or several.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Accordion"
+        },
+        "multiple": {
+          "type": "boolean"
+        },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "child": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            },
+            "required": ["title", "child"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "items"],
+      "additionalProperties": false
+    },
+    "Callout": {
+      "type": "object",
+      "description": "A note, a success, a warning or an error: a title and a text, the tone said in words and by an icon.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Callout"
+        },
+        "tone": {
+          "enum": ["info", "success", "warning", "error"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        }
+      },
+      "required": ["id", "component", "title", "text"],
+      "additionalProperties": false
+    },
+    "Checklist": {
+      "type": "object",
+      "description": "A checklist of items, each with a state and an optional note, and a progress bar. States: done, doing, todo, failed and, only when the thread's catalog is version 8 or more, dropped (struck through, not counted in \"N of M done\"). For a plan, send the whole surface again each time the plan changes, under the same surfaceId, which starts with plan-.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Checklist"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "state": {
+                "enum": ["done", "doing", "todo", "failed", "dropped"]
+              },
+              "note": {
+                "type": "string",
+                "maxLength": 200
+              }
+            },
+            "required": ["label", "state"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "items"],
+      "additionalProperties": false
+    },
+    "Timeline": {
+      "type": "object",
+      "description": "A timeline of events in order: each with its time, title, optional description and state.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Timeline"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "properties": {
+              "time": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 40
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 1000
+              },
+              "state": {
+                "enum": ["done", "doing", "todo", "failed"]
+              }
+            },
+            "required": ["time", "title"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "events"],
+      "additionalProperties": false
+    },
+    "Table": {
+      "type": "object",
+      "description": "A table of columns and rows; a column is sorted by a click on its header.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Table"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              },
+              "align": {
+                "enum": ["start", "end"]
+              }
+            },
+            "required": ["key", "label"],
+            "additionalProperties": false
+          }
+        },
+        "rows": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "propertyNames": {
+              "maxLength": 64
+            },
+            "maxProperties": 12,
+            "additionalProperties": {
+              "type": ["string", "number", "boolean", "null"],
+              "maxLength": 500
+            }
+          }
+        }
+      },
+      "required": ["id", "component", "columns", "rows"],
+      "additionalProperties": false
+    },
+    "KeyValue": {
+      "type": "object",
+      "description": "Pairs of a name and a value, in order, as a list of terms.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "KeyValue"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "pairs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "value": {
+                "type": ["string", "number", "boolean", "null"],
+                "maxLength": 500
+              }
+            },
+            "required": ["key", "value"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "pairs"],
+      "additionalProperties": false
+    },
+    "Stats": {
+      "type": "object",
+      "description": "Tiles of a figure, each with its label, its value, and a change with a trend.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Stats"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "tiles": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 40
+              },
+              "delta": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 40
+              },
+              "trend": {
+                "enum": ["up", "down", "flat"]
+              }
+            },
+            "required": ["label", "value"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "tiles"],
+      "additionalProperties": false
+    },
+    "Chart": {
+      "type": "object",
+      "description": "A bar, line or pie chart of up to four series, drawn as a picture with its data.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Chart"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "type": {
+          "enum": ["bar", "line", "pie"]
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "labels": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "series": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 60
+              },
+              "values": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 24,
+                "items": {
+                  "type": "number",
+                  "minimum": -1000000000000,
+                  "maximum": 1000000000000
+                }
+              }
+            },
+            "required": ["name", "values"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "type", "labels", "series"],
+      "additionalProperties": false
+    },
+    "Gallery": {
+      "type": "object",
+      "description": "Pictures of files of this thread, by their sha256, in a grid; each opens larger.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Gallery"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "images": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "properties": {
+              "artifact": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "alt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "caption": {
+                "type": "string",
+                "maxLength": 300
+              }
+            },
+            "required": ["artifact", "alt"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "images"],
+      "additionalProperties": false
+    },
+    "LinkPreview": {
+      "type": "object",
+      "description": "A link with its title, description and site, as the agent gave them: nothing is fetched.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "LinkPreview"
+        },
+        "url": {
+          "type": "string",
+          "maxLength": 2048,
+          "pattern": "^https?://"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "site": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        }
+      },
+      "required": ["id", "component", "url", "title"],
+      "additionalProperties": false
+    },
+    "Video": {
+      "type": "object",
+      "description": "A video of a file of this thread, by its sha256: played in the page, with its title.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Video"
+        },
+        "artifact": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 500
+        }
+      },
+      "required": ["id", "component", "artifact", "title"],
+      "additionalProperties": false
+    },
+    "Audio": {
+      "type": "object",
+      "description": "A sound recording of a file of this thread, by its sha256: played in the page, with its title.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Audio"
+        },
+        "artifact": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 500
+        }
+      },
+      "required": ["id", "component", "artifact", "title"],
+      "additionalProperties": false
+    }
+  }
+}

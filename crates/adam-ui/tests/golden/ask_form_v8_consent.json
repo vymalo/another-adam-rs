@@ -1,0 +1,53 @@
+[
+  {
+    "createSurface": {
+      "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
+      "surfaceId": "ask-call-1"
+    },
+    "version": "v0.9.1"
+  },
+  {
+    "updateComponents": {
+      "components": [
+        {
+          "children": [
+            "ask"
+          ],
+          "component": "Column",
+          "id": "root"
+        },
+        {
+          "action": {
+            "event": {
+              "name": "answer"
+            }
+          },
+          "component": "Choices",
+          "id": "ask",
+          "questions": [
+            {
+              "default": "no",
+              "id": "go",
+              "noLabel": "Keep as it is",
+              "question": "Apply it?",
+              "show": [
+                "q1-s1"
+              ],
+              "type": "confirm",
+              "yesLabel": "Apply"
+            }
+          ]
+        },
+        {
+          "code": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-let keep = true;\n+let keep = false;\n",
+          "component": "Code",
+          "id": "q1-s1",
+          "language": "diff",
+          "title": "The change"
+        }
+      ],
+      "surfaceId": "ask-call-1"
+    },
+    "version": "v0.9.1"
+  }
+]
