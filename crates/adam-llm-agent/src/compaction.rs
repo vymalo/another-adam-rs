@@ -814,10 +814,10 @@ mod tests {
 
     #[test]
     fn a_pinned_result_is_copied_up_to_its_bound() {
-        let big = "p".repeat(PINNED_EACH_BYTES + 10_000);
+        let big = "p".repeat(40 * 1024);
         let dropped = [call("c1", "t", json!({})), Message::tool_result("c1", &big)];
         let facts = facts_of(&dropped, &["c1".to_owned()], &same_id);
-        assert_eq!(facts.pinned[0].len(), PINNED_EACH_BYTES + CUT_NOTE.len());
+        assert_eq!(facts.pinned[0].len(), 32 * 1024 + CUT_NOTE.len());
         assert!(facts.pinned[0].ends_with(CUT_NOTE));
     }
 
@@ -844,7 +844,7 @@ mod tests {
         };
         let body = marker_body(None, None, &[c("1"), c("2")]);
         assert_eq!(body.matches("\\x5bab").count(), 7999, "one of the two");
-        assert!(body.len() < PINNED_ALL_BYTES + 1024, "{}", body.len());
+        assert!(body.len() < 64 * 1024 + 1024, "{}", body.len());
     }
 
     #[test]
@@ -855,7 +855,7 @@ mod tests {
             ..compaction()
         };
         let body = marker_body(None, None, &[c]);
-        assert_eq!(body.matches("\n[kept as ").count(), MAX_LISTED);
+        assert_eq!(body.matches("\n[kept as ").count(), 50);
         assert!(!body.contains("o-0000000000000009;"), "the oldest give way");
         assert!(body.contains("o-000000000000000a;"));
         assert!(body.contains("o-000000000000003b;"));
@@ -864,7 +864,7 @@ mod tests {
             .find_map(|l| l.strip_prefix("Skills loaded earlier: "))
             .expect("skills line");
         let names: Vec<&str> = skills.split(" (load").next().unwrap().split(", ").collect();
-        assert_eq!(names.len(), MAX_LISTED);
+        assert_eq!(names.len(), 50);
         assert_eq!(names[0], "skill0");
     }
 
@@ -900,29 +900,25 @@ mod tests {
         let ten: Vec<String> = (0..10).map(text).collect();
         let kept = kept_sayings(ten.clone());
         assert_eq!(kept, ten[2..].to_vec(), "the eight newest, oldest first");
-        assert!(kept.iter().map(|s| s.chars().count()).sum::<usize>() <= SAYINGS_MAX_CHARS);
+        assert!(kept.iter().map(|s| s.chars().count()).sum::<usize>() <= 8192);
         // One saying is cut to its bound, with the note.
         let long = "é".repeat(5000);
         let kept = kept_sayings(vec![long]);
-        assert_eq!(kept[0].chars().count(), SAYING_MAX_CHARS + CUT_NOTE.len());
+        assert_eq!(kept[0].chars().count(), 2048 + CUT_NOTE.len());
         assert!(kept[0].ends_with(CUT_NOTE));
     }
 
     #[test]
     fn a_saying_over_its_bound_is_cut_and_one_that_was_cut_is_not_cut_again() {
-        let exactly = "a".repeat(SAYING_MAX_CHARS);
+        let exactly = "a".repeat(2048);
         assert_eq!(kept_sayings(vec![exactly.clone()]), vec![exactly]);
         for over in [1, 5, CUT_NOTE.len()] {
-            let saying = "a".repeat(SAYING_MAX_CHARS + over);
+            let saying = "a".repeat(2048 + over);
             let kept = kept_sayings(vec![saying]);
-            assert_eq!(
-                kept[0].chars().count(),
-                SAYING_MAX_CHARS + CUT_NOTE.len(),
-                "{over}"
-            );
+            assert_eq!(kept[0].chars().count(), 2048 + CUT_NOTE.len(), "{over}");
             assert!(kept[0].ends_with(CUT_NOTE));
         }
-        let cut = format!("{}{CUT_NOTE}", "a".repeat(SAYING_MAX_CHARS));
+        let cut = format!("{}{CUT_NOTE}", "a".repeat(2048));
         assert_eq!(kept_sayings(vec![cut.clone()]), vec![cut]);
     }
 
