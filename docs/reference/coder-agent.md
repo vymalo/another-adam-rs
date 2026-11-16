@@ -258,18 +258,19 @@ The diagrams and the three places a write is refused are in [Workspace and envir
 ### Commands that keep running
 
 `run` and `run_command` wait for their command. A development server or a watcher does not end, and a check may need it
-([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 13,
-slice 16). Three tools, `bin/adam-coder/src/tools/background.rs`:
+([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 13).
+Three tools, `bin/adam-coder/src/tools/background.rs`:
 
 | Tool | Tier | What |
 |---|---|---|
 | `start_command { command, cwd?, repo?, wait?, wait_for? }` | `edits` | starts the command in a slot the run may write (never a reference), in the run's environment, like `run`. Waits `wait` seconds (default 5, 1 to 120), or until a line has `wait_for`, or until it ends. Answers with the id, the state and the first page of the output so far; for a command that ended in the wait, `run`'s result |
-| `stop_command { id }` | `plan` | kills the process group and stops what the environment holds under the exec id. Answers how it ended and the last 4 KiB. Safe to repeat |
+| `stop_command { id }` | `plan` | kills the process group and stops what the environment holds under the exec id. Answers how it ended and the last 4 KiB. Safe to repeat. For a command another worker runs: see *Several workers* |
 | `list_commands {}` | `plan` | one line per command of the run, in the order they started: `o-... running 312 s, 1204 lines, slot app, cwd web: npm run dev` |
 
 Reading is the existing `read_output { id, offset?, limit? }`, unchanged. **The id is the call's output id**, so a command is
-read like any kept output. A page of lines that are complete is the same bytes on every read. Only the last line of the last page
-moves: `[running: N lines so far; next page: offset=N+1]`. A finished output ends `[end: N lines]` as always.
+read like any kept output. A page of lines that are complete is the same bytes on every read: a page of a file that is still
+written shows whole lines only, never the half of the last one. Only the last line of the last page moves:
+`[running: N lines so far; next page: offset=N+1]`. A finished output ends `[end: N lines]` as always.
 
 ```mermaid
 sequenceDiagram
@@ -283,9 +284,10 @@ sequenceDiagram
     participant S as stop_command
 
     M->>T: start_command {command, wait_for}
+    T-->>M: the progress line, starting: command
     T->>F: the output file (open_live)
-    T->>C: reserve (at most BACKGROUND_COMMANDS_MAX running)
-    T->>F: record Starting
+    T->>C: reserve (at most BACKGROUND_COMMANDS_MAX running, on every worker)
+    T->>F: record Starting (owner, exec id, beat)
     T->>P: spawn_prepared (ExecSpec::background)
     T->>F: record Running (pid and start time)
     loop while the process prints
@@ -297,7 +299,7 @@ sequenceDiagram
     R-->>M: the same lines as before, and the new ones
     M->>S: stop_command {id}
     S->>C: request_stop
-    C->>P: supervise: kill the group, EnvSession::kill by exec id
+    C->>P: supervise: kill the group and what it left, EnvSession::kill by exec id
     P-->>F: Sink::finish, the footer if cut, the record says how it ended
     S-->>M: stopped: stop_command, the last 4 KiB, the pointer to read the rest
 ```
@@ -306,11 +308,11 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> Starting: start_command reserves the id and writes the record
     Starting --> Running: the process is spawned
-    Starting --> [*]: it could not be started
+    Starting --> Stopped: it could not be started
+    Starting --> Gone: a stale record is settled
     Running --> Exited: the process ends by itself
-    Running --> Stopped: stop_command, the lifetime, the run ended, a park on the person, the environment made again, another worker took the run
-    Starting --> Gone: a worker that is not the owner finds the record
-    Running --> Gone: a worker that is not the owner finds the record
+    Running --> Stopped: stop_command, the lifetime, the run ended, a park on the person, the environment made again, another worker took the run, a signal nobody asked for in a pod or a devcontainer
+    Running --> Gone: a stale record is settled, or the worker stops
     Exited --> [*]
     Stopped --> [*]
     Gone --> [*]
@@ -318,40 +320,92 @@ stateDiagram-v2
 
 **What is kept.** The output is `outputs/<root run>/<id>.txt`, appended as it arrives. A secret is **never on the volume**: the
 bytes go through a `StreamScrubber` (a part is written only when no secret straddles the cut, and the start of a secret that a
-read ended in is held until the next read shows what follows) and a `LineFolder` (only complete lines are written, lines over
-2,000 characters are folded). The file stops at 16 MiB or when the run has no room (64 MiB), with the line `read_output` shows for
-every cut output, and the last 64 KiB stay in memory for `stop_command` and `list_commands`. The record `<id>.cmd` is private JSON:
-the command (scrubbed, 1 KiB), slot, exec id, owner, pid with its start time, how it ended.
+read ended in is held until the next read shows what follows; a secret that is the start of a longer one is held too) and a
+`LineFolder` (only complete lines are written, lines over 2,000 characters are folded). The file stops at 16 MiB or when the run
+has no room (64 MiB for all its outputs: a start in a run with less than 1 MiB left is refused before anything is spawned), with
+the line `read_output` shows for every cut output, and the last 64 KiB stay in memory for `stop_command` and `list_commands`.
+What the process writes to stderr is kept with its stdout. The record `<id>.cmd` is private JSON, written by temporary file and
+rename: the command (scrubbed, 1 KiB), slot, exec id, owner, pid with its start time, **beat**, **stop_requested**, how it ended.
 
-**Nothing outlives its run.** A command stops on:
+#### Several workers
+
+A run moves between workers at every step, so a record this process does not hold is usually **another worker's live
+command**. The worker that runs a command is its *owner* (a token it made at start). It writes `beat` (unix seconds) at start and at
+every sweep (`BACKGROUND_SWEEP_SECS`). A record is **stale** when its beat is older than `stale_after`: the larger of three sweeps
+and 60 s (`BEAT_STALE_FLOOR_SECS`). The clocks of the workers are assumed to agree within that. With the default sweep of 15 s a
+record is stale after 60 s.
+
+| The record | What the other workers do |
+|---|---|
+| fresh, running | it is somebody's live command. `list_commands` shows it as running (`on another worker`) and counts it against `BACKGROUND_COMMANDS_MAX`; `read_output` reads its file (a page by a worker that did not start it ends `[end: N lines]` for the lines there are so far); `start_command` of another id leaves it alone; a start step that runs again for **its** id returns its view and starts nothing |
+| fresh, and `stop_command` | a stop request is written into the record (read, merge, write; read again after a pause and written again if the owner's beat lost it) and, in a pod or a devcontainer, the exec id is killed at once. The call waits at most one sweep and a second for the owner to settle the record, and returns how it ended; if the owner has not swept, it says **stop asked**, and the owner stops it at its next sweep |
+| stale, running | a dead worker's: its process is killed (by exec id, by pid when the start time still matches, and what is left of its group) and the record says `gone: the worker that ran it is gone; start it again` |
+| not running | how it ended, from the record |
+
+The owner's sweep writes the beat, stops a command whose record holds a stop request (with its reason) and stops a command whose
+record names another owner (`another worker took the run over`). It never writes over a record that names another owner, and a beat
+keeps a stop request it finds.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as model
+    participant B as worker B<br/>steps the run
+    participant R as outputs/RUN/ID.cmd
+    participant A as worker A<br/>owner, Commands::sweep
+    participant P as the process
+
+    A->>R: beat, at start and at every sweep
+    M->>B: stop_command {id}
+    B->>R: stop_requested, read again after a pause
+    B->>P: EnvSession::kill by exec id (pod, devcontainer)
+    A->>R: sweep reads the record: a stop request
+    A->>P: supervise: kill the group and what it left
+    A->>R: the record says stopped, with the reason
+    B->>R: reads until the record does not say running
+    B-->>M: stopped: stop_command, or stop asked, within a sweep
+    Note over B,R: a beat older than stale_after is a dead worker's:<br/>B kills by pid and exec id and writes gone
+```
+
+**Nothing outlives its run** (a process that leaves its group with `setsid` is the exception). A command stops on:
 
 | What | Where |
 |---|---|
 | `stop_command` | the tool |
 | its lifetime, `BACKGROUND_COMMAND_MAX_SECS` (3,600 s) | the process's supervisor |
-| the root run ends (`Done`, `Fail`) | `CoderAgent::step`, at once |
-| the run is cancelled, or the store does not know it | `Commands::sweep`, every `BACKGROUND_SWEEP_SECS` (15 s): a cancel never calls the agent |
-| the run parks on the person (`ask_user`) | `CoderAgent::step`: nothing can use the server while the person decides |
-| the run's environment is made again | `rebuild_environment`, or a run pod made again for a new slot |
-| the janitor releases the run | `Janitor::sweep`, before `Environment::release` |
-| this worker stops | the sweep component, at shutdown |
+| the root run ends (`Done`, `Fail`) | `CoderAgent::step`, at once on the worker that holds the command; a stop request into the record of one another worker holds, which its owner's sweep carries out within one sweep. The end of a **child** run (a subagent) stops nothing |
+| the run is cancelled, or the store does not know it | `Commands::sweep` of the owner, every `BACKGROUND_SWEEP_SECS` (15 s): a cancel never calls the agent |
+| any run of the tree parks on the person (`ask_user`) | `CoderAgent::step`, as for the end of the run: at once here, within one sweep elsewhere. A park on a subagent, a task on another system or a timer stops nothing |
+| the run's environment is made again | `rebuild_environment` (with its reason, at once and by request elsewhere), or a run pod made again for a new slot, a reference or a rebuild, which the coder does not see: the command ended by a signal nobody asked for, in a pod or a devcontainer, says its environment was probably made again and to start it again |
+| the janitor releases the run | `Janitor::sweep`, before `Environment::release`; and for a run that is over it settles the records that say a command runs (kills by pid with its start time, and the group) before it removes them |
+| this worker stops | the sweep component, at shutdown: `gone: the worker stopped; start it again if it is still needed`; a registry that is dropped kills the groups it holds |
 
-A process **group** is killed, and what a pod or a devcontainer holds is stopped by exec id (`bg-kp-...`, `bg-dc-...`, `adam-exec kill`).
-A pid is killed only when its start time is still the one the record names. **Replay:** a start step that runs again finds its
-command; this process owns it, so the call returns its view and starts nothing. Another owner's record is stale: its process is
-killed, and the command starts again with its output begun again. At most one process lives for an id.
+A process **group** is killed whatever ended the leader (`cmd &` leaves nothing behind), and what a pod or a devcontainer holds is
+stopped by exec id (`bg-kp-...`, `bg-dc-...`, `adam-exec kill`), bounded by a time (`kill` that does not answer does not hold the
+command). A pid is killed only when its start time is still the one the record names; when the leader is gone, what is left of its
+group is killed; when another process has the pid, nothing is. **Replay:** a start step that runs again finds its command. This
+process holds it, or its record is fresh (another worker runs it), or it ended: the call returns its view and starts nothing. A
+stale record is an earlier try that died: its process is killed and the command starts again with its output begun again. At most
+one process lives for an id.
 
-**After a worker restart** the command is `gone`: `gone: the worker that ran it restarted; start it again`. Its output so far stays
-readable. A worker that takes a run over marks the record, and the old worker's sweep stops what the record no longer names it for.
+**After a worker restart** the command is `gone` once its beat is stale. Its output so far stays readable. A worker that takes a run
+over marks the record, and the old worker's sweep stops what the record no longer names it for.
 
-**Git.** The slot's git state is read at the start and at the end. If HEAD, a ref or the configuration differ, the result says so. It is
-**not undone** (unlike `run`): the run's own `commit_and_push` moves them too. The undo guard of `run_command` names the commands that
-keep running in its slot when it refuses.
+**Git.** The slot's git state is read at the start and at the end. If the **configuration** (`core.hooksPath`, `core.fsmonitor`, a
+filter, a URL, an alias, `info/exclude`) differs, it is **put back**, as `run` does, and the result says so. If HEAD, a ref or `.git`
+differ, the result says so and **nothing is undone**: the run's own `commit_and_push` moves them too. Nothing is said of git when
+the state cannot be read at the end. A hook file a command wrote in the repository's hooks directory is not undone; the coder's git
+never runs it: every git command the coder makes carries `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, which win over
+the repository's file (`crates/adam-workspace/src/git.rs`: `Invocation::invocation` for what `commit_and_push` commits and pushes,
+`LocalGit` for what `run_checks` and `open_pull_request` ask of the repository). A `filter.*.clean` a command wrote
+is run by the coder's `git add`, in the git sandbox when there is one and otherwise in an empty environment (no secret), so none of
+the three tools refuses while a background command runs. The undo guard of `run_command` and `run` names the commands that keep
+running in the slot (on every worker) in every refusal.
 
 **Ports.** In a run pod a port is reachable from the run's other commands on `localhost`, not through the egress proxy, and by nothing
 outside the pod. In the coder's own container all runs of the worker share one network. Nothing is published.
 
-**Sandbox time (ADR 0043)** is reported at the call that sees the end (`start_command`, `stop_command`, `list_commands`). A command
+**Sandbox time (ADR 0043)** is reported at the call that sees the end (`start_command`, `stop_command`, `list_commands`), once. A command
 stopped by the sweep or a run's end is not metered.
 
 ## Rules in code
@@ -435,7 +489,7 @@ list and fails for a tool that has neither a limit nor a place on the `QUICK_TOO
 | `run_command`, `run`, `run_checks` | making the environment ready (devcontainer: `DEVCONTAINER_UP_TIMEOUT_SECS` + `DEVCONTAINER_SETUP_TIMEOUT_SECS`; run pods: `RUN_POD_WAIT_SECS` + `RUN_POD_READY_TIMEOUT_SECS`; none in the coder's own container) + `CHECK_TIMEOUT_SECS` + 30 s (a call's own `timeout` is at most `CHECK_TIMEOUT_SECS`, so it always fits under this) |
 | `rebuild_environment` | making the environment ready + 30 s |
 | `start_command` | making the environment ready + the longest wait (120 s) + 30 s |
-| `stop_command` | 60 s + 30 s: the process is waited for up to 20 s |
+| `stop_command` | making the environment ready (for a command this worker does not hold) + 60 s + 30 s: the process is waited for up to 20 s |
 | `list_commands` | making the environment ready (only when a worker that is gone left a command to settle) + 30 s (`find::DEADLINE`) + 30 s |
 | `read_file`, `list_files`, `find_files`, `search_files`, `read_output` | their own deadline, 30 s (`find::DEADLINE`) + 30 s |
 | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | one network git operation (30 min) and the local ones around it (5 min) + 30 s |

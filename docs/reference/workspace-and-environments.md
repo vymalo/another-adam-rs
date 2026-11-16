@@ -267,15 +267,21 @@ stateDiagram-v2
 ### Commands that keep running, by placement
 
 `start_command` ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)
-slice 16) starts a process that outlives the call, in the same environment as `run`, with `ExecSpec::background`. The coder holds
-the process it spawned (its `Child`), and the environment holds what it started elsewhere.
+decision 13) starts a process that outlives the call, in the same environment as `run`, with `ExecSpec::background`. The coder holds
+the process it spawned (its `Child`), and the environment holds what it started elsewhere. A run moves between workers at every
+step, so a command is **one worker's** (its owner, which writes a beat into the command's record at start and at every sweep) and
+the others see it through the record: [Several workers](coder-agent.md#several-workers).
 
 | Placement | The process | Id | Stopped by | After the coder restarts |
 |---|---|---|---|---|
-| local | `sh -lc` in its own process group, a child of the coder | `bg-local-<n>` | the group is killed (`kill_group`), and what the leader left in the group | it dies with the container (`tini`); a coder outside a container finds the record, and kills the pid only when its start time still matches (Linux) |
-| run pod | `adam-exec shell` in the pod; the `adam-kube-exec` client is the coder's child | `bg-kp-<epoch>-<n>` | the client is killed, then `adam-exec kill <id>` in the pod | the pod's process may live on: the next `start_command` or `list_commands` finds the record of an owner that is not this process, kills it by exec id, and says `gone`; the janitor's `release` deletes the pod anyway |
+| local | `sh -lc` in its own process group, a child of the coder | `bg-local-<n>` | the group is killed (`kill_group`), and what the leader left in the group, whatever ended the leader | it dies with the container (`tini`); a coder outside a container finds the record, and kills the pid only when its start time still matches, and what is left of its group (Linux); a registry that is dropped kills the groups it holds; the janitor kills what the records of a finished run name before it removes them |
+| run pod | `adam-exec shell` in the pod; the `adam-kube-exec` client is the coder's child | `bg-kp-<epoch>-<n>` | the client is killed, then `adam-exec kill <id>` in the pod, when the client ends by itself too (`cmd &` outlives the client); another worker's `stop_command` kills the exec id at once and asks the owner to settle it | the pod's process may live on: once the record's beat is stale (the larger of three sweeps and 60 s) the next `start_command`, `stop_command` or `list_commands` kills it by exec id, and says `gone`; the janitor's `release` deletes the pod anyway |
 | devcontainer | the same, through `devcontainer exec` | `bg-dc-<epoch>-<n>` | as for a pod | as for a pod; `release` removes the container |
 
+* **A pod made again** (a new slot, a reference, a rebuild) ends the client of a command in it. The coder cannot tell why the client
+  ended, so a command in a pod or a devcontainer that a signal ended, and that nobody asked to stop, is `stopped` with the reason
+  *its environment was made again ... or something outside ended it; start it again if it is still needed*. `rebuild_environment` stops
+  the run's commands first and says so.
 * **`adam-exec active-fg`** counts the live records whose id does not start with `bg-`. A pod made again for a new slot asks
   `active-fg` (`free_for_new_mount`, `seal`), so a development server never holds the pod from a new repository: the pod is
   deleted with the server in it, and the client of the command ends. The idle sweep asks `active`, which counts every command,

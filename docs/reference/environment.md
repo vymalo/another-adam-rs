@@ -87,7 +87,7 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks`, `run_command` or `run`: the time limit is also the most a call's `timeout` may ask for (a larger one is an error); an output over the size is shown as head and tail, the whole kept for `read_output` | `900`, `16384` |
 | `BACKGROUND_COMMANDS_MAX` | commands of one run that keep running (`start_command`) at once, 1 to 16; `0` is refused: exit 78 naming the variable | `4` |
 | `BACKGROUND_COMMAND_MAX_SECS` | how long such a command may run before it is stopped, 60 to 86400; `0` is refused (exit 78) | `3600` |
-| `BACKGROUND_SWEEP_SECS` | how often the sweep stops the commands of a run that is over (a cancel never calls the agent, so this is how long its commands can outlive it), 1 to 3600; `0` is refused (exit 78) | `15` |
+| `BACKGROUND_SWEEP_SECS` | how often the sweep of each worker looks at the commands it holds: it stops those of a run that is over (a cancel never calls the agent, so this is how long its commands can outlive it), carries out a stop another worker asked for (within one sweep), and writes the **beat** of the others. A record whose beat is older than the larger of three sweeps and 60 s is a dead worker's: set the same value on every worker, and keep the clocks of the workers within 60 s. 1 to 3600; `0` is refused (exit 78) | `15` |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 

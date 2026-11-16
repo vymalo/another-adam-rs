@@ -804,8 +804,8 @@ impl Commands {
         asked
     }
 
-    /// Stop every command of every run: this process is stopping. They are `gone`, with the reason
-    /// [`WORKER_STOPPED`].
+    /// Stop every command of every run: this process is stopping. They are `gone`, saying the worker
+    /// stopped.
     pub async fn stop_all(&self) {
         let mine: Vec<Arc<Command>> = self
             .all()

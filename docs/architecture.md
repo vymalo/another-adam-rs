@@ -1212,39 +1212,47 @@ stateDiagram-v2
 ```
 
 A **command that keeps running** (`start_command`, a development server) writes into the same file as it prints, line by line,
-after the secrets are scrubbed, and has a record `<id>.cmd` beside it. The coder holds the process; nothing outlives its run.
-Who stops it, and the lifecycle, are in [The coder agent](reference/coder-agent.md#commands-that-keep-running).
+after the secrets are scrubbed, and has a record `<id>.cmd` beside it. The coder holds the process (the worker that started it is its
+owner and writes a beat into the record at every sweep); the other workers see it through the record, and stop it by writing a stop
+request that the owner's sweep carries out. A process group is killed whatever ended the leader; what a run starts ends with the run
+(a process that leaves its group with `setsid` is the exception). Who stops it, and the lifecycle, are in
+[The coder agent](reference/coder-agent.md#commands-that-keep-running).
 
 ```mermaid
 sequenceDiagram
-    participant A as CoderAgent::step
+    participant A as CoderAgent::step<br/>(any worker)
     participant C as Commands (ToolEnv)
-    participant W as the sweep component<br/>BACKGROUND_SWEEP_SECS
+    participant R as outputs/RUN/ID.cmd
+    participant W as the sweep component<br/>BACKGROUND_SWEEP_SECS (the owner)
     participant S as Store
     participant J as Janitor
     participant E as Environment
-    A->>C: stop_run, when the root run is done or failed, or parks on the person
+    A->>C: stop_run, when the root run is done or failed, or any run parks on the person
+    A->>R: a stop request in each fresh record another worker owns
     Note over A,C: a cancel commits Failed and never calls the agent's step
     loop every BACKGROUND_SWEEP_SECS
         W->>C: sweep
         C->>S: load_run for each run that has a command
         S-->>C: finished, or not known
-        C->>C: stop_run, and stop a command whose record names another owner
+        C->>C: stop_run, when the run is over
+        C->>R: read: a stop request or another owner stops the command, else the beat is written
     end
     J->>S: the standing of each workspace
     J->>C: stop_run, before the release
+    J->>R: settle_over_run: kill by pid and group what the records name, they say gone
     J->>E: release(run)
-    W->>C: stop_all, when the worker stops
+    W->>C: stop_all, when the worker stops (gone: the worker stopped)
 ```
 
 ```mermaid
 stateDiagram-v2
     [*] --> Starting: reserved and recorded
     Starting --> Running: spawned
+    Starting --> Stopped: it could not be started
     Running --> Exited: ended by itself
-    Running --> Stopped: a stop, its lifetime, or the run ended
-    Starting --> Gone: another owner's record
-    Running --> Gone: another owner's record
+    Running --> Stopped: a stop, its lifetime, the run ended, another worker took the run
+    Starting --> Gone: a stale record is settled
+    Running --> Gone: a stale record is settled, or the worker stops
     Exited --> [*]
     Stopped --> [*]
     Gone --> [*]

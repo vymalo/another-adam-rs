@@ -1597,34 +1597,49 @@ stateDiagram-v2
 
 ### Commands that keep running: `start_command`, `stop_command`, `list_commands`
 
-[ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 16.
+[ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) decision 13.
 `bin/adam-coder/src/tools/background.rs`; the diagrams are in [The coder agent](../../docs/reference/coder-agent.md#commands-that-keep-running).
 
 * **The id is the call's output id** (`adam_llm_agent::output_id_of`), so a start step that runs again has the same id, and the
   output is read with `read_output`, whose schema did not change. The output is appended to `<root>/outputs/<run>/<id>.txt` as it
   arrives, scrubbed **before** it is written (`StreamScrubber`: no secret, split or not, is ever on the volume) and folded into lines
-  (`LineFolder`: only complete lines are written, so a page of lines already there is the same bytes on every read). `FileKept` knows
-  the id is live (`open_live`, `end_live`, `is_live`), and the last line of the last page is `[running: N lines so far; next page: offset=N+1]`. The
-  file stops at 16 MiB (`CoderSettings::background_output_max`) or when the run has no room (64 MiB); then only the last 64 KiB stay in
-  memory, for `stop_command` and `list_commands`.
+  (`LineFolder`: only complete lines are written, so a page of lines already there is the same bytes on every read; a page of a live
+  file never shows or counts the bytes after its last newline). `FileKept` knows the id is live (`open_live`, `end_live`, `is_live`),
+  and the last line of the last page is `[running: N lines so far; next page: offset=N+1]`. The file stops at 16 MiB
+  (`CoderSettings::background_output_max`) or when the run has no room (64 MiB, `CoderSettings::run_kept_max`, `FileKept::with_run_max`;
+  a start with less than 1 MiB left is refused before anything is spawned); then only the last 64 KiB stay in memory, for
+  `stop_command` and `list_commands`. What the process writes to stderr is kept with its stdout.
 * **The record** `<id>.cmd` (JSON, `0600`): the command (scrubbed, 1 KiB), slot, cwd, exec id, **owner** (a token this process made at
-  start), the pid and its start time, `state` (`starting`, `running`, `exited`, `stopped`, `gone`). A worker that starts, stops or lists
-  reads the run's records: one that says `running` and that this process does not hold is of a worker that is gone, so its process is
-  killed (by exec id, and by pid when the start time still matches) and the record says `gone: the worker that ran it restarted; start
-  it again`. The janitor removes `outputs/<run>` with the workspace, records included.
-* **Replay.** The registry (`Commands`, `ToolEnv::commands`) finds the command of the id: the call returns its view and starts nothing.
-  Otherwise the earlier try's process is killed and the command starts again, its output begun again. At most one process per id.
-* **When it stops:** `stop_command`; `BACKGROUND_COMMAND_MAX_SECS`; the root run ends (`CoderAgent::step`, at once; a cancel never calls
-  the agent, so `Commands::sweep` reads the run's standing every `BACKGROUND_SWEEP_SECS` and stops what is over); the run parks on the
-  person (`ask_user`); `rebuild_environment`; the janitor's release; the worker's shutdown. A process group is killed, and what a pod or
-  a devcontainer holds is stopped by exec id.
-* **Limits:** at most `BACKGROUND_COMMANDS_MAX` run at once in a run (refused with the number and how to stop one). Commands belong to the
-  **root run**: a subagent's tools reach them, and the read-only helpers cannot start one (tier `plan`). Time limits of the tools: see
-  `own_limit`.
-* **Git.** The slot's git state is read at the start and at the end; a change (HEAD, a ref, `.git`, the configuration) is **reported and
-  not undone**, because the run's own `commit_and_push` moves them too. `run_command`'s undo guard names the commands that keep running in
-  its slot when it refuses.
-* **Sandbox time (ADR 0043)** is reported at the call that sees the end; a command stopped by the sweep or the run's end goes unmetered.
+  start), the pid and its start time, **`beat`** (unix seconds), **`stop_requested`**, `state` (`starting`, `running`, `exited`,
+  `stopped`, `gone`).
+* **Several workers.** A run moves between workers at every step, so a record this process does not hold is usually another
+  worker's live command. The owner writes the beat at start and at every sweep (`BACKGROUND_SWEEP_SECS`); a record is **stale** when
+  its beat is older than `stale_after(sweep)`: the larger of three sweeps and 60 s (`BEAT_STALE_FLOOR_SECS`; the clocks of the workers
+  are assumed to agree within that). A fresh record is listed as running, counts against `BACKGROUND_COMMANDS_MAX`, is read through
+  its file, is left alone by a start of another id, and is stopped by a **stop request** in its record (and, in a pod or a
+  devcontainer, by the kill of its exec id): its owner's sweep stops it, so `stop_command` returns how it ended, or says the stop
+  was asked and the owner does it within a sweep. A stale one is a dead worker's: its process (by exec id, by pid with its start time,
+  and what is left of its group) is killed and the record says `gone: the worker that ran it is gone; start it again`. The janitor
+  settles the records of a run that is over before it removes `outputs/<run>` with the workspace.
+* **Replay.** The registry (`Commands`, `ToolEnv::commands`) finds the command of the id, or its record is fresh (another worker
+  runs it), or it ended: the call returns its view and starts nothing. A stale record is an earlier try that died: its process is
+  killed and the command starts again, its output begun again. At most one process per id.
+* **When it stops:** `stop_command`; `BACKGROUND_COMMAND_MAX_SECS`; the root run ends or any run of the tree parks on the person
+  (`CoderAgent::step`: at once on the worker that holds the command, a stop request in the record of one another worker holds, carried
+  out within one sweep; the end of a child run stops nothing, nor does a park on a subagent or a timer); a cancel never calls the
+  agent, so `Commands::sweep` reads the run's standing every `BACKGROUND_SWEEP_SECS` and stops what is over; `rebuild_environment`;
+  the janitor's release; the worker's shutdown (`gone: the worker stopped...`; `CommandsSweep` is the component, `wire_commands`
+  gives the tools, the janitor and the sweep one registry). A process group is killed whatever ended the leader, and what a pod or a
+  devcontainer holds is stopped by exec id (`CoderSettings::background_kill_wait` bounds the call). A command in a pod or a devcontainer
+  that a signal ended and nobody asked for says its environment was probably made again.
+* **Limits:** at most `BACKGROUND_COMMANDS_MAX` run at once in a run, on every worker (refused with the number and how to stop one).
+  Commands belong to the **root run**: a subagent's tools reach them, and the read-only helpers cannot start one (tier `plan`). Time
+  limits of the tools: see `own_limit`.
+* **Git.** The slot's git state is read at the start and at the end. A changed configuration (`core.hooksPath`, `core.fsmonitor`, a
+  filter, a URL, `info/exclude`) is put back, as `run` does. A changed HEAD, ref or `.git` is **reported and not undone**, because the
+  run's own `commit_and_push` moves them too. Nothing is said when the state cannot be read at the end. `run_command` and `run` name the
+  commands that keep running in their slot in every refusal.
+* **Sandbox time (ADR 0043)** is reported once, at the call that sees the end; a command stopped by the sweep or the run's end goes unmetered.
 * The prompt names the three tools in one line (the guidance is in the tool descriptions, which are fixed for the process).
 
 ### Making something with a command
@@ -2094,7 +2109,7 @@ way; every problem is reported at once at startup):
 | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
 | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart (at least 1) | `5` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` (and of one `run_command` and one `run`): the time limit is also **the most a call's `timeout` may ask for**; the output size is what is shown of a long output, a quarter of it the head and the rest the tail (the whole is kept) | `900`, `16384` |
-| `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS`, `BACKGROUND_SWEEP_SECS` | commands of one run that keep running at once (1 to 16), how long each may run (60 to 86400 s), and how often the sweep stops the commands of a run that is over (1 to 3600 s). **`0` is refused** (exit 78, the message names the variable): the bound of the three is what keeps a process from outliving its run | `4`, `3600`, `15` |
+| `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS`, `BACKGROUND_SWEEP_SECS` | commands of one run that keep running at once (1 to 16), how long each may run (60 to 86400 s), and how often each worker's sweep stops the commands of a run that is over, carries out a stop another worker asked for, and beats (1 to 3600 s; a record is a dead worker's when its beat is older than the larger of three sweeps and 60 s: the same value on every worker, clocks within 60 s). **`0` is refused** (exit 78, the message names the variable): the bound of the three is what keeps a process from outliving its run | `4`, `3600`, `15` |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. The shipped `mcp.json` does not need it any more (the GitHub server is the sidecar, over http); the chart and `compose.yaml` still set it for one release, for an agent folder written before the sidecar. The image does not set it (it also carries `adam-agent`, which must refuse local processes unless its own deployment opts in) | `false` |
@@ -2531,7 +2546,12 @@ database of its own, so the role needs `CREATEDB`):
   `tests/janitor.rs`): `start_read_stop_locally` (3,000 lines then `sleep 600`: pages 1 and 2001, the
   running line, the same bytes twice, stop, `[end: 3000 lines]`), `a_command_that_ends_inside_the_wait_gives_the_result_of_run`,
   `a_start_run_again_with_the_same_call_starts_one_process`, `a_replay_in_another_process_kills_the_old_one_and_starts_again`,
-  `a_restarted_worker_says_gone_and_kills_by_exec_id`, `a_pod_command_is_stopped_through_adam_exec_kill`,
+  `a_restarted_worker_says_gone_and_kills_by_exec_id`, `a_pod_command_is_stopped_through_adam_exec_kill`, and, with a second
+  `ToolEnv` over the same volume as a second worker, `a_fresh_record_of_another_worker_is_listed_running_and_survives_a_start`,
+  `a_stop_from_another_worker_stops_the_command_within_a_sweep`, `a_park_stepped_by_another_worker_stops_the_command_within_a_sweep`,
+  `a_stale_record_is_gone_and_its_whole_group_is_killed`, `a_replayed_start_on_another_worker_starts_no_second_process`,
+  `the_limit_counts_the_commands_other_workers_run`, `a_beat_does_not_erase_a_stop_request`; the stops use a command with a child and
+  a grandchild and assert by pid that each is gone,
   `output_is_scrubbed_before_it_is_written` (a secret of three lines split across two reads, nothing of it on the volume at any time),
   `output_stops_at_the_cap`, `the_lifetime_ends_it`, `more_than_the_maximum_is_refused`, `a_finished_root_run_stops_its_commands`,
   `a_park_on_the_person_stops_the_commands`, `a_cancelled_run_is_reached_by_the_sweep`,
