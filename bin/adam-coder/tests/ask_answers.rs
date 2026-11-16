@@ -15,14 +15,22 @@ use serde_json::{Map, Value, json};
 
 const V7: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v7.json");
 const V7_LOCK: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v7.lock.json");
+const V8: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v8.json");
+const V8_LOCK: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v8.lock.json");
+const V5: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v5.json");
+const V5_LOCK: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v5.lock.json");
 
 fn screen() -> Map<String, Value> {
-    let lock: Value = serde_json::from_str(V7_LOCK).unwrap();
+    screen_of(V7, V7_LOCK)
+}
+
+fn screen_of(document: &str, lock: &str) -> Map<String, Value> {
+    let lock: Value = serde_json::from_str(lock).unwrap();
     let claimed = json!({
         "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
         "version": lock["version"], "digest": lock["digest"]});
     let mut inline = claimed.clone();
-    inline["catalog"] = serde_json::from_str(V7).unwrap();
+    inline["catalog"] = serde_json::from_str(document).unwrap();
     json!({
         adam_a2a_runtime::CONTEXT_UI_REF: claimed,
         adam_a2a_runtime::CONTEXT_UI_CATALOG: inline,
@@ -142,4 +150,82 @@ async fn what_a_refusal_and_an_ending_say_never_repeats_a_secret_the_redactor_hi
         ending.question
     );
     clean("the ending", &ending.question);
+}
+
+/// What a question shows is the model's content drawn next to a question the person answers (a
+/// confirm that shows a diff is the consent case): the redactor scrubs it as it scrubs the question,
+/// on a screen that draws it with the form, on one that draws it above, on one that has it in words,
+/// and in every form asked again.
+#[tokio::test]
+async fn a_secret_in_what_a_question_shows_reaches_neither_the_surface_nor_the_question() {
+    let fx = Fixture::new().await;
+    let tools = coder_tools(&fx.env);
+    let tool = tools.get("ask_user").expect("ask_user").clone();
+    let args = json!({
+        "question": "Apply the change?",
+        "choices": [{"id": "budget", "question": "What is the budget?", "type": "number",
+                     "maxValue": "1000",
+                     "show": [
+                        {"component": "Code", "language": "diff",
+                         "code": format!("-token = old\n+token = {}\n", common::GITHUB_TOKEN)},
+                        {"component": "Text", "text": format!("The key is {}", common::MODEL_KEY)},
+                        {"component": "Cards", "cards": [{"title": "Db", "body": common::DB_PASSWORD}]},
+                        {"component": "Callout", "title": common::A2A_TOKEN, "text": "ok"}]}]
+    });
+    let clean = |what: &str, text: &str| {
+        for secret in common::SECRETS {
+            assert!(!text.contains(secret), "{what} repeats {secret}: {text}");
+        }
+    };
+    for (version, document, lock) in [(8, V8, V8_LOCK), (7, V7, V7_LOCK), (5, V5, V5_LOCK)] {
+        let ctx = ToolCtx::detached("ask_user", "call-1", Arc::new(CollectingSink::new()))
+            .with_state(fx.env.clone())
+            .with_context(screen_of(document, lock));
+        let Err(ToolError::NeedsInput {
+            question,
+            ui: Some(mut ui),
+        }) = tool.call(&ctx, args.clone()).await
+        else {
+            panic!("version {version}: ask_user did not ask with a form");
+        };
+        clean(&format!("version {version}: the question"), &question);
+        clean(&format!("version {version}: the form"), &ui.to_string());
+        // The shown content is there, with the secret taken out: the scrub reached it.
+        let shown = format!("{question}{ui}");
+        assert!(
+            shown.contains("token = [redacted]"),
+            "version {version}: {shown}"
+        );
+        assert!(
+            shown.contains("The key is [redacted]"),
+            "version {version}: {shown}"
+        );
+        for attempt in 1..=3 {
+            let surface = ui[0]["createSurface"]["surfaceId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let answer = json!({"text": "x", "form": {"surface": surface, "context": {
+                "answers": [{"id": "budget", "values": ["1500"]}]}}});
+            let AnswerCheck::Refuse(refusal) =
+                tool.read_answer("call-1", &args, Some(&ui), &answer)
+            else {
+                panic!("version {version}: a budget above its most was accepted");
+            };
+            clean(
+                &format!("version {version}: the question asked again"),
+                &refusal.question,
+            );
+            clean(
+                &format!("version {version}: the form asked again"),
+                &refusal.ui.as_ref().unwrap().to_string(),
+            );
+            let again = format!("{}{}", refusal.question, refusal.ui.as_ref().unwrap());
+            assert!(
+                again.contains("token = [redacted]"),
+                "version {version}, attempt {attempt}: the same things are shown again: {again}"
+            );
+            ui = refusal.ui.unwrap();
+        }
+    }
 }

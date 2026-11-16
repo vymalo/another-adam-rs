@@ -1,7 +1,8 @@
 #!/bin/sh
 # Compare each catalog fixture of adam-ui with the published file at the commit that
 # `crates/adam-ui/tests/fixtures/UPSTREAM` names, and the conformance blocks of
-# `choices-v7-vectors.json` with the ones on the contract page at its commit. Needs curl, node and
+# `choices-v7-vectors.json` and `choices-v8-vectors.json` with the ones on the contract page at
+# their commit. Needs curl, node and
 # the network (CI, job `docs`). `UI_CATALOG_CONTRACT=<file>` reads the contract page from a file
 # instead of fetching it.
 set -eu
@@ -25,26 +26,24 @@ while read -r file commit digest; do
         failed=1
       fi
       ;;
-    choices-v7-vectors.json)
+    choices-v*-vectors.json)
       # `digest` is the path of the page here.
+      case "$file" in
+        choices-v7-vectors.json) blocks='{"vectors":"vectors","whole-answers":"wholeAnswers","invalid-questions":"invalidQuestions","surfaces":"surfaces","questions":"questions","answers":"answers"}' ;;
+        choices-v8-vectors.json) blocks='{"v8-surfaces":"v8Surfaces"}' ;;
+        *) echo "UNKNOWN  $file has no list of blocks in $0" >&2; failed=1; continue ;;
+      esac
       if [ -n "${UI_CATALOG_CONTRACT:-}" ]; then
         cp "$UI_CATALOG_CONTRACT" "$tmp"
       else
         curl -sSfL -o "$tmp" "$base/$commit/$digest"
       fi
-      if node --input-type=module - "$tmp" "$fixtures/$file" <<'JS'
+      if node --input-type=module - "$tmp" "$fixtures/$file" "$blocks" <<'JS'
 import { readFileSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 
-const [page, fixture] = process.argv.slice(2);
-const wanted = {
-  vectors: "vectors",
-  "whole-answers": "wholeAnswers",
-  "invalid-questions": "invalidQuestions",
-  surfaces: "surfaces",
-  questions: "questions",
-  answers: "answers",
-};
+const [page, fixture, blocks] = process.argv.slice(2);
+const wanted = JSON.parse(blocks);
 const found = {};
 for (const [, tag, body] of readFileSync(page, "utf8").matchAll(/^```json (\S+)\n([\s\S]*?)^```$/gm)) {
   if (tag in wanted) found[wanted[tag]] = JSON.parse(body);

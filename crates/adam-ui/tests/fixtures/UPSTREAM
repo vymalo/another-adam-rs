@@ -11,6 +11,7 @@ catalog-v3.json  1e876417cae8c1f2639dbb4fb0379bc4c0c74c05  sha256:9f65f9e6ddd424
 catalog-v5.json  62aeb754980036d94bbe72a75ee33f1eeabf0368  sha256:14ec7c0dff6cb44e0f6c7a3b4793abcadfeacff0c97b3c0db26f11ee008ffadf
 catalog-v6.json  cf1f4fc37a236a87c9470b062ad6864dc7dd8231  sha256:f0baf255994b3c80144a5f3db634f06bce37253eb43efb4a85b33c47628c105d
 catalog-v7.json  5ed8950f09383220cc1bca26c7798b0c7ea135c7  sha256:6df9a37d0ae6fa53b8d22145dc1b5674b6d3f228d1c1b83b2ec640d7b3093d49
+catalog-v8.json  d0a732f21d93485835d7287e9f09a25d2b4fb338  sha256:22c333102bed676791dc9d47f21fc0a39be6e5062ef2c52f5a599ecca1b8341d
 
 # `choices-v7-vectors.json` is not a copy. It holds the `json` blocks `vectors` (133 cases),
 # `whole-answers`, `invalid-questions`, `surfaces`, `questions` and `answers` of
@@ -21,3 +22,10 @@ catalog-v7.json  5ed8950f09383220cc1bca26c7798b0c7ea135c7  sha256:6df9a37d0ae6fa
 #
 # <file>  <commit>  <path of the page>
 choices-v7-vectors.json  5ed8950f09383220cc1bca26c7798b0c7ea135c7  docs/api/ui-catalog-v1.md
+
+# `choices-v8-vectors.json` is not a copy either. It holds the `json` block `v8-surfaces` (46 cases:
+# the surfaces a question that shows may make, and what each is) of the same page, under the key
+# `v8Surfaces`, at the commit below; `tools/check-vendored-catalogs.sh` compares it the same way.
+#
+# <file>  <commit>  <path of the page>
+choices-v8-vectors.json  5cab8fc8216921d0567e1d2bd65a9bdec8d48680  docs/api/ui-catalog-v1.md

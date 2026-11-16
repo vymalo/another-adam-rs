@@ -18,6 +18,8 @@ use serde_json::{Map, Value, json};
 const CATALOG_ID: &str = "https://agents.vymalo.com/a2ui/catalogs/chat";
 const V7: &str = include_str!("fixtures/catalog-v7.json");
 const V7_LOCK: &str = include_str!("fixtures/catalog-v7.lock.json");
+const V8: &str = include_str!("fixtures/catalog-v8.json");
+const V8_LOCK: &str = include_str!("fixtures/catalog-v8.lock.json");
 const V6: &str = include_str!("fixtures/catalog-v6.json");
 const V6_LOCK: &str = include_str!("fixtures/catalog-v6.lock.json");
 const V5: &str = include_str!("fixtures/catalog-v5.json");
@@ -169,12 +171,13 @@ fn every_catalog_fixture_hashes_to_its_lock_and_to_upstream() {
             )
         })
         .collect();
-    assert_eq!(upstream.len(), 5);
+    assert_eq!(upstream.len(), 6);
     for (file, document, lock) in [
         ("catalog-v2.json", V2, V2_LOCK),
         ("catalog-v5.json", V5, V5_LOCK),
         ("catalog-v6.json", V6, V6_LOCK),
         ("catalog-v7.json", V7, V7_LOCK),
+        ("catalog-v8.json", V8, V8_LOCK),
     ] {
         let digest = catalog_digest(&serde_json::from_str(document).unwrap()).unwrap();
         let lock: Value = serde_json::from_str(lock).unwrap();
