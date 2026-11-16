@@ -95,7 +95,9 @@ impl Rig {
     async fn call(&self, name: &str, args: Value) -> ToolOutput {
         let tools = coder_tools(&self.fx.env);
         let tool = tools.get(name).expect("the tool is in the set").clone();
-        tool.call(&self.ctx, args).await.expect("a result, not a failure")
+        tool.call(&self.ctx, args)
+            .await
+            .expect("a result, not a failure")
     }
 
     /// The directory of the slot `dir` of this run.
@@ -107,7 +109,10 @@ impl Rig {
 /// Every file of `dir` outside `.git`, with its content, and `HEAD`: what a write would change.
 fn snapshot(dir: &Path) -> Vec<(String, String)> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-        let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let path = entry.path();
@@ -137,7 +142,11 @@ async fn with_design() -> (Fixture, String) {
     let fx = Fixture::new().await;
     let design = fx.extra_remote("design", &DESIGN_FILES);
     let url = design.to_string_lossy().into_owned();
-    let fx = fx.referencing(vec![def("design", &url, "Tokens and components the UI follows")]);
+    let fx = fx.referencing(vec![def(
+        "design",
+        &url,
+        "Tokens and components the UI follows",
+    )]);
     (fx, url)
 }
 
@@ -152,7 +161,10 @@ async fn read_tools_work_in_reference() {
     let rig = Rig::new(fx, AccessTier::Plan).await;
     rig.named(&remote).await;
     let named_before = rig.notes().await.named_repos;
-    assert!(!rig.slot("design").exists(), "nothing is made until it is read");
+    assert!(
+        !rig.slot("design").exists(),
+        "nothing is made until it is read"
+    );
 
     // The first read, under a plan, checks the reference out.
     let read = rig
@@ -179,7 +191,11 @@ async fn read_tools_work_in_reference() {
     let searched = rig
         .call("search_files", json!({"pattern": "grey", "repo": "design"}))
         .await;
-    assert!(searched.content.contains("tokens.css"), "{}", searched.content);
+    assert!(
+        searched.content.contains("tokens.css"),
+        "{}",
+        searched.content
+    );
     assert!(searched.content.contains("--grey"), "{}", searched.content);
 
     // A file of orders is numbered text: no header of the repository's instructions, nothing run.
@@ -200,10 +216,16 @@ async fn read_tools_work_in_reference() {
     assert_eq!(notes.tier, Some(AccessTier::Plan));
     assert!(notes.consents.is_empty());
     let refused = rig
-        .call("prepare_workspace", json!({"repo_url": "https://github.com/evil/repo"}))
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": "https://github.com/evil/repo"}),
+        )
         .await;
     assert!(
-        refused.is_error && refused.content.contains("not a repository the person named"),
+        refused.is_error
+            && refused
+                .content
+                .contains("not a repository the person named"),
         "{}",
         refused.content
     );
@@ -239,7 +261,10 @@ async fn single_repo_plus_reference_defaults_to_repo() {
     );
 
     let prepared = rig
-        .call("prepare_workspace", json!({"repo_url": remote, "base_branch": "main"}))
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )
         .await;
     assert!(!prepared.is_error, "{}", prepared.content);
     let before = snapshot(&rig.slot("design"));
@@ -247,7 +272,11 @@ async fn single_repo_plus_reference_defaults_to_repo() {
     // A read that names no slot is the repository's: its README is "widgets".
     let readme = rig.call("read_file", json!({"path": "README.md"})).await;
     assert!(readme.content.contains("widgets"), "{}", readme.content);
-    assert!(!readme.content.contains("Design system"), "{}", readme.content);
+    assert!(
+        !readme.content.contains("Design system"),
+        "{}",
+        readme.content
+    );
     // A write that names no slot is the repository's.
     let written = rig
         .call("write_file", json!({"path": "new.txt", "content": "new\n"}))
@@ -255,7 +284,11 @@ async fn single_repo_plus_reference_defaults_to_repo() {
     assert!(!written.is_error, "{}", written.content);
     assert!(rig.slot("remote").join("new.txt").is_file());
     assert!(!rig.slot("design").join("new.txt").exists());
-    assert_eq!(snapshot(&rig.slot("design")), before, "the reference is as it was");
+    assert_eq!(
+        snapshot(&rig.slot("design")),
+        before,
+        "the reference is as it was"
+    );
     // And the reference is still read when it is named.
     let named = rig
         .call("read_file", json!({"path": "tokens.css", "repo": "design"}))
@@ -323,8 +356,11 @@ async fn write_tools_refuse_reference() {
     let rig = Rig::new(fx, AccessTier::Bypass).await;
     rig.named(&remote).await;
     // The reference exists as a slot (it was read), and the repository the run works on beside it.
-    rig.call("prepare_workspace", json!({"repo_url": remote, "base_branch": "main"}))
-        .await;
+    rig.call(
+        "prepare_workspace",
+        json!({"repo_url": remote, "base_branch": "main"}),
+    )
+    .await;
     rig.call("read_file", json!({"path": "tokens.css", "repo": "design"}))
         .await;
     let before = snapshot(&rig.slot("design"));
@@ -334,7 +370,9 @@ async fn write_tools_refuse_reference() {
     let (mut writes, mut by_address, mut reads) = (Vec::new(), Vec::new(), Vec::new());
     for name in tools.names() {
         match slot_use(&name).unwrap_or_else(|| {
-            panic!("`{name}` is a tool of the coder that tools::references::slot_use does not classify")
+            panic!(
+                "`{name}` is a tool of the coder that tools::references::slot_use does not classify"
+            )
         }) {
             SlotUse::Writes => writes.push(name),
             SlotUse::ByAddress => by_address.push(name),
@@ -359,7 +397,10 @@ async fn write_tools_refuse_reference() {
         "rename_repository",
         "delete_repository",
     ] {
-        assert!(by_address.iter().any(|n| n == must), "{must} acts by address");
+        assert!(
+            by_address.iter().any(|n| n == must),
+            "{must} acts by address"
+        );
     }
 
     for name in &writes {
@@ -369,8 +410,16 @@ async fn write_tools_refuse_reference() {
             "{name}: {}",
             refused.content
         );
-        assert_eq!(snapshot(&rig.slot("design")), before, "{name} left the reference alone");
-        assert_eq!(snapshot(&rig.slot("remote")), repo_before, "{name} wrote nowhere else");
+        assert_eq!(
+            snapshot(&rig.slot("design")),
+            before,
+            "{name} left the reference alone"
+        );
+        assert_eq!(
+            snapshot(&rig.slot("remote")),
+            repo_before,
+            "{name} wrote nowhere else"
+        );
     }
     // By address: the repository of a reference that is a slot, and one that was never read.
     for name in &by_address {
@@ -378,12 +427,19 @@ async fn write_tools_refuse_reference() {
             let refused = rig.call(name, address_args(name, url)).await;
             assert!(refused.is_error, "{name} {url}: {}", refused.content);
             assert!(
-                refused.content.contains("reference") || refused.content.contains("not a repository the person named"),
+                refused.content.contains("reference")
+                    || refused
+                        .content
+                        .contains("not a repository the person named"),
                 "{name} {url}: {}",
                 refused.content
             );
         }
-        assert_eq!(snapshot(&rig.slot("design")), before, "{name} left the reference alone");
+        assert_eq!(
+            snapshot(&rig.slot("design")),
+            before,
+            "{name} left the reference alone"
+        );
     }
     // The ones that only look are not refused.
     for name in &reads {
@@ -437,7 +493,12 @@ async fn a_command_that_looks_works_in_a_reference_and_one_that_writes_is_undone
 
 /// A coder on a `Runtime`, one run of it, and the model's script: the requests the model was sent
 /// are what the prefix tests read.
-async fn drive(fx: &Fixture, text: &str, tier: Option<AccessTier>, script: impl FnOnce(&MockModel)) -> Vec<ModelRequest> {
+async fn drive(
+    fx: &Fixture,
+    text: &str,
+    tier: Option<AccessTier>,
+    script: impl FnOnce(&MockModel),
+) -> Vec<ModelRequest> {
     let mock = Arc::new(MockModel::new());
     script(&mock);
     let model: DynModel = mock.clone();
@@ -498,14 +559,16 @@ fn system(request: &ModelRequest) -> String {
 async fn the_system_prompt_names_the_references_and_keeps_its_prefix() {
     let (fx, _url) = with_design().await;
     let script = |mock: &MockModel| {
-        mock.push_tool_calls(vec![call(
-            "c1",
-            "list_files",
-            json!({"repo": "design"}),
-        )])
-        .push_text("Done.");
+        mock.push_tool_calls(vec![call("c1", "list_files", json!({"repo": "design"}))])
+            .push_text("Done.");
     };
-    let requests = drive(&fx, "Look at the design system", Some(AccessTier::Edits), script).await;
+    let requests = drive(
+        &fx,
+        "Look at the design system",
+        Some(AccessTier::Edits),
+        script,
+    )
+    .await;
     assert!(requests.len() >= 2, "{}", requests.len());
     let first = system(&requests[0]);
     assert!(first.contains("## References"), "{first}");
@@ -516,20 +579,27 @@ async fn the_system_prompt_names_the_references_and_keeps_its_prefix() {
     assert!(first.contains("never change them"), "{first}");
     // Before the words that depend on the message.
     let at = first.find("## References").unwrap();
-    let tier = first.find("## Access tier of this message").expect("the tier says itself");
+    let tier = first
+        .find("## Access tier of this message")
+        .expect("the tier says itself");
     assert!(at < tier, "the static part comes first");
     // The same on every request of the run: the tool's result is in the messages, not the prompt.
     for request in &requests[1..] {
         assert_eq!(system(request), first);
     }
     let tools = |r: &ModelRequest| r.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
-    assert_eq!(tools(&requests[1]), tools(&requests[0]), "the tool list does not move");
+    assert_eq!(
+        tools(&requests[1]),
+        tools(&requests[0]),
+        "the tool list does not move"
+    );
     // A run under another message has the same prefix up to the tier's words.
     let other = drive(&fx, "Another task", Some(AccessTier::Plan), |m| {
         m.push_text("Done.");
     })
     .await;
-    let prefix = |text: &str| text[..text.find("## Access tier of this message").unwrap()].to_owned();
+    let prefix =
+        |text: &str| text[..text.find("## Access tier of this message").unwrap()].to_owned();
     assert_eq!(prefix(&system(&other[0])), prefix(&first));
 
     // With no reference nothing of it is in the prompt, and the prompt is what it was.
@@ -538,7 +608,79 @@ async fn the_system_prompt_names_the_references_and_keeps_its_prefix() {
         m.push_text("Done.");
     })
     .await;
-    assert!(!system(&requests[0]).contains("References"), "{}", system(&requests[0]));
+    assert!(
+        !system(&requests[0]).contains("References"),
+        "{}",
+        system(&requests[0])
+    );
+}
+
+/// A run that read a reference and made a scratch project is still scratch work: sharing the file
+/// delivers it, and the reference is not work left undelivered.
+#[tokio::test]
+async fn a_reference_beside_scratch_work_changes_nothing_about_how_the_run_ends() {
+    let (fx, _url) = with_design().await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call("s1", "start_scratch", json!({"name": "notes"}))])
+        .push_tool_calls(vec![call(
+            "r1",
+            "read_file",
+            json!({"path": "tokens.css", "repo": "design"}),
+        )])
+        .push_tool_calls(vec![call(
+            "w1",
+            "write_file",
+            json!({"path": "blue.txt", "content": "#00f\n"}),
+        )])
+        .push_tool_calls(vec![call("f1", "share_file", json!({"path": "blue.txt"}))])
+        .push_text("The blue is #00f.");
+    let model: DynModel = mock.clone();
+    let agent = CoderAgent::new(model, "test-model", fx.env.clone());
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = Runtime::builder(store)
+        .agent(agent)
+        .poll_interval(Duration::from_millis(20))
+        .build();
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let worker = {
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            let _ = rt
+                .run_worker(async {
+                    let _ = rx.await;
+                })
+                .await;
+        })
+    };
+    let run = rt
+        .start(
+            AGENT_NAME,
+            Inbound::new(
+                "message",
+                json!({"text": "Put the design's blue in a file for me"}),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let view = loop {
+        let view = rt.view(run).await.unwrap().unwrap();
+        if view.status.is_terminal() || view.waiting {
+            break view;
+        }
+        assert!(Instant::now() < deadline, "timed out: {view:#?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let _ = stop.send(());
+    worker.await.unwrap();
+    assert_eq!(
+        view.status,
+        RunStatus::Done,
+        "the run ends with its answer, it is not parked on a question: {view:#?}"
+    );
+    let written = result_of(&mock, "w1");
+    assert!(written.contains("blue.txt"), "{written}");
 }
 
 // ------------------------------------------------------------------- a repository declares one
@@ -634,14 +776,20 @@ fn bare_repo(root: &Path, name: &str, files: &[(&str, &str)]) {
     let seed = root.join(format!("seed-{name}"));
     std::fs::create_dir_all(&remote).unwrap();
     std::fs::create_dir_all(&seed).unwrap();
-    git(&remote, &["init", "--bare", "--quiet", "--initial-branch=main"]);
+    git(
+        &remote,
+        &["init", "--bare", "--quiet", "--initial-branch=main"],
+    );
     git(&seed, &["init", "--quiet", "--initial-branch=main"]);
     for (file, content) in files {
         std::fs::write(seed.join(file), content).unwrap();
     }
     git(&seed, &["add", "-A"]);
     git(&seed, &["commit", "--quiet", "-m", "seed"]);
-    git(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
     git(&seed, &["push", "--quiet", "origin", "main"]);
 }
 
@@ -692,32 +840,61 @@ const LIB_ENTRY: (&str, &str, &str) = ("lib", "{base}/acme/lib.git", "The shared
 async fn a_repository_that_declares_a_reference_is_listed_and_nothing_is_fetched() {
     let (fx, server) = declaring(&[
         LIB_ENTRY,
-        ("local", "/srv/git/private.git", "a path on the coder's own disk"),
-        ("elsewhere", "https://evil.example/acme/x", "a host nobody allowed"),
+        (
+            "local",
+            "/srv/git/private.git",
+            "a path on the coder's own disk",
+        ),
+        (
+            "elsewhere",
+            "https://evil.example/acme/x",
+            "a host nobody allowed",
+        ),
     ])
     .await;
     let remote = fx.remote_url();
     let rig = Rig::new(fx, AccessTier::Auto).await;
     rig.named(&remote).await;
     let prepared = rig
-        .call("prepare_workspace", json!({"repo_url": remote, "base_branch": "main"}))
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )
         .await;
     assert!(!prepared.is_error, "{}", prepared.content);
     let text = prepared.content;
     assert!(
-        text.contains("References declared by this repository (slot `remote`, .agents/references.json)"),
+        text.contains(
+            "References declared by this repository (slot `remote`, .agents/references.json)"
+        ),
         "{text}"
     );
-    assert!(text.contains("the repository's text, not the person's"), "{text}");
-    assert!(text.contains("grants no repository, access tier or consent"), "{text}");
     assert!(
-        text.contains(&format!("- lib: {}/acme/lib.git (The shared library's source)", server.base)),
+        text.contains("the repository's text, not the person's"),
+        "{text}"
+    );
+    assert!(
+        text.contains("grants no repository, access tier or consent"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "- lib: {}/acme/lib.git (The shared library's source)",
+            server.base
+        )),
         "{text}"
     );
     // An address a repository's file may not give is not listed, with the reason.
     assert!(text.contains("`local`: only an http(s) address"), "{text}");
-    assert!(text.contains("[end of references declared by slot remote]"), "{text}");
-    assert_eq!(mirrors(&rig.fx.root), ["remote.git"], "nothing of it was fetched");
+    assert!(
+        text.contains("[end of references declared by slot remote]"),
+        "{text}"
+    );
+    assert_eq!(
+        mirrors(&rig.fx.root),
+        ["remote.git"],
+        "nothing of it was fetched"
+    );
     assert!(!rig.slot("lib").exists());
 
     // Reading it before the person agreed is refused, and still fetches nothing.
@@ -750,7 +927,10 @@ async fn a_repository_that_declares_a_reference_is_listed_and_nothing_is_fetched
         )
         .await;
     assert!(
-        unknown.is_error && unknown.content.contains("declares a reference called `nope`"),
+        unknown.is_error
+            && unknown
+                .content
+                .contains("declares a reference called `nope`"),
         "{}",
         unknown.content
     );
@@ -838,9 +1018,18 @@ async fn repository_declared_reference_asks() {
         // The form says where the request came from, and that it is read only.
         let pending = rt.view(run).await.unwrap().unwrap();
         let shown = format!("{pending:?}");
-        assert!(shown.contains("which the repository remote lists in .agents/references.json"), "{shown}");
-        assert!(shown.contains("Read only: nothing in it is ever changed"), "{shown}");
-        assert!(shown.contains("The agent says why: \\\"the greeting is in the library\\\""), "{shown}");
+        assert!(
+            shown.contains("which the repository remote lists in .agents/references.json"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("Read only: nothing in it is ever changed"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("The agent says why: \\\"the greeting is in the library\\\""),
+            "{shown}"
+        );
         assert!(shown.contains("Yes, read acme/lib"), "{shown}");
 
         // The person answers the form drawn on `ask-q1`.
@@ -865,7 +1054,10 @@ async fn repository_declared_reference_asks() {
         assert_eq!(notes.consents[0].subject, format!("reference:{lib_key}"));
         // Writing it, and adding it as a repository, are refused either way.
         let write = result_of(&mock, "w1");
-        assert!(write.contains("is a reference") || write.contains("has not agreed"), "{write}");
+        assert!(
+            write.contains("is a reference") || write.contains("has not agreed"),
+            "{write}"
+        );
         let add = result_of(&mock, "x1");
         assert!(add.contains("not a repository the person named"), "{add}");
         let read = result_of(&mock, "r1");
@@ -905,17 +1097,36 @@ fn result_of(mock: &MockModel, id: &str) -> String {
 #[tokio::test]
 async fn an_address_the_coder_refuses_for_a_repository_is_refused_for_a_reference() {
     let (fx, _server) = declaring(&[
-        ("elsewhere", "https://evil.example/acme/x", "a host nobody allowed"),
-        ("path", "/work/git/github.com/acme/private.git", "a mirror on the coder's disk"),
-        ("file", "file:///work/git/github.com/acme/private.git", "a file address"),
-        ("creds", "https://user:token@github.com/acme/x", "credentials in the address"),
+        (
+            "elsewhere",
+            "https://evil.example/acme/x",
+            "a host nobody allowed",
+        ),
+        (
+            "path",
+            "/work/git/github.com/acme/private.git",
+            "a mirror on the coder's disk",
+        ),
+        (
+            "file",
+            "file:///work/git/github.com/acme/private.git",
+            "a file address",
+        ),
+        (
+            "creds",
+            "https://user:token@github.com/acme/x",
+            "credentials in the address",
+        ),
     ])
     .await;
     let remote = fx.remote_url();
     let rig = Rig::new(fx, AccessTier::Auto).await;
     rig.named(&remote).await;
     let prepared = rig
-        .call("prepare_workspace", json!({"repo_url": remote, "base_branch": "main"}))
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )
         .await;
     assert!(!prepared.is_error, "{}", prepared.content);
     for listed in ["path", "file", "creds"] {
@@ -926,7 +1137,13 @@ async fn an_address_the_coder_refuses_for_a_repository_is_refused_for_a_referenc
         );
     }
     // The one a repository's file may spell (an https address) but the workspace's policy refuses.
-    assert!(prepared.content.contains("- elsewhere: https://evil.example/acme/x"), "{}", prepared.content);
+    assert!(
+        prepared
+            .content
+            .contains("- elsewhere: https://evil.example/acme/x"),
+        "{}",
+        prepared.content
+    );
     let asked = rig
         .call(
             "request_repository",
@@ -934,7 +1151,9 @@ async fn an_address_the_coder_refuses_for_a_repository_is_refused_for_a_referenc
         )
         .await;
     assert!(
-        asked.is_error && asked.content.contains("cannot be read here") && asked.content.contains("Do not ask the person"),
+        asked.is_error
+            && asked.content.contains("cannot be read here")
+            && asked.content.contains("Do not ask the person"),
         "{}",
         asked.content
     );

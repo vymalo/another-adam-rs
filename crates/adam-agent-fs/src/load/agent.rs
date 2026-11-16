@@ -383,7 +383,10 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
         );
     }
     if let Err(why) = check_references(&fm.references) {
-        sink.error(key_line(split, "references"), format!("`references`: {why}"));
+        sink.error(
+            key_line(split, "references"),
+            format!("`references`: {why}"),
+        );
     }
     for key in fm.vars.keys() {
         if !is_env_name(key) {

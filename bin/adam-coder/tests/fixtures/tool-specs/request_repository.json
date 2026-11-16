@@ -1,6 +1,6 @@
 {
   "name": "request_repository",
-  "description": "Ask the person whether another repository may join this workspace. Use it when the task needs a repository the person did not name: to read something from it, or to change it too. The person is asked a yes or no question that this tool writes, with your reason, and only a yes adds the repository: then call prepare_workspace with it. A no is final for this task: do not ask again for the same repository and do not look for another way to change it.",
+  "description": "Ask the person whether another repository may join this workspace. Use it when the task needs a repository the person did not name: to read something from it, or to change it too. The person is asked a yes or no question that this tool writes, with your reason, and only a yes adds the repository: then call prepare_workspace with it. A no is final for this task: do not ask again for the same repository and do not look for another way to change it. To read a repository that a repository you prepared lists as a reference (its result says so), pass that reference's name as `reference` and its address as `repo_url`: a yes lets you read it with the file tools, passing the name as `repo`, and never lets you change it.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,6 +11,10 @@
       "reason": {
         "type": "string",
         "description": "Why the task needs this repository, in one plain sentence (at most 300 characters). The person reads it."
+      },
+      "reference": {
+        "type": "string",
+        "description": "The name of a reference a prepared repository listed, to read it and never change it. Leave out to ask to add the repository to work on."
       }
     },
     "required": [

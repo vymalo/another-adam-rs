@@ -1158,7 +1158,9 @@ mod tests {
             "its own directory in the mirror stays writable"
         );
         assert!(
-            after.unwrap().contains(&format!("ro {}", design.path().display())),
+            after
+                .unwrap()
+                .contains(&format!("ro {}", design.path().display())),
             "the annotation says so"
         );
     }

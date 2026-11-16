@@ -278,6 +278,7 @@ async fn only_the_optional_arguments_are_nullable() {
             "read_file.repo",
             "read_file.start_line",
             "rebuild_environment.use_default",
+            "request_repository.reference",
             "run.cwd",
             "run.repo",
             "run.timeout",

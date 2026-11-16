@@ -1141,7 +1141,9 @@ The tree of enums and the exit codes are in [Errors](reference/errors.md).
 ## Where a run's files and processes live
 
 The coder keeps a **workspace** per run: `<root>/workspaces/<run>/`, a directory of slots, each a
-repository's worktree or a scratch project. Its commands run through the `Environment` port: in the
+repository's worktree, a scratch project or a **reference** (a repository read beside the one the run works on and never
+written: a detached checkout that a run pod and a devcontainer mount read-only,
+[References](reference/workspace-and-environments.md#references)). Its commands run through the `Environment` port: in the
 coder's own container (`Local`), in the repository's devcontainer on a rootless Podman service
 (`DevContainer`), or in a Kubernetes pod of the run's own (`KubeEnvironment`).
 

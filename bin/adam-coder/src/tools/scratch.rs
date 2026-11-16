@@ -198,7 +198,9 @@ pub async fn publish_scratch(
         && super::references::is_reference_key(&env, &slots, &key)
         && !notes.named_repos.contains(&key)
     {
-        return Ok(ToolOutput::error(super::references::refusal_by_address(url)));
+        return Ok(ToolOutput::error(super::references::refusal_by_address(
+            url,
+        )));
     }
     let source = match pick_scratch(&slots, scratch.as_deref().and_then(non_empty)) {
         Ok(slot) => slot,

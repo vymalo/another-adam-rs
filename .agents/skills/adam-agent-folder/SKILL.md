@@ -53,6 +53,10 @@ before you rely on a detail here.
    `files: true` in a remote's file shares the file parts of its answer (a browser's screenshot) as files of the
    calling run; without it they are described and dropped. A subagent's files never reach the person.
    Optional `commands/<name>.md` are prompt templates the agent serves (`description`, `argument-hint`, a body with `$ARGUMENTS` and `$1` to `$9`; at most 50, `$$` is a literal `$`, never executed, any `!` right before a backtick is refused; a file is `*.md`, regular, at most 40 KiB): the card lists them (`commands/v1`) and a message `/name arguments` or its metadata invokes one; a subagent's `commands/` is ignored.
+   `references:` in the frontmatter of the root `instructions.md` (a list of `name`, `url`, optional `branch`, `description`;
+   at most 16; no credentials in the `url`) names repositories the **coder** may read beside the one it works on and never
+   write; a deployment adds more with `ADAM_REFERENCES_FILE` (a name both declare is exit 78) and `adam-agent` has no
+   workspace to read them in. A subagent's `references:` is ignored.
    Formats: `docs/reference/agent-files.md`; the short version is `docs/guides/write-an-agent.md`.
 4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog` and the plan,
    `plan_work`, `plan_check`, `plan_add` (`crates/adam-ui/README.md`; a checklist of at most 50 items kept in the

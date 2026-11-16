@@ -100,6 +100,34 @@ mod tests {
         assert_eq!(coded(e), 78);
     }
 
+    /// The deployment's references that clash with the agent's, or cannot be read, are a mistake of the
+    /// deployment's files: 78.
+    #[test]
+    fn references_that_clash_or_cannot_be_read_are_78() {
+        use crate::tools::{References, ReferencesError};
+        let def = |name: &str| adam::agent_fs::ReferenceDef {
+            name: name.into(),
+            url: format!("https://github.com/acme/{name}"),
+            branch: None,
+            description: "d".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("references.json");
+        std::fs::write(
+            &file,
+            r#"{"references": [{"name": "design", "url": "https://github.com/acme/other", "description": "d"}]}"#,
+        )
+        .unwrap();
+        let clash = References::load(&[def("design")], Some(&file)).unwrap_err();
+        assert!(matches!(clash, ReferencesError::Clash { .. }));
+        let chained = Err::<(), _>(clash)
+            .context("reading the references (ADAM_REFERENCES_FILE)")
+            .unwrap_err();
+        assert_eq!(exit_code(&chained), 78);
+        let missing = References::load(&[], Some(&dir.path().join("none.json"))).unwrap_err();
+        assert_eq!(coded(missing), 78);
+    }
+
     /// A mistake in the agent files, or the files and the code disagreeing, is the deployment's:
     /// 78, so a supervisor does not restart it. An assembly error keeps its own class otherwise.
     #[test]

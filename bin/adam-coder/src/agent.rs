@@ -1281,8 +1281,15 @@ impl Agent for CoderAgent {
                     },
                     None if notes.pull_request.is_some() => Transition::Done { state, output },
                     None => {
+                        // The slots the run works in: a reference is read, so a run that only read
+                        // one has no work to deliver, and a scratch project beside one is still the
+                        // only thing the run made.
                         let slots = match self.env.workspaces.run(&run) {
-                            Ok(workspace) => workspace.slots().await.unwrap_or_default(),
+                            Ok(workspace) => {
+                                let mut slots = workspace.slots().await.unwrap_or_default();
+                                slots.retain(adam_workspace::Slot::writable);
+                                slots
+                            }
                             Err(_) => Vec::new(),
                         };
                         let scratch_only =

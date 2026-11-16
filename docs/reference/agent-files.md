@@ -88,6 +88,8 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
+references:                    # root only: repositories the coder reads and never writes (below)
+  - { name: design-system, url: "https://github.com/acme/design-system", description: Tokens and components the UI follows. }
 card:                          # root only: becomes adam_a2a::AgentCardConfig
   name: adam-coder
   skills:
@@ -167,6 +169,26 @@ embedded up to 1 MiB per skill. What the model sees of a skill at run time is
 
 The repository's own `.agents/skills/` is a corpus of 75 vendored `SKILL.md` files. The parser must read
 all of them with no error; that is a conformance test.
+
+### References (`references:`)
+
+A reference is a repository the **coder** may read beside the one it works on and can never write to: a design system, an
+API's source, a sibling service. The key is a list in the frontmatter of the root `instructions.md`. It is root-agent
+only (on a subagent it is a warning and ignored), and an agent that does not run in a workspace, such as
+`adam-agent`, has nothing to read them with. How a reference is read, and who else declares one, is in
+[Workspace and environments](workspace-and-environments.md#references).
+
+| Key | |
+|---|---|
+| `name` | the name the model passes as `repo` to read it: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64 characters, not ending in `.git` |
+| `url` | `https://host/owner/repo`, at most 500 characters, no whitespace and **no credentials** (an error at load) |
+| `branch` | optional: the branch it is read at; absent, the repository's default branch |
+| `description` | required, one line of at most 200 characters: what it holds and when to read it. The model reads it |
+
+At most 16 references, a name once. A mistake is an error at load, which is exit 78 for a process that reads the folder.
+The deployment adds more with `ADAM_REFERENCES_FILE` ([Environment](environment.md)), and a repository declares its own in
+`.agents/references.json`, which the person must agree to. A folder without `references:` has the digest it had before
+references existed.
 
 ### Commands (`commands/<name>.md`)
 

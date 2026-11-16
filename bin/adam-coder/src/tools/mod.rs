@@ -4,7 +4,7 @@
 //! |---|---|
 //! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
 //! | `start_scratch { name? }`, `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | [`scratch`] |
-//! | `request_repository { repo_url, reason }` | [`consent`] |
+//! | `request_repository { repo_url, reason, reference? }` | [`consent`]; with `reference`, to read a repository a prepared repository declared, and never change it ([`references`]) |
 //! | `create_repository { owner, name, private?, description? }` | [`create`] |
 //! | `run_command { command, cwd?, repo?, timeout? }`: look around, changes undone | [`inspect`] |
 //! | `run { command, cwd?, repo?, timeout? }`: make something with a command, changes kept, never a check | [`make`] |
@@ -17,6 +17,8 @@
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
 //! | `merge_pull_request { repo, number, method?, delete_branch? }` (tier `auto`), `rename_repository { repo, new_name }` and `delete_repository { repo, confirm }` (tier `bypass`) | [`admin`] |
 //! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}`, `plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }` | [`adam_ui`]: the person's screen as tools, and the plan |
+//!
+//! A tool that takes `repo` acts in a slot of the run's workspace, and a slot may be a **reference**: read, never written ([`references`]). Every tool that only looks asks [`ToolEnv::slot_to_read`]; every tool that changes anything asks [`ToolEnv::slot_to_write`], which refuses a reference.
 //!
 //! # Retry safety
 //!
@@ -773,7 +775,11 @@ pub(crate) fn resolve_slot(
             .map(|slot| match (slot.worktree(), slot.reference()) {
                 (Some(wt), _) => format!("`{}` ({})", slot.dir(), wt.repo().url),
                 (None, Some(wt)) => {
-                    format!("`{}` (a reference, read only: {})", slot.dir(), wt.repo().url)
+                    format!(
+                        "`{}` (a reference, read only: {})",
+                        slot.dir(),
+                        wt.repo().url
+                    )
                 }
                 (None, None) => format!("`{}` (a scratch project)", slot.dir()),
             })

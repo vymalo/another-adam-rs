@@ -709,7 +709,10 @@ impl RunWorkspace {
                 (inner.reference_target(&self.run, name, seq), seq)
             }
         };
-        let wt = self.ws.prepare_at(&spelled, &self.run, None, &target).await?;
+        let wt = self
+            .ws
+            .prepare_at(&spelled, &self.run, None, &target)
+            .await?;
         Ok(Slot {
             dir: wt.dir().to_owned(),
             path: wt.path().to_path_buf(),

@@ -1674,6 +1674,39 @@ mod tests {
     }
 
     #[test]
+    fn the_references_file_is_read_by_the_workers_and_must_be_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("references.json");
+        std::fs::write(&file, r#"{"references": []}"#).unwrap();
+        let with = |value: &str| {
+            let get = |name: &str| match name {
+                "ADAM_REFERENCES_FILE" => Some(value.to_owned()),
+                other => full().get(other).map(|v| (*v).to_owned()),
+            };
+            Config::from_lookup(get)
+        };
+        assert_eq!(worker(&full()).references_file, None);
+        assert_eq!(
+            with(file.to_str().unwrap())
+                .unwrap()
+                .worker
+                .unwrap()
+                .references_file,
+            Some(file)
+        );
+        for bad in [dir.path().to_str().unwrap(), "/not/a/file.json"] {
+            let error = with(bad).unwrap_err();
+            assert!(
+                error
+                    .problems
+                    .iter()
+                    .any(|p| p.starts_with("ADAM_REFERENCES_FILE")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn the_mcp_flags_are_off_by_default_and_each_one_is_read() {
         let w = worker(&full());
         assert_eq!(w.mcp, McpSettings::default());

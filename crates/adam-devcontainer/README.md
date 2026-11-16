@@ -43,7 +43,7 @@ let environment = DevContainer::new(settings);
 
 ## Which file is used
 
-The **first slot** of the run, in the order the slots joined (a scratch project counts), decides **once**, for the
+The **first slot** of the run, in the order the slots joined (a scratch project counts, a reference never does: it is placed after the others), decides **once**, for the
 whole run. In it, in the containers.dev order: `.devcontainer/devcontainer.json`, then `.devcontainer.json`,
 then `.devcontainer/<folder>/devcontainer.json` (the first folder in sorted order; a step names the others). A
 slot with none gets `Settings::default_image`. Later repositories are mounted into the same container and their
@@ -61,7 +61,7 @@ the container that was made**, which has the last word: a refusal there removes 
 | Key | What happens |
 |---|---|
 | `workspaceFolder`, `workspaceMount` | set to the first slot's path and a bind of the run's whole workspace at the same path |
-| `mounts` | the repository's `volume` and `tmpfs` only (a volume name must be a name, `volume-opt` and `volume-driver` are refused, a target under `/opt/adam` or `/run/adam` is refused); a `bind` is **refused**. We append, all **read-only**: each repository slot's mirror, each slot's `.git`, the tools at `/opt/adam/bin`, the secrets at `/run/adam/secrets`; and the first slot read-write at the folder the repository says its workspace is (`/workspaces/<dir>`), for scripts that hardcode it |
+| `mounts` | the repository's `volume` and `tmpfs` only (a volume name must be a name, `volume-opt` and `volume-driver` are refused, a target under `/opt/adam` or `/run/adam` is refused); a `bind` is **refused**. We append, all **read-only**: each repository slot's mirror (and a reference's), each slot's `.git`, **each reference's directory** (a reference is read and never written, so it is a read-only mount on top of the run's directory), the tools at `/opt/adam/bin`, the secrets at `/run/adam/secrets`; and the first slot read-write at the folder the repository says its workspace is (`/workspaces/<dir>`), for scripts that hardcode it |
 | `runArgs` | allowed: `-e/--env`, `-l/--label` (not the `adam.vymalo.com/` prefix), `--hostname`, `--add-host`, `--shm-size`, `--ulimit`, `--init`, `--tmpfs`, `--memory*`, `--cpus`, `--pids-limit`; anything else is **refused**. We append `--network=host` (`Inherit`) or `--network=none` |
 | `initializeCommand` | **removed**: the specification runs it on the host side, which here is the coder, next to its credentials |
 | `dockerComposeFile` | **refused** |

@@ -171,8 +171,11 @@ pub fn read_references_leniently(text: &str) -> Result<ReferencesRead, String> {
             .and_then(|def| def.check().map(|()| def));
         match checked {
             Ok(def) if read.references.iter().any(|r| r.name == def.name) => {
-                read.skipped
-                    .push(format!("entry {}: `{}` is declared twice", at + 1, def.name));
+                read.skipped.push(format!(
+                    "entry {}: `{}` is declared twice",
+                    at + 1,
+                    def.name
+                ));
             }
             Ok(def) => read.references.push(def),
             Err(why) => read.skipped.push(format!("entry {}: {why}", at + 1)),
@@ -251,7 +254,16 @@ mod tests {
         }
         let long = "a".repeat(65);
         for bad in [
-            "", "Design", "-a", ".a", "a b", "a/b", "..", "x.git", "é", long.as_str(),
+            "",
+            "Design",
+            "-a",
+            ".a",
+            "a b",
+            "a/b",
+            "..",
+            "x.git",
+            "é",
+            long.as_str(),
         ] {
             assert!(!is_reference_name(bad), "{bad:?}");
         }
@@ -327,7 +339,12 @@ mod tests {
         let good = r#"{"references": [{"name": "a", "url": "https://github.com/x/a", "branch": "main", "description": "d"}]}"#;
         let defs = parse_references_file(good).unwrap();
         assert_eq!(defs[0].branch.as_deref(), Some("main"));
-        assert!(parse_references_file(r#"{"references": [{"name": "A", "url": "u", "description": "d"}]}"#).is_err());
+        assert!(
+            parse_references_file(
+                r#"{"references": [{"name": "A", "url": "u", "description": "d"}]}"#
+            )
+            .is_err()
+        );
         assert!(parse_references_file(r#"{"references": [{"name": "a"}]}"#).is_err());
         assert_eq!(parse_references_file(r#"{"references": []}"#).unwrap(), []);
     }

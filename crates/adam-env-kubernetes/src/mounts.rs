@@ -661,10 +661,7 @@ mod tests {
             read_only,
             ..dirs(mirror, "r1+design")
         };
-        let mounts = plan_with(
-            &[slot("app", Some("1a-0")), reference(true)],
-            &[dirs(true)],
-        );
+        let mounts = plan_with(&[slot("app", Some("1a-0")), reference(true)], &[dirs(true)]);
         let ls = lines(&mounts);
         // The reference and its directory in the mirror are read-only, and the repository's slot is not.
         assert!(
@@ -680,7 +677,8 @@ mod tests {
             "{ls:?}"
         );
         assert!(
-            ls.iter().all(|l| !l.starts_with("rw /work/workspaces/r1/design")),
+            ls.iter()
+                .all(|l| !l.starts_with("rw /work/workspaces/r1/design")),
             "{ls:?}"
         );
         // A pod made when the slot was writable is made again: the line differs.

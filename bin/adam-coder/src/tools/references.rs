@@ -43,7 +43,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use adam::agent_fs::{
-    ReferenceDef, ReferencesRead, check_references, parse_references_file, read_references_leniently,
+    ReferenceDef, ReferencesRead, check_references, parse_references_file,
+    read_references_leniently,
 };
 use adam::prelude::*;
 use adam_error::{Classify, ErrorClass};
@@ -285,9 +286,18 @@ pub enum SlotUse {
 /// What the coder's tool `name` does with slots, or `None` for a tool nobody classified.
 pub fn slot_use(name: &str) -> Option<SlotUse> {
     Some(match name {
-        "prepare_workspace" | "start_scratch" | "request_repository" | "create_repository"
-        | "rebuild_environment" | "read_output" | "ask_user" | "show" | "ui_catalog"
-        | "plan_work" | "plan_check" | "plan_add" => SlotUse::NoSlot,
+        "prepare_workspace"
+        | "start_scratch"
+        | "request_repository"
+        | "create_repository"
+        | "rebuild_environment"
+        | "read_output"
+        | "ask_user"
+        | "show"
+        | "ui_catalog"
+        | "plan_work"
+        | "plan_check"
+        | "plan_add" => SlotUse::NoSlot,
         "read_file" | "list_files" | "find_files" | "search_files" | "share_file"
         | "run_command" => SlotUse::Reads,
         "write_file" | "edit_file" | "apply_patch" | "run" | "run_checks" | "commit_and_push"
@@ -386,12 +396,7 @@ pub(super) async fn at_prepare(
     }
     let root = Arc::clone(slot.root());
     let read = tokio::task::spawn_blocking(move || {
-        read_inside(
-            &root,
-            Path::new(REPOSITORY_FILE),
-            None,
-            MAX_REPOSITORY_FILE,
-        )
+        read_inside(&root, Path::new(REPOSITORY_FILE), None, MAX_REPOSITORY_FILE)
     })
     .await
     .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
@@ -562,8 +567,7 @@ pub(super) async fn ask_to_read(
         )));
     };
     // The model gives the address, the declaration has it: they must be one repository.
-    let (Some(key), Some(declared_key)) =
-        (key_of_argument(url), key_of_argument(&declared.url))
+    let (Some(key), Some(declared_key)) = (key_of_argument(url), key_of_argument(&declared.url))
     else {
         return Ok(ToolOutput::error(
             "repo_url must be a repository address (https://<host>/<owner>/<repo>)",
@@ -586,9 +590,9 @@ pub(super) async fn ask_to_read(
         .check_repository(&RepoRef::new(declared.url.as_str(), "main"))
     {
         return Ok(ToolOutput::error(match e {
-            WorkspaceError::Invalid(why) => format!(
-                "{display} cannot be read here: {why}. Do not ask the person about it."
-            ),
+            WorkspaceError::Invalid(why) => {
+                format!("{display} cannot be read here: {why}. Do not ask the person about it.")
+            }
             other => other.to_string(),
         }));
     }
@@ -609,12 +613,12 @@ pub(super) async fn ask_to_read(
     let origin = paging::escape_name(slot.as_bytes());
     let lead = format!(
         "May I read the repository {display} ({}) as a reference, which the repository {origin} lists in {REPOSITORY_FILE}?",
-        declared.url
+        listing_text(&paging::escape_name(declared.url.as_bytes()))
     );
     let why = format!(
         "Read only: nothing in it is ever changed. The repository {origin} says: \"{}\". The agent says why: \"{}\"",
-        quoted_reason(&declared.description),
-        quoted_reason(reason)
+        listing_text(&quoted_reason(&declared.description)),
+        listing_text(&quoted_reason(reason))
     );
     ask(
         env,
@@ -662,10 +666,7 @@ pub(super) async fn check_out(
         let shown = shorten(&paging::escape_name(name.as_bytes()), 80);
         let key = key_of_argument(&declared.url);
         let agreed = key.as_deref().is_some_and(|key| {
-            notes.agreed(
-                super::consent::REQUEST_REPOSITORY,
-                &reference_subject(key),
-            )
+            notes.agreed(super::consent::REQUEST_REPOSITORY, &reference_subject(key))
         });
         if !agreed {
             let origin = paging::escape_name(slot.as_bytes());
@@ -697,13 +698,12 @@ pub(super) async fn check_out(
         None => match env.workspaces.default_branch(&def.url).await {
             Ok(base) => base,
             Err(e) => {
-                return Err(match default_branch_refusal(
-                    &e,
-                    "Ask the person which branch of it to read.",
-                ) {
-                    Some(said) => Ok(ToolOutput::error(said)),
-                    None => Err(env.delivery_error(ctx, &e).await),
-                });
+                return Err(
+                    match default_branch_refusal(&e, "Ask the person which branch of it to read.") {
+                        Some(said) => Ok(ToolOutput::error(said)),
+                        None => unreadable(&def.name, &e),
+                    },
+                );
             }
         },
     };
@@ -717,15 +717,22 @@ pub(super) async fn check_out(
             let _ = env.seal(ctx, &workspace).await;
             Ok(Some(slot))
         }
-        Err(
-            e @ (WorkspaceError::Invalid(_)
-            | WorkspaceError::NotFound(_)
-            | WorkspaceError::Conflict(_)),
-        ) => Err(Ok(ToolOutput::error(format!(
-            "The reference `{shown}` cannot be checked out: {e}"
-        )))),
-        Err(e) => Err(Err(env.delivery_error(ctx, &e).await)),
+        Err(e) => Err(unreadable(&def.name, &e)),
     }
+}
+
+/// What a reference that cannot be fetched tells the model. **Never a blocker of the run**: unlike a
+/// repository the run works on, a reference that cannot be read (credentials that do not reach it, a
+/// host that is down) does not make the run undeliverable, so `ToolEnv::delivery_error`, which notes
+/// a blocker, is not used. A failure worth trying again is the tool's transient error.
+fn unreadable(name: &str, e: &WorkspaceError) -> Outcome {
+    if e.class().is_retryable() {
+        return Err(workspace_error(e));
+    }
+    let shown = shorten(&paging::escape_name(name.as_bytes()), 80);
+    Ok(ToolOutput::error(format!(
+        "The reference `{shown}` cannot be read: {e}. Carry on without it, or tell the person what you could not read."
+    )))
 }
 
 #[cfg(test)]
@@ -753,7 +760,11 @@ mod tests {
         .unwrap();
         let both = References::load(&[def("design", "tokens")], Some(&file)).unwrap();
         let names: Vec<&str> = both.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, ["design", "api"], "the agent's, then the deployment's");
+        assert_eq!(
+            names,
+            ["design", "api"],
+            "the agent's, then the deployment's"
+        );
         // A name both declare is not replaced: the process does not start.
         let clash = References::load(&[def("api", "mine")], Some(&file)).unwrap_err();
         assert!(matches!(clash, ReferencesError::Clash { .. }), "{clash}");
@@ -778,11 +789,17 @@ mod tests {
         assert!(References::default().source().is_none());
         // A newline in a description is not a line of the prompt: it is refused.
         assert!(References::of(vec![def("design", "Tokens\nand components")]).is_err());
-        let refs = References::of(vec![def("design", "Tokens and components"), def("api", "The API")])
-            .unwrap();
+        let refs = References::of(vec![
+            def("design", "Tokens and components"),
+            def("api", "The API"),
+        ])
+        .unwrap();
         let text = refs.prompt().unwrap();
         assert!(text.starts_with("## References\n"), "{text}");
-        assert!(text.contains("\n- `design`: Tokens and components"), "{text}");
+        assert!(
+            text.contains("\n- `design`: Tokens and components"),
+            "{text}"
+        );
         assert!(text.contains("\n- `api`: The API"), "{text}");
         assert!(text.contains("never change them"), "{text}");
     }
@@ -803,11 +820,22 @@ mod tests {
         let text = render("app", &note);
         // Only the closing line of the frame starts with `[`, and the description is one line.
         let starts: Vec<&str> = text.lines().filter(|l| l.starts_with('[')).collect();
-        assert_eq!(starts, ["[end of references declared by slot app]"], "{text}");
-        assert!(text.contains("\n- design: https://github.com/acme/design, branch main ("), "{text}");
+        assert_eq!(
+            starts,
+            ["[end of references declared by slot app]"],
+            "{text}"
+        );
+        assert!(
+            text.contains("\n- design: https://github.com/acme/design, branch main ("),
+            "{text}"
+        );
         assert!(text.contains("Not listed: entry 2"), "{text}");
         assert!(text.contains("3 more were not looked at"), "{text}");
-        assert_eq!(text, render("app", &note), "a pure function: a retry gives the same bytes");
+        assert_eq!(
+            text,
+            render("app", &note),
+            "a pure function: a retry gives the same bytes"
+        );
     }
 
     #[test]

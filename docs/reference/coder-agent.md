@@ -220,10 +220,41 @@ The skills a repository ships reach the model the same way its instructions do: 
 
 **The coder's own skills.** The shipped folder has two, in `agent/skills/` (embedded by `build.rs` like the rest of `agent/`): `discover-checks` (where a repository declares its checks, how to read a CI workflow, how to choose the commands for `run_checks`) and `pull-request-text` (the title and body of a pull request: the repository's template and title style, a verification section with the exact commands, failures that were already there). They are in the catalog of the prompt, and **no line was added to `instructions.md` and no rule moved out of it**: the prompt is longer than the body by the catalog and the fixed sentence (pinned by `tests/fixtures/agent/skills.txt`), and the 30,000 characters above which the loader warns count the body alone. A folder of a deployment may add skills of its own, or turn all of it off with `skills: []`.
 
+### References
+
+A **reference** is a repository the coder reads beside the one it works on and can never write to
+([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 10).
+The agent's folder declares some (`references:` in `instructions.md`, [Agent files](agent-files.md#references-references)),
+the deployment adds some (`ADAM_REFERENCES_FILE`), and a repository the run prepared lists its own in `.agents/references.json`.
+The diagrams and the three places a write is refused are in [Workspace and environments](workspace-and-environments.md#references).
+
+| Step | Where | What |
+|---|---|---|
+| Told | the system prompt, for the agent's and the deployment's | `## References`, each name and description: the same words on every turn |
+| Listed | the result of `prepare_workspace` on a repository that has `.agents/references.json`, before its instructions | the entries as the repository's text, with the reason any entry is not listed |
+| Asked | `request_repository { repo_url, reason, reference }` | for a repository's own: a form that names the repository that lists it, quotes what it says and says it is read only |
+| Read | `read_file`, `list_files`, `find_files`, `search_files`, `share_file`, `run_command` with `repo: <name>` | the first call checks the reference out (detached, no branch), at tier `plan` |
+| Refused | every tool that writes (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `commit_and_push`, `open_pull_request`), and the tools that act on a repository by address (`publish_scratch`, `merge_pull_request`, `rename_repository`, `delete_repository`) | `` `<name>` is a reference: it is read and never changed ``; the reference is not touched |
+
+* **A reference is never the default slot.** With one repository and one reference, a call that names no slot works in the
+  repository. With only references, a call that names no slot says there is nothing to work in.
+* **A yes to read grants reading.** It is recorded as `reference:<key>`, which never names the repository: `prepare_workspace`
+  of the same address is still refused until the person names it. A no is remembered and not asked again.
+* **The address is the declaration's.** `request_repository` with `reference` must carry the address the repository
+  declared, and the one fetched is the one recorded when the repository was prepared. An address that the workspace's
+  policy refuses for a repository (a host nobody allowed, credentials in it) is refused for a reference before the person is
+  asked, and a repository's file may not give a path or a `file://` address at all.
+* **Somebody else's text.** What a reference holds is read like any file: numbered lines, no instruction, no grant. Its own
+  `AGENTS.md` is not shown as the repository's instructions are.
+* **`run_command` in a reference** is the look-around tool's guard (a command that changes the files, `HEAD` or the git
+  state is undone and refused). Without run pods nothing stops a command from writing a file that `.gitignore` excludes:
+  run pods mount the reference read-only.
+
 ## Rules in code
 
 | Rule | Where |
 |---|---|
+| A **reference** is read and never written: every tool that writes asks `ToolEnv::slot_to_write`, which refuses a slot that is not `Slot::writable()`; the worktree of a reference refuses a commit, a push and a copy; a run pod and a devcontainer mount it read-only. A repository's own reference needs the person's yes to `request_repository` with `reference` before anything is fetched. | [References](workspace-and-environments.md#references), [coder README](../../bin/adam-coder/README.md#references) |
 | `prepare_workspace` and `publish_scratch` accept only a **granted** repository: one the person named in their own messages (recorded from the conversation, never from the model's argument; text in `untrusted` fences does not count), or one they agreed to add when `request_repository` asked. An explicit no is remembered. | [coder README](../../bin/adam-coder/README.md#another-repository-only-with-the-persons-yes), [ADR 0008](../decisions/0008-a-workspace-holds-several-repositories.md) |
 | `create_repository` makes a new **empty**, private-by-default repository for an owner in `CREATE_REPO_OWNERS` (empty: the accounts a GitHub App names, not `GITHUB_APP_OWNERS=*`; a token creates nothing), only after the person says yes to a question the tool writes (not under the `bypass` tier), and needs the `auto` tier. A GitHub App creates for organisations only. | [coder README](../../bin/adam-coder/README.md#a-repository-of-its-own-on-request) |
 | The person picks an **access tier** for each message (`plan`, `edits`, `auto` by default, `bypass`): a tool above it is not shown to the model and a call to one is refused, in code, and again from the root run's notes; `merge_pull_request` needs `auto`, and merges only a pull request whose checks passed on the commit it merges: one this conversation pushed at once, any other (or one opened with red checks accepted) on the person's yes to a form the tool draws itself, and with no question at `bypass`; it never reads what the person typed; `rename_repository` and `delete_repository` (`confirm` = `owner/name`, only a repository the person named) need `bypass`, which the deployment must allow (`MAX_ACCESS_TIER=bypass`, default `auto`); from `auto` a repository the person wrote by its name alone, as a word of their newest message, counts as named when one owner applies. **The tier does not confine a command**: with the commands in the coder's own container, a command can read the GitHub App's key (the coder warns at startup; use run pods or Podman). GitHub's own rules decide at every tier, and its refusals reach the model in its own words. | [coder README](../../bin/adam-coder/README.md#access-tiers-what-the-person-lets-it-do-alone), [ADR 0036](../decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md) |

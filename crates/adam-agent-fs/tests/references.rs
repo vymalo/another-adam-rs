@@ -110,7 +110,11 @@ fn a_bad_reference_is_an_error_at_load() {
     // A name twice, and more than sixteen.
     let twice = "---\nname: root\nreferences:\n  - { name: a, url: 'https://x/a/b', description: d }\n  - { name: a, url: 'https://x/a/c', description: d }\n---\nHi.\n";
     let dir = write(&[("agent/instructions.md", twice)]);
-    assert!(errors(&load(dir.path())).iter().any(|m| m.contains("twice")));
+    assert!(
+        errors(&load(dir.path()))
+            .iter()
+            .any(|m| m.contains("twice"))
+    );
     let many: String = (0..17)
         .map(|n| format!("  - {{ name: r{n}, url: 'https://x/a/b', description: d }}\n"))
         .collect();
@@ -132,8 +136,11 @@ fn a_subagent_has_no_references_and_says_so() {
     ]);
     let report = load(dir.path());
     assert!(
-        report.diagnostics.iter().any(|d| d.severity == Severity::Warning
-            && d.message.contains("`references` is for the root agent")),
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Warning
+                && d.message.contains("`references` is for the root agent")),
         "{:#?}",
         report.diagnostics
     );

@@ -63,9 +63,10 @@ stateDiagram-v2
 
 A run's files are `<root>/workspaces/<run>/`, a directory of **slots**
 ([ADR 0008](../decisions/0008-a-workspace-holds-several-repositories.md)). A slot is a worktree of one
-repository on the run's branch `agent/<run-short-id>`, or a **scratch project**: a local git repository
-with an empty root commit, where work can start before anyone names a repository. A run has at most one
-slot per repository; slots keep the order they joined.
+repository on the run's branch `agent/<run-short-id>`, a **scratch project**: a local git repository
+with an empty root commit, where work can start before anyone names a repository, or a **reference**: a
+repository to read beside the one the run works on, checked out detached with no branch of its own and never
+written. A run has at most one slot per repository it works on; slots keep the order they joined.
 
 * The workspace lives as long as the run and is deleted when it ends (the janitor), **except its scratch projects**:
   a scratch project lives for the conversation. The next task of the same A2A context takes it over (its first step
@@ -88,8 +89,87 @@ stateDiagram-v2
     Scratch --> Scratch: the run ends, the conversation is alive, the next task takes it over
     Scratch --> Removed: remove, nothing was published, or the conversation was idle for SCRATCH_IDLE_DAYS
     RepoBacked --> Removed: remove, pushed branches remain
+    Empty --> Reading: add_reference (first read of a reference)
+    Scratch --> Scratch: add_reference (a read-only slot beside it)
+    RepoBacked --> RepoBacked: add_reference (a read-only slot beside it)
+    Reading --> RepoBacked: add_repository
+    Reading --> Scratch: add_scratch
+    Reading --> Removed: remove
     Removed --> [*]
 ```
+
+`Reading` is a workspace that holds references and nothing to work in: a read tool works in a reference, and a tool
+that writes says there is nothing to write to.
+
+### References
+
+A reference is a repository the coder **reads** beside the one it works on (a design system, an API's source, a sibling
+service) and can never write to
+([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
+decision 10). It is a read-only slot: `Slot::writable()` is false, the checkout is detached at `origin/<branch>` with no
+branch of its own, and nothing is pushed from it.
+
+| Declared in | Consent | Notes |
+|---|---|---|
+| the agent's folder: `references:` in the frontmatter of `instructions.md` ([Agent files](agent-files.md#references-references)) | none | the agent's files are the deployment's |
+| the deployment: the file `ADAM_REFERENCES_FILE` names ([Environment](environment.md)) | none | added to the agent's; a name both declare is exit 78 |
+| a repository the run works on: its `.agents/references.json` | **the person's yes** to `request_repository` with `reference` | listed in the result of `prepare_workspace` as the repository's text; nothing is fetched before the yes |
+
+```mermaid
+sequenceDiagram
+    participant M as model
+    participant T as coder tools
+    participant P as person
+    participant W as workspace (the coder's git)
+    M->>T: read_file { repo: "design" } (declared by the agent or the deployment)
+    T->>W: add_reference (fetch the mirror, detached checkout)
+    W-->>T: a read-only slot
+    T-->>M: the file
+    M->>T: prepare_workspace (a repository that lists .agents/references.json)
+    T-->>M: the repository's text: the references it lists, granting nothing
+    M->>T: request_repository { repo_url, reason, reference }
+    T->>P: a form: which repository lists it, what it says, read only
+    P-->>T: yes
+    M->>T: read_file { repo: "lib" }
+    T->>W: add_reference (the recorded address)
+    T-->>M: the file
+    M->>T: write_file { repo: "lib" }
+    T-->>M: refused: a reference is read and never changed
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Declared: the agent or the deployment names it, or a prepared repository lists it
+    Declared --> Declared: a repository's reference waits for the person's yes
+    Declared --> Refused: the person says no, or the address is one a repository may not give
+    Declared --> Checked_out: a read tool names it (after the yes, for a repository's)
+    Checked_out --> Checked_out: read, list, find, search, run_command that only looks
+    Checked_out --> Removed: the run's workspace is removed
+    Refused --> [*]
+    Removed --> [*]
+```
+
+* **Reading.** `read_file`, `list_files`, `find_files`, `search_files` and `share_file` take the reference's name as
+  `repo`; the first read checks it out, under the lowest access tier (`plan`), through the coder's own git (its
+  sandbox, when there is one) and never in a run pod. A run with one repository and one reference still defaults to the
+  repository for a write and for a read that names no slot.
+* **What the model is told.** The names and descriptions of the references the process knows at start are part of the
+  system prompt, the same words on every turn and before anything that changes with a message, so the stable prefix
+  holds. A repository's own references reach the model only in the result of the `prepare_workspace` that found them.
+* **Writing is refused at three places.** The tools: every tool that acts in a slot asks one function,
+  `ToolEnv::slot_to_write`, which refuses a slot that is not writable; a test calls each tool that writes with a
+  reference. Git: the worktree refuses a commit, a push, a publication, a base checkout and a copy into it, and a
+  reference has no branch and no credential to push with. The mount: a run pod gets the reference and its directory in
+  the mirror **read-only**, and so does a devcontainer.
+* **With no run pods only the first two hold.** A `run_command` in a reference runs in the coder's own container (or the
+  devcontainer): its guard undoes and refuses what changed a tracked or untracked file, `HEAD` or the git state, and
+  **cannot see a file that `.gitignore` excludes**, nor a write outside the slot. `run` and `run_checks` are refused in a
+  reference. Use run pods when a reference must be unchangeable by a command.
+* **What a reference holds is somebody else's text.** Reading grants no repository, tier or consent, and its own
+  `AGENTS.md` is not shown as the repository's instructions are. A repository's declaration is its text too: it is
+  listed under a header that says so, its address is checked like a repository's (allowed hosts, the owners a GitHub App
+  acts for, no credentials) and must be http(s), never a path or a `file://` address, and the address fetched is the one
+  recorded when the repository was prepared, never one the model gives.
 
 The janitor (`bin/adam-coder/src/janitor.rs`, a worker component) sweeps at startup and every
 `WORKSPACE_SWEEP_SECS` (default 300; `0` is off): it removes the workspace of a run that is `done`,
@@ -164,7 +244,9 @@ A build is bounded by the pod's memory (2Gi in the chart), and the coder shrinks
 that holds the image, resources, priority class, security context and volumes; the code adds a name, labels and
 annotations, and narrows the template's one mount of the workspace volume to the run: its own directory, and for
 each worktree its mirror read-only and the worktree's own directory in it (with `HEAD`, `commondir`, `gitdir` and `logs` read-only on
-top), each at the same path as in the coder, so a pod sees no other run ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md)). A repository added to a
+top), each at the same path as in the coder, so a pod sees no other run ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md)).
+A reference is mounted **read-only** (`ro <path>` in the pod's mounts annotation), and so is its directory in the
+mirror, whole: a write from the pod is `EROFS`. A repository added to a
 run later, or a slot made again under the same name, makes the pod again, when no command runs in it. A command is
 `adam-kube-exec`, which runs `adam-exec` in the pod over `pods/exec`. No GitHub credential ever enters a
 pod. The chart's `runPods` block renders what surrounds it

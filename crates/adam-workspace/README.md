@@ -20,7 +20,7 @@ authentication behave like the real tool.
 | Item | What |
 |---|---|
 | `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, **`check_repository(&RepoRef)`** (whether the policy accepts a repository: nothing is spawned, requested or written), **`acts_for()`** (the accounts the credentials are confined to, `None` for a token), **`run(run)`** (a run's workspace, below), **`runs()`** (the runs that have one on disk), **`remote_is_empty(url)`**, **`initialize_empty(&RepoRef, &GitIdentity)`**, **`wait_reachable(url, Duration)`**, `default_branch(url)`, `remove(run)` (everything of the run's workspace, the legacy worktree included), and the single-repository helpers `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `open_existing(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`); a remote whose `HEAD` names none is `NoDefaultBranch` (class `NotFound`: a caller that solves it by naming a branch matches this variant and no other). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
-| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, **`add_scratch_for(dir, &GitIdentity, Option<&str>)`** (for a conversation), **`adopt_scratch(conversation)`**, `remove()`, **`remove_keeping_scratch()`**; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()` and **`generation()`** (a token that is new each time the coder makes the slot's directory, or moves a scratch project into a run's workspace: a run pod mounts a directory and not its name, so a pod made for a slot removed and added again under the same name is told from the one made for what is there now; `None` for a slot made before it was recorded); a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)`, `files()`, `status()`, `published_to()`, `set_published_to(url)`, **`generation()`** and **`conversation()`** **`root()`** on a `Slot`, a `Worktree` and a `Scratch`: the slot's directory as the coder opened it, `&Arc<SlotDir>` ([below](#a-slots-directory-is-held-not-named)); `path()` stays what it was, the name. `copy_into` and `Scratch::files()` work relative to those directories |
+| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, **`add_scratch_for(dir, &GitIdentity, Option<&str>)`** (for a conversation), **`adopt_scratch(conversation)`**, **`add_reference(&RepoRef, name)`** (a read-only slot, [below](#references-a-slot-that-is-read-and-never-written)), `remove()`, **`remove_keeping_scratch()`**; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)`, `SlotKind::Scratch(Scratch)` or `SlotKind::Reference(Worktree)`), `worktree()` (a repository's only), `scratch()`, **`reference()`**, **`checkout()`** (a repository's or a reference's worktree, for reading), **`writable()`** (the one gate: false for a reference) and **`generation()`** (a token that is new each time the coder makes the slot's directory, or moves a scratch project into a run's workspace: a run pod mounts a directory and not its name, so a pod made for a slot removed and added again under the same name is told from the one made for what is there now; `None` for a slot made before it was recorded); a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)`, `files()`, `status()`, `published_to()`, `set_published_to(url)`, **`generation()`** and **`conversation()`** **`root()`** on a `Slot`, a `Worktree` and a `Scratch`: the slot's directory as the coder opened it, `&Arc<SlotDir>` ([below](#a-slots-directory-is-held-not-named)); `path()` stays what it was, the name. `copy_into` and `Scratch::files()` work relative to those directories |
 | `copy_into(&Scratch, &Worktree, path, overwrite)`, `CopyReport`, `Collision` | the files of a scratch project into a worktree, all or nothing: `copied`, `unchanged`, `collisions` |
 | `Environment` (trait), `DynEnvironment`, `Local` | where a run's processes run: `ensure(&RunWorkspace, &dyn EnvProgress)` gives the run's `EnvSession` (made on first need, then the same), `release(run)` (idempotent), `held_runs()`, `rebuild(run, use_default)` (throw the run's environment away and make it again on the next `ensure`; `false` where there is nothing of its own to make again) and **`seal(&RunWorkspace)`** (a new **provided** method, default a no-op, so no implementation breaks: the caller calls it right after it adds a slot, because its file and git tools never call `ensure`; an environment that shows the run its slots as places the run cannot rename throws away what lacks the new slot when nothing runs in it, and answers `EnvError::Unavailable` while a command does; it never makes anything). `Local` is the caller's own container and holds nothing |
 | `HidingEnvironment` | `HidingEnvironment::new(inner, names)`: an `Environment` that adds `names` to the `hide` list of **every** `ExecSpec` its sessions prepare, so a process that holds secrets keeps them from the code it runs for others (the coder passes the variables its `mcp.json` files read as `${VAR}`) without every caller having to remember them; everything else (`describe`, `kill`, `sandbox_shape`, `release`, `held_runs`, `rebuild`, `seal`) is the inner environment's. `hidden()` lists the names |
@@ -355,9 +355,9 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
 
 ```text
 <root>/git/<host>/<owner>/<name>.git    mirrors, shared by every run (unchanged)
-<root>/workspaces/<run>/<dir>/          a slot: a worktree on agent/<run-short-id>, or a scratch project
+<root>/workspaces/<run>/<dir>/          a slot: a worktree on agent/<run-short-id>, a scratch project, or a reference
 <root>/workspaces/<run>.lock            the run's lock, beside its directory
-<root>/meta/<run>/<dir>.json            the slot's metadata, version 2: dir, seq, kind ("repo" | "scratch"),
+<root>/meta/<run>/<dir>.json            the slot's metadata, version 2: dir, seq, kind ("repo" | "scratch" | "reference"),
                                         for a repository url, base_branch, branch, remote_branch and admin (the
                                         worktree's directory in the mirror's worktrees/), for a scratch project
                                         published_to and conversation (no secrets)
@@ -437,10 +437,37 @@ stateDiagram-v2
   Empty --> RepoBacked: add_repository
   Scratch --> RepoBacked: add_repository, copy_into
   RepoBacked --> RepoBacked: add_repository (another repository, a new slot)
+  Empty --> Reading: add_reference
+  Scratch --> Scratch: add_reference
+  RepoBacked --> RepoBacked: add_reference
+  Reading --> RepoBacked: add_repository
+  Reading --> Scratch: add_scratch
+  Reading --> Removed: remove
   Scratch --> Removed: remove, nothing was published
   RepoBacked --> Removed: remove, pushed branches remain
   Removed --> [*]
 ```
+
+### References: a slot that is read and never written
+
+`add_reference(&RepoRef, name)` adds the repository as a **reference** ([ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
+decision 10): `git worktree add --detach` of `origin/<base_branch>` in the slot called `name` (the scratch rule:
+`^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`), with metadata of kind `"reference"` and an empty `branch`. The mirror is
+fetched like any repository's, under the same policy (allowed hosts, local paths only when allowed) and the same credentials
+for the fetch; nothing is made in the mirror but the checkout's directory under `worktrees/`.
+
+* **Read, never written.** `Slot::writable()` is false, and it is the one gate: a new `SlotKind` has no default there. The
+  `Worktree` of a reference refuses `commit_all`, `push`, `publish` and `add_base_checkout` (`WorkspaceError::Invalid`,
+  "is a reference"), and `copy_into` refuses it as a destination. `Worktree::is_reference()` says it. A reference has no branch
+  to push and nothing in it is the run's.
+* **Idempotent.** Asking again for the same name and repository returns the slot as it is (it is **not** moved to a newer
+  commit); a slot whose directory was lost is made again. A repository the run works on is a `Conflict` (read it in its own
+  slot), so is a name another slot has, and `slot_for` never finds a reference (a reference is found by its name). A
+  repository added later whose own name a reference has gets another directory name.
+* **`Slot::worktree()` is a repository's only**, so the code that commits and pushes never meets a reference there; reading
+  code (`checkout()`, `root()`, `git_pin()`) takes both.
+* **Mounts.** `adam-env-kubernetes` mounts the slot and its directory in the mirror read-only, and `adam-devcontainer`
+  binds the slot read-only on top of the run's directory ([the environments](#where-a-runs-processes-run-the-environment-port)).
 
 ## GitHub App credentials
 
@@ -710,6 +737,9 @@ The only environment variable the crate reads is the one you name in
 
 Offline. The `git` CLI must be on `PATH`.
 
+* `tests/workspace.rs` also holds the references: detached with no branch of its own and no branch made in the mirror, idempotent
+  and not moved, kept across a restart, refused for a commit, a push, a publication, a base checkout and a copy into it (the
+  remote's refs and the files are as they were), their conflicts and bad names, and removal with the workspace.
 * `tests/workspace.rs`: worktrees against local bare repositories (including the configuration planted in the
   mirror: fifteen kinds of key, `insteadOf`, an include, a credential helper, a request header, a changed
   `remote.origin.url`, a second remote, a proxy and an fsmonitor among them, each of which makes the fetch of a later run,
