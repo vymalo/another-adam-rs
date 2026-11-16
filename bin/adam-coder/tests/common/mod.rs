@@ -839,6 +839,30 @@ impl Fixture {
         self
     }
 
+    /// The same fixture that also reaches http repositories on `127.0.0.1` (a git server of the test),
+    /// with the token valid there as for `github.com`.
+    #[must_use]
+    pub fn reaching_local_http(mut self) -> Self {
+        let creds: DynGitCredentials =
+            Arc::new(ScopedToken::new("github.com", GITHUB_TOKEN).and_host("127.0.0.1"));
+        let workspaces = Workspaces::new(self.root.clone(), creds)
+            .allow_hosts(["github.com", "127.0.0.1"])
+            .allow_local(true);
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .workspaces = workspaces;
+        self
+    }
+
+    /// The same fixture whose agent and deployment declare `references` (read and never written).
+    #[must_use]
+    pub fn referencing(mut self, references: Vec<adam::agent_fs::ReferenceDef>) -> Self {
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .references = adam_coder::tools::References::of(references).expect("valid references");
+        self
+    }
+
     /// The same fixture whose deployment caps the access tiers at `max` (`MAX_ACCESS_TIER`).
     #[must_use]
     pub fn capped_at(self, max: adam_a2a::AccessTier) -> Self {

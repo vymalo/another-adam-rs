@@ -143,12 +143,13 @@ async fn target(
             "{repo:?} is not a repository address"
         )));
     };
-    // A reference is read and never changed: not merged into, renamed, deleted or published to.
+    // A reference is read and never changed: not merged into, renamed or deleted. A repository the
+    // person named is theirs to change, whatever else reads it.
     let slots = match env.workspaces.run(&ctx.root_run_id().to_string()) {
         Ok(workspace) => workspace.slots().await.unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    if references::is_reference_key(env, &slots, &key) {
+    if references::is_reference_key(env, &slots, &key) && !notes.named_repos.contains(&key) {
         return Err(ToolOutput::error(references::refusal_by_address(&address)));
     }
     if let Err(e) = env.workspaces.check_repository(&at) {

@@ -193,6 +193,13 @@ pub async fn publish_scratch(
 
     let workspace = env.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
     let slots = workspace.slots().await.map_err(|e| workspace_error(&e))?;
+    // A reference is read and never published to, unless the person named the repository too.
+    if let Some(key) = key_of_argument(url)
+        && super::references::is_reference_key(&env, &slots, &key)
+        && !notes.named_repos.contains(&key)
+    {
+        return Ok(ToolOutput::error(super::references::refusal_by_address(url)));
+    }
     let source = match pick_scratch(&slots, scratch.as_deref().and_then(non_empty)) {
         Ok(slot) => slot,
         Err(why) => return Ok(ToolOutput::error(why)),
