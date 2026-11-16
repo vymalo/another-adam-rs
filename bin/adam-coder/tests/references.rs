@@ -1389,6 +1389,34 @@ async fn a_reference_and_the_working_copy_of_one_repository_are_reached_by_their
     );
 }
 
+/// A reference whose name is the directory the working copy of its own repository gets: the name is
+/// the working copy's then, and reads it, as the reference's repository is read in its own slot.
+#[tokio::test]
+async fn a_name_that_is_the_working_copys_own_directory_reads_the_working_copy() {
+    let fx = Fixture::new().await;
+    let remote = fx.remote_url();
+    let fx = fx.referencing(vec![def("remote", &remote, "The repository, read")]);
+    let rig = Rig::new(fx, AccessTier::Auto).await;
+    rig.named(&remote).await;
+    let prepared = rig
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )
+        .await;
+    assert!(!prepared.is_error, "{}", prepared.content);
+    rig.call(
+        "write_file",
+        json!({"path": "mine.txt", "content": "mine\n", "repo": "remote"}),
+    )
+    .await;
+    let read = rig
+        .call("read_file", json!({"path": "mine.txt", "repo": "remote"}))
+        .await;
+    assert!(!read.is_error, "{}", read.content);
+    assert!(read.content.contains("mine"), "{}", read.content);
+}
+
 /// What the person named is theirs to change, whatever else reads it: the reference's guard stands
 /// aside for a repository they named.
 #[tokio::test]
