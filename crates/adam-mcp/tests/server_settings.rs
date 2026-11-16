@@ -501,9 +501,13 @@ async fn a_server_that_hangs_on_prompts_list_is_connected_with_its_tools_and_no_
     let server = TestHttpServer::start_scripted(None, script).await;
     let config = common::http_config("docs", &server.url(), r#""connectTimeoutSecs": 1"#);
     let started = Instant::now();
-    let servers = McpServers::connect(&config, &Env::new(), &McpPolicy::default())
-        .await
-        .unwrap();
+    let servers = tokio::time::timeout(
+        Duration::from_secs(8),
+        McpServers::connect(&config, &Env::new(), &McpPolicy::default()),
+    )
+    .await
+    .expect("the listing of prompts is inside the connect deadline")
+    .unwrap();
     let took = started.elapsed();
     assert!(took < Duration::from_secs(4), "{took:?}");
     assert!(
@@ -631,8 +635,12 @@ async fn a_prompt_that_never_answers_is_unavailable_after_the_call_timeout_not_t
         .await
         .unwrap();
     let started = Instant::now();
-    let error = servers.prompt_commands()[0].expand(&[]).await.unwrap_err();
+    let command = &servers.prompt_commands()[0];
+    let waited = tokio::time::timeout(Duration::from_secs(8), command.expand(&[])).await;
     let took = started.elapsed();
+    let error = waited
+        .expect("the expansion is bounded by the call timeout, not left waiting")
+        .unwrap_err();
     assert!(matches!(error, PromptError::Unavailable(_)), "{error}");
     assert!(
         took >= Duration::from_millis(900) && took < Duration::from_secs(4),
@@ -678,9 +686,12 @@ async fn a_redial_that_hangs_is_inside_the_expansions_bound() {
         }
     });
     let started = Instant::now();
-    let error = plain.expand(&[]).await.unwrap_err();
+    let waited = tokio::time::timeout(Duration::from_secs(8), plain.expand(&[])).await;
     let took = started.elapsed();
     hold.abort();
+    let error = waited
+        .expect("the redial is inside the expansion's bound")
+        .unwrap_err();
     assert!(matches!(error, PromptError::Unavailable(_)), "{error}");
     assert!(took < Duration::from_secs(4), "{took:?}");
 }
