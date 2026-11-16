@@ -14,17 +14,17 @@
 //! **What the model is told.** The static ones are known when the process starts, so their names
 //! and descriptions are a fixed part of the system prompt ([`ReferencesSource`]), after the folder's
 //! own text and before anything that changes with a message. A repository's own are not static:
-//! they arrive in the result of the `prepare_workspace` that found them ([`at_prepare`]) and in
+//! they arrive in the result of the `prepare_workspace` that found them (`at_prepare`) and in
 //! nothing else, so the system prompt and the tool list never depend on what a repository holds.
 //!
 //! **Reading.** A read tool (`read_file`, `list_files`, `find_files`, `search_files`, `share_file`,
 //! `run_command`) given `repo: <name>` finds the reference's slot, and the first time makes it
-//! ([`check_out`]): the mirror is fetched and the checkout made by the coder's own git (its sandbox,
+//! (`check_out`): the mirror is fetched and the checkout made by the coder's own git (its sandbox,
 //! when the deployment has one), never in a run pod. Reading is tier `plan`. A run with one repository
 //! and one reference still defaults to the repository for a write and for a read that names no slot.
 //!
 //! **Writing is refused at three places.** The tools: every tool that acts in a slot asks
-//! [`ToolEnv::slot_to_write`](super::ToolEnv::slot_to_write), which refuses a slot that is not
+//! `ToolEnv::slot_to_write`, which refuses a slot that is not
 //! [`writable`](Slot::writable); [`slot_use`] says which tools write, and a test calls each with a
 //! reference. Git: the checkout has no branch and the worktree refuses a commit, a push, a
 //! publication and a copy into it. The mount: a run pod gets the slot and its git directory

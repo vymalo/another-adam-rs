@@ -18,7 +18,7 @@
 //! | `merge_pull_request { repo, number, method?, delete_branch? }` (tier `auto`), `rename_repository { repo, new_name }` and `delete_repository { repo, confirm }` (tier `bypass`) | [`admin`] |
 //! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}`, `plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }` | [`adam_ui`]: the person's screen as tools, and the plan |
 //!
-//! A tool that takes `repo` acts in a slot of the run's workspace, and a slot may be a **reference**: read, never written ([`references`]). Every tool that only looks asks [`ToolEnv::slot_to_read`]; every tool that changes anything asks [`ToolEnv::slot_to_write`], which refuses a reference.
+//! A tool that takes `repo` acts in a slot of the run's workspace, and a slot may be a **reference**: read, never written ([`references`]). Every tool that only looks asks `ToolEnv::slot_to_read`; every tool that changes anything asks `ToolEnv::slot_to_write`, which refuses a reference.
 //!
 //! # Retry safety
 //!
