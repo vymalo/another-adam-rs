@@ -872,6 +872,42 @@ async fn the_words_of_a_screen_are_bounded_like_its_surface() {
     }
 }
 
+/// A screen whose catalog is `base` with `change` applied to its document, digest and all.
+fn screen_with(base: &Screen, change: impl FnOnce(&mut Value)) -> Screen {
+    let mut document = base.document.clone();
+    change(&mut document);
+    Screen {
+        claimed: Claimed {
+            digest: catalog_digest(&document).unwrap(),
+            ..base.claimed.clone()
+        },
+        document,
+    }
+}
+
+#[tokio::test]
+async fn a_screen_whose_component_is_stricter_than_the_table_refuses_the_block_naming_it() {
+    // The table is the catalog of version 8; a screen's own schema still has the last word.
+    let strict = screen_with(&v8(), |document| {
+        document["components"]["Code"]["properties"]["code"]["maxLength"] = json!(100);
+    });
+    let out = refused(
+        Some(&strict),
+        one_block(json!({"component": "Code", "code": "x".repeat(101)})),
+    )
+    .await;
+    assert!(
+        out.contains("block 1 of `show` of question `a` (Code): "),
+        "{out}"
+    );
+    // Within its limit the block is drawn.
+    form(
+        &strict,
+        one_block(json!({"component": "Code", "code": "x".repeat(100)})),
+    )
+    .await;
+}
+
 // ---- a question's blocks are never detached from it ----
 
 fn two_confirms() -> Value {
@@ -977,20 +1013,13 @@ async fn the_number_of_a_block_is_said_wherever_it_lands() {
 #[tokio::test]
 async fn a_screen_with_no_column_gets_everything_it_shows_in_words() {
     for (screen, what) in [(v8(), "version 8"), (v7(), "version 7")] {
-        let mut document = screen.document.clone();
-        document["components"]
-            .as_object_mut()
-            .unwrap()
-            .remove("Column")
-            .unwrap();
-        let digest = catalog_digest(&document).unwrap();
-        let screen = Screen {
-            claimed: Claimed {
-                digest,
-                ..screen.claimed
-            },
-            document,
-        };
+        let screen = screen_with(&screen, |document| {
+            document["components"]
+                .as_object_mut()
+                .unwrap()
+                .remove("Column")
+                .unwrap();
+        });
         let (lead, ui) = form(&screen, consent()).await;
         assert!(lead.contains(DIFF.trim_end()), "{what}: {lead}");
         assert!(
