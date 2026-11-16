@@ -16,10 +16,18 @@
 //! checkboxes, at most 8 options, the description folded into the question's text) and, when a
 //! question needs more than that (a typed answer), as text.
 
+mod answer;
+mod kinds;
+mod reask;
+#[cfg(test)]
+mod vectors;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use adam_llm_agent::{StepIcon, StepStyle, Tool, ToolCtx, ToolError, ToolOutput, parse_args};
+use adam_llm_agent::{
+    AnswerCheck, StepIcon, StepStyle, Tool, ToolCtx, ToolError, ToolOutput, parse_args,
+};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -63,7 +71,7 @@ pub const DEFAULT_ASK_LEAD: &str = "Ask the person you are talking to a question
 
 /// What the description of `ask_user` says after the lead, about `choices`: the constraints the
 /// tool enforces, so that the first call is right.
-const CHOICES_GUIDE: &str = "`question` is always required, with or without `choices`: it is the sentence the person reads first. Whenever the answer is one of a few options, pass `choices` and never write the options as a list in your text: the person gets one form with a list of options per question and answers them together; their answers come back as the result, so \"yes\" is never ambiguous. Give the form a short `title` and a `description` of why you ask (a sentence or two of plain text). Each entry of `choices` needs its own `question`; give every option a short `label` and a `description` that says what it means or what it costs, and mark the one you recommend with `recommended: true`. A question's `type` is `single` (radio buttons, the default; 2 to 12 options), `multiple` (checkboxes; 2 to 12; `min` and `max` say how many), `select` (a searchable list; 2 to 50 options), `images` (a deck of pictures; 2 to 16 options, each with `image` {sha256, alt}: the sha256 of an image file you shared in this conversation, never a URL) or `text` / `longText` (the person types the answer; no options). `help` is a line under the question, `default` is what is chosen at first, `allowOther` offers an \"Other\" the person can write, `freeInput` adds an \"anything else\" box. With a single possible answer, or none that you know, do not use `choices`: ask a plain question. There are at most 8 questions. An `id` or option `value` is 1 to 64 characters of letters, digits and `- _ . :`. Example: {\"question\": \"A few things I need before I start.\", \"title\": \"Before I start\", \"description\": \"The migration depends on the database, so I need to know which one.\", \"choices\": [{\"id\": \"db\", \"question\": \"Which database?\", \"options\": [{\"label\": \"Postgres\", \"description\": \"Relational, the default\", \"recommended\": true}, {\"label\": \"MongoDB\", \"description\": \"Documents, no schema\"}]}]} Without `choices` the question is plain text.";
+const CHOICES_GUIDE: &str = "`question` is always required, with or without `choices`: it is the sentence the person reads first. Whenever the answer is one of a few options, pass `choices` and never write the options as a list in your text: the person gets one form with a list of options per question and answers them together; their answers come back as the result, so \"yes\" is never ambiguous. Give the form a short `title` and a `description` of why you ask (a sentence or two of plain text). Each entry of `choices` needs its own `question`; give every option a short `label` and a `description` that says what it means or what it costs, and mark the one you recommend with `recommended: true`. A question's `type` is `single` (radio buttons, the default; 2 to 12 options), `multiple` (checkboxes; 2 to 12; `min` and `max` say how many), `select` (a searchable list; 2 to 50 options), `images` (a deck of pictures; 2 to 16 options, each with `image` {sha256, alt}: the sha256 of an image file you shared in this conversation, never a URL) or `text` / `longText` (the person types the answer; no options). Five kinds fit what a list cannot: `confirm` (a yes or no, `yesLabel` and `noLabel` name the two buttons, `default` \"yes\" or \"no\" is the safe answer; use it for consent before something that cannot be undone), `number` (a decimal, `minValue`, `maxValue`, `step`, `unit`), `scale` (a rating of whole numbers from `from`, 0 or 1, to `to`, 2 to 10, with `fromLabel` and `toLabel` for the two ends), `date` (a day, YYYY-MM-DD, `minDate`, `maxDate`) and `rank` (the person puts 2 to 12 options in order, the best first). A number, a bound and a default are decimals, like 12.5; a screen that lacks a kind gets the nearest form. Your form is checked against the answer: one that breaks a rule (a number out of range, a day outside its bounds, a rank that is not every option once) goes back to the person to fix, and you only ever read an answer that fits. `help` is a line under the question, `default` is what is chosen at first, `allowOther` offers an \"Other\" the person can write, `freeInput` adds an \"anything else\" box. With a single possible answer, or none that you know, do not use `choices`: ask a plain question. There are at most 8 questions. An `id` or option `value` is 1 to 64 characters of letters, digits and `- _ . :`. Example: {\"question\": \"A few things I need before I start.\", \"title\": \"Before I start\", \"description\": \"The migration depends on the database, so I need to know which one.\", \"choices\": [{\"id\": \"db\", \"question\": \"Which database?\", \"options\": [{\"label\": \"Postgres\", \"description\": \"Relational, the default\", \"recommended\": true}, {\"label\": \"MongoDB\", \"description\": \"Documents, no schema\"}]}]} Without `choices` the question is plain text.";
 
 /// The pattern of a question id and of an option value: the `Choices` component's own.
 const ID_PATTERN: &str = "^[A-Za-z0-9_.:-]{1,64}$";
@@ -109,6 +117,11 @@ enum Kind {
     Images,
     Text,
     LongText,
+    Confirm,
+    Number,
+    Scale,
+    Date,
+    Rank,
 }
 
 impl Kind {
@@ -120,6 +133,11 @@ impl Kind {
             Self::Images => "images",
             Self::Text => "text",
             Self::LongText => "longText",
+            Self::Confirm => "confirm",
+            Self::Number => "number",
+            Self::Scale => "scale",
+            Self::Date => "date",
+            Self::Rank => "rank",
         }
     }
 
@@ -134,6 +152,8 @@ impl Kind {
 enum DefaultArg {
     One(String),
     Many(Vec<String>),
+    /// A number where a decimal or a whole number is the answer.
+    Number(serde_json::Number),
 }
 
 /// One question.
@@ -153,6 +173,27 @@ struct ChoiceArg {
     default: Option<DefaultArg>,
     min: Option<u32>,
     max: Option<u32>,
+    // The members of the five kinds of catalog version 7.
+    #[serde(rename = "yesLabel")]
+    yes_label: Option<String>,
+    #[serde(rename = "noLabel")]
+    no_label: Option<String>,
+    #[serde(rename = "minValue")]
+    min_value: Option<kinds::Scalar>,
+    #[serde(rename = "maxValue")]
+    max_value: Option<kinds::Scalar>,
+    step: Option<kinds::Scalar>,
+    unit: Option<String>,
+    from: Option<kinds::Scalar>,
+    to: Option<kinds::Scalar>,
+    #[serde(rename = "fromLabel")]
+    from_label: Option<String>,
+    #[serde(rename = "toLabel")]
+    to_label: Option<String>,
+    #[serde(rename = "minDate")]
+    min_date: Option<String>,
+    #[serde(rename = "maxDate")]
+    max_date: Option<String>,
 }
 
 /// An option: a label (its value is made from it) or an object.
@@ -211,6 +252,8 @@ pub(crate) struct Question {
     default_text: Option<String>,
     min: Option<u32>,
     max: Option<u32>,
+    /// The members of the five kinds of catalog version 7, checked.
+    ext: kinds::Ext,
 }
 
 impl Question {
@@ -228,7 +271,14 @@ impl Question {
         match self.kind() {
             Kind::Multiple => true,
             Kind::Select | Kind::Images => self.multiple == Some(true),
-            Kind::Single | Kind::Text | Kind::LongText => false,
+            Kind::Single
+            | Kind::Text
+            | Kind::LongText
+            | Kind::Confirm
+            | Kind::Number
+            | Kind::Scale
+            | Kind::Date
+            | Kind::Rank => false,
         }
     }
 }
@@ -360,6 +410,7 @@ fn resolve_defaults(
     let named = match default {
         DefaultArg::One(one) => vec![one],
         DefaultArg::Many(many) => many,
+        DefaultArg::Number(number) => vec![number.to_string()],
     };
     named
         .into_iter()
@@ -401,6 +452,20 @@ fn normalize_question(
     }
     let declared = choice.kind;
     let multiple = choice.multiple;
+    let raw = kinds::ExtRaw {
+        yes_label: choice.yes_label,
+        no_label: choice.no_label,
+        min_value: choice.min_value,
+        max_value: choice.max_value,
+        step: choice.step,
+        unit: choice.unit,
+        from: choice.from,
+        to: choice.to,
+        from_label: choice.from_label,
+        to_label: choice.to_label,
+        min_date: choice.min_date,
+        max_date: choice.max_date,
+    };
     if declared == Some(Kind::Single) && multiple == Some(true) {
         return Err(format!(
             "question `{id}` is type \"single\" but has `multiple: true`"
@@ -425,9 +490,14 @@ fn normalize_question(
         default_text: None,
         min: choice.min,
         max: choice.max,
+        ext: kinds::Ext::default(),
     };
     let id = out.id.clone();
     let kind = out.kind();
+    if kind.is_extended() {
+        return kinds::finish(out, raw, choice.default, multiple);
+    }
+    raw.reject_foreign(&id, kind)?;
     if kind.is_typed() {
         let limit = if kind == Kind::Text {
             MAX_TEXT
@@ -453,7 +523,7 @@ fn normalize_question(
         if let Some(default) = choice.default {
             let DefaultArg::One(text) = default else {
                 return Err(format!(
-                    "the default of question `{id}` is words, not a list"
+                    "the default of question `{id}` is words, not a list or a number"
                 ));
             };
             let text = text.trim().to_owned();
@@ -652,6 +722,7 @@ fn choices_instance(form: &Form) -> Value {
             if let Some(kind) = q.declared {
                 question.insert("type".into(), json!(kind.as_str()));
             }
+            kinds::native_members(q, &mut question);
             if !options.is_empty() {
                 question.insert("options".into(), Value::Array(options));
             }
@@ -731,10 +802,9 @@ fn clipped(text: &str, max: usize) -> String {
 /// its label, a deck or a list is a list of radio buttons or checkboxes. The description goes in
 /// the question the person reads first (the caller's job).
 fn choices_instance_v4(form: &Form) -> Option<Value> {
-    let fits = form
-        .questions
-        .iter()
-        .all(|q| !q.kind().is_typed() && q.options.len() <= V4_MAX_OPTIONS);
+    let fits = form.questions.iter().all(|q| {
+        !q.kind().is_typed() && !q.kind().is_extended() && q.options.len() <= V4_MAX_OPTIONS
+    });
     if !fits {
         return None;
     }
@@ -820,15 +890,20 @@ fn as_text(question: &str, form: &Form) -> String {
         match q.kind() {
             Kind::Text => text.push_str(" (answer in a few words)"),
             Kind::LongText => text.push_str(" (answer in your own words)"),
+            kind if kind.is_extended() => {
+                text.push_str(&format!(" ({})", kinds::phrase(q)));
+            }
             _ if q.takes_several() => text.push_str(" (any number of these)"),
             _ => {}
         }
         for (m, option) in q.options.iter().enumerate() {
-            text.push_str(&format!(
-                "\n   {}) {}",
-                marker(m, q.options.len()),
-                option.label
-            ));
+            // A rank is answered with numbers, the other questions with letters.
+            let mark = if q.kind() == Kind::Rank {
+                (m + 1).to_string()
+            } else {
+                marker(m, q.options.len())
+            };
+            text.push_str(&format!("\n   {mark}) {}", option.label));
             if let Some(description) = &option.description {
                 text.push_str(&format!(" - {description}"));
             }
@@ -914,19 +989,31 @@ fn parameters() -> Value {
                         "id": {"type": "string", "pattern": ID_PATTERN, "description": "A short id for the question (1 to 64 letters, digits, - _ . :), used in the answer; defaults to q1, q2, ..."},
                         "question": {"type": "string", "minLength": 1, "description": "Required: the question"},
                         "help": {"type": "string", "description": "A line under the question: what the options mean, or what the answer is for"},
-                        "type": {"enum": ["single", "multiple", "select", "images", "text", "longText"], "description": "How it is answered: single (radio buttons, the default), multiple (checkboxes), select (a searchable list), images (a deck of pictures), text (a short typed answer), longText (a longer one)"},
+                        "type": {"enum": ["single", "multiple", "select", "images", "text", "longText", "confirm", "number", "scale", "date", "rank"], "description": "How it is answered: single (radio buttons, the default), multiple (checkboxes), select (a searchable list), images (a deck of pictures), text (a short typed answer), longText (a longer one), confirm (yes or no), number (a decimal), scale (a rating between two ends), date (a day), rank (put the options in order)"},
                         "options": {
                             "type": "array",
                             "maxItems": MAX_SELECT_OPTIONS,
-                            "description": "The answers to pick from, each a label or {value, label, description, image, icon, recommended}: 2 to 12 for single and multiple, 2 to 50 for select, 2 to 16 for images (each with an image); none for text and longText",
+                            "description": "The answers to pick from, each a label or {value, label, description, image, icon, recommended}: 2 to 12 for single, multiple and rank, 2 to 50 for select, 2 to 16 for images (each with an image); none for the other types",
                             "items": option
                         },
                         "multiple": {"type": "boolean", "description": "Several options may be picked (the same as type \"multiple\"; with select and images it lets several be picked)"},
                         "allowOther": {"type": "boolean", "description": "Offer an \"Other\" the person can write"},
                         "required": {"type": "boolean", "description": "The person must answer this one (the default)"},
-                        "default": {"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "What is chosen at first: an option's value or label, or a list of them for several; the words a typed question starts with"},
+                        "default": {"anyOf": [{"type": "string"}, {"type": "number"}, {"type": "array", "items": {"type": "string"}}], "description": "What is chosen at first: an option's value or label, or a list of them for several; the words a typed question starts with; for confirm \"yes\" or \"no\" (the safe answer), for number a decimal, for scale a point, for date a day, for rank every option's value once, in the order the list starts in"},
                         "min": {"type": "integer", "minimum": 0, "description": "The fewest options to pick, when several may be picked"},
-                        "max": {"type": "integer", "minimum": 1, "description": "The most options to pick, when several may be picked"}
+                        "max": {"type": "integer", "minimum": 1, "description": "The most options to pick, when several may be picked"},
+                        "yesLabel": {"type": "string", "minLength": 1, "maxLength": 40, "description": "confirm only: the words of the yes button (\"Yes\" when absent)"},
+                        "noLabel": {"type": "string", "minLength": 1, "maxLength": 40, "description": "confirm only: the words of the no button (\"No\" when absent)"},
+                        "minValue": {"type": ["string", "number"], "description": "number only: the least, a decimal like 0 or \"2.5\""},
+                        "maxValue": {"type": ["string", "number"], "description": "number only: the most, a decimal"},
+                        "step": {"type": ["string", "number"], "description": "number only: the answer is the least (or 0) plus a whole number of these, above zero"},
+                        "unit": {"type": "string", "minLength": 1, "maxLength": 20, "description": "number only: what the number counts, shown beside the box (EUR, kg)"},
+                        "from": {"type": "integer", "minimum": 0, "maximum": 1, "description": "scale only: the first point, 0 or 1 (1 when absent)"},
+                        "to": {"type": "integer", "minimum": 2, "maximum": 10, "description": "scale only, required: the last point, 2 to 10, above `from`"},
+                        "fromLabel": {"type": "string", "minLength": 1, "maxLength": 60, "description": "scale only: the words at the first point (Not at all)"},
+                        "toLabel": {"type": "string", "minLength": 1, "maxLength": 60, "description": "scale only: the words at the last point (Certainly)"},
+                        "minDate": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", "description": "date only: the first day allowed, YYYY-MM-DD"},
+                        "maxDate": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", "description": "date only: the last day allowed, YYYY-MM-DD"}
                     },
                     "required": ["question"]
                 }
@@ -962,6 +1049,18 @@ impl Tool for AskUser {
         true
     }
 
+    /// The answer of a form is judged by the catalog's rules for the five kinds of version 7
+    /// before the model reads it: see [`reask`].
+    fn read_answer(
+        &self,
+        call_id: &str,
+        args: &Value,
+        ui: Option<&Value>,
+        payload: &Value,
+    ) -> AnswerCheck {
+        reask::read(call_id, args, ui, payload)
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = match parse_args(ASK_USER, args) {
             Ok(args) => args,
@@ -983,15 +1082,22 @@ impl Tool for AskUser {
         };
         match self.state.resolve(ctx.context_map()).await {
             Resolved::Found(catalog) if catalog.component("Choices").is_some() => {
+                // A kind the screen's `Choices` lacks is asked as the nearest older form, or as words.
+                let Some(drawn) = kinds::lowered(&form, kinds::Kinds::probe(&catalog)) else {
+                    tracing::debug!(
+                        "a kind the screen lacks does not fit its older form; the form goes in the text"
+                    );
+                    return Err(ToolError::needs_input(as_text(&question, &form)));
+                };
                 // The whole form for a screen that has it; else what that screen has, or words.
                 let (instance, lead) = if catalog.version() >= CATALOG_V5 {
-                    (choices_instance(&form), question)
-                } else if let Some(instance) = choices_instance_v4(&form) {
+                    (choices_instance(&drawn), question)
+                } else if let Some(instance) = choices_instance_v4(&drawn) {
                     tracing::debug!(
                         version = catalog.version(),
                         "the screen's Choices is older than version 5; the form is sent as that screen has it"
                     );
-                    (instance, lead_with_description(&question, &form))
+                    (instance, lead_with_description(&question, &drawn))
                 } else {
                     tracing::debug!(
                         version = catalog.version(),
@@ -1581,8 +1687,28 @@ mod tests {
         assert_eq!(entry["properties"]["id"]["pattern"], ID_PATTERN);
         assert_eq!(
             entry["properties"]["type"]["enum"],
-            json!(["single", "multiple", "select", "images", "text", "longText"])
+            json!([
+                "single", "multiple", "select", "images", "text", "longText", "confirm", "number",
+                "scale", "date", "rank"
+            ])
         );
+        // The schema is one value: the same on every call and for every screen.
+        for member in [
+            "yesLabel",
+            "noLabel",
+            "minValue",
+            "maxValue",
+            "step",
+            "unit",
+            "from",
+            "to",
+            "fromLabel",
+            "toLabel",
+            "minDate",
+            "maxDate",
+        ] {
+            assert!(entry["properties"][member].is_object(), "{member}");
+        }
         assert_eq!(spec.parameters["properties"]["choices"]["maxItems"], 8);
         let option = &entry["properties"]["options"];
         assert_eq!(option["maxItems"], 50);

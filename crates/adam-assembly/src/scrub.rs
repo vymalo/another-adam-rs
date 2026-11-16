@@ -151,6 +151,55 @@ mod tests {
         }
     }
 
+    /// A tool that refuses the answer "no", so that a wrapper that forgets to forward
+    /// `read_answer` is the one that accepts it.
+    struct Picky;
+
+    #[async_trait]
+    impl Tool for Picky {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "picky".into(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+        fn read_answer(
+            &self,
+            _call_id: &str,
+            _args: &Value,
+            _ui: Option<&Value>,
+            payload: &Value,
+        ) -> AnswerCheck {
+            if payload["text"] == "no" {
+                AnswerCheck::Refuse(adam_llm_agent::Refusal::new("again?", None, "no"))
+            } else {
+                AnswerCheck::Accept
+            }
+        }
+    }
+
+    #[test]
+    fn the_answer_to_a_question_is_read_by_the_tool_that_asked_through_the_scrub() {
+        let wrapped = Scrubbed::new(
+            Arc::new(Picky),
+            Arc::new(|text: &str| text.to_owned()),
+            None,
+        );
+        let no = json!({"text": "no"});
+        assert!(matches!(
+            wrapped.read_answer("c1", &json!({}), None, &no),
+            AnswerCheck::Refuse(_)
+        ));
+        assert_eq!(
+            wrapped.read_answer("c1", &json!({}), None, &json!({"text": "yes"})),
+            AnswerCheck::Accept
+        );
+    }
+
     fn scrubbed() -> Scrubbed {
         Scrubbed::new(
             Arc::new(Leaky),

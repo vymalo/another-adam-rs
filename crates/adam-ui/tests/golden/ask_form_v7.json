@@ -1,0 +1,71 @@
+{
+  "action": {
+    "event": {
+      "name": "answer"
+    }
+  },
+  "component": "Choices",
+  "description": "Five things I cannot decide for you.",
+  "id": "root",
+  "questions": [
+    {
+      "default": "no",
+      "help": "It cannot be restored.",
+      "id": "ship",
+      "noLabel": "Keep it",
+      "question": "Delete the old branch?",
+      "type": "confirm",
+      "yesLabel": "Delete it"
+    },
+    {
+      "default": "250",
+      "id": "budget",
+      "maxValue": "1000",
+      "minValue": "0",
+      "question": "What is the monthly budget?",
+      "step": "0.5",
+      "type": "number",
+      "unit": "EUR"
+    },
+    {
+      "from": 0,
+      "fromLabel": "Not at all",
+      "id": "nps",
+      "question": "How likely are you to recommend it?",
+      "required": false,
+      "to": 10,
+      "toLabel": "Certainly",
+      "type": "scale"
+    },
+    {
+      "id": "when",
+      "maxDate": "2026-12-31",
+      "minDate": "2026-12-01",
+      "question": "When should it ship?",
+      "type": "date"
+    },
+    {
+      "help": "The most important first.",
+      "id": "order",
+      "options": [
+        {
+          "icon": "execute",
+          "label": "Speed",
+          "value": "speed"
+        },
+        {
+          "label": "Cost",
+          "value": "cost"
+        },
+        {
+          "description": "What can go wrong",
+          "label": "Risk",
+          "value": "risk"
+        }
+      ],
+      "question": "Put these in order of importance",
+      "type": "rank"
+    }
+  ],
+  "title": "Before I ship"
+}

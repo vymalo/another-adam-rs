@@ -39,7 +39,7 @@
 use adam::prelude::*;
 use adam_a2a_runtime::{CONTEXT_CALLER, asked_by_an_agent, form_answer_surface};
 use adam_model::ToolCall;
-use adam_ui::{ASK_USER, ask_surface_id};
+use adam_ui::{ASK_USER, ask_surface_id, is_ask_surface_of};
 use adam_workspace::{RepoRef, WorkspaceError};
 use serde_json::{Value, json};
 
@@ -196,11 +196,19 @@ pub(crate) enum Surface {
 /// answer to this question, whatever its ids and values say.
 pub(crate) fn surface_of_answer(call: &ToolCall, text: &str) -> Surface {
     let own = ask_surface_id(&call.id);
+    // A form `ask_user` asked again after it refused an answer is the same question's.
+    let asked_again = call.name == ASK_USER;
     let mut found = false;
     for line in text.lines() {
         if let Some(surface) = form_answer_surface(line) {
             found = true;
-            if surface != Some(own.as_str()) {
+            let ours = match surface {
+                Some(surface) => {
+                    surface == own || (asked_again && is_ask_surface_of(&call.id, surface))
+                }
+                None => false,
+            };
+            if !ours {
                 return Surface::Stranger;
             }
         }
@@ -576,6 +584,37 @@ mod tests {
         // The call's id is made into an identifier the way the surface is: `ask_user` names it so.
         let odd = call_of("call 1/x", REQUEST_REPOSITORY);
         assert_eq!(surface_of_answer(&odd, &form("ask-call-1-x")), Surface::Own);
+    }
+
+    #[test]
+    fn a_form_ask_user_asked_again_is_the_same_calls_and_no_other_tools() {
+        let form = |surface: &str| {
+            format!("The person answered through the interface (form {surface}):\n- n: 5")
+        };
+        let ask = call_of("c1", adam_ui::ASK_USER);
+        for own in ["ask-c1", "ask-c1.r1", "ask-c1.r12"] {
+            assert_eq!(surface_of_answer(&ask, &form(own)), Surface::Own, "{own}");
+        }
+        for stranger in [
+            "ask-c2.r1",
+            "ask-c1.rx",
+            "ask-c1.r",
+            "ask-c.r1",
+            "ask-c1x.r1",
+        ] {
+            assert_eq!(
+                surface_of_answer(&ask, &form(stranger)),
+                Surface::Stranger,
+                "{stranger}"
+            );
+        }
+        // The tools that write their own questions never ask again: a click on such a form is not
+        // theirs.
+        let consent = call_of("c1", REQUEST_REPOSITORY);
+        assert_eq!(
+            surface_of_answer(&consent, &form("ask-c1.r1")),
+            Surface::Stranger
+        );
     }
 
     #[test]

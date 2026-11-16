@@ -91,7 +91,7 @@ use std::time::Duration;
 
 use adam::mcp::McpPolicy;
 use adam::prelude::*;
-use adam::{DynTool, StateKey, StepEvent, StepIcon, StepKind, StepState, StepStyle};
+use adam::{AnswerCheck, DynTool, StateKey, StepEvent, StepIcon, StepKind, StepState, StepStyle};
 use adam_a2a::AccessTier;
 use adam_error::{Classify, report};
 use adam_model::ToolSpec;

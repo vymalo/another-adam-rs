@@ -64,7 +64,9 @@ pub use catalog::{
 };
 pub use plan::{PLAN_ADD, PLAN_CHECK, PLAN_WORK, PlanAdd, PlanCheck, PlanWork};
 pub use show::{MAX_BLOCKS, SHOW, Show, UI_CATALOG, UiCatalogTool};
-pub use surface::{A2UI_VERSION, ask_surface_id};
+pub use surface::{
+    A2UI_VERSION, ask_attempt, ask_retry_surface_id, ask_surface_id, is_ask_surface_of,
+};
 pub use thread_tools::{
     Clock, GET_UI_CATALOG, META_KEY, TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools,
     ThreadToolsClient,
