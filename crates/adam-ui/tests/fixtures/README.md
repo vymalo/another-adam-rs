@@ -9,7 +9,7 @@ file, its lock and `UPSTREAM` together.
 
 `choices-v7-vectors.json` is **not a copy**: it holds the `json` blocks of `docs/api/ui-catalog-v1.md` (version 7) that a
 receiver of an answer is tested with, under the keys `vectors` (133 cases), `wholeAnswers`, `invalidQuestions`, `surfaces`,
-`questions` and `answers`. `UPSTREAM` says which commit of the page they were read at. `src/ask/vectors.rs` runs every case.
+`questions` and `answers`. `UPSTREAM` says which commit of the page they were read at, and `tools/check-vendored-catalogs.sh` reads the blocks from the page at that commit again and compares them with the file value by value (CI, job `docs`). `src/ask/vectors.rs` runs every case.
 
 `checklist-subset-v6.json` and `checklist-subset-v8.json` are **hand-written subsets** of the catalog's versions 6 and 8, for the
 plan's tests. Each holds `Text` and `Column` (copied from version 5) and a `Checklist` (`items` of `{label, state}`, `state` one

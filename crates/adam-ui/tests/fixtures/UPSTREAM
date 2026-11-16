@@ -15,5 +15,9 @@ catalog-v7.json  5ed8950f09383220cc1bca26c7798b0c7ea135c7  sha256:6df9a37d0ae6fa
 # `choices-v7-vectors.json` is not a copy. It holds the `json` blocks `vectors` (133 cases),
 # `whole-answers`, `invalid-questions`, `surfaces`, `questions` and `answers` of
 #   vymalo/another-agentic-system : docs/api/ui-catalog-v1.md
-# at 5ed8950f09383220cc1bca26c7798b0c7ea135c7, under the keys `vectors`, `wholeAnswers`,
-# `invalidQuestions`, `surfaces`, `questions` and `answers`, in that order.
+# at the commit below, under the keys `vectors`, `wholeAnswers`, `invalidQuestions`, `surfaces`,
+# `questions` and `answers`, in that order. `tools/check-vendored-catalogs.sh` reads the blocks from
+# the page at that commit again and compares them with the file, value by value.
+#
+# <file>  <commit>  <path of the page>
+choices-v7-vectors.json  5ed8950f09383220cc1bca26c7798b0c7ea135c7  docs/api/ui-catalog-v1.md
