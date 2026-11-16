@@ -652,7 +652,13 @@ mod tests {
         assert_eq!(ours.id, m.message_id);
         assert_eq!(ours.kind, "message");
         assert!(vymalo_inbound(&text_message("  ")).is_err());
-        assert!(vymalo_inbound(&Message::new(Role::User, vec![Part::raw(vec![1])])).is_err());
+        // A file that is not a picture is a line of the text, not an empty message: the agent says
+        // that only images are read.
+        let file = Message::new(Role::User, vec![Part::raw(vec![1])]);
+        assert_eq!(
+            vymalo_inbound(&file).unwrap().payload["text"],
+            "[attached: file (unknown type, 1 bytes); only images are read]"
+        );
     }
 
     #[test]
