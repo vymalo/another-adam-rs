@@ -1474,6 +1474,87 @@ mod tests {
         chunks
     }
 
+    /// Several secrets that overlap: one that is the start of a longer one, and two that share a
+    /// middle. Longer ones are replaced first, as a redactor does.
+    const NEEDLES: [&str; 4] = [
+        "sk-live-SECRET-0123456789-LONGER",
+        "sk-live-SECRET-0123456789",
+        "0123456789-LONGER-tail",
+        "tok_AbCdEf",
+    ];
+
+    fn multi_scrub(text: &str) -> String {
+        let mut text = text.to_owned();
+        for needle in NEEDLES {
+            text = text.replace(needle, "[redacted]");
+        }
+        text
+    }
+
+    /// How many bytes at the end of `text` are the start of any of the secrets (a secret that ends
+    /// `text` whole counts when a longer one starts with it).
+    fn multi_partial(text: &str) -> usize {
+        NEEDLES
+            .iter()
+            .filter_map(|needle| {
+                (1..needle.len())
+                    .rev()
+                    .find(|&n| text.as_bytes().ends_with(&needle.as_bytes()[..n]))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(96))]
+
+        /// Whatever the reads, with several secrets that overlap, what is written is the scrub of
+        /// the whole.
+        #[test]
+        fn stream_scrubber_with_overlapping_secrets_equals_whole_scrub(
+            pieces in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::strategy::Just(NEEDLES[0].to_owned()),
+                    proptest::strategy::Just(NEEDLES[1].to_owned()),
+                    proptest::strategy::Just(NEEDLES[2].to_owned()),
+                    proptest::strategy::Just(NEEDLES[3].to_owned()),
+                    proptest::strategy::Just(NEEDLES[0][..20].to_owned()),
+                    proptest::strategy::Just(NEEDLES[0][20..].to_owned()),
+                    proptest::strategy::Just(NEEDLES[2][..8].to_owned()),
+                    proptest::strategy::Just("\n".to_owned()),
+                    "[a-z é\\n]{0,30}",
+                ],
+                0..50,
+            ),
+            sizes in proptest::collection::vec(1usize..37, 1..8),
+            margin in 40usize..90,
+        ) {
+            let text: String = pieces.concat();
+            let mut scrubber = StreamScrubber::with_small_margin(margin);
+            let mut out = String::new();
+            for chunk in chunked(text.as_bytes(), &sizes) {
+                out.push_str(&scrubber.push(&chunk, &multi_scrub));
+                out.push_str(&scrubber.release(&multi_scrub, &multi_partial));
+            }
+            out.push_str(&scrubber.finish(&multi_scrub));
+            proptest::prop_assert_eq!(out, multi_scrub(&text));
+        }
+    }
+
+    /// A secret that is the start of a longer one is held back when it ends the text so far, so
+    /// that the longer one is replaced whole.
+    #[test]
+    fn a_secret_that_starts_a_longer_one_is_held_until_the_read_shows_which() {
+        let mut scrubber = StreamScrubber::with_small_margin(64);
+        let first = scrubber.push(NEEDLES[1].as_bytes(), &multi_scrub);
+        let released = scrubber.release(&multi_scrub, &multi_partial);
+        assert_eq!(format!("{first}{released}"), "", "held: it may go on");
+        let rest = scrubber.push(b"-LONGER", &multi_scrub);
+        let mut out = format!("{rest}{}", scrubber.release(&multi_scrub, &multi_partial));
+        out.push_str(&scrubber.finish(&multi_scrub));
+        assert_eq!(out, "[redacted]");
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
 

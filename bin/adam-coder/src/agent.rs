@@ -1263,6 +1263,9 @@ impl Agent for CoderAgent {
         let run = ctx.run_id().to_string();
         let redactor = &self.env.redactor;
         self.record_grants(ctx, &state, &run).await?;
+        // The commands are the root run's: a subagent's run shares them.
+        let root = state.root_run.unwrap_or_else(|| ctx.run_id());
+        let child = root != ctx.run_id();
         // Whatever leaves this step as a failure, a retry note or the final
         // answer may quote a check's output, a command's output or a provider's
         // error body, so it passes through the redactor.
@@ -1274,22 +1277,30 @@ impl Agent for CoderAgent {
         // (a cancel never calls this, and the sweep of `BACKGROUND_SWEEP_SECS` reaches those), and
         // when the run parks on the person, who may take a while: a server nobody can use is not
         // kept for days.
-        match &transition {
-            Transition::Done { .. } | Transition::Fail { .. } => {
-                self.env.commands.stop_run(&run, "the run ended").await;
-            }
+        // The end of a child run ends nothing; a park of any run of the tree on a question to the
+        // person stops the root's commands.
+        let stop = match &transition {
+            Transition::Done { .. } | Transition::Fail { .. } if !child => Some("the run ended"),
             Transition::Park { state, .. }
                 if matches!(
                     state.pending_wait,
                     Some(adam_llm_agent::PendingWait::Question(_))
                 ) =>
             {
-                self.env
-                    .commands
-                    .stop_run(&run, "the run waits for the person's answer")
-                    .await;
+                Some("the run waits for the person's answer")
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(why) = stop {
+            let root = root.to_string();
+            // At once on this worker, and a stop request in the record of what another worker holds:
+            // its sweep stops it.
+            self.env.commands.stop_run(&root, why).await;
+            let stale = crate::tools::background::stale_after(self.env.settings.background_sweep);
+            self.env
+                .commands
+                .stop_run_elsewhere(&self.env.kept, &root, why, stale)
+                .await;
         }
         match transition {
             Transition::Fail { state, error } => Ok(Transition::Fail {

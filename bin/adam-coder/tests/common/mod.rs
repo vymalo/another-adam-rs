@@ -1513,6 +1513,8 @@ pub struct FakeSession {
     /// What the session says its processes reserve (`EnvSession::sandbox_shape`); `None`: it is not
     /// metered.
     pub shape: Mutex<Option<SandboxShape>>,
+    /// `kill` never returns while this is set (an exec that does not answer).
+    pub kill_hangs: AtomicBool,
 }
 
 impl FakeSession {
@@ -1666,5 +1668,8 @@ impl EnvSession for FakeSession {
 
     async fn kill(&self, exec: &ExecId) {
         self.killed.lock().unwrap().push(exec.clone());
+        if self.kill_hangs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
     }
 }

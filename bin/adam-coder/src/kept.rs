@@ -56,6 +56,39 @@ use crate::redact::Redactor;
 /// The most bytes one run keeps on the volume.
 pub const RUN_KEPT_MAX: u64 = 64 * 1024 * 1024;
 
+/// A size for a message: whole MiB when there are some, else KiB, else bytes.
+pub fn size_text(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{} MiB", bytes / (1024 * 1024))
+    } else if bytes >= 1024 {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// The length of the part of `file` (of `size` bytes) that ends with a newline: what a reader of a
+/// file that is still being written may count and show, since the last block may be half there.
+fn complete_len(file: &std::fs::File, size: u64) -> io::Result<u64> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = file;
+    let mut end = size;
+    let mut buf = [0u8; 8192];
+    while end > 0 {
+        let start = end.saturating_sub(buf.len() as u64);
+        let n = usize::try_from(end - start).unwrap_or(buf.len());
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf[..n])?;
+        if let Some(at) = buf[..n].iter().rposition(|b| *b == b'\n') {
+            file.seek(SeekFrom::Start(0))?;
+            return Ok(start + at as u64 + 1);
+        }
+        end = start;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(0)
+}
+
 /// A leftover temporary file is removed when it is older than this.
 const STALE_TMP: Duration = Duration::from_secs(600);
 
@@ -70,6 +103,8 @@ pub struct FileKept {
     /// The outputs this process is writing now (`(run, id)`): a page of one ends with
     /// `[running: ...]` and not `[end: ...]`, because more lines are coming.
     live: Arc<Mutex<HashSet<(String, String)>>>,
+    /// The most bytes a run keeps ([`RUN_KEPT_MAX`] unless [`with_run_max`](Self::with_run_max)).
+    run_max: u64,
 }
 
 /// A run id that cannot leave the directory.
@@ -234,7 +269,21 @@ impl FileKept {
             root: workspace_root.to_path_buf(),
             redactor,
             live: Arc::default(),
+            run_max: RUN_KEPT_MAX,
         }
+    }
+
+    /// Keep at most `max` bytes per run, not [`RUN_KEPT_MAX`]: a deployment's choice, and how a test
+    /// reaches the bound with a little text.
+    #[must_use]
+    pub fn with_run_max(mut self, max: u64) -> Self {
+        self.run_max = max;
+        self
+    }
+
+    /// The most bytes one run keeps.
+    pub fn run_max(&self) -> u64 {
+        self.run_max
     }
 
     /// Whether this process is writing the output `id` of `run` now.
@@ -261,11 +310,11 @@ impl FileKept {
         let dir = self.dir_of(run, true)?;
         let name = format!("{id}.txt");
         let used = used_by_others(&dir, &name)?;
-        if used + room > RUN_KEPT_MAX {
+        if used + room > self.run_max {
             return Err(KeptError::Refused(format!(
-                "a run keeps at most {} MiB of output, and this run holds {} MiB already",
-                RUN_KEPT_MAX / (1024 * 1024),
-                used / (1024 * 1024)
+                "a run keeps at most {} of output, and this run holds {} already",
+                size_text(self.run_max),
+                size_text(used)
             )));
         }
         let name = std::ffi::OsString::from(name);
@@ -570,11 +619,11 @@ impl FileKept {
                 }
             }
         }
-        if used + prepared.len() as u64 > RUN_KEPT_MAX {
+        if used + prepared.len() as u64 > self.run_max {
             return Err(KeptError::Refused(format!(
-                "a run keeps at most {} MiB of output, and this run holds {} MiB already",
-                RUN_KEPT_MAX / (1024 * 1024),
-                used / (1024 * 1024)
+                "a run keeps at most {} of output, and this run holds {} already",
+                size_text(self.run_max),
+                size_text(used)
             )));
         }
         let tmp = format!(
@@ -641,7 +690,14 @@ impl FileKept {
             ));
         }
         let live = self.is_live(run, id);
-        match page_lines(BufReader::new(file), offset, limit, false) {
+        // A file that is still written may end in half a line: only whole lines are shown and counted.
+        let reader: Box<dyn io::Read> = if live {
+            let whole = complete_len(&file, meta.len()).map_err(|e| io_error(&e))?;
+            Box::new(io::Read::take(file, whole))
+        } else {
+            Box::new(file)
+        };
+        match page_lines(BufReader::new(reader), offset, limit, false) {
             Ok(page) if live => Ok(page.render_live()),
             Ok(page) => Ok(page.render()),
             // A command that is still running: the line after the last one is where the next page
@@ -712,6 +768,56 @@ mod tests {
         text: &str,
     ) -> Result<KeptInfo, KeptError> {
         store.keep(run, id, text, 0).await
+    }
+
+    /// A file that is still written may end in half a line: the page shows and counts whole lines,
+    /// and the half line appears when it is finished.
+    #[tokio::test]
+    async fn a_live_page_never_shows_or_counts_bytes_after_the_last_newline() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default());
+        let id = id("live");
+        let mut file = store.open_live(RUN, &id, 1024).unwrap();
+        file.write_all(b"one\ntwo\nthr").unwrap();
+        let page = store.page(RUN, &id, 1, 100).await.unwrap();
+        assert_eq!(
+            page,
+            "one\ntwo\n[running: 2 lines so far; next page: offset=3]"
+        );
+        // Nothing but half a line yet: nothing is there.
+        let mut second = store
+            .open_live(RUN, &adam_llm_agent::output_id(RUN, "b"), 1024)
+            .unwrap();
+        second.write_all(b"half").unwrap();
+        let none = store
+            .page(RUN, &adam_llm_agent::output_id(RUN, "b"), 1, 100)
+            .await;
+        assert!(none.as_ref().is_ok_and(|p| !p.contains("half")), "{none:?}");
+        file.write_all(b"ee\n").unwrap();
+        let page = store.page(RUN, &id, 1, 100).await.unwrap();
+        assert_eq!(
+            page,
+            "one\ntwo\nthree\n[running: 3 lines so far; next page: offset=4]"
+        );
+        store.end_live(RUN, &id);
+    }
+
+    #[tokio::test]
+    async fn a_run_keeps_at_most_what_it_is_given() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKept::new(root.path(), Redactor::default()).with_run_max(4096);
+        let one = id("one");
+        let refused = store.open_live(RUN, &one, 8192);
+        assert!(
+            matches!(&refused, Err(KeptError::Refused(why)) if why.contains("at most 4 KiB")),
+            "{refused:?}"
+        );
+        assert!(store.open_live(RUN, &one, 1024).is_ok());
+        let big = "x".repeat(5000);
+        let kept = store.keep(RUN, &id("two"), &big, 0).await;
+        assert!(matches!(kept, Err(KeptError::Refused(_))), "{kept:?}");
+        store.end_live(RUN, &one);
     }
 
     #[tokio::test]

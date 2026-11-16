@@ -91,13 +91,19 @@ pub async fn run(
 
     // What git is before the command: nothing it does may change that.
     let Some(before) = Snapshot::of_slot(&slot).await else {
-        return Ok(ToolOutput::error(
+        return Ok(ToolOutput::error(super::background::noted(
+            &env,
+            ctx,
+            &slot,
             "Cannot read the state of the worktree, so nothing was run (a command that might \
-             change git cannot be undone). Try again; if it persists, tell the person.",
-        ));
+             change git cannot be undone). Try again; if it persists, tell the person."
+                .to_owned(),
+        )));
     };
     if let Some(refusal) = before.refusal() {
-        return Ok(ToolOutput::error(refusal));
+        return Ok(ToolOutput::error(super::background::noted(
+            &env, ctx, &slot, refusal,
+        )));
     }
 
     let redactor = &env.redactor;
@@ -124,13 +130,23 @@ pub async fn run(
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("could not check git after: {shown}; undid it"))
             .await;
-        return Ok(ToolOutput::error(unverified(&shown, &outcome, restored)));
+        return Ok(ToolOutput::error(super::background::noted(
+            &env,
+            ctx,
+            &slot,
+            unverified(&shown, &outcome, restored),
+        )));
     };
     if !before.same_git_as(&after) {
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("undid a change to git made by: {shown}"))
             .await;
-        return Ok(ToolOutput::error(touched_git(&shown, &outcome, restored)));
+        return Ok(ToolOutput::error(super::background::noted(
+            &env,
+            ctx,
+            &slot,
+            touched_git(&shown, &outcome, restored),
+        )));
     }
 
     if let Some(missing) = missing_tool(&outcome, command) {

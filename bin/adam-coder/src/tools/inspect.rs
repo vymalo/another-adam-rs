@@ -25,8 +25,8 @@ use adam::prelude::*;
 
 use super::checks::missing_tool_answer;
 use super::gitcli::{
-    GitAt, RepoState, git_stdout, head_ref, head_sha, point_head, repo_state, restore_repo_state,
-    restore_worktree, status_text, working_tree_id,
+    GitAt, RepoState, git_stdout, head_ref, head_sha, point_head, repo_state,
+    restore_configuration_only, restore_repo_state, restore_worktree, status_text, working_tree_id,
 };
 use super::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
 use super::{Outcome, ToolEnv, non_empty, output, run_error};
@@ -75,13 +75,19 @@ pub async fn run_command(
 
     // What the worktree is before the command: nothing it does may change it.
     let Some(before) = Snapshot::of_slot(&slot).await else {
-        return Ok(ToolOutput::error(
+        return Ok(ToolOutput::error(super::background::noted(
+            &env,
+            ctx,
+            &slot,
             "Cannot read the state of the worktree, so nothing was run (a command that might \
-             change it cannot be undone). Try again; if it persists, tell the person.",
-        ));
+             change it cannot be undone). Try again; if it persists, tell the person."
+                .to_owned(),
+        )));
     };
     if let Some(refusal) = before.refusal() {
-        return Ok(ToolOutput::error(refusal));
+        return Ok(ToolOutput::error(super::background::noted(
+            &env, ctx, &slot, refusal,
+        )));
     }
 
     let redactor = &env.redactor;
@@ -106,13 +112,10 @@ pub async fn run_command(
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("undid a change made by: {shown}"))
             .await;
-        let mut said = changed_the_worktree(&shown, &outcome, restored);
-        said.push_str(&super::background::slot_note(
-            &env.commands,
-            &ctx.root_run_id().to_string(),
-            slot.dir(),
-        ));
-        return Ok(ToolOutput::error(said));
+        let said = changed_the_worktree(&shown, &outcome, restored);
+        return Ok(ToolOutput::error(super::background::noted(
+            &env, ctx, &slot, said,
+        )));
     }
 
     if let Some(missing) = missing_tool(&outcome, command) {
@@ -239,6 +242,38 @@ impl Snapshot {
             && self.head == other.head
             && self.branch == other.branch
             && self.repo == other.repo
+    }
+
+    /// Whether the repository's configuration and ignore rules are as `other` has them.
+    pub(super) fn same_configuration_as(&self, other: &Self) -> bool {
+        self.repo.configuration_is_as(&other.repo)
+    }
+
+    /// Whether everything [`same_git_as`](Self::same_git_as) compares is as `other` has it, except
+    /// the configuration: the git directory, the `.git` file, `HEAD`, the branch and the refs.
+    pub(super) fn same_git_apart_from_configuration_as(&self, other: &Self) -> bool {
+        self.git_dir == other.git_dir
+            && self.dot_git == other.dot_git
+            && self.head == other.head
+            && self.branch == other.branch
+            && self.repo.refs_are_as(&other.repo)
+    }
+
+    /// Put the configuration back as it was and leave `HEAD`, the refs and the files: a command that
+    /// kept running may have made commits the run's own tools made too. `true` when it is back.
+    pub(super) async fn restore_configuration(&self, slot: &adam_workspace::Slot) -> bool {
+        if self.head_is_foreign {
+            return false;
+        }
+        let at = GitAt::slot(slot);
+        let _lock = match slot.checkout() {
+            Some(wt) => match wt.lock_mirror().await {
+                Ok(lock) => Some(lock),
+                Err(_) => return false,
+            },
+            None => None,
+        };
+        restore_configuration_only(&at, &self.repo).await
     }
 
     /// Whether the files differ from `other`'s (a worktree whose tree id cannot be computed has

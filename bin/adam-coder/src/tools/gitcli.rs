@@ -404,6 +404,18 @@ pub(crate) struct RepoState {
     exclude: Option<String>,
 }
 
+impl RepoState {
+    /// Whether the configuration (and `info/exclude`, which hides files) is as `other` has it.
+    pub(crate) fn configuration_is_as(&self, other: &Self) -> bool {
+        self.config == other.config && self.exclude == other.exclude
+    }
+
+    /// Whether the refs are as `other` has them.
+    pub(crate) fn refs_are_as(&self, other: &Self) -> bool {
+        self.refs == other.refs
+    }
+}
+
 /// Whether a run other than this one changes `refname` as a matter of course.
 fn moved_by_others(refname: &str) -> bool {
     refname.starts_with("refs/heads/agent/")
@@ -531,6 +543,18 @@ pub(crate) async fn repo_state(at: &GitAt) -> Option<RepoState> {
         config,
         exclude,
     })
+}
+
+/// Put the configuration and `info/exclude` back as `before` had them, and leave the refs: a ref
+/// that moved may be the run's own commit. The caller holds the mirror lock. `true` when they are
+/// as they were.
+pub(crate) async fn restore_configuration_only(at: &GitAt, before: &RepoState) -> bool {
+    let Some(now) = repo_state(at).await else {
+        return false;
+    };
+    let mut keep = before.clone();
+    keep.refs = now.refs.clone();
+    restore_repo_state(at, &keep).await
 }
 
 /// Put the refs, the configuration and `info/exclude` that [`repo_state`] reads back as `before`

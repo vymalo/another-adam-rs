@@ -1,10 +1,11 @@
-//! Commands that keep running: `start_command`, `stop_command`, `list_commands` (ADR 0044 slice 16).
+//! Commands that keep running: `start_command`, `stop_command`, `list_commands` (ADR 0044).
 //!
 //! `run` and `run_command` wait for their command. A development server or a watcher does not end,
 //! and the model needs it while it works: a check against `localhost`, a test that talks to the
 //! server. `start_command` starts such a command, reads **its output as it arrives** into the same
 //! kept output `read_output` pages (the id is the call's output id), and returns after a short wait.
-//! `stop_command` stops it and `list_commands` says what runs. Nothing here outlives its run.
+//! `stop_command` stops it and `list_commands` says what runs. What a run starts ends with the run
+//! (a process that left its group with `setsid` is the exception).
 //!
 //! ```mermaid
 //! sequenceDiagram
@@ -37,24 +38,39 @@
 //!   for `stop_command` and `list_commands`.
 //! * **The record** is `<id>.cmd` beside it: JSON, private, with the command (scrubbed, 1 KiB), the
 //!   slot, the exec id, the **owner** (a token this process made at start), the pid with its start
-//!   time, and how it ended. A worker that starts, stops or lists reads the records of the run: a
-//!   command whose owner is another process is not running here, so its process is killed (by the
-//!   exec id, and by pid when the start time still matches) and the record says `gone`.
+//!   time, a **beat** (unix seconds), a stop another worker asked for, and how it ended.
+//!
+//! # Several workers
+//!
+//! A run moves between workers at every step, so a record this process does not hold is usually
+//! another worker's live command. The owner writes the beat at start and at every
+//! [`Commands::sweep`] (`BACKGROUND_SWEEP_SECS`). A record is **stale** when its beat is older than
+//! [`stale_after`] (the larger of three sweeps and 60 s; the clocks of the workers are assumed to
+//! agree within that).
+//!
+//! * A **fresh** record is somebody's live command. `list_commands` shows it, `read_output` reads
+//!   its file, `start_command` of another id leaves it alone, and a start step that runs again for
+//!   its id returns its view and starts nothing. `stop_command` writes `stop_requested` into the
+//!   record (and kills by exec id in the environment); the owner's next sweep stops it.
+//! * A **stale** record is a dead worker's: its process is killed (by the exec id, and by pid when
+//!   the start time still matches, and what is left of its group) and the record says `gone`.
+//! * The owner's sweep stops a command whose record holds a stop request or names another owner.
 //!
 //! # Replay
 //!
 //! A start step that runs again (its result was never journaled) finds its command: this process
-//! owns it and it is in the registry, so the call returns its view and starts nothing; otherwise
-//! the record of the earlier try is stale, its process is killed and the command starts again,
-//! with its output truncated. At most one process lives for an id.
+//! holds it, or its record is fresh, so the call returns its view and starts nothing; a stale
+//! record is an earlier try that died: its process is killed and the command starts again, with its
+//! output truncated. At most one process lives for an id.
 //!
 //! # When a command stops
 //!
 //! `stop_command`; its lifetime (`BACKGROUND_COMMAND_MAX_SECS`); the **root run is no longer open**
-//! (at once, in the agent's step, and by [`Commands::sweep`] every `BACKGROUND_SWEEP_SECS`, because a
-//! cancel never calls the agent); a **park on the person** (`ask_user`); the environment is made
-//! again; the janitor's release. A process group is killed, and what a pod or a devcontainer holds is
-//! stopped through [`EnvSession::kill`] by exec id.
+//! (at once on the worker that holds it, in the agent's step, and within one sweep elsewhere, which
+//! is also how a cancel is reached, since it never calls the agent); a **park on the person**
+//! (`ask_user`); the environment is made again; the janitor's release; the worker's own stop. A
+//! process group is killed, and what a pod or a devcontainer holds is stopped through
+//! [`EnvSession::kill`] by exec id.
 
 use std::fmt::Write as _;
 use std::hash::{BuildHasher as _, Hasher as _};
@@ -67,7 +83,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use adam::prelude::*;
 use adam_core::{DynStore, Store};
 use adam_llm_agent::{LineFolder, StreamScrubber, is_output_id, output_id_of};
-use adam_workspace::{EnvSession, ExecId, Slot};
+use adam_workspace::{EnvKind, EnvSession, ExecId, Slot};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::sync::Notify;
@@ -77,7 +93,7 @@ use super::inspect::Snapshot;
 use super::sandbox::Meter;
 use super::shell::{KeptNote, ShellOutcome, kill_group, resolve_cwd, shell_spec, spawn_prepared};
 use super::{Outcome, ToolEnv, cancelled, non_empty, output, run_error};
-use crate::kept::{FileKept, RUN_KEPT_MAX};
+use crate::kept::{FileKept, size_text};
 use crate::redact::Redactor;
 
 /// The tool that starts a command that keeps running.
@@ -103,7 +119,8 @@ const MAX_COMMAND_BYTES: usize = 1024;
 const MEMORY_KEPT: usize = 64 * 1024;
 /// A run must have this much room left of its 64 MiB to start a command.
 const MIN_ROOM: u64 = 1024 * 1024;
-/// How often the run's room is looked at while a command writes: every this many bytes.
+/// How often the run's room is looked at while a command writes: every this many bytes (less for
+/// a small budget).
 const ROOM_CHECK_EVERY: u64 = 1024 * 1024;
 /// How often a waiting call looks at the command.
 const POLL: Duration = Duration::from_millis(40);
@@ -113,6 +130,24 @@ const END_WAIT: Duration = Duration::from_secs(20);
 const KEEP_ENDED: usize = 16;
 /// How long the pipes are waited for after the process is gone.
 const PIPE_GRACE: Duration = Duration::from_secs(2);
+/// A record is stale when its owner has not written its beat for this many sweeps (see
+/// [`stale_after`]).
+const BEAT_STALE_SWEEPS: u64 = 3;
+/// A record is never judged stale before this many seconds without a beat: the clocks of two workers
+/// are assumed to agree within it.
+pub const BEAT_STALE_FLOOR_SECS: u64 = 60;
+/// What a command that is stopped because its worker stops says.
+const WORKER_STOPPED: &str = "the worker stopped; start it again if it is still needed";
+/// What a command in a pod or a devcontainer says when a signal ended it and nobody asked.
+const ENVIRONMENT_MADE_AGAIN: &str = "its environment was made again (a new repository, a reference or a rebuild) or \
+     something outside ended it; start it again if it is still needed";
+/// What a command says when its worker is gone.
+const WORKER_GONE: &str = "the worker that ran it is gone; start it again";
+
+/// Seconds after its last beat that a record is a dead worker's: three sweeps, and at least 60 s.
+pub fn stale_after(sweep: Duration) -> u64 {
+    (BEAT_STALE_SWEEPS * sweep.as_secs()).max(BEAT_STALE_FLOOR_SECS)
+}
 
 /// How a command stands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +197,20 @@ struct Record {
     ran_secs: Option<u64>,
     lines: Option<u64>,
     git: Option<String>,
+    /// Unix seconds of the owner's last beat: written at start and at every sweep.
+    #[serde(default)]
+    beat: u64,
+    /// A stop that another worker asked for; the owner's next sweep stops the command with this
+    /// reason, and a beat keeps it.
+    #[serde(default)]
+    stop_requested: Option<String>,
+}
+
+impl Record {
+    /// Whether its owner beat within `stale` seconds of `now`.
+    fn is_fresh(&self, now: u64, stale: u64) -> bool {
+        now.saturating_sub(self.beat) <= stale
+    }
 }
 
 /// A process that ended: how, and how long it ran.
@@ -204,6 +253,8 @@ struct Sink {
     raw_total: u64,
     scrubbed_total: u64,
     next_check: u64,
+    /// How many bytes are written between two looks at the run's room.
+    check_every: u64,
     /// The text `start_command` waits for, and whether a line has had it.
     watch: Option<String>,
     matched: bool,
@@ -317,12 +368,12 @@ impl Sink {
             self.lines += 1;
         }
         if self.written >= self.next_check {
-            self.next_check = self.written + ROOM_CHECK_EVERY;
+            self.next_check = self.written + self.check_every;
             match self.kept.run_used(&self.run, &self.id) {
-                Ok(used) if used + self.written > RUN_KEPT_MAX => {
+                Ok(used) if used + self.written > self.kept.run_max() => {
                     self.refused = Some(format!(
-                        "a run keeps at most {} MiB of output",
-                        RUN_KEPT_MAX / (1024 * 1024)
+                        "a run keeps at most {} of output",
+                        size_text(self.kept.run_max())
                     ));
                     self.cut = true;
                     self.full = true;
@@ -363,6 +414,10 @@ pub(crate) struct Command {
     git_note: Mutex<Option<String>>,
     /// What a view shows of the output at most.
     view_cap: usize,
+    /// How long a call to the environment's `kill` is waited for.
+    kill_wait: Duration,
+    /// The environment is not this container: a pod or a devcontainer.
+    remote: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -418,33 +473,63 @@ impl Command {
             ran_secs: ended.as_ref().map(|e| e.ran.as_secs()),
             lines: Some(lines),
             git,
+            beat: now_unix(),
+            stop_requested: None,
         }
     }
 
     /// Write the record, unless another worker has taken the command over (its record names
     /// another owner): that record is the truth, and this one must not overwrite it.
+    ///
+    /// This is the owner's beat too: it is read again here and a stop another worker asked for is
+    /// kept, so that a beat never erases it.
     fn write_record(&self) {
         let taken = format!("gone:{}", self.owner);
+        let mut record = self.record();
         if let Ok(Some(bytes)) = self.kept.get_record(&self.run, &self.id)
             && let Ok(current) = serde_json::from_slice::<Record>(&bytes)
-            && current.owner != *self.owner
-            && current.owner != taken
         {
-            return;
+            if current.owner != *self.owner && current.owner != taken {
+                return;
+            }
+            record.stop_requested = current.stop_requested;
         }
-        self.write_record_over();
+        self.put(&record);
     }
 
-    /// Write the record whatever is there: the command starts now, and what the volume holds for
-    /// its id is an earlier try's.
-    fn write_record_over(&self) {
-        match serde_json::to_vec(&self.record()) {
+    fn put(&self, record: &Record) {
+        match serde_json::to_vec(record) {
             Ok(bytes) => {
                 if let Err(e) = self.kept.put_record(&self.run, &self.id, &bytes) {
                     tracing::warn!(error = %e, "cannot write the record of a command");
                 }
             }
             Err(e) => tracing::warn!(error = %e, "cannot make the record of a command"),
+        }
+    }
+
+    /// Write the record whatever is there: the command starts now, and what the volume holds for
+    /// its id is an earlier try's.
+    fn write_record_over(&self) {
+        self.put(&self.record());
+    }
+
+    /// The stop another worker asked for, if the record holds one.
+    fn requested_stop(&self) -> Option<String> {
+        let bytes = self.kept.get_record(&self.run, &self.id).ok()??;
+        serde_json::from_slice::<Record>(&bytes)
+            .ok()?
+            .stop_requested
+    }
+
+    /// The environment's `kill` of the exec id, for at most `kill_wait`.
+    async fn kill_in_environment(&self) {
+        let exec = lock(&self.exec).clone();
+        if tokio::time::timeout(self.kill_wait, self.session.kill(&exec))
+            .await
+            .is_err()
+        {
+            tracing::warn!(id = %self.id, "the environment did not kill a command in time");
         }
     }
 
@@ -491,6 +576,29 @@ impl Command {
     }
 }
 
+/// The commands of this process, shared by the clones of [`Commands`]. When the last clone goes, the
+/// process groups of what still runs are killed: a worker that stops, or a test that ends, leaves
+/// no child behind.
+#[derive(Default)]
+struct Registry {
+    list: Mutex<Vec<Arc<Command>>>,
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        let list = self.list.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for command in list.iter().filter(|c| c.running()) {
+            let pid = *lock(&command.pid);
+            let start = *lock(&command.start_ticks);
+            if let (Some(pid), Some(start)) = (pid, start)
+                && proc_start(pid) == Some(start)
+            {
+                kill_group_blocking(pid);
+            }
+        }
+    }
+}
+
 /// The processes this worker runs for the runs it serves.
 ///
 /// Held by [`ToolEnv`]; clones share it. The tools hold nothing of their own: what a command is
@@ -498,7 +606,7 @@ impl Command {
 #[derive(Clone)]
 pub struct Commands {
     owner: Arc<str>,
-    entries: Arc<Mutex<Vec<Arc<Command>>>>,
+    entries: Arc<Registry>,
 }
 
 impl std::fmt::Debug for Commands {
@@ -534,6 +642,14 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// A record that says a command runs, read for a command this process does not hold.
+struct Elsewhere {
+    id: String,
+    record: Record,
+    /// Its owner beat within the staleness limit and is another process: a live command.
+    fresh: bool,
+}
+
 impl Commands {
     /// A registry for this process, with an owner token of its own.
     pub fn new() -> Self {
@@ -548,12 +664,16 @@ impl Commands {
         &self.owner
     }
 
+    fn list(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Command>>> {
+        lock(&self.entries.list)
+    }
+
     fn all(&self) -> Vec<Arc<Command>> {
-        lock(&self.entries).clone()
+        self.list().clone()
     }
 
     fn of_run(&self, run: &str) -> Vec<Arc<Command>> {
-        lock(&self.entries)
+        self.list()
             .iter()
             .filter(|c| c.run == run)
             .cloned()
@@ -561,7 +681,7 @@ impl Commands {
     }
 
     fn get(&self, run: &str, id: &str) -> Option<Arc<Command>> {
-        lock(&self.entries)
+        self.list()
             .iter()
             .find(|c| c.id == id && c.run == run)
             .cloned()
@@ -576,35 +696,54 @@ impl Commands {
     }
 
     fn running_count_all(&self) -> usize {
-        lock(&self.entries).iter().filter(|c| c.running()).count()
+        self.list().iter().filter(|c| c.running()).count()
     }
 
-    /// How many commands of `run` run now.
+    /// How many commands of `run` this process holds that run now.
     pub fn running_count(&self, run: &str) -> usize {
-        lock(&self.entries)
+        self.list()
             .iter()
             .filter(|c| c.run == run && c.running())
             .count()
     }
 
     /// The commands running in the slot `slot` of `run`: their ids and command lines, for a refusal
-    /// that says what else writes there.
+    /// that says what else writes there. What another worker runs is read from its records.
     pub fn running_in(&self, run: &str, slot: &str) -> Vec<(String, String)> {
-        lock(&self.entries)
+        self.list()
             .iter()
             .filter(|c| c.run == run && c.slot == slot && c.running())
             .map(|c| (c.id.clone(), c.shown.clone()))
             .collect()
     }
 
-    /// Add `command`, when its run has fewer than `max` running. Checked and added under one lock, so
-    /// two calls of a turn cannot both take the last place.
-    fn reserve(&self, command: Arc<Command>, max: usize) -> Result<(), usize> {
-        let mut entries = lock(&self.entries);
+    /// [`running_in`](Self::running_in) with what other workers run there too (fresh records).
+    pub fn running_in_slot(
+        &self,
+        kept: &FileKept,
+        run: &str,
+        slot: &str,
+        stale: u64,
+    ) -> Vec<(String, String)> {
+        let mut found = self.running_in(run, slot);
+        for other in self.elsewhere(kept, run, stale) {
+            if other.fresh && other.record.slot == slot {
+                found.push((other.id, other.record.command));
+            }
+        }
+        found
+    }
+
+    /// Add `command`, when its run has fewer than `max` running (here, and on other workers:
+    /// `elsewhere` is how many fresh records of other workers say so). Checked and added under one
+    /// lock, so two calls of a turn cannot both take the last place.
+    fn reserve(&self, command: Arc<Command>, max: usize, elsewhere: usize) -> Result<(), usize> {
+        let mut entries = self.list();
         let running = entries
             .iter()
             .filter(|c| c.run == command.run && c.running())
-            .count();
+            .count()
+            + elsewhere;
         if running >= max {
             return Err(running);
         }
@@ -626,17 +765,17 @@ impl Commands {
     }
 
     fn remove(&self, run: &str, id: &str) {
-        lock(&self.entries).retain(|c| !(c.run == run && c.id == id));
+        self.list().retain(|c| !(c.run == run && c.id == id));
     }
 
     /// Forget the commands of `run` that ended (its workspace is gone).
     pub fn forget_run(&self, run: &str) {
-        lock(&self.entries).retain(|c| c.run != run || c.running());
+        self.list().retain(|c| c.run != run || c.running());
     }
 
-    /// Stop every command of `run`, saying why, and wait until they are gone (at most 10 s). Never
-    /// fails; what is already over is left alone. For the end of the run, a park on the person and
-    /// the janitor.
+    /// Stop every command of `run` this process holds, saying why, and wait until they are gone (at
+    /// most 10 s). Never fails; what is already over is left alone. Commands that another worker
+    /// holds are asked in [`stop_run_elsewhere`](Self::stop_run_elsewhere).
     pub async fn stop_run(&self, run: &str, why: &str) {
         let mine: Vec<Arc<Command>> = self
             .of_run(run)
@@ -646,19 +785,40 @@ impl Commands {
         wait_all_ended(&mine, Duration::from_secs(10)).await;
     }
 
-    /// Stop every command of every run: this process is stopping.
-    pub async fn stop_all(&self, why: &str) {
+    /// Write a stop request, with `why`, into the record of every command of `run` that another
+    /// worker runs (a fresh record of another owner): its owner stops it at its next sweep. The
+    /// ids asked, in the order of the records. A stale record is not asked: it is a dead worker's.
+    pub async fn stop_run_elsewhere(
+        &self,
+        kept: &FileKept,
+        run: &str,
+        why: &str,
+        stale: u64,
+    ) -> Vec<String> {
+        let mut asked = Vec::new();
+        for other in self.elsewhere(kept, run, stale) {
+            if other.fresh && ask_stop(kept, run, &other.id, why).await {
+                asked.push(other.id);
+            }
+        }
+        asked
+    }
+
+    /// Stop every command of every run: this process is stopping. They are `gone`, with the reason
+    /// [`WORKER_STOPPED`].
+    pub async fn stop_all(&self) {
         let mine: Vec<Arc<Command>> = self
             .all()
             .into_iter()
-            .filter(|c| c.request_stop(why))
+            .filter(|c| c.request_stop(WORKER_STOPPED))
             .collect();
         wait_all_ended(&mine, Duration::from_secs(10)).await;
     }
 
-    /// One look at the runs that have commands: a run that is over (finished, failed, cancelled or
-    /// unknown to the store) has them stopped, and a command whose record names another owner (a
-    /// worker took the run over) is stopped too. Returns how many it stopped.
+    /// One look at the runs that have commands here: a run that is over (finished, failed,
+    /// cancelled or unknown to the store) has them stopped; a command whose record names another
+    /// owner (a worker took the run over) is stopped, and so is one whose record holds a stop request
+    /// another worker wrote; every other command gets its beat. Returns how many it stopped.
     pub async fn sweep(&self, store: &dyn Store) -> usize {
         let mut stopped = 0;
         let mut runs: Vec<String> = Vec::new();
@@ -680,15 +840,31 @@ impl Commands {
                     tracing::warn!(%run, error = %adam_error::report(&e), "cannot ask the store about a run with commands; they stay");
                 }
             }
-            // Another worker took the run over: its record names it, and this process must not go
-            // on running what is no longer its own.
+            let taken = format!("gone:{}", self.owner);
             for command in self.of_run(&run).into_iter().filter(|c| c.running()) {
-                if let Ok(Some(bytes)) = command.kept.get_record(&command.run, &command.id)
-                    && let Ok(record) = serde_json::from_slice::<Record>(&bytes)
-                    && record.owner != *self.owner
-                    && command.request_stop("another worker took the run over")
-                {
-                    stopped += 1;
+                let record = command
+                    .kept
+                    .get_record(&command.run, &command.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok());
+                let why = match record {
+                    // Another worker took the run over: its record names it, and this process must
+                    // not go on running what is no longer its own.
+                    Some(record) if record.owner != *self.owner && record.owner != taken => {
+                        Some("another worker took the run over".to_owned())
+                    }
+                    Some(record) => record.stop_requested,
+                    None => None,
+                };
+                match why {
+                    Some(why) => {
+                        if command.request_stop(&why) {
+                            stopped += 1;
+                        }
+                    }
+                    // The beat: the record says a worker runs it, and since when it is sure.
+                    None => command.write_record(),
                 }
             }
         }
@@ -710,7 +886,7 @@ impl Commands {
         loop {
             tokio::select! {
                 () = stop.cancelled() => {
-                    self.stop_all("the worker is stopping").await;
+                    self.stop_all().await;
                     return Ok(());
                 }
                 () = tokio::time::sleep(every) => {}
@@ -722,55 +898,139 @@ impl Commands {
         }
     }
 
-    /// Whether the volume holds a record of a command of `run` that says it runs and that this
-    /// process does not hold: a worker that is gone left it, and [`settle_records`](Self::settle_records)
-    /// has something to do.
-    fn has_stale(&self, kept: &FileKept, run: &str) -> bool {
+    /// The records of `run` that say a command runs and that this process does not hold, with
+    /// whether each is a live command of another worker.
+    fn elsewhere(&self, kept: &FileKept, run: &str, stale: u64) -> Vec<Elsewhere> {
         let Ok(records) = kept.records(run) else {
-            return false;
+            return Vec::new();
         };
-        records.iter().any(|(id, bytes)| {
-            self.get(run, id).is_none()
-                && serde_json::from_slice::<Record>(bytes).is_ok_and(|r| r.state.is_running())
-        })
+        let now = now_unix();
+        records
+            .into_iter()
+            .filter(|(id, _)| self.get(run, id).is_none())
+            .filter_map(|(id, bytes)| {
+                let record = serde_json::from_slice::<Record>(&bytes).ok()?;
+                record.state.is_running().then(|| Elsewhere {
+                    fresh: record.owner != *self.owner && record.is_fresh(now, stale),
+                    id,
+                    record,
+                })
+            })
+            .collect()
     }
 
-    /// Settle what an earlier owner left for `run`: a record that says a command runs, and that this
-    /// process does not hold, is of a worker that is gone (or that lost the run). Its process is
-    /// killed, by its exec id and, when the pid still has the start time the record names, by pid;
-    /// the record then says `gone`.
-    async fn settle_records(&self, kept: &FileKept, run: &str, session: &dyn EnvSession) {
-        let records = match kept.records(run) {
-            Ok(records) => records,
-            Err(e) => {
-                tracing::warn!(%run, error = %e, "cannot read the records of the commands of a run");
-                return;
-            }
-        };
-        for (id, bytes) in records {
-            if self.get(run, &id).is_some() {
+    /// How many commands of `run` other workers run now (fresh records).
+    fn count_elsewhere(&self, kept: &FileKept, run: &str, stale: u64) -> usize {
+        self.elsewhere(kept, run, stale)
+            .iter()
+            .filter(|other| other.fresh)
+            .count()
+    }
+
+    /// Whether the volume holds a record of a command of `run` that says it runs, that this process
+    /// does not hold and whose owner has not beat for `stale` seconds: a worker that is gone left it,
+    /// and [`settle_records`](Self::settle_records) has something to do.
+    fn has_stale(&self, kept: &FileKept, run: &str, stale: u64) -> bool {
+        self.elsewhere(kept, run, stale)
+            .iter()
+            .any(|other| !other.fresh)
+    }
+
+    /// Settle what a dead worker left for `run`: a record that says a command runs, that this
+    /// process does not hold and that is stale. Its process is killed, by its exec id and, when the
+    /// pid still has the start time the record names, by pid, and what is left of its group; the
+    /// record then says `gone`. The record of `except` is left to the caller.
+    async fn settle_records(
+        &self,
+        kept: &FileKept,
+        run: &str,
+        session: Option<&dyn EnvSession>,
+        stale: u64,
+        except: Option<&str>,
+        kill_wait: Duration,
+    ) {
+        for other in self.elsewhere(kept, run, stale) {
+            if other.fresh || except == Some(other.id.as_str()) {
                 continue;
             }
-            let Ok(mut record) = serde_json::from_slice::<Record>(&bytes) else {
-                continue;
-            };
-            if !record.state.is_running() {
-                continue;
-            }
-            kill_recorded(&record, session).await;
-            // The record is this process's now: the process that wrote it, if it is still alive
-            // somewhere, no longer writes over it.
-            record.owner = format!("gone:{}", self.owner);
-            record.state = CommandState::Gone {
-                why: "the worker that ran it restarted; start it again".to_owned(),
-            };
-            if let Ok(bytes) = serde_json::to_vec(&record)
-                && let Err(e) = kept.put_record(run, &id, &bytes)
-            {
-                tracing::warn!(%run, error = %e, "cannot write the record of a command");
-            }
+            self.settle(kept, run, other, session, WORKER_GONE, kill_wait)
+                .await;
         }
     }
+
+    /// The run is over: whatever its records say runs is killed (by pid with its start time, and what
+    /// is left of its group) and they say `gone`. For the janitor, before it removes the records.
+    pub async fn settle_over_run(&self, kept: &FileKept, run: &str) {
+        for other in self.elsewhere(kept, run, 0) {
+            self.settle(kept, run, other, None, "the run ended", Duration::ZERO)
+                .await;
+        }
+    }
+
+    async fn settle(
+        &self,
+        kept: &FileKept,
+        run: &str,
+        other: Elsewhere,
+        session: Option<&dyn EnvSession>,
+        why: &str,
+        kill_wait: Duration,
+    ) {
+        kill_recorded(&other.record, session, kill_wait).await;
+        // Written over only when it is still what was judged: a worker that beat meanwhile owns it.
+        let now = kept
+            .get_record(run, &other.id)
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok());
+        let Some(mut record) = now else { return };
+        if record.beat != other.record.beat || !record.state.is_running() {
+            return;
+        }
+        // The record is this process's now: the process that wrote it, if it is still alive
+        // somewhere, no longer writes over it.
+        record.owner = format!("gone:{}", self.owner);
+        record.state = CommandState::Gone {
+            why: why.to_owned(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&record)
+            && let Err(e) = kept.put_record(run, &other.id, &bytes)
+        {
+            tracing::warn!(%run, error = %e, "cannot write the record of a command");
+        }
+    }
+}
+
+/// Write a stop request into the record of a command another worker runs, and make sure it stays:
+/// the owner's beat can write the record in the instant between this read and write, so it is read
+/// again after a pause and written once more if it was lost. `false` when the command is not running.
+async fn ask_stop(kept: &FileKept, run: &str, id: &str, why: &str) -> bool {
+    for round in 0..3 {
+        let Ok(Some(bytes)) = kept.get_record(run, id) else {
+            return false;
+        };
+        let Ok(mut record) = serde_json::from_slice::<Record>(&bytes) else {
+            return false;
+        };
+        if !record.state.is_running() {
+            return false;
+        }
+        if record.stop_requested.is_some() {
+            if round > 0 {
+                return true;
+            }
+        } else {
+            record.stop_requested = Some(why.to_owned());
+            if let Ok(bytes) = serde_json::to_vec(&record)
+                && let Err(e) = kept.put_record(run, id, &bytes)
+            {
+                tracing::warn!(%run, error = %e, "cannot write a stop request");
+                return false;
+            }
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    true
 }
 
 async fn wait_all_ended(commands: &[Arc<Command>], limit: Duration) {
@@ -843,15 +1103,51 @@ async fn kill_leftovers(group: u32) {
     kill_pids(&group_members(group)).await;
 }
 
-/// Kill what a record says runs: through the environment, by exec id, and the process this
-/// machine holds, by pid when it is still the process the record names (the same start time).
-async fn kill_recorded(record: &Record, session: &dyn EnvSession) {
-    session.kill(&ExecId::new(record.exec.clone())).await;
-    if let (Some(pid), Some(start)) = (record.pid, record.start)
-        && proc_start(pid) == Some(start)
+/// SIGKILL these processes, waiting for the shell (for a `Drop`).
+fn kill_pids_blocking(pids: &[u32], group: Option<u32>) {
+    let mut targets: Vec<String> = pids.iter().map(u32::to_string).collect();
+    if let Some(group) = group {
+        targets.push(format!("-{group}"));
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -s KILL -- {}", targets.join(" ")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// SIGKILL the process group `pid` leads, and what is left of it, without waiting on a runtime.
+fn kill_group_blocking(pid: u32) {
+    kill_pids_blocking(&group_members(pid), Some(pid));
+}
+
+/// Kill what a record says runs: through the environment, by exec id (when there is a session), and
+/// the processes this machine holds. The leader is killed by pid only when it is still the process
+/// the record names (the same start time); when it is gone, what is left of its group is killed (a
+/// group id is not reused while a member lives); when another process has the pid, nothing is.
+async fn kill_recorded(record: &Record, session: Option<&dyn EnvSession>, wait: Duration) {
+    if let Some(session) = session
+        && tokio::time::timeout(wait, session.kill(&ExecId::new(record.exec.clone())))
+            .await
+            .is_err()
     {
-        kill_group(Some(pid)).await;
-        kill_leftovers(pid).await;
+        tracing::warn!("the environment did not kill a command in time");
+    }
+    let (Some(pid), Some(start)) = (record.pid, record.start) else {
+        return;
+    };
+    match proc_start(pid) {
+        Some(now) if now == start => {
+            kill_group(Some(pid)).await;
+            kill_leftovers(pid).await;
+        }
+        None => kill_leftovers(pid).await,
+        Some(_) => {}
     }
 }
 
@@ -893,23 +1189,36 @@ async fn supervise(
     };
     let state = match ending {
         Ending::Exit(waited) => {
-            // What the leader left in its group is the command's too.
+            // What the leader left in its group is the command's too, and so is what the
+            // environment holds for its exec id (`cmd &` in a pod outlives the client).
             if let Some(group) = pid {
                 kill_leftovers(group).await;
             }
-            CommandState::Exited {
-                code: waited.ok().and_then(|status| status.code()),
+            command.kill_in_environment().await;
+            let code = waited.ok().and_then(|status| status.code());
+            match (code, command.requested_stop()) {
+                // Ended by the kill another worker made in the environment, for the stop it asked.
+                (None, Some(why)) => CommandState::Stopped { why },
+                // A signal nobody asked for, where something outside this process can end a
+                // command: the environment was made again, most likely.
+                (None, None) if command.remote => CommandState::Stopped {
+                    why: ENVIRONMENT_MADE_AGAIN.to_owned(),
+                },
+                _ => CommandState::Exited { code },
             }
         }
         Ending::Stop(why) => {
             kill_group(pid).await;
             let _ = child.kill().await;
-            let exec = lock(&command.exec).clone();
-            command.session.kill(&exec).await;
+            command.kill_in_environment().await;
             if let Some(group) = pid {
                 kill_leftovers(group).await;
             }
-            CommandState::Stopped { why }
+            if why == WORKER_STOPPED {
+                CommandState::Gone { why }
+            } else {
+                CommandState::Stopped { why }
+            }
         }
     };
     let ran = command.started.elapsed();
@@ -929,18 +1238,27 @@ async fn supervise(
     }
     lock(&command.sink).finish();
     command.kept.end_live(&command.run, &command.id);
-    if let Some(watch) = &command.git {
-        let after = Snapshot::of_slot(&watch.slot).await;
-        let same = after
-            .as_ref()
-            .is_some_and(|after| watch.before.same_git_as(after));
-        if !same {
-            *lock(&command.git_note) = Some(
-                "git was changed while it ran (HEAD, a ref, `.git` or the git configuration differ \
-                 from when it started); it is not undone here, because the run's own commits move \
-                 them too: look with `run_command git status`"
-                    .to_owned(),
+    if let Some(watch) = &command.git
+        && let Some(after) = Snapshot::of_slot(&watch.slot).await
+    {
+        let mut notes: Vec<&str> = Vec::new();
+        if !watch.before.same_configuration_as(&after) {
+            // As `run` does: the configuration (hooks path, fsmonitor, filters, urls) is put back.
+            notes.push(if watch.before.restore_configuration(&watch.slot).await {
+                "the git configuration was changed while it ran and has been put back"
+            } else {
+                "the git configuration was changed while it ran and could not be put back \
+                 completely: look with `run_command git config --local --list`"
+            });
+        }
+        if !watch.before.same_git_apart_from_configuration_as(&after) {
+            notes.push(
+                "HEAD, a ref or `.git` differ from when it started; this is not undone here, \
+                 because the run's own commits move them too: look with `run_command git status`",
             );
+        }
+        if !notes.is_empty() {
+            *lock(&command.git_note) = Some(notes.join("; "));
         }
     }
     *lock(&command.ended) = Some(Ended { state, ran });
@@ -1152,12 +1470,30 @@ pub async fn start_command(
     let id = output_id_of(ctx);
     let run = ctx.root_run_id().to_string();
 
+    let stale = stale_after(env.settings.background_sweep);
+    let kill_wait = env.settings.background_kill_wait;
+
     // A step that runs again finds its command: this process owns it, and nothing is started twice.
     if let Some(existing) = env.commands.get(&run, &id) {
         if let Some(text) = &wait_for {
             lock(&existing.sink).watch = Some(text.clone());
         }
         return view_after(&env, ctx, &existing, wait).await;
+    }
+    // Or another worker holds it (a fresh record), or it ended there: its view, and nothing is
+    // started. A stale record, or one this process wrote and does not hold, is an earlier try that
+    // died: it is dealt with below.
+    let earlier = env
+        .kept
+        .get_record(&run, &id)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok());
+    if let Some(record) = &earlier
+        && (!record.state.is_running()
+            || (record.owner != *env.commands.owner && record.is_fresh(now_unix(), stale)))
+    {
+        return Ok(ToolOutput::text(remote_view(&env, &run, &id, record).await));
     }
 
     // A slot the run may write: a command changes files, and never in a reference.
@@ -1170,15 +1506,20 @@ pub async fn start_command(
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     let environment = env.session(ctx).await?;
-    // What an earlier try of this call, or a worker that is gone, left running under any id.
+    // What a worker that is gone left running under any other id.
     env.commands
-        .settle_records(&env.kept, &run, &*environment)
+        .settle_records(
+            &env.kept,
+            &run,
+            Some(&*environment),
+            stale,
+            Some(&id),
+            kill_wait,
+        )
         .await;
-    if let Ok(Some(bytes)) = env.kept.get_record(&run, &id)
-        && let Ok(record) = serde_json::from_slice::<Record>(&bytes)
-    {
-        // The earlier try of this very call: its process must not live beside the new one.
-        kill_recorded(&record, &*environment).await;
+    if let Some(record) = &earlier {
+        // The earlier try of this very call died: its process must not live beside the new one.
+        kill_recorded(record, Some(&*environment), kill_wait).await;
     }
 
     let Some(before) = Snapshot::of_slot(&slot).await else {
@@ -1192,7 +1533,10 @@ pub async fn start_command(
 
     let redactor = &env.redactor;
     let shown = cut_text(&redactor.scrub(command), MAX_COMMAND_BYTES);
-    let file = match env.kept.open_live(&run, &id, MIN_ROOM) {
+    // Nothing is reserved yet: a call that is dropped here (its time limit, a cancel) leaves nothing.
+    ctx.emit_progress(format!("starting: {shown}")).await;
+    let room = MIN_ROOM.min(env.kept.run_max() / 4);
+    let file = match env.kept.open_live(&run, &id, room) {
         Ok(file) => file,
         Err(e) => {
             return Ok(ToolOutput::error(format!(
@@ -1209,6 +1553,7 @@ pub async fn start_command(
         }
     };
     let view_cap = env.settings.check_output_tail.clamp(256, MEMORY_KEPT);
+    let check_every = (env.kept.run_max() / 16).clamp(1024, ROOM_CHECK_EVERY);
     let entry = Arc::new(Command {
         id: id.clone(),
         run: run.clone(),
@@ -1245,7 +1590,8 @@ pub async fn start_command(
             tail: Vec::new(),
             raw_total: 0,
             scrubbed_total: 0,
-            next_check: ROOM_CHECK_EVERY,
+            next_check: check_every,
+            check_every,
             watch: wait_for,
             matched: false,
         }),
@@ -1259,9 +1605,13 @@ pub async fn start_command(
         }),
         git_note: Mutex::new(None),
         view_cap,
+        kill_wait,
+        remote: !matches!(environment.describe().kind, EnvKind::Local),
     });
     let max = env.settings.background_commands_max;
-    if let Err(running) = env.commands.reserve(entry.clone(), max) {
+    let elsewhere = env.commands.count_elsewhere(&env.kept, &run, stale);
+    // From here to the supervisor there is no await: the entry is never left without one.
+    if let Err(running) = env.commands.reserve(entry.clone(), max, elsewhere) {
         env.kept.end_live(&run, &id);
         return Ok(ToolOutput::error(format!(
             "{running} commands of this run are running, and at most {max} may run at once: stop one \
@@ -1269,12 +1619,18 @@ pub async fn start_command(
         )));
     }
 
-    ctx.emit_progress(format!("starting: {shown}")).await;
     // Written before the process exists: a worker that dies in between leaves the exec id to kill.
     entry.write_record_over();
     let mut child = match spawn_prepared(&prepared) {
         Ok(child) => child,
         Err(e) => {
+            *lock(&entry.ended) = Some(Ended {
+                state: CommandState::Stopped {
+                    why: "it could not be started".to_owned(),
+                },
+                ran: Duration::ZERO,
+            });
+            entry.write_record();
             env.commands.remove(&run, &id);
             env.kept.end_live(&run, &id);
             return Err(run_error(redactor, &super::shell::RunError::Spawn(e)));
@@ -1319,24 +1675,7 @@ pub async fn stop_command(
     }
     let run = ctx.root_run_id().to_string();
     let Some(command) = env.commands.get(&run, id) else {
-        // Not held here: a record of a worker that is gone, or nothing.
-        if env.commands.has_stale(&env.kept, &run) {
-            let session = env.session(ctx).await?;
-            env.commands
-                .settle_records(&env.kept, &run, &*session)
-                .await;
-        }
-        return match env.kept.get_record(&run, id) {
-            Ok(Some(bytes)) => match serde_json::from_slice::<Record>(&bytes) {
-                Ok(record) => Ok(ToolOutput::text(record_view(&record, id))),
-                Err(_) => Ok(ToolOutput::error(format!(
-                    "the record of `{id}` cannot be read"
-                ))),
-            },
-            _ => Ok(ToolOutput::error(format!(
-                "no command `{id}` was started in this run (list_commands lists them)"
-            ))),
-        };
+        return stop_elsewhere(&env, ctx, &run, id).await;
     };
     command.request_stop("stop_command");
     let deadline = Instant::now() + END_WAIT;
@@ -1379,13 +1718,92 @@ pub async fn stop_command(
     Ok(ToolOutput::text(text))
 }
 
-/// The view of a command this process does not hold: from its record.
-fn record_view(record: &Record, id: &str) -> String {
-    let mut text = format!(
-        "$ {}\n{}\n",
+/// `stop_command` for a command this process does not hold: a record of a dead worker (settled),
+/// of another worker that runs it (a stop request, and the kill by exec id), or of one that ended.
+async fn stop_elsewhere(env: &ToolEnv, ctx: &ToolCtx, run: &str, id: &str) -> Outcome {
+    let stale = stale_after(env.settings.background_sweep);
+    let kill_wait = env.settings.background_kill_wait;
+    // A dead worker's commands are settled first, and the record is read after.
+    if env.commands.has_stale(&env.kept, run, stale) {
+        let session = env.session(ctx).await?;
+        env.commands
+            .settle_records(&env.kept, run, Some(&*session), stale, None, kill_wait)
+            .await;
+    }
+    let record = match env.kept.get_record(run, id) {
+        Ok(Some(bytes)) => match serde_json::from_slice::<Record>(&bytes) {
+            Ok(record) => record,
+            Err(_) => {
+                return Ok(ToolOutput::error(format!(
+                    "the record of `{id}` cannot be read"
+                )));
+            }
+        },
+        _ => {
+            return Ok(ToolOutput::error(format!(
+                "no command `{id}` was started in this run (list_commands lists them)"
+            )));
+        }
+    };
+    if !record.state.is_running() {
+        return Ok(ToolOutput::text(record_view(&record, id)));
+    }
+    // Another worker runs it. Its owner stops it at its next sweep; in a pod or a devcontainer the
+    // exec id is killed now, so that it ends at once.
+    if let Ok(session) = env.session(ctx).await {
+        let exec = ExecId::new(record.exec.clone());
+        let _ = tokio::time::timeout(kill_wait, session.kill(&exec)).await;
+    }
+    let asked = ask_stop(&env.kept, run, id, "stop_command").await;
+    let wait = (env.settings.background_sweep + Duration::from_secs(2)).min(END_WAIT);
+    let deadline = Instant::now() + wait;
+    while asked {
+        match read_record(env, run, id) {
+            Some(now) if now.state.is_running() => {}
+            Some(now) => return Ok(ToolOutput::text(record_view(&now, id))),
+            None => break,
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        if ctx.is_cancelled() {
+            return Err(cancelled("the command is being stopped"));
+        }
+        tokio::time::sleep(POLL).await;
+        // The owner's beat can write the record in the instant of the request: asked again.
+        let _ = ask_stop(&env.kept, run, id, "stop_command").await;
+    }
+    if !asked && let Some(now) = read_record(env, run, id) {
+        // It ended while the request was written.
+        return Ok(ToolOutput::text(record_view(&now, id)));
+    }
+    Ok(ToolOutput::text(format!(
+        "$ {}\nstop asked: `{id}` runs on another worker, which stops it at its next sweep (within \
+         about {} s); list_commands says when it has ended, and read_output reads what it printed.\n",
         record.command,
-        how(&record.state, record.ran_secs)
-    );
+        env.settings.background_sweep.as_secs().max(1)
+    )))
+}
+
+/// The record of `id`, if there is a readable one.
+fn read_record(env: &ToolEnv, run: &str, id: &str) -> Option<Record> {
+    let bytes = env.kept.get_record(run, id).ok()??;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The view of a command this process does not hold: from its record. A command that runs is shown
+/// as running (`running as <id>`); one that ended says how.
+fn record_view(record: &Record, id: &str) -> String {
+    let secs = if record.state.is_running() {
+        Some(now_unix().saturating_sub(record.started_at))
+    } else {
+        record.ran_secs
+    };
+    let mut text = format!("$ {}\n", record.command);
+    if record.state.is_running() {
+        let _ = writeln!(text, "[running as {id} on another worker]");
+    }
+    let _ = writeln!(text, "{}", how(&record.state, secs));
     if let Some(note) = &record.git {
         let _ = writeln!(text, "Note: {note}.");
     }
@@ -1397,17 +1815,49 @@ fn record_view(record: &Record, id: &str) -> String {
     text
 }
 
+/// What `start_command` gives for a command another worker holds, or one that ended: its record,
+/// and for one that runs the first page of its output. Nothing is started.
+async fn remote_view(env: &ToolEnv, run: &str, id: &str, record: &Record) -> String {
+    let mut text = record_view(record, id);
+    if record.state.is_running() {
+        text.push_str("--- output so far ---\n");
+        match adam_llm_agent::KeptOutputs::page(
+            &*env.kept,
+            run,
+            id,
+            1,
+            adam_llm_agent::paging::PAGE_LINES,
+        )
+        .await
+        {
+            Ok(page) => text.push_str(&page),
+            Err(e) => {
+                let _ = write!(text, "(the output cannot be read now: {e})");
+            }
+        }
+    }
+    text
+}
+
 /// List the commands this task started with start_command, in the order they started: each one's
 /// id, whether it runs or how it ended, the lines of output it has, its slot and the command. Read
 /// the output of one with read_output.
 #[tool(label = "List the commands", icon = "execute")]
 pub async fn list_commands(env: State<ToolEnv>, ctx: &ToolCtx) -> Outcome {
     let run = ctx.root_run_id().to_string();
+    let stale = stale_after(env.settings.background_sweep);
     // The environment is asked for only when there is something to settle in it.
-    if env.commands.has_stale(&env.kept, &run) {
+    if env.commands.has_stale(&env.kept, &run, stale) {
         let session = env.session(ctx).await?;
         env.commands
-            .settle_records(&env.kept, &run, &*session)
+            .settle_records(
+                &env.kept,
+                &run,
+                Some(&*session),
+                stale,
+                None,
+                env.settings.background_kill_wait,
+            )
             .await;
     }
     let mut rows: Vec<(u64, String, String)> = Vec::new();
@@ -1433,7 +1883,9 @@ pub async fn list_commands(env: State<ToolEnv>, ctx: &ToolCtx) -> Outcome {
         seen.push(command.id.clone());
         rows.push((command.started_at, command.id.clone(), line));
     }
+    let mut running = env.commands.running_count(&run);
     if let Ok(records) = env.kept.records(&run) {
+        let now = now_unix();
         for (id, bytes) in records {
             if seen.contains(&id) {
                 continue;
@@ -1441,9 +1893,19 @@ pub async fn list_commands(env: State<ToolEnv>, ctx: &ToolCtx) -> Outcome {
             let Ok(record) = serde_json::from_slice::<Record>(&bytes) else {
                 continue;
             };
+            let live = record.state.is_running();
+            if live && record.is_fresh(now, stale) {
+                running += 1;
+            }
+            let secs = if live {
+                Some(now.saturating_sub(record.started_at))
+            } else {
+                record.ran_secs
+            };
             let mut line = format!(
-                "{id} {}, {} lines, slot {}",
-                how(&record.state, record.ran_secs),
+                "{id} {}{}, {} lines, slot {}",
+                how(&record.state, secs),
+                if live { " (on another worker)" } else { "" },
                 record.lines.unwrap_or(0),
                 record.slot
             );
@@ -1455,7 +1917,6 @@ pub async fn list_commands(env: State<ToolEnv>, ctx: &ToolCtx) -> Outcome {
         }
     }
     rows.sort();
-    let running = env.commands.running_count(&run);
     let max = env.settings.background_commands_max;
     if rows.is_empty() {
         return Ok(ToolOutput::text(format!(
@@ -1470,10 +1931,17 @@ pub async fn list_commands(env: State<ToolEnv>, ctx: &ToolCtx) -> Outcome {
     Ok(ToolOutput::text(text))
 }
 
+/// `text`, a refusal in `slot`, with the commands that keep running there named when there are some.
+pub(crate) fn noted(env: &ToolEnv, ctx: &ToolCtx, slot: &Slot, mut text: String) -> String {
+    text.push_str(&slot_note(env, &ctx.root_run_id().to_string(), slot.dir()));
+    text
+}
+
 /// A line for a refusal in a slot that a background command may be writing: the commands running
-/// there, or nothing.
-pub(crate) fn slot_note(commands: &Commands, run: &str, slot: &str) -> String {
-    let running = commands.running_in(run, slot);
+/// there (on this worker, and on others), or nothing.
+pub(crate) fn slot_note(env: &ToolEnv, run: &str, slot: &str) -> String {
+    let stale = stale_after(env.settings.background_sweep);
+    let running = env.commands.running_in_slot(&env.kept, run, slot, stale);
     if running.is_empty() {
         return String::new();
     }
@@ -1524,11 +1992,11 @@ mod tests {
         assert_eq!(
             how(
                 &CommandState::Gone {
-                    why: "the worker that ran it restarted; start it again".into()
+                    why: WORKER_GONE.into()
                 },
                 None
             ),
-            "gone: the worker that ran it restarted; start it again"
+            format!("gone: {WORKER_GONE}")
         );
     }
 
@@ -1547,6 +2015,8 @@ mod tests {
             ran_secs: Some(3),
             lines: Some(4),
             git: None,
+            beat: 5,
+            stop_requested: None,
         };
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["state"], "exited");

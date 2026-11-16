@@ -159,8 +159,10 @@ impl Janitor {
                     report.failed.push(run);
                 }
                 Ok(Standing::Over(record)) => {
-                    // What runs in the environment goes first: the commands that keep running.
+                    // What runs in the environment goes first: the commands that keep running, and
+                    // what a worker that is gone left in the records.
                     self.commands.stop_run(&run, "the run ended").await;
+                    self.commands.settle_over_run(&self.kept, &run).await;
                     // What the environment holds goes next, and a workspace it could not let go of
                     // stays for the next sweep.
                     if !self.was_released(&run)
@@ -228,6 +230,7 @@ impl Janitor {
             }
             match is_over(store, &run).await {
                 Ok(Some(true)) => {
+                    self.commands.settle_over_run(&self.kept, &run).await;
                     if let Err(e) = self.kept.remove_run(&run).await {
                         tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the kept output of a finished run");
                     }
@@ -313,6 +316,7 @@ impl Janitor {
     /// it is released.
     async fn release_after_commands(&self, run: &str) -> Result<(), adam_workspace::EnvError> {
         self.commands.stop_run(run, "the run ended").await;
+        self.commands.settle_over_run(&self.kept, run).await;
         self.environment.release(run).await
     }
 

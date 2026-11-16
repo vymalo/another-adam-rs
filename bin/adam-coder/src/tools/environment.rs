@@ -38,9 +38,12 @@ pub async fn rebuild_environment(
     }
     let use_default = use_default.unwrap_or(false);
     let run = ctx.root_run_id().to_string();
-    // What runs in the environment ends with it.
+    // What runs in the environment ends with it; the reason is the true one.
+    let stale = super::background::stale_after(env.settings.background_sweep);
+    let why = "its environment was made again (rebuild_environment); start it again if it is still needed";
+    env.commands.stop_run(&run, why).await;
     env.commands
-        .stop_run(&run, "the run's environment was made again")
+        .stop_run_elsewhere(&env.kept, &run, why, stale)
         .await;
     let made_again = env
         .environment

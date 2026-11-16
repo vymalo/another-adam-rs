@@ -215,6 +215,11 @@ pub struct CoderSettings {
     /// How often the sweep looks at the runs that have commands (`BACKGROUND_SWEEP_SECS`): a cancel
     /// never calls the agent, so this is how long a cancelled run's commands can outlive it.
     pub background_sweep: Duration,
+    /// How long a call to the environment's `kill` of a command's exec id is waited for.
+    pub background_kill_wait: Duration,
+    /// The most bytes of output one run keeps on the volume ([`crate::kept::RUN_KEPT_MAX`]); a
+    /// setting so that a test reaches it with a little text.
+    pub run_kept_max: u64,
     /// The longest `ToolEnv::session` can take to make the run's environment ready: nothing for the
     /// coder's own container; for a devcontainer `DEVCONTAINER_UP_TIMEOUT_SECS` plus
     /// `DEVCONTAINER_SETUP_TIMEOUT_SECS`; for run pods `RUN_POD_WAIT_SECS` plus
@@ -264,6 +269,8 @@ impl CoderSettings {
             background_commands_max: 4,
             background_command_max: Duration::from_secs(3600),
             background_sweep: Duration::from_secs(15),
+            background_kill_wait: Duration::from_secs(10),
+            run_kept_max: crate::kept::RUN_KEPT_MAX,
             background_output_max: adam_llm_agent::MAX_KEPT_BYTES as u64,
         }
     }
@@ -321,7 +328,10 @@ impl ToolEnv {
     /// Environment over `workspaces` and `code_host`.
     pub fn new(workspaces: Workspaces, code_host: DynCodeHost, settings: CoderSettings) -> Self {
         let notes = NotesStore::new(workspaces.root());
-        let kept = Arc::new(FileKept::new(workspaces.root(), Redactor::default()));
+        let kept = Arc::new(
+            FileKept::new(workspaces.root(), Redactor::default())
+                .with_run_max(settings.run_kept_max),
+        );
         Self {
             workspaces,
             code_host,
@@ -387,7 +397,10 @@ impl ToolEnv {
     /// progress line of the checks.
     #[must_use]
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
-        self.kept = Arc::new(FileKept::new(self.workspaces.root(), redactor.clone()));
+        self.kept = Arc::new(
+            FileKept::new(self.workspaces.root(), redactor.clone())
+                .with_run_max(self.settings.run_kept_max),
+        );
         self.redactor = redactor;
         self
     }
@@ -1127,7 +1140,9 @@ pub const QUICK_TOOLS: [&str; 16] = [
 /// |---|---|
 /// | `run_command`, `run`, `run_checks` | the environment is made ready (`environment_start`) and the command runs (`CHECK_TIMEOUT_SECS`) |
 /// | `rebuild_environment` | the environment is made ready (`environment_start`) |
-/// | `start_command` | the environment is made ready and the call waits for the command at most 120 s; `stop_command` waits for the process 60 s; `list_commands` asks for the session and reads records |
+/// | `start_command` | the environment is made ready and the call waits for the command at most 120 s |
+/// | `stop_command` | the environment is made ready (for a command this worker does not hold) and the call waits for the process 60 s |
+/// | `list_commands` | the environment is asked for its session, and the records are read |
 /// | `read_file`, `list_files`, `find_files`, `search_files`, `read_output` | their own deadline (`find::DEADLINE`, 30 s) |
 /// | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | git: one network operation and the local ones around it |
 fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
@@ -1140,7 +1155,7 @@ fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
             environment + Duration::from_secs(background::MAX_WAIT_SECS.unsigned_abs())
         }
         // The process is stopped and waited for (20 s), and the output is read.
-        "stop_command" => Duration::from_secs(60),
+        "stop_command" => environment + Duration::from_secs(60),
         // The environment is asked for its session, and the records are read.
         "list_commands" => environment + find::DEADLINE,
         "read_file" | "list_files" | "find_files" | "search_files" | "read_output" => {

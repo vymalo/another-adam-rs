@@ -1,9 +1,11 @@
-//! Commands that keep running (ADR 0044, slice 16): `start_command`, `stop_command`,
-//! `list_commands`, read with `read_output`, and gone with their run.
+//! Commands that keep running (ADR 0044): `start_command`, `stop_command`, `list_commands`, read
+//! with `read_output`, and gone with their run.
 //!
 //! The commands are real processes (`sh` in this container); the tests start them with short
-//! lifetimes and sweeps through the settings, and every test stops what it starts (`sleep 600` is
-//! only ever waiting to be stopped).
+//! lifetimes and sweeps through the settings, and every test stops what it starts (`sleep 6NN` is
+//! only ever waiting to be stopped; each test has its own number). A test that needs a process of
+//! somebody else starts its own and kills it at the end. A stop test uses a command with a child
+//! and a grandchild and asserts by pid that each is gone.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -16,12 +18,17 @@ use adam_coder::tools::background::{CommandState, ListCommands, StartCommand, St
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::{AGENT_NAME, CoderAgent, CoderSettings, Redactor, ToolEnv};
-use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
+use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus};
 use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput};
 use adam_model::{DynModel, MockModel, ModelRequest};
 use adam_runtime::{CollectingSink, Inbound, Runtime};
 use common::{FakeEnvironment, Fixture, MODEL_KEY, call};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+/// A command with a child and a grandchild in its process group: a stop that kills the leader only
+/// leaves two behind.
+const TREE: &str = "sh -c 'sleep 621 & wait' & echo up; wait";
 
 struct Rig {
     fx: Fixture,
@@ -187,6 +194,150 @@ fn last_line(text: &str) -> &str {
     text.rsplit_once('\n').map_or(text, |(_, last)| last)
 }
 
+/// The pids whose process group is `group`.
+fn group_members(group: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        if rest
+            .split_whitespace()
+            .nth(2)
+            .and_then(|g| g.parse::<u32>().ok())
+            == Some(group)
+        {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// The start time of a process, as the record names it.
+fn start_of(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let rest = stat.rsplit_once(") ").unwrap().1;
+    rest.split_whitespace().nth(19).unwrap().parse().unwrap()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+async fn until_gone(what: &str, pids: &[u32]) {
+    until(what, || pids.iter().all(|p| !alive(*p))).await;
+}
+
+/// Change the record of command `id` the way another worker or the passing of time would.
+fn set_record(rig: &Rig, id: &str, change: impl FnOnce(&mut Value)) {
+    let kept = &rig.fx.env.kept;
+    let bytes = kept.get_record(&rig.run(), id).unwrap().expect("a record");
+    let mut record: Value = serde_json::from_slice(&bytes).unwrap();
+    change(&mut record);
+    kept.put_record(&rig.run(), id, &serde_json::to_vec(&record).unwrap())
+        .unwrap();
+}
+
+fn record_of(rig: &Rig, id: &str) -> Value {
+    let bytes = rig
+        .fx
+        .env
+        .kept
+        .get_record(&rig.run(), id)
+        .unwrap()
+        .expect("a record");
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// The owner of the record has not been heard of for ten minutes.
+fn age(rig: &Rig, id: &str) {
+    set_record(rig, id, |r| r["beat"] = json!(now_secs() - 600));
+}
+
+/// A run of the rig that is open in a store, so that a sweep does not take it for a finished one.
+async fn open_store(rig: &Rig) -> DynStore {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    store
+        .create_run(NewRun::new(AGENT_NAME, json!({})).with_id(rig.ctx.run_id()))
+        .await
+        .unwrap();
+    store
+}
+
+/// A worker's sweep, running until `finish`.
+struct Sweeping {
+    token: CancellationToken,
+    handle: tokio::task::JoinHandle<Result<(), adam_error::BoxError>>,
+}
+
+impl Sweeping {
+    fn of(env: &ToolEnv, store: &DynStore, every: Duration) -> Self {
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(env.commands.clone().sweep_loop(
+            store.clone(),
+            token.clone(),
+            every,
+        ));
+        Self { token, handle }
+    }
+
+    async fn finish(self) {
+        self.token.cancel();
+        self.handle.await.unwrap().unwrap();
+    }
+}
+
+/// A second worker over the same volume and run: its own registry, its own owner.
+struct Peer {
+    env: Arc<ToolEnv>,
+}
+
+impl Peer {
+    fn new(rig: &Rig) -> Self {
+        Self {
+            env: another_worker(rig),
+        }
+    }
+
+    fn ctx(&self, rig: &Rig, call: &str) -> ToolCtx {
+        rig.call_ctx(call)
+            .with_state(self.env.clone())
+            .with_state(Arc::new(KeptStore(self.env.kept.clone())))
+    }
+
+    async fn start(&self, rig: &Rig, call: &str, args: Value) -> ToolOutput {
+        StartCommand.call(&self.ctx(rig, call), args).await.unwrap()
+    }
+
+    async fn stop(&self, rig: &Rig, id: &str) -> ToolOutput {
+        StopCommand
+            .call(&self.ctx(rig, "peer-stop"), json!({ "id": id }))
+            .await
+            .unwrap()
+    }
+
+    async fn list(&self, rig: &Rig) -> String {
+        ListCommands
+            .call(&self.ctx(rig, "peer-list"), json!({}))
+            .await
+            .unwrap()
+            .content
+    }
+}
+
 #[tokio::test]
 async fn start_read_stop_locally() {
     let rig = Rig::new().await;
@@ -318,7 +469,11 @@ async fn a_start_run_again_with_the_same_call_starts_one_process() {
 
 /// A second worker over the same volume, as a restarted process is one.
 fn another_worker(rig: &Rig) -> Arc<ToolEnv> {
-    let first = &rig.fx.env;
+    another_env(&rig.fx)
+}
+
+fn another_env(fx: &Fixture) -> Arc<ToolEnv> {
+    let first = &fx.env;
     Arc::new(
         ToolEnv::new(
             first.workspaces.clone(),
@@ -339,8 +494,10 @@ async fn a_replay_in_another_process_kills_the_old_one_and_starts_again() {
     let id = rig.id_of("start-1");
     let old = rig.pid_of(&id);
     until("the line", || work.join("started.txt").exists()).await;
+    // The worker that started it is gone: it has not beat for ten minutes.
+    age(&rig, &id);
 
-    // The worker restarted and the step runs again: another owner, the same call.
+    // The step runs again on another worker: another owner, the same call.
     let env = another_worker(&rig);
     let ctx = rig
         .call_ctx("start-1")
@@ -389,6 +546,8 @@ async fn a_restarted_worker_says_gone_and_kills_by_exec_id() {
     let pid = rig.pid_of(&id);
     let exec = fake.session.prepared.lock().unwrap()[0].clone();
     assert!(exec.is_background(), "{exec}");
+    // The worker is gone: it has not beat for ten minutes.
+    age(&rig, &id);
 
     // A new process serves the run: it holds none of the first one's commands.
     let env = another_worker(&rig);
@@ -403,7 +562,7 @@ async fn a_restarted_worker_says_gone_and_kills_by_exec_id() {
     let listed = ListCommands.call(&ctx, json!({})).await.unwrap().content;
     assert!(
         listed.contains(&format!(
-            "{id} gone: the worker that ran it restarted; start it again"
+            "{id} gone: the worker that ran it is gone; start it again"
         )),
         "{listed}"
     );
@@ -641,49 +800,138 @@ async fn bad_arguments_and_a_stranger_are_refused() {
     assert!(rig.list().await.starts_with("No command was started"));
 }
 
+/// The configuration of the slot's repository, as `run` holds a command to leave it.
+fn git_config(dir: &Path) -> String {
+    common::git(dir, &["config", "--local", "--list"])
+}
+
 #[tokio::test]
-async fn git_changes_of_a_background_command_are_reported_at_stop() {
+async fn a_changed_configuration_is_put_back_and_a_moved_ref_is_reported() {
     let rig = Rig::new().await;
+    let work = rig.worktree();
+    let before = git_config(&work);
     let started = rig
         .start(
             "start-1",
-            json!({"command": "git config user.nickname watcher; echo ready; sleep 600", "wait_for": "ready", "wait": 20}),
+            json!({"command": "git config user.nickname watcher; git config core.hooksPath /nonexistent; git config core.fsmonitor 'touch /nonexistent/x'; echo ready; sleep 628", "wait_for": "ready", "wait": 20}),
         )
         .await;
     assert!(!started.is_error, "{}", started.content);
     let id = rig.id_of("start-1");
+    assert!(git_config(&work).contains("core.hookspath"), "it ran");
     let stopped = rig.stop(&id).await;
     assert!(
-        stopped.content.contains("git was changed while it ran"),
+        stopped
+            .content
+            .contains("the git configuration was changed while it ran and has been put back"),
         "{}",
         stopped.content
     );
+    assert_eq!(git_config(&work), before, "the configuration is as it was");
     assert!(rig.list().await.contains("(git changed while it ran)"));
-    // The files it wrote stay, and the guard of `run_command` names what runs in its slot.
+
+    // A ref that moved is reported and left alone: it may be the run's own commit.
     let second = rig
         .start(
             "start-2",
-            json!({"command": "echo ready; sleep 600", "wait_for": "ready", "wait": 20}),
+            json!({"command": "git branch made-by-the-watcher; echo ready; sleep 629", "wait_for": "ready", "wait": 20}),
         )
         .await;
     assert!(!second.is_error, "{}", second.content);
-    let refused = adam_coder::tools::inspect::RunCommand
+    let stopped = rig.stop(&rig.id_of("start-2")).await;
+    assert!(
+        stopped.content.contains("HEAD, a ref or `.git` differ"),
+        "{}",
+        stopped.content
+    );
+    assert!(
+        common::git(&work, &["branch", "--list", "made-by-the-watcher"])
+            .contains("made-by-the-watcher"),
+        "not undone"
+    );
+}
+
+/// What a run's guard of `run_command` and `run` says about commands that keep running, on every
+/// refusal path.
+#[tokio::test]
+async fn every_refusal_of_run_command_and_run_names_the_commands_that_run_in_the_slot() {
+    use adam_coder::tools::inspect::RunCommand;
+    use adam_coder::tools::make::Run;
+
+    let rig = Rig::new().await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": "echo ready; sleep 630", "wait_for": "ready", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let named = |text: &str| {
+        text.contains("Commands that keep running are writing in this slot") && text.contains(&id)
+    };
+
+    // A command that changes a file: `run_command` undoes it.
+    let out = RunCommand
         .call(
             &rig.call_ctx("look"),
             json!({"command": "echo changed > README.md"}),
         )
         .await
         .unwrap();
-    assert!(refused.is_error, "{}", refused.content);
+    assert!(out.is_error && named(&out.content), "{}", out.content);
+    // A command that changes git: `run` undoes it.
+    let out = Run
+        .call(
+            &rig.call_ctx("make"),
+            json!({"command": "git config user.nickname somebody"}),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error && named(&out.content), "{}", out.content);
+
+    // HEAD is not on the run's own branch: nothing is run, in either tool.
+    common::git(&rig.worktree(), &["checkout", "--quiet", "--detach"]);
+    for (call, tool) in [("look-2", "run_command"), ("make-2", "run")] {
+        let ctx = rig.call_ctx(call);
+        let out = if tool == "run" {
+            Run.call(&ctx, json!({"command": "true"})).await.unwrap()
+        } else {
+            RunCommand
+                .call(&ctx, json!({"command": "true"}))
+                .await
+                .unwrap()
+        };
+        assert!(
+            out.is_error && out.content.contains("Nothing was run") && named(&out.content),
+            "{tool}: {}",
+            out.content
+        );
+    }
+    rig.stop(&id).await;
+}
+
+#[tokio::test]
+async fn a_worktree_that_cannot_be_read_at_the_end_says_nothing_about_git() {
+    let rig = Rig::new().await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": "echo ready; sleep 631", "wait_for": "ready", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    // The worktree goes away (the janitor, a command): git cannot be read at the end.
+    std::fs::remove_dir_all(rig.worktree()).unwrap();
+    let stopped = rig.stop(&id).await;
+    assert!(!stopped.is_error, "{}", stopped.content);
     assert!(
-        refused
-            .content
-            .contains("Commands that keep running are writing in this slot")
-            && refused.content.contains(&rig.id_of("start-2")),
+        !stopped.content.contains("Note:") && !stopped.content.contains("git"),
         "{}",
-        refused.content
+        stopped.content
     );
-    rig.stop(&rig.id_of("start-2")).await;
+    assert!(!rig.list().await.contains("git changed"));
 }
 
 #[tokio::test]
@@ -969,4 +1217,561 @@ async fn three_identical_reads_of_a_quiet_command_are_refused() {
     );
     assert!(results[2].contains("third call in a row"), "{results:?}");
     fx.env.commands.stop_run(&run_id, "the test is over").await;
+}
+
+// ---------------------------------------------------------------------- processes: the whole group
+
+/// The process group is killed by a stop: the child and the grandchild of the shell go with it.
+#[tokio::test]
+async fn a_stop_kills_the_leader_its_child_and_its_grandchild() {
+    let rig = Rig::new().await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": TREE, "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let leader = rig.pid_of(&id);
+    until("the tree to be there", || group_members(leader).len() >= 3).await;
+    let tree = group_members(leader);
+    let stopped = rig.stop(&id).await;
+    assert!(!stopped.is_error, "{}", stopped.content);
+    until_gone("every process of the group to be gone", &tree).await;
+}
+
+/// A leader that ends by itself leaves nothing running in its group.
+#[tokio::test]
+async fn a_leader_that_ends_by_itself_leaves_no_child_behind() {
+    let rig = Rig::new().await;
+    let out = rig
+        .start(
+            "start-1",
+            json!({"command": "sleep 622 & echo child=$!", "wait": 20}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    let child: u32 = out
+        .content
+        .lines()
+        .find_map(|line| line.strip_prefix("child="))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the child's pid: {}", out.content));
+    until_gone("the child of the leader to be gone", &[child]).await;
+}
+
+/// In a pod or a devcontainer the client's exit does not end what `cmd &` left there: the exec id is
+/// killed in the environment on exit as well.
+#[tokio::test]
+async fn a_command_that_ends_by_itself_is_still_killed_in_the_environment() {
+    let fake = FakeEnvironment::new(None);
+    fake.session.as_pod(Some(250), Some(512 * 1024 * 1024));
+    let rig = Rig::from(Fixture::new().await.using(fake.clone())).await;
+    let out = rig
+        .start("start-1", json!({"command": "echo done", "wait": 20}))
+        .await;
+    assert!(out.content.contains("exit code 0"), "{}", out.content);
+    let exec = fake.session.prepared.lock().unwrap()[0].clone();
+    assert!(
+        fake.session.killed.lock().unwrap().contains(&exec),
+        "{:?}",
+        fake.session.killed.lock().unwrap()
+    );
+}
+
+/// An exec that does not answer does not hold the command: the stop is done after the bound.
+#[tokio::test]
+async fn a_kill_that_never_answers_does_not_hold_a_stop() {
+    let fake = FakeEnvironment::new(None);
+    let rig = Rig::from(
+        Fixture::with(|s| s.background_kill_wait = Duration::from_millis(300))
+            .await
+            .using(fake.clone()),
+    )
+    .await;
+    fake.session
+        .kill_hangs
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let started = rig
+        .start("start-1", json!({"command": "sleep 632", "wait": 1}))
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let pid = rig.pid_of(&id);
+    let began = Instant::now();
+    let stopped = rig.stop(&id).await;
+    assert!(
+        !stopped.is_error && stopped.content.contains("stopped: stop_command"),
+        "{}",
+        stopped.content
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        began.elapsed()
+    );
+    until_gone("the process", &[pid]).await;
+}
+
+/// A record that names a live process of somebody else (another start time) never gets it killed.
+#[tokio::test]
+async fn a_pid_with_another_start_time_is_never_killed_and_one_with_its_own_is() {
+    use std::os::unix::process::CommandExt as _;
+    let rig = Rig::new().await;
+    let peer = Peer::new(&rig);
+    let spawn = |seconds: &str| {
+        std::process::Command::new("sleep")
+            .arg(seconds)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    let mut stranger = spawn("633");
+    let mut ghost = spawn("634");
+    let record = |id: &str, pid: u32, start: u64| {
+        json!({
+            "command": "ghost", "slot": "remote", "cwd": "", "exec": format!("bg-ghost-{id}"),
+            "owner": "a-worker-that-is-gone", "pid": pid, "start": start, "started_at": 1,
+            "state": "running", "ran_secs": null, "lines": 0, "git": null, "beat": 0,
+        })
+    };
+    let (wrong, right) = (
+        adam_llm_agent::output_id(&rig.run(), "wrong"),
+        adam_llm_agent::output_id(&rig.run(), "right"),
+    );
+    for (id, pid, start) in [
+        (&wrong, stranger.id(), start_of(stranger.id()) + 1),
+        (&right, ghost.id(), start_of(ghost.id())),
+    ] {
+        rig.fx
+            .env
+            .kept
+            .put_record(
+                &rig.run(),
+                id,
+                &serde_json::to_vec(&record(id, pid, start)).unwrap(),
+            )
+            .unwrap();
+    }
+    let listed = peer.list(&rig).await;
+    assert!(
+        listed.contains(&format!("{wrong} gone")) && listed.contains(&format!("{right} gone")),
+        "{listed}"
+    );
+    until("the process the record names to be killed", || {
+        ghost.try_wait().unwrap().is_some()
+    })
+    .await;
+    assert!(
+        stranger.try_wait().unwrap().is_none(),
+        "a process with another start time is not the record's"
+    );
+    stranger.kill().unwrap();
+    stranger.wait().unwrap();
+}
+
+/// What a leader left in its group is killed when the record is settled, whether or not the leader
+/// is still there.
+#[tokio::test]
+async fn what_is_left_of_a_group_whose_leader_is_gone_is_killed() {
+    use std::os::unix::process::CommandExt as _;
+    let rig = Rig::new().await;
+    let peer = Peer::new(&rig);
+    let mut leader = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 635 & exec sleep 0.4")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = leader.id();
+    let start = start_of(group);
+    until("the member of the group", || {
+        group_members(group).len() >= 2
+    })
+    .await;
+    let member = group_members(group)
+        .into_iter()
+        .find(|p| *p != group)
+        .unwrap();
+    leader.wait().unwrap();
+    assert!(alive(member), "it outlives its leader");
+    let id = adam_llm_agent::output_id(&rig.run(), "orphan");
+    let record = json!({
+        "command": "orphan", "slot": "remote", "cwd": "", "exec": "bg-orphan-1",
+        "owner": "a-worker-that-is-gone", "pid": group, "start": start, "started_at": 1,
+        "state": "running", "ran_secs": null, "lines": 0, "git": null, "beat": 0,
+    });
+    rig.fx
+        .env
+        .kept
+        .put_record(&rig.run(), &id, &serde_json::to_vec(&record).unwrap())
+        .unwrap();
+    assert!(peer.list(&rig).await.contains(&format!("{id} gone")));
+    until_gone("what the leader left", &[member]).await;
+}
+
+// ------------------------------------------------------------------------- several workers (M1)
+
+fn short_sweep(s: &mut CoderSettings) {
+    s.background_sweep = Duration::from_millis(200);
+}
+
+/// A fresh record of another worker is a live command: listed as running, left alone by a start of
+/// another id, readable.
+#[tokio::test]
+async fn a_fresh_record_of_another_worker_is_listed_running_and_survives_a_start() {
+    let rig = Rig::with(short_sweep).await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": TREE, "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let leader = rig.pid_of(&id);
+    let peer = Peer::new(&rig);
+
+    let listed = peer.list(&rig).await;
+    assert!(
+        listed.contains(&format!("{id} running")) && listed.contains("(on another worker)"),
+        "{listed}"
+    );
+    assert!(listed.contains("1 running"), "{listed}");
+    let other = peer
+        .start(
+            &rig,
+            "other",
+            json!({"command": "echo ready; sleep 636", "wait_for": "ready", "wait": 20}),
+        )
+        .await;
+    assert!(!other.is_error, "{}", other.content);
+    assert!(alive(leader), "a start of another id leaves it alone");
+    assert!(rig.states()[0].1.is_running());
+    assert!(
+        peer.list(&rig).await.contains("2 running"),
+        "both are counted"
+    );
+    // Its output is the shared file.
+    assert!(rig.read(&id, 1).await.starts_with("up\n"));
+
+    let tree = group_members(leader);
+    rig.stop(&id).await;
+    peer.stop(&rig, &rig.id_of("other")).await;
+    until_gone("the tree", &tree).await;
+}
+
+/// `stop_command` of a command another worker runs: a request in its record, the owner's sweep stops
+/// it, and both agree on the end.
+#[tokio::test]
+async fn a_stop_from_another_worker_stops_the_command_within_a_sweep() {
+    let rig = Rig::with(short_sweep).await;
+    let store = open_store(&rig).await;
+    let sweeping = Sweeping::of(&rig.fx.env, &store, Duration::from_millis(200));
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": TREE, "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let leader = rig.pid_of(&id);
+    until("the tree to be there", || group_members(leader).len() >= 3).await;
+    let tree = group_members(leader);
+
+    let peer = Peer::new(&rig);
+    let stopped = peer.stop(&rig, &id).await;
+    assert!(!stopped.is_error, "{}", stopped.content);
+    assert!(
+        stopped.content.contains("stopped: stop_command"),
+        "{}",
+        stopped.content
+    );
+    until_gone("the tree", &tree).await;
+    // The owner and the record say the same.
+    assert!(matches!(
+        &rig.states()[0].1,
+        CommandState::Stopped { why } if why == "stop_command"
+    ));
+    assert_eq!(record_of(&rig, &id)["state"], "stopped");
+    assert_eq!(record_of(&rig, &id)["why"], "stop_command");
+    // Asking again for what ended says how it ended.
+    assert!(
+        peer.stop(&rig, &id)
+            .await
+            .content
+            .contains("stopped: stop_command")
+    );
+    sweeping.finish().await;
+}
+
+/// When the owner does not sweep, the caller is told the stop was asked, and the owner's next sweep
+/// does it.
+#[tokio::test]
+async fn a_stop_asked_of_a_worker_that_has_not_swept_is_done_by_its_next_sweep() {
+    let rig = Rig::with(short_sweep).await;
+    let store = open_store(&rig).await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": "echo up; sleep 637", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let pid = rig.pid_of(&id);
+    let peer = Peer::new(&rig);
+    let asked = peer.stop(&rig, &id).await;
+    assert!(
+        !asked.is_error && asked.content.contains("stop asked"),
+        "{}",
+        asked.content
+    );
+    assert!(alive(pid), "nobody has swept yet");
+    assert_eq!(record_of(&rig, &id)["stop_requested"], "stop_command");
+    assert_eq!(rig.fx.env.commands.sweep(store.as_ref()).await, 1);
+    until_gone("the process", &[pid]).await;
+    until("it to be settled", || {
+        rig.states().iter().all(|(_, s)| !s.is_running())
+    })
+    .await;
+    assert!(matches!(
+        &rig.states()[0].1,
+        CommandState::Stopped { why } if why == "stop_command"
+    ));
+}
+
+/// A beat keeps a stop request that another worker wrote.
+#[tokio::test]
+async fn a_beat_does_not_erase_a_stop_request() {
+    let rig = Rig::new().await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": "echo up; sleep 1", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    set_record(&rig, &id, |r| {
+        r["stop_requested"] = json!("asked elsewhere")
+    });
+    // It ends by itself, and writes its record: the request is still there.
+    until("it to end", || {
+        rig.states().iter().all(|(_, s)| !s.is_running())
+    })
+    .await;
+    let record = record_of(&rig, &id);
+    assert_eq!(record["stop_requested"], "asked elsewhere", "{record}");
+    assert_eq!(record["state"], "exited");
+}
+
+/// The sweep writes the beat of what it holds.
+#[tokio::test]
+async fn the_sweep_writes_the_beat() {
+    let rig = Rig::new().await;
+    let store = open_store(&rig).await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": "echo up; sleep 638", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    set_record(&rig, &id, |r| r["beat"] = json!(now_secs() - 30));
+    assert_eq!(rig.fx.env.commands.sweep(store.as_ref()).await, 0);
+    let beat = record_of(&rig, &id)["beat"].as_u64().unwrap();
+    assert!(beat + 5 >= now_secs(), "{beat} now {}", now_secs());
+    rig.stop(&id).await;
+}
+
+/// A record that names another owner is not this worker's any more: its sweep stops the command.
+#[tokio::test]
+async fn the_sweep_stops_a_command_whose_record_another_worker_took() {
+    let rig = Rig::new().await;
+    let store = open_store(&rig).await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": "echo up; sleep 639", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let pid = rig.pid_of(&id);
+    set_record(&rig, &id, |r| r["owner"] = json!("somebody-else"));
+    assert_eq!(rig.fx.env.commands.sweep(store.as_ref()).await, 1);
+    until_gone("the process", &[pid]).await;
+    until("it to be settled", || {
+        rig.states().iter().all(|(_, s)| !s.is_running())
+    })
+    .await;
+    assert!(matches!(
+        &rig.states()[0].1,
+        CommandState::Stopped { why } if why == "another worker took the run over"
+    ));
+    // What the new owner wrote stays: this worker does not write over it.
+    assert_eq!(record_of(&rig, &id)["owner"], "somebody-else");
+}
+
+/// A worker that stops stops what it holds, says so, and runs nothing afterwards.
+#[tokio::test]
+async fn a_worker_that_stops_ends_its_commands_and_runs_nothing_after() {
+    let rig = Rig::with(short_sweep).await;
+    let store = open_store(&rig).await;
+    let sweeping = Sweeping::of(&rig.fx.env, &store, Duration::from_millis(200));
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": TREE, "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let leader = rig.pid_of(&id);
+    until("the tree to be there", || group_members(leader).len() >= 3).await;
+    let tree = group_members(leader);
+    sweeping.finish().await;
+    assert!(
+        matches!(&rig.states()[0].1, CommandState::Gone { why } if why.starts_with("the worker stopped")),
+        "{:?}",
+        rig.states()
+    );
+    until_gone("the tree", &tree).await;
+    assert_eq!(record_of(&rig, &id)["state"], "gone");
+}
+
+/// A stale record is a dead worker's: gone, its process (and its group) killed.
+#[tokio::test]
+async fn a_stale_record_is_gone_and_its_whole_group_is_killed() {
+    let rig = Rig::new().await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": TREE, "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let leader = rig.pid_of(&id);
+    until("the tree to be there", || group_members(leader).len() >= 3).await;
+    let tree = group_members(leader);
+    age(&rig, &id);
+    let peer = Peer::new(&rig);
+    let listed = peer.list(&rig).await;
+    assert!(
+        listed.contains(&format!(
+            "{id} gone: the worker that ran it is gone; start it again"
+        )),
+        "{listed}"
+    );
+    until_gone("the tree", &tree).await;
+    assert_eq!(record_of(&rig, &id)["state"], "gone");
+    // `stop_command` of it says the same.
+    assert!(peer.stop(&rig, &id).await.content.contains("gone:"));
+}
+
+/// A start step that runs again on another worker, while the first worker beats, starts nothing.
+#[tokio::test]
+async fn a_replayed_start_on_another_worker_starts_no_second_process() {
+    let rig = Rig::new().await;
+    let work = rig.worktree();
+    let command = "echo started >> replayed.txt; sleep 641";
+    let first = rig
+        .start("start-1", json!({"command": command, "wait": 1}))
+        .await;
+    assert!(!first.is_error, "{}", first.content);
+    let id = rig.id_of("start-1");
+    let pid = rig.pid_of(&id);
+    until("the line", || work.join("replayed.txt").exists()).await;
+    let peer = Peer::new(&rig);
+    let again = peer
+        .start(&rig, "start-1", json!({"command": command, "wait": 1}))
+        .await;
+    assert!(!again.is_error, "{}", again.content);
+    assert!(
+        again
+            .content
+            .contains(&format!("running as {id} on another worker")),
+        "{}",
+        again.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("replayed.txt")).unwrap(),
+        "started\n",
+        "nothing was started twice"
+    );
+    assert_eq!(rig.pid_of(&id), pid);
+    assert!(peer.env.commands.states(&rig.run()).is_empty());
+    rig.stop(&id).await;
+}
+
+/// The limit counts the commands of the run on every worker.
+#[tokio::test]
+async fn the_limit_counts_the_commands_other_workers_run() {
+    let rig = Rig::with(|s| s.background_commands_max = 2).await;
+    for call in ["a", "b"] {
+        let out = rig
+            .start(
+                call,
+                json!({"command": "echo up; sleep 642", "wait_for": "up", "wait": 20}),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+    }
+    let peer = Peer::new(&rig);
+    let refused = peer
+        .start(&rig, "c", json!({"command": "sleep 643", "wait": 1}))
+        .await;
+    assert!(
+        refused.is_error && refused.content.contains("at most 2"),
+        "{}",
+        refused.content
+    );
+    assert!(peer.env.commands.states(&rig.run()).is_empty());
+    for call in ["a", "b"] {
+        rig.stop(&rig.id_of(call)).await;
+    }
+}
+
+/// Two starts at once at one below the maximum: one takes the place, the other is refused, though the
+/// first has not started its process yet.
+#[tokio::test]
+async fn two_starts_at_once_at_one_below_the_maximum_take_one_place() {
+    let rig = Rig::with(|s| s.background_commands_max = 2).await;
+    let first = rig
+        .start(
+            "a",
+            json!({"command": "echo up; sleep 644", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!first.is_error, "{}", first.content);
+    let (b, c) = tokio::join!(
+        rig.start(
+            "b",
+            json!({"command": "echo up; sleep 645", "wait_for": "up", "wait": 20})
+        ),
+        rig.start(
+            "c",
+            json!({"command": "echo up; sleep 646", "wait_for": "up", "wait": 20})
+        ),
+    );
+    assert_eq!(
+        u8::from(b.is_error) + u8::from(c.is_error),
+        1,
+        "{}\n---\n{}",
+        b.content,
+        c.content
+    );
+    assert_eq!(rig.fx.env.commands.running_count(&rig.run()), 2);
+    for call in ["a", "b", "c"] {
+        rig.stop(&rig.id_of(call)).await;
+    }
 }
