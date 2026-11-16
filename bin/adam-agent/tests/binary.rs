@@ -478,6 +478,41 @@ async fn serves_the_card_of_its_folder_and_stops_cleanly_on_sigterm() {
     db.finish().await;
 }
 
+/// A folder that declares `references:` starts, and the process says once that it does not serve
+/// them: only the coder reads them.
+#[tokio::test]
+async fn a_folder_that_declares_references_starts_and_says_they_are_not_served() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let agent = common::folder_with(
+        "---\nname: reader\ndescription: Reads.\nreferences:\n  - name: design\n    url: https://github.com/acme/design\n    description: Tokens.\n---\nYou read.\n",
+    );
+    let mut p = Proc::spawn(&valid_env(&db.url(), agent.path()));
+    p.ready().await;
+    let said = p
+        .stdout()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|log| log["level"] == "WARN")
+        .filter_map(|log| log["fields"]["message"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        said.iter()
+            .filter(|m| m.contains("declares references"))
+            .count(),
+        1,
+        "{said:?}"
+    );
+    assert!(
+        said.iter()
+            .any(|m| m.contains("only adam-coder reads them")),
+        "{said:?}"
+    );
+    p.stop_cleanly().await;
+    db.finish().await;
+}
+
 /// Answers `POST /chat/completions` the way the `mock-assistant` mapping of `dev/wiremock` does: from
 /// the two persona lines at the top of the system prompt it is sent. The requests it got are kept.
 struct Persona {

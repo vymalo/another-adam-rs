@@ -274,7 +274,9 @@ stateDiagram-v2
 Startup logs one `agent files` line (`source=folder`, `path`: the directory that holds `agent/`, `digest`:
 `sha256:...`, `agent`, `warnings`) and each warning as `path:line: warning: ...`; the same line `adam-coder`
 logs. A mistake in the files stops the process before it connects to anything, exit code 78, with every finding
-as `path:line: error: ...` in the one `adam-agent failed` line.
+as `path:line: error: ...` in the one `adam-agent failed` line. A folder that declares `schedules` or
+`references:` logs one more warning each: this binary reads them and runs or serves neither (only `adam-coder` reads
+references).
 
 Exit codes are `adam-service`'s: 0 after a clean shutdown, 78 configuration (including the folder and the files),
 69 a dependency is unreachable (Postgres, an MCP server), 71 the OS refused something (a port), 70 internal (a

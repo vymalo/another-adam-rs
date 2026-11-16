@@ -92,6 +92,16 @@ fn a_bad_reference_is_an_error_at_load() {
             "credentials",
         ),
         (
+            "a token in the query string",
+            "{ name: a, url: 'https://github.com/a/b?token=abc', description: d }",
+            "query string or fragment",
+        ),
+        (
+            "a fragment",
+            "{ name: a, url: 'https://github.com/a/b#x', description: d }",
+            "query string or fragment",
+        ),
+        (
             "a branch with a space",
             "{ name: a, url: 'https://github.com/a/b', branch: 'a b', description: d }",
             "branch",

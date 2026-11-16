@@ -58,7 +58,8 @@ impl ReferenceDef {
     /// The first thing wrong, in words: a name that is not a directory name, a description that is
     /// empty, over [`REFERENCE_DESCRIPTION_MAX`] characters or not one line of plain text, an
     /// address that is empty, has whitespace or a control character, is longer than
-    /// [`REFERENCE_URL_MAX`] or embeds credentials, a branch that is blank or has whitespace.
+    /// [`REFERENCE_URL_MAX`], has a query string or a fragment or embeds credentials, a branch
+    /// that is blank or has whitespace.
     pub fn check(&self) -> Result<(), String> {
         if !is_reference_name(&self.name) {
             return Err(format!(
@@ -94,6 +95,14 @@ impl ReferenceDef {
             return Err(format!(
                 "reference `{name}`: `url` is an address of at most {REFERENCE_URL_MAX} characters \
                  with no whitespace"
+            ));
+        }
+        // A token travels in a query string as well as in the user part, and neither is part of
+        // a repository's address.
+        if url.contains(['?', '#']) {
+            return Err(format!(
+                "reference `{name}`: `url` is an address with no query string or fragment; \
+                 credentials belong in the deployment's credentials, never in a file"
             ));
         }
         if url.contains("://")
@@ -284,9 +293,16 @@ mod tests {
             "https://u:p@github.com/a/b",
             "https://tok@github.com/a/b",
             "https://github.com/a/b c",
+            "https://github.com/a/b?token=abc",
+            "https://github.com/a/b#frag",
+            "https://github.com/a/b?",
         ] {
             assert!(def("ds", url).check().is_err(), "{url:?}");
         }
+        let said = def("ds", "https://github.com/a/b?token=abc")
+            .check()
+            .unwrap_err();
+        assert!(said.contains("query string or fragment"), "{said}");
         let mut with_branch = def("ds", "https://github.com/acme/ds");
         with_branch.branch = Some("a b".into());
         assert!(with_branch.check().unwrap_err().contains("branch"));
