@@ -378,10 +378,17 @@ impl AgentDef {
                 .map_err(|source| {
                     Error::mcp(Origin::new(name.clone(), mcp::file_of(manifest)), source)
                 })?;
-            connected.push((name, config.clone(), servers.tools()));
+            connected.push((
+                name,
+                config.clone(),
+                servers.tools(),
+                servers.instructions(),
+                servers.prompt_commands(),
+            ));
         }
-        for (name, config, tools) in connected {
-            self.mcp.set(name, Some(config), tools);
+        for (name, config, tools, instructions, prompts) in connected {
+            self.mcp
+                .set_connected(name, config, tools, instructions, prompts);
         }
         Ok(self)
     }
@@ -482,7 +489,18 @@ impl AgentDef {
                 });
             }
         }
-        Ok(BoundDef::new(self.manifest, nodes, remotes))
+        let root = self.manifest.name.clone();
+        let bound = BoundDef::new(self.manifest, nodes, remotes);
+        #[cfg(feature = "mcp")]
+        let bound = bound.with_prompt_commands(
+            self.mcp
+                .get(&root)
+                .map(|given| given.prompts.clone())
+                .unwrap_or_default(),
+        );
+        #[cfg(not(feature = "mcp"))]
+        let _ = root;
+        Ok(bound)
     }
 }
 
@@ -585,6 +603,16 @@ impl Walk<'_> {
             refuse_asking_tools(&origin, &tools)?;
         }
         let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        // What the agent's MCP servers said about themselves, once, here: the prompt is the same
+        // for every model call of the process, so the cached prefix holds.
+        if let Some(given) = self.mcp.get(&name).filter(|g| !g.instructions.is_empty()) {
+            prompt.push_str(
+                "
+
+",
+            );
+            prompt.push_str(&given.instructions);
+        }
         // An agent that has an MCP tool can get a long result that is kept and paged: it reads the
         // rest with `read_output` (a folder agent keeps it in the run's state, up to 4 MiB).
         let has_mcp_tool = tools

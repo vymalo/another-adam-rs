@@ -933,3 +933,140 @@ mod dev {
         assert!(live.last_error().is_none());
     }
 }
+
+// --- server instructions and prompts -------------------------------------------------------
+
+/// What a server says about itself is appended to the agent's instructions once, when the agent is
+/// bound: every model call of the process sends the same system prompt, so the cached prefix holds.
+#[tokio::test]
+async fn instructions_appended_stable() {
+    for (backend, store) in stores().await {
+        let script = adam_mcp_testkit::Script {
+            instructions: Some(format!("Prefer `echo` for greetings. Key: {TOKEN}")),
+            prompts: Vec::new(),
+        };
+        let server = TestHttpServer::start_scripted(Some(TOKEN), script).await;
+        let root = uniq("root");
+        let files = root_files(
+            &root,
+            "tools: ['linear__echo']",
+            &mcp_json(&server.url(), "LINEAR_TOKEN", ""),
+        );
+        let def = def_of(&files)
+            .env("LINEAR_TOKEN", TOKEN)
+            .connect_mcp(&policy())
+            .await
+            .unwrap();
+        let model = Arc::new(MockModel::new());
+        model
+            .push_tool_calls(vec![call("c1", "linear__echo", json!({"text": "hi"}))])
+            .push_text("done");
+        let assembly = assemble(def, &model);
+        let prompt = assembly.info()[0].prompt.clone();
+        assert!(
+            prompt.starts_with("You are the root.\n\n## Instructions of the MCP server linear"),
+            "{backend}: {prompt}"
+        );
+        assert!(prompt.contains("Prefer `echo` for greetings."), "{backend}");
+        assert!(!prompt.contains(TOKEN), "{backend}: scrubbed");
+
+        let rt = assembly
+            .register(Runtime::builder(store.clone()))
+            .poll_interval(std::time::Duration::from_millis(20))
+            .build();
+        let worker = spawn_worker(&rt);
+        let run = rt.start(&root, user_message("go"), None).await.unwrap();
+        wait_done(&rt, run).await;
+        worker.stop().await;
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2, "{backend}");
+        assert_eq!(
+            requests[0].system, requests[1].system,
+            "{backend}: the system prompt is the same on every call"
+        );
+        assert_eq!(requests[0].system.as_deref(), Some(prompt.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn instructions_false_leaves_the_prompt_as_the_file_wrote_it() {
+    let script = adam_mcp_testkit::Script {
+        instructions: Some("Server words.".into()),
+        prompts: Vec::new(),
+    };
+    let server = TestHttpServer::start_scripted(Some(TOKEN), script).await;
+    let root = uniq("root");
+    let files = root_files(
+        &root,
+        "",
+        &mcp_json(&server.url(), "LINEAR_TOKEN", r#""instructions": false"#),
+    );
+    let def = def_of(&files)
+        .env("LINEAR_TOKEN", TOKEN)
+        .connect_mcp(&policy())
+        .await
+        .unwrap();
+    let assembly = assemble(def, &Arc::new(MockModel::new()));
+    assert_eq!(assembly.info()[0].prompt, "You are the root.");
+}
+
+/// A subagent has its own servers and its own instructions: they reach its prompt and never the
+/// parent's, and only the root's prompts are commands.
+#[tokio::test]
+async fn a_subagents_instructions_and_prompts_stay_with_it() {
+    let script = |text: &str, prompt: &str| adam_mcp_testkit::Script {
+        instructions: Some(text.to_owned()),
+        prompts: vec![adam_mcp_testkit::TestPrompt::new(prompt, "A prompt.").user("go")],
+    };
+    let parent_server = TestHttpServer::start_scripted(None, script("parent words", "p")).await;
+    let child_server = TestHttpServer::start_scripted(None, script("child words", "c")).await;
+    let root = uniq("root");
+    let plain =
+        |url: &str| format!(r#"{{"mcpServers": {{"srv": {{"type": "http", "url": "{url}"}}}}}}"#);
+    let files: Files = vec![
+        (
+            "agent/instructions.md".into(),
+            instructions(
+                &format!("name: {root}\nsubagents: [kid]"),
+                "You are the root.",
+            ),
+        ),
+        ("agent/mcp.json".into(), plain(&parent_server.url())),
+        (
+            "agent/subagents/kid/instructions.md".into(),
+            instructions("description: A kid.", "You are the kid."),
+        ),
+        (
+            "agent/subagents/kid/mcp.json".into(),
+            plain(&child_server.url()),
+        ),
+    ];
+    let def = def_of(&files).connect_mcp(&policy()).await.unwrap();
+    let assembly = assemble(def, &Arc::new(MockModel::new()));
+    let prompt_of = |name: &str| {
+        assembly
+            .info()
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap()
+            .prompt
+            .clone()
+    };
+    let parent = prompt_of(&root);
+    let child = prompt_of(&format!("{root}/kid"));
+    assert!(
+        parent.contains("parent words") && !parent.contains("child words"),
+        "{parent}"
+    );
+    assert!(
+        child.contains("child words") && !child.contains("parent words"),
+        "{child}"
+    );
+    let commands: Vec<&str> = assembly
+        .prompt_commands()
+        .iter()
+        .map(|c| c.name())
+        .collect();
+    assert_eq!(commands, ["srv__p"], "the root's prompts only");
+}

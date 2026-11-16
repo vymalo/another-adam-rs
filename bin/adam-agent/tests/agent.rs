@@ -1643,3 +1643,144 @@ async fn a_warning_is_kept_and_does_not_stop_the_load() {
     );
     folder::log(&loaded);
 }
+
+// ------------------------------------------------------------------ MCP prompts as commands
+
+fn docs_script() -> adam_mcp_testkit::Script {
+    adam_mcp_testkit::Script {
+        instructions: None,
+        prompts: vec![
+            adam_mcp_testkit::TestPrompt::new("summarize", "Summarize a topic.")
+                .argument("topic", true)
+                .argument("style", false)
+                .user("Summarize {{topic}} in a {{style}} style."),
+        ],
+    }
+}
+
+fn write_docs_mcp_json(folder: &tempfile::TempDir, url: &str) {
+    std::fs::write(
+        folder.path().join("agent/mcp.json"),
+        format!(r#"{{"mcpServers": {{"docs": {{"type": "http", "url": "{url}"}}}}}}"#),
+    )
+    .unwrap();
+}
+
+/// The prompts of an MCP server are commands of the agent: the card lists them (`commands/v1`,
+/// with the arguments the prompt declares as the hint), a message that names one is expanded with
+/// `prompts/get` before it is stored, and the run reads the server's text.
+#[tokio::test]
+async fn the_prompts_of_an_mcp_server_are_commands_of_the_agent() {
+    let server = TestHttpServer::start_scripted(None, docs_script()).await;
+    let folder = chat();
+    write_docs_mcp_json(&folder, &server.url());
+    let card = card_of(&def_of(&folder), &url()).unwrap();
+    assert!(
+        card.extensions
+            .iter()
+            .all(|e| e.uri != adam_a2a::COMMANDS_EXTENSION),
+        "before the servers are connected the card knows no prompt"
+    );
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let agents = build(def_of(&folder), Some(card), Some(worker_parts(model)))
+        .await
+        .unwrap();
+    let listed = agents.card.clone().expect("the card is kept");
+    let entry = listed
+        .extensions
+        .iter()
+        .find(|e| e.uri == adam_a2a::COMMANDS_EXTENSION)
+        .expect("the card lists commands/v1 once the prompts are known");
+    assert_eq!(
+        serde_json::Value::Object(entry.params.clone()),
+        json!({"commands": [{
+            "name": "docs__summarize",
+            "description": "Summarize a topic.",
+            "argumentHint": "<topic> [style]"
+        }]})
+    );
+
+    let service = service_over(agents, &store());
+    let worker = Worker::start(&service);
+    ask(&service, "/docs__summarize rust formal").await;
+    worker.stop().await;
+    assert_eq!(
+        mock.requests()[0].messages[0],
+        adam_model::Message::user_text("Summarize rust in a formal style.")
+    );
+    assert_eq!(server.prompt_gets(), 1, "asked once, at submit");
+}
+
+/// A command of the folder with the name of a prompt wins: the prompt is not served and not listed.
+#[tokio::test]
+async fn a_folders_command_wins_over_an_mcp_prompt_of_the_same_name() {
+    let server = TestHttpServer::start_scripted(None, docs_script()).await;
+    let folder = chat();
+    write_docs_mcp_json(&folder, &server.url());
+    let commands = folder.path().join("agent/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(
+        commands.join("docs__summarize.md"),
+        "---\ndescription: The folder's own.\n---\nFrom the folder: $ARGUMENTS\n",
+    )
+    .unwrap();
+    let card = card_of(&def_of(&folder), &url()).unwrap();
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let agents = build(def_of(&folder), Some(card), Some(worker_parts(model)))
+        .await
+        .unwrap();
+    let listed = agents.card.clone().unwrap();
+    let entry = listed
+        .extensions
+        .iter()
+        .find(|e| e.uri == adam_a2a::COMMANDS_EXTENSION)
+        .unwrap();
+    assert_eq!(
+        serde_json::Value::Object(entry.params.clone()),
+        json!({"commands": [{
+            "name": "docs__summarize",
+            "description": "The folder's own."
+        }]})
+    );
+    let service = service_over(agents, &store());
+    let worker = Worker::start(&service);
+    ask(&service, "/docs__summarize rust").await;
+    worker.stop().await;
+    assert_eq!(
+        mock.requests()[0].messages[0],
+        adam_model::Message::user_text("From the folder: rust")
+    );
+    assert_eq!(server.prompt_gets(), 0, "the prompt was never asked for");
+}
+
+/// A prompt that is not text of the user is refused as invalid params, and nothing is written.
+#[tokio::test]
+async fn a_prompt_that_is_not_text_is_refused_before_anything_is_stored() {
+    let script = adam_mcp_testkit::Script {
+        instructions: None,
+        prompts: vec![adam_mcp_testkit::TestPrompt::new("picture", "An image.").image()],
+    };
+    let server = TestHttpServer::start_scripted(None, script).await;
+    let folder = chat();
+    write_docs_mcp_json(&folder, &server.url());
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let agents = build(def_of(&folder), None, Some(worker_parts(model)))
+        .await
+        .unwrap();
+    let service = service_over(agents, &store());
+    let error = service
+        .backend
+        .submit(alice(), user("/docs__picture"), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, adam_a2a::BackendError::InvalidParams(why) if why.contains("not text")),
+        "{error:?}"
+    );
+}

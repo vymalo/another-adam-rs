@@ -36,6 +36,8 @@ pub struct BoundDef {
     step_io: Option<StepIo>,
     scrub: Option<Scrub>,
     scrub_longest: Option<crate::scrub::Longest>,
+    #[cfg(feature = "mcp")]
+    prompt_commands: Vec<adam_mcp::PromptCommand>,
 }
 
 impl std::fmt::Debug for BoundDef {
@@ -69,7 +71,16 @@ impl BoundDef {
             step_io: None,
             scrub: None,
             scrub_longest: None,
+            #[cfg(feature = "mcp")]
+            prompt_commands: Vec::new(),
         }
+    }
+
+    /// The prompts of the root's MCP servers, served as commands.
+    #[cfg(feature = "mcp")]
+    pub(crate) fn with_prompt_commands(mut self, commands: Vec<adam_mcp::PromptCommand>) -> Self {
+        self.prompt_commands = commands;
+        self
     }
 
     /// Share `value` with the tools of every agent, as
@@ -209,6 +220,8 @@ impl BoundDef {
             agents,
             info,
             remotes,
+            #[cfg(feature = "mcp")]
+            prompt_commands: self.prompt_commands,
         })
     }
 
@@ -350,6 +363,8 @@ pub struct Assembly {
     agents: Vec<LlmAgent>,
     info: Vec<AgentInfo>,
     remotes: Vec<RemoteInfo>,
+    #[cfg(feature = "mcp")]
+    prompt_commands: Vec<adam_mcp::PromptCommand>,
 }
 
 impl Assembly {
@@ -387,6 +402,15 @@ impl Assembly {
     /// The remote subagents the files name.
     pub fn remotes(&self) -> &[RemoteInfo] {
         &self.remotes
+    }
+
+    /// The prompts of the root agent's MCP servers as commands named `<server>__<prompt>`
+    /// (`commands/v1`), read once when the servers were connected. A subagent's servers give none:
+    /// commands are the root's. A server with a bearer per call, or with `prompts: false`, gives
+    /// none. Only with the feature `mcp`.
+    #[cfg(feature = "mcp")]
+    pub fn prompt_commands(&self) -> &[adam_mcp::PromptCommand] {
+        &self.prompt_commands
     }
 
     /// The manifest the root agent was made from: its skills, `mcp.json` and schedules (the

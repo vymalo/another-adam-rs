@@ -26,6 +26,7 @@ adam-model-openai.workspace = true
 adam-notify-postgres.workspace = true
 adam-runtime.workspace = true
 adam-store-postgres.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
 secrecy.workspace = true

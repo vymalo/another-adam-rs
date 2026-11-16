@@ -400,3 +400,178 @@ async fn quoted_arguments_split_as_documented() {
         ModelMessage::user_text("fast then acme app")
     );
 }
+
+/// A command whose text comes from somewhere that is asked (an MCP server's prompt).
+struct Asked {
+    calls: std::sync::atomic::AtomicUsize,
+    seen: std::sync::Mutex<Vec<Vec<String>>>,
+    answer: Result<String, adam_a2a_runtime::CommandRefusal>,
+}
+
+impl Asked {
+    fn new(answer: Result<&str, adam_a2a_runtime::CommandRefusal>) -> Arc<Self> {
+        Arc::new(Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+            answer: answer.map(str::to_owned),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl adam_a2a_runtime::RemoteCommand for Asked {
+    async fn expand(
+        &self,
+        arguments: &[String],
+    ) -> Result<String, adam_a2a_runtime::CommandRefusal> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen.lock().unwrap().push(arguments.to_vec());
+        self.answer.clone()
+    }
+}
+
+fn with_remote(command: Arc<Asked>) -> Commands {
+    let mut all = commands("Review $1");
+    assert!(all.add_remote("docs__summarize", command));
+    all
+}
+
+/// The text is asked once, when the message arrives, and stored as the message: stepping the run
+/// and reading the task never ask the server again.
+#[tokio::test]
+async fn a_remote_commands_text_is_asked_once_and_stored() {
+    let asked = Asked::new(Ok("Summarize the repository in two lines."));
+    let rig = Rig::new(Some(with_remote(asked.clone())));
+    rig.mock.push_text("ok");
+    let who = uniq("hal");
+    let task = rig
+        .backend
+        .submit(
+            plain(&who),
+            said("/docs__summarize rust \"a b\" ", "m-0", None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(asked.calls(), 1);
+    assert_eq!(
+        *asked.seen.lock().unwrap(),
+        [["rust".to_owned(), "a b".to_owned()]],
+        "split like $1 and $2, quotes respected"
+    );
+    assert_eq!(
+        rig.first_text(&plain(&who), &task, 0).await,
+        ModelMessage::user_text("Summarize the repository in two lines.")
+    );
+    // The run was stepped and the task read: the server was not asked again.
+    let _ = rig.backend.get(&plain(&who), &task.id).await.unwrap();
+    assert_eq!(asked.calls(), 1);
+}
+
+#[tokio::test]
+async fn the_metadata_form_names_a_remote_command_too() {
+    let asked = Asked::new(Ok("From the metadata."));
+    let rig = Rig::new(Some(with_remote(asked.clone())));
+    rig.mock.push_text("ok");
+    let who = uniq("ivy");
+    let task = rig
+        .backend
+        .submit(
+            activated(&who),
+            said(
+                "run it",
+                "m-0",
+                Some(json!({"command": "docs__summarize", "arguments": "x"})),
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.first_text(&activated(&who), &task, 0).await,
+        ModelMessage::user_text("From the metadata.")
+    );
+    assert_eq!(*asked.seen.lock().unwrap(), [["x".to_owned()]]);
+}
+
+#[tokio::test]
+async fn a_remote_refusal_is_invalid_params_and_an_unreachable_source_is_unavailable() {
+    let invalid = Asked::new(Err(adam_a2a_runtime::CommandRefusal::Invalid(
+        "the prompt cannot be a message: it has a message that is not text".into(),
+    )));
+    let rig = Rig::new(Some(with_remote(invalid)));
+    let error = rig
+        .backend
+        .submit(
+            plain("jon"),
+            said("/docs__summarize", "m-0", None),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, BackendError::InvalidParams(why) if why.contains("not text")),
+        "{error:?}"
+    );
+
+    let down = Asked::new(Err(adam_a2a_runtime::CommandRefusal::Unavailable(
+        "the connection to the MCP server `docs` failed".into(),
+    )));
+    let rig = Rig::new(Some(with_remote(down)));
+    let error = rig
+        .backend
+        .submit(
+            plain("kay"),
+            said("/docs__summarize", "m-0", None),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, BackendError::Unavailable { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_text_is_held_to_the_same_limits() {
+    // Too long, and empty, are invalid.
+    for text in [
+        "x".repeat(adam_a2a_runtime::MAX_COMMAND_EXPANSION + 1),
+        "  ".into(),
+    ] {
+        let mut all = commands("Review $1");
+        all.add_remote("docs__summarize", Asked::new(Ok(&text)));
+        let error = all.expand_any("docs__summarize", "").await.unwrap_err();
+        assert!(
+            matches!(error, adam_a2a_runtime::CommandRefusal::Invalid(_)),
+            "{error}"
+        );
+    }
+    // Arguments over the limit never reach the source.
+    let asked = Asked::new(Ok("fine"));
+    let all = with_remote(asked.clone());
+    let big = "a".repeat(adam_a2a_runtime::MAX_COMMAND_ARGUMENTS + 1);
+    assert!(all.expand_any("docs__summarize", &big).await.is_err());
+    assert_eq!(asked.calls(), 0);
+}
+
+/// A folder's own command wins over a prompt of the same name: the prompt is not added.
+#[test]
+fn a_folders_command_wins_over_a_prompt_of_the_same_name() {
+    let mut all = Commands::new([("docs__summarize", "From the folder: $ARGUMENTS")]);
+    let added = all.add_remote("docs__summarize", Asked::new(Ok("From the server.")));
+    assert!(!added);
+    assert_eq!(
+        all.expand("docs__summarize", "x").unwrap(),
+        "From the folder: x"
+    );
+}

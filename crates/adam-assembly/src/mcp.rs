@@ -45,6 +45,14 @@ use std::path::PathBuf;
 use adam_agent_fs::{AgentManifest, McpConfig, Subagent};
 use adam_llm_agent::ToolSet;
 
+/// The prompts of an agent's MCP servers, as commands.
+#[cfg(feature = "mcp")]
+pub(crate) type Prompts = Vec<adam_mcp::PromptCommand>;
+
+/// Without the feature there is no client to ask: no prompts, and a type that says so.
+#[cfg(not(feature = "mcp"))]
+pub(crate) type Prompts = Vec<std::convert::Infallible>;
+
 /// What was given for one agent.
 #[derive(Clone)]
 pub(crate) struct AgentMcp {
@@ -53,6 +61,12 @@ pub(crate) struct AgentMcp {
     /// this crate knows.
     pub(crate) config: Option<McpConfig>,
     pub(crate) tools: ToolSet,
+    /// What its servers said about themselves, ready to append to its instructions (empty for
+    /// tools supplied by hand). Read once, when the servers were connected, so the prompt of the
+    /// agent never changes during the process.
+    pub(crate) instructions: String,
+    /// The prompts of its servers as commands (the root's are served; a subagent's are not).
+    pub(crate) prompts: Prompts,
 }
 
 impl std::fmt::Debug for AgentMcp {
@@ -66,6 +80,8 @@ impl std::fmt::Debug for AgentMcp {
                     .map(|c| c.servers.keys().collect::<Vec<_>>()),
             )
             .field("tools", &self.tools)
+            .field("instructions", &self.instructions.len())
+            .field("prompts", &self.prompts.len())
             .finish()
     }
 }
@@ -83,7 +99,36 @@ impl McpBinding {
         config: Option<McpConfig>,
         tools: ToolSet,
     ) {
-        self.agents.insert(agent.into(), AgentMcp { config, tools });
+        self.agents.insert(
+            agent.into(),
+            AgentMcp {
+                config,
+                tools,
+                instructions: String::new(),
+                prompts: Vec::new(),
+            },
+        );
+    }
+
+    /// Tools connected from `config`, with what their servers said and the prompts they serve.
+    #[cfg(feature = "mcp")]
+    pub(crate) fn set_connected(
+        &mut self,
+        agent: impl Into<String>,
+        config: McpConfig,
+        tools: ToolSet,
+        instructions: String,
+        prompts: Prompts,
+    ) {
+        self.agents.insert(
+            agent.into(),
+            AgentMcp {
+                config: Some(config),
+                tools,
+                instructions,
+                prompts,
+            },
+        );
     }
 
     pub(crate) fn get(&self, agent: &str) -> Option<&AgentMcp> {

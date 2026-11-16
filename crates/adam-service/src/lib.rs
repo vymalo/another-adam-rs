@@ -6,6 +6,8 @@ pub mod config;
 pub mod exit;
 pub mod harden;
 pub mod logging;
+#[cfg(feature = "mcp")]
+mod prompt_commands;
 mod serve;
 mod service;
 
@@ -19,5 +21,7 @@ pub use config::{
 pub use exit::{
     EX_CONFIG, EX_GENERAL, EX_OSERR, EX_SOFTWARE, EX_UNAVAILABLE, exit_code, exit_code_with,
 };
+#[cfg(feature = "mcp")]
+pub use prompt_commands::{card_with_commands, with_prompt_commands};
 pub use serve::{Agents, Register, ServeError, claim_scope_for, serve};
 pub use service::{LiveSignals, RuntimeOptions, Service, router, router_with_options};

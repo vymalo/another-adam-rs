@@ -775,7 +775,11 @@ impl TaskBackend for RuntimeTaskBackend {
                 commands,
                 caller.has_extension(COMMANDS_EXTENSION),
             )
-            .map_err(BackendError::InvalidParams)?;
+            .await
+            .map_err(|refusal| match refusal {
+                crate::CommandRefusal::Invalid(why) => BackendError::InvalidParams(why),
+                crate::CommandRefusal::Unavailable(why) => BackendError::unavailable(why),
+            })?;
         }
         // A message that activated the extension names a tier the agent honours, or nothing is
         // written. One that did not is read as it always was.
