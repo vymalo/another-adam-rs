@@ -83,6 +83,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0044](decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) | a request is the previous one plus what happened since, so the provider's cache holds; every read is paged (`read_file`, `list_files`, `find_files`, `search_files`, `read_output`); `plan_work`, skills, commands and project instructions are built in; web and image generation stay MCP servers |
 | [0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) | a subagent can run in the background as a session: `subagent_start` returns at once, the parent keeps working and reads reports, `subagent_send` continues it with its context, and "close when done" is chosen at creation; a kept-open session lives for the thread and is announced to clients by `child-sessions/v1` |
 | [0046](decisions/0046-the-operator-lives-in-the-platform-repository.md) | the operator lives only in the platform repository: adam-rs's copy, its charts, CRDs, image and skill are removed; `deploy/coder` stays the contract |
+| [0047](decisions/0047-adam-rs-can-be-embedded-in-an-application.md) | adam-rs can be embedded in an application: a library with no protocol (`adam-engine`), the embedded set as Cargo features, a SQLite store on cratestack in its own workspace, the host's model client, and ports for secrets, approvals and the tools' workspace (proposed; nothing is built) |
 
 ## Keeping these docs short and true
 
