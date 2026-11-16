@@ -125,6 +125,8 @@ jobs:
         run: npm --prefix tools/docs-check ci --no-fund --no-audit
       - name: Check diagrams and links
         run: node tools/docs-check/check-docs.mjs
+      - name: Check the vendored UI catalogs against the published files
+        run: sh tools/check-vendored-catalogs.sh
 
   conformance:
     runs-on: ubuntu-latest

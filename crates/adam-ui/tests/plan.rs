@@ -29,12 +29,12 @@ const V5: Fixture = Fixture {
     lock: include_str!("fixtures/catalog-v5.lock.json"),
 };
 const V6: Fixture = Fixture {
-    document: include_str!("fixtures/catalog-v6.json"),
-    lock: include_str!("fixtures/catalog-v6.lock.json"),
+    document: include_str!("fixtures/checklist-subset-v6.json"),
+    lock: include_str!("fixtures/checklist-subset-v6.lock.json"),
 };
 const V7: Fixture = Fixture {
-    document: include_str!("fixtures/catalog-v7.json"),
-    lock: include_str!("fixtures/catalog-v7.lock.json"),
+    document: include_str!("fixtures/checklist-subset-v8.json"),
+    lock: include_str!("fixtures/checklist-subset-v8.lock.json"),
 };
 
 impl Fixture {

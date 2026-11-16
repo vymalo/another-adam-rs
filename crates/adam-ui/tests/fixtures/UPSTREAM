@@ -1,0 +1,19 @@
+# Where the vendored files come from. Each `catalog-vN.json` is a byte-for-byte copy of
+#   vymalo/another-agentic-system : web/src/features/chat/lib/a2ui/catalog/catalog.json
+# at the commit named here (the commit that set that catalog version), with the digest of its
+# canonical JSON (`catalog_digest`) that `catalog-vN.lock.json` holds.
+# `tools/check-vendored-catalogs.sh` compares each file with the published one (CI, job `docs`);
+# `tests/ask_v7.rs` compares each digest with its lock.
+#
+# <file>  <commit>  <digest>
+catalog-v2.json  d8f7ccb7e2568f1843c4563b500c0fc13f540e0c  sha256:4ed91bcc9db52d5e2262aef2091d2b3eeccbf5bfe51519d7326fdc6641fb7856
+catalog-v3.json  1e876417cae8c1f2639dbb4fb0379bc4c0c74c05  sha256:9f65f9e6ddd424688b1cf61c47634eafee321a3b6736fb7fea8c0f7db1fc7579
+catalog-v5.json  62aeb754980036d94bbe72a75ee33f1eeabf0368  sha256:14ec7c0dff6cb44e0f6c7a3b4793abcadfeacff0c97b3c0db26f11ee008ffadf
+catalog-v6.json  cf1f4fc37a236a87c9470b062ad6864dc7dd8231  sha256:f0baf255994b3c80144a5f3db634f06bce37253eb43efb4a85b33c47628c105d
+catalog-v7.json  5ed8950f09383220cc1bca26c7798b0c7ea135c7  sha256:6df9a37d0ae6fa53b8d22145dc1b5674b6d3f228d1c1b83b2ec640d7b3093d49
+
+# `choices-v7-vectors.json` is not a copy. It holds the `json` blocks `vectors` (133 cases),
+# `whole-answers`, `invalid-questions`, `surfaces`, `questions` and `answers` of
+#   vymalo/another-agentic-system : docs/api/ui-catalog-v1.md
+# at 5ed8950f09383220cc1bca26c7798b0c7ea135c7, under the keys `vectors`, `wholeAnswers`,
+# `invalidQuestions`, `surfaces`, `questions` and `answers`, in that order.

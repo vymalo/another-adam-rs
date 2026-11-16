@@ -4628,13 +4628,13 @@ async fn a_secret_in_a_plan_is_scrubbed_before_the_surface_cuts_it() {
         ),
         (
             "checklist, no note",
-            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v6.json"),
-            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v6.lock.json"),
+            include_str!("../../../crates/adam-ui/tests/fixtures/checklist-subset-v6.json"),
+            include_str!("../../../crates/adam-ui/tests/fixtures/checklist-subset-v6.lock.json"),
         ),
         (
             "checklist with note",
-            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v7.json"),
-            include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v7.lock.json"),
+            include_str!("../../../crates/adam-ui/tests/fixtures/checklist-subset-v8.json"),
+            include_str!("../../../crates/adam-ui/tests/fixtures/checklist-subset-v8.lock.json"),
         ),
     ];
     for (name, document, lock) in catalogs {

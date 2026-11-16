@@ -21,8 +21,8 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 const CATALOG_ID: &str = "https://agents.vymalo.com/a2ui/catalogs/chat";
-const FIXTURE: &str = include_str!("fixtures/catalog-v6.json");
-const LOCK: &str = include_str!("fixtures/catalog-v6.lock.json");
+const FIXTURE: &str = include_str!("fixtures/checklist-subset-v6.json");
+const LOCK: &str = include_str!("fixtures/checklist-subset-v6.lock.json");
 
 fn as_doubles(value: &Value) -> Value {
     match value {
