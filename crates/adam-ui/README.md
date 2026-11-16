@@ -37,6 +37,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 | `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1` (the host's promise that a message sent to a running task is read and never lost; `adam-llm-agent` keeps it) |
 | `A2UI_VERSION` | `v0.9.1`: the version the surfaces are written for |
 | `ask_surface_id(call_id)` | the id of the surface `ask_user` draws its form on for a call: `ask-` and the call's id as an identifier (at most 64 characters). A form's answer names it (`(form ask-<id>)`), so a host that holds the call can tell whether the answer is for the question it asked |
+| `ask_retry_surface_id(call_id, n)`, `ask_attempt(surface)`, `is_ask_surface_of(call_id, surface)` | the surface of a form asked again after its answer was refused (`ask-<id>.r<n>`, still at most 64 characters after `ask-`), how many times a surface was asked again, and whether a surface is a call's form or one of its re-asks |
 | `comparable(text)`, `is_format_or_control(c)` (re-exported from `adam-a2a-runtime`, which marks typed lines with them) | `text` as it is compared with a typed question's default: without whitespace and without control or format characters (U+FEFF, the zero-width and bidirectional marks), in lowercase; the characters are those of Unicode categories Cc and Cf (*verified 2026-10-11*, Python 3's `unicodedata`, Unicode 14.0, widened for later versions) |
 
 ## Wiring
@@ -68,13 +69,50 @@ inbound function reads a screen's action as JSON text.
   agent shared in the conversation (never a URL), `icon` one of the `steps/v1` icon ids. Ids and values are made when
   omitted: `q1`, `q2`, and a slug of the label, made unique; a `default` may name an option by its value or its label.
 
+  **Five more kinds** (catalog version 7, `docs/api/ui-catalog-v1.md` of `vymalo/another-agentic-system`), all in the same
+  flat argument schema, which does not change with the screen:
+
+  | `type` | Members | The answer's `values` |
+  |---|---|---|
+  | `confirm` | `yesLabel`, `noLabel` (1 to 40 characters); `default` `"yes"` or `"no"`, the safe answer (a label also names it) | `["yes"]` or `["no"]` |
+  | `number` | `minValue`, `maxValue`, `step`, `unit` (1 to 20 characters); `default` | one decimal: `["12.5"]` |
+  | `scale` | `from` (0 or 1, 1 when absent), `to` (2 to 10, required, above `from`), `fromLabel`, `toLabel` (1 to 60); `default` | one whole number: `["4"]` |
+  | `date` | `minDate`, `maxDate` (`YYYY-MM-DD`); `default` | one day: `["2026-12-15"]` |
+  | `rank` | `options`: 2 to 12, no `image`; `default`: every option once, the order the list starts in | every option's value once, in the person's order |
+
+  A decimal is a string in the form and in the answer (`-?(0|[1-9][0-9]{0,14})(\.[0-9]{1,6})?`; zero has no sign); the model
+  may write a JSON number and it is turned into that string. A member of one kind on another type, a `default` of the wrong
+  shape or one the kind would refuse as an answer, `minValue` above `maxValue`, a `step` of zero, a day that does not exist and
+  the like are refused before the form is drawn. **Which kinds the screen takes is read from its `Choices` schema, one
+  kind at a time** (a question with every member of the kind is validated), never from the version number. A kind the
+  screen lacks is asked as the nearest version 6 form: `confirm` and `scale` as radio buttons (`yes`, `no`; one option per
+  point, the ends carrying their words), `number` and `date` as a `text` question whose `help` says the unit, the bounds and
+  the format, `rank` as a `text` question whose `help` numbers the options (when they do not fit in 300 characters the whole form
+  goes as words). On a screen of version 2 to 4 a form that has a typed question goes as words. As words each kind reads
+  `(yes: "Delete it" / no: "Keep it"; the safe answer is no)`, `(a number from 0 to 1000 EUR, in steps of 0.5)`,
+  `(a whole number from 0 "Not at all" to 10 "Certainly")`, `(a day, YYYY-MM-DD, from 2026-12-01 to 2026-12-31)` and, for a
+  rank, the options numbered and "answer with their numbers in order".
+
+  **The answer is read again by the agent** ([`Tool::read_answer`](../adam-llm-agent/README.md); the orchestrator relays an
+  answer and reads none of it). The form is rebuilt from the call's own arguments, which the history holds. The rules are the
+  catalog's, tried in its order for each question: `unknown`, `unexpected`, `required`, `too_many`, `not_offered`, `grammar`,
+  `below_min`, `above_max`, `off_step`, `not_a_permutation` (`src/ask/answer.rs`). Decimals are exact integers of millionths,
+  never floats, and nothing is trimmed or repaired. An answer that breaks a rule is **not used**: the run stays parked, the
+  person reads `The answer to "budget" ("What is the monthly budget?") was not used (above_max): 1500 is above the most,
+  1000 EUR.` and the question, and is asked the same form again on a new surface `ask-<call id>.r<n>` (`ask_retry_surface_id`,
+  `is_ask_surface_of`) with each question they got right as its `default`. The model is not woken and sees nothing of the
+  refused answer; the loop journals `answer_refused {call_id, question, rule}`. Words, a form that went out as text, and a
+  form with none of the five kinds are not judged: the older types are not covered by the contract. A kind the screen lacked
+  is judged when it was asked as radio buttons (`confirm`, `scale`) and left to the model when it came back as typed words.
+
   | Limit | |
   |---|---|
   | questions | 8 |
   | options of `single` and `multiple` | 2 to 12 |
   | options of `select` | 2 to 50 |
   | options of `images` | 2 to 16, each with an `image` |
-  | options of `text` and `longText` | none |
+  | options of `rank` | 2 to 12, none with an `image` |
+  | options of `text`, `longText`, `confirm`, `number`, `scale` and `date` | none |
 
   These are the rules the web's validator holds a surface to, and the tool refuses what the web would refuse **before** it
   asks, in words the model can act on (`question \`db\` has 13 options; a radio or checkbox question needs 2 to 12 (use
@@ -233,8 +271,9 @@ Plan: Fix the date parser          ("Plan" alone when there is no title)
   2026-11-14, as that version is in review there): a `createSurface` for a surface that exists starts it over, and a surface
   whose id starts with `plan-` (and has at least one more character) is a plan, drawn from its newest copy (where a screen draws it is the screen's rule); a plan may
   hold no form, input or button, and this crate draws only `Checklist`, `Column` and `Text`. The `Checklist` is a component of
-  version 6 of that catalog (*unverified*: the fixtures of this repository stop at version 5, and
-  `tests/fixtures/catalog-v6.json` and `catalog-v7.json` are hand-written subsets, see `tests/fixtures/README.md`).
+  version 6 of that catalog (`tests/fixtures/catalog-v6.json` is the published file, see `tests/fixtures/UPSTREAM`;
+  the plan's own tests also use the hand-written `Checklist` subsets `checklist-subset-v6.json` and `-v8.json`, see
+  `tests/fixtures/README.md`).
 * **The plan in the state is scrubbed when it is written**: a secret the redactor learns later stays in `Conversation::plan` until the next plan call writes it again; every result and surface is scrubbed again when it is made.
 * **Scrub, then cut.** The surface is a pure function of `(plan, catalog)` (`plan_surface`), and the plan it is given has
   **already been scrubbed**: each call runs `ToolCtx::scrub` (the redaction layer around the tool sets it, the coder's
@@ -344,9 +383,17 @@ stateDiagram-v2
   keeps the reason: the middle of the value is elided (`src/catalog.rs`, unit tests).
 * `tests/plan.rs`: the plan tools (see *The plan*): the exact result of each call and of each refusal, ids that do not shift,
   the limits at their edges (characters, not bytes), ids as strings, a subagent, no screen, and the surface on four screens
-  (`catalog-v5.json`: `Column` and `Text`; `catalog-v6.json`: a `Checklist` with no `dropped` and no `note`, so a dropped item
-  is left out and counted and a long note is cut inside the label limit; `catalog-v7.json`: a `Checklist` that allows both),
+  (`catalog-v5.json`: `Column` and `Text`; `checklist-subset-v6.json`: a `Checklist` with no `dropped` and no `note`, so a dropped item
+  is left out and counted and a long note is cut inside the label limit; `checklist-subset-v8.json`: a `Checklist` that allows both),
   and the specs, pinned byte for byte.
+* `tests/ask_v7.rs`, `tests/ask_answers.rs` and `src/ask/vectors.rs`: the five kinds against the published catalogs of
+  versions 7, 6, 5 and 2 (byte copies, `tests/fixtures/UPSTREAM`; `tools/check-vendored-catalogs.sh` compares them with
+  the published files in CI): the contract's own example form is a valid instance and a golden file
+  (`tests/golden/ask_form_v7.json`), the nearest older form on versions 6 and 5, words on version 2 and with no catalog,
+  the models' mistakes in words; a whole agent behind A2A that refuses an answer, asks again on `ask-<id>.r1` with the
+  right answers as defaults, never wakes the model, and reads words unchecked; each rule of the catalog; and the
+  catalog's **133 conformance vectors** and its whole-answer, invalid-question and surface blocks
+  (`tests/fixtures/choices-v7-vectors.json`, a test fails when a case is deleted).
 * `tests/agent.rs`: a whole agent behind A2A over the fake thread-tools endpoint of
   [`adam-mcp-testkit`](../adam-mcp-testkit/README.md): the three questions as one form, the person's answer as an
   action and the model's next words, a tool the endpoint lists offered and called, a refetch over the thread tools,

@@ -62,7 +62,18 @@ read the exact strings in the file at your rev.
    orchestration layer's UI catalog version 8 and *unverified* against the published page, 2026-11-14: a `createSurface`
    for a surface that exists starts it over, and a surface whose id starts with `plan-` (plus at least one character) is a
    plan, drawn from its newest copy (where a screen draws it is the screen's rule), which may hold no form, input or
-   button);
+   button). **`ask_user` has eleven kinds of question** in one argument schema that never changes with the screen: the six
+   of version 5 and `confirm`, `number`, `scale`, `date` and `rank`, which need the screen's `Choices` to list them (catalog
+   version 7; the agent asks the schema one kind at a time, not the version number). A screen without a kind is asked the
+   nearest version 6 form (`confirm` and `scale` as radio buttons, `number`, `date` and `rank` as typed words) or words,
+   and the agent checks the answer itself, by the catalog's rules, in its order (`unknown`, `unexpected`, `required`,
+   `too_many`, `not_offered`, `grammar`, `below_min`, `above_max`, `off_step`, `not_a_permutation`; decimals exactly, a
+   `date` is a day `YYYY-MM-DD`, nothing is trimmed). **An answer that breaks a rule is not used**: the task stays
+   `input-required`, a message says which question and rule (`The answer to "budget" ... was not used (above_max): ...`),
+   and the same form comes again on a new surface `ask-<call id>.r<n>` with what was right as `default`s. A client
+   therefore sees a second `input-required` with a new `surfaceId` and answers on that one; it never needs to repeat
+   the old answers. The orchestrator relays an answer and checks none of it. See `crates/adam-ui/README.md` ("The tools")
+   and the contract page `ui-catalog-v1.md` in the docs/api directory of `vymalo/another-agentic-system`;
    `adam-a2a-runtime` (`crates/adam-a2a-runtime/README.md`) reads the messages a screen sends
    (`vymalo_inbound`), reports steps, streamed text and tokens ("Usage"), and implements steering ("Steering a
    running task": a message to a finished task is `UnsupportedOperation`, `-32004`; to a working

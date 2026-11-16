@@ -95,6 +95,28 @@ Artifacts:
 * A shared file (`share_file`): one A2A `raw` part with `mediaType` and `filename`, capped at 4 MiB a file
   and 6 MiB a run, never shown to the model ([ADR 0012](../decisions/0012-files-as-a2a-artifacts.md)).
 
+### Asking, giving and showing
+
+Three tools reach the person's screen. Each description says when to use it, when not, the limits and gives one example; the
+prompt (`agent/instructions.md`) says only which is which, and the descriptions are pinned by
+`bin/adam-coder/tests/fixtures/tool-specs/`.
+
+| The person needs | Tool | Not for |
+|---|---|---|
+| to answer a question | `ask_user` | a statement or a result |
+| a file to look at or keep | `share_file` (4 MiB a file, 6 MiB a task) | what fits in a reply, a file that goes into the pull request |
+| an arrangement drawn beside the answer | `show` (at most 16 blocks) | a question, a file to keep: a shared image goes in an `Image` block by its sha256 |
+
+`ask_user` has eleven kinds of question: `single`, `multiple`, `select`, `images`, `text` and `longText`, and `confirm`,
+`number`, `scale`, `date` and `rank` ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 6;
+[`adam-ui`](../../crates/adam-ui/README.md) has their members and limits). The schema is one value for every screen. A screen
+whose `Choices` lacks a kind gets the nearest older form, or words. The coder reads the answer to a form
+before the model does: an answer that breaks a rule of the catalog (a number out of its range, a day outside its bounds, a rank
+that is not every option once) is **not used**. The person is told which question and why, in a message of the same task, and
+is asked the same form again on a new surface (`ask-<call>.r<n>`) with what they got right as its defaults; the run stays
+`input-required`, the model is not woken, and the journal has `answer_refused {call_id, question, rule}`. Words and the older
+types are the model's to read as before.
+
 ## The same flow as states
 
 The states are not stored as an enum: they follow from the per-run notes (failures counted, last check and
