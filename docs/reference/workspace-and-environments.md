@@ -66,7 +66,8 @@ A run's files are `<root>/workspaces/<run>/`, a directory of **slots**
 repository on the run's branch `agent/<run-short-id>`, a **scratch project**: a local git repository
 with an empty root commit, where work can start before anyone names a repository, or a **reference**: a
 repository to read beside the one the run works on, checked out detached with no branch of its own and never
-written. A run has at most one slot per repository it works on; slots keep the order they joined.
+written. A run has at most one slot per repository it works on (and may also hold a reference of it: the address
+reaches the working copy, the reference's own name reaches the reference); slots keep the order they joined.
 
 * The workspace lives as long as the run and is deleted when it ends (the janitor), **except its scratch projects**:
   a scratch project lives for the conversation. The next task of the same A2A context takes it over (its first step
@@ -99,7 +100,9 @@ stateDiagram-v2
 ```
 
 `Reading` is a workspace that holds references and nothing to work in: a read tool works in a reference, and a tool
-that writes says there is nothing to write to.
+that writes says there is nothing to write to. A **devcontainer** has nothing to run in there either (a reference has
+no devcontainer of its own, and `run_command` needs a repository or a project); a run pod works, and mounts the
+reference read-only.
 
 ### References
 
@@ -132,7 +135,7 @@ sequenceDiagram
     P-->>T: yes
     M->>T: read_file { repo: "lib" }
     T->>W: add_reference (the recorded address)
-    T-->>M: the file
+    T-->>M: the file, and the commit it holds
     M->>T: write_file { repo: "lib" }
     T-->>M: refused: a reference is read and never changed
 ```
@@ -152,7 +155,17 @@ stateDiagram-v2
 * **Reading.** `read_file`, `list_files`, `find_files`, `search_files` and `share_file` take the reference's name as
   `repo`; the first read checks it out, under the lowest access tier (`plan`), through the coder's own git (its
   sandbox, when there is one) and never in a run pod. A run with one repository and one reference still defaults to the
-  repository for a write and for a read that names no slot.
+  repository for a write and for a read that names no slot. The repository's address reaches the reference too, until
+  the run works in that repository: then the address is the working copy's, and the reference keeps its name.
+* **The commit.** The first read says which commit the reference holds, and the run's notes keep it. A reference
+  made again (its directory was lost) is checked out at that commit and says so; a commit that is gone from the
+  repository is said and nothing is moved to another. The reference never follows the branch within a run.
+* **A pod that already runs.** The slot is told to the run's pod when the reference is made, and a pod with a command
+  running cannot take it: the result of that first read says the pod does not mount it yet, and the next command makes
+  the pod again. Until then a command already running there sees the directory as writable.
+* **Names.** A name that is also the directory of another slot is never answered with that slot. A repository's own
+  declaration of such a name is not offered (the listing says why); for a reference the agent or the deployment
+  declares, the lookup says that the name is both and reads neither.
 * **What the model is told.** The names and descriptions of the references the process knows at start are part of the
   system prompt, the same words on every turn and before anything that changes with a message, so the stable prefix
   holds. A repository's own references reach the model only in the result of the `prepare_workspace` that found them.
@@ -168,8 +181,19 @@ stateDiagram-v2
 * **What a reference holds is somebody else's text.** Reading grants no repository, tier or consent, and its own
   `AGENTS.md` is not shown as the repository's instructions are. A repository's declaration is its text too: it is
   listed under a header that says so, its address is checked like a repository's (allowed hosts, the owners a GitHub App
-  acts for, no credentials) and must be http(s), never a path or a `file://` address, and the address fetched is the one
-  recorded when the repository was prepared, never one the model gives.
+  acts for, no credentials) and must be http(s), never a path, a `file://` address, a query string or a fragment, and the
+  address fetched is the one recorded when the repository was prepared, never one the model gives.
+* **What the person's yes is.** A yes to `request_repository` with `reference` is a yes to reading **that address at
+  that branch**, shown in the question, and to nothing else: another branch of one repository is another question, and
+  the yes names no repository to work on, whether it came as a click or as typed words (`Yes, read acme/lib`):
+  `prepare_workspace` of it is still refused. A no is final for the run.
+* **The bound on a repository's reference.** A reference a repository declares is fetched with the same credentials as
+  a repository (a GitHub App's installation token for the address's owner). Three things bound it: the person's yes to
+  the exact address and branch the question shows, the workspaces' policy for the address (allowed hosts, the owners a
+  GitHub App acts for), and an http(s) address with no credentials. Nothing ties the reference's owner or its
+  visibility to the repository that declared it, and what the agent reads there can end up in what it writes (a commit,
+  a pull request): the question says so. A declaration of the agent's or the deployment's files is not asked about at
+  all, and is checked against the same policy at startup (exit 78 naming the reference).
 
 The janitor (`bin/adam-coder/src/janitor.rs`, a worker component) sweeps at startup and every
 `WORKSPACE_SWEEP_SECS` (default 300; `0` is off): it removes the workspace of a run that is `done`,

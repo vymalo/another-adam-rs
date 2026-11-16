@@ -181,11 +181,14 @@ only (on a subagent it is a warning and ignored), and an agent that does not run
 | Key | |
 |---|---|
 | `name` | the name the model passes as `repo` to read it: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64 characters, not ending in `.git` |
-| `url` | `https://host/owner/repo`, at most 500 characters, no whitespace and **no credentials** (an error at load) |
+| `url` | `https://host/owner/repo`, at most 500 characters, no whitespace, **no credentials, no query string and no fragment** (an error at load) |
 | `branch` | optional: the branch it is read at; absent, the repository's default branch |
 | `description` | required, one line of at most 200 characters: what it holds and when to read it. The model reads it |
 
 At most 16 references, a name once. A mistake is an error at load, which is exit 78 for a process that reads the folder.
+The coder also checks each address against its workspaces' policy at startup (an allowed host, an owner a GitHub App
+acts for): one it could never read is exit 78 naming the reference. **`adam-agent` does not serve references**: it
+reads them, logs one warning at start that only `adam-coder` reads them, and the agent never sees them.
 The deployment adds more with `ADAM_REFERENCES_FILE` ([Environment](environment.md)), and a repository declares its own in
 `.agents/references.json`, which the person must agree to. A folder without `references:` has the digest it had before
 references existed.

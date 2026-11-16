@@ -70,6 +70,10 @@ Rules worth knowing:
   is that subagent's tool; `files: true` in its file passes the files of its answer (a screenshot) on, and they
   reach the person only from the root's own remotes: a subagent's stay on its run
   ([Remote subagents](../reference/agent-files.md#remote-subagents-a2a)).
+* **References** (`references:` in the root's frontmatter) are repositories the **coder** reads beside the one it works
+  on and never writes: a `name`, a `url`, an optional `branch` and a one-line `description` each. `adam-agent` does not
+  serve them (it logs one warning), so use them in a coder's folder
+  ([format](../reference/agent-files.md#references-references), [how they are read](../reference/workspace-and-environments.md#references)).
 * **A subagent of Adam shares its root run's workspace**: `bin/adam-coder/agent/subagents/` has two read-only ones
   (`explorer`, `reviewer`) that read the worktree the calling run prepared.
 * **The agent already has** `ask_user`, `show` and `ui_catalog` (the person's screen), `plan_work`, `plan_check` and
