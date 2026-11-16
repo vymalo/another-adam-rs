@@ -294,6 +294,11 @@ pub(crate) struct ExecState {
     pub(crate) commands: Vec<(String, Vec<String>)>,
     /// What `adam-exec active` answers: a count, or `None` to fail.
     pub(crate) active: Option<u32>,
+    /// How many of `active` are commands that outlive their call (`bg-` ids): `active-fg` leaves
+    /// them out.
+    pub(crate) background: u32,
+    /// An `adam-exec` of an older image: it has no `active-fg` and answers with its usage line.
+    pub(crate) without_active_fg: bool,
     /// What every other command answers: its exit code.
     pub(crate) code: i32,
 }
@@ -310,6 +315,24 @@ impl PodExec for FakeExec {
     ) -> Result<Captured, ExecError> {
         let mut state = self.0.lock().unwrap();
         state.commands.push((pod.to_owned(), argv.clone()));
+        if argv.get(1).map(String::as_str) == Some("active-fg") {
+            if state.without_active_fg {
+                return Ok(Captured {
+                    status: ExitStatus::Code(2),
+                    stdout: String::new(),
+                    stderr: "adam-exec: usage: adam-exec run|shell|kill|chown|active ...\n"
+                        .to_owned(),
+                });
+            }
+            return match state.active {
+                Some(n) => Ok(Captured {
+                    status: ExitStatus::Code(0),
+                    stdout: format!("{}\n", n.saturating_sub(state.background)),
+                    stderr: String::new(),
+                }),
+                None => Err(ExecError::Start("the pod is not there".to_owned())),
+            };
+        }
         if argv.get(1).map(String::as_str) == Some("active") {
             return match state.active {
                 Some(n) => Ok(Captured {
@@ -1660,6 +1683,95 @@ mod tests {
         assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
     }
 
+    /// A development server a run started to keep running is not a command that holds the pod: a new
+    /// slot makes the pod again, and the server ends with it.
+    #[tokio::test]
+    async fn a_new_mount_deletes_a_pod_with_only_background_commands() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        ws.add_repository(&fx.remote("alpha")).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        ws.add_repository(&fx.remote("beta")).await.unwrap();
+
+        // Two live records, both of them `bg-`: nothing the run waits for.
+        {
+            let mut exec = fx.exec.lock().unwrap();
+            exec.active = Some(2);
+            exec.background = 2;
+        }
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!((fx.requests("POST"), fx.requests("DELETE")), (2, 1));
+        let commands = fx.exec.lock().unwrap().commands.clone();
+        assert_eq!(
+            commands.last().map(|(_, argv)| argv.clone()),
+            Some(["/opt/adam/bin/adam-exec", "active-fg"].map(str::to_owned).to_vec()),
+            "the question for a new slot leaves the background commands out"
+        );
+
+        // A command that is not one of them still holds the pod.
+        ws.add_repository(&fx.remote("gamma")).await.unwrap();
+        {
+            let mut exec = fx.exec.lock().unwrap();
+            exec.active = Some(2);
+            exec.background = 1;
+        }
+        let error = fx
+            .env
+            .ensure(&ws, &Steps::default())
+            .await
+            .err()
+            .expect("a foreground command runs");
+        assert!(error.to_string().contains("command is running"), "{error}");
+        assert_eq!(fx.requests("DELETE"), 1);
+    }
+
+    /// The idle sweep asks `active`, which counts every command: a pod with a development server in
+    /// it is never idle.
+    #[tokio::test]
+    async fn the_idle_sweep_spares_a_pod_with_a_background_command() {
+        let fx = fixture(idle_settings(Duration::from_millis(20)));
+        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
+        {
+            let mut exec = fx.exec.lock().unwrap();
+            exec.active = Some(1);
+            exec.background = 1;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(fx.env.reap_idle().await.unwrap().is_empty());
+        assert_eq!(fx.pod_names().len(), 1);
+        let commands = fx.exec.lock().unwrap().commands.clone();
+        assert_eq!(
+            commands.last().map(|(_, argv)| argv.clone()),
+            Some(["/opt/adam/bin/adam-exec", "active"].map(str::to_owned).to_vec())
+        );
+    }
+
+    /// A pod made by an older image has an `adam-exec` that does not know `active-fg`: it cannot be
+    /// asked, and the caller waits as it did before.
+    #[tokio::test]
+    async fn an_adam_exec_without_active_fg_waits_as_before() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        ws.add_repository(&fx.remote("alpha")).await.unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        ws.add_repository(&fx.remote("beta")).await.unwrap();
+        {
+            let mut exec = fx.exec.lock().unwrap();
+            exec.active = Some(0);
+            exec.without_active_fg = true;
+        }
+        let error = fx
+            .env
+            .ensure(&ws, &Steps::default())
+            .await
+            .err()
+            .expect("it cannot be asked");
+        assert!(matches!(error, EnvError::Unavailable(_)), "{error}");
+        assert_eq!(error.class(), ErrorClass::Transient);
+        assert!(error.to_string().contains("active-fg"), "{error}");
+        assert_eq!(fx.requests("DELETE"), 0, "the pod is not deleted unasked");
+    }
+
     #[tokio::test]
     async fn a_pod_made_before_mounts_were_recorded_is_made_again_and_a_spare_mount_is_harmless() {
         let fx = fixture(settings());
@@ -1990,6 +2102,20 @@ mod tests {
             .prepare(&ExecSpec::shell("true", ws.path()))
             .unwrap();
         assert_ne!(a.exec, b.exec);
+        // A process that outlives its call has `bg-` in front of the same id, and it is what
+        // `adam-exec` is told (it names its record after it).
+        let kept = session
+            .prepare(&ExecSpec::shell("npm run dev", ws.path()).background())
+            .unwrap();
+        assert!(kept.exec.is_background() && kept.exec.as_str().starts_with("bg-kp-"));
+        assert!(!a.exec.is_background());
+        assert!(
+            kept.args
+                .iter()
+                .any(|arg| arg.to_string_lossy() == kept.exec.as_str()),
+            "{:?}",
+            kept.args
+        );
         for cwd in [
             Path::new("/work/workspaces/another-run"),
             Path::new("/etc"),

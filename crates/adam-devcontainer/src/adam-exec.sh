@@ -10,10 +10,15 @@
 #   adam-exec kill  <id>                                 stop what `run` or `shell` started
 #   adam-exec chown <uid> <gid> <dir>                    give a directory tree to <uid>:<gid> (as the host sees them)
 #   adam-exec active                                     print how many commands started by `run` or `shell` are alive
+#   adam-exec active-fg                                  the same, without the commands whose id starts with `bg-`
 #
 # `active` is for adam-env-kubernetes, which deletes a run's pod when no command used it for a while
 # and must not do so under a build that is still running (a devcontainer is removed with its run, and
-# never asks).
+# never asks). `active-fg` is for the other question it asks, whether the pod may be made again for a
+# slot it does not mount: a command the run started to keep running (a development server, id
+# `bg-...`) keeps the pod from the idle sweep, and never from a new slot (the pod is made again and the
+# server ends with it). An older adam-exec has no `active-fg` and fails with the usage line: the caller
+# reads that as "cannot be asked" and waits, as it did before.
 #
 # Every word of the command after <cwd> carries a leading ":" that is removed here. The devcontainer
 # CLI reads its command line with an option parser, which would take an argument such as "--version"
@@ -169,11 +174,18 @@ kill)
     done
     exit 0
     ;;
-active)
-    [ $# -eq 1 ] || fail "usage: adam-exec active"
+active | active-fg)
+    [ $# -eq 1 ] || fail "usage: adam-exec $cmd"
     n=0
     for record in "$dir"/*.pid; do
         [ -f "$record" ] || continue
+        # A command that was started to outlive its call is not counted by `active-fg`.
+        if [ "$cmd" = active-fg ]; then
+            name=${record##*/}
+            case $name in
+            bg-*) continue ;;
+            esac
+        fi
         pid=
         started=
         read -r pid started <"$record" || true
@@ -209,6 +221,6 @@ chown)
     exec chown -hR "$inner_uid:$inner_gid" "$4"
     ;;
 *)
-    fail "usage: adam-exec run|shell|kill|chown|active ..."
+    fail "usage: adam-exec run|shell|kill|chown|active|active-fg ..."
     ;;
 esac

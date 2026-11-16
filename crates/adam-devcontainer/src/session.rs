@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 
 use adam_workspace::{
     EnvDescription, EnvError, EnvKind, EnvSession, ExecId, ExecSpec, PreparedCommand, Program,
+    exec_id_for,
 };
 use async_trait::async_trait;
 
@@ -73,9 +74,10 @@ pub(crate) struct DevSession {
 }
 
 impl DevSession {
-    fn exec_id(&self) -> ExecId {
+    /// `dc-<epoch>-<n>`, and `bg-dc-<epoch>-<n>` for a process that outlives its call.
+    fn exec_id(&self, spec: &ExecSpec) -> ExecId {
         let n = self.inner.counter.fetch_add(1, Ordering::Relaxed);
-        ExecId::new(format!("dc-{}-{n}", self.inner.epoch))
+        exec_id_for(spec, "dc", format!("{}-{n}", self.inner.epoch))
     }
 }
 
@@ -141,7 +143,7 @@ impl EnvSession for DevSession {
         remote.insert("GIT_CONFIG_KEY_0".to_owned(), "safe.directory".to_owned());
         remote.insert("GIT_CONFIG_VALUE_0".to_owned(), "*".to_owned());
 
-        let id = self.exec_id();
+        let id = self.exec_id(spec);
         let mut args = vec![OsString::from("exec")];
         args.extend(common_args(
             &self.inner,

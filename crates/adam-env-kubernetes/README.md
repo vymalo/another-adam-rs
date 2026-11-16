@@ -67,7 +67,7 @@ the pod that is there. A dropped call leaves nothing a later call cannot use.
 | not ready in `ready_timeout`, and a container's image is refused or its configuration is wrong (`ErrImagePull`, `ImagePullBackOff`, `InvalidImageName`, `CreateContainerConfigError`, ...) | the pod is deleted; `EnvError::Build` with the reason |
 | not ready in `ready_timeout`, only slow | `EnvError::Timeout { phase: "start" }`; the pod stays, the next `ensure` waits for it again |
 | the pod ended (`Failed`, `Succeeded`: evicted) | it is deleted and made again |
-| the run's workspace needs a mount the pod lacks (a slot added since, or a slot made again under the same name; a pod made before mounts were recorded) and no command runs in the pod (`adam-exec active`) | the pod is deleted and made again, with a step that says why; the files are on the volume |
+| the run's workspace needs a mount the pod lacks (a slot added since, or a slot made again under the same name; a pod made before mounts were recorded) and no command runs in the pod (`adam-exec active-fg`: a command started with `ExecSpec::background`, id `bg-kp-...`, a development server, does not count) | the pod is deleted and made again, and a background command ends with it, with a step that says why; the files are on the volume |
 | ... and a command runs in it, or it cannot be asked | `EnvError::Unavailable` (class `Transient`): the coder waits as it waits for a slot, and the pod is made again when the command ends |
 | the run's directory is not below where the template mounts the volume | `EnvError::Refused`: `WORKSPACE_ROOT` and the template disagree |
 
@@ -139,7 +139,7 @@ the run's commands rename the new slot's directory until the next command. The c
 slot (`prepare_workspace`, `start_scratch`, `publish_scratch`, a conversation's scratch projects taken over by a later task).
 `seal` is a **provided** method of the trait with a default that does nothing, so it breaks no implementation. Here it takes the
 run's lock, looks for the run's pod and, if the pod lacks a mount the workspace needs now, deletes it when no command runs in it
-(`adam-exec active`); the next `ensure` makes the new one. While a command runs, or when the pod cannot be asked, it answers
+(`adam-exec active-fg`); the next `ensure` makes the new one. While a command runs, or when the pod cannot be asked, it answers
 `EnvError::Unavailable` (the slot stays; the coder says so in the tool's result and the next command waits for the command to end).
 It **never makes a pod**, and leaves alone a run with no pod, a pod that is going away or over, a pod that has every mount, and a pod
 of another run.
@@ -195,7 +195,7 @@ A pod that **no command used for `Settings::idle`** (900 seconds) is deleted by 
 `Settings::reap_every`, and the next `ensure` makes another: the files are on the volume. The clock is this process's (every
 `ensure`, `prepare` and `kill` of the run restarts it; a pod this process has not seen yet starts its clock when it is first
 seen), the sweep only looks at pods whose `adam.vymalo.com/worker` annotation is this worker, and a pod is asked, with
-`adam-exec active`, whether a command is still alive in it (a long build) before it is deleted: a busy pod restarts
+`adam-exec active`, whether a command is still alive in it (a long build, or a command that outlives its call, a development server) before it is deleted: a busy pod restarts
 its clock. A pod that cannot be asked stays for the next sweep. `None` never sweeps.
 
 ## Errors
@@ -251,3 +251,6 @@ one line); none carries a secret, and the API server never echoes one in a refus
   replaced and is exchanged (the control), and that the slot keeps its inode. Needs root, `unshare` and `setpriv`; `ADAM_TEST_REQUIRE_MOUNTS=1` (CI) makes it fail instead of skip.
 * `ADAM_TEST_REQUIRE_DB=1`, which CI sets for the database suites, does **not** turn this test on: a runner without a cluster
   would fail every other job.
+
+
+**A command that outlives its call** (`ExecSpec::background`): its id is `bg-kp-<epoch>-<n>`. `adam-exec active` counts it, so the idle sweep spares the pod; `adam-exec active-fg` does not, so it never keeps the pod from being made again for a new slot (the server ends with the pod). A pod made by an older image has an `adam-exec` without `active-fg`: it answers its usage line, the question is *cannot be asked*, and the caller waits as it did before (it fails safe). A newer `adam-exec` with an older coder is harmless: nothing asks `active-fg`. Proven by the tests `a_new_mount_deletes_a_pod_with_only_background_commands`, `the_idle_sweep_spares_a_pod_with_a_background_command` and `an_adam_exec_without_active_fg_waits_as_before`.

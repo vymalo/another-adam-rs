@@ -381,8 +381,12 @@ impl KubeEnvironment {
 
     /// The pod is up and lacks a mount the workspace needs: it may be made again only when nothing runs
     /// in it. Otherwise the caller waits (it is not a failure of the run: the command ends).
+    ///
+    /// A command that was started to outlive its call (`bg-` ids: a development server) does not hold
+    /// the pod: it ends with it. A pod whose `adam-exec` has no `active-fg` cannot be asked, and the
+    /// caller waits.
     async fn free_for_new_mount(&self, name: &str, missing: &str) -> Result<(), EnvError> {
-        match self.busy(name).await {
+        match self.busy_with(name, "active-fg").await {
             Ok(false) => Ok(()),
             Ok(true) => Err(EnvError::Unavailable(format!(
                 "the run's workspace has {missing} as it is now, which its pod does not mount, and a command is running in the pod; the pod is made again when it ends"
@@ -482,10 +486,16 @@ impl KubeEnvironment {
         Ok(deleted)
     }
 
-    /// Whether a command is alive in the pod.
+    /// Whether a command is alive in the pod, one that outlives its call included.
     async fn busy(&self, pod: &str) -> Result<bool, EnvError> {
+        self.busy_with(pod, "active").await
+    }
+
+    /// Whether `adam-exec <question>` (`active`, or `active-fg`, which leaves out the commands that
+    /// outlive their call) counts a command in the pod.
+    async fn busy_with(&self, pod: &str, question: &str) -> Result<bool, EnvError> {
         let settings = &self.inner.settings;
-        let argv = vec![settings.adam_exec.clone(), "active".to_owned()];
+        let argv = vec![settings.adam_exec.clone(), question.to_owned()];
         let answer = self
             .inner
             .exec
@@ -495,7 +505,7 @@ impl KubeEnvironment {
         match (&answer.status, answer.stdout.trim().parse::<u64>()) {
             (ExitStatus::Code(0), Ok(n)) => Ok(n > 0),
             _ => Err(EnvError::Unavailable(format!(
-                "adam-exec active answered ({}) {}",
+                "adam-exec {question} answered ({}) {}",
                 answer.status,
                 clip(&answer.stderr)
             ))),

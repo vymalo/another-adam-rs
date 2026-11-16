@@ -72,6 +72,10 @@ pub struct ExecSpec {
     /// along (the secrets of the caller's own process). An environment that starts the process
     /// with nothing of the caller's has nothing to hide and ignores it. Wins over `env`.
     pub hide: Vec<String>,
+    /// The process is meant to **outlive the call** that starts it (a development server, a
+    /// watcher): its [`ExecId`] starts with `bg-` ([`ExecId::is_background`]), which is how a pod's
+    /// `adam-exec active-fg` leaves it out when it counts what keeps the pod from being made again.
+    pub background: bool,
 }
 
 impl ExecSpec {
@@ -82,6 +86,7 @@ impl ExecSpec {
             cwd: cwd.into(),
             env: BTreeMap::new(),
             hide: Vec::new(),
+            background: false,
         }
     }
 
@@ -96,7 +101,15 @@ impl ExecSpec {
             cwd: cwd.into(),
             env: BTreeMap::new(),
             hide: Vec::new(),
+            background: false,
         }
+    }
+
+    /// Mark the process as one that outlives the call that starts it ([`ExecSpec::background`]).
+    #[must_use]
+    pub fn background(mut self) -> Self {
+        self.background = true;
+        self
     }
 
     /// Set a variable (never a secret).
@@ -132,6 +145,27 @@ impl ExecId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether the process was started as one that outlives its call ([`ExecSpec::background`]):
+    /// the id starts with [`BACKGROUND_PREFIX`].
+    pub fn is_background(&self) -> bool {
+        self.0.starts_with(BACKGROUND_PREFIX)
+    }
+}
+
+/// What an [`ExecId`] of a process that outlives its call starts with: `adam-exec active-fg` does
+/// not count the processes whose record starts with it.
+pub const BACKGROUND_PREFIX: &str = "bg-";
+
+/// The id of the `n`th process a session starts, `<kind>-<n>`, with [`BACKGROUND_PREFIX`] in front
+/// when `spec` says the process outlives its call.
+pub fn exec_id_for(spec: &ExecSpec, kind: &str, n: impl fmt::Display) -> ExecId {
+    let lead = if spec.background {
+        BACKGROUND_PREFIX
+    } else {
+        ""
+    };
+    ExecId::new(format!("{lead}{kind}-{n}"))
 }
 
 impl fmt::Display for ExecId {
@@ -563,7 +597,7 @@ impl EnvSession for LocalSession {
                 .collect(),
             env_clear: false,
             env_remove: spec.hide.clone(),
-            exec: ExecId::new(format!("local-{}", NEXT.fetch_add(1, Ordering::Relaxed))),
+            exec: exec_id_for(spec, "local", NEXT.fetch_add(1, Ordering::Relaxed)),
         })
     }
 

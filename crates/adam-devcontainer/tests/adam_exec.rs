@@ -291,6 +291,54 @@ fn active_counts_the_commands_that_are_alive_and_only_those() {
     assert_eq!(output(&mut adam_exec(state.path(), &["active", "x"])).0, 2);
 }
 
+/// `active-fg` is `active` without the commands that were started to outlive their call: a record
+/// named `bg-...` is not counted, and a pod with only such commands may be made again.
+#[test]
+fn active_fg_skips_background_records() {
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(
+        output(&mut adam_exec(&state.path().join("absent"), &["active-fg"])),
+        (0, "0\n".to_owned(), String::new())
+    );
+    let (mut server, _) = start(state.path(), "bg-kp-1-1", "sleep 34", false);
+    let (mut build, _) = start(state.path(), "kp-1-2", "sleep 34", false);
+    assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "2\n");
+    assert_eq!(output(&mut adam_exec(state.path(), &["active-fg"])).1, "1\n");
+    assert_eq!(output(&mut adam_exec(state.path(), &["kill", "kp-1-2"])).0, 0);
+    build.wait().unwrap();
+    // Only the server is left: it keeps the pod from the idle sweep (`active`), not from a new slot.
+    assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "1\n");
+    assert_eq!(output(&mut adam_exec(state.path(), &["active-fg"])).1, "0\n");
+    assert_eq!(
+        output(&mut adam_exec(state.path(), &["kill", "bg-kp-1-1"])).0,
+        0
+    );
+    server.wait().unwrap();
+    assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "0\n");
+    // It takes no arguments either.
+    assert_eq!(output(&mut adam_exec(state.path(), &["active-fg", "x"])).0, 2);
+}
+
+/// What a development server starts is stopped with it: the tree, and the group a leader has.
+#[test]
+fn kill_stops_a_background_tree_and_its_group() {
+    let state = tempfile::tempdir().unwrap();
+    let marker = format!("sleep 35{}", std::process::id() % 1000);
+    // A server that starts a worker and a watcher in the background, and one that is its own session
+    // leader's child: the way a dev server starts a compiler.
+    let script = format!("({marker} &) ; {marker} & {marker}");
+    let (mut child, pid) = start(state.path(), "bg-kill-1", &script, true);
+    wait_until("the sleeps to start", || pids_of(&marker).len() >= 4);
+    assert_eq!(
+        output(&mut adam_exec(state.path(), &["kill", "bg-kill-1"])).0,
+        0
+    );
+    child.wait().unwrap();
+    wait_until("the whole tree to be gone", || {
+        pids_of(&marker).is_empty() && !alive(pid)
+    });
+}
+
 #[test]
 fn chown_validates_its_arguments_and_leaves_a_missing_directory_alone() {
     let state = tempfile::tempdir().unwrap();

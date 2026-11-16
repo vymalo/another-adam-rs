@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 
 use adam_workspace::{
     EnvDescription, EnvError, EnvKind, EnvSession, ExecId, ExecSpec, PreparedCommand, Program,
-    SandboxShape,
+    SandboxShape, exec_id_for,
 };
 use async_trait::async_trait;
 
@@ -33,9 +33,10 @@ pub(crate) struct KubeSession {
 }
 
 impl KubeSession {
-    fn exec_id(&self) -> ExecId {
+    /// `kp-<epoch>-<n>`, and `bg-kp-<epoch>-<n>` for a process that outlives its call.
+    fn exec_id(&self, spec: &ExecSpec) -> ExecId {
         let n = self.inner.counter.fetch_add(1, Ordering::Relaxed);
-        ExecId::new(format!("kp-{}-{n}", self.inner.epoch))
+        exec_id_for(spec, "kp", format!("{}-{n}", self.inner.epoch))
     }
 }
 
@@ -124,7 +125,7 @@ impl EnvSession for KubeSession {
             .cloned()
             .collect();
 
-        let id = self.exec_id();
+        let id = self.exec_id(spec);
         let settings = &self.inner.settings;
         let invocation = Invocation {
             namespace: settings.namespace.clone(),
