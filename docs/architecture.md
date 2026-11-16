@@ -670,7 +670,7 @@ sequenceDiagram
     participant C as Ctx journal
     participant M as ModelClient
     S->>S: compact_if_due: estimate reaches the budget, two turns can leave
-    S->>C: step compact:n
+    S->>C: step compact:n:turn
     C->>M: complete(the request as it stands + COMPACTION_TURN, tool_choice none)
     M-->>C: the summary and its usage
     C-->>S: Summarised (journaled: a replay calls no model)
@@ -680,14 +680,14 @@ sequenceDiagram
     S->>M: next step: model:turn, from the new history
     M--xS: ContextLength (a prompt the provider refuses)
     S->>S: rejected_as_too_long: compact_next = overflow
-    S->>C: next step: compact:n without the oversized tail, then model:turn again
+    S->>C: next step: compact:n:turn without the oversized tail, then model:turn again
 ```
 
 ```mermaid
 stateDiagram-v2
     [*] --> Growing
     Growing --> Due: estimate reaches the budget and two turns can leave
-    Due --> Summarising: compact:n
+    Due --> Summarising: compact:n:turn
     Summarising --> Summarised: a summary was made (or recorded)
     Summarising --> Shortened: no summary could be made (compact_failed)
     Summarised --> Growing: the new prefix starts at the next request
@@ -695,18 +695,20 @@ stateDiagram-v2
     Growing --> Rejected: the provider says the prompt is too long
     Rejected --> Summarising: once per turn, without the oversized tail
     Rejected --> [*]: a second rejection fails the run
-    Summarising --> Summarised: no summary after a rejection: the turns go anyway
+    Summarising --> Summarised: the summary request was too long after a rejection: the turns go anyway
+    Summarising --> [*]: any other failure of the summary after a rejection fails the run
 ```
 
 | Part | Rule |
 |---|---|
 | **Budget** | the smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens`, and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
 | **Estimate** | the last call's reported prompt tokens plus characters / 4 of what came after; with no report, characters / 4 of the instructions, the tools and every message |
-| **Cut** | at the start of a turn (an assistant message, never the first message), so a call is never parted from its result; the newest 1 to 8 turns worth at most a quarter of the budget stay verbatim; fewer than two turns to drop, or eight compactions in the run, shortens instead |
+| **Cut** | at the start of a turn (an assistant message, never the first message), so a call is never parted from its result; the newest 1 to 8 turns worth at most a quarter of the budget stay verbatim; fewer than two turns to drop, eight compactions in the conversation (a run that continues another carries its compactions), or a request that would still be over the budget with no summary, shortens instead |
 | **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, 4,096 output tokens, capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |
 | **New history** | the task (the first part of the first message) verbatim, then the marker (its second part, `Conversation::is_omission_marker`), then the person's later messages verbatim (2 KiB each, 8 KiB in all, as parts of that message), then the turns that stayed |
 | **The marker's lines** | the summary, then lines **written by code** from what left: the plan, the results a tool pinned, a pointer to each kept output (built from the call's own output id), the names of the skills loaded earlier, a line that sessions exist. Text that is copied has each line that starts with `[` written `\x5b`, so it cannot forge a loop line |
 | **Sessions** | a run whose `subagent_start` was cut still waits for, and cancels, the sessions it started (`Compaction::sessions`) |
+| **Trust** | the summary and the pinned results are in the first message, a user-role message: text a tool returned (a repository's instructions) has that standing from the first compaction on; it is labelled as the repository's, bounded and escaped, and the coder does not read it as the person's words |
 | **A subagent** | compacts against its own limits; one on another alias has no window, so its `max_history_tokens` applies |
 
 The summary request is the previous request plus one message, so the provider serves it from its cache

@@ -854,7 +854,7 @@ after it.
 
 ## Compaction (ADR 0044 slice 9)
 
-A history that reaches its budget is summarised once, at a journaled step `compact:<n>`, and a prompt the
+A history that reaches its budget is summarised once, at a journaled step `compact:<n>:<turn>`, and a prompt the
 provider rejects as too long is compacted and tried once more. The picture, with the sequence and the states,
 is in [the architecture](../../docs/architecture.md#compaction-a-long-history-is-summarised-once).
 
@@ -862,8 +862,10 @@ is in [the architecture](../../docs/architecture.md#compaction-a-long-history-is
   last call's reported `input_tokens`, `Conversation::last_prompt`, plus characters / 4 of what came after;
   with no report, characters / 4 of the instructions, the tools and every message) reaches the budget, the
   smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens`, and `Limits::max_history_tokens`.
-  With neither set there is none. Fewer than two turns to drop, a compaction at this very turn already, or
-  eight in the run: no compaction, and `record_shortenings` does what it always did.
+  With neither set there is none. Fewer than two turns to drop, a compaction at this very turn already,
+  eight in the conversation, or a request that would still be over the budget with no summary at all (the
+  instructions, the tools, the task and the turns that stay): no compaction, and `record_shortenings` does
+  what it always did.
 * **The cut** is at a turn start, so a call keeps its result; the newest 1 to 8 turns worth at most a quarter
   of the budget stay verbatim.
 * **The summary** is the agent's own model (no tool, 4,096 output tokens), the request as it stands plus
@@ -878,15 +880,30 @@ is in [the architecture](../../docs/architecture.md#compaction-a-long-history-is
   kept output of a dropped call (built from the call's own output id), the names of the skills loaded earlier,
   a line that sessions exist. Copied text has each line that starts with `[` written `\x5b`.
 * **Carried.** `Conversation::summary` is the marker's body: a run that continues this one carries it into the
-  marker of its own first message (`Conversation::continued`).
+  marker of its own first message (`Conversation::continued`), and with it `compactions` and `pinned_calls`,
+  so a compaction of the new run writes the same code-made lines again (pinned results, pointers, skills, the
+  sessions line) and the limit of eight counts the conversation: after the eighth the history is only
+  shortened. A carried `Compaction::turn` is the turn of the run that made it.
+* **Trust.** The summary and the pinned results sit in message 0, a user-role message, for the rest of the
+  run. A pinned result is text a tool returned (the project instructions of a repository among it), so from
+  the first compaction on it has the standing of a user message with the provider; before, it was a tool
+  result. It is kept whole, up to its bounds, because the run needs it (the workspace and the repository's
+  instructions are what pinning is for); it is labelled as the repository's, not the person's, bounded and
+  escaped, and a reader of what the person said (the coder's) skips the marker part, so nothing in it grants
+  a repository or a consent.
 * **Sessions.** `Compaction::sessions` says a `subagent_start` or `subagent_send` was cut: the run still waits
   for, and cancels, its working sessions.
 * **Overflow.** `ModelError::is_context_overflow()` (the class stays `Invalid`) sets
   `Conversation::compact_next`; the next transition compacts, from the turns before the newest ones with every
   tool output over 2,000 characters shortened in the summary request, and the turn is asked again. A second
-  rejection of the same turn (`overflow_turn`) fails the run with both messages. A rejected summary request
-  drops the turns without a summary (the marker says so). Only the two bodies `adam-model-openai` maps are
-  recognised; others are *unverified*.
+  rejection of the same turn (`overflow_turn`) fails the run with both messages. A summary request that is
+  itself rejected as too long drops the turns without a summary (the marker says so); any other failure of
+  the summary call fails the run with the call's class and message, and the history is kept. Only the two
+  bodies `adam-model-openai` maps are recognised; others are *unverified*.
+* **Bounds.** A summary is cut at 16 KiB; the person's later messages at 2,048 characters each and 8,192 in
+  all (the newest first: older words are gone from the history, and the summary may carry them); a pinned
+  result at 32 KiB each and 64 KiB in all, counted after escaping; at most 50 pointers and 50 skill names are
+  listed, the newest pointers and the oldest skill names first.
 * **Not built:** the folder's `compaction` subagent and the `compacting` hook (ADR 0039 decision 5): a
   built-in prompt only.
 * **Breaking.** `Conversation` gains the public fields `last_prompt`, `summary`, `compactions`,
