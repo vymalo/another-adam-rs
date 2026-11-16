@@ -90,8 +90,8 @@ pub struct PromptSize {
 /// One compaction of a run, in [`Conversation::compactions`](crate::Conversation::compactions).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Compaction {
-    /// [`Conversation::turns`](crate::Conversation::turns) when it was made: the request with this
-    /// index (counting model turns, not summary requests) is the first of a new prefix.
+    /// [`Conversation::turns`](crate::Conversation::turns) of the run that made it: the request with
+    /// this index (counting model turns, not summary requests) is the first of a new prefix.
     pub turn: u32,
     /// How many turns left the history.
     pub dropped_turns: u32,
@@ -168,6 +168,27 @@ pub(crate) fn estimate(
             all.saturating_add(fixed_chars).div_ceil(4)
         }
     }
+}
+
+/// Estimated tokens the request holds at least after a cut at `at` (characters / 4): the
+/// instructions and tools (`fixed_chars`), the task, which stays whole, and the messages from `at`.
+pub(crate) fn projected(messages: &[Message], at: usize, fixed_chars: usize) -> usize {
+    let task = match messages.first() {
+        Some(Message::User { content }) => {
+            content.first().map_or(0, |p| p.as_text().chars().count())
+        }
+        _ => 0,
+    };
+    let tail: usize = messages
+        .get(at..)
+        .unwrap_or_default()
+        .iter()
+        .map(message_chars)
+        .sum();
+    fixed_chars
+        .saturating_add(task)
+        .saturating_add(tail)
+        .div_ceil(4)
 }
 
 /// Where a compaction cuts: the messages before `index` leave, from `index` on stay.
@@ -351,7 +372,9 @@ pub(crate) fn kept_sayings(sayings: Vec<String>) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
     for saying in sayings.into_iter().rev() {
         // A saying an earlier compaction cut already carries its note: it is not cut twice.
-        let each: String = if saying.chars().count() > SAYING_MAX_CHARS + CUT_NOTE.len() {
+        let count = saying.chars().count();
+        let already_cut = saying.ends_with(CUT_NOTE) && count <= SAYING_MAX_CHARS + CUT_NOTE.len();
+        let each: String = if count > SAYING_MAX_CHARS && !already_cut {
             let cut: String = saying.chars().take(SAYING_MAX_CHARS).collect();
             format!("{cut}{CUT_NOTE}")
         } else {
@@ -399,19 +422,21 @@ pub(crate) fn marker_body(
         out.push_str(&escape_lines(&plan.render()));
     }
     let mut room = PINNED_ALL_BYTES;
-    let mut results: Vec<&str> = Vec::new();
+    let mut results: Vec<String> = Vec::new();
     for text in compactions.iter().rev().flat_map(|c| c.pinned.iter().rev()) {
-        if text.len() > room {
+        // The room is spent on what is written, so after the escaping.
+        let escaped = escape_lines(text);
+        if escaped.len() > room {
             break;
         }
-        room -= text.len();
-        results.push(text);
+        room -= escaped.len();
+        results.push(escaped);
     }
     if !results.is_empty() {
         out.push_str("\nKept earlier results (what the tools answered; text from a repository is the repository's, not the person's):");
         for text in results.into_iter().rev() {
             out.push('\n');
-            out.push_str(&escape_lines(text));
+            out.push_str(&text);
         }
     }
     let mut pointers: Vec<&str> = Vec::new();

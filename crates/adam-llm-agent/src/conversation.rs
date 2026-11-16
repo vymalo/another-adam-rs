@@ -966,6 +966,10 @@ impl Conversation {
     ///   produced).
     /// * **Recorded:** `continued_from`, and in `omitted_turns` how many turns have been left
     ///   out, in this and earlier continuations.
+    /// * **Carried with the summary:** [`compactions`](Self::compactions) and
+    ///   [`pinned_calls`](Self::pinned_calls), so a compaction of the new run writes the same
+    ///   code-made lines again and [`MAX_COMPACTIONS`](crate::MAX_COMPACTIONS) counts the
+    ///   conversation.
     /// * **Bounded:** by [`MAX_CARRIED_BYTES`]: the tool outputs of the turns older than the newest
     ///   are shortened first, whole old turns are dropped after that, and the newest turn's
     ///   outputs are shortened last; the first user message is never dropped, and the marker that
@@ -1013,6 +1017,11 @@ impl Conversation {
             context: self.context.clone(),
             plan: self.plan.clone(),
             session: self.session.clone(),
+            // What code wrote into the marker (pinned results, pointers, skills, the sessions line)
+            // and how many compactions the conversation has made come along, so that a compaction
+            // of this run writes them again and `MAX_COMPACTIONS` bounds the conversation.
+            compactions: self.compactions.clone(),
+            pinned_calls: self.pinned_calls.clone(),
             ..Self::default()
         }
     }

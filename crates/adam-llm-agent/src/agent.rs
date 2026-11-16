@@ -1354,7 +1354,17 @@ impl LlmAgent {
                 .compact_failed
                 .is_none_or(|at| state.turns >= at.saturating_add(RETRY_AFTER_TURNS))
             && self.estimated_tokens(state) >= budget
-            && self.cut_for(state, CompactionReason::Budget).is_some()
+            // A compaction that leaves the request over the budget even with no summary would be
+            // made again at once: the history is shortened instead.
+            && self
+                .cut_for(state, CompactionReason::Budget)
+                .is_some_and(|cut| self.projected_tokens(state, cut.index) < budget)
+    }
+
+    /// The least the request holds after a cut at `at`: the instructions, the tools, the task and
+    /// the turns that stay. The marker, whatever it holds, comes on top.
+    fn projected_tokens(&self, state: &Conversation, at: usize) -> usize {
+        compaction::projected(&state.messages, at, self.fixed_chars())
     }
 
     /// What a model call whose prompt the provider rejected as too long does: ask for one compaction
@@ -1410,7 +1420,8 @@ impl LlmAgent {
         };
         let n = state.compactions.len();
         let before_tokens = self.estimated_tokens(state);
-        let id = format!("compact:{n}");
+        // One id for each attempt: a summary that failed is tried again at a later turn.
+        let id = format!("compact:{n}:{}", state.turns);
         let step = |state_of: StepState| {
             StepEvent::new(&id, StepKind::Tool, "Summarise the conversation", state_of)
                 .with_icon(StepIcon::Think)
@@ -1477,10 +1488,25 @@ impl LlmAgent {
                 });
             }
             // The summary could not be made. A prompt that was rejected still has to shrink, so its
-            // turns go without one; a history that only neared its budget is shortened instead, and
-            // this is not tried again for a few turns.
-            Err(_) if reason == CompactionReason::Overflow => {
+            // turns go without one when the summary request was itself too long; a history that only
+            // neared its budget is shortened instead, and this is not tried again for a few turns.
+            Err(f) if reason == CompactionReason::Overflow && f.context_length => {
                 (None, cut.index, state.overflow_message.take())
+            }
+            // Any other failure would fail the next call too, with the history gone: the run fails
+            // with the summary call's own class and message instead.
+            Err(f) if reason == CompactionReason::Overflow => {
+                let message = format!(
+                    "model call failed: the summary after a prompt rejected as too long failed \
+                     ({}): {}",
+                    f.class.as_deref().unwrap_or("unclassified"),
+                    f.message
+                );
+                ctx.emit(RunEvent::Step(
+                    step(StepState::Failed).with_detail(message.clone()),
+                ))
+                .await;
+                return Err(AgentError::permanent(message));
             }
             Err(f) => {
                 tracing::warn!(run = %run, "the summary call failed: the history is shortened instead");

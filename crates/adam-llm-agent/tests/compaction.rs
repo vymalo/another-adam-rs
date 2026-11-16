@@ -671,7 +671,7 @@ async fn the_person_sees_one_step_for_the_summary() {
         .events_for(run)
         .into_iter()
         .filter_map(|e| match e {
-            RunEvent::Step(s) if s.id == "compact:0" => Some(s),
+            RunEvent::Step(s) if s.id == "compact:0:4" => Some(s),
             _ => None,
         })
         .collect();
@@ -920,7 +920,9 @@ fn spawn_worker(rt: &Runtime) -> (oneshot::Sender<()>, tokio::task::JoinHandle<(
 
 #[tokio::test]
 async fn an_open_session_is_still_waited_for_after_its_start_was_cut() {
-    let family = Family::new(BUDGET, 0, true);
+    // The parent's tools weigh about a thousand tokens: a budget of 3,200 is reached by the fourth
+    // result of 2,400 letters and not by the third.
+    let family = Family::new(3200, 0, true);
     family.child_mock.push_text("child says 42");
     let parent = family.start().await;
     // The start is the first turn; the big results then fill the history, which is compacted before
@@ -928,10 +930,10 @@ async fn an_open_session_is_still_waited_for_after_its_start_was_cut() {
     family
         .parent_mock
         .push_tool_calls(vec![start_call("c1")])
-        .push_tool_calls(vec![big("b0", 1200)])
-        .push_tool_calls(vec![big("b1", 1200)])
-        .push_tool_calls(vec![big("b2", 1200)])
-        .push_tool_calls(vec![big("b3", 1200)])
+        .push_tool_calls(vec![big("b0", 2400)])
+        .push_tool_calls(vec![big("b1", 2400)])
+        .push_tool_calls(vec![big("b2", 2400)])
+        .push_tool_calls(vec![big("b3", 2400)])
         .push_text("SUMMARY: started a helper")
         .push_text("I think I am done")
         .push_text("the helper said 42");
