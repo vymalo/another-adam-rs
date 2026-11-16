@@ -170,12 +170,12 @@ pub use fn_tool::FnTool;
 pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};
 pub use history::{SHORTENING_FLOOR, TRUNCATION_MARKER_PREFIX};
 pub use kept::{
-    KeptError, KeptInfo, KeptMap, KeptOutput, KeptOutputs, KeptStore, MAX_KEPT_BYTES,
+    KeptError, KeptInfo, KeptMap, KeptOutput, KeptOutputs, KeptStore, LineFolder, MAX_KEPT_BYTES,
     MAX_RUN_KEPT_BYTES, MemoryKept, READ_OUTPUT, ReadOutput, SCRUB_OVERLAP, call_key,
     canonical_pointer_id, count_lines, find_pointer, is_output_id, keep_long, keep_long_cut,
     kept_header, kept_outputs_conformance, kept_view, output_id, output_id_of, page_of,
     pointer_line, prepare, read_pointer, scrub_open_end, scrub_open_start, scrubbed_for_keeping,
-    unkept_view,
+    unkept_view, StreamScrubber,
 };
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 #[cfg(feature = "schema")]

@@ -431,6 +431,219 @@ pub fn scrub_open_start(text: &str, scrub: impl Fn(&str) -> String, margin: usiz
     whole[start..].to_owned()
 }
 
+/// Scrubs an output **as it streams**, so that what is written is exactly the scrub of the whole
+/// and no secret is ever on disk in part.
+///
+/// The bytes of a command arrive in reads of any size, and a secret can be split between two of
+/// them. The scrubber holds raw bytes back, and lets a part go only when scrubbing it alone and
+/// scrubbing it as part of the buffer agree (`scrub(buf) == scrub(buf[..k]) + scrub(buf[k..])`): no
+/// secret straddles `k`. What it emits, concatenated, is `scrub(whole)`.
+///
+/// * [`push`](Self::push) lets a part go once the buffer holds two margins: it cuts `margin` bytes
+///   before the end, so a secret that straddles the cut lies whole in the buffer (no secret is
+///   longer than the margin) and the check sees it. It holds at most `2 * margin` bytes.
+/// * [`release`](Self::release) lets everything go except the tail that can still be the start of a
+///   secret, which the caller measures (`partial`): an output that goes quiet is not held for a
+///   margin of bytes that will never come.
+/// * [`finish`](Self::finish) scrubs the rest.
+///
+/// The `scrub` closures passed to each call are the same, and replace values (they never depend on
+/// where a text starts).
+#[derive(Debug, Clone)]
+pub struct StreamScrubber {
+    /// Raw text not written yet (what is not UTF-8 is already U+FFFD, as a lossy read makes it).
+    pending: String,
+    /// The first bytes of a character the last read ended in the middle of (at most 3).
+    carry: Vec<u8>,
+    margin: usize,
+}
+
+impl StreamScrubber {
+    /// A scrubber for secrets of at most `margin` bytes (at least [`SCRUB_OVERLAP`]).
+    pub fn new(margin: usize) -> Self {
+        Self {
+            pending: String::new(),
+            carry: Vec::new(),
+            margin: margin.max(SCRUB_OVERLAP),
+        }
+    }
+
+    /// How many raw bytes are held back now.
+    pub fn held(&self) -> usize {
+        self.pending.len() + self.carry.len()
+    }
+
+    /// A scrubber with a margin below [`SCRUB_OVERLAP`], so that a test reaches the cuts with a
+    /// little text.
+    #[cfg(test)]
+    fn with_small_margin(margin: usize) -> Self {
+        Self {
+            margin,
+            ..Self::new(0)
+        }
+    }
+
+    /// Add `bytes`; the scrubbed text that can be written now (maybe none).
+    pub fn push(&mut self, bytes: &[u8], scrub: &dyn Fn(&str) -> String) -> String {
+        self.add(bytes);
+        if self.pending.len() < 2 * self.margin {
+            return String::new();
+        }
+        // Try the cut `margin` bytes before the end, and, when a secret straddles it, one margin
+        // earlier, down to the start: a cut that a secret straddles is never taken.
+        let mut at = self.pending.len() - self.margin;
+        loop {
+            let cut = floor_boundary(&self.pending, at);
+            if cut > 0
+                && let Some(text) = self.cut_at(cut, scrub)
+            {
+                return text;
+            }
+            match at.checked_sub(self.margin) {
+                Some(earlier) if earlier > 0 => at = earlier,
+                _ => return String::new(),
+            }
+        }
+    }
+
+    /// Everything that cannot be the start of a secret: `partial(text)` is how many bytes at the
+    /// end of `text` could still be the first part of a secret (0 when none), and they stay.
+    pub fn release(
+        &mut self,
+        scrub: &dyn Fn(&str) -> String,
+        partial: &dyn Fn(&str) -> usize,
+    ) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let window = floor_boundary(&self.pending, self.pending.len().saturating_sub(self.margin));
+        let held = partial(&self.pending[window..]);
+        let cut = floor_boundary(&self.pending, self.pending.len().saturating_sub(held));
+        if cut == 0 {
+            return String::new();
+        }
+        self.cut_at(cut, scrub).unwrap_or_default()
+    }
+
+    /// What is left, scrubbed: the output has ended.
+    pub fn finish(&mut self, scrub: &dyn Fn(&str) -> String) -> String {
+        if !self.carry.is_empty() {
+            // A character that never ended.
+            self.pending.push('\u{fffd}');
+            self.carry.clear();
+        }
+        scrub(&std::mem::take(&mut self.pending))
+    }
+
+    /// Decode `bytes` as a lossy read does and add them to `pending`, holding back the start of a
+    /// character the read ended in.
+    fn add(&mut self, bytes: &[u8]) {
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(bytes);
+        let mut rest = data.as_slice();
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    self.pending.push_str(valid);
+                    return;
+                }
+                Err(e) => {
+                    let (valid, after) = rest.split_at(e.valid_up_to());
+                    if let Ok(valid) = std::str::from_utf8(valid) {
+                        self.pending.push_str(valid);
+                    }
+                    match e.error_len() {
+                        // The read ended inside a character.
+                        None => {
+                            self.carry = after.to_vec();
+                            return;
+                        }
+                        Some(n) => {
+                            self.pending.push('\u{fffd}');
+                            rest = &after[n..];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The scrub of `pending[..cut]`, taken off the buffer, when no secret straddles `cut`.
+    fn cut_at(&mut self, cut: usize, scrub: &dyn Fn(&str) -> String) -> Option<String> {
+        let whole = scrub(&self.pending);
+        let head = scrub(&self.pending[..cut]);
+        let tail = scrub(&self.pending[cut..]);
+        if whole.len() != head.len() + tail.len()
+            || !whole.starts_with(&head)
+            || !whole.ends_with(&tail)
+        {
+            return None;
+        }
+        self.pending.drain(..cut);
+        Some(head)
+    }
+}
+
+/// `at`, moved back to the start of a character of `text`.
+fn floor_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// Folds a streamed text the way [`prepare`] does, a piece at a time: a line over
+/// [`MAX_LINE_CHARS`] characters is folded onto several, a NUL is U+FFFD, and only **complete**
+/// lines are returned, so that a file written from them never ends in the middle of one (the pages
+/// of the lines already there do not change when more is written).
+#[derive(Debug, Clone, Default)]
+pub struct LineFolder {
+    line: String,
+    chars: usize,
+}
+
+impl LineFolder {
+    /// An empty folder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Characters of the line that is not complete yet.
+    pub fn open_chars(&self) -> usize {
+        self.chars
+    }
+
+    /// Add `text`; the lines it completed, each ending in `\n`.
+    pub fn push(&mut self, text: &str) -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            if c == '\n' {
+                out.push_str(&self.line);
+                out.push('\n');
+                self.line.clear();
+                self.chars = 0;
+                continue;
+            }
+            if self.chars == MAX_LINE_CHARS {
+                out.push_str(&self.line);
+                out.push('\n');
+                self.line.clear();
+                self.chars = 0;
+            }
+            self.line.push(if c == '\0' { '\u{fffd}' } else { c });
+            self.chars += 1;
+        }
+        out
+    }
+
+    /// The line that was never ended, without a line end: the output has ended.
+    pub fn finish(&mut self) -> String {
+        self.chars = 0;
+        std::mem::take(&mut self.line)
+    }
+}
+
 /// Keep a long `text` for the call of `ctx` and say what the model is shown: the first page and an
 /// id to read the rest with [`ReadOutput`], or, when it cannot be kept, the first page and why the
 /// rest is lost. The second value is what the loop keeps in the run's state
@@ -1212,5 +1425,136 @@ mod tests {
         let (prepared, cut) = prepare(&text, 0);
         assert!(cut);
         assert!(prepared.starts_with("x\nx\n") && prepared.contains("(output cut: only the first"));
+    }
+
+    /// The secret of the streaming tests, and what replaces it.
+    const STREAM_SECRET: &str = "sk-live-SECRET-0123456789";
+
+    fn stream_scrub(text: &str) -> String {
+        text.replace(STREAM_SECRET, "[redacted]")
+    }
+
+    /// How many bytes at the end of `text` are the start of the secret.
+    fn stream_partial(text: &str) -> usize {
+        (1..STREAM_SECRET.len())
+            .rev()
+            .find(|&n| text.as_bytes().ends_with(&STREAM_SECRET.as_bytes()[..n]))
+            .unwrap_or(0)
+    }
+
+    /// Feed `chunks` through a scrubber with `margin`, releasing after each read when `releasing`,
+    /// and return what was written and the most it held.
+    fn stream(chunks: &[Vec<u8>], margin: usize, releasing: bool) -> (String, usize) {
+        let mut scrubber = StreamScrubber::with_small_margin(margin);
+        let mut out = String::new();
+        let mut most = 0;
+        for chunk in chunks {
+            out.push_str(&scrubber.push(chunk, &stream_scrub));
+            if releasing {
+                out.push_str(&scrubber.release(&stream_scrub, &stream_partial));
+            }
+            most = most.max(scrubber.held());
+        }
+        out.push_str(&scrubber.finish(&stream_scrub));
+        (out, most)
+    }
+
+    fn chunked(bytes: &[u8], sizes: &[usize]) -> Vec<Vec<u8>> {
+        let mut chunks = Vec::new();
+        let mut at = 0;
+        let mut sizes = sizes.iter().cycle();
+        while at < bytes.len() {
+            let n = (*sizes.next().unwrap_or(&1)).clamp(1, bytes.len() - at);
+            chunks.push(bytes[at..at + n].to_vec());
+            at += n;
+        }
+        chunks
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Whatever the reads, what is written is the scrub of the whole.
+        #[test]
+        fn stream_scrubber_equals_whole_scrub_for_any_chunking(
+            pieces in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::strategy::Just(STREAM_SECRET.to_owned()),
+                    proptest::strategy::Just(STREAM_SECRET[..9].to_owned()),
+                    proptest::strategy::Just(STREAM_SECRET[9..].to_owned()),
+                    proptest::strategy::Just("\n".to_owned()),
+                    "[a-z é€\\n]{0,40}",
+                ],
+                0..60,
+            ),
+            sizes in proptest::collection::vec(1usize..37, 1..8),
+            margin in 40usize..90,
+            releasing in proptest::bool::ANY,
+        ) {
+            let text: String = pieces.concat();
+            let (out, _) = stream(&chunked(text.as_bytes(), &sizes), margin, releasing);
+            proptest::prop_assert_eq!(out, stream_scrub(&text));
+        }
+
+        /// Text that holds no secret is never held for more than two margins.
+        #[test]
+        fn stream_scrubber_holds_at_most_two_margins(
+            text in "[a-z \\n]{0,600}",
+            sizes in proptest::collection::vec(1usize..50, 1..6),
+            margin in 40usize..90,
+        ) {
+            let (out, most) = stream(&chunked(text.as_bytes(), &sizes), margin, false);
+            proptest::prop_assert_eq!(out, text);
+            proptest::prop_assert!(most <= 2 * margin, "{most} > 2 * {margin}");
+        }
+
+        /// The lines a streamed text completes are the lines `prepare` makes of it.
+        #[test]
+        fn line_folder_makes_what_prepare_makes(
+            text in "[a-z\\n\\x00é]{0,9000}",
+            sizes in proptest::collection::vec(1usize..3000, 1..5),
+        ) {
+            let mut folder = LineFolder::new();
+            let mut out = String::new();
+            let mut at = 0;
+            let chars: Vec<char> = text.chars().collect();
+            let mut sizes = sizes.iter().cycle();
+            while at < chars.len() {
+                let n = (*sizes.next().unwrap_or(&1)).min(chars.len() - at);
+                out.push_str(&folder.push(&chars[at..at + n].iter().collect::<String>()));
+                at += n;
+            }
+            out.push_str(&folder.finish());
+            proptest::prop_assert_eq!(out, prepare(&text, 0).0.into_owned());
+        }
+    }
+
+    /// A secret that two reads cut in half: nothing of it is written after the first read, and the
+    /// whole is replaced after the second. (The default margin: no bytes beyond it are needed.)
+    #[test]
+    fn a_secret_split_across_reads_is_never_written() {
+        let mut scrubber = StreamScrubber::new(SCRUB_OVERLAP);
+        let first = format!("ready\nkey={}", &STREAM_SECRET[..12]);
+        let mut written = scrubber.push(first.as_bytes(), &stream_scrub);
+        written.push_str(&scrubber.release(&stream_scrub, &stream_partial));
+        assert_eq!(written, "ready\nkey=", "the start of the secret stays held");
+        assert!(!written.contains("sk-"), "{written}");
+        let mut more = scrubber.push(STREAM_SECRET[12..].as_bytes(), &stream_scrub);
+        more.push_str(&scrubber.release(&stream_scrub, &stream_partial));
+        more.push_str(&scrubber.push(b"\nafter\n", &stream_scrub));
+        more.push_str(&scrubber.finish(&stream_scrub));
+        assert_eq!(written + &more, "ready\nkey=[redacted]\nafter\n");
+    }
+
+    /// A character cut by a read is written whole, and a byte that is not UTF-8 is U+FFFD.
+    #[test]
+    fn a_character_split_across_reads_is_written_whole() {
+        let mut scrubber = StreamScrubber::new(SCRUB_OVERLAP);
+        let euro = "€".as_bytes();
+        let mut out = scrubber.push(&euro[..1], &stream_scrub);
+        out.push_str(&scrubber.push(&euro[1..], &stream_scrub));
+        out.push_str(&scrubber.push(&[0xff, b'a'], &stream_scrub));
+        out.push_str(&scrubber.finish(&stream_scrub));
+        assert_eq!(out, "€\u{fffd}a");
     }
 }
