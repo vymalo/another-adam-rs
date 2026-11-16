@@ -74,3 +74,72 @@ async fn the_answer_to_a_form_is_read_by_ask_user_through_the_coders_wrappers() 
         AnswerCheck::Accept
     );
 }
+
+#[tokio::test]
+async fn what_a_refusal_and_an_ending_say_never_repeats_a_secret_the_redactor_hides() {
+    let fx = Fixture::new().await;
+    let tools = coder_tools(&fx.env);
+    let tool = tools.get("ask_user").expect("ask_user").clone();
+    // The model wrote secrets into the words the refusal quotes: the question, the failed question's
+    // words, its unit and its help.
+    let args = json!({
+        "question": format!("Deploy with {}?", common::GITHUB_TOKEN),
+        "description": format!("Key {}", common::MODEL_KEY),
+        "choices": [{"id": "budget", "question": format!("Budget for {}?", common::DB_PASSWORD),
+                     "type": "number", "maxValue": "1000", "unit": common::A2A_TOKEN,
+                     "help": format!("About {}", common::DB_PASSWORD)}]
+    });
+    let ctx = ToolCtx::detached("ask_user", "call-1", Arc::new(CollectingSink::new()))
+        .with_state(fx.env.clone())
+        .with_context(screen());
+    let Err(ToolError::NeedsInput {
+        ui: Some(mut ui), ..
+    }) = tool.call(&ctx, args.clone()).await
+    else {
+        panic!("ask_user did not ask with a form");
+    };
+    let bad = json!({"text": "x", "form": {"surface": "ask-call-1", "context": {
+        "answers": [{"id": "budget", "values": ["1500"]}]}}});
+    let clean = |what: &str, text: &str| {
+        for secret in common::SECRETS {
+            assert!(!text.contains(secret), "{what} repeats {secret}: {text}");
+        }
+    };
+    let mut ended = None;
+    for attempt in 1..=6 {
+        let surface = ui[0]["createSurface"]["surfaceId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut answer = bad.clone();
+        answer["form"]["surface"] = json!(surface);
+        match tool.read_answer("call-1", &args, Some(&ui), &answer) {
+            AnswerCheck::Refuse(refusal) => {
+                assert!(attempt <= 5, "refused a sixth time");
+                assert!(
+                    refusal.question.contains("above the most, 1000"),
+                    "{}",
+                    refusal.question
+                );
+                clean("the question asked again", &refusal.question);
+                clean(
+                    "the form asked again",
+                    &refusal.ui.as_ref().unwrap().to_string(),
+                );
+                ui = refusal.ui.unwrap();
+            }
+            AnswerCheck::End(ending) => {
+                ended = Some(ending);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let ending = ended.expect("the sixth bad answer ends the question");
+    assert!(
+        ending.question.contains("did not fit the form"),
+        "{}",
+        ending.question
+    );
+    clean("the ending", &ending.question);
+}

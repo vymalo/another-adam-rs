@@ -1794,6 +1794,53 @@ mod tests {
         assert!(named_by(&person_sayings(&parked_on_call(&ask), &inbox)).is_empty());
     }
 
+    /// A form `ask_user` asked again after it refused an answer is the same call's form: its answer is
+    /// paired with the call's defaults in the history and in the inbox, and the forms of other calls
+    /// that merely look alike are strangers.
+    #[test]
+    fn an_answer_to_the_form_asked_again_is_paired_with_the_defaults_of_its_call() {
+        let ask = asking_with_default("merge acme/widgets#7");
+        let defaults = Some(vec!["  merge acme/widgets#7 ".to_owned()]);
+        for surface in ["ask-c1.r1", "ask-c1.r2", "ask-c1.r12"] {
+            let history = conversation(vec![
+                Message::user_text("look around"),
+                assistant("", vec![ask.clone()]),
+                Message::tool_result("c1", untouched(surface)),
+            ]);
+            assert_eq!(
+                person_sayings(&history, &[])[1].defaults,
+                defaults,
+                "{surface}"
+            );
+            let inbox = [Inbound::new(
+                "message",
+                json!({ "text": untouched(surface) }),
+            )];
+            assert_eq!(
+                person_sayings(&parked_on_call(&ask), &inbox)[1].defaults,
+                defaults,
+                "{surface} in the inbox"
+            );
+        }
+        for surface in [
+            "ask-c10.r1",
+            "ask-c1.rx",
+            "ask-c1.r",
+            "ask-c.r1",
+            "ask-c2.r1",
+        ] {
+            let inbox = [Inbound::new(
+                "message",
+                json!({ "text": untouched(surface) }),
+            )];
+            assert_eq!(
+                person_sayings(&parked_on_call(&ask), &inbox)[1].defaults,
+                None,
+                "{surface}"
+            );
+        }
+    }
+
     /// The page may take what is not visible out of the words it sends back (a JavaScript `trim()`
     /// removes U+FEFF), and the model may have put it in the default.
     #[test]
