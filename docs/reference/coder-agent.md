@@ -232,14 +232,19 @@ The diagrams and the three places a write is refused are in [Workspace and envir
 |---|---|---|
 | Told | the system prompt, for the agent's and the deployment's | `## References`, each name and description: the same words on every turn |
 | Listed | the result of `prepare_workspace` on a repository that has `.agents/references.json`, before its instructions | the entries as the repository's text, with the reason any entry is not listed |
-| Asked | `request_repository { repo_url, reason, reference }` | for a repository's own: a form that names the repository that lists it, quotes what it says and says it is read only |
-| Read | `read_file`, `list_files`, `find_files`, `search_files`, `share_file`, `run_command` with `repo: <name>` | the first call checks the reference out (detached, no branch), at tier `plan` |
+| Asked | `request_repository { repo_url, reason, reference }` | for a repository's own: a form that names the repository that lists it and its branch, quotes what it says, says it is read only and that what is read can end up in what the agent writes |
+| Read | `read_file`, `list_files`, `find_files`, `search_files`, `share_file`, `run_command` with `repo: <name>` | the first call checks the reference out (detached, no branch), at tier `plan`, and says which commit it holds |
 | Refused | every tool that writes (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `commit_and_push`, `open_pull_request`), and the tools that act on a repository by address (`publish_scratch`, `merge_pull_request`, `rename_repository`, `delete_repository`) | `` `<name>` is a reference: it is read and never changed ``; the reference is not touched |
 
 * **A reference is never the default slot.** With one repository and one reference, a call that names no slot works in the
   repository. With only references, a call that names no slot says there is nothing to work in.
-* **A yes to read grants reading.** It is recorded as `reference:<key>`, which never names the repository: `prepare_workspace`
-  of the same address is still refused until the person names it. A no is remembered and not asked again.
+* **A yes to read grants reading.** It is recorded as `reference:<key>` (`@<branch>` when the declaration names one: another
+  branch is another question), which never names the repository, as a click or as typed words: `prepare_workspace` of the
+  same address is still refused until the person names it. A no is remembered and not asked again.
+* **The commit is kept.** The notes hold the commit of the first read, and a reference made again (its directory was lost)
+  is checked out at it, never at the branch's tip; a commit that is gone is said.
+* **A reference and its repository.** When a run works in the repository too, its address reaches the working copy and the
+  reference keeps its name. A name that is also another slot's directory is never answered with that slot.
 * **The address is the declaration's.** `request_repository` with `reference` must carry the address the repository
   declared, and the one fetched is the one recorded when the repository was prepared. An address that the workspace's
   policy refuses for a repository (a host nobody allowed, credentials in it) is refused for a reference before the person is
