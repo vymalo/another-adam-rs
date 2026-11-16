@@ -758,6 +758,7 @@ async fn the_janitor_kills_what_the_records_of_a_finished_run_name_before_it_rem
         "owner": "a-worker-that-is-gone", "pid": pid, "start": start, "started_at": 1,
         "state": "running", "ran_secs": null, "lines": 0, "git": null,
         // A beat that is fresh: the run is over, so it does not matter.
+        "host": fx.env.commands.host(),
         "beat": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -793,4 +794,56 @@ async fn the_janitor_kills_what_the_records_of_a_finished_run_name_before_it_rem
         })
         .count();
     assert_eq!(left, 0, "what the leader left in its group");
+}
+
+/// The janitor kills by pid only what the record says this machine started.
+#[tokio::test]
+async fn the_janitor_signals_no_pid_of_another_machine() {
+    use std::os::unix::process::CommandExt as _;
+
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let run = run_in(&store, RunStatus::Done).await.to_string();
+    workspace_of(&fx, &run).await;
+    let mut other = std::process::Command::new("sleep")
+        .arg("666")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = other.id();
+    let _reap = common::GroupGuard(pid);
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let start: u64 = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let id = adam_llm_agent::output_id(&run, "elsewhere");
+    let record = json!({
+        "command": "elsewhere", "slot": "remote", "cwd": "", "exec": "bg-elsewhere-1",
+        "owner": "a-worker-on-another-pod", "pid": pid, "start": start, "started_at": 1,
+        "state": "running", "ran_secs": null, "lines": 0, "git": null, "beat": 0,
+        "host": "another-pod",
+    });
+    fx.env
+        .kept
+        .put_record(&run, &id, &serde_json::to_vec(&record).unwrap())
+        .unwrap();
+    let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)))
+        .with_commands(fx.env.commands.clone());
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(report.failed.is_empty(), "{report:?}");
+    // The run is over and its records are gone with it; the process of this machine was not touched.
+    assert!(other.try_wait().unwrap().is_none(), "another machine's pid");
+    other.kill().unwrap();
+    other.wait().unwrap();
 }

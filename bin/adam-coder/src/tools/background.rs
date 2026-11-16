@@ -200,6 +200,10 @@ struct Record {
     /// Unix seconds of the owner's last beat: written at start and at every sweep.
     #[serde(default)]
     beat: u64,
+    /// The machine (the pod, the container) whose process the pid is: a pid is signalled only there.
+    /// A record without one is another machine's.
+    #[serde(default)]
+    host: String,
     /// A stop that another worker asked for; the owner's next sweep stops the command with this
     /// reason, and a beat keeps it.
     #[serde(default)]
@@ -414,6 +418,8 @@ pub(crate) struct Command {
     git_note: Mutex<Option<String>>,
     /// What a view shows of the output at most.
     view_cap: usize,
+    /// The machine this process runs on, as the record names it.
+    host: Arc<str>,
     /// How long a call to the environment's `kill` is waited for.
     kill_wait: Duration,
     /// The environment is not this container: a pod or a devcontainer.
@@ -474,6 +480,7 @@ impl Command {
             lines: Some(lines),
             git,
             beat: now_unix(),
+            host: self.host.to_string(),
             stop_requested: None,
         }
     }
@@ -606,6 +613,7 @@ impl Drop for Registry {
 #[derive(Clone)]
 pub struct Commands {
     owner: Arc<str>,
+    host: Arc<str>,
     entries: Arc<Registry>,
 }
 
@@ -636,6 +644,13 @@ fn random_token() -> String {
     token
 }
 
+/// The hostname the kernel gives this container, when it can be read.
+fn host_name() -> Option<String> {
+    let name = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -653,10 +668,19 @@ struct Elsewhere {
 impl Commands {
     /// A registry for this process, with an owner token of its own.
     pub fn new() -> Self {
+        let owner = random_token();
         Self {
-            owner: random_token().into(),
+            host: host_name().unwrap_or_else(|| owner.clone()).into(),
+            owner: owner.into(),
             entries: Arc::default(),
         }
+    }
+
+    /// The machine this process runs on, as its records name it: the hostname the kernel gives (the
+    /// pod's name in Kubernetes), or, when that cannot be read, the owner token, which no other
+    /// worker has.
+    pub fn host(&self) -> &str {
+        &self.host
     }
 
     /// The owner token (for tests of a worker that takes a run over).
@@ -976,7 +1000,7 @@ impl Commands {
         why: &str,
         kill_wait: Duration,
     ) {
-        kill_recorded(&other.record, session, kill_wait).await;
+        kill_recorded(&other.record, &self.host, session, kill_wait).await;
         // Written over only when it is still what was judged: a worker that beat meanwhile owns it.
         let now = kept
             .get_record(run, &other.id)
@@ -1168,10 +1192,16 @@ fn kill_group_blocking(pid: u32) {
 }
 
 /// Kill what a record says runs: through the environment, by exec id (when there is a session), and
-/// the processes this machine holds. The leader is killed by pid only when it is still the process
+/// the processes this machine holds, **when the record names this machine** (a pid means something
+/// only there; another machine's record, or one that names none, is killed by exec id alone). The leader is killed by pid only when it is still the process
 /// the record names (the same start time); when it is gone, what is left of its group is killed (a
 /// group id is not reused while a member lives); when another process has the pid, nothing is.
-async fn kill_recorded(record: &Record, session: Option<&dyn EnvSession>, wait: Duration) {
+async fn kill_recorded(
+    record: &Record,
+    host: &str,
+    session: Option<&dyn EnvSession>,
+    wait: Duration,
+) {
     if let Some(session) = session
         && tokio::time::timeout(wait, session.kill(&ExecId::new(record.exec.clone())))
             .await
@@ -1182,6 +1212,10 @@ async fn kill_recorded(record: &Record, session: Option<&dyn EnvSession>, wait: 
     let (Some(pid), Some(start)) = (record.pid, record.start) else {
         return;
     };
+    // The pid is a number on the machine that started the process; here it could be anything.
+    if record.host.is_empty() || record.host != host {
+        return;
+    }
     match proc_start(pid) {
         Some(now) if now == start => {
             kill_group(Some(pid)).await;
@@ -1560,7 +1594,7 @@ pub async fn start_command(
         .await;
     if let Some(record) = &earlier {
         // The earlier try of this very call died: its process must not live beside the new one.
-        kill_recorded(record, Some(&*environment), kill_wait).await;
+        kill_recorded(record, env.commands.host(), Some(&*environment), kill_wait).await;
     }
 
     let Some(before) = Snapshot::of_slot(&slot).await else {
@@ -1639,6 +1673,7 @@ pub async fn start_command(
         session: environment.clone(),
         kept: env.kept.clone(),
         owner: env.commands.owner.clone(),
+        host: env.commands.host.clone(),
         metered: AtomicBool::new(false),
         git: Some(GitWatch {
             slot: slot.clone(),
@@ -2059,6 +2094,7 @@ mod tests {
             lines: Some(4),
             git: None,
             beat: 5,
+            host: "h".into(),
             stop_requested: None,
         };
         let json = serde_json::to_value(&record).unwrap();
@@ -2097,6 +2133,7 @@ mod tests {
             lines: None,
             git: None,
             beat,
+            host: String::new(),
             stop_requested: None,
         };
         assert!(record(940).is_fresh(1000, 60));

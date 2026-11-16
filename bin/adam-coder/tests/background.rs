@@ -1362,6 +1362,7 @@ async fn a_pid_with_another_start_time_is_never_killed_and_one_with_its_own_is()
             "command": "ghost", "slot": "remote", "cwd": "", "exec": format!("bg-ghost-{id}"),
             "owner": "a-worker-that-is-gone", "pid": pid, "start": start, "started_at": 1,
             "state": "running", "ran_secs": null, "lines": 0, "git": null, "beat": 0,
+            "host": rig.fx.env.commands.host(),
         })
     };
     let (wrong, right) = (
@@ -1433,6 +1434,7 @@ async fn what_is_left_of_a_group_whose_leader_is_gone_is_killed() {
         "command": "orphan", "slot": "remote", "cwd": "", "exec": "bg-orphan-1",
         "owner": "a-worker-that-is-gone", "pid": group, "start": start, "started_at": 1,
         "state": "running", "ran_secs": null, "lines": 0, "git": null, "beat": 0,
+            "host": rig.fx.env.commands.host(),
     });
     rig.fx
         .env
@@ -2248,4 +2250,99 @@ async fn dropping_the_registry_kills_the_groups_it_holds() {
     let tree = group_members(leader);
     drop(rig);
     until_gone("the tree", &tree).await;
+}
+
+// ------------------------------------------------------------------------------- the host
+
+/// A record of a stale command that another machine started: a pid and a start time that match a live
+/// process of this machine do not make it the record's. Nothing local is signalled, the exec id is
+/// killed where there is a session, and the record says `gone`. With this machine's host the same
+/// record kills the process.
+#[tokio::test]
+async fn a_pid_is_only_killed_on_the_machine_that_the_record_names() {
+    use std::os::unix::process::CommandExt as _;
+    let fake = FakeEnvironment::new(None);
+    let rig = Rig::from(Fixture::new().await.using(fake.clone())).await;
+    let peer = Peer {
+        env: {
+            let mut env = Arc::try_unwrap(another_worker(&rig))
+                .ok()
+                .expect("not shared");
+            env.environment = fake.clone();
+            Arc::new(env)
+        },
+    };
+    let spawn = |seconds: &str| {
+        std::process::Command::new("sleep")
+            .arg(seconds)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    let mut elsewhere = spawn("663");
+    let mut nowhere = spawn("664");
+    let mut here = spawn("665");
+    let _reap = (
+        common::GroupGuard(elsewhere.id()),
+        common::GroupGuard(nowhere.id()),
+        common::GroupGuard(here.id()),
+    );
+    let this_host = rig.fx.env.commands.host().to_owned();
+    let mut ids = Vec::new();
+    for (name, child, host) in [
+        ("elsewhere", &elsewhere, Some("another-pod".to_owned())),
+        ("nowhere", &nowhere, None),
+        ("here", &here, Some(this_host)),
+    ] {
+        let id = adam_llm_agent::output_id(&rig.run(), name);
+        let mut record = json!({
+            "command": name, "slot": "remote", "cwd": "", "exec": format!("bg-host-{name}"),
+            "owner": "a-worker-that-is-gone", "pid": child.id(), "start": start_of(child.id()),
+            "started_at": 1, "state": "running", "ran_secs": null, "lines": 0, "git": null,
+            "beat": 0,
+        });
+        if let Some(host) = host {
+            record["host"] = json!(host);
+        }
+        rig.fx
+            .env
+            .kept
+            .put_record(&rig.run(), &id, &serde_json::to_vec(&record).unwrap())
+            .unwrap();
+        ids.push(id);
+    }
+    let listed = peer.list(&rig).await;
+    for id in &ids {
+        assert!(listed.contains(&format!("{id} gone")), "{listed}");
+        assert_eq!(record_of(&rig, id)["state"], "gone");
+    }
+    until("the process of this machine to be killed", || {
+        here.try_wait().unwrap().is_some()
+    })
+    .await;
+    assert!(
+        elsewhere.try_wait().unwrap().is_none(),
+        "another machine's pid"
+    );
+    assert!(
+        nowhere.try_wait().unwrap().is_none(),
+        "a record with no host"
+    );
+    // The exec id is killed through the environment all the same.
+    let killed = fake.session.killed.lock().unwrap().clone();
+    for name in ["elsewhere", "nowhere", "here"] {
+        assert!(
+            killed
+                .iter()
+                .any(|e| e.as_str() == format!("bg-host-{name}")),
+            "{name}: {killed:?}"
+        );
+    }
+    elsewhere.kill().unwrap();
+    nowhere.kill().unwrap();
+    elsewhere.wait().unwrap();
+    nowhere.wait().unwrap();
 }

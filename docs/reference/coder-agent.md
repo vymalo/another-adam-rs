@@ -382,7 +382,7 @@ sequenceDiagram
 
 A process **group** is killed whatever ended the leader (`cmd &` leaves nothing behind), and what a pod or a devcontainer holds is
 stopped by exec id (`bg-kp-...`, `bg-dc-...`, `adam-exec kill`), bounded by a time (`kill` that does not answer does not hold the
-command). A pid is killed only when its start time is still the one the record names; when the leader is gone, what is left of its
+command). A record names the machine that started the process (`host`, the hostname the kernel gives: the pod's name), and a pid is signalled **only on that machine**: a stale record of another machine, or one that names none, is marked `gone` and its exec id is killed where there is a session, and nothing local is signalled (a local process of a worker that was killed on another machine then ends only when that machine goes away, which is what a pod's deletion does). A pid is killed only when its start time is still the one the record names; when the leader is gone, what is left of its
 group is killed; when another process has the pid, nothing is. **Replay:** a start step that runs again finds its command. This
 process holds it, or its record is fresh (another worker runs it), or it ended: the call returns its view and starts nothing. A
 stale record is an earlier try that died: its process is killed and the command starts again with its output begun again. At most
