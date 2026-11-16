@@ -947,7 +947,8 @@ async fn a_loaded_repository_skill_replays_from_the_journal_after_the_file_chang
     assert_eq!(notes.repo_skills["remote"].call_id, "c1");
 }
 
-/// A long run is compacted (a budget of 3,000 tokens, a 12 KB read at the fourth turn): the result of
+/// A long run is compacted (two reads of a 31 KB file fill a budget of 31,000 tokens, of which the
+/// coder's instructions and tools take about 18,000): the result of
 /// `prepare_workspace` (the slot, the branch, the listing of the repository's skills and its
 /// instructions) is pinned, so the marker that replaces the turns it was in still holds it, as the
 /// repository's text and not as a message of the person.
@@ -955,19 +956,20 @@ async fn a_loaded_repository_skill_replays_from_the_journal_after_the_file_chang
 async fn the_prepare_result_survives_a_compaction() {
     let fx = Fixture::new().await;
     repository_with_a_skill(&fx);
-    let notes: String = (0..200)
+    let notes: String = (0..500)
         .map(|n| format!("note {n:04}: {}\n", "w".repeat(50)))
         .collect();
     fx.commit_to_main("notes.txt", &notes);
-    fx.commit_to_main("small.txt", "small\n");
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![prepare("c1", &fx)])
-        .push_tool_calls(vec![read("c2", "small.txt")])
-        .push_tool_calls(vec![read("c3", "small.txt")])
-        .push_tool_calls(vec![read("c4", "notes.txt")])
+        .push_tool_calls(vec![read("c2", "notes.txt")])
+        .push_tool_calls(vec![read("c3", "notes.txt")])
         .push_text("SUMMARY: prepared the workspace and read the notes")
         .push_text("done");
-    let coder = coder_with_history_and_summaries(&fx, &mock, Arc::new(MemoryStore::new()), 3000);
+    // The budget is over what the request holds at least after the cut (the instructions and the
+    // tools, the task and the newest read: a compaction that left the request over it would not be
+    // made) and under what it holds after the second read, each by about 4,000 tokens.
+    let coder = coder_with_history_and_summaries(&fx, &mock, Arc::new(MemoryStore::new()), 31_000);
     let task_text = format!("look at {}", fx.remote_url());
     let (_, run) = submit(&coder, &task_text).await;
     let worker = spawn_worker(&coder);
@@ -978,10 +980,10 @@ async fn the_prepare_result_survives_a_compaction() {
     let requests = mock.requests();
     assert_eq!(
         requests.len(),
-        6,
-        "four turns, the summary and the last turn"
+        5,
+        "three turns, the summary and the last turn"
     );
-    let after = &requests[5];
+    let after = &requests[4];
     // Whoever reads what the person said sees the task and nothing else: the marker is the second
     // part of the first message and holds the repository's text.
     let Message::User { content } = &after.messages[0] else {
@@ -1017,5 +1019,5 @@ async fn the_prepare_result_survives_a_compaction() {
         "no other part: the person said nothing else"
     );
     // The cache's head did not move.
-    assert_eq!(head(&requests[3]), head(&requests[5]));
+    assert_eq!(head(&requests[2]), head(&requests[4]));
 }
