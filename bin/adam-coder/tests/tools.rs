@@ -5164,7 +5164,8 @@ async fn share_file_returns_the_file_as_an_artifact_and_tells_the_model_one_line
         format!(
             "Shared chart.svg ({} bytes, image/svg+xml). To show it in your answer, write \
              ![description](chart.svg). To use it as the picture of an `ask_user` option, pass \
-             image {{sha256: \"{hash}\", alt}}.",
+             image {{sha256: \"{hash}\", alt}}. In a `show` block, an `Image` names it: \
+             {{component: \"Image\", artifact: \"{hash}\", alt}}.",
             SVG.len()
         )
     );

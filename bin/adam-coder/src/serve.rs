@@ -383,7 +383,7 @@ pub async fn serve(
     // Only a role that runs workers builds the agent: model, GitHub client, workspaces, MCP
     // servers. A control plane starts, delivers to, cancels and views runs, which needs the
     // agent's name and `init` only (`CoderStarter`), so it takes no model or GitHub configuration.
-    let agents = match &config.worker {
+    let (agents, prompts) = match &config.worker {
         Some(worker) => {
             let (agent, janitor) = build_agent(
                 worker,
@@ -392,29 +392,41 @@ pub async fn serve(
                 &files,
             )
             .await?;
-            Agents::new(AGENT_NAME, move |builder| agent.register(builder))
-                .options(options_of(worker))
-                // Beside the runtime's worker: the sweep of the workspaces of finished runs.
-                .worker_component("janitor", move |store, stop| janitor.run(store, stop))
+            // The prompts of the MCP servers the deployment adds (`ADAM_EXTRA_MCP_FILE`) are
+            // commands too; the coder's own `github` server has a bearer per call and gives none.
+            let prompts = agent.assembly().prompt_commands().to_vec();
+            (
+                Agents::new(AGENT_NAME, move |builder| agent.register(builder))
+                    .options(options_of(worker))
+                    // Beside the runtime's worker: the sweep of the workspaces of finished runs.
+                    .worker_component("janitor", move |store, stop| janitor.run(store, stop)),
+                prompts,
+            )
         }
-        None => Agents::new(AGENT_NAME, |builder| builder.starter(CoderStarter)),
-    }
-    // The person's screen is the sender: their answers through a form, and the catalog and the
-    // tools of the conversation, reach the run (the extensions the card lists).
-    .inbound(adam_a2a_runtime::vymalo_inbound)
-    // The card lists `access-tier/v1` with all four tiers: the backend reads the tier a message
-    // names, refuses a bad one and says the tier a task works under.
-    .access_tiers(crate::tier::honoured_up_to(config.max_access_tier))
-    // The card lists the commands of the files (`commands/v1`); the backend expands a message
-    // that names one before it is stored.
-    .commands(files.commands());
+        None => (
+            Agents::new(AGENT_NAME, |builder| builder.starter(CoderStarter)),
+            Vec::new(),
+        ),
+    };
+    let (commands, listed) = adam_service::with_prompt_commands(files.commands(), &prompts);
+    let agents = agents
+        // The person's screen is the sender: their answers through a form, and the catalog and the
+        // tools of the conversation, reach the run (the extensions the card lists).
+        .inbound(adam_a2a_runtime::vymalo_inbound)
+        // The card lists `access-tier/v1` with all four tiers: the backend reads the tier a message
+        // names, refuses a bad one and says the tier a task works under.
+        .access_tiers(crate::tier::honoured_up_to(config.max_access_tier))
+        // The card lists the commands of the files and the prompts of the MCP servers (`commands/v1`);
+        // the backend expands a message that names one before it is stored.
+        .commands(commands);
     // The card of the files this process runs, like the workers' agent.
     let card = match &config.service.public_url {
         Some(public_url) => Some(
             agent_card_for(&files, public_url, config.max_access_tier)
                 .map_err(|e| *e)
                 .context("building the agent card")?,
-        ),
+        )
+        .map(|card| adam_service::card_with_commands(card, &listed)),
         None => None,
     };
 

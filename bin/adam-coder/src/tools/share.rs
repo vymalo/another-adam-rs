@@ -32,9 +32,10 @@
 //!
 //! # What the model is told
 //!
-//! One line: `Shared chart.svg (1.2 KiB, image/svg+xml). To show it in your answer, write
-//! ![description](chart.svg).` ([`Artifact::shared_line`]; the second sentence for an image only),
-//! and for an image a third that gives the file's SHA-256 for the picture of an `ask_user` option.
+//! One line, [`Artifact::shared_line`], the same for every source of a shared file: `Shared
+//! chart.svg (1.2 KiB, image/svg+xml).` and, for an image only, how to use it: inline in the answer
+//! by name (`![description](chart.svg)`), by its SHA-256 as the picture of an `ask_user` option, and
+//! by the same SHA-256 in a `show` `Image` block.
 //! The bytes go only into the artifact; they are never in the model's history (the loop records a
 //! tool's `content` and the artifact's size, nothing else).
 //!
@@ -124,7 +125,7 @@ pub async fn share_file(
         Ok(artifact) => artifact,
         Err(e) => return Ok(ToolOutput::error(e.to_string())),
     };
-    let line = with_picture_hint(&artifact);
+    let line = artifact.shared_line();
     // The run delivered something: a scratch run that ends here may complete without a pull
     // request (`CoderAgent`). Noted once however often the file is shared. In the notes of the
     // run that shares, not of its root: a subagent's file stays on the subagent's run and the
@@ -140,25 +141,6 @@ pub async fn share_file(
             .map_err(|e| notes_error(&e))?;
     }
     Ok(ToolOutput::text(line).with_artifact(artifact))
-}
-
-/// What the model is told of a shared file: [`Artifact::shared_line`], and for an image also the
-/// file's SHA-256, which is how an option of an `ask_user` form names it as its picture.
-fn with_picture_hint(artifact: &Artifact) -> String {
-    let line = artifact.shared_line();
-    let is_image = artifact
-        .mime_type
-        .as_deref()
-        .is_some_and(|t| t.starts_with("image/"));
-    if !is_image {
-        return line;
-    }
-    match artifact.file_sha256() {
-        Some(hash) => format!(
-            "{line} To use it as the picture of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}."
-        ),
-        None => line,
-    }
 }
 
 /// Read `rel` under `root` for sharing, or the reason the model is told.

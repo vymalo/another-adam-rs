@@ -1246,6 +1246,7 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
         tools,
         optional,
         files,
+        settings,
     } = &config.servers["github"]
     else {
         panic!(
@@ -1259,6 +1260,10 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
         "GitHub is the coder's one required server: without it a worker must not start"
     );
     assert!(!*files, "GitHub answers in text: nothing of it is shared");
+    assert!(
+        !settings.instructions,
+        "the coder's prompt already covers GitHub, and its bearer per call has no session to ask"
+    );
     assert_eq!(url, "http://127.0.0.1:8082/");
     assert!(
         headers.is_empty(),

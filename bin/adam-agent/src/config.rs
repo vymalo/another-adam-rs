@@ -20,6 +20,7 @@
 //! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
 //! | `A2A_ALLOW_INSECURE_REMOTES` | let a remote subagent (`a2a:`) be at a plain-`http` URL that is not this machine, such as a Kubernetes service in the same cluster; the messages and the bearer then cross the network in clear text, so protect it (a NetworkPolicy, mesh mTLS) | `false` |
+//! | `MCP_MAX_CALL_SECS` | the longest an agent's own files may ask of one MCP server with `timeoutSecs` or `connectTimeoutSecs` (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 //!
 //! Every problem is reported at once, so a misconfigured deployment is fixed in one round trip.

@@ -674,12 +674,15 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
             name.starts_with("screenshot-") && name.ends_with(".png"),
             "{backend}: {name}"
         );
+        let hash = view.artifacts[0].file_sha256().unwrap();
         assert_eq!(
             last_tool_result(&model.requests()[1], "c1"),
             (
                 format!(
                     "Shared {name} (67 bytes, image/png). To show it in your answer, write \
-                     ![description]({name})."
+                     ![description]({name}). To use it as the picture of an `ask_user` option, \
+                     pass image {{sha256: \"{hash}\", alt}}. In a `show` block, an `Image` names \
+                     it: {{component: \"Image\", artifact: \"{hash}\", alt}}."
                 ),
                 false
             ),

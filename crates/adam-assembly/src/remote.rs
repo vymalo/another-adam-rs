@@ -1065,11 +1065,13 @@ mod tests {
             "{pdf}"
         );
         assert_eq!(names[1].0, pdf);
+        let hash = out.artifacts[0].file_sha256().unwrap();
         assert_eq!(
             out.content,
             format!(
                 "Shared {page} (16 bytes, image/png). To show it in your answer, write \
-                 ![description]({page}).\n\nand a PDF:\nShared {pdf} (8 bytes, application/pdf).\n\
+                 ![description]({page}). To use it as the picture of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}. \
+                 In a `show` block, an `Image` names it: {{component: \"Image\", artifact: \"{hash}\", alt}}.\n\nand a PDF:\nShared {pdf} (8 bytes, application/pdf).\n\
                  [file at https://x.example.com/f]"
             )
         );

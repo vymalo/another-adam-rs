@@ -771,6 +771,11 @@ async fn a_screenshot_of_a_files_true_server_reaches_the_a2a_client_as_a_file() 
     assert_eq!(part.media_type.as_deref(), Some("image/png"));
     let name = part.filename.clone().unwrap();
     assert!(name.ends_with(".png") && shot[0].name.as_deref() == Some(name.as_str()));
+    let hash =
+        adam_runtime::Artifact::file("x", "image/png", "x.png", adam_mcp_testkit::PNG.to_vec())
+            .unwrap()
+            .file_sha256()
+            .unwrap();
     match mock.requests()[1].messages.last().unwrap() {
         adam_model::Message::Tool {
             content, is_error, ..
@@ -779,7 +784,9 @@ async fn a_screenshot_of_a_files_true_server_reaches_the_a2a_client_as_a_file() 
             (
                 format!(
                     "Shared {name} (67 bytes, image/png). To show it in your answer, write \
-                     ![description]({name})."
+                     ![description]({name}). To use it as the picture of an `ask_user` option, \
+                     pass image {{sha256: \"{hash}\", alt}}. In a `show` block, an `Image` names \
+                     it: {{component: \"Image\", artifact: \"{hash}\", alt}}."
                 )
                 .as_str(),
                 false

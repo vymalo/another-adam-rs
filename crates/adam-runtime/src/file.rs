@@ -154,11 +154,22 @@ pub fn extension_of(media_type: &str) -> &'static str {
 }
 
 impl Artifact {
-    /// What a tool tells the model it shared, in place of the bytes, in one line: `Shared report.pdf
-    /// (84.0 KiB, application/pdf).` for a file artifact; for an image, also how to show it inline,
-    /// by the file's name (what the person's screen resolves an image's source against), never by a
-    /// path: `Shared chart.png (1.5 KiB, image/png). To show it in your answer, write
-    /// ![description](chart.png).` A JSON artifact is `Shared <name>.`
+    /// What a tool tells the model it shared, in place of the bytes: `Shared report.pdf (84.0 KiB,
+    /// application/pdf).` for a file artifact; for an image, also how to use it, by the file's name
+    /// inline in the answer (what the person's screen resolves an image's source against, never a
+    /// path) and by its SHA-256 as the picture of an `ask_user` option and in a `show` `Image`
+    /// block:
+    ///
+    /// ```text
+    /// Shared chart.png (1.5 KiB, image/png). To show it in your answer, write
+    /// ![description](chart.png). To use it as the picture of an `ask_user` option, pass image
+    /// {sha256: "<64 hex digits>", alt}. In a `show` block, an `Image` names it:
+    /// {component: "Image", artifact: "<64 hex digits>", alt}.
+    /// ```
+    ///
+    /// Every source of a shared file says it the same way: the coder's `share_file`, a server of an
+    /// `mcp.json` with `files: true` and a remote subagent with `files: true`. A JSON artifact is
+    /// `Shared <name>.`
     pub fn shared_line(&self) -> String {
         let Some(file) = &self.file else {
             return format!("Shared {}.", self.name);
@@ -174,6 +185,12 @@ impl Artifact {
                 " To show it in your answer, write ![description]({}).",
                 link_destination(&file.filename)
             ));
+            if let Some(hash) = self.file_sha256() {
+                line.push_str(&format!(
+                    " To use it as the picture of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}. \
+                     In a `show` block, an `Image` names it: {{component: \"Image\", artifact: \"{hash}\", alt}}."
+                ));
+            }
         }
         line
     }
@@ -491,10 +508,16 @@ mod tests {
     #[test]
     fn the_shared_line_says_name_size_and_type_never_the_bytes() {
         let file = Artifact::file("chart", "image/png", "chart.png", vec![7; 1536]).unwrap();
+        let hash = file.file_sha256().unwrap();
+        assert_eq!(hash.len(), 64);
         assert_eq!(
             file.shared_line(),
-            "Shared chart.png (1.5 KiB, image/png). To show it in your answer, write \
-             ![description](chart.png)."
+            format!(
+                "Shared chart.png (1.5 KiB, image/png). To show it in your answer, write \
+                 ![description](chart.png). To use it as the picture of an `ask_user` option, \
+                 pass image {{sha256: \"{hash}\", alt}}. In a `show` block, an `Image` names it: \
+                 {{component: \"Image\", artifact: \"{hash}\", alt}}."
+            )
         );
         // A name a bare link cannot hold is put between angle brackets.
         let spaced = Artifact::file("c", "image/svg+xml", "my chart (v2).svg", vec![1]).unwrap();

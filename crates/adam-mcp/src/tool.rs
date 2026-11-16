@@ -661,11 +661,13 @@ mod tests {
             is_named(&names[2], "browser_screenshot", "wav"),
             "{names:?}"
         );
+        let hash = output.artifacts[0].file_sha256().unwrap();
         assert_eq!(
             output.content,
             format!(
                 "the page\nShared {} (67 bytes, image/png). To show it in your answer, write \
-                 ![description]({}).\nShared {} (13 bytes, application/pdf).\n\
+                 ![description]({}). To use it as the picture of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}. \
+                 In a `show` block, an `Image` names it: {{component: \"Image\", artifact: \"{hash}\", alt}}.\nShared {} (13 bytes, application/pdf).\n\
                  Shared {} (16 bytes, audio/wav).\nnotes\n[resource link: file:///c.txt]",
                 names[0], names[0], names[1], names[2]
             )

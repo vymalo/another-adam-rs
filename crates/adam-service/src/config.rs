@@ -25,6 +25,7 @@
 //! | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (no `contextWindow`) |
 //! | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: with `conversation` each request carries a `prompt_cache_key` that is the same for every request of one conversation (a SHA-256 of its id cut to 32 hex digits), so that a gateway with a prompt cache routes them together; anything else is a startup error ([`ModelConfig::prompt_cache_key`]) | `off` |
 //! | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the MCP servers of an agent folder may be ([`McpSettings`], feature `mcp`) | `false` each |
+//! | `MCP_MAX_CALL_SECS` | the longest an agent's own files may ask of one MCP server with `timeoutSecs` or `connectTimeoutSecs`; a larger value is lowered to it with a warning (1 to 86400; [`McpSettings`], feature `mcp`) | `900` |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400; [`McpSettings`], feature `mcp`) | `3600` |
 //!
 //! A binary reads what it needs with the `parse` functions of this module, each of which adds
@@ -724,6 +725,14 @@ fn parse_prompt_cache_key(raw: &Option<String>, problems: &mut Vec<String>) -> P
 #[cfg(feature = "mcp")]
 pub const DEFAULT_THREAD_TOOLS_MAX_CALL_SECS: u64 = 3600;
 
+/// The default of `MCP_MAX_CALL_SECS`: fifteen minutes.
+#[cfg(feature = "mcp")]
+pub const DEFAULT_MCP_MAX_CALL_SECS: u64 = 900;
+
+/// The most `MCP_MAX_CALL_SECS` may say: a day.
+#[cfg(feature = "mcp")]
+pub const MAX_MCP_MAX_CALL_SECS: u64 = 86_400;
+
 /// The most `THREAD_TOOLS_MAX_CALL_SECS` may say: a day.
 #[cfg(feature = "mcp")]
 pub const MAX_THREAD_TOOLS_MAX_CALL_SECS: u64 = 86_400;
@@ -750,6 +759,11 @@ pub struct McpSettings {
     /// (`_meta["thread-tools/v1"].timeoutSecs`: 125 s for a relayed search, 30 minutes for an
     /// asked agent); the agent waits that long, **capped by this**. 1 to 86400, default 3600.
     pub thread_tools_max_call_secs: u64,
+    /// `MCP_MAX_CALL_SECS`: the longest, in seconds, that an agent's own files may ask of one MCP
+    /// server: a `timeoutSecs` or a `connectTimeoutSecs` of an `mcp.json` (or of the extra MCP
+    /// file) above it is lowered to it, with a warning at startup. The files never decide alone
+    /// how long a call may take. 1 to 86400, default 900.
+    pub max_call_secs: u64,
 }
 
 #[cfg(feature = "mcp")]
@@ -760,6 +774,7 @@ impl Default for McpSettings {
             allow_insecure: false,
             allow_url_vars: false,
             thread_tools_max_call_secs: DEFAULT_THREAD_TOOLS_MAX_CALL_SECS,
+            max_call_secs: DEFAULT_MCP_MAX_CALL_SECS,
         }
     }
 }
@@ -776,6 +791,7 @@ impl McpSettings {
             allow_insecure: parse_flag(&get, "MCP_ALLOW_INSECURE", problems),
             allow_url_vars: parse_flag(&get, "MCP_ALLOW_URL_VARS", problems),
             thread_tools_max_call_secs: parse_max_call_secs(&get, problems),
+            max_call_secs: parse_mcp_max_call_secs(&get, problems),
         }
     }
 
@@ -788,7 +804,26 @@ impl McpSettings {
             .thread_tools_max_call(std::time::Duration::from_secs(
                 self.thread_tools_max_call_secs,
             ))
+            .max_call(std::time::Duration::from_secs(self.max_call_secs))
     }
+}
+
+/// `MCP_MAX_CALL_SECS`: 1 to 86400, [`DEFAULT_MCP_MAX_CALL_SECS`] when unset or blank; anything
+/// else is a problem and the default.
+#[cfg(feature = "mcp")]
+fn parse_mcp_max_call_secs(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> u64 {
+    const NAME: &str = "MCP_MAX_CALL_SECS";
+    let secs = parse_or(get, NAME, DEFAULT_MCP_MAX_CALL_SECS, problems);
+    if (1..=MAX_MCP_MAX_CALL_SECS).contains(&secs) {
+        return secs;
+    }
+    problems.push(format!(
+        "{NAME} must be between 1 and {MAX_MCP_MAX_CALL_SECS} seconds, got {secs}"
+    ));
+    DEFAULT_MCP_MAX_CALL_SECS
 }
 
 /// `THREAD_TOOLS_MAX_CALL_SECS`: 1 to 86400, [`DEFAULT_THREAD_TOOLS_MAX_CALL_SECS`] when unset or
@@ -1516,6 +1551,34 @@ mod tests {
                     s.policy().thread_tools_max_call_value(),
                     std::time::Duration::from_secs(secs)
                 );
+            }
+        }
+
+        #[test]
+        fn the_cap_on_what_the_files_may_ask_is_fifteen_minutes_and_can_be_set() {
+            let (s, problems) = settings(&HashMap::new());
+            assert!(problems.is_empty());
+            assert_eq!(s.max_call_secs, 900);
+            assert_eq!(
+                s.policy().max_call_value(),
+                std::time::Duration::from_secs(900)
+            );
+            for (value, secs) in [("", 900), (" 120 ", 120), ("1", 1), ("86400", 86_400)] {
+                let (s, problems) = settings(&HashMap::from([("MCP_MAX_CALL_SECS", value)]));
+                assert!(problems.is_empty(), "{value}: {problems:?}");
+                assert_eq!(s.max_call_secs, secs, "{value}");
+                assert_eq!(
+                    s.policy().max_call_value(),
+                    std::time::Duration::from_secs(secs)
+                );
+            }
+            for bad in ["0", "86401", "-5", "a quarter hour", "1.5"] {
+                let (s, problems) = settings(&HashMap::from([("MCP_MAX_CALL_SECS", bad)]));
+                assert!(
+                    problems.iter().any(|p| p.starts_with("MCP_MAX_CALL_SECS")),
+                    "{bad}: {problems:?}"
+                );
+                assert_eq!(s.max_call_secs, 900, "{bad}");
             }
         }
 

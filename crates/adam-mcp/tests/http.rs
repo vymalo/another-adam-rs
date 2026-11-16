@@ -198,11 +198,14 @@ async fn a_server_with_files_true_shares_its_images_and_blobs_as_files() {
         name.starts_with("screenshot-") && name.ends_with(".png") && name.len() == 23,
         "{name}"
     );
+    let hash = artifact.file_sha256().unwrap();
     assert_eq!(
         shot.content,
         format!(
             "Shared {name} (67 bytes, image/png). To show it in your answer, write \
-             ![description]({name})."
+             ![description]({name}). To use it as the picture of an `ask_user` option, pass \
+             image {{sha256: \"{hash}\", alt}}. In a `show` block, an `Image` names it: \
+             {{component: \"Image\", artifact: \"{hash}\", alt}}."
         )
     );
     assert_eq!(artifact.name, name);
@@ -1466,4 +1469,38 @@ async fn an_optional_server_with_a_mistake_in_its_file_is_still_an_error() {
         .await
         .unwrap_err();
     assert!(matches!(&error, Error::Name { .. }), "{error}");
+}
+
+/// What the model reads of an image a server shared names its SHA-256 twice over: as the picture of
+/// an `ask_user` option and as the `artifact` of a `show` `Image` block, so that an image an MCP
+/// server made can be put in front of the person.
+#[tokio::test]
+async fn mcp_image_line_has_sha256() {
+    let server = TestHttpServer::start(None).await;
+    let servers = connect(&http_config("paint", &server.url(), r#""files": true"#)).await;
+    let out = call(&servers.tools(), "paint__screenshot", json!({})).await;
+    let hash = out.artifacts[0].file_sha256().unwrap();
+    assert_eq!(hash.len(), 64);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{hash}");
+    assert!(
+        out.content
+            .contains(&format!("pass image {{sha256: \"{hash}\", alt}}")),
+        "ask_user: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains(&format!(
+            "{{component: \"Image\", artifact: \"{hash}\", alt}}"
+        )),
+        "show: {}",
+        out.content
+    );
+    // A server without `files: true` describes the image and says nothing of a hash.
+    let plain = connect(&http_config("paint", &server.url(), "")).await;
+    let described = call(&plain.tools(), "paint__screenshot", json!({})).await;
+    assert!(
+        !described.content.contains("sha256"),
+        "{}",
+        described.content
+    );
 }
