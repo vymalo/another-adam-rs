@@ -99,7 +99,14 @@ impl Recipe {
 
     /// Start (or dial) the server and run the handshake, within the connect timeout.
     pub(crate) async fn dial(&self) -> Result<Service, Error> {
-        match tokio::time::timeout(self.connect_timeout, self.dial_untimed()).await {
+        self.dial_by(tokio::time::Instant::now() + self.connect_timeout)
+            .await
+    }
+
+    /// [`dial`](Self::dial) with the instant it must be done by: the one deadline of opening a
+    /// connection is shared with the listings that follow.
+    async fn dial_by(&self, deadline: tokio::time::Instant) -> Result<Service, Error> {
+        match tokio::time::timeout_at(deadline, self.dial_untimed()).await {
             Ok(result) => result,
             Err(_) => Err(self.connect_error(&format!(
                 "no answer within {} ms",
@@ -280,7 +287,21 @@ pub(crate) async fn list_with(
     recipe: &Recipe,
     service: &Service,
 ) -> Result<Vec<ListedTool>, Error> {
-    match tokio::time::timeout(recipe.connect_timeout, service.peer().list_all_tools()).await {
+    list_by(
+        recipe,
+        service,
+        tokio::time::Instant::now() + recipe.connect_timeout,
+    )
+    .await
+}
+
+/// [`list_with`] by `deadline`.
+async fn list_by(
+    recipe: &Recipe,
+    service: &Service,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<ListedTool>, Error> {
+    match tokio::time::timeout_at(deadline, service.peer().list_all_tools()).await {
         Ok(Ok(tools)) => Ok(tools),
         Ok(Err(e)) => Err(Error::ListTools {
             server: recipe.server.clone(),
@@ -319,14 +340,17 @@ pub(crate) struct Connection {
 
 impl Connection {
     /// Connect for the first time and list the tools, and the prompts when `want_prompts` and the
-    /// server has any. A failure to list the tools is a startup error; a failure to list the prompts
-    /// is a warning and no prompt: they are a convenience, never a reason to stop.
+    /// server has any. The whole of it (dial, initialize, tools, prompts) has one deadline, the
+    /// connect timeout. A failure to list the tools is a startup error; a failure to list the
+    /// prompts, or no answer to it in time, is a warning and no prompt: they are a convenience,
+    /// never a reason to stop.
     pub(crate) async fn open(
         recipe: Recipe,
         want_prompts: bool,
     ) -> Result<(Arc<Self>, Offer), Error> {
-        let service = recipe.dial().await?;
-        let tools = list_with(&recipe, &service).await?;
+        let deadline = tokio::time::Instant::now() + recipe.connect_timeout;
+        let service = recipe.dial_by(deadline).await?;
+        let tools = list_by(&recipe, &service, deadline).await?;
         let peer = service.peer();
         let (instructions, has_prompts) = match peer.peer_info() {
             Some(info) => (
@@ -336,7 +360,7 @@ impl Connection {
             None => (None, false),
         };
         let prompts = if want_prompts && has_prompts {
-            match tokio::time::timeout(recipe.connect_timeout, peer.list_all_prompts()).await {
+            match tokio::time::timeout_at(deadline, peer.list_all_prompts()).await {
                 Ok(Ok(prompts)) => prompts,
                 Ok(Err(error)) => {
                     tracing::warn!(

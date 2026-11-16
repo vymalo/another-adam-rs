@@ -8,19 +8,21 @@
 //!     participant C as PromptCommand
 //!     participant S as MCP server
 //!     P->>B: message
-//!     B->>C: expand(["a", "b"])
-//!     Note over C: positional arguments, in the order the prompt declares them;<br/>a missing required one or an extra one is invalid params
-//!     C->>S: prompts/get (within the call timeout)
+//!     B->>C: expand_text("a b rest of the line")
+//!     Note over C: the first words (double quotes respected) are the declared arguments in order,<br/>the last declared one takes the rest of the line;<br/>a missing required one, or any text for a prompt with none, is invalid params
+//!     C->>S: prompts/get (the redial too, all within the smaller of the call timeout and 30 s)
 //!     S-->>C: messages
-//!     Note over C: only text messages of the user; anything else is invalid params;<br/>scrubbed of the values the file's ${VAR} put in
-//!     C-->>B: the text
+//!     Note over C: only text messages of the user; anything else is invalid params;<br/>control and format characters removed, then scrubbed of the values the file's ${VAR} put in
+//!     C-->>B: one line naming the prompt and the server, then the text
 //!     Note over B: the text is stored as the message: a replay never asks the server again
 //! ```
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_agent_fs::{COMMAND_DESCRIPTION_MAX, COMMAND_HINT_MAX, is_agent_name};
+use adam_agent_fs::{
+    COMMAND_DESCRIPTION_MAX, COMMAND_HINT_MAX, is_agent_name, is_format_or_control,
+};
 use rmcp::ServiceError;
 use rmcp::model::{
     ContentBlock, GetPromptRequestParams, GetPromptResponse, GetPromptResult, Prompt, Role,
@@ -44,6 +46,16 @@ pub enum PromptError {
     Unavailable(String),
 }
 
+/// The longest an expansion waits, whatever the server's call timeout says: a person is waiting for
+/// the message to be accepted.
+pub(crate) const MAX_EXPANSION_WAIT: Duration = Duration::from_secs(30);
+
+/// How long an expansion may take, redial included: the server's call timeout, and never more than
+/// [`MAX_EXPANSION_WAIT`].
+pub(crate) fn expansion_wait(call_timeout: Duration) -> Duration {
+    call_timeout.min(MAX_EXPANSION_WAIT)
+}
+
 /// One argument a prompt declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Declared {
@@ -64,7 +76,8 @@ pub struct PromptCommand {
     server: String,
     remote: String,
     connection: Arc<Connection>,
-    call_timeout: Duration,
+    /// The whole of one expansion: [`expansion_wait`] of the server's call timeout.
+    wait: Duration,
 }
 
 impl std::fmt::Debug for PromptCommand {
@@ -98,7 +111,32 @@ impl PromptCommand {
         &self.server
     }
 
-    /// The text this prompt makes of `arguments`, mapped in order onto the arguments it declares.
+    /// The prompt's own name on the server.
+    pub(crate) fn remote(&self) -> &str {
+        &self.remote
+    }
+
+    /// [`expand`](Self::expand) for what a person typed after the command name. The first words
+    /// (split on whitespace, double quotes respected, the quotes dropped) are the arguments the
+    /// prompt declares, in order, **except the last declared one, which takes the rest of the line**
+    /// (trimmed, one pair of surrounding double quotes dropped when the rest is one quoted span):
+    /// `/scene a red dot` for a prompt with one argument gives it `a red dot`. A prompt that
+    /// declares none refuses any text.
+    ///
+    /// # Errors
+    ///
+    /// As [`expand`](Self::expand).
+    pub async fn expand_text(&self, text: &str) -> Result<String, PromptError> {
+        let arguments = arguments_from_text(&self.declared, text).map_err(PromptError::Invalid)?;
+        self.expand(&arguments).await
+    }
+
+    /// The text this prompt makes of `arguments`, mapped in order onto the arguments it declares:
+    /// one line that says which prompt of which server it is, a blank line, then the server's text
+    /// (control and format characters removed, scrubbed of the values the file's `${VAR}` put in).
+    ///
+    /// The whole of it, a redial of a lost session included, is given the smaller of the server's
+    /// call timeout (`timeoutSecs`) and 30 seconds.
     ///
     /// # Errors
     ///
@@ -107,6 +145,18 @@ impl PromptCommand {
     /// user; [`PromptError::Unavailable`] when the server cannot be asked or does not answer in time.
     pub async fn expand(&self, arguments: &[String]) -> Result<String, PromptError> {
         let object = arguments_object(&self.declared, arguments).map_err(PromptError::Invalid)?;
+        match tokio::time::timeout(self.wait, self.ask(object)).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(PromptError::Unavailable(format!(
+                "the MCP server `{}` did not answer the prompt `{}` within {} ms",
+                self.server,
+                self.remote,
+                self.wait.as_millis()
+            ))),
+        }
+    }
+
+    async fn ask(&self, object: Map<String, Value>) -> Result<String, PromptError> {
         let (peer, generation) = self
             .connection
             .peer()
@@ -116,34 +166,31 @@ impl PromptCommand {
         if !object.is_empty() {
             params = params.with_arguments(object);
         }
-        let outcome = tokio::time::timeout(self.call_timeout, peer.get_prompt_once(params)).await;
-        match outcome {
-            Err(_) => Err(PromptError::Unavailable(format!(
-                "the MCP server `{}` did not answer the prompt `{}` within {} ms",
-                self.server,
-                self.remote,
-                self.call_timeout.as_millis()
-            ))),
-            Ok(Ok(GetPromptResponse::Complete(result))) => {
-                text_of(&result, self.connection.redactor()).map_err(|why| {
+        match peer.get_prompt_once(params).await {
+            Ok(GetPromptResponse::Complete(result)) => {
+                let text = text_of(&result, self.connection.redactor()).map_err(|why| {
                     PromptError::Invalid(format!(
                         "the prompt `{}` of the MCP server `{}` cannot be a message: {why}",
                         self.remote, self.server
                     ))
-                })
+                })?;
+                Ok(format!(
+                    "(the prompt {} of the MCP server {}, with the person's arguments)\n\n{text}",
+                    self.remote, self.server
+                ))
             }
-            Ok(Ok(_)) => Err(PromptError::Invalid(format!(
+            Ok(_) => Err(PromptError::Invalid(format!(
                 "the MCP server `{}` needs more input for the prompt `{}`, which this client \
                  cannot give",
                 self.server, self.remote
             ))),
-            Ok(Err(ServiceError::McpError(error))) => Err(PromptError::Invalid(format!(
+            Err(ServiceError::McpError(error)) => Err(PromptError::Invalid(format!(
                 "the MCP server `{}` refused the prompt `{}`: {}",
                 self.server,
                 self.remote,
                 self.connection.scrub(&error.message)
             ))),
-            Ok(Err(error)) => {
+            Err(error) => {
                 // The session is dropped, so that the next message reconnects.
                 self.connection.mark_broken(generation).await;
                 Err(PromptError::Unavailable(format!(
@@ -194,7 +241,7 @@ pub(crate) fn command_of(
         server: server.to_owned(),
         remote: prompt.name.clone(),
         connection: Arc::clone(connection),
-        call_timeout,
+        wait: expansion_wait(call_timeout),
     })
 }
 
@@ -204,13 +251,7 @@ fn readable(text: &str, redactor: &Redactor, max: usize) -> String {
     let scrubbed = redactor.scrub(text);
     let cleaned: String = scrubbed
         .chars()
-        .map(|c| {
-            if adam_a2a_runtime::is_format_or_control(c) {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if is_format_or_control(c) { ' ' } else { c })
         .collect();
     let line = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     line.chars().take(max).collect()
@@ -232,6 +273,53 @@ fn hint_of(declared: &[Declared], redactor: &Redactor) -> Option<String> {
         })
         .collect();
     Some(shown.join(" ")).map(|hint| hint.chars().take(COMMAND_HINT_MAX).collect())
+}
+
+/// The positional arguments a person's text makes for a prompt that declares `declared`: the first
+/// `N - 1` words, then the rest of the line as the last.
+fn arguments_from_text(declared: &[Declared], text: &str) -> Result<Vec<String>, String> {
+    let mut rest = text.trim();
+    let Some(words) = declared.len().checked_sub(1) else {
+        return if rest.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err("the prompt takes no arguments, and the command was given some".to_owned())
+        };
+    };
+    let mut out = Vec::with_capacity(declared.len());
+    for _ in 0..words {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let (word, after) = take_word(rest);
+        out.push(word);
+        rest = after;
+    }
+    let rest = rest.trim();
+    if !rest.is_empty() {
+        let inner = rest
+            .strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .filter(|inner| !inner.contains('"'));
+        out.push(inner.unwrap_or(rest).to_owned());
+    }
+    Ok(out)
+}
+
+/// The first word of `text` (not empty, not starting with whitespace) and what follows it: it ends
+/// at whitespace outside double quotes, and the quotes are dropped.
+fn take_word(text: &str) -> (String, &str) {
+    let mut word = String::new();
+    let mut quoted = false;
+    for (at, c) in text.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => return (word, &text[at..]),
+            c => word.push(c),
+        }
+    }
+    (word, "")
 }
 
 /// The arguments of `prompts/get`: the person's positional arguments, in the order the prompt
@@ -267,7 +355,8 @@ fn arguments_object(declared: &[Declared], given: &[String]) -> Result<Map<Strin
 }
 
 /// The text of the prompt's messages: every message must be a text of the user, joined by a blank
-/// line, and scrubbed of what the file's `${VAR}` put into the server's text.
+/// line, without control and format characters (a newline and a tab stay) and scrubbed of what the
+/// file's `${VAR}` put into the server's text.
 fn text_of(result: &GetPromptResult, redactor: &Redactor) -> Result<String, String> {
     let mut parts = Vec::with_capacity(result.messages.len());
     for message in &result.messages {
@@ -286,7 +375,14 @@ fn text_of(result: &GetPromptResult, redactor: &Redactor) -> Result<String, Stri
             }
         }
     }
-    let joined = redactor.scrub(&parts.join("\n\n"));
+    // Stripped first: a secret with a zero-width character inside it is whole again once that is
+    // gone, and only then can the redactor find it.
+    let stripped: String = parts
+        .join("\n\n")
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !is_format_or_control(*c))
+        .collect();
+    let joined = redactor.scrub(&stripped);
     if joined.trim().is_empty() {
         return Err("it has no text".to_owned());
     }
@@ -321,6 +417,45 @@ mod tests {
         assert_eq!(
             Value::Object(two),
             serde_json::json!({"topic": "rust", "style": "formal"})
+        );
+    }
+
+    #[test]
+    fn the_last_declared_argument_takes_the_rest_of_the_line() {
+        let one = declared(&[("subject", true)]);
+        let text = |d: &[Declared], t: &str| arguments_from_text(d, t).unwrap();
+        assert_eq!(text(&one, "a red dot"), ["a red dot"]);
+        assert_eq!(text(&one, "  a  red dot  "), ["a  red dot"]);
+        assert_eq!(
+            text(&one, "\"a red dot\""),
+            ["a red dot"],
+            "one quoted span loses its quotes"
+        );
+        assert_eq!(
+            text(&one, "say \"hi\" now"),
+            ["say \"hi\" now"],
+            "inner quotes stay"
+        );
+        assert_eq!(text(&one, ""), Vec::<String>::new());
+
+        let two = declared(&[("first", true), ("rest", false)]);
+        assert_eq!(
+            text(&two, "\"first one\" the rest of it"),
+            ["first one", "the rest of it"]
+        );
+        assert_eq!(text(&two, "only"), ["only"]);
+        assert_eq!(text(&two, "a \"b c\""), ["a", "b c"]);
+
+        assert!(
+            arguments_from_text(&[], "text").is_err(),
+            "none declared, text refused"
+        );
+        assert!(arguments_from_text(&[], "  ").unwrap().is_empty());
+        let both = declared(&[("a", true), ("b", true)]);
+        let given = text(&both, "x");
+        assert!(
+            arguments_object(&both, &given).is_err(),
+            "a required one is missing"
         );
     }
 
@@ -364,6 +499,29 @@ mod tests {
         )]);
         let text = text_of(&result, &redactor).unwrap();
         assert!(!text.contains("tok-secret-1"), "{text}");
+    }
+
+    #[test]
+    fn the_hint_is_at_most_a_hundred_characters() {
+        let redactor = Redactor::default();
+        let names: Vec<(String, bool)> = (0..5)
+            .map(|n| (format!("{n}{}", "a".repeat(39)), true))
+            .collect();
+        let items: Vec<(&str, bool)> = names.iter().map(|(n, r)| (n.as_str(), *r)).collect();
+        let hint = hint_of(&declared(&items), &redactor).unwrap();
+        assert_eq!(hint.chars().count(), COMMAND_HINT_MAX, "{hint}");
+    }
+
+    #[test]
+    fn an_expansion_waits_for_the_smaller_of_the_call_timeout_and_thirty_seconds() {
+        assert_eq!(
+            expansion_wait(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            expansion_wait(Duration::from_secs(900)),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

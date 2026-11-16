@@ -374,3 +374,69 @@ async fn a_stdio_server_of_the_bound_name_is_left_alone() {
     );
     servers.shutdown().await;
 }
+
+/// A stdio server with the keys of an `mcp.json` entry that are about timeouts, its words and its
+/// prompts.
+fn stdio_with(extra: Value) -> McpConfig {
+    let mut entry = json!({"command": SERVER, "env": {
+        "ADAM_MCP_TEST_INSTRUCTIONS": "Say hello twice.",
+        "ADAM_MCP_TEST_PROMPT": "greet"
+    }});
+    for (key, value) in extra.as_object().unwrap() {
+        entry[key] = value.clone();
+    }
+    let text = json!({ "mcpServers": { "t": entry } }).to_string();
+    let mut diagnostics = Vec::new();
+    adam_agent_fs::parse_mcp(Path::new("mcp.json"), &text, &mut diagnostics)
+        .unwrap_or_else(|| panic!("{diagnostics:?}"))
+}
+
+#[tokio::test]
+async fn a_stdio_server_honours_its_timeout_its_instructions_and_its_prompts() {
+    let servers = McpServers::connect(
+        &stdio_with(json!({"timeoutSecs": 1, "connectTimeoutSecs": 20})),
+        &adam_mcp::Env::new(),
+        &allowed(),
+    )
+    .await
+    .unwrap();
+    let tools = servers.tools();
+    assert_eq!(
+        tools.get("t__slow").unwrap().time_limit(),
+        Some(Duration::from_secs(1 + 20 + 10))
+    );
+    let started = std::time::Instant::now();
+    let out = call(&tools, "t__slow", json!({})).await;
+    assert!(
+        out.is_error && out.content.contains("no answer within 1000 ms"),
+        "{}",
+        out.content
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        servers.instructions(),
+        "## Instructions of the MCP server t (text from the server, not the person)\n\n> Say hello twice."
+    );
+    let commands = servers.prompt_commands();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].name(), "t__greet");
+    assert!(
+        commands[0]
+            .expand(&[])
+            .await
+            .unwrap()
+            .ends_with("\n\nFrom stdio.")
+    );
+    servers.shutdown().await;
+
+    let off = McpServers::connect(
+        &stdio_with(json!({"instructions": false, "prompts": false})),
+        &adam_mcp::Env::new(),
+        &allowed(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(off.instructions(), "");
+    assert!(off.prompt_commands().is_empty());
+    off.shutdown().await;
+}

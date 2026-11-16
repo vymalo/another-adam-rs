@@ -11,12 +11,13 @@ rust-version.workspace = true
 [features]
 default = []
 # `McpSettings`: the deployment's policy for the MCP servers of an agent folder (`MCP_ALLOW_*`).
-mcp = ["dep:adam-mcp"]
+mcp = ["dep:adam-mcp", "dep:adam-agent-fs"]
 
 [dependencies]
 a2a-lf.workspace = true
 adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true
+adam-agent-fs = { workspace = true, optional = true }
 adam-core.workspace = true
 adam-error.workspace = true
 adam-host.workspace = true

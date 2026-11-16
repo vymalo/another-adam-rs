@@ -110,6 +110,10 @@ send() {
   fi
   sed -n 's/^data: //p' "$stream" | jq -c '.' > "$tmp/events.jsonl" 2>/dev/null || : > "$tmp/events.jsonl"
   rpc_error=$(jq -r 'select(.error) | .error | "\(.code): \(.message)"' "$tmp/events.jsonl" | head -n 1)
+  # A refusal before the stream starts is one plain JSON object, not SSE: there is no `data:` line.
+  if [ ! -s "$tmp/events.jsonl" ]; then
+    rpc_error=$(jq -r 'select(.error) | .error | "\(.code): \(.message)"' "$stream" 2>/dev/null | head -n 1 || true)
+  fi
   if [ -n "$rpc_error" ]; then bad "the server answered with a JSON-RPC error: $rpc_error"; fi
 }
 

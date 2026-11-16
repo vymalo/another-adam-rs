@@ -36,6 +36,7 @@ mod digest;
 mod embedded;
 mod error;
 mod frontmatter;
+mod invisible;
 mod load;
 mod manifest;
 mod schema;
@@ -53,6 +54,7 @@ pub use embedded::{
 };
 pub use error::Error;
 pub use frontmatter::{Split, SplitError, split};
+pub use invisible::is_format_or_control;
 pub use load::{parse_mcp, parse_skill};
 pub use manifest::{
     AgentManifest, COMMAND_DESCRIPTION_MAX, COMMAND_HINT_MAX, COMMAND_TEMPLATE_MAX, Command,

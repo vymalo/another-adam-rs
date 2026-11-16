@@ -72,6 +72,10 @@ pub struct Counters {
 pub struct TestPrompt {
     prompt: Prompt,
     messages: Vec<PromptMessage>,
+    /// `prompts/get` never answers.
+    hangs: bool,
+    /// `prompts/get` answers with this MCP error.
+    fails: Option<String>,
 }
 
 impl TestPrompt {
@@ -80,6 +84,8 @@ impl TestPrompt {
         Self {
             prompt: Prompt::new(name, Some(description), None),
             messages: Vec::new(),
+            hangs: false,
+            fails: None,
         }
     }
 
@@ -111,6 +117,20 @@ impl TestPrompt {
         self
     }
 
+    /// Never answer `prompts/get` for this prompt.
+    #[must_use]
+    pub fn hangs(mut self) -> Self {
+        self.hangs = true;
+        self
+    }
+
+    /// Answer `prompts/get` for this prompt with an MCP error that says `message`.
+    #[must_use]
+    pub fn fails(mut self, message: &str) -> Self {
+        self.fails = Some(message.to_owned());
+        self
+    }
+
     /// Answer with one more message of the user that is an image.
     #[must_use]
     pub fn image(mut self) -> Self {
@@ -130,6 +150,10 @@ pub struct Script {
     /// The prompts it serves. `prompts/get` fills `{{name}}` in a text with the argument of that
     /// name, so that a test can see what was sent.
     pub prompts: Vec<TestPrompt>,
+    /// `prompts/list` never answers (a server that has the capability and does not use it).
+    pub hang_prompt_list: bool,
+    /// How long `tools/list` waits before it answers, in milliseconds.
+    pub list_tools_delay_ms: u64,
 }
 
 /// The MCP server behind the tools of the table in the [crate docs](crate).
@@ -240,7 +264,7 @@ fn text(text: impl Into<String>) -> CallToolResponse {
 
 impl ServerHandler for TestServer {
     fn get_info(&self) -> ServerConfig {
-        let capabilities = if self.script.prompts.is_empty() {
+        let capabilities = if self.script.prompts.is_empty() && !self.script.hang_prompt_list {
             ServerCapabilities::builder().enable_tools().build()
         } else {
             ServerCapabilities::builder()
@@ -270,6 +294,9 @@ impl ServerHandler for TestServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
+        if self.script.hang_prompt_list {
+            std::future::pending::<()>().await;
+        }
         Ok(ListPromptsResult::with_all_items(
             self.script
                 .prompts
@@ -296,6 +323,12 @@ impl ServerHandler for TestServer {
                 None,
             ));
         };
+        if found.hangs {
+            std::future::pending::<()>().await;
+        }
+        if let Some(message) = &found.fails {
+            return Err(McpError::invalid_params(message.clone(), None));
+        }
         let arguments = request.arguments.unwrap_or_default();
         let messages = found
             .messages
@@ -321,6 +354,12 @@ impl ServerHandler for TestServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        if self.script.list_tools_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.script.list_tools_delay_ms,
+            ))
+            .await;
+        }
         Ok(ListToolsResult::with_all_items(Self::tools()))
     }
 

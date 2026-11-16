@@ -190,6 +190,11 @@ pub async fn agents(
         }
         None => {
             let starter = LlmStarter::new(&name);
+            // A control plane connects no MCP server, so it cannot expand a prompt: a message that
+            // names the prompt of one of the folder's servers is refused, not sent to the model as
+            // plain text.
+            let commands =
+                adam_service::refuse_prompt_commands(commands, def.manifest().mcp.as_ref());
             (
                 Agents::new(name, move |builder| builder.starter(starter)),
                 commands,

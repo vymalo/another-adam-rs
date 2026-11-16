@@ -1663,6 +1663,7 @@ fn docs_script() -> adam_mcp_testkit::Script {
                 .argument("style", false)
                 .user("Summarize {{topic}} in a {{style}} style."),
         ],
+        ..Default::default()
     }
 }
 
@@ -1673,6 +1674,10 @@ fn write_docs_mcp_json(folder: &tempfile::TempDir, url: &str) {
     )
     .unwrap();
 }
+
+/// The line the model reads before the text of the `summarize` prompt of the server `docs`.
+const SUMMARIZE_LINE: &str =
+    "(the prompt summarize of the MCP server docs, with the person's arguments)\n\n";
 
 /// The prompts of an MCP server are commands of the agent: the card lists them (`commands/v1`,
 /// with the arguments the prompt declares as the hint), a message that names one is expanded with
@@ -1717,7 +1722,9 @@ async fn the_prompts_of_an_mcp_server_are_commands_of_the_agent() {
     worker.stop().await;
     assert_eq!(
         mock.requests()[0].messages[0],
-        adam_model::Message::user_text("Summarize rust in a formal style.")
+        adam_model::Message::user_text(format!(
+            "{SUMMARIZE_LINE}Summarize rust in a formal style."
+        ))
     );
     assert_eq!(server.prompt_gets(), 1, "asked once, at submit");
 }
@@ -1772,6 +1779,7 @@ async fn a_prompt_that_is_not_text_is_refused_before_anything_is_stored() {
     let script = adam_mcp_testkit::Script {
         instructions: None,
         prompts: vec![adam_mcp_testkit::TestPrompt::new("picture", "An image.").image()],
+        ..Default::default()
     };
     let server = TestHttpServer::start_scripted(None, script).await;
     let folder = chat();
@@ -1817,7 +1825,7 @@ async fn the_shipped_painter_loads_without_a_warning() {
 async fn the_painter_draws_and_shares_the_picture_with_the_servers_instructions_in_its_prompt() {
     let script = adam_mcp_testkit::Script {
         instructions: Some("Call `draw` with a short `prompt`.".into()),
-        prompts: Vec::new(),
+        ..Default::default()
     };
     let server = TestHttpServer::start_scripted(None, script).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1857,7 +1865,7 @@ async fn the_painter_draws_and_shares_the_picture_with_the_servers_instructions_
     assert!(
         system.contains(
             "## Instructions of the MCP server images (text from the server, not the person)\n\n\
-             Call `draw` with a short `prompt`."
+             > Call `draw` with a short `prompt`."
         ),
         "{system}"
     );
@@ -1872,5 +1880,202 @@ async fn the_painter_draws_and_shares_the_picture_with_the_servers_instructions_
             .iter()
             .any(|p| p.media_type.as_deref() == Some("image/png"))),
         "{shared:?}"
+    );
+}
+
+/// What a person types after the command is the prompt's arguments: the last one declared takes the
+/// rest of the line, and the model reads the first line that says where the text came from.
+#[tokio::test]
+async fn the_last_argument_of_a_prompt_takes_the_rest_of_the_line_and_the_model_is_told_whose_text_it_is()
+ {
+    let server = TestHttpServer::start_scripted(None, docs_script()).await;
+    let folder = chat();
+    write_docs_mcp_json(&folder, &server.url());
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let agents = build(def_of(&folder), None, Some(worker_parts(model)))
+        .await
+        .unwrap();
+    let service = service_over(agents, &store());
+    let worker = Worker::start(&service);
+    ask(
+        &service,
+        "/docs__summarize \"the repo\" in a very formal and terse",
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        mock.requests()[0].messages[0],
+        adam_model::Message::user_text(format!(
+            "{SUMMARIZE_LINE}Summarize the repo in a in a very formal and terse style."
+        ))
+    );
+}
+
+/// A server that is down is `unavailable`, one that refuses the prompt is `invalid params`, and a
+/// prompt that declares nothing refuses text, through the real mapping of the backend.
+#[tokio::test]
+async fn the_classes_of_a_prompts_failures_reach_the_a2a_error() {
+    let script = adam_mcp_testkit::Script {
+        prompts: vec![
+            adam_mcp_testkit::TestPrompt::new("plain", "No arguments.").user("hello"),
+            adam_mcp_testkit::TestPrompt::new("nope", "Refused.")
+                .user("x")
+                .fails("not today"),
+        ],
+        ..Default::default()
+    };
+    let mut server = TestHttpServer::start_scripted(None, script).await;
+    let folder = chat();
+    write_docs_mcp_json(&folder, &server.url());
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let mut parts = worker_parts(model);
+    parts.mcp = McpPolicy::default()
+        .connect_timeout(Duration::from_secs(2))
+        .call_timeout(Duration::from_secs(2));
+    let agents = build(def_of(&folder), None, Some(parts)).await.unwrap();
+    let service = service_over(agents, &store());
+    let submit = |text: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .backend
+                .submit(alice(), user(text), None, None)
+                .await
+                .unwrap_err()
+        }
+    };
+    assert!(matches!(
+        submit("/docs__plain some text").await,
+        adam_a2a::BackendError::InvalidParams(_)
+    ));
+    assert!(matches!(
+        submit("/docs__nope").await,
+        adam_a2a::BackendError::InvalidParams(why) if why.contains("not today")
+    ));
+    server.stop().await;
+    assert!(matches!(
+        submit("/docs__plain").await,
+        adam_a2a::BackendError::Unavailable { .. }
+    ));
+}
+
+/// The folder's commands and the prompts of its servers are at most 50, the folder's first.
+#[tokio::test]
+async fn the_folders_commands_and_the_prompts_together_are_at_most_the_limit() {
+    let many = adam_mcp_testkit::Script {
+        prompts: (0..51)
+            .map(|n| adam_mcp_testkit::TestPrompt::new(&format!("p{n:02}"), "One.").user("x"))
+            .collect(),
+        ..Default::default()
+    };
+    let server = TestHttpServer::start_scripted(None, many).await;
+    let logs = adam_mcp_testkit::LogCapture::start();
+    let folder = chat();
+    write_docs_mcp_json(&folder, &server.url());
+    let commands = folder.path().join("agent/commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    for n in 0..3 {
+        std::fs::write(
+            commands.join(format!("own{n}.md")),
+            "---\ndescription: The folder's own.\n---\nown\n",
+        )
+        .unwrap();
+    }
+    let card = card_of(&def_of(&folder), &url()).unwrap();
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let agents = build(def_of(&folder), Some(card), Some(worker_parts(model)))
+        .await
+        .unwrap();
+    let listed = agents.card.clone().unwrap();
+    let entry = listed
+        .extensions
+        .iter()
+        .find(|e| e.uri == adam_a2a::COMMANDS_EXTENSION)
+        .unwrap();
+    let names: Vec<&str> = entry.params["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 50, "{names:?}");
+    assert!(
+        names.contains(&"own0") && names.contains(&"own2"),
+        "the folder's come first"
+    );
+    assert!(
+        names.contains(&"docs__p46") && !names.contains(&"docs__p47"),
+        "the last prompts are dropped"
+    );
+    assert_eq!(
+        agents.commands.as_ref().unwrap().served(),
+        50,
+        "the backend serves what the card lists"
+    );
+    let text = logs.text();
+    assert_eq!(
+        text.matches("over the limit of commands").count(),
+        1,
+        "{text}"
+    );
+    assert!(
+        text.contains("dropped=4") || text.contains("dropped: 4"),
+        "{text}"
+    );
+}
+
+/// A control plane connects no MCP server: it refuses what names the prompt of one of the folder's
+/// servers (and says at startup that it does), and sends nothing to a model as plain text.
+#[tokio::test]
+async fn a_control_plane_refuses_a_prompt_it_cannot_expand_and_warns_at_start() {
+    let server = TestHttpServer::start_scripted(None, docs_script()).await;
+    let folder = chat();
+    write_docs_mcp_json(&folder, &server.url());
+    let logs = adam_mcp_testkit::LogCapture::start();
+    let agents = build(def_of(&folder), None, None).await.unwrap();
+    let text = logs.text();
+    assert!(
+        text.contains("connects no MCP server") && text.contains("docs"),
+        "{text}"
+    );
+    let service = service_over(agents, &store());
+    let error = service
+        .backend
+        .submit(alice(), user("/docs__summarize rust"), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, adam_a2a::BackendError::InvalidParams(why) if why.contains("control plane")),
+        "{error:?}"
+    );
+    assert_eq!(server.prompt_gets(), 0, "a control plane asks no server");
+    // A server that serves no prompts is nothing to refuse (and nothing to warn about).
+    let quiet = chat();
+    std::fs::write(
+        quiet.path().join("agent/mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{"docs": {{"type": "http", "url": "{}", "prompts": false}}}}}}"#,
+            server.url()
+        ),
+    )
+    .unwrap();
+    let logs = adam_mcp_testkit::LogCapture::start();
+    let agents = build(def_of(&quiet), None, None).await.unwrap();
+    assert!(
+        !logs.text().contains("connects no MCP server"),
+        "{}",
+        logs.text()
+    );
+    let service = service_over(agents, &store());
+    assert!(
+        service
+            .backend
+            .submit(alice(), user("/docs__summarize rust"), None, None)
+            .await
+            .is_ok()
     );
 }

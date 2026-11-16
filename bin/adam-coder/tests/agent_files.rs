@@ -1264,6 +1264,10 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
         !settings.instructions,
         "the coder's prompt already covers GitHub, and its bearer per call has no session to ask"
     );
+    assert!(
+        !settings.prompts,
+        "its bearer per call has no session to ask for prompts, and a control plane would refuse /github__..."
+    );
     assert_eq!(url, "http://127.0.0.1:8082/");
     assert!(
         headers.is_empty(),

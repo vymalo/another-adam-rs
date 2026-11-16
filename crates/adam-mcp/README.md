@@ -33,8 +33,8 @@ own.
 | Item | What |
 |---|---|
 | `McpServers` | `connect(&McpConfig, &Env, &McpPolicy)`, `tools()` (a `ToolSet`), `names()`, `instructions()` (what the servers said about themselves, bounded and scrubbed: see *Server instructions*), `prompt_commands()` (the prompts as commands: see *Prompts as commands*), `shutdown()`; `Debug` shows server and tool names only |
-| `PromptCommand`, `PromptError`, `MAX_SERVER_INSTRUCTIONS_BYTES`, `MAX_INSTRUCTIONS_BYTES`, `MAX_PROMPT_COMMANDS` | one prompt of a server as a command (`name()`, `description()`, `argument_hint()`, `server()`, `expand(&[String])`), why it could not be expanded (`Invalid` or `Unavailable`), and the limits of the two features (2 KiB a server, 8 KiB in all, 50 commands) |
-| `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s; the agent's time limit for an MCP tool is `call_timeout` + `connect_timeout` + 10 s, 100 s by default, `Tool::time_limit`: a call that has to dial again, or dials for itself, is within the limit; a server's own `timeoutSecs` and `connectTimeoutSecs` replace both for it), `max_call` (900 s, `DEFAULT_MAX_CALL`: the most those two keys may ask, a larger one is lowered with a warning; the `MCP_MAX_CALL_SECS` of the binaries), `thread_tools_max_call` (3600 s: the cap a caller puts on a call to the thread-tools endpoint), `bearer_per_call(server, origin, Arc<dyn CallBearer>)` (a server name plus an origin bound to a bearer per call: see *A bearer per call*); `Debug` names the bindings (server and origin) and never a token |
+| `PromptCommand`, `PromptError`, `MAX_SERVER_INSTRUCTIONS_BYTES`, `MAX_INSTRUCTIONS_BYTES` | one prompt of a server as a command (`name()`, `description()`, `argument_hint()`, `server()`, `expand(&[String])`, `expand_text(&str)` for what a person typed), why it could not be expanded (`Invalid` or `Unavailable`), and the limits of the two features (2 KiB a server, 8 KiB in all; how many commands an agent serves is for `adam-service`) |
+| `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s; the agent's time limit for an MCP tool is `call_timeout` + `connect_timeout` + 10 s, 100 s by default, `Tool::time_limit`: a call that has to dial again, or dials for itself, is within the limit; a server's own `timeoutSecs` and `connectTimeoutSecs` replace both for it), `max_call` (900 s, `DEFAULT_MAX_CALL`: the most one server of an `mcp.json` is waited for, for a call and for a connection each, **whoever asked for the value**: a file's key, the `call_timeout` and `connect_timeout` defaults, or a value a host set in code; one lowered is a warning; never under 1 s; the `MCP_MAX_CALL_SECS` of the binaries), `thread_tools_max_call` (3600 s: the cap a caller puts on a call to the thread-tools endpoint), `bearer_per_call(server, origin, Arc<dyn CallBearer>)` (a server name plus an origin bound to a bearer per call: see *A bearer per call*); `Debug` names the bindings (server and origin) and never a token |
 | `CallBearer` | the deployment's trait: `for_listing()` and `for_call(tool, &arguments)`, each a `SecretString` or a `ToolError` |
 | `Env` | values for `${VAR}`, taken before the process environment; held as secrets, `Debug` shows names only |
 | `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool`, `BearerBinding` (a bearer-per-call binding the file or the bearer does not fit) |
@@ -248,7 +248,7 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
 * **`files: true`** (an adam extension, on a `command` or a `url` server) shares the images, audio clips and blobs of
   the server's results with the person as files of the run, instead of describing them to the model: see
   [Files](#files-files-true). Without it (or with `files: false`) nothing of a file is kept (fail closed).
-* **`timeoutSecs`, `connectTimeoutSecs`** (adam extensions, whole seconds from 1; `adam-agent-fs` refuses 0, a negative or a fraction when the file is loaded) are the server's own call and connection timeouts, in place of the policy's. **The deployment caps them** with `McpPolicy::max_call` (default 15 minutes): a larger value is lowered to the cap, with one `warn!` per key naming the server, at `connect`. `McpTool::time_limit` is the server's `timeoutSecs` + `connectTimeoutSecs` + 10 s, so the agent's limit follows by itself. Tests: `tests/server_settings.rs` (`per_server_timeout_bounds_slow_server`, `time_limit_follows_server_timeout`, `timeout_capped_by_deployment`).
+* **`timeoutSecs`, `connectTimeoutSecs`** (adam extensions, whole seconds from 1; `adam-agent-fs` refuses 0, a negative or a fraction when the file is loaded) are the server's own call and connection timeouts, in place of the policy's. **The deployment caps the effective value** with `McpPolicy::max_call` (default 15 minutes): the file's key, and the policy's default of a server that says nothing, are lowered to the cap, with one `warn!` per key naming the server, at `connect`, and a value the file asks for is at least one second. A bearer-per-call server gets the same resolved values. **One deadline**, the connect timeout, covers opening a connection: the dial, `initialize`, `tools/list` and `prompts/list`; a server that lists its tools in time and hangs on its prompts is connected with no prompts and a warning, and one that lists no tools in time is a server that did not connect. `McpTool::time_limit` is the server's `timeoutSecs` + `connectTimeoutSecs` + 10 s, so the agent's limit follows by itself. Tests: `tests/server_settings.rs` (`per_server_timeout_bounds_slow_server`, `time_limit_follows_server_timeout`, `timeout_capped_by_deployment`, `a_cap_below_the_defaults_lowers_the_defaults_of_a_server_that_asks_for_nothing`, `opening_a_connection_has_one_deadline_for_the_dial_and_both_listings`, and the unit tests of `timeouts` in `servers.rs`).
 * **`instructions`, `prompts`** (adam extensions, on unless `false`): see *Server instructions* and *Prompts as commands* below.
 * **Names say whose tool it is.** A server name has no `__` and does not end in `_` (`Error::Name`, also in
   `adam-agent-fs`), and a tool name does not start with `_` (an error in an allow-list, skipped with a warning
@@ -347,10 +347,13 @@ the cached prefix holds (the likely mistake, a `ToolSource` that adds it per tur
 
 * A heading per server, in the order of the server names: `## Instructions of the MCP server <name> (text from the server,
   not the person)`, then the text.
-* Each text is **scrubbed first, whole,** of the values `${VAR}` put into the file (so a secret that would straddle the cut is
-  not left half there), then stripped of control and format characters (a newline and a tab stay; the rule is
-  `adam_a2a_runtime::is_format_or_control`), trimmed and cut at **2 KiB** on a character boundary. All servers together
-  are cut at **8 KiB**: the first server that would pass it, and those after, are left out with a `warn!`.
+* Each text is **stripped first** of control and format characters (a newline and a tab stay; the rule is
+  `adam_agent_fs::is_format_or_control`), **then scrubbed**, whole, of the values `${VAR}` put into the file (a secret
+  with a zero-width character inside it is whole again, and found), trimmed, written **as a Markdown blockquote** (every
+  line starts with `> `, an empty one is `>`: the text cannot make a heading, so it cannot pass as the agent's own
+  sections) and cut at **2 KiB**, quote marks counted, on a character boundary, with a `warn!` that names the server and
+  the two sizes. All servers together are cut at **8 KiB**, headings counted: the first server that would pass it, and
+  those after, are left out with a `warn!`.
 * `"instructions": false` on a server leaves its text out. A server with a bearer per call has no session kept, and gives
   none. A server that is not connected (an optional one that was skipped) contributes nothing, and the text does not change
   later in the process.
@@ -361,20 +364,25 @@ the cached prefix holds (the likely mistake, a `ToolSource` that adds it per tur
 
 A server that has the `prompts` capability is asked for `prompts/list` once, when it is connected (within the connect
 timeout; a failure is a warning and no prompt, never a startup error). `McpServers::prompt_commands()` gives each prompt
-as a `PromptCommand` named `<server>__<prompt>`, at most 50 together; a prompt whose name is not `a-z0-9_-` (the rule of a
-command's file name) is left out with a warning. `description()` is the prompt's description (its title, else a fixed
+as a `PromptCommand` named `<server>__<prompt>`, in the order of the server names and then of the prompt names (not capped here: the 50 commands an agent serves, the folder's first, are `adam-service`'s to apply); a prompt whose name is not `a-z0-9_-` (the rule of a
+command's file name, so a server whose name has an upper-case letter serves no prompt) is left out with a warning. `description()` is the prompt's description (its title, else a fixed
 sentence), cleaned of control and format characters and cut at 200 characters; `argument_hint()` is made of the declared
 arguments (`<topic> [style]`).
 
-`expand(&arguments)` maps the arguments **in order** onto the prompt's declared ones, calls `prompts/get` (`get_prompt_once`:
-an `input_required` answer is `Invalid`, as for a tool) within `timeoutSecs`, and takes only **text messages of the
+`expand_text(text)` takes what the person typed after the name: the first words (whitespace, double quotes respected)
+are the declared arguments in order and **the last declared argument takes the rest of the line** (a prompt with none
+refuses any text). `expand(&arguments)` maps given positional arguments in order. Either calls `prompts/get`
+(`get_prompt_once`: an `input_required` answer is `Invalid`, as for a tool) and takes only **text messages of the
 user**: an assistant message, an image, audio or a resource is `PromptError::Invalid`, like a missing required argument,
-more arguments than declared, or a server that refuses the prompt. A connection that is gone or does not answer is
-`PromptError::Unavailable` (and the broken session is dropped, so the next call reconnects). The text is scrubbed of the
-file's expanded values. `adam-service` adds the commands to the backend, which stores the text like a template's
+any argument beyond those declared, or a server that refuses the prompt. The whole expansion, a redial of a lost session
+included, is bounded by the smaller of `timeoutSecs` and 30 s; a connection that is gone or does not answer is
+`PromptError::Unavailable` (and a failed session is dropped, so the next call reconnects). The text is stripped of
+control and format characters, then scrubbed of the file's expanded values, and starts with one line,
+`(the prompt <prompt> of the MCP server <server>, with the person's arguments)`, then a blank line. `adam-service` adds the commands to the backend, which stores the text like a template's
 expansion, so a replay never asks again. `"prompts": false` on a server serves none of its prompts.
 Tests: `prompt_becomes_command`, `a_prompt_that_is_not_text_of_the_user_is_invalid_params`,
-`prompts_false_serves_none_and_a_server_that_is_down_is_unavailable`.
+`prompts_false_serves_none_and_a_server_that_is_down_is_unavailable`,
+`the_last_declared_argument_takes_the_rest_of_what_the_person_typed`, `a_prompt_that_never_answers_is_unavailable_after_the_call_timeout_not_the_connect_one`, `a_redial_that_hangs_is_inside_the_expansions_bound`.
 
 ## Startup
 
@@ -386,7 +394,7 @@ sequenceDiagram
     A->>X: McpConfig, Env, McpPolicy
     Note over X: for every server, in name order: sse refused, stdio only when allowed,<br/>a ${VAR} in a url refused (unless opted in), ${VAR} expanded (a missing one is an error),<br/>URL and headers checked
     loop each server, in name order
-        X->>S: start the process or dial, initialize (within connect_timeout)
+        X->>S: start the process or dial, initialize (one deadline, connect_timeout, for this and both listings)
         S-->>X: initialized
         X->>S: tools/list, every page
         S-->>X: tools

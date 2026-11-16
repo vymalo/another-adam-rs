@@ -27,13 +27,13 @@ client's own idea of one.
 | `slow` | none | nothing, ever |
 | `a.b` | none | `dotted`: a tool whose name no model provider accepts (listed with no description and a schema without a type) |
 
-With `TestHttpServer::start_scripted(token, Script { instructions, prompts })` the server also says `instructions` when it initializes and serves prompts (`TestPrompt::new(name, description).argument(name, required).user(text).assistant(text).image()`; `{{name}}` in a text is filled with the argument of that name); `prompt_gets()` counts `prompts/get`.
+With `TestHttpServer::start_scripted(token, Script { instructions, prompts })` the server also says `instructions` when it initializes and serves prompts (`TestPrompt::new(name, description).argument(name, required).user(text).assistant(text).image()`; `{{name}}` in a text is filled with the argument of that name); `prompt_gets()` counts `prompts/get`. `Script` also has `hang_prompt_list` (`prompts/list` never answers) and `list_tools_delay_ms`; a `TestPrompt` can `hangs()` (`prompts/get` never answers) or `fails(message)` (an MCP error). **Breaking:** `Script` gained fields, so a literal needs `..Default::default()`.
 
 ## Over stdio
 
 The binary `adam-mcp-test-server` serves `TestServer` on stdin and stdout; `env!("CARGO_BIN_EXE_adam-mcp-test-server")`
 is its path in the tests of this package (`tests/stdio.rs`, which tests `adam-mcp` against a child process; the
-stdio tests live here because only the owning package gets that variable). It writes `adam-mcp-test-server
+stdio tests live here because only the owning package gets that variable); `ADAM_MCP_TEST_INSTRUCTIONS` is the text it says when it initializes and `ADAM_MCP_TEST_PROMPT` names one prompt it serves. It writes `adam-mcp-test-server
 started, pid N` to stderr, and, when `ADAM_MCP_TEST_STDERR_ECHO` names an environment variable, that variable's
 value too, so a test can check that a client keeps a value it expanded out of its logs.
 

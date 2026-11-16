@@ -43,7 +43,7 @@
 //! | `MCP_ALLOW_STDIO` | let an agent folder's `mcp.json` start local processes (`command` servers) | `false` |
 //! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
-//! | `MCP_MAX_CALL_SECS` | the longest an agent's own files may ask of one MCP server with `timeoutSecs` or `connectTimeoutSecs` (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
+//! | `MCP_MAX_CALL_SECS` | the longest one MCP server is waited for, a call and a connection each: what `timeoutSecs` and `connectTimeoutSecs` ask for and the defaults (60 s and 30 s) are lowered to it, and a value the file asks for is at least 1 s (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 //! | `DEVCONTAINER_RUNTIME` | where a run's commands run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service, [ADR 0010](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)) | `off` |
 //! | `CONTAINER_HOST` | Podman's own variable: where the service is, `unix:///run/podman/podman.sock`; required with `podman` | unset |

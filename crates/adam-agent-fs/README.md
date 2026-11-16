@@ -43,6 +43,7 @@ Directory walking uses `std::fs`, so there is no `walkdir` dependency either.
 | `split(text)` | the frontmatter splitter: `Split { frontmatter, body, .. }` or `SplitError::Unterminated` |
 | `parse_skill`, `parse_mcp` | the pure text-to-value parsers, for callers that hold text and not a directory |
 | `is_agent_name`, `is_skill_name`, `is_tool_name`, `is_env_name` | the name patterns |
+| `is_format_or_control(c)` | whether `c` is a control (Cc) or format (Cf) character: what a page, a card or a prompt may not show. Re-exported by `adam-a2a-runtime` and `adam-ui`; it lives here because `adam-mcp` needs it without the A2A SDK |
 | `Error` | `Io { path, source }` (the source could not be read), `Invalid { diagnostics }` (`into_package` refused) and `Codec { action, what, source }` (a manifest could not be encoded or decoded); implements `adam_error::Classify` (`NotFound`, `Internal`, `Invalid`) |
 | `Digest`, `digest_with`, `Dir::digest` | `sha256:...` of a normalised manifest and its skill resources: the same for a directory and for the embedded copy of it |
 | `EmbeddedPackage`, `EmbeddedAgent`, `EmbeddedSkill`, `EmbeddedSubagent`, `EmbeddedCommand`, ... | the `'static` form of a package, built by generated code (**breaking:** `EmbeddedAgent` gained the field `commands`; generated code is rewritten by the build, a hand-written literal needs it); `EmbeddedPackage` is a `ManifestSource`, `EmbeddedAgent::{to_manifest, frontmatter, recompute_digest, verify, resource}` |

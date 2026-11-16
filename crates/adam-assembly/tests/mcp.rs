@@ -947,6 +947,7 @@ async fn instructions_appended_stable() {
         let script = adam_mcp_testkit::Script {
             instructions: Some(format!("Prefer `echo` for greetings. Key: {TOKEN}")),
             prompts: Vec::new(),
+            ..Default::default()
         };
         let server = TestHttpServer::start_scripted(Some(TOKEN), script).await;
         let root = uniq("root");
@@ -997,6 +998,7 @@ async fn instructions_false_leaves_the_prompt_as_the_file_wrote_it() {
     let script = adam_mcp_testkit::Script {
         instructions: Some("Server words.".into()),
         prompts: Vec::new(),
+        ..Default::default()
     };
     let server = TestHttpServer::start_scripted(Some(TOKEN), script).await;
     let root = uniq("root");
@@ -1021,6 +1023,7 @@ async fn a_subagents_instructions_and_prompts_stay_with_it() {
     let script = |text: &str, prompt: &str| adam_mcp_testkit::Script {
         instructions: Some(text.to_owned()),
         prompts: vec![adam_mcp_testkit::TestPrompt::new(prompt, "A prompt.").user("go")],
+        ..Default::default()
     };
     let parent_server = TestHttpServer::start_scripted(None, script("parent words", "p")).await;
     let child_server = TestHttpServer::start_scripted(None, script("child words", "c")).await;

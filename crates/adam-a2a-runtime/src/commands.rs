@@ -12,8 +12,8 @@
 //! * A message that carries a form's answer (an A2UI `action` part) is never a command: its text is
 //!   not read as `/name`, and a metadata command beside it is `invalid params`.
 //! * A command may be **remote**: its text is asked of another party when the message arrives (an MCP
-//!   server's prompt, by `adam-service`). The arguments are split as `$1` to `$9` are, the party
-//!   maps them, and what it answers goes through the same size checks and the `(typed)` marking. A
+//!   server's prompt, by `adam-service`). The party gets the argument text as typed (trimmed) and maps
+//!   it itself, and what it answers goes through the same size checks and the `(typed)` marking. A
 //!   party that cannot be asked is `unavailable`, not `invalid params`.
 //! * The expansion is plain substitution in one pass: `$ARGUMENTS` is the trimmed argument string,
 //!   `$1` to `$9` the arguments split on whitespace with double quotes respected (a missing one is
@@ -72,15 +72,15 @@ impl From<String> for CommandRefusal {
 /// not empty, forged form answers marked) and stored as the message, so a replay never asks again.
 #[async_trait]
 pub trait RemoteCommand: Send + Sync + 'static {
-    /// The text of the command for these arguments: the person's text after the name, split on
-    /// whitespace with double quotes respected, at most [`MAX_COMMAND_ARGUMENTS`] bytes before the
-    /// split.
+    /// The text of the command for these arguments: the person's text after the name, trimmed and
+    /// not split (how it maps onto the source's own arguments is the source's to say), at most
+    /// [`MAX_COMMAND_ARGUMENTS`] bytes.
     ///
     /// # Errors
     ///
     /// [`CommandRefusal::Invalid`] when the arguments do not fit or what comes back is not usable;
     /// [`CommandRefusal::Unavailable`] when the source cannot be asked.
-    async fn expand(&self, arguments: &[String]) -> Result<String, CommandRefusal>;
+    async fn expand(&self, arguments: &str) -> Result<String, CommandRefusal>;
 }
 
 #[derive(Clone)]
@@ -116,6 +116,8 @@ impl std::fmt::Debug for Entry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Commands {
     templates: BTreeMap<String, Entry>,
+    /// Names a process refuses instead of serving: a prefix and the sentence that says why.
+    refused: Vec<(String, String)>,
 }
 
 impl Commands {
@@ -138,7 +140,29 @@ impl Commands {
                 .into_iter()
                 .map(|(name, template)| (name.into(), Entry::Template(template.into())))
                 .collect(),
+            refused: Vec::new(),
         }
+    }
+
+    /// Refuse every command whose name starts with `prefix`, with `why` as the sentence of the
+    /// `invalid params` error, for a name the agent does not serve. A process that cannot serve a
+    /// family of commands (a control plane has no MCP server to ask for prompts) says so this way
+    /// instead of letting `/prefix...` reach the model as plain text. A command the agent does
+    /// serve under such a name is served.
+    pub fn refuse_prefix(&mut self, prefix: impl Into<String>, why: impl Into<String>) {
+        self.refused.push((prefix.into(), why.into()));
+    }
+
+    /// The sentence that refuses `name`, when a prefix given to [`refuse_prefix`](Self::refuse_prefix)
+    /// does and the agent does not serve the name.
+    fn refusal(&self, name: &str) -> Option<&str> {
+        if self.templates.contains_key(name) {
+            return None;
+        }
+        self.refused
+            .iter()
+            .find(|(prefix, _)| name.starts_with(prefix.as_str()))
+            .map(|(_, why)| why.as_str())
     }
 
     /// Serve `name` with a text that `command` makes when a message names it. A name the agent
@@ -153,9 +177,14 @@ impl Commands {
         true
     }
 
-    /// Whether the agent serves no command.
+    /// How many commands the agent serves (the names it refuses are not counted).
+    pub fn served(&self) -> usize {
+        self.templates.len()
+    }
+
+    /// Whether the agent serves no command and refuses no name.
     pub fn is_empty(&self) -> bool {
-        self.templates.is_empty()
+        self.templates.is_empty() && self.refused.is_empty()
     }
 
     /// Whether the agent serves a command called `name`.
@@ -196,7 +225,10 @@ impl Commands {
     /// As [`expand`](Self::expand), and a remote command's own refusal.
     pub async fn expand_any(&self, name: &str, arguments: &str) -> Result<String, CommandRefusal> {
         match self.templates.get(name) {
-            None => Err(CommandRefusal::Invalid(self.unknown(name))),
+            None => Err(CommandRefusal::Invalid(
+                self.refusal(name)
+                    .map_or_else(|| self.unknown(name), str::to_owned),
+            )),
             Some(Entry::Template(template)) => Ok(self.render(name, template, arguments)?),
             Some(Entry::Remote(remote)) => {
                 let arguments = arguments.trim();
@@ -207,7 +239,7 @@ impl Commands {
                         arguments.len()
                     )));
                 }
-                let text = remote.expand(&split_arguments(arguments)).await?;
+                let text = remote.expand(arguments).await?;
                 if text.len() > MAX_COMMAND_EXPANSION {
                     return Err(too_long(name).into());
                 }
@@ -346,7 +378,8 @@ fn slash(text: &str, commands: &Commands) -> Reading {
     let name: String = body.chars().take_while(|c| is_name_char(*c)).collect();
     let rest = &body[name.len()..];
     let ends = rest.chars().next().is_none_or(char::is_whitespace);
-    if name.is_empty() || !ends || !commands.contains(&name) {
+    if name.is_empty() || !ends || !(commands.contains(&name) || commands.refusal(&name).is_some())
+    {
         return Reading::Plain;
     }
     if doubled {
@@ -379,7 +412,9 @@ fn named(message: &Message, commands: &Commands) -> Result<Option<(String, Strin
         Some(_) => return Err("the arguments of the command are not text".to_owned()),
     };
     if !commands.contains(name) {
-        return Err(commands.unknown(name));
+        return Err(commands
+            .refusal(name)
+            .map_or_else(|| commands.unknown(name), str::to_owned));
     }
     if arguments.contains('\0') {
         return Err("the arguments of the command hold a NUL character".to_owned());

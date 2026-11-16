@@ -3275,3 +3275,107 @@ async fn a_github_app_installation_gets_its_token_minted_and_opens_the_pull_requ
     }
     db.finish().await;
 }
+
+/// The prompts of the MCP servers a deployment adds with `ADAM_EXTRA_MCP_FILE` are commands of the
+/// coder: its card lists them (`commands/v1`) and a message that names one is expanded by asking the
+/// server, before it is stored. A control plane of the same files does not connect the server, so it
+/// refuses the name instead of sending it to the model as text.
+#[tokio::test]
+async fn the_prompts_of_the_extra_mcp_servers_are_commands_of_the_coder() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let script = adam_mcp_testkit::Script {
+        prompts: vec![
+            adam_mcp_testkit::TestPrompt::new("summarize", "Summarize a topic.")
+                .argument("topic", true)
+                .user("Summarize {{topic}}."),
+        ],
+        ..Default::default()
+    };
+    let server = adam_mcp_testkit::TestHttpServer::start_scripted(None, script).await;
+    let extra = tmp.path().join("extra-mcp.json");
+    std::fs::write(
+        &extra,
+        format!(
+            r#"{{"mcpServers": {{"docs": {{"type": "http", "url": "{}"}}}}}}"#,
+            server.url()
+        ),
+    )
+    .unwrap();
+    let mut env = role_env("all", &db.url(), tmp.path());
+    env.push((
+        "ADAM_EXTRA_MCP_FILE".into(),
+        extra.to_string_lossy().into_owned(),
+    ));
+    let mut p = Proc::spawn(&env);
+    let addr = p.ready().await;
+
+    let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
+    assert_eq!(status, 200, "{card}");
+    let card = common::json_of(&card);
+    let listed = card["capabilities"]["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["uri"] == adam_a2a::COMMANDS_EXTENSION)
+        .flat_map(|e| e["params"]["commands"].as_array().unwrap().clone())
+        .find(|c| c["name"] == "docs__summarize")
+        .unwrap_or_else(|| panic!("the card lists the prompt: {card}\n{}", p.logs()));
+    assert_eq!(listed["argumentHint"], "<topic>", "{listed}");
+
+    let client = common::a2a_client(addr, A2A_TOKEN).await;
+    let _ = client
+        .send_streaming_message(&SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("/docs__summarize the repo")]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        server.prompt_gets(),
+        1,
+        "asked once, at submit:\n{}",
+        p.logs()
+    );
+    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(status.code(), Some(0), "{}", p.logs());
+
+    // A control plane over a folder that names the server connects nothing: it refuses the name.
+    let agent = folder();
+    std::fs::write(
+        agent.path().join("agent/mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{"docs": {{"type": "http", "url": "{}"}}}}}}"#,
+            server.url()
+        ),
+    )
+    .unwrap();
+    let mut env = role_env("control-plane", &db.url(), tmp.path());
+    env.push((
+        "ADAM_AGENT_DIR".into(),
+        agent.path().to_string_lossy().into_owned(),
+    ));
+    let mut front = Proc::spawn(&env);
+    let addr = front.ready().await;
+    let client = common::a2a_client(addr, A2A_TOKEN).await;
+    let refused = client
+        .send_streaming_message(&SendMessageRequest {
+            message: Message::new(Role::User, vec![Part::text("/docs__summarize the repo")]),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await;
+    assert!(refused.is_err(), "a control plane cannot expand a prompt");
+    assert_eq!(server.prompt_gets(), 1, "and asked no server");
+    assert!(warned(&front, "connects no MCP server"), "{}", front.logs());
+    front.sigterm().await;
+    let status = front.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(status.code(), Some(0), "{}", front.logs());
+    db.finish().await;
+}

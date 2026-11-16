@@ -408,7 +408,18 @@ pub async fn serve(
             Vec::new(),
         ),
     };
-    let (commands, listed) = adam_service::with_prompt_commands(files.commands(), &prompts);
+    // A control plane connects no MCP server, so it cannot expand a prompt: a message that names the
+    // prompt of one of the files' servers is refused, not sent to the model as plain text.
+    let commands = if config.worker.is_none() {
+        let def = files
+            .def()
+            .map_err(|e| *e)
+            .context("reading the agent definition")?;
+        adam_service::refuse_prompt_commands(files.commands(), def.manifest().mcp.as_ref())
+    } else {
+        files.commands()
+    };
+    let (commands, listed) = adam_service::with_prompt_commands(commands, &prompts);
     let agents = agents
         // The person's screen is the sender: their answers through a form, and the catalog and the
         // tools of the conversation, reach the run (the extensions the card lists).

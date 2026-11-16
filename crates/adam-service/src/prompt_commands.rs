@@ -4,7 +4,9 @@
 //! serve; [`with_prompt_commands`] adds them to the commands the backend expands, and
 //! [`card_with_commands`] lists them on the card. A prompt that has the name of a command of the
 //! folder loses, with one warning, in both places (the backend and the card are made from the same
-//! answer, so they cannot list different commands).
+//! answer, so they cannot list different commands), and the folder's commands and the prompts
+//! together are at most 50. A process that connects no server ([`refuse_prompt_commands`]) refuses
+//! the names of the prompts its folder's servers could serve.
 //!
 //! ```mermaid
 //! sequenceDiagram
@@ -23,6 +25,7 @@ use std::sync::Arc;
 
 use adam_a2a::{AgentCardConfig, COMMANDS_EXTENSION, CommandInfo, ExtensionConfig};
 use adam_a2a_runtime::{CommandRefusal, Commands, RemoteCommand};
+use adam_agent_fs::{MAX_COMMANDS, McpConfig, is_agent_name};
 use adam_mcp::{PromptCommand, PromptError};
 use async_trait::async_trait;
 
@@ -31,22 +34,36 @@ struct Prompt(PromptCommand);
 
 #[async_trait]
 impl RemoteCommand for Prompt {
-    async fn expand(&self, arguments: &[String]) -> Result<String, CommandRefusal> {
-        self.0.expand(arguments).await.map_err(|error| match error {
-            PromptError::Invalid(why) => CommandRefusal::Invalid(why),
-            PromptError::Unavailable(why) => CommandRefusal::Unavailable(why),
-        })
+    async fn expand(&self, arguments: &str) -> Result<String, CommandRefusal> {
+        self.0
+            .expand_text(arguments)
+            .await
+            .map_err(|error| match error {
+                PromptError::Invalid(why) => CommandRefusal::Invalid(why),
+                PromptError::Unavailable(why) => CommandRefusal::Unavailable(why),
+            })
     }
 }
 
 /// `commands` with each of `prompts` added as a remote command, and what the card says of the ones
-/// that were added. A prompt whose name a command already has is left out, with a warning.
+/// that were added.
+///
+/// The folder's commands and the prompts together are at most [`MAX_COMMANDS`] (the limit of an
+/// agent's folder): the folder's come first and the prompts follow in the order given, so what does
+/// not fit is the last prompts, dropped with one warning that gives how many. A prompt whose name a
+/// command already has is left out, with a warning.
 pub fn with_prompt_commands(
     mut commands: Commands,
     prompts: &[PromptCommand],
 ) -> (Commands, Vec<CommandInfo>) {
-    let mut infos = Vec::with_capacity(prompts.len());
+    let room = MAX_COMMANDS.saturating_sub(commands.served());
+    let mut infos = Vec::with_capacity(prompts.len().min(room));
+    let mut dropped = 0_usize;
     for prompt in prompts {
+        if infos.len() >= room {
+            dropped += 1;
+            continue;
+        }
         if !commands.add_remote(prompt.name(), Arc::new(Prompt(prompt.clone()))) {
             tracing::warn!(
                 command = prompt.name(),
@@ -62,43 +79,90 @@ pub fn with_prompt_commands(
             argument_hint: prompt.argument_hint().map(str::to_owned),
         });
     }
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            limit = MAX_COMMANDS,
+            "the folder's commands and the MCP prompts are over the limit of commands an agent \
+             serves: the last prompts are left out"
+        );
+    }
     (commands, infos)
 }
 
-/// `card` with `extra` added to its `commands/v1` entry (made when the card has none).
+/// `commands` for a process that connects no MCP server (a control plane): it cannot ask a server
+/// for a prompt, so a message that names `/<server>__<anything>` for a server of `mcp` that serves
+/// prompts is **refused** (`invalid params`) and never reaches the model as plain text. The names
+/// come from the files, so nothing is connected. One warning names the servers.
+///
+/// A server with `prompts: false`, or whose name cannot start a command, is left alone.
+pub fn refuse_prompt_commands(mut commands: Commands, mcp: Option<&McpConfig>) -> Commands {
+    let Some(mcp) = mcp else {
+        return commands;
+    };
+    let mut named = Vec::new();
+    for (name, server) in &mcp.servers {
+        if !server.settings().prompts || !is_agent_name(&format!("{name}__x")) {
+            continue;
+        }
+        commands.refuse_prefix(
+            format!("{name}__"),
+            format!(
+                "`/{name}__...` is the prompt of an MCP server, and this deployment's front \
+                 (a control plane) connects no MCP server, so it does not serve the prompts of \
+                 MCP servers"
+            ),
+        );
+        named.push(name.as_str());
+    }
+    if !named.is_empty() {
+        tracing::warn!(
+            servers = named.join(", "),
+            "this process connects no MCP server (a control plane): it serves none of their \
+             prompts as commands, and refuses a message that names one"
+        );
+    }
+    commands
+}
+
+/// `card` with `extra` added to its `commands/v1` entry (made when the card has none). Every entry
+/// the card already has is kept as it is; the entries are sorted by name.
 #[must_use]
 pub fn card_with_commands(mut card: AgentCardConfig, extra: &[CommandInfo]) -> AgentCardConfig {
-    if extra.is_empty() {
+    let Some(added) = ExtensionConfig::commands(extra) else {
         return card;
-    }
-    let mut infos: Vec<CommandInfo> = card
+    };
+    let Some(existing) = card
         .extensions
-        .iter()
+        .iter_mut()
         .find(|extension| extension.uri == COMMANDS_EXTENSION)
-        .and_then(|extension| extension.params.get("commands"))
-        .and_then(serde_json::Value::as_array)
-        .map(|listed| {
-            listed
-                .iter()
-                .filter_map(|entry| {
-                    Some(CommandInfo {
-                        name: entry.get("name")?.as_str()?.to_owned(),
-                        description: entry.get("description")?.as_str()?.to_owned(),
-                        argument_hint: entry
-                            .get("argumentHint")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    infos.extend(extra.iter().cloned());
-    card.extensions
-        .retain(|extension| extension.uri != COMMANDS_EXTENSION);
-    if let Some(extension) = ExtensionConfig::commands(&infos) {
-        card.extensions.push(extension);
-    }
+    else {
+        card.extensions.push(added);
+        return card;
+    };
+    let entries = |extension: &ExtensionConfig| {
+        extension
+            .params
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut listed = entries(existing);
+    listed.extend(entries(&added));
+    listed.sort_by(|a, b| {
+        let name = |entry: &serde_json::Value| {
+            entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        name(a).cmp(&name(b))
+    });
+    existing
+        .params
+        .insert("commands".to_owned(), serde_json::Value::Array(listed));
     card
 }
 
@@ -165,5 +229,68 @@ mod tests {
         // Nothing to add: the card is as it was.
         let same = card_with_commands(plain_card(&[]), &[]);
         assert!(listed(&same).is_empty());
+    }
+
+    #[test]
+    fn a_card_entry_that_cannot_be_read_as_a_command_is_kept_as_it_is() {
+        let mut card = plain_card(&[info("review", None)]);
+        let entry = card
+            .extensions
+            .iter_mut()
+            .find(|e| e.uri == COMMANDS_EXTENSION)
+            .unwrap();
+        entry
+            .params
+            .get_mut("commands")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "odd", "note": "no description"}));
+        let card = card_with_commands(card, &[info("docs__a", None)]);
+        let entries = card.extensions[0].params["commands"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["name"] == "odd" && e["note"] == "no description")
+        );
+    }
+
+    fn mcp(json: &str) -> McpConfig {
+        let mut diagnostics = Vec::new();
+        adam_agent_fs::parse_mcp(std::path::Path::new("mcp.json"), json, &mut diagnostics)
+            .expect("an mcp.json")
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_refuses_the_prompts_of_the_servers_that_could_serve_them() {
+        let config = mcp(r#"{"mcpServers": {
+                "docs": {"type": "http", "url": "https://a.example.com/mcp"},
+                "quiet": {"type": "http", "url": "https://b.example.com/mcp", "prompts": false},
+                "Loud": {"type": "http", "url": "https://c.example.com/mcp"}
+            }}"#);
+        let commands =
+            refuse_prompt_commands(Commands::new([("review", "Review $1")]), Some(&config));
+        let refusal = |name: &'static str| {
+            let commands = commands.clone();
+            async move { commands.expand_any(name, "").await.unwrap_err().to_string() }
+        };
+        let refused = refusal("docs__summarize").await;
+        assert!(refused.contains("connects no MCP server"), "{refused}");
+        assert!(
+            refusal("quiet__x").await.starts_with("unknown command"),
+            "prompts: false"
+        );
+        assert!(refusal("loud__x").await.starts_with("unknown command"));
+        assert_eq!(
+            commands.expand_any("review", "a").await.unwrap(),
+            "Review a"
+        );
+        // No servers, nothing refused.
+        let none = refuse_prompt_commands(Commands::default(), None);
+        assert!(none.is_empty());
     }
 }

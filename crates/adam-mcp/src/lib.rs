@@ -40,7 +40,5 @@ pub use policy::{
     DEFAULT_THREAD_TOOLS_MAX_CALL, McpPolicy,
 };
 pub use prompts::{PromptCommand, PromptError};
-pub use servers::{
-    MAX_INSTRUCTIONS_BYTES, MAX_PROMPT_COMMANDS, MAX_SERVER_INSTRUCTIONS_BYTES, McpServers,
-};
+pub use servers::{MAX_INSTRUCTIONS_BYTES, MAX_SERVER_INSTRUCTIONS_BYTES, McpServers};
 pub use text::MAX_RESULT_BYTES;

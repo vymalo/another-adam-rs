@@ -20,7 +20,8 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The longest an agent's own files may ask one tool call, or one connection, of a server to take
 /// (the default of [`McpPolicy::max_call`]): 15 minutes. A larger `timeoutSecs` or
-/// `connectTimeoutSecs` in an `mcp.json` is lowered to the cap, with a warning at startup.
+/// `connectTimeoutSecs` in an `mcp.json`, and a default over it, is lowered to the cap, with a
+/// warning at startup.
 pub const DEFAULT_MAX_CALL: Duration = Duration::from_secs(900);
 
 /// The longest a call to the thread-tools endpoint may be waited for, whatever the tool says (the
@@ -232,13 +233,15 @@ impl McpPolicy {
         self
     }
 
-    /// The longest an agent's files may ask of one server: a `timeoutSecs` or a
-    /// `connectTimeoutSecs` of an `mcp.json` above it is lowered to it, with a warning when the
-    /// servers are connected. **The deployment's, not the agent's:** the files never decide alone
-    /// how long a call may take. Default 15 minutes ([`DEFAULT_MAX_CALL`]). A zero is raised to one
-    /// millisecond. The `MCP_MAX_CALL_SECS` variable of the binaries. It does not change
-    /// [`call_timeout`](Self::call_timeout) or [`connect_timeout`](Self::connect_timeout), which
-    /// are what a server that says nothing gets.
+    /// The longest one server of an `mcp.json` may be waited for: its call and its connection are
+    /// each the file's `timeoutSecs` or `connectTimeoutSecs` or, when it says nothing,
+    /// [`call_timeout`](Self::call_timeout) or [`connect_timeout`](Self::connect_timeout), **and
+    /// never more than this**, whoever asked for the value (a warning at connect says when one was
+    /// lowered). A value the file asks for is at least a second. **The deployment's, not the agent's:** the files never
+    /// decide alone how long a call may take. Default 15 minutes ([`DEFAULT_MAX_CALL`]). A zero
+    /// is raised to one millisecond. The `MCP_MAX_CALL_SECS` variable of the binaries. It does not
+    /// apply to the thread-tools endpoint ([`thread_tools_max_call`](Self::thread_tools_max_call))
+    /// or to a one-off [`Endpoint`](crate::Endpoint).
     #[must_use]
     pub fn max_call(mut self, cap: Duration) -> Self {
         self.max_call = cap.max(Duration::from_millis(1));
