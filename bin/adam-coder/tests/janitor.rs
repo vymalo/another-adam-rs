@@ -736,10 +736,12 @@ async fn the_janitor_kills_what_the_records_of_a_finished_run_name_before_it_rem
         .arg("sleep 662 & wait")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
         .unwrap();
     let pid = leader.id();
+    let _reap = common::GroupGuard(pid);
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
     let start: u64 = stat
         .rsplit_once(") ")

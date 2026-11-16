@@ -29,6 +29,19 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 pub mod pg;
 
+/// Kills the process group `0` leads when it goes out of scope, so that a test that fails leaves
+/// nothing running.
+pub struct GroupGuard(pub u32);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", "--"])
+            .arg(format!("-{}", self.0))
+            .status();
+    }
+}
+
 /// What somebody types (or a client sends as a text part): the message as the A2A layer makes it.
 /// Whatever it says, it is not a form's answer.
 pub fn typed_message(text: &str) -> Inbound {

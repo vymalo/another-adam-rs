@@ -1346,12 +1346,17 @@ async fn a_pid_with_another_start_time_is_never_killed_and_one_with_its_own_is()
             .arg(seconds)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .process_group(0)
             .spawn()
             .unwrap()
     };
     let mut stranger = spawn("633");
     let mut ghost = spawn("634");
+    let _reap = (
+        common::GroupGuard(stranger.id()),
+        common::GroupGuard(ghost.id()),
+    );
     let record = |id: &str, pid: u32, start: u64| {
         json!({
             "command": "ghost", "slot": "remote", "cwd": "", "exec": format!("bg-ghost-{id}"),
@@ -1406,10 +1411,12 @@ async fn what_is_left_of_a_group_whose_leader_is_gone_is_killed() {
         .arg("sleep 635 & exec sleep 0.4")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
         .unwrap();
     let group = leader.id();
+    let _reap = common::GroupGuard(group);
     let start = start_of(group);
     until("the member of the group", || {
         group_members(group).len() >= 2
