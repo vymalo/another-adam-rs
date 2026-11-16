@@ -114,8 +114,12 @@ whose `Choices` lacks a kind gets the nearest older form, or words. The coder re
 before the model does: an answer that breaks a rule of the catalog (a number out of its range, a day outside its bounds, a rank
 that is not every option once) is **not used**. The person is told which question and why, in a message of the same task, and
 is asked the same form again on a new surface (`ask-<call>.r<n>`) with what they got right as its defaults; the run stays
-`input-required`, the model is not woken, and the journal has `answer_refused {call_id, question, rule}`. Words and the older
-types are the model's to read as before.
+`input-required`, the model is not woken, and the journal has `answer_refused {call_id, question, rule}`. An answer for another
+form than the one asked (`other_surface`) or a message with several form actions (`several_answers`) is refused the same way. The
+form is asked again at most 5 times: the sixth bad answer ends the question with an error result that names the last rule and
+question, and the model asks another way. A refusal is scrubbed of secrets like the question it repeats. Words the person typed
+instead of using the form, and the older types, are the model's to read, unchecked; a yes or no typed to a form that went out as
+words (`yes`, `no` or a button's words) reaches the model as `yes` or `no`.
 
 ## The same flow as states
 

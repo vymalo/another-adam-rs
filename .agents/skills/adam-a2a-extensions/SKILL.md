@@ -72,7 +72,11 @@ read the exact strings in the file at your rev.
    `input-required`, a message says which question and rule (`The answer to "budget" ... was not used (above_max): ...`),
    and the same form comes again on a new surface `ask-<call id>.r<n>` with what was right as `default`s. A client
    therefore sees a second `input-required` with a new `surfaceId` and answers on that one; it never needs to repeat
-   the old answers. The orchestrator relays an answer and checks none of it. See `crates/adam-ui/README.md` ("The tools")
+   the old answers. An answer must name the surface that is open, and a message must carry one form action: an answer for an
+   earlier surface (`other_surface`) or with several form actions (`several_answers`) is refused the same way. A form is asked
+   again at most 5 times; after that the agent stops asking and tells its model. A number, a day or a rank that a screen
+   without the kind drew as a text box is judged as the kind (a rank is typed as the numbers of the options in order); words
+   typed instead of the form reach the model unchecked. The orchestrator relays an answer and checks none of it. See `crates/adam-ui/README.md` ("The tools")
    and the contract page `ui-catalog-v1.md` in the docs/api directory of `vymalo/another-agentic-system`;
    `adam-a2a-runtime` (`crates/adam-a2a-runtime/README.md`) reads the messages a screen sends
    (`vymalo_inbound`), reports steps, streamed text and tokens ("Usage"), and implements steering ("Steering a
