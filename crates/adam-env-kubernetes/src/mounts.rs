@@ -118,6 +118,9 @@ pub struct WorktreeDirs {
     /// mounts of a pod, so that a directory made again under the same name makes the pod again.
     /// `None` for a worktree made before it was recorded.
     pub generation: Option<String>,
+    /// Whether the directory is mounted read-only: a reference's is (`Slot::writable` is false).
+    /// Its sealed entries are read-only whatever this says.
+    pub read_only: bool,
 }
 
 /// A slot's directory, which the pod mounts on its own on top of the run's directory.
@@ -129,6 +132,9 @@ pub struct SlotMount {
     /// pod, so that a slot removed and added again under the same name makes the pod again.
     /// `None` for a slot made before it was recorded.
     pub generation: Option<String>,
+    /// Whether the slot is mounted read-only: a reference is (`Slot::writable` is false), so a
+    /// command in the pod cannot write a file of it (`EROFS`).
+    pub read_only: bool,
 }
 
 /// The mounts of the workspace volume a run pod gets, for one run's workspace as it is now.
@@ -167,7 +173,7 @@ impl WorkspaceMounts {
             }
             wanted
                 .entry(slot.path.clone())
-                .or_insert((false, slot.generation.clone()));
+                .or_insert((slot.read_only, slot.generation.clone()));
         }
         for dirs in worktrees {
             let inside = dirs
@@ -184,7 +190,7 @@ impl WorkspaceMounts {
             wanted.entry(dirs.mirror.clone()).or_insert((true, None));
             wanted
                 .entry(dirs.admin.clone())
-                .or_insert((false, dirs.generation.clone()));
+                .or_insert((dirs.read_only, dirs.generation.clone()));
             for entry in SEALED {
                 wanted
                     .entry(dirs.admin.join(entry))
@@ -260,11 +266,14 @@ impl WorkspaceMounts {
             if !slot.path().starts_with(run_dir) {
                 continue;
             }
+            // The one gate: what the run may not change is mounted so that it cannot.
+            let read_only = !slot.writable();
             slot_mounts.push(SlotMount {
                 path: slot.path().to_owned(),
                 generation: slot.generation().map(str::to_owned),
+                read_only,
             });
-            let Some(worktree) = slot.worktree() else {
+            let Some(worktree) = slot.checkout() else {
                 continue;
             };
             match worktree.git_dir() {
@@ -272,6 +281,7 @@ impl WorkspaceMounts {
                     mirror: worktree.mirror().to_owned(),
                     admin: admin.to_owned(),
                     generation: worktree.git_dir_generation().map(str::to_owned),
+                    read_only,
                 }),
                 Some(admin) => tracing::warn!(
                     slot = slot.dir(),
@@ -350,6 +360,7 @@ mod tests {
             mirror: PathBuf::from(mirror),
             admin: PathBuf::from(format!("{mirror}/worktrees/{name}")),
             generation: None,
+            read_only: false,
         }
     }
 
@@ -365,6 +376,7 @@ mod tests {
         SlotMount {
             path: PathBuf::from(format!("{RUN}/{name}")),
             generation: generation.map(str::to_owned),
+            read_only: false,
         }
     }
 
@@ -532,12 +544,14 @@ mod tests {
             mirror: PathBuf::from("/work/git/github.com/o/a.git"),
             admin: PathBuf::from("/work/git/github.com/o/b.git/worktrees/a"),
             generation: None,
+            read_only: false,
         };
         assert!(refused(RUN, &[stray]).contains("not a worktree directory of the mirror"));
         let deep = WorktreeDirs {
             mirror: PathBuf::from("/work/git/github.com/o/a.git"),
             admin: PathBuf::from("/work/git/github.com/o/a.git/worktrees/a/b"),
             generation: None,
+            read_only: false,
         };
         assert!(refused(RUN, &[deep]).contains("not a worktree directory"));
     }
@@ -637,11 +651,51 @@ mod tests {
     }
 
     #[test]
+    fn mount_plan_marks_reference_ro() {
+        let reference = |read_only| SlotMount {
+            read_only,
+            ..slot("design", Some("3c-2"))
+        };
+        let mirror = "/work/git/github.com/o/ds.git";
+        let dirs = |read_only| WorktreeDirs {
+            read_only,
+            ..dirs(mirror, "r1+design")
+        };
+        let mounts = plan_with(
+            &[slot("app", Some("1a-0")), reference(true)],
+            &[dirs(true)],
+        );
+        let ls = lines(&mounts);
+        // The reference and its directory in the mirror are read-only, and the repository's slot is not.
+        assert!(
+            ls.contains(&"ro /work/workspaces/r1/design @3c-2".to_owned()),
+            "{ls:?}"
+        );
+        assert!(
+            ls.contains(&format!("ro {mirror}/worktrees/r1+design")),
+            "{ls:?}"
+        );
+        assert!(
+            ls.contains(&"rw /work/workspaces/r1/app @1a-0".to_owned()),
+            "{ls:?}"
+        );
+        assert!(
+            ls.iter().all(|l| !l.starts_with("rw /work/workspaces/r1/design")),
+            "{ls:?}"
+        );
+        // A pod made when the slot was writable is made again: the line differs.
+        let before = plan_with(&[reference(false)], &[dirs(false)]);
+        let missing = mounts.missing_from(Some(&before.encode())).unwrap();
+        assert!(missing.read_only(), "{}", missing.path().display());
+    }
+
+    #[test]
     fn a_slot_that_is_not_a_direct_child_of_the_runs_directory_is_refused() {
         let refused = |path: &str| {
             let slot = SlotMount {
                 path: PathBuf::from(path),
                 generation: None,
+                read_only: false,
             };
             match WorkspaceMounts::plan(Path::new(BASE), Path::new(RUN), &[slot], &[]).unwrap_err()
             {

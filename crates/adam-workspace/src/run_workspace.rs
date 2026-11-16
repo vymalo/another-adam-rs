@@ -75,6 +75,9 @@ pub enum SlotKind {
     Repository(Worktree),
     /// A local project that no remote has yet.
     Scratch(Scratch),
+    /// A repository to read beside the one the run works on: a detached checkout with no branch of
+    /// its own, never written ([`Slot::writable`]).
+    Reference(Worktree),
 }
 
 impl Slot {
@@ -108,7 +111,7 @@ impl Slot {
     /// the directory had then.
     pub fn root(&self) -> &Arc<SlotDir> {
         match &self.kind {
-            SlotKind::Repository(wt) => wt.root(),
+            SlotKind::Repository(wt) | SlotKind::Reference(wt) => wt.root(),
             SlotKind::Scratch(s) => s.root(),
         }
     }
@@ -122,15 +125,43 @@ impl Slot {
     /// [`Worktree::git_dir_generation`]. `None` for a slot made before it was recorded.
     pub fn generation(&self) -> Option<&str> {
         match &self.kind {
-            SlotKind::Repository(wt) => wt.git_dir_generation(),
+            SlotKind::Repository(wt) | SlotKind::Reference(wt) => wt.git_dir_generation(),
             SlotKind::Scratch(s) => s.generation(),
         }
     }
 
-    /// The worktree, for a repository slot.
+    /// Whether the run may change what the slot holds. **The one gate every write asks**: a
+    /// repository slot and a scratch project are writable, a reference never is. A new
+    /// [`SlotKind`] has no default here, so it fails to compile until it says.
+    pub fn writable(&self) -> bool {
+        match &self.kind {
+            SlotKind::Repository(_) | SlotKind::Scratch(_) => true,
+            SlotKind::Reference(_) => false,
+        }
+    }
+
+    /// The worktree, for a repository slot. A reference is not one: it is read through
+    /// [`checkout`](Self::checkout) and never written.
     pub fn worktree(&self) -> Option<&Worktree> {
         match &self.kind {
             SlotKind::Repository(wt) => Some(wt),
+            SlotKind::Scratch(_) | SlotKind::Reference(_) => None,
+        }
+    }
+
+    /// The detached checkout, for a reference slot.
+    pub fn reference(&self) -> Option<&Worktree> {
+        match &self.kind {
+            SlotKind::Reference(wt) => Some(wt),
+            SlotKind::Repository(_) | SlotKind::Scratch(_) => None,
+        }
+    }
+
+    /// The checkout of a slot that holds somebody's repository, for reading: a repository's
+    /// worktree or a reference's. `None` for a scratch project.
+    pub fn checkout(&self) -> Option<&Worktree> {
+        match &self.kind {
+            SlotKind::Repository(wt) | SlotKind::Reference(wt) => Some(wt),
             SlotKind::Scratch(_) => None,
         }
     }
@@ -139,7 +170,7 @@ impl Slot {
     pub fn scratch(&self) -> Option<&Scratch> {
         match &self.kind {
             SlotKind::Scratch(s) => Some(s),
-            SlotKind::Repository(_) => None,
+            SlotKind::Repository(_) | SlotKind::Reference(_) => None,
         }
     }
 
@@ -148,7 +179,7 @@ impl Slot {
     /// worktree whose directory in the mirror cannot be told (then no `git` is run on it).
     pub fn git_pin(&self) -> Option<GitPin> {
         match &self.kind {
-            SlotKind::Repository(wt) => wt.git_pin(),
+            SlotKind::Repository(wt) | SlotKind::Reference(wt) => wt.git_pin(),
             SlotKind::Scratch(s) => Some(s.git_pin()),
         }
     }
@@ -391,6 +422,27 @@ impl RunWorkspace {
                     path,
                 }))
             }
+            SlotMeta::Reference(m) => {
+                let dir = m.dir.clone().unwrap_or_default();
+                let path = inner.slot_path(&self.run, &dir);
+                let Some(root) = (if is_slot_name(&dir) {
+                    open_worktree_root(&path).await
+                } else {
+                    None
+                }) else {
+                    return Ok(None);
+                };
+                let loc = RepoRef::new(&m.url, &m.base_branch).locate()?;
+                let mirror = inner.root().join(loc.mirror_relative());
+                let meta_path = inner.slot_meta_path(&self.run, &dir);
+                let worktree = inner.open_worktree(m, &dir, root, mirror, &meta_path).await;
+                Ok(Some(Slot {
+                    seq: m.seq.unwrap_or(0),
+                    kind: SlotKind::Reference(worktree),
+                    dir,
+                    path,
+                }))
+            }
             SlotMeta::Scratch(m) => {
                 let path = inner.slot_path(&self.run, &m.dir);
                 let Some(root) = (if is_slot_name(&m.dir) {
@@ -492,6 +544,7 @@ impl RunWorkspace {
     /// As [`slots`](Self::slots); [`WorkspaceError::Invalid`] for a url that cannot be read.
     pub async fn slot_for(&self, repo: &RepoRef) -> WorkspaceResult<Option<Slot>> {
         let wanted = repo.locate()?.mirror_relative();
+        // A reference is not the run's repository: it is found by its name.
         Ok(self.slots().await?.into_iter().find(|slot| {
             slot.worktree().is_some_and(|wt| {
                 wt.repo()
@@ -585,6 +638,86 @@ impl RunWorkspace {
         Ok(repository_slot(wt, seq))
     }
 
+    /// Add the repository `repo` as a **reference** called `name`: a detached checkout of
+    /// `origin/<base_branch>`, with no branch of its own, which the run reads and never writes
+    /// ([`Slot::writable`], [`Worktree::is_reference`]). Nothing is pushed from it, and a commit, a
+    /// push, a publication and a copy into it are refused by the worktree itself.
+    ///
+    /// **Idempotent**: a reference the run already has under `name` for the same repository is
+    /// returned as it is (it is not moved to a newer commit), and one whose directory was lost is
+    /// made again. `name` is `^[a-z0-9][a-z0-9._-]{0,63}$` and does not end with `.git`.
+    ///
+    /// The mirror is fetched like any repository's ([`Workspaces::prepare`]), so the policy of the
+    /// workspaces applies as it does to a repository.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Invalid`] for a bad `name`, or a repository the policy refuses;
+    /// [`WorkspaceError::Conflict`] when `name` is in use by another slot, or `repo` is a
+    /// repository the run works on (read it in its own slot); [`WorkspaceError::NotFound`] when the
+    /// remote or the branch is not there; as [`Workspaces::prepare`] otherwise.
+    #[tracing::instrument(skip(self, repo), fields(run = %self.run, repo = %repo.url, name))]
+    pub async fn add_reference(&self, repo: &RepoRef, name: &str) -> WorkspaceResult<Slot> {
+        validate_scratch_dir(name)?;
+        // A refused repository costs no process, no lock and no credential.
+        let loc = self.ws.check_repo(repo)?;
+        let inner = self.inner();
+        let _run = inner.lock_path(&self.path).await?;
+        let metas = inner.read_slot_metas(&self.run).await?;
+        let legacy = inner.read_meta(&self.run).await?;
+        let wanted = loc.mirror_relative();
+        let same = |url: &str| {
+            RepoRef::new(url, "HEAD")
+                .locate()
+                .is_ok_and(|l| l.mirror_relative() == wanted)
+        };
+        if legacy.as_ref().is_some_and(|m| same(&m.url))
+            || metas
+                .iter()
+                .any(|m| matches!(m, SlotMeta::Repo(m) if same(&m.url)))
+        {
+            return Err(WorkspaceError::Conflict(format!(
+                "{} is a repository this run works on: read it in its own slot",
+                repo.url
+            )));
+        }
+        let known = metas.iter().find(|m| m.dir() == name);
+        // The spelling of the url the reference was made with: its metadata finds it again.
+        let mut spelled = repo.clone();
+        let (target, seq) = match known {
+            Some(SlotMeta::Reference(m)) if same(&m.url) => {
+                let seq = m.seq.unwrap_or(0);
+                spelled = RepoRef::new(&m.url, repo.base_branch.clone());
+                (inner.reference_target(&self.run, name, seq), seq)
+            }
+            Some(_) => {
+                return Err(WorkspaceError::Conflict(format!(
+                    "{name} is already in use in this workspace"
+                )));
+            }
+            None => {
+                if self
+                    .taken_names(&metas, legacy.as_ref())
+                    .await?
+                    .contains(name)
+                {
+                    return Err(WorkspaceError::Conflict(format!(
+                        "{name} is already in use in this workspace"
+                    )));
+                }
+                let seq = metas.iter().map(SlotMeta::seq).max().unwrap_or(0) + 1;
+                (inner.reference_target(&self.run, name, seq), seq)
+            }
+        };
+        let wt = self.ws.prepare_at(&spelled, &self.run, None, &target).await?;
+        Ok(Slot {
+            dir: wt.dir().to_owned(),
+            path: wt.path().to_path_buf(),
+            seq,
+            kind: SlotKind::Reference(wt),
+        })
+    }
+
     /// Every directory name that is in use: slots, the legacy worktree's name, and anything
     /// that is in the workspace's directory.
     async fn taken_names(
@@ -644,7 +777,7 @@ impl RunWorkspace {
         let meta_path = inner.slot_meta_path(&self.run, dir);
         let known = metas.iter().find(|m| m.dir() == dir);
         let (mut meta, fresh) = match known {
-            Some(SlotMeta::Repo(_)) => {
+            Some(SlotMeta::Repo(_) | SlotMeta::Reference(_)) => {
                 return Err(WorkspaceError::Conflict(format!(
                     "a repository of this workspace is already called {dir}"
                 )));
@@ -830,7 +963,7 @@ impl RunWorkspace {
             Ok(metas) => {
                 for meta in &metas {
                     match meta {
-                        SlotMeta::Repo(m) => {
+                        SlotMeta::Repo(m) | SlotMeta::Reference(m) => {
                             let dir = m.dir.clone().unwrap_or_default();
                             let path = inner.slot_path(&self.run, &dir);
                             match RepoRef::new(&m.url, &m.base_branch).locate() {
@@ -1120,6 +1253,12 @@ pub async fn copy_into(
     path: &str,
     overwrite: bool,
 ) -> WorkspaceResult<CopyReport> {
+    if to.is_reference() {
+        return Err(WorkspaceError::Invalid(format!(
+            "{} is a reference: it is read and never changed, so nothing is copied into it",
+            to.dir()
+        )));
+    }
     let base = destination_base(path)?;
     let files = from.files().await?;
     // Both directories as they are held: the plan and the writes are relative to them, whatever

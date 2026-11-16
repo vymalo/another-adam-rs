@@ -28,8 +28,10 @@ pub struct Worktree {
     /// The name the work ends up under: the run's own branch, or the pushed branch this worktree
     /// continues (which only [`Worktree::publish`] moves).
     branch: String,
-    /// The local branch that is checked out, always the run's own.
+    /// The local branch that is checked out, always the run's own. Empty for a reference.
     local: String,
+    /// A reference: a detached checkout of somebody else's repository, read and never written.
+    reference: bool,
     mirror: PathBuf,
     /// The worktree's directory in the mirror's `worktrees/`, from the coder's metadata.
     admin: Option<PathBuf>,
@@ -146,6 +148,7 @@ impl Worktree {
                 .clone()
                 .unwrap_or_else(|| meta.branch.clone()),
             local: meta.branch.clone(),
+            reference: meta.kind.as_deref() == Some(crate::workspace::REFERENCE_KIND),
             admin: meta
                 .admin
                 .as_deref()
@@ -211,6 +214,25 @@ impl Worktree {
     /// that [`publish`](Self::publish) moves forward.
     pub fn continues(&self) -> Option<&str> {
         (self.branch != self.local).then_some(self.branch.as_str())
+    }
+
+    /// Whether this is a reference: a detached checkout with no branch of its own, which is read and
+    /// never written ([`RunWorkspace::add_reference`](crate::RunWorkspace::add_reference)).
+    /// [`commit_all`](Self::commit_all), [`push`](Self::push), [`publish`](Self::publish),
+    /// [`add_base_checkout`](Self::add_base_checkout) and [`copy_into`](crate::copy_into) refuse it.
+    pub fn is_reference(&self) -> bool {
+        self.reference
+    }
+
+    /// The refusal of a write to a reference, `Ok` for any other worktree.
+    fn writable(&self, what: &str) -> WorkspaceResult<()> {
+        if self.reference {
+            return Err(WorkspaceError::Invalid(format!(
+                "{} is a reference: it is read and never changed, so {what} is refused",
+                self.dir
+            )));
+        }
+        Ok(())
     }
 
     /// The run this worktree belongs to.
@@ -359,6 +381,7 @@ impl Worktree {
         message: &str,
         author: &GitIdentity,
     ) -> WorkspaceResult<Option<String>> {
+        self.writable("a commit")?;
         commit_all_in(|| self.git(), message, author, Some(&self.local)).await
     }
 
@@ -376,6 +399,7 @@ impl Worktree {
     /// [`WorkspaceError::Invalid`].
     #[tracing::instrument(skip(self), fields(run = %self.run, branch = %self.local))]
     pub async fn push(&self) -> WorkspaceResult<()> {
+        self.writable("a push")?;
         let loc = self.repo.locate()?;
         let auth = self.ws.authorize(&self.repo, &loc).await?;
         // The mirror lock is held from the check of the configuration to the end of the push and
@@ -428,6 +452,7 @@ impl Worktree {
     /// it), and it was not touched. Any other push failure as for [`push`](Self::push).
     #[tracing::instrument(skip(self), fields(run = %self.run, branch = %self.branch))]
     pub async fn publish(&self) -> WorkspaceResult<()> {
+        self.writable("publishing a branch")?;
         if self.continues().is_none() {
             return Ok(());
         }
@@ -562,6 +587,7 @@ impl Worktree {
     /// A git or file system failure.
     #[tracing::instrument(skip(self), fields(run = %self.run))]
     pub async fn add_base_checkout(&self) -> WorkspaceResult<Option<BaseCheckout>> {
+        self.writable("a checkout of the base for a check")?;
         let run_dir = self.ws.run_dir(&self.run);
         if self.path.parent() != Some(run_dir.as_path()) {
             return Ok(None);

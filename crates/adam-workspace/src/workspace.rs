@@ -207,7 +207,8 @@ pub(crate) struct Meta {
     /// Version 2: the order slots joined the run, from 1 (the legacy worktree is 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) seq: Option<u32>,
-    /// Version 2: `"repo"`.
+    /// Version 2: `"repo"`, or `"reference"` for a read-only slot (a detached checkout with no
+    /// branch of its own: `branch` is then empty).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
     /// The name of the worktree's directory in the mirror's `worktrees/`, which is its git
@@ -259,20 +260,25 @@ pub(crate) struct ScratchMeta {
 #[derive(Clone)]
 pub(crate) enum SlotMeta {
     Repo(Meta),
+    /// A reference: a [`Meta`] of kind `"reference"`.
+    Reference(Meta),
     Scratch(ScratchMeta),
 }
+
+/// The `kind` of a reference slot's metadata.
+pub(crate) const REFERENCE_KIND: &str = "reference";
 
 impl SlotMeta {
     pub(crate) fn dir(&self) -> &str {
         match self {
-            Self::Repo(m) => m.dir.as_deref().unwrap_or_default(),
+            Self::Repo(m) | Self::Reference(m) => m.dir.as_deref().unwrap_or_default(),
             Self::Scratch(m) => &m.dir,
         }
     }
 
     pub(crate) fn seq(&self) -> u32 {
         match self {
-            Self::Repo(m) => m.seq.unwrap_or(0),
+            Self::Repo(m) | Self::Reference(m) => m.seq.unwrap_or(0),
             Self::Scratch(m) => m.seq,
         }
     }
@@ -290,6 +296,8 @@ pub(crate) struct Target {
     /// `Some` for a slot of a [`RunWorkspace`] (metadata version 2): its place in the order slots
     /// joined. `None` for the legacy worktree of a run.
     pub(crate) seq: Option<u32>,
+    /// A reference: checked out detached, with no branch of its own and nothing to push.
+    pub(crate) reference: bool,
 }
 
 impl Workspaces {
@@ -627,7 +635,12 @@ impl Workspaces {
         let (meta, fresh) = match meta {
             Some(m) => (m, false),
             None => {
-                let branch = self.inner.pick_branch(&mirror, run).await?;
+                // A reference has no branch: it is a detached checkout that nothing can commit to.
+                let branch = if target.reference {
+                    String::new()
+                } else {
+                    self.inner.pick_branch(&mirror, run).await?
+                };
                 (
                     Meta {
                         version: if target.seq.is_some() {
@@ -642,7 +655,13 @@ impl Workspaces {
                         remote_branch: existing.map(str::to_owned),
                         dir: target.seq.map(|_| target.dir.clone()),
                         seq: target.seq,
-                        kind: target.seq.map(|_| "repo".to_owned()),
+                        kind: target.seq.map(|_| {
+                            if target.reference {
+                                REFERENCE_KIND.to_owned()
+                            } else {
+                                "repo".to_owned()
+                            }
+                        }),
                         admin: None,
                         admin_gen: None,
                     },
@@ -653,11 +672,13 @@ impl Workspaces {
 
         // Record ownership and intent before touching the worktree, so a crash
         // in between is repaired by the next `prepare` instead of leaking.
-        self.inner
-            .mirror_git(&mirror)
-            .args(["config", &format!("branch.{}.adam-run", meta.branch), run])
-            .run()
-            .await?;
+        if !target.reference {
+            self.inner
+                .mirror_git(&mirror)
+                .args(["config", &format!("branch.{}.adam-run", meta.branch), run])
+                .run()
+                .await?;
+        }
         self.inner.write_meta_at(&target.meta_path, &meta).await?;
 
         let added = self
@@ -1136,6 +1157,7 @@ impl Inner {
             meta_path: self.meta_path(run),
             dir: slot_name(&loc.name),
             seq: None,
+            reference: false,
         }
     }
 
@@ -1146,6 +1168,15 @@ impl Inner {
             meta_path: self.slot_meta_path(run, dir),
             dir: dir.to_owned(),
             seq: Some(seq),
+            reference: false,
+        }
+    }
+
+    /// The target of the reference `dir` of `run`, which joined as number `seq`.
+    pub(crate) fn reference_target(&self, run: &str, dir: &str, seq: u32) -> Target {
+        Target {
+            reference: true,
+            ..self.slot_target(run, dir, seq)
         }
     }
 
@@ -1632,6 +1663,18 @@ impl Inner {
         start_ref: &str,
         dir: &str,
     ) -> WorkspaceResult<String> {
+        if meta.kind.as_deref() == Some(REFERENCE_KIND) {
+            // Detached at the base: no branch is made, so nothing in the mirror is the reference's.
+            return self
+                .add_linked(
+                    mirror,
+                    &meta.run,
+                    &admin_name(&meta.run, dir),
+                    path,
+                    |cmd, staging| cmd.arg("--detach").arg(staging).arg(start_ref),
+                )
+                .await;
+        }
         let branch_ref = format!("refs/heads/{}", meta.branch);
         let branch_exists = self
             .mirror_git(mirror)
@@ -2067,11 +2110,17 @@ impl Inner {
                 SlotMeta::Scratch(
                     serde_json::from_value(probe).map_err(|e| corrupt(e.to_string()))?,
                 )
+            } else if probe.get("kind").and_then(|k| k.as_str()) == Some(REFERENCE_KIND) {
+                SlotMeta::Reference(
+                    serde_json::from_value(probe).map_err(|e| corrupt(e.to_string()))?,
+                )
             } else {
                 SlotMeta::Repo(serde_json::from_value(probe).map_err(|e| corrupt(e.to_string()))?)
             };
             let (version, run_of, dir_of) = match &meta {
-                SlotMeta::Repo(m) => (m.version, m.run.as_str(), m.dir.as_deref().unwrap_or("")),
+                SlotMeta::Repo(m) | SlotMeta::Reference(m) => {
+                    (m.version, m.run.as_str(), m.dir.as_deref().unwrap_or(""))
+                }
                 SlotMeta::Scratch(m) => (m.version, m.run.as_str(), m.dir.as_str()),
             };
             let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");

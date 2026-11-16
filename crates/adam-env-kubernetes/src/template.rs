@@ -587,11 +587,13 @@ spec:
             &[SlotMount {
                 path: "/work/workspaces/r1/r".into(),
                 generation: Some("1a-0".to_owned()),
+                read_only: false,
             }],
             &[WorktreeDirs {
                 mirror: "/work/git/github.com/o/r.git".into(),
                 admin: "/work/git/github.com/o/r.git/worktrees/r".into(),
                 generation: None,
+                read_only: false,
             }],
         )
         .unwrap()

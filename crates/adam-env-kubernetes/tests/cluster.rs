@@ -830,11 +830,13 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
         &[SlotMount {
             path: PathBuf::from("/work/workspaces/kind-iso-a/r"),
             generation: Some("1a-0".to_owned()),
+            read_only: false,
         }],
         &[WorktreeDirs {
             mirror: PathBuf::from(&mirror),
             admin: PathBuf::from(&admin),
             generation: None,
+            read_only: false,
         }],
     )
     .expect("the mounts");
