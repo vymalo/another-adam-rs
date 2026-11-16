@@ -29,6 +29,10 @@ const MAX_BRANCHES_LISTED: usize = 30;
 const META_VERSION: u32 = 1;
 /// The metadata of a slot of a [`RunWorkspace`].
 pub(crate) const SLOT_META_VERSION: u32 = 2;
+/// The metadata of a reference slot. Higher than a repository slot's, so that a binary that does
+/// not know references refuses it (its version check fails) instead of reading it as a repository
+/// slot that can be written.
+pub(crate) const REFERENCE_META_VERSION: u32 = 3;
 const MAX_RUN_ID: usize = 128;
 /// The empty tree of git (`git hash-object -t tree /dev/null`): what the first commit of an empty
 /// repository points at.
@@ -298,6 +302,22 @@ pub(crate) struct Target {
     pub(crate) seq: Option<u32>,
     /// A reference: checked out detached, with no branch of its own and nothing to push.
     pub(crate) reference: bool,
+    /// For a reference: the commit to check out instead of the branch's tip (the one it was first
+    /// read at).
+    pub(crate) pin: Option<String>,
+}
+
+impl Target {
+    /// The version of the metadata this target's file has.
+    fn meta_version(&self) -> u32 {
+        if self.reference {
+            REFERENCE_META_VERSION
+        } else if self.seq.is_some() {
+            SLOT_META_VERSION
+        } else {
+            META_VERSION
+        }
+    }
 }
 
 impl Workspaces {
@@ -557,7 +577,7 @@ impl Workspaces {
         let path = &target.path;
         let meta = self
             .inner
-            .read_meta_at(&target.meta_path, run, target.seq.is_some())
+            .read_meta_at(&target.meta_path, run, target.meta_version())
             .await?;
         if let Some(m) = &meta {
             if m.url != repo.url {
@@ -609,7 +629,19 @@ impl Workspaces {
             .await?;
 
         let base_ref = format!("{REMOTE_TRACKING_PREFIX}{}", repo.base_branch);
-        if !self.inner.has_commit(&mirror, &base_ref).await? {
+        // A reference made again starts from the commit it was first read at, whatever the branch
+        // is at now: when that commit is gone, it is not moved to another.
+        if let Some(pin) = &target.pin {
+            if !is_commit_id(pin) || !self.inner.has_commit(&mirror, pin).await? {
+                return Err(WorkspaceError::NotFound(format!(
+                    "the commit {} that {} was first read at is no longer in {}: nothing was moved to \
+                     another commit",
+                    pin.chars().take(12).collect::<String>(),
+                    target.dir,
+                    repo.url
+                )));
+            }
+        } else if !self.inner.has_commit(&mirror, &base_ref).await? {
             return Err(WorkspaceError::NotFound(format!(
                 "branch {} does not exist on {}. {}",
                 repo.base_branch,
@@ -617,7 +649,7 @@ impl Workspaces {
                 self.inner.branches_said(&mirror).await
             )));
         }
-        // What the worktree starts from: the base, or the branch it continues.
+        // What the worktree starts from: the pinned commit, the base, or the branch it continues.
         let start_ref = match existing {
             Some(existing) => {
                 let continued = format!("{REMOTE_TRACKING_PREFIX}{existing}");
@@ -629,7 +661,7 @@ impl Workspaces {
                 }
                 continued
             }
-            None => base_ref,
+            None => target.pin.clone().unwrap_or(base_ref),
         };
 
         let (meta, fresh) = match meta {
@@ -643,11 +675,7 @@ impl Workspaces {
                 };
                 (
                     Meta {
-                        version: if target.seq.is_some() {
-                            SLOT_META_VERSION
-                        } else {
-                            META_VERSION
-                        },
+                        version: target.meta_version(),
                         run: run.to_owned(),
                         url: repo.url.clone(),
                         base_branch: repo.base_branch.clone(),
@@ -1081,6 +1109,15 @@ pub(crate) fn is_generation(token: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
 }
 
+/// Whether `text` is a full commit id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits, which git
+/// reads as nothing else.
+pub(crate) fn is_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64)
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// The branch in the first line of `git ls-remote --symref origin HEAD`:
 /// `ref: refs/heads/<branch>\tHEAD`.
 fn parse_symref_head(output: &str) -> Option<String> {
@@ -1158,6 +1195,7 @@ impl Inner {
             dir: slot_name(&loc.name),
             seq: None,
             reference: false,
+            pin: None,
         }
     }
 
@@ -1169,13 +1207,22 @@ impl Inner {
             dir: dir.to_owned(),
             seq: Some(seq),
             reference: false,
+            pin: None,
         }
     }
 
-    /// The target of the reference `dir` of `run`, which joined as number `seq`.
-    pub(crate) fn reference_target(&self, run: &str, dir: &str, seq: u32) -> Target {
+    /// The target of the reference `dir` of `run`, which joined as number `seq`, at the commit
+    /// `pin` when it was first read there.
+    pub(crate) fn reference_target(
+        &self,
+        run: &str,
+        dir: &str,
+        seq: u32,
+        pin: Option<&str>,
+    ) -> Target {
         Target {
             reference: true,
+            pin: pin.map(str::to_owned),
             ..self.slot_target(run, dir, seq)
         }
     }
@@ -2049,16 +2096,17 @@ impl Inner {
 
     /// The metadata of the legacy worktree of `run`.
     pub(crate) async fn read_meta(&self, run: &str) -> WorkspaceResult<Option<Meta>> {
-        self.read_meta_at(&self.meta_path(run), run, false).await
+        self.read_meta_at(&self.meta_path(run), run, META_VERSION)
+            .await
     }
 
-    /// The repository metadata in `path`: version 1 (`slot` false: the legacy file) or version 2
-    /// (`slot` true), for `run`.
+    /// The repository metadata in `path`, which must be of `version` (1 the legacy file, 2 a slot's,
+    /// 3 a reference's), for `run`.
     pub(crate) async fn read_meta_at(
         &self,
         path: &Path,
         run: &str,
-        slot: bool,
+        version: u32,
     ) -> WorkspaceResult<Option<Meta>> {
         let Some(bytes) = read_if_exists(path).await? else {
             return Ok(None);
@@ -2066,11 +2114,6 @@ impl Inner {
         let meta: Meta = serde_json::from_slice(&bytes).map_err(|e| {
             WorkspaceError::Corrupt(format!("{} is not valid metadata: {e}", path.display()))
         })?;
-        let version = if slot {
-            SLOT_META_VERSION
-        } else {
-            META_VERSION
-        };
         if meta.version != version || meta.run != run {
             return Err(WorkspaceError::Corrupt(format!(
                 "{} has unexpected version or run",
@@ -2117,14 +2160,25 @@ impl Inner {
             } else {
                 SlotMeta::Repo(serde_json::from_value(probe).map_err(|e| corrupt(e.to_string()))?)
             };
-            let (version, run_of, dir_of) = match &meta {
-                SlotMeta::Repo(m) | SlotMeta::Reference(m) => {
-                    (m.version, m.run.as_str(), m.dir.as_deref().unwrap_or(""))
+            let (version, expected, run_of, dir_of) = match &meta {
+                SlotMeta::Repo(m) => (
+                    m.version,
+                    SLOT_META_VERSION,
+                    m.run.as_str(),
+                    m.dir.as_deref().unwrap_or(""),
+                ),
+                SlotMeta::Reference(m) => (
+                    m.version,
+                    REFERENCE_META_VERSION,
+                    m.run.as_str(),
+                    m.dir.as_deref().unwrap_or(""),
+                ),
+                SlotMeta::Scratch(m) => {
+                    (m.version, SLOT_META_VERSION, m.run.as_str(), m.dir.as_str())
                 }
-                SlotMeta::Scratch(m) => (m.version, m.run.as_str(), m.dir.as_str()),
             };
             let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
-            if version != SLOT_META_VERSION || run_of != run || dir_of != stem {
+            if version != expected || run_of != run || dir_of != stem {
                 return Err(WorkspaceError::Corrupt(format!(
                     "{} has unexpected version, run or directory",
                     path.display()

@@ -5031,3 +5031,101 @@ async fn removing_the_workspace_removes_its_references() {
     );
     run.remove().await.unwrap();
 }
+
+/// The metadata of a reference has a version a binary that does not know references refuses, so a
+/// rolling deploy or a rollback never reads it as a repository slot that can be written. A
+/// repository slot's and a scratch project's keep theirs.
+#[tokio::test]
+async fn a_reference_has_its_own_metadata_version_and_a_repository_slot_keeps_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, design) = remote_with(tmp.path(), "acme", "design", &[("a.txt", "a\n")]);
+    let (_, app) = remote_with(tmp.path(), "acme", "app", &[("b.txt", "b\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    run.add_reference(&design, "design").await.unwrap();
+    run.add_repository(&app).await.unwrap();
+    run.add_scratch("notes", &me()).await.unwrap();
+    let meta_dir = tmp.path().join("root/meta").join(RUN);
+    let version_of = |name: &str| -> u64 {
+        let text = std::fs::read_to_string(meta_dir.join(format!("{name}.json"))).unwrap();
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["version"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(version_of("design"), 3, "a reference");
+    assert_eq!(version_of("app"), 2, "a repository slot: as it always was");
+    assert_eq!(
+        version_of("notes"),
+        2,
+        "a scratch project: as it always was"
+    );
+    assert_eq!(run.slots().await.unwrap().len(), 3);
+
+    // The reader holds a reference to its version: the shape of a repository slot's file, at the
+    // version a repository has, is not read as a reference, and not as anything.
+    let path = meta_dir.join("design.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    meta["version"] = serde_json::json!(2);
+    std::fs::write(&path, meta.to_string()).unwrap();
+    let again = workspaces(tmp.path());
+    let e = again.run(RUN).unwrap().slots().await.unwrap_err();
+    assert!(matches!(e, WorkspaceError::Corrupt(_)), "{e}");
+}
+
+/// A reference made again comes back at the commit it was first read at, not at where the branch is
+/// now; a commit that is gone is said and nothing is moved to another.
+#[tokio::test]
+async fn a_reference_made_again_comes_back_at_the_commit_it_was_read_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, design) = remote_with(tmp.path(), "acme", "design", &[("a.txt", "first\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_reference(&design, "design").await.unwrap();
+    let read_at = slot.reference().unwrap().head_commit().await.unwrap();
+    assert_eq!(read_at, git(&remote, &["rev-parse", "main"]));
+    assert_eq!(read_at.len(), 40);
+
+    // The branch moves on and the directory is lost.
+    let seed = tmp.path().join("seed-acme-design");
+    std::fs::write(seed.join("a.txt"), "second\n").unwrap();
+    git(&seed, &["add", "-A"]);
+    git(&seed, &["commit", "--quiet", "-m", "later"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    assert_ne!(git(&remote, &["rev-parse", "main"]), read_at);
+    std::fs::remove_dir_all(slot.path()).unwrap();
+
+    // Without the commit, the branch's tip; with it, the commit.
+    let back = run
+        .add_reference_at(&design, "design", Some(&read_at))
+        .await
+        .unwrap();
+    assert_eq!(
+        back.reference().unwrap().head_commit().await.unwrap(),
+        read_at
+    );
+    assert_eq!(
+        std::fs::read_to_string(back.path().join("a.txt")).unwrap(),
+        "first\n",
+        "the file as it was when it was read"
+    );
+
+    // A commit the repository does not have: an error that says so, and no slot made.
+    let (_, lib) = remote_with(tmp.path(), "acme", "lib", &[("l.txt", "l\n")]);
+    for gone in ["1".repeat(40), "--output=/tmp/x".to_owned()] {
+        let e = run
+            .add_reference_at(&lib, "lib", Some(&gone))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, WorkspaceError::NotFound(_)), "{e}");
+        assert!(e.to_string().contains("nothing was moved"), "{e}");
+    }
+    assert_eq!(run.slots().await.unwrap().len(), 1, "no slot for `lib`");
+    assert!(
+        !tmp.path()
+            .join("root/meta")
+            .join(RUN)
+            .join("lib.json")
+            .exists()
+    );
+}

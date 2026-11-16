@@ -641,7 +641,20 @@ impl RunWorkspace {
     /// Add the repository `repo` as a **reference** called `name`: a detached checkout of
     /// `origin/<base_branch>`, with no branch of its own, which the run reads and never writes
     /// ([`Slot::writable`], [`Worktree::is_reference`]). Nothing is pushed from it, and a commit, a
-    /// push, a publication and a copy into it are refused by the worktree itself.
+    /// push, a publication and a copy into it are refused by the worktree itself. As
+    /// [`add_reference_at`](Self::add_reference_at) with no commit.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_reference_at`](Self::add_reference_at).
+    pub async fn add_reference(&self, repo: &RepoRef, name: &str) -> WorkspaceResult<Slot> {
+        self.add_reference_at(repo, name, None).await
+    }
+
+    /// [`add_reference`](Self::add_reference), made at `commit` (a full commit id) when the
+    /// reference has to be made again: its directory was lost, and the caller recorded the commit
+    /// it was first read at ([`Worktree::head_commit`]). The branch is not read then, and a commit
+    /// that is no longer in the repository is an error: the reference is never moved to another.
     ///
     /// **Idempotent**: a reference the run already has under `name` for the same repository is
     /// returned as it is (it is not moved to a newer commit), and one whose directory was lost is
@@ -655,9 +668,14 @@ impl RunWorkspace {
     /// [`WorkspaceError::Invalid`] for a bad `name`, or a repository the policy refuses;
     /// [`WorkspaceError::Conflict`] when `name` is in use by another slot, or `repo` is a
     /// repository the run works on (read it in its own slot); [`WorkspaceError::NotFound`] when the
-    /// remote or the branch is not there; as [`Workspaces::prepare`] otherwise.
+    /// remote, the branch or `commit` is not there; as [`Workspaces::prepare`] otherwise.
     #[tracing::instrument(skip(self, repo), fields(run = %self.run, repo = %repo.url, name))]
-    pub async fn add_reference(&self, repo: &RepoRef, name: &str) -> WorkspaceResult<Slot> {
+    pub async fn add_reference_at(
+        &self,
+        repo: &RepoRef,
+        name: &str,
+        commit: Option<&str>,
+    ) -> WorkspaceResult<Slot> {
         validate_scratch_dir(name)?;
         // A refused repository costs no process, no lock and no credential.
         let loc = self.ws.check_repo(repo)?;
@@ -688,7 +706,7 @@ impl RunWorkspace {
             Some(SlotMeta::Reference(m)) if same(&m.url) => {
                 let seq = m.seq.unwrap_or(0);
                 spelled = RepoRef::new(&m.url, repo.base_branch.clone());
-                (inner.reference_target(&self.run, name, seq), seq)
+                (inner.reference_target(&self.run, name, seq, commit), seq)
             }
             Some(_) => {
                 return Err(WorkspaceError::Conflict(format!(
@@ -706,7 +724,7 @@ impl RunWorkspace {
                     )));
                 }
                 let seq = metas.iter().map(SlotMeta::seq).max().unwrap_or(0) + 1;
-                (inner.reference_target(&self.run, name, seq), seq)
+                (inner.reference_target(&self.run, name, seq, commit), seq)
             }
         };
         let wt = self

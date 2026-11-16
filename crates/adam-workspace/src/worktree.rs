@@ -224,6 +224,20 @@ impl Worktree {
         self.reference
     }
 
+    /// The commit `HEAD` is at: the one a reference was checked out at.
+    ///
+    /// # Errors
+    ///
+    /// A git failure.
+    pub async fn head_commit(&self) -> WorkspaceResult<String> {
+        Ok(self
+            .git()
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .run()
+            .await?
+            .stdout_text())
+    }
+
     /// The refusal of a write to a reference, `Ok` for any other worktree.
     fn writable(&self, what: &str) -> WorkspaceResult<()> {
         if self.reference {
