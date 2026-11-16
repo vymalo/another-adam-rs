@@ -73,6 +73,132 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
             .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/')
 }
 
+/// The most segments of a JPEG that [`image_size`] walks before it gives up.
+const JPEG_MAX_SEGMENTS: usize = 256;
+
+/// The width and height in pixels that the header of an image says, for PNG, JPEG, GIF and WebP
+/// (lossy, lossless and extended). `None` for anything else, for a header that is cut short, and
+/// for a size of zero.
+///
+/// Nothing is decoded: only the first bytes are read, by hand, with every index checked, a JPEG
+/// walked segment by segment for at most [`JPEG_MAX_SEGMENTS`] segments, and no allocation. What
+/// the header says is untrusted: it is a number, never a size to allocate. An SVG has no pixel
+/// size and is `None`.
+pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let (width, height) = match sniff_raster(bytes)? {
+        "image/png" => png_size(bytes),
+        "image/jpeg" => jpeg_size(bytes),
+        "image/gif" => gif_size(bytes),
+        _ => webp_size(bytes),
+    }?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// `sniff_image` for the four raster formats only.
+fn sniff_raster(bytes: &[u8]) -> Option<&'static str> {
+    sniff_image(bytes).filter(|kind| *kind != "image/svg+xml")
+}
+
+fn be32(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    let b: [u8; 4] = bytes.get(at..end)?.try_into().ok()?;
+    Some(u32::from_be_bytes(b))
+}
+
+fn be16(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(2)?;
+    let b: [u8; 2] = bytes.get(at..end)?.try_into().ok()?;
+    Some(u32::from(u16::from_be_bytes(b)))
+}
+
+fn le16(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(2)?;
+    let b: [u8; 2] = bytes.get(at..end)?.try_into().ok()?;
+    Some(u32::from(u16::from_le_bytes(b)))
+}
+
+fn le24(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(3)?;
+    let b = bytes.get(at..end)?;
+    Some(u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16)
+}
+
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    // Signature, then the first chunk, which must be IHDR: length, type, width, height.
+    if bytes.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    Some((be32(bytes, 16)?, be32(bytes, 20)?))
+}
+
+fn gif_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    Some((le16(bytes, 6)?, le16(bytes, 8)?))
+}
+
+fn webp_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    match bytes.get(12..16)? {
+        // Lossy: a frame tag of 3 bytes, the start code 9d 01 2a, then 14-bit sizes.
+        b"VP8 " => {
+            if bytes.get(23..26)? != [0x9d, 0x01, 0x2a] {
+                return None;
+            }
+            Some((le16(bytes, 26)? & 0x3fff, le16(bytes, 28)? & 0x3fff))
+        }
+        // Lossless: the signature 0x2f, then two 14-bit sizes, each less one.
+        b"VP8L" => {
+            if *bytes.get(20)? != 0x2f {
+                return None;
+            }
+            let b = bytes.get(21..25)?;
+            let packed = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            Some(((packed & 0x3fff) + 1, ((packed >> 14) & 0x3fff) + 1))
+        }
+        // Extended: flags and reserved, then two 24-bit sizes, each less one.
+        b"VP8X" => Some((
+            le24(bytes, 24)?.checked_add(1)?,
+            le24(bytes, 27)?.checked_add(1)?,
+        )),
+        _ => None,
+    }
+}
+
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut at = 2usize;
+    for _ in 0..JPEG_MAX_SEGMENTS {
+        // A marker is 0xFF and a code; any number of 0xFF may fill before it.
+        if *bytes.get(at)? != 0xFF {
+            return None;
+        }
+        let mut code = *bytes.get(at.checked_add(1)?)?;
+        at = at.checked_add(2)?;
+        while code == 0xFF {
+            code = *bytes.get(at)?;
+            at = at.checked_add(1)?;
+        }
+        match code {
+            // No length: stuffed zero, restart markers, the start of the image.
+            0x00 | 0x01 | 0xD0..=0xD8 => continue,
+            // The end of the image or the start of the scan, with no frame header before.
+            0xD9 | 0xDA => return None,
+            _ => {}
+        }
+        let len = usize::try_from(be16(bytes, at)?).ok()?;
+        if len < 2 {
+            return None;
+        }
+        // The frame headers: every SOFn except DHT (C4), JPG (C8) and DAC (CC).
+        if matches!(code, 0xC0..=0xCF) && !matches!(code, 0xC4 | 0xC8 | 0xCC) {
+            // Length, precision, height, width.
+            return Some((
+                be16(bytes, at.checked_add(5)?)?,
+                be16(bytes, at.checked_add(3)?)?,
+            ));
+        }
+        at = at.checked_add(len)?;
+    }
+    None
+}
+
 /// The media type to share `bytes` as, given what was `claimed` for them (by their sender, or by a
 /// file's extension), checked against the bytes:
 ///
@@ -416,7 +542,7 @@ fn short_hash(bytes: &[u8]) -> String {
 }
 
 /// `1234` bytes as `1.2 KiB`.
-pub(crate) fn human_size(len: usize) -> String {
+pub fn human_size(len: usize) -> String {
     #[allow(clippy::cast_precision_loss)] // a file of at most a few MiB
     let len_f = len as f64;
     if len < 1024 {
@@ -690,5 +816,133 @@ mod tests {
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(1536), "1.5 KiB");
         assert_eq!(human_size(4 * 1024 * 1024), "4.0 MiB");
+    }
+
+    // Real headers, built by hand.
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 2, 0, 0, 0]);
+        v
+    }
+
+    fn gif(w: u16, h: u16) -> Vec<u8> {
+        let mut v = b"GIF89a".to_vec();
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.extend_from_slice(&[0, 0, 0]);
+        v
+    }
+
+    fn jpeg(w: u16, h: u16) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 16];
+        v.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        v.extend_from_slice(&[0xFF, 0xFF, 0xDB, 0, 4, 0, 0]);
+        v.extend_from_slice(&[0xFF, 0xC2, 0, 17, 8]);
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        v
+    }
+
+    fn webp_lossy(w: u16, h: u16) -> Vec<u8> {
+        let mut v = b"RIFF\x20\0\0\0WEBPVP8 \x14\0\0\0\x10\x02\0\x9d\x01\x2a".to_vec();
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v
+    }
+
+    fn webp_lossless(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"RIFF\x20\0\0\0WEBPVP8L\x10\0\0\0\x2f".to_vec();
+        let packed = (w - 1) | ((h - 1) << 14);
+        v.extend_from_slice(&packed.to_le_bytes());
+        v.extend_from_slice(&[0; 4]);
+        v
+    }
+
+    fn webp_extended(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"RIFF\x20\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
+        v.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        v.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        v
+    }
+
+    #[test]
+    fn image_size_reads_png_jpeg_gif_webp() {
+        assert_eq!(image_size(&png(800, 600)), Some((800, 600)));
+        assert_eq!(image_size(&png(1, 70_000)), Some((1, 70_000)));
+        assert_eq!(image_size(&gif(320, 200)), Some((320, 200)));
+        assert_eq!(image_size(&jpeg(1024, 768)), Some((1024, 768)));
+        assert_eq!(image_size(&webp_lossy(640, 480)), Some((640, 480)));
+        assert_eq!(image_size(&webp_lossless(641, 481)), Some((641, 481)));
+        assert_eq!(image_size(&webp_extended(16_384, 100)), Some((16_384, 100)));
+    }
+
+    #[test]
+    fn a_jpeg_without_a_frame_header_has_no_size() {
+        // Start of scan before any frame header.
+        assert_eq!(image_size(&[0xFF, 0xD8, 0xFF, 0xDA, 0, 2]), None);
+        // The end of the image.
+        assert_eq!(image_size(&[0xFF, 0xD8, 0xFF, 0xD9]), None);
+        // Segments that never end, and a length that leaves the data.
+        assert_eq!(image_size(&[0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xFF]), None);
+        assert_eq!(image_size(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 1, 0]), None);
+        // Only the signature.
+        assert_eq!(image_size(&[0xFF, 0xD8, 0xFF]), None);
+        // A table is not a frame (DHT).
+        assert_eq!(image_size(&[0xFF, 0xD8, 0xFF, 0xC4, 0, 2]), None);
+    }
+
+    #[test]
+    fn a_size_of_zero_and_an_svg_have_no_size() {
+        assert_eq!(image_size(&png(0, 10)), None);
+        assert_eq!(image_size(&gif(10, 0)), None);
+        assert_eq!(image_size(SVG), None);
+        assert_eq!(image_size(b""), None);
+    }
+
+    #[test]
+    fn a_truncated_header_has_no_size_and_never_panics() {
+        for full in [
+            png(800, 600),
+            gif(3, 4),
+            jpeg(5, 6),
+            webp_lossy(7, 8),
+            webp_lossless(9, 10),
+            webp_extended(11, 12),
+        ] {
+            assert!(image_size(&full).is_some());
+            for cut in 0..full.len() {
+                if image_size(&full[..cut]).is_some() {
+                    // A size that comes from a cut header must be the real one.
+                    assert_eq!(image_size(&full[..cut]), image_size(&full), "{cut}");
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn image_size_never_panics(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+            head in 0usize..6,
+        ) {
+            let heads: [&[u8]; 6] = [
+                b"", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", b"GIF89a", &[0xFF, 0xD8, 0xFF],
+                b"RIFF\0\0\0\0WEBPVP8 ", b"RIFF\0\0\0\0WEBPVP8X",
+            ];
+            let mut data = heads[head].to_vec();
+            data.extend_from_slice(&bytes);
+            let _ = image_size(&data);
+            let _ = image_size(&bytes);
+        }
+
+        #[test]
+        fn a_cut_real_header_never_panics(cut in 0usize..40, w in 0u32..u32::MAX, h in 0u32..u32::MAX) {
+            for full in [png(w, h), webp_extended(w.clamp(1, 1 << 24), h.clamp(1, 1 << 24)), jpeg(w as u16, h as u16)] {
+                let _ = image_size(&full[..cut.min(full.len())]);
+            }
+        }
     }
 }
