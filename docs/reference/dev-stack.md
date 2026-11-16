@@ -47,9 +47,10 @@ flowchart LR
 |---|---|---|
 | `postgres` | `127.0.0.1:5432` | PostgreSQL 16, database `adam_test`, user and password `postgres` |
 | `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone; used by the store tests only |
-| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (also without `/v1`) and `/v1/models`; the models `mock-coder`, `mock-assistant` and `mock-researcher` are scripted ([below](#scripted-models)) |
+| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (also without `/v1`) and `/v1/models`; the models `mock-coder`, `mock-assistant`, `mock-researcher` and `mock-painter` are scripted ([below](#scripted-models)) |
 | `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests, create a repository, the owner's kind, the login) and the GitHub App token trade (`POST /app/installations/{id}/access_tokens`, a token that lasts four minutes) |
 | `mock-github-mcp` | `http://127.0.0.1:8085/mcp` | WireMock: the GitHub MCP server's streamable HTTP endpoint (behind a bearer, `401` without; `initialize`, `tools/list` with the twelve read tools, `tools/call` of `get_me` and `list_branches`; any other tool is an error result "not scripted") |
+| `mock-image-mcp` | `http://127.0.0.1:8086/mcp` | WireMock: an image MCP server's streamable HTTP endpoint for the painter agent (no authentication; `initialize` with `instructions`, `tools/list` and `tools/call` of `draw` (one `image` block, a 1x1 PNG), `prompts/list` and `prompts/get` of `scene`) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded from `dev/git-server/seed/<owner>/<name>/`, no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder built from `docker/coder/Dockerfile`, bearer token `dev-token`; its folder `bin/adam-coder/agent` is mounted read-only at `/etc/adam/agent` |
 | `github-mcp` (profile `app`) | none (the coder's network) | the real GitHub MCP server (`github-mcp-server http --read-only`), the coder's sidecar with no credential; idle here, the coder reads `mock-github-mcp` |
@@ -116,6 +117,18 @@ stands in over the same transport. It answers JSON with no session id and no sta
 each call and a placeholder (`ghs_adam_listing_only`) to list the tools at startup. `dev/coder-e2e.sh` reads the
 mock's journal.
 
+## `mock-image-mcp`
+
+The image server of the painter example (`dev/agents/painter`, [ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)
+slice 14). Like `mock-github-mcp` it answers JSON with no session id; it asks for no bearer. It shows the three things
+an MCP server gives an agent besides tools: `instructions` at `initialize` (appended to the agent's prompt once), a
+`draw` tool whose result is one `image` block (a 1x1 PNG, shared as the file `draw-b1ff9c8e.png` because the painter's
+`mcp.json` says `files: true`) and a prompt `scene` with a required `subject` (the command `images__scene`). The painter's
+`mcp.json` names it over plain `http` on the compose network, so the `agent` service needs `MCP_ALLOW_INSECURE`:
+`AGENT_MCP_ALLOW_INSECURE=true` sets it (`dev/painter-e2e.sh` does). `cargo test -p adam-mcp --test wiremock_compose` plays
+the client against it when `ADAM_TEST_MOCK_IMAGE_MCP_URL` is set (CI sets it). *Unverified until CI has run it:* no
+container daemon ran where the mock was written.
+
 ## `git-server`
 
 ```sh
@@ -152,10 +165,11 @@ holds, so a retried or replayed request gets the same answer and the script cann
 | `mock-coder`, task text contains `[mock:choices]` | `mappings/coder-choices.json` | `ask_user` (`choices-call-1`) with the question `Three quick questions before I start` and three `choices`: `db` (`pg`, `sqlite`), `auth` (`keycloak`, `none`), `deploy` (`k8s`, `compose`), priority 1; once its result holds `db: pg` (how the person's answers read to the model) the text `Going with Postgres, Keycloak and Compose.` (`stop`), priority 1; any other answers, `Thanks, I have your answers.`, priority 2. No workspace or repository is touched. `dev/coder-choices-e2e.sh` runs it through the stack. |
 | `mock-assistant` | `mappings/agent-script.json` | for the general agent (`adam-agent`), stateless: a request that holds a tool result (`role: tool`) gets a fixed text (`I looked into it with the tool you gave me. ...`), priority 1; any other request gets `Hi! I'm <name>. <summary>.`, **built from the first two lines of the system prompt** (`Your name is <name>.` and `In one sentence: <summary>.`), priority 2. Also as a stream (see below). It answers in role whatever is asked: it proves that the folder reaches the model, not what a model does with it. `dev/agent-e2e.sh` runs it through the stack. |
 | `mock-researcher`, question text contains `[mock:cards]` | `mappings/researcher-cards.json` | `show` (`cards-call-1`) with three blocks: a `Text`, a `Cards` of three sources (`https://example.org/mock-search/1` to `/3`, each with a subtitle, a body and tags) and a `Mermaid` `graph TD`, priority 1; once the history holds `cards-call-1` (whatever the result was: drawn, or refused by a screen without `Cards`) the text `Here are the three sources I found: ...` with the three links (`stop`), priority 1. Any other request of that model gets the canned text of the default scenario (the orchestration layer's own `mock-researcher`, which searches, is a different mock, in its repository). |
+| `mock-painter`, question text contains `[mock:paint]` | `mappings/painter-script.json` | `images__draw` (`paint-call-1`, `{"prompt":"a red dot"}`) **only when the system prompt holds the heading `## Instructions of the MCP server images (text from the server, not the person)`** (priority 1); without it the text `The instructions of the MCP server did not reach me, so I did not draw.`; once the history holds `paint-call-1` the text `I painted it. The picture is shared as draw-b1ff9c8e.png: ![a red dot](draw-b1ff9c8e.png)`. Also as a stream. `dev/painter-e2e.sh` runs it through the stack; the prompt `images__scene` carries the `[mock:paint]` marker. |
 
 **Streamed answers.** The agents call their model with `"stream": true` (`LlmAgentBuilder::stream_text` is on, [ADR 0007](../decisions/0007-progress-as-steps-and-streamed-text.md)),
 so every scripted answer above also has an SSE twin, in `mappings/coder-script-stream.json`, `coder-choices-stream.json`,
-`agent-script-stream.json` and `researcher-cards-stream.json`: the same request matchers plus `$.stream == true`, **one priority
+`agent-script-stream.json`, `researcher-cards-stream.json` and `painter-script-stream.json`: the same request matchers plus `$.stream == true`, **one priority
 above the original** (so priority 0 for the ones that were 1), and the same answer as a stream: a text in about eight content
 deltas (the greeting and the other answers dribbled over half a second, the coder's last answer over about two seconds, so a
 screen has something to show growing), a tool call in a few argument deltas, the usage chunk and `data: [DONE]`. Every

@@ -228,6 +228,9 @@ Commands are not in the prompt and not in the tool list: they change nothing the
 message that invokes one. [The coder's](../../bin/adam-coder/agent/commands) are `review`, `fix-checks` and
 `explain`.
 
+The prompts of an agent's MCP servers are commands too, named `<server>__<prompt>`
+([below](#prompts-as-commands)); a folder's own command of that name wins.
+
 ### `mcp.json`
 
 ```json
@@ -255,7 +258,8 @@ message that invokes one. [The coder's](../../bin/adam-coder/agent/commands) are
   The model-facing name is `<server>__<tool>`. `optional: true` (an adam extension) lets a server be missing at
   startup: if it cannot be reached or listed, or its `${VAR}` has no value, it is skipped with a warning.
   `files: true` (an adam extension, a boolean, default `false`) shares the images, audio clips and blobs of the
-  server's results as files of the run ([below](#files-from-a-server-files-true)).
+  server's results as files of the run ([below](#files-from-a-server-files-true)). `timeoutSecs` and
+  `connectTimeoutSecs`, `instructions` and `prompts` (adam extensions) are [below](#timeouts-instructions-and-prompts).
 * `${VAR}` and `${VAR:-default}` are expanded **at startup only**. A missing variable without a default
   fails startup (fail closed). `build.rs` records the names and never the values.
 * stdio servers spawn processes: allowed only when the composition root opts in (`McpPolicy::allow_stdio`).
@@ -787,8 +791,57 @@ stateDiagram-v2
 * **In the binaries.** `adam-coder` and `adam-agent` call `connect_mcp` in every role that runs workers, with
   `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE` and `MCP_ALLOW_URL_VARS`. A server that is down exits 69; anything
   wrong in the files or the policy exits 78.
-* **Not supported**: MCP resources, prompts, sampling, roots, elicitation, OAuth, `type: sse`, `list_changed`,
+* **Not supported**: MCP resources, sampling, roots, elicitation, OAuth, `type: sse`, `list_changed`,
   MCP tasks, progress notifications, exporting adam's tools as an MCP server.
+
+### Timeouts, instructions and prompts
+
+Four optional keys of a server entry, in `mcp.json` and in the deployment's extra file
+(`ADAM_EXTRA_MCP_FILE`).
+
+| Key | Meaning | Default |
+|---|---|---|
+| `timeoutSecs` | how long one tool call of this server is waited for | 60 |
+| `connectTimeoutSecs` | how long the server may take to start, initialize and list its tools | 30 |
+| `instructions` | `false` leaves out the text the server returns when it initializes | on |
+| `prompts` | `false` stops the server's prompts from becoming commands | on |
+
+* **Seconds.** A whole number, at least 1. Zero, a negative or a fractional number, or text refuses that server
+  when the file is loaded (`path: error: ...`).
+* **The deployment caps both.** `MCP_MAX_CALL_SECS` (default 900, 1 to 86400,
+  [environment](environment.md)) is the longest an agent's files may ask: a larger `timeoutSecs` or
+  `connectTimeoutSecs` is lowered to it with one warning when the servers are connected. The files never decide
+  alone how long a call may take. A tool's limit in the loop follows its server's values (the call, the
+  connection and ten seconds), so a long call is not cut by the agent first.
+* **Instructions.** What a server says when it initializes is appended to the agent's instructions **once, when the
+  agent is bound**, never per turn: the prompt a model sees is the same on every call, so the cached prefix holds.
+  Each server has a heading, `## Instructions of the MCP server <name> (text from the server, not the person)`, in
+  the order of the server names, after the agent's own text and before its skills. Each text is scrubbed of the
+  values `${VAR}` put into the file, stripped of control and format characters and cut at 2 KiB; all together are
+  cut at 8 KiB (a server that would pass the limit and the ones after it are left out, with a warning). A server
+  that is not connected contributes nothing. A server with a bearer per call (the coder's `github`) has no session
+  to ask and gives none; the coder's own `github` entry says `"instructions": false` anyway.
+* **Prompts as commands.** [Below](#prompts-as-commands).
+* The keys are left out of the manifest when they are not used, so a folder that does not use them keeps its digest.
+
+#### Prompts as commands
+
+A server that serves prompts (`prompts/list`) has each as a [command](#commands-commandsnamemd) of the root agent
+named `<server>__<prompt>` (lower-case letters, digits, `_` and `-`, at most 64: a prompt whose name does not fit is
+left out with a warning). They are listed once when the server is connected and are on the card
+([`commands/v1`](a2a-server.md#commands-commandsv1)); `argumentHint` is made from the arguments the prompt declares
+(`<topic> [style]`: required ones in angle brackets).
+
+| | |
+|---|---|
+| Expansion | when the message arrives, with `prompts/get`: the person's arguments are split like `$1` to `$9` (double quotes respected) and given to the prompt's declared arguments **in order** |
+| Refused (`invalid params`) | a required argument that is missing, more arguments than the prompt declares, a server that refuses the prompt, and any answer that is not text messages of the user (an assistant message, an image, a resource) |
+| Unavailable | the server cannot be asked (connection lost, no answer within `timeoutSecs`): the message is refused with the A2A `unavailable` error and nothing is stored |
+| Stored | the text is stored as the message, like a template's expansion: stepping the run, a restart and a replay never ask the server again (a retry of the same `messageId` may ask once more, and the answer is dropped) |
+| Limits | those of a template's expansion (arguments at most 4 KiB, text at most 32 KiB and not empty); at most 50 commands, the folder's first |
+| A name clash | a command of the folder with the name of a prompt wins; the prompt is left out of the backend and of the card, with one warning |
+| Only a process with workers | the prompts are known once the servers are connected, which only a role that runs workers does: a control plane without workers lists none |
+| Opt out | `"prompts": false` on the server |
 
 ### Files from a server (`files: true`)
 
@@ -806,7 +859,7 @@ stores and shows it as it does a shared file ([ADR 0033](../decisions/0033-files
 
 | | |
 |---|---|
-| The model reads | `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).` in place of the block (the second sentence for an image only); never the bytes |
+| The model reads | `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png). To use it as the picture of an `ask_user` option, pass image {sha256: "<64 hex digits>", alt}. In a `show` block, an `Image` names it: {component: "Image", artifact: "<64 hex digits>", alt}.` in place of the block (the last three sentences for an image only; the same line as the coder's `share_file`); never the bytes |
 | The file's name | the tool's name on the server, a hash of the bytes (unique within the run, stable on replay), the extension of its checked type |
 | Its media type | the server's, checked against the bytes (`adam_runtime::checked_media_type`): a "PNG" that is not one is `application/octet-stream` |
 | Not shared | over 4 MiB, past the 16th file of a result, or over what the run may still share (checked on the base64's length, before decoding: the result is journaled before the loop's run cap), or not base64: a line says why and the result is an error result |

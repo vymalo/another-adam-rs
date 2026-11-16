@@ -27,6 +27,8 @@ client's own idea of one.
 | `slow` | none | nothing, ever |
 | `a.b` | none | `dotted`: a tool whose name no model provider accepts (listed with no description and a schema without a type) |
 
+With `TestHttpServer::start_scripted(token, Script { instructions, prompts })` the server also says `instructions` when it initializes and serves prompts (`TestPrompt::new(name, description).argument(name, required).user(text).assistant(text).image()`; `{{name}}` in a text is filled with the argument of that name); `prompt_gets()` counts `prompts/get`.
+
 ## Over stdio
 
 The binary `adam-mcp-test-server` serves `TestServer` on stdin and stdout; `env!("CARGO_BIN_EXE_adam-mcp-test-server")`

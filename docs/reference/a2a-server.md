@@ -322,6 +322,12 @@ A message invokes one in either of two forms, and both give the same stored text
   A replay, or a restart with an edited folder, never expands again, and a message sent again with the same `messageId` joins the
   run it made. The same holds for a follow-up and for a steering message, and a typed reply to a pending question that starts with
   `/name` is expanded too (tests: `crates/adam-a2a-runtime/tests/commands_flow.rs`); `//name` is the escape.
+* **Some commands are asked of an MCP server.** A prompt of an MCP server of the agent is a command named
+  `<server>__<prompt>`, listed on the card like any other once the servers are connected
+  ([`mcp.json`](agent-files.md#prompts-as-commands)); the text is asked of the server with `prompts/get` when the message
+  arrives and stored like a template's expansion. A prompt the server refuses, or that is not text of the user, is
+  `InvalidParams`; a server that cannot be asked is an `unavailable` error (nothing is written either way). A client sees no
+  difference in the card or in the message it sends.
 * Commands change **no system prompt and no tool list**: the model sees the expanded text as the person's message.
 
 ```mermaid

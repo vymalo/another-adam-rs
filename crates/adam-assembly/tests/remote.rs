@@ -1228,11 +1228,15 @@ async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run(
                         "{name}"
                     );
                     assert_eq!(artifact.name, "page.png", "the remote artifact's own name");
+                    let hash = artifact.file_sha256().unwrap();
                     assert_eq!(
                         text,
                         format!(
                             "The page is blank.\n\nShared {name} (16 bytes, image/png). To show it \
-                             in your answer, write ![description]({name})."
+                             in your answer, write ![description]({name}). To use it as the picture \
+                             of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}. In a \
+                             `show` block, an `Image` names it: {{component: \"Image\", artifact: \
+                             \"{hash}\", alt}}."
                         ),
                         "{backend}"
                     );

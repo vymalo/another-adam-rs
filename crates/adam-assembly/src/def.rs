@@ -606,11 +606,7 @@ impl Walk<'_> {
         // What the agent's MCP servers said about themselves, once, here: the prompt is the same
         // for every model call of the process, so the cached prefix holds.
         if let Some(given) = self.mcp.get(&name).filter(|g| !g.instructions.is_empty()) {
-            prompt.push_str(
-                "
-
-",
-            );
+            prompt.push_str("\n\n");
             prompt.push_str(&given.instructions);
         }
         // An agent that has an MCP tool can get a long result that is kept and paged: it reads the

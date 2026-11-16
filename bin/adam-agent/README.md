@@ -173,11 +173,12 @@ works against a *stateless* server too (`POST /mcp` answered with JSON, no `Mcp-
   part with `mediaType` and `filename`), named after the tool and a hash of its bytes (`browser_screenshot-3fa2c19b.png`:
   two screenshots never share a name), and the model reads
   one line,
-  `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).`
+  `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).` and, for an image, how to use it by its SHA-256 as the picture of an `ask_user` option and in a `show` `Image` block.
   A file is at most 4 MiB and a run shares at
   most 6 MiB; a subagent's files stay on the subagent's run. Without the key a file is described in a line and
   no byte of it is kept. [ADR 0033](../../docs/decisions/0033-files-from-mcp-results-are-shared-files.md),
   rules in [`adam-mcp`](../../crates/adam-mcp/README.md#files-files-true).
+* **Instructions, timeouts and prompts of an MCP server.** What a server says when it initializes is appended to the agent's instructions once, at startup; `timeoutSecs` and `connectTimeoutSecs` set its own timeouts (capped by `MCP_MAX_CALL_SECS`); its prompts are commands named `<server>__<prompt>`, on the card and expanded when a message names one. A process with no workers (a control plane) connects no server and lists none. See [`mcp.json`](../../docs/reference/agent-files.md#timeouts-instructions-and-prompts); the `dev/agents/painter` folder and `dev/painter-e2e.sh` show all three on a mock.
 * **A server that is down** at startup stops the process with exit 69, so a supervisor restarts it until the
   server is up; a mistake in the files or in the policy is 78. A tool call that fails later is an error result
   the model reads, not a failed run.
@@ -214,6 +215,7 @@ same way; every problem is reported at once at startup):
 | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none. Anything else: exit 78 | unset: reports carry no window |
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the folder's MCP servers may be (see above) | `false` each |
 | `A2A_ALLOW_INSECURE_REMOTES` | roles that run workers: a remote subagent (`a2a:` in a subagent file) may be at plain `http` on another machine, such as a service of the same cluster (`AgentDef::allow_insecure_remotes`); without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it (a NetworkPolicy that admits only the caller, or mesh mTLS); plain `http` goes only to the card's own host, never from an `https` card. The subagent's token is `auth: bearer:VAR`, a variable of this process ([remote subagents](../../docs/reference/agent-files.md#remote-subagents-a2a)) | `false` |
+| `MCP_MAX_CALL_SECS` | the longest an agent's own files may ask of one MCP server with `timeoutSecs` or `connectTimeoutSecs` in `mcp.json` or the extra file (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `RUST_LOG` | log filter (JSON logs on stdout); when set it replaces the default whole, so `RUST_LOG=info` shows `rmcp` again | `info,rmcp=warn` (the MCP client library's per-connection lines are quiet; `adam_service::logging`) |
 

@@ -11,7 +11,7 @@ cargo test --workspace
 
 Each database suite is **skipped when its variable is unset**, so `cargo test` works with no databases (only the
 in-memory store runs). The same holds for the two tests that check the real clients against the compose mocks
-(`adam-model-openai/tests/wiremock_compose.rs`, `adam-workspace/tests/wiremock_compose.rs`). Suites isolate
+(`adam-model-openai/tests/wiremock_compose.rs`, `adam-workspace/tests/wiremock_compose.rs`, `adam-mcp/tests/wiremock_compose.rs`, which also reads `ADAM_TEST_MOCK_GITHUB_MCP_URL` and `ADAM_TEST_MOCK_IMAGE_MCP_URL`). Suites isolate
 their cases by agent name, so they run in parallel on one shared database with no cleanup between runs.
 
 **CI must not pass by skipping.** `ADAM_TEST_REQUIRE_DB=1` makes a suite whose variable is unset **fail**; CI sets
@@ -91,6 +91,7 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 | `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text |
 | `sh dev/agent-e2e.sh` | the general agent answers "hi" in role; a restart on an edited folder changes the card and the answer |
 | `sh dev/agent-cards-e2e.sh` | the researcher folder answers with a surface of cards and a graph on a screen that has them, words only on one that has not |
+| `sh dev/painter-e2e.sh` | the painter folder: the instructions of its image MCP server reach the model, the picture is a shared `image/png` file the words name, and the server's prompt is the command `images__scene` (it starts `mock-image-mcp` and restarts `agent` on a copy of the folder with `AGENT_MCP_ALLOW_INSECURE=true`) |
 
 How the scripted models and mocks work, and how to change a script: [the local stack](../reference/dev-stack.md).
 Exit and assertion details are in each script's header; `PRELOAD_FROM_DOCKER=1` and `COMPOSE_CMD` are

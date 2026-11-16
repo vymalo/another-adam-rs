@@ -524,7 +524,7 @@ mod tests {
         assert!(
             spaced
                 .shared_line()
-                .ends_with("write ![description](<my chart (v2).svg>)."),
+                .contains("write ![description](<my chart (v2).svg>)."),
             "{}",
             spaced.shared_line()
         );

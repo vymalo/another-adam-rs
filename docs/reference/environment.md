@@ -31,6 +31,7 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLI
 | `MCP_ALLOW_STDIO` | let `mcp.json` start local processes | `false` |
 | `MCP_ALLOW_INSECURE` | allow plain `http` MCP servers on other machines; development only | `false` |
 | `MCP_ALLOW_URL_VARS` | allow `${VAR}` in a server `url` (the SDK logs URLs) | `false` |
+| `MCP_MAX_CALL_SECS` | the longest an agent's own files may ask of one MCP server with `timeoutSecs` or `connectTimeoutSecs` (1 to 86400); a larger value is lowered to it with a warning at startup ([`mcp.json`](agent-files.md#timeouts-instructions-and-prompts)) | `900` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | longest wait for a thread-tool call (1 to 86400) | `3600` |
 | `RUST_LOG` | log filter; JSON logs on stdout; replaces the default whole | `info,rmcp=warn` |
 
@@ -161,11 +162,12 @@ Put these in a `.env` next to `compose.yaml`.
 | Variable | Meaning | Default |
 |---|---|---|
 | `POSTGRES_PORT`, `MONGODB_PORT` | host ports of the databases | `5432`, `27017` |
-| `MOCK_OPENAI_PORT`, `MOCK_GITHUB_PORT`, `MOCK_GITHUB_MCP_PORT`, `GIT_SERVER_PORT` | host ports of the mocks | `8081`, `8082`, `8085`, `8083` |
+| `MOCK_OPENAI_PORT`, `MOCK_GITHUB_PORT`, `MOCK_GITHUB_MCP_PORT`, `MOCK_IMAGE_MCP_PORT`, `GIT_SERVER_PORT` | host ports of the mocks | `8081`, `8082`, `8085`, `8086`, `8083` |
 | `CODER_PORT`, `AGENT_PORT` | host ports of the coder and the general agent | `8080`, `8084` |
 | `ADAM_BUILD_REVISION` | build argument, not a runtime variable: the commit baked into both binaries, shown on the card as the version's `+<sha7>` and in `build/v1` ([ADR 0028](../decisions/0028-the-card-says-which-build-answers.md)). Unset says `unknown` | unset |
 | `CODER_IMAGE` | image of both agents; with `--no-build` runs a prebuilt one | `adam-rs/coder:dev` |
 | `CODER_MODEL`, `AGENT_MODEL` | the scripted models | `mock-coder`, `mock-assistant` |
+| `AGENT_MCP_ALLOW_INSECURE` | `MCP_ALLOW_INSECURE` of the `agent` service: plain `http` to another container, for a folder whose `mcp.json` names a mock (the painter); development only | `false` |
 | `CODER_AGENT_DIR`, `AGENT_FOLDER` | the agent folders mounted at `/etc/adam/agent` | `./bin/adam-coder/agent`, `./dev/agents/assistant/agent` |
 
 ## Tests
