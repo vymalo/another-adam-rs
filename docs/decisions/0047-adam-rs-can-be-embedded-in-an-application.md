@@ -2,7 +2,8 @@
 
 Status: **Accepted** (2026-11-16), an owner decision: the six decisions at the end are confirmed as written. Nothing is
 built; by the owner's order of the same day it is built after ADR 0044 and after
-[ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md). The owner's words (2026-11-15): *"I just want adam-rs to be the
+[ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md). *Amended 2026-11-16*: decision 9 and slice 10
+(adam-rs as an ACP agent). The owner's words (2026-11-15): *"I just want adam-rs to be the
 agent at the core of it. It'll use a sqlite on desktop. So we need to develop traits and features, so that we shall have
 it possible for adam-rs to be embedded e.g. into a flutter app via frb, knowing that the core state of the app would be
 managed by the rust part"*; *"It'll just be a library"*; *"We can use hexagonal port and adapter around adam-rs, so that
@@ -70,6 +71,10 @@ workspace as it is.
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
 9. **No ACP in this plan.** ADR 0038 stands: `adam-acp` stays a library that nothing here wires.
+   *Amended 2026-11-16* (the owner): adam-rs speaks ACP **as an agent**, as slice 10 below. `adam-acp` today is the
+   client half only (it drives an agent); the agent half is an adapter over `adam-engine` that speaks ACP on stdio, so an
+   editor that hosts ACP agents can be a front end for adam-rs. It is a separate process and links nothing of the editor.
+   The client half is still wired by nothing.
 
 ```mermaid
 sequenceDiagram
@@ -139,8 +144,9 @@ is still `Runnable`: at the next start the engine releases its own leases and th
 | 7 | The person's directory, and a local agent | the example edits a file with a scripted model; nothing is restored | 5, 6 |
 | 8 | The workspace and the tools on Windows and macOS | the same tests on hosted runners | 7 |
 | 9 | The local sandbox | a write outside the directory is refused | 7, ADR 0044 slice 16 |
+| 10 | adam-rs as an ACP agent (added 2026-11-16): an adapter over `adam-engine` on stdio | a scripted ACP client starts a session, prompts, answers a permission request and cancels | 4, 5 |
 
-Slices 1 to 8 need nothing of what is left of ADR 0044.
+Slices 1 to 8 and 10 need nothing of what is left of ADR 0044.
 
 ## Decisions the owner confirmed
 
@@ -154,11 +160,18 @@ Confirmed on 2026-11-16, all six as written.
 5. The first operating-system sandbox is macOS's, then Linux's; Windows last.
 6. The crate is named `adam-engine` (`adam-embed` is a skill's name).
 
+Added on 2026-11-16, after a check of whether an editor's own agent could be embedded instead: slice 10, adam-rs as an
+ACP agent.
+
 ## Verified and unverified
 
 * *Verified 2026-11-16*: the SQLite binding conflict and its two probes (Context); cratestack's embedded store is
   `rusqlite` 0.41.1 with bundled SQLite and offers the raw connection for hand-written transactions (its `README.md` and
   `Cargo.toml` at 0.20.1, `crates/cratestack-rusqlite/src/runtime.rs`).
+* *Verified 2026-11-16* (the `main` branch of `zed-industries/zed`): the `agent` crate of the Zed editor is
+  `GPL-3.0-or-later` (`crates/agent/Cargo.toml`), its workspace sets `publish = false` (`Cargo.toml`), and its docs describe
+  a custom agent as a separate process that speaks ACP (`docs/ai/external-agents`). So an editor is a front end for
+  adam-rs over ACP, and its agent is not a library to link.
 * *Unverified*: every claim about building on macOS and Windows; flutter_rust_bridge's behaviour with streams; whether a
   cratestack schema can say a partial unique index and a composite key; every operating-system sandbox; that a step that
   panics leaves the worker alive.
