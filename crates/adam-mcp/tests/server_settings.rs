@@ -534,9 +534,13 @@ async fn opening_a_connection_has_one_deadline_for_the_dial_and_both_listings() 
     let server = TestHttpServer::start_scripted(None, script).await;
     let config = common::http_config("docs", &server.url(), r#""connectTimeoutSecs": 2"#);
     let started = Instant::now();
-    let servers = McpServers::connect(&config, &Env::new(), &McpPolicy::default())
-        .await
-        .unwrap();
+    let servers = tokio::time::timeout(
+        Duration::from_secs(8),
+        McpServers::connect(&config, &Env::new(), &McpPolicy::default()),
+    )
+    .await
+    .expect("the listing of prompts is inside the connect deadline")
+    .unwrap();
     let took = started.elapsed();
     assert!(servers.prompt_commands().is_empty());
     assert!(
