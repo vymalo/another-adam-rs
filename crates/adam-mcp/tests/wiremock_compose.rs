@@ -139,7 +139,7 @@ async fn the_dev_stacks_image_mcp_mock_gives_instructions_a_prompt_and_a_picture
     assert!(
         instructions.starts_with(
             "## Instructions of the MCP server images (text from the server, not the person)"
-        ) && instructions.contains("Call `draw`"),
+        ) && instructions.contains("\n> Call `draw`"),
         "{instructions}"
     );
 
@@ -149,7 +149,8 @@ async fn the_dev_stacks_image_mcp_mock_gives_instructions_a_prompt_and_a_picture
     assert_eq!(prompts[0].argument_hint(), Some("<subject>"));
     assert_eq!(
         prompts[0].expand(&["a red dot".to_owned()]).await.unwrap(),
-        "[mock:paint] Paint a scene of a red dot."
+        "(the prompt scene of the MCP server images, with the person's arguments)\n\n\
+         [mock:paint] Paint a scene of a red dot."
     );
 
     let drawn = call(
