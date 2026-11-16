@@ -325,9 +325,13 @@ A message invokes one in either of two forms, and both give the same stored text
 * **Some commands are asked of an MCP server.** A prompt of an MCP server of the agent is a command named
   `<server>__<prompt>`, listed on the card like any other once the servers are connected
   ([`mcp.json`](agent-files.md#prompts-as-commands)); the text is asked of the server with `prompts/get` when the message
-  arrives and stored like a template's expansion. A prompt the server refuses, or that is not text of the user, is
-  `InvalidParams`; a server that cannot be asked is an `unavailable` error (nothing is written either way). A client sees no
-  difference in the card or in the message it sends.
+  arrives and stored like a template's expansion, behind one line that says which prompt of which server it is. What
+  the person types after the name is the prompt's arguments: the last one the prompt declares takes the rest of the
+  line. A prompt the server refuses, or that is not text of the user, is `InvalidParams`; a server that cannot be asked
+  is an `unavailable` error (nothing is written either way). The message a client sends is the same as for any command,
+  but the **card differs by process**: only a process that connects the MCP servers (`role: all`) lists their prompts. The front of `topology: split` is a control plane, connects none,
+  lists none, and refuses a message that names `/<server>__<prompt>` for a server of the folder's `mcp.json` with
+  `InvalidParams` (it is never sent to the model as plain text).
 * Commands change **no system prompt and no tool list**: the model sees the expanded text as the person's message.
 
 ```mermaid

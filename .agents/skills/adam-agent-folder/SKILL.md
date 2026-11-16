@@ -88,11 +88,12 @@ before you rely on a detail here.
      files stay on its own run. Without the key a file is described and dropped. Rules:
      `crates/adam-mcp/README.md` ("Files"), `docs/decisions/0033-files-from-mcp-results-are-shared-files.md`.
    * `"timeoutSecs"` and `"connectTimeoutSecs"` on a server (whole seconds from 1; 60 and 30 without them) are its
-     own call and connection timeouts; the deployment caps both with `MCP_MAX_CALL_SECS` (900), so a larger value is
-     lowered with a warning, and `0` or a negative number refuses the server. `"instructions": false` leaves out
+     own call and connection timeouts; the deployment caps the effective value, defaults included, with
+     `MCP_MAX_CALL_SECS` (900), so a larger one is lowered with a warning, and `0` or a negative number refuses
+     the server. `"instructions": false` leaves out
      the text a server returns when it initializes, which is otherwise appended to the agent's instructions once,
-     at startup, under a heading that says it comes from the server. `"prompts": false` stops a server's prompts
-     from becoming commands (`<server>__<prompt>`, on the card; a command of the folder with that name wins).
+     at startup, under a heading that says it comes from the server, as a quoted block. `"prompts": false` stops a server's prompts
+     from becoming commands (`<server>__<prompt>`, on the card; the last argument takes the rest of the line; a command of the folder with that name wins; the folder's commands and the prompts are at most 50 together; not in a split front).
      Rules: `docs/reference/agent-files.md` ("Timeouts, instructions and prompts").
    * **More servers without copying the folder**: `ADAM_EXTRA_MCP_FILE=/path/mcp.json`, a file in the same
      shape, is added to the folder's own `mcp.json` at startup by the roles that run workers (`adam-agent` and

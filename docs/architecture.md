@@ -100,6 +100,7 @@ flowchart TB
     service --> pg
     service --> pgn
     service -.-> mcp
+    service -.-> agentfs
     a2art --> a2a
     a2art --> rt
     ui --> a2art
@@ -326,6 +327,7 @@ sequenceDiagram
     H->>H: validate: parts not empty, role ROLE_USER
     H->>B: submit(caller, message, task_id, context_id)
     B->>B: default_inbound(message) gives an Inbound<br/>conversation = subject:context id
+    B->>B: a message that names a command is expanded here<br/>an MCP prompt asks its server with prompts/get<br/>refused as invalid params or unavailable, nothing stored
     B->>R: start(agent, inbound, conversation)
     R->>DB: open_run_for_conversation
     alt the conversation has an open run

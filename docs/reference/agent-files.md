@@ -802,24 +802,32 @@ Four optional keys of a server entry, in `mcp.json` and in the deployment's extr
 | Key | Meaning | Default |
 |---|---|---|
 | `timeoutSecs` | how long one tool call of this server is waited for | 60 |
-| `connectTimeoutSecs` | how long the server may take to start, initialize and list its tools | 30 |
+| `connectTimeoutSecs` | how long the server may take to start, initialize and list its tools and its prompts: one deadline for all of it | 30 |
 | `instructions` | `false` leaves out the text the server returns when it initializes | on |
 | `prompts` | `false` stops the server's prompts from becoming commands | on |
 
 * **Seconds.** A whole number, at least 1. Zero, a negative or a fractional number, or text refuses that server
   when the file is loaded (`path: error: ...`).
 * **The deployment caps both.** `MCP_MAX_CALL_SECS` (default 900, 1 to 86400,
-  [environment](environment.md)) is the longest an agent's files may ask: a larger `timeoutSecs` or
-  `connectTimeoutSecs` is lowered to it with one warning when the servers are connected. The files never decide
+  [environment](environment.md)) bounds the **effective** value, whoever asked for it: a `timeoutSecs` or
+  `connectTimeoutSecs` over it is lowered to it, and so is the default of a server that says nothing (with
+  `MCP_MAX_CALL_SECS=10`, no call of a server of these files waits more than 10 s, and no connection either). Each
+  lowering is one warning when the servers are connected. A value the file asks for is at least 1 s. The files never decide
   alone how long a call may take. A tool's limit in the loop follows its server's values (the call, the
   connection and ten seconds), so a long call is not cut by the agent first.
 * **Instructions.** What a server says when it initializes is appended to the agent's instructions **once, when the
   agent is bound**, never per turn: the prompt a model sees is the same on every call, so the cached prefix holds.
   Each server has a heading, `## Instructions of the MCP server <name> (text from the server, not the person)`, in
-  the order of the server names, after the agent's own text and before its skills. Each text is scrubbed of the
-  values `${VAR}` put into the file, stripped of control and format characters and cut at 2 KiB; all together are
-  cut at 8 KiB (a server that would pass the limit and the ones after it are left out, with a warning). A server
-  that is not connected contributes nothing. A server with a bearer per call (the coder's `github`) has no session
+  the order of the server names, after the agent's own text and before its skills. The server's text follows
+  **as a Markdown blockquote** (every line starts with `> `), so it cannot make a heading of its own. It is
+  stripped of control and format characters, **then** scrubbed of the values `${VAR}` put into the file (a secret
+  with a zero-width character inside it is still found), quoted and cut at 2 KiB, quote marks counted (a cut warns
+  once, naming the server and the sizes); all together are cut at 8 KiB (the server that would pass the limit and
+  the ones after it are left out, with a warning). A server that is not connected contributes nothing, so a
+  worker that started while an `optional` server was down, or whose server says another text after a restart, has
+  another system prompt than its siblings: nothing pins the prompt of a run (each model call takes it from the
+  worker's own agent, `crates/adam-llm-agent/src/agent.rs`), so a run that another worker resumes reads that
+  worker's, and only the prompt cache of the first call differs. A server with a bearer per call (the coder's `github`) has no session
   to ask and gives none; the coder's own `github` entry says `"instructions": false` anyway.
 * **Prompts as commands.** [Below](#prompts-as-commands).
 * The keys are left out of the manifest when they are not used, so a folder that does not use them keeps its digest.
@@ -828,19 +836,21 @@ Four optional keys of a server entry, in `mcp.json` and in the deployment's extr
 
 A server that serves prompts (`prompts/list`) has each as a [command](#commands-commandsnamemd) of the root agent
 named `<server>__<prompt>` (lower-case letters, digits, `_` and `-`, at most 64: a prompt whose name does not fit is
-left out with a warning). They are listed once when the server is connected and are on the card
-([`commands/v1`](a2a-server.md#commands-commandsv1)); `argumentHint` is made from the arguments the prompt declares
-(`<topic> [style]`: required ones in angle brackets).
+left out with a warning; so is every prompt of a server whose own name has an upper-case letter, because command
+names are lower-case: such a server serves its tools and no prompts). They are listed once when the server is
+connected and are on the card ([`commands/v1`](a2a-server.md#commands-commandsv1)); `argumentHint` is made from the
+arguments the prompt declares (`<topic> [style]`: required ones in angle brackets).
 
 | | |
 |---|---|
-| Expansion | when the message arrives, with `prompts/get`: the person's arguments are split like `$1` to `$9` (double quotes respected) and given to the prompt's declared arguments **in order** |
-| Refused (`invalid params`) | a required argument that is missing, more arguments than the prompt declares, a server that refuses the prompt, and any answer that is not text messages of the user (an assistant message, an image, a resource) |
-| Unavailable | the server cannot be asked (connection lost, no answer within `timeoutSecs`): the message is refused with the A2A `unavailable` error and nothing is stored |
+| Expansion | when the message arrives, with `prompts/get`: the first words of the person's text (double quotes respected) are the prompt's declared arguments **in order, and the last declared argument takes the rest of the line** (`/images__scene a red dot` gives the one argument `subject` the text `a red dot`; one pair of quotes around the whole rest is dropped) |
+| What the model reads | one line, `(the prompt <prompt> of the MCP server <server>, with the person's arguments)`, a blank line, then the server's text: stripped of control and format characters (bidirectional ones included), then scrubbed, so a server's text is never taken for the person's own words; the command's name stays in the stored message |
+| Refused (`invalid params`) | a required argument that is missing, any text for a prompt that declares no argument, a server that refuses the prompt, and any answer that is not text messages of the user (an assistant message, an image, a resource) |
+| Unavailable | the server cannot be asked (connection lost, no answer): the message is refused with the A2A `unavailable` error and nothing is stored. The whole expansion, a redial of a lost connection included, is given the smaller of `timeoutSecs` and 30 s |
 | Stored | the text is stored as the message, like a template's expansion: stepping the run, a restart and a replay never ask the server again (a retry of the same `messageId` may ask once more, and the answer is dropped) |
-| Limits | those of a template's expansion (arguments at most 4 KiB, text at most 32 KiB and not empty); at most 50 commands, the folder's first |
+| Limits | those of a template's expansion (arguments at most 4 KiB, text at most 32 KiB and not empty); the folder's commands and the prompts **together** are at most 50: the folder's first, then the prompts by server name and prompt name; what does not fit is left out, with one warning that gives how many |
 | A name clash | a command of the folder with the name of a prompt wins; the prompt is left out of the backend and of the card, with one warning |
-| Only a process with workers | the prompts are known once the servers are connected, which only a role that runs workers does: a control plane without workers lists none |
+| Only a process with workers | the prompts are known once the servers are connected, which only a role that runs workers does. A control plane (the front of `topology: split`) lists none, and **refuses** a message that names `/<server>__<anything>` for a server of the folder's `mcp.json` that serves prompts (`invalid params`, with words that say so; one warning at its start names the servers). It never reaches the model as text. The front does not read `ADAM_EXTRA_MCP_FILE`, so a prompt of a server only that file names is not refused there |
 | Opt out | `"prompts": false` on the server |
 
 ### Files from a server (`files: true`)

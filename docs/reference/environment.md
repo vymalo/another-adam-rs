@@ -31,7 +31,7 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLI
 | `MCP_ALLOW_STDIO` | let `mcp.json` start local processes | `false` |
 | `MCP_ALLOW_INSECURE` | allow plain `http` MCP servers on other machines; development only | `false` |
 | `MCP_ALLOW_URL_VARS` | allow `${VAR}` in a server `url` (the SDK logs URLs) | `false` |
-| `MCP_MAX_CALL_SECS` | the longest an agent's own files may ask of one MCP server with `timeoutSecs` or `connectTimeoutSecs` (1 to 86400); a larger value is lowered to it with a warning at startup ([`mcp.json`](agent-files.md#timeouts-instructions-and-prompts)) | `900` |
+| `MCP_MAX_CALL_SECS` | the longest one MCP server is waited for, a call and a connection each: what `timeoutSecs` and `connectTimeoutSecs` ask for and the defaults (60 s and 30 s) are lowered to it, and a value the file asks for is at least 1 s (1 to 86400); a larger value is lowered to it with a warning at startup ([`mcp.json`](agent-files.md#timeouts-instructions-and-prompts)) | `900` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | longest wait for a thread-tool call (1 to 86400) | `3600` |
 | `RUST_LOG` | log filter; JSON logs on stdout; replaces the default whole | `info,rmcp=warn` |
 

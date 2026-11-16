@@ -196,6 +196,12 @@ With `split`:
   `front.replicas` is above 1. `front.resources` and `front.terminationGracePeriodSeconds`
   size the front; `resources`, `persistence` and `terminationGracePeriodSeconds` are the
   worker's.
+* **No MCP prompts as commands.** The front connects no MCP server, so its card lists no prompt of one
+  (`commands/v1`) and a message that names `/<server>__<prompt>` for a server of the agent's `mcp.json`
+  is refused there with `InvalidParams` (one warning at the front's start names the servers); it is never
+  sent to the model as text. The front does not read `ADAM_EXTRA_MCP_FILE` (the chart's web-search and
+  Context7 servers), so those servers' prompts are not refused there either. Use `topology: combined` for
+  an agent whose people use MCP prompts.
 
 Migrating a running release: `helm upgrade <release> deploy/coder --set topology=split`. The
 StatefulSet rolls to `ROLE=worker` (its pod restarts, reusing the PVC, and a step cut short is

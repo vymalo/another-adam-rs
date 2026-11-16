@@ -84,7 +84,10 @@ Rules worth knowing:
   down; `"files": true` hands the images and documents its tools return (a browser's screenshot and PDF) to the
   person as files of the run, the model reading one line each. Which kinds of server are allowed is the
   **deployment's** decision (`MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS`), not the file's.
-  `ADAM_EXTRA_MCP_FILE` adds servers without copying the folder.
+  `ADAM_EXTRA_MCP_FILE` adds servers without copying the folder. A server entry can also set `timeoutSecs` and
+  `connectTimeoutSecs` (capped by the deployment), `"instructions": false` (what the server says about itself is
+  otherwise added to the agent's instructions, quoted) and `"prompts": false` (its prompts are otherwise commands
+  `/<server>__<prompt>`); see [the reference](../reference/agent-files.md#timeouts-instructions-and-prompts).
 * **Commands** are templates for the messages people send often. `commands/review.md` with a `description`,
   an optional `argument-hint` and a body that uses `$ARGUMENTS` or `$1` to `$9` is listed on the card, and a
   client (or a person typing `/review acme/app`) invokes it; the agent expands it before the run starts. A
