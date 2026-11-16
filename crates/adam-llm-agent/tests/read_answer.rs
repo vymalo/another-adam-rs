@@ -13,7 +13,7 @@ use adam_llm_agent::{
     ToolOutput, user_message,
 };
 use adam_model::{DynModel, Message, MockModel, ToolCall, ToolSpec};
-use adam_runtime::{CollectingSink, RunEvent, RunView, Runtime};
+use adam_runtime::{CollectingSink, Inbound, RunEvent, RunView, Runtime};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -50,8 +50,27 @@ impl Tool for Pick {
         ui: Option<&Value>,
         payload: &Value,
     ) -> AnswerCheck {
-        if payload["text"] == "ok" {
-            return AnswerCheck::Accept;
+        match payload["text"].as_str() {
+            Some("ok") => return AnswerCheck::Accept,
+            Some("read") => return AnswerCheck::Read("read as a value".into()),
+            Some("end") => {
+                return AnswerCheck::End(
+                    Refusal::new(
+                        "no more questions",
+                        Some(json!([{"ignored": true}])),
+                        "gave_up",
+                    )
+                    .about("q1"),
+                );
+            }
+            Some("whole") => {
+                return AnswerCheck::Refuse(Refusal::new(
+                    "the whole answer",
+                    Some(json!([{"form": "again", "attempt": 1}])),
+                    "unknown",
+                ));
+            }
+            _ => {}
         }
         let attempt = ui.map_or(0, |ui| ui[0]["attempt"].as_u64().unwrap_or(0)) + 1;
         AnswerCheck::Refuse(
@@ -81,21 +100,54 @@ struct Rig {
     run: RunId,
 }
 
-async fn started() -> Rig {
-    let store: DynStore = Arc::new(MemoryStore::new());
-    let mock = Arc::new(MockModel::new());
+/// A runtime over `store` whose one agent has `pick` and answers with `mock`, with `sink` as its
+/// events.
+fn runtime_on(store: &DynStore, mock: &Arc<MockModel>, sink: &CollectingSink) -> Runtime {
     let model: DynModel = mock.clone();
     let agent = LlmAgent::builder("llm", model, "test-model")
         .tool(Pick)
         .build();
-    mock.push_tool_calls(vec![call("c1", "pick", json!({"note": "n"}))])
-        .push_text("thanks");
-    let sink = CollectingSink::new();
-    let rt = Runtime::builder(store)
+    Runtime::builder(store.clone())
         .agent(agent)
         .event_sink(sink.clone())
         .poll_interval(Duration::from_millis(20))
-        .build();
+        .build()
+}
+
+fn message(id: &str, text: &str) -> Inbound {
+    Inbound::new("message", json!({ "text": text })).with_id(id)
+}
+
+fn spawn_worker(rt: &Runtime) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (stop, rx) = oneshot::channel::<()>();
+    let rt = rt.clone();
+    let handle = tokio::spawn(async move {
+        rt.run_worker(async {
+            let _ = rx.await;
+        })
+        .await
+        .unwrap();
+    });
+    (stop, handle)
+}
+
+fn refusals(sink: &CollectingSink, run: RunId) -> Vec<Value> {
+    sink.events_for(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Custom { kind, payload } if kind == "answer_refused" => Some(payload),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn started() -> Rig {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call("c1", "pick", json!({"note": "n"}))])
+        .push_text("thanks");
+    let sink = CollectingSink::new();
+    let rt = runtime_on(&store, &mock, &sink);
     let run = rt
         .start("llm", user_message("go"), None)
         .await
@@ -235,4 +287,153 @@ fn a_tool_that_does_not_read_answers_accepts_every_one() {
         Plain.read_answer("c", &json!({}), None, &json!({"text": "anything"})),
         AnswerCheck::Accept
     );
+}
+
+#[tokio::test]
+async fn a_refusal_of_the_whole_answer_is_journaled_with_a_star_for_its_question() {
+    let rig = started().await;
+    let (stop, worker) = spawn_worker(&rig.rt);
+    until(&rig.rt, rig.run, "parked", |v| v.waiting).await;
+    rig.rt
+        .deliver(rig.run, user_message("whole"))
+        .await
+        .unwrap();
+    until(&rig.rt, rig.run, "asked again", asking_again(1)).await;
+    let _ = stop.send(());
+    worker.await.unwrap();
+    assert_eq!(
+        refusals(&rig.sink, rig.run),
+        [json!({"call_id": "c1", "question": "*", "rule": "unknown"})]
+    );
+}
+
+#[tokio::test]
+async fn a_tool_may_end_the_question_and_the_model_reads_an_error_and_goes_on() {
+    let rig = started().await;
+    let (stop, worker) = spawn_worker(&rig.rt);
+    until(&rig.rt, rig.run, "parked", |v| v.waiting).await;
+    rig.rt.deliver(rig.run, user_message("end")).await.unwrap();
+    let done = until(&rig.rt, rig.run, "done", |v| v.status == RunStatus::Done).await;
+    let _ = stop.send(());
+    worker.await.unwrap();
+    let state = conversation(&done);
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .find(|m| matches!(m, Message::Tool { .. })),
+        Some(&Message::tool_error("c1", "no more questions"))
+    );
+    assert!(state.pending_wait.is_none() && state.pending_calls.is_empty());
+    assert_eq!(rig.mock.requests().len(), 2, "the model answered once more");
+    assert_eq!(
+        refusals(&rig.sink, rig.run),
+        [json!({"call_id": "c1", "question": "q1", "rule": "gave_up"})]
+    );
+    assert_eq!(done.output.expect("output")["text"], "thanks");
+}
+
+#[tokio::test]
+async fn a_tool_may_say_what_the_answer_reads_as() {
+    let rig = started().await;
+    let (stop, worker) = spawn_worker(&rig.rt);
+    until(&rig.rt, rig.run, "parked", |v| v.waiting).await;
+    rig.rt.deliver(rig.run, user_message("read")).await.unwrap();
+    let done = until(&rig.rt, rig.run, "done", |v| v.status == RunStatus::Done).await;
+    let _ = stop.send(());
+    worker.await.unwrap();
+    assert!(
+        conversation(&done)
+            .messages
+            .contains(&Message::tool_result("c1", "read as a value"))
+    );
+    assert!(refusals(&rig.sink, rig.run).is_empty());
+}
+
+#[tokio::test]
+async fn messages_that_arrive_together_are_read_in_turn_and_a_copy_of_one_is_read_once() {
+    let rig = started().await;
+    let (stop, worker) = spawn_worker(&rig.rt);
+    until(&rig.rt, rig.run, "parked", |v| v.waiting).await;
+    let _ = stop.send(());
+    worker.await.unwrap();
+    // Four messages sit in the inbox of a run nobody is stepping: a refused one and a copy of it,
+    // the one that fits, and what comes after the question is answered.
+    for inbound in [
+        message("m-1", "nope"),
+        message("m-1", "nope"),
+        message("m-2", "ok"),
+        message("m-3", "and one more thing"),
+    ] {
+        rig.rt.deliver(rig.run, inbound).await.unwrap();
+    }
+    let (stop, worker) = spawn_worker(&rig.rt);
+    let done = until(&rig.rt, rig.run, "done", |v| v.status == RunStatus::Done).await;
+    let _ = stop.send(());
+    worker.await.unwrap();
+    let state = conversation(&done);
+    assert_eq!(
+        refusals(&rig.sink, rig.run),
+        [json!({"call_id": "c1", "question": "q1", "rule": "not_ok"})],
+        "refused once, though it came twice"
+    );
+    assert_eq!(state.read_ids, ["m-1", "m-2", "m-3"]);
+    assert!(state.messages.contains(&Message::tool_result("c1", "ok")));
+    // Nothing is judged once the question is answered: the next message is a message.
+    assert!(
+        state
+            .messages
+            .contains(&Message::user_text("and one more thing")),
+        "{:?}",
+        state.messages
+    );
+    assert!(
+        !state.messages.iter().any(|m| m.text().contains("nope")),
+        "a refused answer reached the history"
+    );
+    assert_eq!(rig.mock.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn a_run_that_is_loaded_again_refuses_from_the_question_it_stored() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call("c1", "pick", json!({"note": "n"}))])
+        .push_text("thanks");
+    let sink = CollectingSink::new();
+    let first = runtime_on(&store, &mock, &sink);
+    let run = first
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let (stop, worker) = spawn_worker(&first);
+    until(&first, run, "parked", |v| v.waiting).await;
+    first.deliver(run, message("m-1", "nope")).await.unwrap();
+    until(&first, run, "asked again", asking_again(1)).await;
+    let _ = stop.send(());
+    worker.await.unwrap();
+    drop(first);
+
+    // A new process: the runtime and the agent are new, the question is read from the store.
+    let second = runtime_on(&store, &mock, &sink);
+    let (stop, worker) = spawn_worker(&second);
+    second
+        .deliver(run, message("m-2", "still not"))
+        .await
+        .unwrap();
+    let view = until(&second, run, "asked a second time", asking_again(2)).await;
+    // The same message again, after the restart, is read as it was: once.
+    second
+        .deliver(run, message("m-2", "still not"))
+        .await
+        .unwrap();
+    second.deliver(run, message("m-3", "ok")).await.unwrap();
+    until(&second, run, "done", |v| v.status == RunStatus::Done).await;
+    let _ = stop.send(());
+    worker.await.unwrap();
+    let Some(PendingWait::Question(q)) = conversation(&view).pending_wait else {
+        panic!("not parked on a question")
+    };
+    assert_eq!(q.question, "\"still not\" was refused (\"n\"). which?");
+    assert_eq!(refusals(&sink, run).len(), 2, "{:?}", refusals(&sink, run));
 }

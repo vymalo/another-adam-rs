@@ -866,15 +866,16 @@ impl LlmAgent {
         self.tool(name).is_some_and(|t| t.paged())
     }
 
-    /// Move inbound messages into the state; the first one answers a pending
-    /// question. Returns `false` when the run must keep waiting for that answer.
+    /// Move inbound messages into the state; the first one answers a pending question.
+    /// [`Absorbed::waiting`] is `true` when the run must keep waiting for that answer.
     ///
     /// A wait on a child run is not touched here: user messages queue behind
     /// the owed tool result like any other.
     ///
     /// The answer is read by the tool that asked ([`Tool::read_answer`]) before the model sees it. A
     /// refused one is not used: the run stays parked on the question the tool made in its place, and
-    /// the refusal is returned for the caller to journal.
+    /// the refusal is returned for the caller to journal. A tool may also end the question: the call
+    /// then gets an error result.
     fn absorb_inbox(&self, state: &mut Conversation, inbox: Vec<Inbound>) -> Absorbed {
         let mut texts = Vec::new();
         for inbound in inbox {
@@ -916,8 +917,16 @@ impl LlmAgent {
                 };
             };
             let (call_id, tool, ui) = (q.call_id.clone(), q.tool.clone(), q.ui.clone());
+            let given = |state: &mut Conversation, result: Message| {
+                state.pending_wait = None;
+                if state.pending_calls.first().is_some_and(|c| c.id == call_id) {
+                    state.pending_calls.remove(0);
+                }
+                state.messages.push(result);
+            };
             match self.read_answer(state, &tool, &call_id, ui.as_ref(), &payload) {
                 AnswerCheck::Refuse(refusal) => {
+                    // The new question is other words than the model's, so it has no stream.
                     state.pending_wait = Some(PendingWait::Question(PendingQuestion {
                         call_id: call_id.clone(),
                         tool,
@@ -927,13 +936,17 @@ impl LlmAgent {
                     }));
                     refusals.push((call_id, refusal));
                 }
-                _ => {
-                    state.pending_wait = None;
-                    if state.pending_calls.first().is_some_and(|c| c.id == call_id) {
-                        state.pending_calls.remove(0);
-                    }
-                    state.messages.push(Message::tool_result(call_id, answer));
+                AnswerCheck::End(refusal) => {
+                    given(
+                        state,
+                        Message::tool_error(call_id.clone(), refusal.question.clone()),
+                    );
+                    refusals.push((call_id, refusal));
                 }
+                AnswerCheck::Read(said) => {
+                    given(state, Message::tool_result(call_id.clone(), said))
+                }
+                AnswerCheck::Accept => given(state, Message::tool_result(call_id.clone(), answer)),
             }
         }
         for (text, _) in texts {
@@ -3309,9 +3322,6 @@ impl Agent for LlmAgent {
                 }),
             })
             .await;
-        }
-        if !absorbed.refusals.is_empty() {
-            ctx.read_already(&state.read_ids);
         }
         if absorbed.waiting {
             // Woken without an answer (nothing usable arrived), or the answer was refused and the

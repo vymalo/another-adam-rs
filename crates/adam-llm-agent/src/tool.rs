@@ -127,9 +127,11 @@ pub trait Tool: Send + Sync + 'static {
     /// (`adam_a2a_runtime::PAYLOAD_FORM`). Words alone, and a question that went out as text, carry
     /// no `form`.
     ///
-    /// [`AnswerCheck::Accept`], the default, hands the answer over as it came. [`AnswerCheck::Refuse`]
-    /// keeps the run parked on a new question (the refusal's words and interface) and gives the
-    /// model nothing: it never sees the refused answer, and no result is recorded for the call.
+    /// [`AnswerCheck::Accept`], the default, hands the answer over as it came. [`AnswerCheck::Read`]
+    /// hands over the words the tool read it as. [`AnswerCheck::Refuse`] keeps the run parked on a
+    /// new question (the refusal's words and interface) and gives the model nothing: it never sees
+    /// the refused answer, and no result is recorded for the call. [`AnswerCheck::End`] stops
+    /// asking: the call ends with an error result and the model carries on.
     /// The check is a pure function of its arguments, so a replay refuses what it refused.
     /// A tool that wraps another (see [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it.
     fn read_answer(
@@ -172,8 +174,51 @@ pub trait Tool: Send + Sync + 'static {
 pub enum AnswerCheck {
     /// Hand the answer to the model as the result of the call.
     Accept,
+    /// Hand the model these words as the result of the call, in place of the answer's own: what the
+    /// tool read the answer as.
+    Read(String),
     /// The answer is not used: ask again.
     Refuse(Refusal),
+    /// The answer is not used and the question is not asked again: the call ends with
+    /// `Refusal::question` as its error result, which the model reads, and the run carries on.
+    /// `Refusal::ui` is not used. The refusal is journaled like any other.
+    End(Refusal),
+}
+
+impl AnswerCheck {
+    /// The same check with every text the person or the model will read passed through `text`, and
+    /// every interface through `ui`: for a wrapper that hides secrets (a [`Refusal`] is made from the
+    /// call's own arguments, which a scrub has not seen).
+    #[must_use]
+    pub fn scrubbed(
+        self,
+        mut text: impl FnMut(String) -> String,
+        mut ui: impl FnMut(&mut Value),
+    ) -> Self {
+        let mut scrub_refusal = |refusal: Refusal, text: &mut dyn FnMut(String) -> String| {
+            let Refusal {
+                question,
+                ui: mut interface,
+                rule,
+                subject,
+            } = refusal;
+            if let Some(interface) = &mut interface {
+                ui(interface);
+            }
+            Refusal {
+                question: text(question),
+                ui: interface,
+                rule,
+                subject,
+            }
+        };
+        match self {
+            Self::Accept => Self::Accept,
+            Self::Read(said) => Self::Read(text(said)),
+            Self::Refuse(refusal) => Self::Refuse(scrub_refusal(refusal, &mut text)),
+            Self::End(refusal) => Self::End(scrub_refusal(refusal, &mut text)),
+        }
+    }
 }
 
 /// Why an answer is not used, and the question that takes its place: see [`AnswerCheck::Refuse`].
