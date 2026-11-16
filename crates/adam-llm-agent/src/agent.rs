@@ -1329,7 +1329,7 @@ impl LlmAgent {
     /// Where a compaction of `state` would cut, if it could: fewer than two turns to drop, or
     /// [`MAX_COMPACTIONS`] already made, is none (the history is shortened instead).
     fn cut_for(&self, state: &Conversation, reason: CompactionReason) -> Option<compaction::Cut> {
-        if state.compactions.len() >= MAX_COMPACTIONS {
+        if state.compactions.iter().filter(|c| !c.carried).count() >= MAX_COMPACTIONS {
             return None;
         }
         let estimate = self.estimated_tokens(state);
@@ -1349,7 +1349,7 @@ impl LlmAgent {
         state
             .compactions
             .last()
-            .is_none_or(|c| c.turn != state.turns)
+            .is_none_or(|c| c.carried || c.turn != state.turns)
             && state
                 .compact_failed
                 .is_none_or(|at| state.turns >= at.saturating_add(RETRY_AFTER_TURNS))
@@ -3663,6 +3663,14 @@ mod compaction_gate_tests {
             skills: vec![],
             pointers: vec![],
             pinned: vec![],
+            carried: false,
+        }
+    }
+
+    fn carried(turn: u32) -> Compaction {
+        Compaction {
+            carried: true,
+            ..made(turn)
         }
     }
 
@@ -3684,6 +3692,9 @@ mod compaction_gate_tests {
         state.compactions = vec![made(state.turns)];
         assert!(!agent.compaction_due(&state));
         state.compactions = vec![made(state.turns - 1)];
+        assert!(agent.compaction_due(&state));
+        // What an earlier run compacted at a turn of that number says nothing about this one.
+        state.compactions = vec![carried(state.turns)];
         assert!(agent.compaction_due(&state));
     }
 
@@ -3707,6 +3718,14 @@ mod compaction_gate_tests {
         assert!(agent.cut_for(&state, CompactionReason::Budget).is_some());
         assert!(agent.cut_for(&state, CompactionReason::Overflow).is_some());
         state.compactions = vec![made(0); MAX_COMPACTIONS];
+        assert!(agent.cut_for(&state, CompactionReason::Budget).is_none());
+        assert!(agent.cut_for(&state, CompactionReason::Overflow).is_none());
+        // The record a continued run carries is not one of its own eight.
+        state.compactions = vec![made(0); MAX_COMPACTIONS - 1];
+        state.compactions.insert(0, carried(0));
+        assert!(agent.cut_for(&state, CompactionReason::Budget).is_some());
+        assert!(agent.cut_for(&state, CompactionReason::Overflow).is_some());
+        state.compactions.push(made(0));
         assert!(agent.cut_for(&state, CompactionReason::Budget).is_none());
         assert!(agent.cut_for(&state, CompactionReason::Overflow).is_none());
     }

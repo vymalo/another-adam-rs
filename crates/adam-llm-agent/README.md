@@ -44,7 +44,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
-| `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8) |
+| `COMPACTION_TURN`, `Compaction`, `CompactionReason`, `PromptSize`, `MAX_COMPACTIONS` | compaction (below): the instruction a summary request ends with, one recorded compaction (`turn`, `dropped_turns`, `reason`, `sessions`, and the facts the marker lists), why it was made (`Budget` or `Overflow`), the last call's reported prompt size, and the most compactions a run makes (8, not counting the one record a continued run carries) |
 | `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
 | `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
@@ -880,10 +880,12 @@ is in [the architecture](../../docs/architecture.md#compaction-a-long-history-is
   kept output of a dropped call (built from the call's own output id), the names of the skills loaded earlier,
   a line that sessions exist. Copied text has each line that starts with `[` written `\x5b`.
 * **Carried.** `Conversation::summary` is the marker's body: a run that continues this one carries it into the
-  marker of its own first message (`Conversation::continued`), and with it `compactions` and `pinned_calls`,
-  so a compaction of the new run writes the same code-made lines again (pinned results, pointers, skills, the
-  sessions line) and the limit of eight counts the conversation: after the eighth the history is only
-  shortened. A carried `Compaction::turn` is the turn of the run that made it.
+  marker of its own first message (`Conversation::continued`), and with it `pinned_calls` and the
+  `compactions` folded into one record (`Compaction::carried`, bounded as the marker is), so a compaction of
+  the new run writes the same code-made lines again (pinned results, pointers, skills, the sessions line).
+  The limit of eight is each run's own, and the carried record is not one of them: a conversation is
+  compacted for as long as it lasts. The carried record's `turn` is a turn of the run that made it and
+  holds back no compaction of the new run.
 * **Trust.** The summary and the pinned results sit in message 0, a user-role message, for the rest of the
   run. A pinned result is text a tool returned (the project instructions of a repository among it), so from
   the first compaction on it has the standing of a user message with the provider; before, it was a tool

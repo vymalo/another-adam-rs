@@ -833,7 +833,9 @@ async fn a_run_that_continues_another_and_compacts_again_keeps_what_code_wrote()
             .await
             .expect("continue")
     );
-    for n in 0..4 {
+    // Three results fill it again: the compaction is due at this run's fourth request, a turn of
+    // the number the first run compacted at, which says nothing about this run.
+    for n in 0..3 {
         rig.mock.push_tool_calls(vec![big(&format!("d{n}"), 3500)]);
     }
     rig.mock
@@ -847,6 +849,12 @@ async fn a_run_that_continues_another_and_compacts_again_keeps_what_code_wrote()
         "one summary for each of the two runs"
     );
     assert_eq!(state.compactions.len(), 2, "{:?}", state.compactions);
+    assert_eq!(
+        (state.compactions[0].carried, state.compactions[1].carried),
+        (true, false),
+        "what the first run compacted is carried as one record, and this run made its own"
+    );
+    assert_eq!(state.compactions[0].turn, state.compactions[1].turn);
     assert_eq!(first_part(&state.messages[0]), "go");
     let marker = state.messages[0].text();
     assert!(marker.contains("SUMMARY B"), "{marker}");

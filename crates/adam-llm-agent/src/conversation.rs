@@ -530,8 +530,10 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// The compactions of this run, oldest first (at most [`MAX_COMPACTIONS`](crate::MAX_COMPACTIONS)): the requests that
-    /// start a new prefix, beside [`shortenings`](Self::shortenings). Absent from state written
-    /// before it existed, and not written while empty.
+    /// start a new prefix, beside [`shortenings`](Self::shortenings). A run that continues another
+    /// has one more in front, [`carried`](crate::Compaction::carried): what the runs before it
+    /// compacted, folded into one. Absent from state written before it existed, and not written
+    /// while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compactions: Vec<Compaction>,
     /// The turn whose prompt the provider rejected as too long, once: a second rejection of the same
@@ -966,10 +968,11 @@ impl Conversation {
     ///   produced).
     /// * **Recorded:** `continued_from`, and in `omitted_turns` how many turns have been left
     ///   out, in this and earlier continuations.
-    /// * **Carried with the summary:** [`compactions`](Self::compactions) and
-    ///   [`pinned_calls`](Self::pinned_calls), so a compaction of the new run writes the same
-    ///   code-made lines again and [`MAX_COMPACTIONS`](crate::MAX_COMPACTIONS) counts the
-    ///   conversation.
+    /// * **Carried with the summary:** [`pinned_calls`](Self::pinned_calls), and the
+    ///   [`compactions`](Self::compactions) folded into one record
+    ///   ([`carried`](crate::Compaction::carried)), so a compaction of the new run writes the same
+    ///   code-made lines again. [`MAX_COMPACTIONS`](crate::MAX_COMPACTIONS) counts each run's own:
+    ///   a long conversation is compacted for as long as it lasts.
     /// * **Bounded:** by [`MAX_CARRIED_BYTES`]: the tool outputs of the turns older than the newest
     ///   are shortened first, whole old turns are dropped after that, and the newest turn's
     ///   outputs are shortened last; the first user message is never dropped, and the marker that
@@ -1018,9 +1021,11 @@ impl Conversation {
             plan: self.plan.clone(),
             session: self.session.clone(),
             // What code wrote into the marker (pinned results, pointers, skills, the sessions line)
-            // and how many compactions the conversation has made come along, so that a compaction
-            // of this run writes them again and `MAX_COMPACTIONS` bounds the conversation.
-            compactions: self.compactions.clone(),
+            // comes along as one record, so that a compaction of this run writes it again. The
+            // record does not count against this run's `MAX_COMPACTIONS`.
+            compactions: crate::compaction::carried(&self.compactions)
+                .into_iter()
+                .collect(),
             pinned_calls: self.pinned_calls.clone(),
             ..Self::default()
         }
@@ -1809,25 +1814,43 @@ mod tests {
     }
 
     #[test]
-    fn a_continued_run_carries_the_compactions_and_the_pinned_calls() {
+    fn a_continued_run_carries_the_compactions_as_one_record_and_the_pinned_calls() {
         use crate::compaction::{Compaction, CompactionReason};
-        let made = Compaction {
-            turn: 4,
+        let made = |turn, skill: &str, sessions| Compaction {
+            turn,
             dropped_turns: 3,
             reason: CompactionReason::Budget,
             summarised: true,
-            sessions: true,
-            rejected: None,
-            skills: vec!["rust".into()],
+            sessions,
+            rejected: Some("too long".into()),
+            skills: vec![skill.into()],
             pointers: vec!["o-0123456789abcdef".into()],
-            pinned: vec!["slot: 7".into()],
+            pinned: vec![format!("slot: {turn}")],
+            carried: false,
         };
         let mut prior = compacted("Summary (written by you):\nthe parser is fixed");
-        prior.compactions = vec![made.clone(); 2];
+        prior.compactions = vec![made(4, "rust", true), made(9, "docker", false)];
         prior.pinned_calls = vec!["p1".into()];
         let next = prior.continued("go on", RunId::new());
-        assert_eq!(next.compactions, vec![made; 2]);
+        assert_eq!(
+            next.compactions,
+            vec![Compaction {
+                turn: 9,
+                dropped_turns: 6,
+                reason: CompactionReason::Budget,
+                summarised: true,
+                sessions: true,
+                rejected: None,
+                skills: vec!["rust".into(), "docker".into()],
+                pointers: vec!["o-0123456789abcdef".into()],
+                pinned: vec!["slot: 4".into(), "slot: 9".into()],
+                carried: true,
+            }]
+        );
         assert_eq!(next.pinned_calls, vec!["p1".to_owned()]);
+        // A third run carries one record still, not one more for each run before it.
+        let third = next.continued("and on", RunId::new());
+        assert_eq!(third.compactions, next.compactions);
         // A conversation that never compacted carries none.
         assert!(
             Conversation::new("x")
