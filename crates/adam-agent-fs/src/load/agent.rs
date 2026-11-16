@@ -7,8 +7,8 @@ use crate::diagnostic::Sink;
 use crate::frontmatter::{Split, clean_body, key_line};
 use crate::manifest::RemoteAuth;
 use crate::schema::{
-    AgentFrontmatter, MAX_MINUTES_LIMIT, ModelRef, ToolList, is_agent_name, is_env_name,
-    is_tool_name,
+    AgentFrontmatter, MAX_MINUTES_LIMIT, ModelRef, ToolList, check_references, is_agent_name,
+    is_env_name, is_tool_name,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -114,11 +114,19 @@ pub(crate) fn parse_agent_file(
                 "`a2a` and `auth` make a remote subagent; they cannot be used on an agent",
             );
         }
-    } else if fm.card.is_some() {
-        sink.warn(
-            key_line(&split, "card"),
-            "`card` is for the root agent; it is ignored on a subagent",
-        );
+    } else {
+        if fm.card.is_some() {
+            sink.warn(
+                key_line(&split, "card"),
+                "`card` is for the root agent; it is ignored on a subagent",
+            );
+        }
+        if !fm.references.is_empty() {
+            sink.warn(
+                key_line(&split, "references"),
+                "`references` is for the root agent; it is ignored on a subagent",
+            );
+        }
     }
 
     if fm.files.is_some() && fm.a2a.is_none() {
@@ -373,6 +381,9 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
                 "`limits.max_minutes` is at most {MAX_MINUTES_LIMIT} (24 hours), and `0` means no limit; it is {minutes}"
             ),
         );
+    }
+    if let Err(why) = check_references(&fm.references) {
+        sink.error(key_line(split, "references"), format!("`references`: {why}"));
     }
     for key in fm.vars.keys() {
         if !is_env_name(key) {

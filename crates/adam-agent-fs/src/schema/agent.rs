@@ -12,6 +12,7 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
+use super::reference::ReferenceDef;
 use super::scalar::{StringOrSeq, lenient_map, scalar_map};
 
 /// Which tools an agent gets.
@@ -249,6 +250,11 @@ pub struct AgentFrontmatter {
     /// The A2A card (root agent only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card: Option<Card>,
+    /// Repositories the agent may read beside the one it works on, and never write (root agent
+    /// only; the coder serves them as read-only slots). Left out of the JSON (and so of the
+    /// digest) when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<ReferenceDef>,
     /// The agent-card URL of a remote subagent (A2A). Makes the file a remote subagent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub a2a: Option<String>,

@@ -4,6 +4,7 @@ mod agent;
 mod command;
 mod mcp;
 mod names;
+mod reference;
 mod scalar;
 mod schedule;
 mod skill;
@@ -15,6 +16,11 @@ pub use agent::{
 pub use command::CommandFrontmatter;
 pub use mcp::{EnvRef, McpConfig, McpServer, RemoteKind, Segment, split_env_references};
 pub use names::{is_agent_name, is_env_name, is_skill_name, is_tool_name};
+pub use reference::{
+    MAX_REFERENCES, REFERENCE_BRANCH_MAX, REFERENCE_DESCRIPTION_MAX, REFERENCE_URL_MAX,
+    REFERENCES_FILE_MAX, ReferenceDef, ReferencesRead, check_references, is_reference_name,
+    parse_references_file, read_references_leniently,
+};
 pub use schedule::ScheduleFrontmatter;
 pub use skill::SkillFrontmatter;
 
