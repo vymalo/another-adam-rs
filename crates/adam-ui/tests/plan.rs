@@ -32,7 +32,7 @@ const V6: Fixture = Fixture {
     document: include_str!("fixtures/checklist-subset-v6.json"),
     lock: include_str!("fixtures/checklist-subset-v6.lock.json"),
 };
-const V7: Fixture = Fixture {
+const V8: Fixture = Fixture {
     document: include_str!("fixtures/checklist-subset-v8.json"),
     lock: include_str!("fixtures/checklist-subset-v8.lock.json"),
 };
@@ -780,7 +780,7 @@ async fn a_catalog_with_a_short_title_limit_still_gets_its_checklist() {
 
 #[tokio::test]
 async fn a_catalog_with_a_short_note_limit_still_gets_its_checklist() {
-    let context = changed(&V7, |d| {
+    let context = changed(&V8, |d| {
         checklist_of(d)["properties"]["items"]["items"]["properties"]["note"]["maxLength"] =
             json!(50);
     });
@@ -808,7 +808,7 @@ async fn a_catalog_with_a_short_note_limit_still_gets_its_checklist() {
 
 #[tokio::test]
 async fn a_label_is_cut_to_its_own_limit_even_when_the_catalog_has_note() {
-    let context = changed(&V7, |d| {
+    let context = changed(&V8, |d| {
         checklist_of(d)["properties"]["items"]["items"]["properties"]["label"]["maxLength"] =
             json!(50);
     });
@@ -919,7 +919,7 @@ async fn a_secret_is_scrubbed_before_the_surface_cuts_the_text() {
     for (name, context) in [
         ("v5", V5.context()),
         ("v6", V6.context()),
-        ("v7", V7.context()),
+        ("v8", V8.context()),
     ] {
         let ctx = scrubbing(context);
         let work = ui().tools().get("plan_work").cloned().unwrap();
@@ -1151,18 +1151,18 @@ async fn a_dropped_item_is_left_out_and_counted_when_the_catalog_has_no_dropped_
 
 #[tokio::test]
 async fn a_catalog_that_allows_dropped_and_note_gets_them() {
-    let made = call("plan_work", None, V7.context(), started()).await;
+    let made = call("plan_work", None, V8.context(), started()).await;
     let doing = call(
         "plan_check",
         Some(&plan_of(&made)),
-        V7.context(),
+        V8.context(),
         json!({"id": 2, "status": "doing", "note": "lexer.rs"}),
     )
     .await;
     let dropped = call(
         "plan_check",
         Some(&plan_of(&doing)),
-        V7.context(),
+        V8.context(),
         json!({"id": 4, "status": "dropped", "note": "the person opens it"}),
     )
     .await;

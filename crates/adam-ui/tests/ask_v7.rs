@@ -385,10 +385,85 @@ async fn the_models_mistakes_with_the_five_kinds_come_back_before_the_catalog_is
             ),
             "does not draw",
         ),
+        // What the person reads has nothing they cannot see: the member is named.
+        (
+            q(json!({"type": "confirm", "yesLabel": "Go\u{202e}"})),
+            "`yesLabel` of question `a` has a character the person cannot see (U+202E)",
+        ),
+        (
+            q(json!({"type": "confirm", "noLabel": "No\nway"})),
+            "`noLabel` of question `a` has a character the person cannot see (U+000A)",
+        ),
+        (
+            q(json!({"type": "number", "unit": "k\u{200b}g"})),
+            "`unit` of question `a` has a character the person cannot see (U+200B)",
+        ),
+        (
+            q(json!({"type": "scale", "to": 5, "fromLabel": "Low\u{202d}"})),
+            "`fromLabel` of question `a` has a character the person cannot see (U+202D)",
+        ),
+        (
+            q(json!({"type": "scale", "to": 5, "toLabel": "\u{0007}High"})),
+            "`toLabel` of question `a` has a character the person cannot see (U+0007)",
+        ),
+        (
+            q(json!({"type": "single", "options": ["a", "b"], "help": "Pick\u{202e}"})),
+            "`help` of question `a` has a character the person cannot see (U+202E)",
+        ),
+        (
+            q(json!({"type": "confirm", "help": "x\u{2066}"})),
+            "`help` of question `a` has a character the person cannot see (U+2066)",
+        ),
+        // A scale's bounds are whole numbers, written as the grammar of its points writes them.
+        (
+            q(json!({"type": "scale", "to": 5.5})),
+            "`to` of question `a` is not a whole number",
+        ),
+        (
+            q(json!({"type": "scale", "to": "07"})),
+            "`to` of question `a` is not a whole number",
+        ),
+        (
+            q(json!({"type": "scale", "from": "+1", "to": 5})),
+            "`from` of question `a` is not a whole number",
+        ),
+        // A member of the wrong shape is named, not left to the parser's words about a union.
+        (
+            q(json!({"type": "scale", "from": true, "to": 5})),
+            "`from` of question `a` is \"true\", which is neither a string nor a number",
+        ),
+        (
+            q(json!({"type": "number", "minValue": [1]})),
+            "`minValue` of question `a` is \"[1]\", which is neither a string nor a number",
+        ),
+        (
+            q(json!({"type": "number", "step": {"x": 1}})),
+            "`step` of question `a` is",
+        ),
     ];
     for (call, expected) in cases {
         let out = refused(Some(&v7()), call.clone()).await;
         assert!(out.contains(expected), "{expected}: {out}\n{call}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_bound_written_as_a_number_or_a_string_and_a_help_with_lines_are_drawn() {
+    for (to, from) in [
+        (json!(5), json!(1)),
+        (json!(5.0), json!(1.0)),
+        (json!("5"), json!("0")),
+    ] {
+        let (_, root) = form(
+            &v7(),
+            one(
+                json!({"id": "a", "question": "Q?", "type": "scale", "from": from, "to": to,
+                       "help": "Two\nlines"}),
+            ),
+        )
+        .await;
+        assert_eq!(root["questions"][0]["to"], 5, "{to}");
+        assert_eq!(root["questions"][0]["help"], "Two\nlines");
     }
 }
 

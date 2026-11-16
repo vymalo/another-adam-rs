@@ -101,9 +101,20 @@ inbound function reads a screen's action as JSON text.
   person reads `The answer to "budget" ("What is the monthly budget?") was not used (above_max): 1500 is above the most,
   1000 EUR.` and the question, and is asked the same form again on a new surface `ask-<call id>.r<n>` (`ask_retry_surface_id`,
   `is_ask_surface_of`) with each question they got right as its `default`. The model is not woken and sees nothing of the
-  refused answer; the loop journals `answer_refused {call_id, question, rule}`. Words, a form that went out as text, and a
-  form with none of the five kinds are not judged: the older types are not covered by the contract. A kind the screen lacked
-  is judged when it was asked as radio buttons (`confirm`, `scale`) and left to the model when it came back as typed words.
+  refused answer; the loop journals `answer_refused {call_id, question, rule}`. Two refusals are adam's own and not among the
+  catalog's ten: `other_surface` (the answer names another surface than the exact one the pending question's interface holds, so
+  a stale click on an earlier form is never read as this question's; a question that went out as text has no surface and takes
+  any answer) and `several_answers` (the message holds more than one form action: the payload says how many, and the model would
+  read all of them). **A form is asked again at most 5 times** (`MAX_REFUSALS`, counted from the surface's `.r<n>`): the sixth
+  bad answer ends the question, and the model gets an error result that names the last rule and question and says to ask another
+  way. What is carried as a `default` into the form asked again is something that question accepts (a text that shows and fits its
+  box, an option it offers, picks within its `max`). Words typed instead of the form, a form that went out as text, and the
+  answer of a form with none of the five kinds are not judged by the rules: the older types are not covered by the contract. A
+  kind the screen lacked is judged when it came back as radio buttons (`confirm`, `scale`) and when it came back as typed words
+  (`number` and `date`: the text is the value; `rank`: the numbers of the options in order, like `3, 1, 2`). A yes or no that is
+  the one question of a form asked as words and answered with exactly `yes`, `no` or one of its two labels (any case, nothing
+  trimmed) is read as that value. A hidden, control or bidirectional character is refused in `yesLabel`, `noLabel`, `unit`,
+  `fromLabel`, `toLabel` and `help`, naming the member; the option labels of the older kinds still accept them.
 
   | Limit | |
   |---|---|
@@ -387,7 +398,7 @@ stateDiagram-v2
   is left out and counted and a long note is cut inside the label limit; `checklist-subset-v8.json`: a `Checklist` that allows both),
   and the specs, pinned byte for byte.
 * `tests/ask_v7.rs`, `tests/ask_answers.rs` and `src/ask/vectors.rs`: the five kinds against the published catalogs of
-  versions 7, 6, 5 and 2 (byte copies, `tests/fixtures/UPSTREAM`; `tools/check-vendored-catalogs.sh` compares them with
+  versions 7, 6, 5 and 2 (byte copies, `tests/fixtures/UPSTREAM`; `tools/check-vendored-catalogs.sh` compares them, and the vectors, with
   the published files in CI): the contract's own example form is a valid instance and a golden file
   (`tests/golden/ask_form_v7.json`), the nearest older form on versions 6 and 5, words on version 2 and with no catalog,
   the models' mistakes in words; a whole agent behind A2A that refuses an answer, asks again on `ask-<id>.r1` with the

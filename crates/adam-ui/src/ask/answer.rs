@@ -30,6 +30,11 @@ pub(crate) enum Rule {
     AboveMax,
     OffStep,
     NotAPermutation,
+    /// Adam's own, not one of the catalog's ten: the answer is for another form than the one the
+    /// question drew.
+    OtherSurface,
+    /// Adam's own: the message holds more than one answer to a form.
+    SeveralAnswers,
 }
 
 impl Rule {
@@ -46,6 +51,8 @@ impl Rule {
             Self::AboveMax => "above_max",
             Self::OffStep => "off_step",
             Self::NotAPermutation => "not_a_permutation",
+            Self::OtherSurface => "other_surface",
+            Self::SeveralAnswers => "several_answers",
         }
     }
 }
@@ -219,7 +226,7 @@ pub(crate) struct Failure {
     pub(crate) why: String,
 }
 
-fn failure(rule: Rule, why: impl Into<String>) -> Failure {
+pub(crate) fn failure(rule: Rule, why: impl Into<String>) -> Failure {
     Failure {
         rule,
         why: why.into(),
@@ -394,7 +401,7 @@ pub(crate) struct Verdict {
     pub(crate) valid: Vec<bool>,
 }
 
-fn whole(rule: Rule, why: &str) -> Verdict {
+pub(crate) fn whole(rule: Rule, why: &str) -> Verdict {
     Verdict {
         question: None,
         failure: failure(rule, why),
@@ -429,8 +436,10 @@ pub(crate) fn check_answer(form: &FormSpec, context: &Value) -> Result<(), Verdi
             "the answer has a member the form does not take",
         ));
     }
+    // A `note` is the words of the form's box: a string, and only when the form has one. Whatever
+    // else it holds, `null` included, is a note the form does not take.
     match context.get("note") {
-        None | Some(Value::Null) => {}
+        None => {}
         Some(Value::String(_)) if form.free_input => {}
         Some(_) => {
             return Err(whole(

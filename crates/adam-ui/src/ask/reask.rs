@@ -12,7 +12,7 @@ use adam_a2a_runtime::{PAYLOAD_FORM, is_format_or_control};
 use adam_llm_agent::{AnswerCheck, Refusal};
 use serde_json::{Value, json};
 
-use super::answer::{Check, FormSpec, Verdict, check_answer};
+use super::answer::{Check, FormSpec, Rule, Verdict, check_answer, whole};
 use super::{
     Args, Form, Kind, MAX_LONG_TEXT, MAX_TEXT, clipped, kinds, lead_with_description, normalize,
 };
@@ -21,17 +21,20 @@ use crate::surface::{ask_attempt, ask_retry_surface_id};
 /// The longest words of a question quoted back to the person.
 const QUOTED_QUESTION: usize = 80;
 
+/// How many times a form is asked again after an answer that does not fit. The next bad answer ends
+/// the question: the model is told, as an error, and may ask another way.
+pub(crate) const MAX_REFUSALS: u32 = 5;
+
 /// What `ask_user` says about the answer to its call `call_id`: [`AnswerCheck::Accept`] unless the
-/// person answered a form and the answer breaks a rule of the catalog.
+/// person answered a form and the answer breaks a rule of the catalog (or is for another form, or
+/// holds several answers), and a yes or no said in words as the one question of a form that went out
+/// as text.
 pub(super) fn read(
     call_id: &str,
     args: &Value,
     ui: Option<&Value>,
     payload: &Value,
 ) -> AnswerCheck {
-    let (Some(ui), Some(answered)) = (ui, payload.get(PAYLOAD_FORM)) else {
-        return AnswerCheck::Accept;
-    };
     let Ok(parsed) = serde_json::from_value::<Args>(args.clone()) else {
         return AnswerCheck::Accept;
     };
@@ -39,19 +42,153 @@ pub(super) fn read(
     let Ok(form) = normalize(parsed) else {
         return AnswerCheck::Accept;
     };
-    let Some(drawn) = Drawn::of(ui) else {
+    let Some(ui) = ui else {
+        return in_words(&form, payload);
+    };
+    let (Some(answered), Some(drawn)) = (payload.get(PAYLOAD_FORM), Drawn::of(ui)) else {
         return AnswerCheck::Accept;
     };
     let spec = spec_of(&form, &drawn);
+    let context = answered.get("context").unwrap_or(&Value::Null);
+    let Some(verdict) = judge(&spec, &drawn, ui, answered, context) else {
+        return AnswerCheck::Accept;
+    };
+    let tries = surface_of(ui)
+        .and_then(|surface| ask_attempt(&surface))
+        .unwrap_or(0);
+    if tries >= MAX_REFUSALS {
+        return AnswerCheck::End(giving_up(&form, &verdict));
+    }
+    AnswerCheck::Refuse(ask_again(
+        call_id, &question, &form, &drawn, ui, context, &verdict,
+    ))
+}
+
+/// Why the answer in `answered` is not used, or `None` when it is.
+fn judge(
+    spec: &FormSpec,
+    drawn: &Drawn,
+    ui: &Value,
+    answered: &Value,
+    context: &Value,
+) -> Option<Verdict> {
+    if answered
+        .get("actions")
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n > 1)
+    {
+        return Some(whole(
+            Rule::SeveralAnswers,
+            "the message holds more than one answer to a form",
+        ));
+    }
+    let asked = surface_of(ui);
+    if asked.is_some() && answered.get("surface").and_then(Value::as_str) != asked.as_deref() {
+        return Some(whole(
+            Rule::OtherSurface,
+            "the answer is for another form than the one asked",
+        ));
+    }
     if !spec.judges_anything() {
+        return None;
+    }
+    check_answer(spec, &typed_as_values(spec, drawn, context)).err()
+}
+
+/// A yes or no as the one question of a form that went out as words: the person's reply is that
+/// answer when it is exactly `yes`, `no` or one of the two labels, in any case. Anything else is
+/// words, and the model reads it.
+fn in_words(form: &Form, payload: &Value) -> AnswerCheck {
+    let [question] = form.questions.as_slice() else {
+        return AnswerCheck::Accept;
+    };
+    if question.kind() != Kind::Confirm || payload.get(PAYLOAD_FORM).is_some() {
         return AnswerCheck::Accept;
     }
-    let context = answered.get("context").unwrap_or(&Value::Null);
-    match check_answer(&spec, context) {
-        Ok(()) => AnswerCheck::Accept,
-        Err(verdict) => AnswerCheck::Refuse(ask_again(
-            call_id, &question, &form, &drawn, ui, context, &verdict,
-        )),
+    let Some(text) = payload.get("text").and_then(Value::as_str) else {
+        return AnswerCheck::Accept;
+    };
+    kinds::confirm_answer(
+        text,
+        question.ext.yes_label.as_deref(),
+        question.ext.no_label.as_deref(),
+    )
+    .map_or(AnswerCheck::Accept, |value| {
+        AnswerCheck::Read(value.to_owned())
+    })
+}
+
+/// The entries of the answers with what was typed for a number, a day or a rank that a screen
+/// without the kind drew as a text box read as the kind's own answer: the words are the one value,
+/// and a rank's numbers are the options they count, in order.
+fn typed_as_values(spec: &FormSpec, drawn: &Drawn, context: &Value) -> Value {
+    let mut context = context.clone();
+    let Some(entries) = context.get_mut("answers").and_then(Value::as_array_mut) else {
+        return context;
+    };
+    for (question, entry) in spec.questions.iter().zip(entries) {
+        let typed = matches!(
+            question.check,
+            Check::Number { .. } | Check::Date { .. } | Check::Rank { .. }
+        ) && drawn.types.get(&question.id).map(String::as_str) == Some("text");
+        let Some(entry) = entry.as_object_mut().filter(|_| typed) else {
+            continue;
+        };
+        let empty = entry
+            .get("values")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        let text = match entry.get("text") {
+            Some(Value::String(text)) if empty => text.clone(),
+            _ => continue,
+        };
+        let values = match &question.check {
+            Check::Rank { options } => text
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|word| !word.is_empty())
+                .map(|word| {
+                    let counted =
+                        word.bytes().all(|b| b.is_ascii_digit()) && !word.starts_with('0');
+                    word.parse::<usize>()
+                        .ok()
+                        .filter(|_| counted)
+                        .and_then(|n| options.get(n - 1))
+                        .map_or_else(String::new, Clone::clone)
+                })
+                .collect(),
+            _ => vec![text],
+        };
+        entry.remove("text");
+        entry.insert("values".into(), json!(values));
+    }
+    context
+}
+
+/// The error the model reads when the person's answers keep not fitting.
+fn giving_up(form: &Form, verdict: &Verdict) -> Refusal {
+    let rule = verdict.failure.rule.as_str();
+    let about = match &verdict.question {
+        Some(id) => {
+            let words = form
+                .questions
+                .iter()
+                .find(|q| &q.id == id)
+                .map(|q| clipped(&q.question, QUOTED_QUESTION))
+                .unwrap_or_default();
+            format!("question \"{id}\" (\"{words}\")")
+        }
+        None => "the whole answer".to_owned(),
+    };
+    let message = format!(
+        "The person's answers did not fit the form after {MAX_REFUSALS} tries, so it is not asked \
+         again. The last one broke the rule `{rule}` for {about}: {}. Ask another way: in plain \
+         words, with a simpler form or fewer questions.",
+        verdict.failure.why
+    );
+    let refusal = Refusal::new(message, None, rule);
+    match &verdict.question {
+        Some(id) => refusal.about(id.clone()),
+        None => refusal,
     }
 }
 
@@ -109,8 +246,8 @@ fn root_of_mut(ui: &mut Value) -> Option<&mut Value> {
 
 /// What the answer is judged by: each of the five kinds as it was drawn. A kind drawn as itself is
 /// judged by the contract; a yes or no and a scale asked as radio buttons are answered in the same
-/// shape (`values`), so they are judged by it too; any other kind that the screen lacked came back
-/// as typed words and is left to the model, as the older types are.
+/// shape (`values`), and a number, a day or a rank asked as a text box is answered in words, which
+/// are judged as the kind's own value ([`typed_as_values`]). The older types are left to the model.
 fn spec_of(form: &Form, drawn: &Drawn) -> FormSpec {
     let questions = form
         .questions
@@ -121,7 +258,9 @@ fn spec_of(form: &Form, drawn: &Drawn) -> FormSpec {
             let kind = q.kind();
             let judged = !kind.is_extended()
                 || shown == Some(kind.as_str())
-                || (matches!(kind, Kind::Confirm | Kind::Scale) && shown == Some("single"));
+                || (matches!(kind, Kind::Confirm | Kind::Scale) && shown == Some("single"))
+                || (matches!(kind, Kind::Number | Kind::Date | Kind::Rank)
+                    && shown == Some("text"));
             if !judged {
                 spec.check = Check::Unchecked;
             }
@@ -260,6 +399,17 @@ fn default_of(kind: &str, question: &Value, entry: &Value) -> Option<Value> {
             })
     };
     let several = question.get("multiple") == Some(&json!(true));
+    let room = |list: &[&str]| {
+        let distinct = list
+            .iter()
+            .enumerate()
+            .all(|(n, value)| !list[..n].contains(value));
+        let within = question
+            .get("max")
+            .and_then(Value::as_u64)
+            .is_none_or(|max| list.len() as u64 <= max);
+        distinct && within
+    };
     match (kind, values.as_slice()) {
         (_, []) if matches!(kind, "text" | "longText") => {
             let text = entry.get("text")?.as_str()?;
@@ -282,7 +432,8 @@ fn default_of(kind: &str, question: &Value, entry: &Value) -> Option<Value> {
         ("multiple" | "select" | "images", list)
             if !list.is_empty()
                 && list.iter().all(|v| offered(v))
-                && (kind == "multiple" || several) =>
+                && (kind == "multiple" || several)
+                && room(list) =>
         {
             Some(json!(list))
         }

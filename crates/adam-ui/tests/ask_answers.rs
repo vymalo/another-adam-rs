@@ -255,6 +255,7 @@ async fn a_refused_answer_is_told_to_the_person_asked_again_with_what_was_right_
         )
     );
     let second = interface(&again);
+    assert_drawable(&screen(V7, V7_LOCK), &second);
     assert_eq!(second[0]["createSurface"]["surfaceId"], "ask-q-call.r1");
     assert_eq!(second[1]["updateComponents"]["surfaceId"], "ask-q-call.r1");
     assert_eq!(second[0]["createSurface"]["catalogId"], CATALOG_ID);
@@ -407,15 +408,46 @@ async fn a_screen_of_version_6_is_asked_the_nearest_form_and_its_answer_is_judge
     assert_eq!(questions[1]["default"], "250.5");
     assert_eq!(questions[3]["default"], "2026-12-15");
     assert_eq!(questions[0]["default"], "no");
-    // The typed kinds the screen lacked are the model's to read, as the older types are.
-    let fixed = json!([
+    // A number, a day and a rank that the screen drew as text boxes are judged as the kinds they
+    // stand for: words that are no number are refused like a number that is no number.
+    let words = json!([
         {"id": "ship", "values": ["yes"]},
         {"id": "budget", "values": [], "text": "a bit over a thousand"},
         {"id": "nps", "values": ["8"]},
         {"id": "when", "values": [], "text": "soon"},
         {"id": "order", "values": [], "text": "3, 1, 2"}
     ]);
-    rig.send(&task, action("ask-q-call.r1", fixed)).await;
+    rig.send(&task, action("ask-q-call.r1", words)).await;
+    let third = rig.asking(&task, "The answer to \"budget\"").await;
+    assert!(
+        third
+            .status
+            .message
+            .as_ref()
+            .and_then(Message::text)
+            .is_some_and(|t| t.contains("(grammar)")),
+    );
+    assert_eq!(
+        interface(&third)[0]["createSurface"]["surfaceId"],
+        "ask-q-call.r2"
+    );
+    let questions = root(&interface(&third))["questions"].clone();
+    // What fit is kept; the words that did not are not carried, and the form starts those boxes
+    // where the last form that was shown had them.
+    assert_eq!(questions[0]["default"], "yes");
+    assert_eq!(questions[4]["default"], "3, 1, 2");
+    assert_eq!(questions[1]["default"], "250.5");
+    assert_eq!(questions[3]["default"], "2026-12-15");
+    // The model has not been asked again.
+    assert_eq!(rig.model.requests().len(), 1);
+    let fixed = json!([
+        {"id": "ship", "values": ["yes"]},
+        {"id": "budget", "values": [], "text": "250.5"},
+        {"id": "nps", "values": ["8"]},
+        {"id": "when", "values": [], "text": "2026-12-15"},
+        {"id": "order", "values": [], "text": "3, 1, 2"}
+    ]);
+    rig.send(&task, action("ask-q-call.r2", fixed)).await;
     rig.until(&task, "completed", |t| {
         t.status.state == TaskState::Completed
     })
@@ -427,12 +459,10 @@ async fn a_screen_of_version_6_is_asked_the_nearest_form_and_its_answer_is_judge
 
 // ---- the check by itself ----
 
-/// The call's interface, and the tool.
-async fn asked_with_v7() -> (adam_llm_agent::DynTool, Value, Value) {
+/// The tool, the call's arguments, and the interface of the call `c1` on `screen`.
+async fn asked_on(screen: &Screen, args: Value) -> (adam_llm_agent::DynTool, Value, Value) {
     let ui = Ui::new(McpPolicy::default());
     let tool = ui.tools().get("ask_user").cloned().unwrap();
-    let call = five("c1");
-    let screen = screen(V7, V7_LOCK);
     let c = &screen.claimed;
     let context = json!({
         "vymalo.ui.ref": {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
@@ -446,13 +476,45 @@ async fn asked_with_v7() -> (adam_llm_agent::DynTool, Value, Value) {
     let Err(ToolError::NeedsInput { ui: Some(ui), .. }) = tool
         .call(
             &ToolCtx::detached("ask_user", "c1", Arc::new(NoopSink)).with_context(context),
-            call.arguments.clone(),
+            args.clone(),
         )
         .await
     else {
         panic!("the call did not ask with a form");
     };
-    (tool, call.arguments, ui)
+    (tool, args, ui)
+}
+
+/// The call's interface, and the tool.
+async fn asked_with_v7() -> (adam_llm_agent::DynTool, Value, Value) {
+    asked_on(&screen(V7, V7_LOCK), five("c1").arguments).await
+}
+
+/// `ui` is a form the screen's own catalog draws: every refusal asks one that is valid again.
+fn assert_drawable(screen: &Screen, ui: &Value) {
+    let catalog = adam_ui::Catalog::from_document(screen.document.clone(), &screen.claimed)
+        .expect("the screen's catalog");
+    catalog
+        .validate(root(ui))
+        .unwrap_or_else(|problem| panic!("the form asked again is not drawable: {problem}\n{ui}"));
+}
+
+/// What the check says about `context` as the answer to the form on `surface`: the rule and the
+/// question it was about (`*` for the whole answer), or `None` when it is accepted.
+fn verdict(
+    tool: &adam_llm_agent::DynTool,
+    args: &Value,
+    ui: &Value,
+    surface: &str,
+    context: Value,
+) -> Option<(String, String)> {
+    match tool.read_answer("c1", args, Some(ui), &payload(surface, context)) {
+        AnswerCheck::Accept => None,
+        AnswerCheck::Refuse(r) | AnswerCheck::End(r) => {
+            Some((r.subject.unwrap_or_else(|| "*".into()), r.rule))
+        }
+        other => panic!("unexpected {other:?}"),
+    }
 }
 
 fn payload(surface: &str, context: Value) -> Value {
@@ -584,5 +646,685 @@ async fn a_form_with_no_answer_to_judge_is_accepted_as_it_came() {
             &payload("ask-c1", json!({"answers": []}))
         ),
         AnswerCheck::Accept
+    );
+}
+
+// ---- the answer belongs to its form ----
+
+#[tokio::test]
+async fn an_answer_for_another_form_is_not_this_questions_even_when_its_ids_and_values_fit() {
+    // Two calls that both ask a `confirm` with the default id `q1`: a stale click on the first form
+    // must not stand for the consent the second one asks.
+    let screen = screen(V7, V7_LOCK);
+    let args =
+        json!({"question": "Delete it?", "choices": [{"type": "confirm", "question": "Sure?"}]});
+    let (tool, args, ui) = asked_on(&screen, args).await;
+    let yes = json!({"answers": [{"id": "q1", "values": ["yes"]}]});
+    assert_eq!(verdict(&tool, &args, &ui, "ask-c1", yes.clone()), None);
+    let other = verdict(&tool, &args, &ui, "ask-c0", yes.clone());
+    assert_eq!(other, Some(("*".into(), "other_surface".into())));
+    // The exact surface decides, not one that merely names the call: a form that has not been asked
+    // yet is no more this question's than another call's.
+    for surface in ["ask-c1.r1", "ask-c1.r3", "ask-c10", "ask-c", "ask-c1x.r1"] {
+        assert_eq!(
+            verdict(&tool, &args, &ui, surface, yes.clone()),
+            Some(("*".into(), "other_surface".into())),
+            "{surface}"
+        );
+    }
+    // The question is asked again, as itself, and nothing of the stray answer is carried.
+    let AnswerCheck::Refuse(refusal) =
+        tool.read_answer("c1", &args, Some(&ui), &payload("ask-c0", yes))
+    else {
+        panic!("refused")
+    };
+    assert!(
+        refusal.question.starts_with(
+            "The answers were not used (other_surface): the answer is for another form than the one asked.\n"
+        ),
+        "{}",
+        refusal.question
+    );
+    let again = refusal.ui.unwrap();
+    assert_eq!(again[0]["createSurface"]["surfaceId"], "ask-c1.r1");
+    assert!(root(&again)["questions"][0].get("default").is_none());
+    assert_drawable(&screen, &again);
+    // Asked again, only that form's answer is the answer.
+    assert_eq!(
+        verdict(
+            &tool,
+            &args,
+            &again,
+            "ask-c1.r1",
+            json!({"answers": [{"id": "q1", "values": ["yes"]}]})
+        ),
+        None
+    );
+    assert_eq!(
+        verdict(
+            &tool,
+            &args,
+            &again,
+            "ask-c1",
+            json!({"answers": [{"id": "q1", "values": ["yes"]}]})
+        ),
+        Some(("*".into(), "other_surface".into()))
+    );
+}
+
+#[tokio::test]
+async fn a_form_of_the_older_types_is_tied_to_its_surface_and_accepts_any_answer_on_it() {
+    let args = json!({"question": "Which?", "choices": [
+        {"id": "db", "question": "Database?", "options": ["Postgres", "SQLite"]}]});
+    let (tool, args, ui) = asked_on(&screen(V7, V7_LOCK), args).await;
+    // Its answers are not covered by the contract: whatever its shape, on its own surface.
+    for context in [
+        json!({}),
+        json!({"answers": []}),
+        json!({"answers": 3, "x": 1}),
+        json!(null),
+    ] {
+        assert_eq!(
+            verdict(&tool, &args, &ui, "ask-c1", context.clone()),
+            None,
+            "{context}"
+        );
+    }
+    assert_eq!(
+        verdict(&tool, &args, &ui, "ask-other", json!({})),
+        Some(("*".into(), "other_surface".into()))
+    );
+}
+
+#[tokio::test]
+async fn a_message_that_holds_several_form_answers_is_refused_whole() {
+    let (tool, args, ui) = asked_with_v7().await;
+    let mut message = payload("ask-c1", json!({"answers": good()}));
+    assert_eq!(
+        tool.read_answer("c1", &args, Some(&ui), &message),
+        AnswerCheck::Accept
+    );
+    message[PAYLOAD_FORM]["actions"] = json!(1);
+    assert_eq!(
+        tool.read_answer("c1", &args, Some(&ui), &message),
+        AnswerCheck::Accept,
+        "one is one"
+    );
+    message[PAYLOAD_FORM]["actions"] = json!(2);
+    let AnswerCheck::Refuse(refusal) = tool.read_answer("c1", &args, Some(&ui), &message) else {
+        panic!("a message with two answers was read")
+    };
+    assert_eq!(refusal.rule, "several_answers");
+    assert_eq!(refusal.subject, None);
+    assert!(
+        refusal
+            .question
+            .contains("the message holds more than one answer to a form"),
+        "{}",
+        refusal.question
+    );
+}
+
+#[tokio::test]
+async fn two_form_actions_in_one_message_are_asked_again_and_never_half_checked() {
+    let rig = Rig::new();
+    rig.model
+        .push_tool_calls(vec![five("q-call")])
+        .push_text("Done.");
+    let (stop, handle) = rig.worker();
+    let task = rig
+        .backend
+        .submit(
+            alice(),
+            from_the_screen("ship it", &screen(V7, V7_LOCK)),
+            None,
+            Some("ctx".into()),
+        )
+        .await
+        .unwrap();
+    rig.asking(&task, "Before I ship it.").await;
+    // The first action is right, the second is the same form with another budget.
+    let both = {
+        let mut first = action("ask-q-call", good());
+        let second = action("ask-q-call", with("budget", json!(["1500"])));
+        first.parts.extend(second.parts);
+        first
+    };
+    rig.send(&task, both).await;
+    let again = rig
+        .asking(&task, "The answers were not used (several_answers)")
+        .await;
+    assert_eq!(
+        interface(&again)[0]["createSurface"]["surfaceId"],
+        "ask-q-call.r1"
+    );
+    assert_eq!(rig.model.requests().len(), 1, "the model was not asked");
+    rig.send(&task, action("ask-q-call.r1", good())).await;
+    rig.until(&task, "completed", |t| {
+        t.status.state == TaskState::Completed
+    })
+    .await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
+}
+
+// ---- the number of times a form is asked again ----
+
+#[tokio::test]
+async fn a_form_is_asked_again_five_times_and_the_sixth_bad_answer_ends_the_question() {
+    let (tool, args, mut ui) = asked_with_v7().await;
+    let bad = |surface: &str| payload(surface, json!({"answers": with("budget", json!(["1500"]))}));
+    for attempt in 1..=5 {
+        let surface = ui[0]["createSurface"]["surfaceId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let AnswerCheck::Refuse(refusal) = tool.read_answer("c1", &args, Some(&ui), &bad(&surface))
+        else {
+            panic!("the answer was not refused again at try {attempt}");
+        };
+        ui = refusal.ui.unwrap();
+        assert_eq!(
+            ui[0]["createSurface"]["surfaceId"],
+            format!("ask-c1.r{attempt}")
+        );
+    }
+    // Five times asked again; the next bad answer is the sixth.
+    let AnswerCheck::End(ending) = tool.read_answer("c1", &args, Some(&ui), &bad("ask-c1.r5"))
+    else {
+        panic!("the sixth bad answer did not end the question");
+    };
+    assert_eq!(ending.rule, "above_max");
+    assert_eq!(ending.subject.as_deref(), Some("budget"));
+    assert!(ending.ui.is_none());
+    assert_eq!(
+        ending.question,
+        "The person's answers did not fit the form after 5 tries, so it is not asked again. \
+         The last one broke the rule `above_max` for question \"budget\" (\"What is the monthly \
+         budget?\"): 1500 is above the most, 1000 EUR. Ask another way: in plain words, with a \
+         simpler form or fewer questions."
+    );
+    // A whole answer that does not fit ends it as well, and says so.
+    let AnswerCheck::End(whole) =
+        tool.read_answer("c1", &args, Some(&ui), &payload("ask-c1.r5", json!({})))
+    else {
+        panic!("a whole answer that does not fit did not end the question")
+    };
+    assert!(
+        whole.question.contains("for the whole answer: "),
+        "{}",
+        whole.question
+    );
+}
+
+#[tokio::test]
+async fn the_sixth_bad_answer_gives_the_model_an_error_and_the_run_goes_on() {
+    let rig = Rig::new();
+    rig.model
+        .push_tool_calls(vec![five("q-call")])
+        .push_text("I will ask in words instead.");
+    let (stop, handle) = rig.worker();
+    let task = rig
+        .backend
+        .submit(
+            alice(),
+            from_the_screen("ship it", &screen(V7, V7_LOCK)),
+            None,
+            Some("ctx".into()),
+        )
+        .await
+        .unwrap();
+    rig.asking(&task, "Before I ship it.").await;
+    let mut surface = "ask-q-call".to_owned();
+    for attempt in 1..=5 {
+        rig.send(&task, action(&surface, with("budget", json!(["1500"]))))
+            .await;
+        let again = rig.asking(&task, "The answer to \"budget\"").await;
+        surface = format!("ask-q-call.r{attempt}");
+        assert_eq!(
+            interface(&again)[0]["createSurface"]["surfaceId"],
+            surface.as_str()
+        );
+        assert_eq!(rig.model.requests().len(), 1);
+    }
+    rig.send(&task, action(&surface, with("budget", json!(["1500"]))))
+        .await;
+    let done = rig
+        .until(&task, "completed", |t| {
+            t.status.state == TaskState::Completed
+        })
+        .await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
+    assert_eq!(
+        done.status.message.as_ref().and_then(Message::text),
+        Some("I will ask in words instead.")
+    );
+    let requests = rig.model.requests();
+    assert_eq!(requests.len(), 2);
+    let Some(adam_model::Message::Tool {
+        call_id,
+        content,
+        is_error,
+    }) = requests[1].messages.last()
+    else {
+        panic!(
+            "the model was not given a tool result: {:?}",
+            requests[1].messages
+        );
+    };
+    assert_eq!(call_id, "q-call");
+    assert!(is_error, "the ending is an error result");
+    assert!(
+        content.contains("did not fit the form after 5 tries")
+            && content.contains("`above_max`")
+            && content.contains("\"budget\""),
+        "{content}"
+    );
+    assert!(
+        !format!("{:?}", requests[1].messages).contains("1500\"]"),
+        "no refused answer"
+    );
+}
+
+// ---- a screen that has no control for a kind ----
+
+#[tokio::test]
+async fn what_is_typed_for_a_number_a_day_or_a_rank_is_judged_as_the_kind() {
+    let screen = screen(V6, V6_LOCK);
+    let (tool, args, ui) = asked_on(&screen, five("c1").arguments).await;
+    let answer = |text: &str, id: &str| {
+        let mut answers = json!([
+            {"id": "ship", "values": ["yes"]},
+            {"id": "budget", "values": [], "text": "250.5"},
+            {"id": "nps", "values": ["8"]},
+            {"id": "when", "values": [], "text": "2026-12-15"},
+            {"id": "order", "values": [], "text": "3, 1, 2"}
+        ]);
+        for entry in answers.as_array_mut().unwrap() {
+            if entry["id"] == id {
+                entry["text"] = json!(text);
+            }
+        }
+        json!({"answers": answers})
+    };
+    let check = |text: &str, id: &str| verdict(&tool, &args, &ui, "ask-c1", answer(text, id));
+    let is = |id: &str, rule: &str| Some((id.to_owned(), rule.to_owned()));
+    assert_eq!(check("250.5", "budget"), None);
+    assert_eq!(
+        check("a bit over a thousand", "budget"),
+        is("budget", "grammar")
+    );
+    assert_eq!(check("1000.5", "budget"), is("budget", "above_max"));
+    assert_eq!(check("250.25", "budget"), is("budget", "off_step"));
+    assert_eq!(check("1,5", "budget"), is("budget", "grammar"));
+    assert_eq!(check("2026-12-15", "when"), None);
+    assert_eq!(check("soon", "when"), is("when", "grammar"));
+    assert_eq!(check("2027-01-01", "when"), is("when", "above_max"));
+    assert_eq!(check("2026-02-30", "when"), is("when", "grammar"));
+    // A rank is typed as the numbers of the options, in order.
+    for good in ["3, 1, 2", "3 1 2", "3,1,2", "2,3,1", " 1  2 3"] {
+        assert_eq!(check(good, "order"), None, "{good}");
+    }
+    assert_eq!(check("1, 1, 2", "order"), is("order", "not_a_permutation"));
+    assert_eq!(check("1, 2", "order"), is("order", "not_a_permutation"));
+    assert_eq!(check("1 2 3 3", "order"), is("order", "not_a_permutation"));
+    assert_eq!(check("1 2 4", "order"), is("order", "not_offered"));
+    assert_eq!(check("0 1 2", "order"), is("order", "not_offered"));
+    assert_eq!(check("01 2 3", "order"), is("order", "not_offered"));
+    assert_eq!(
+        check("risk speed cost", "order"),
+        is("order", "not_offered")
+    );
+    // Nothing typed is no answer, and a required question needs one.
+    let mut none = answer("x", "budget");
+    none["answers"][1] = json!({"id": "budget", "values": []});
+    assert_eq!(
+        verdict(&tool, &args, &ui, "ask-c1", none),
+        is("budget", "required")
+    );
+    // Typed words beside values are an entry no question of the five takes.
+    let mut both = answer("250.5", "budget");
+    both["answers"][1]["values"] = json!(["250.5"]);
+    assert_eq!(
+        verdict(&tool, &args, &ui, "ask-c1", both),
+        is("budget", "unexpected")
+    );
+}
+
+#[tokio::test]
+async fn a_scale_asked_as_radio_buttons_is_judged_by_its_points() {
+    let screen = screen(V6, V6_LOCK);
+    let (tool, args, ui) = asked_on(&screen, five("c1").arguments).await;
+    let nps = |point: &str| {
+        verdict(
+            &tool,
+            &args,
+            &ui,
+            "ask-c1",
+            json!({"answers": [
+                {"id": "ship", "values": ["yes"]},
+                {"id": "budget", "values": [], "text": "250.5"},
+                {"id": "nps", "values": [point]},
+                {"id": "when", "values": [], "text": "2026-12-15"},
+                {"id": "order", "values": [], "text": "3, 1, 2"}]}),
+        )
+    };
+    assert_eq!(nps("8"), None);
+    assert_eq!(nps("99"), Some(("nps".into(), "above_max".into())));
+    assert_eq!(nps("seven"), Some(("nps".into(), "grammar".into())));
+}
+
+// ---- a refusal keeps the whole of the form ----
+
+#[tokio::test]
+async fn what_is_carried_into_the_form_asked_again_is_something_that_form_accepts() {
+    let screen = screen(V7, V7_LOCK);
+    let args = json!({"question": "Set up", "choices": [
+        {"id": "pick", "question": "Pick up to two", "type": "multiple", "max": 2,
+         "options": ["a", "b", "c"]},
+        {"id": "one", "question": "Which one?", "options": ["a", "b"]},
+        {"id": "name", "question": "Name?", "type": "text"},
+        {"id": "story", "question": "Story?", "type": "longText"},
+        {"id": "n", "question": "How many?", "type": "number", "maxValue": "10"}]});
+    let (tool, args, ui) = asked_on(&screen, args).await;
+    let refuse = |answers: Value| {
+        let AnswerCheck::Refuse(refusal) = tool.read_answer(
+            "c1",
+            &args,
+            Some(&ui),
+            &payload("ask-c1", json!({"answers": answers})),
+        ) else {
+            panic!("not refused")
+        };
+        refusal.ui.unwrap()
+    };
+    let defaults = |ui: &Value| -> Vec<Value> {
+        root(ui)["questions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| q.get("default").cloned().unwrap_or(Value::Null))
+            .collect()
+    };
+    let answers = |pick: Value, one: Value, name: &str, story: &str| {
+        json!([
+            {"id": "pick", "values": pick},
+            {"id": "one", "values": one},
+            {"id": "name", "values": [], "text": name},
+            {"id": "story", "values": [], "text": story},
+            {"id": "n", "values": ["11"]}])
+    };
+    // Right answers of the older types are carried.
+    let carried = refuse(answers(json!(["a", "b"]), json!(["b"]), "Ada", "A life"));
+    assert_eq!(
+        defaults(&carried),
+        [
+            json!(["a", "b"]),
+            json!("b"),
+            json!("Ada"),
+            json!("A life"),
+            Value::Null
+        ]
+    );
+    assert_drawable(&screen, &carried);
+    // Answers that are not unlike what the form takes are not: too many picks, a repeated pick, a
+    // value that is no option, words nobody can see or that the box would refuse.
+    let hidden = "Ada\u{202e}evil";
+    let long = "x".repeat(501);
+    let longer = "y".repeat(2001);
+    for (pick, one, name, story) in [
+        (json!(["a", "b", "c"]), json!(["zzz"]), hidden, "ok\u{200b}"),
+        (
+            json!(["a", "a"]),
+            json!(["a", "b"]),
+            long.as_str(),
+            longer.as_str(),
+        ),
+        (json!(["a", "q"]), json!(["zzz"]), "", ""),
+    ] {
+        let again = refuse(answers(pick, one, name, story));
+        assert_eq!(
+            defaults(&again),
+            [
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null
+            ]
+        );
+        assert_drawable(&screen, &again);
+    }
+    // What is hidden or long is the only thing left out: a text a box takes is carried.
+    let mixed = refuse(answers(json!(["a"]), json!(["zzz"]), "Ada", &longer));
+    assert_eq!(
+        defaults(&mixed),
+        [
+            json!(["a"]),
+            Value::Null,
+            json!("Ada"),
+            Value::Null,
+            Value::Null
+        ]
+    );
+    assert_drawable(&screen, &mixed);
+}
+
+#[tokio::test]
+async fn the_form_asked_again_on_a_screen_without_a_description_keeps_the_description_in_its_words()
+{
+    let args = json!({"question": "Sure?", "description": "Because of the data.",
+        "choices": [{"id": "ok", "question": "Go?", "type": "confirm"}]});
+    let wrong = json!({"answers": [{"id": "ok", "values": ["maybe"]}]});
+    let say = |refusal: adam_llm_agent::Refusal| refusal.question;
+    // Version 2's Choices has no description: it is the second line of the question.
+    let v2 = screen(
+        include_str!("fixtures/catalog-v2.json"),
+        include_str!("fixtures/catalog-v2.lock.json"),
+    );
+    let (tool, args2, ui) = asked_on(&v2, args.clone()).await;
+    let AnswerCheck::Refuse(refusal) =
+        tool.read_answer("c1", &args2, Some(&ui), &payload("ask-c1", wrong.clone()))
+    else {
+        panic!("not refused")
+    };
+    assert_eq!(
+        say(refusal),
+        "The answer to \"ok\" (\"Go?\") was not used (not_offered): the answer is neither yes nor no.\n\
+         Sure?\nBecause of the data."
+    );
+    // Version 7's has one, and the words are not said twice.
+    let (tool, args7, ui) = asked_on(&screen(V7, V7_LOCK), args).await;
+    let AnswerCheck::Refuse(refusal) =
+        tool.read_answer("c1", &args7, Some(&ui), &payload("ask-c1", wrong))
+    else {
+        panic!("not refused")
+    };
+    assert!(say(refusal).ends_with("the answer is neither yes nor no.\nSure?"));
+}
+
+// ---- a yes or no said in words ----
+
+#[tokio::test]
+async fn a_yes_or_no_the_person_types_for_a_form_that_went_out_as_words_is_that_answer() {
+    let ask = |extra: Value| {
+        let mut q = json!({"id": "go", "question": "Delete it?", "type": "confirm"});
+        q.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"question": "Sure?", "choices": [q]})
+    };
+    let tool = Ui::new(McpPolicy::default())
+        .tools()
+        .get("ask_user")
+        .cloned()
+        .unwrap();
+    let said =
+        |args: &Value, text: &str| tool.read_answer("c1", args, None, &json!({"text": text}));
+    let plain = ask(json!({}));
+    for (text, want) in [
+        ("yes", "yes"),
+        ("YES", "yes"),
+        ("no", "no"),
+        ("No", "no"),
+        ("Yes", "yes"),
+    ] {
+        assert_eq!(said(&plain, text), AnswerCheck::Read(want.into()), "{text}");
+    }
+    for text in [
+        "yes please",
+        "y",
+        "maybe",
+        " yes",
+        "yes ",
+        "",
+        "no way",
+        "yes\nno",
+    ] {
+        assert_eq!(said(&plain, text), AnswerCheck::Accept, "{text:?}");
+    }
+    // The person's own labels say the same.
+    let labelled = ask(json!({"yesLabel": "Delete it", "noLabel": "Keep it"}));
+    assert_eq!(
+        said(&labelled, "delete it"),
+        AnswerCheck::Read("yes".into())
+    );
+    assert_eq!(said(&labelled, "KEEP IT"), AnswerCheck::Read("no".into()));
+    assert_eq!(said(&labelled, "yes"), AnswerCheck::Read("yes".into()));
+    assert_eq!(said(&labelled, "delete"), AnswerCheck::Accept);
+    // A label that is the other word's is both, and so neither.
+    let tangled = ask(json!({"yesLabel": "No", "noLabel": "Yes"}));
+    assert_eq!(said(&tangled, "yes"), AnswerCheck::Accept);
+    // Only a form of one question that is a yes or no is read so; a form that went out as a form is
+    // answered with its form, and what is typed beside it is words.
+    let two = json!({"question": "Sure?", "choices": [
+        {"id": "go", "question": "Delete it?", "type": "confirm"},
+        {"id": "n", "question": "How many?", "type": "number"}]});
+    assert_eq!(said(&two, "yes"), AnswerCheck::Accept);
+    let single = json!({"question": "Sure?", "choices": [
+        {"id": "go", "question": "Which?", "options": ["Yes", "No"]}]});
+    assert_eq!(said(&single, "yes"), AnswerCheck::Accept);
+    let (tool7, args7, ui7) = asked_on(&screen(V7, V7_LOCK), plain.clone()).await;
+    assert_eq!(
+        tool7.read_answer("c1", &args7, Some(&ui7), &json!({"text": "yes"})),
+        AnswerCheck::Accept
+    );
+}
+
+#[tokio::test]
+async fn the_model_reads_the_value_of_a_yes_or_no_that_was_typed_to_words() {
+    let rig = Rig::new();
+    rig.model
+        .push_tool_calls(vec![ToolCall {
+            id: "q-call".into(),
+            name: "ask_user".into(),
+            arguments: json!({"question": "Delete the branch?", "choices": [
+                {"id": "go", "question": "Delete it?", "type": "confirm",
+                 "yesLabel": "Delete it", "noLabel": "Keep it"}]}),
+            ..Default::default()
+        }])
+        .push_text("Kept.");
+    let (stop, handle) = rig.worker();
+    // A screen with no catalog gets the question in words.
+    let task = rig
+        .backend
+        .submit(
+            alice(),
+            Message::new(Role::User, vec![Part::text("clean up")]),
+            None,
+            Some("ctx".into()),
+        )
+        .await
+        .unwrap();
+    rig.asking(&task, "Delete the branch?").await;
+    rig.send(&task, Message::new(Role::User, vec![Part::text("Keep it")]))
+        .await;
+    rig.until(&task, "completed", |t| {
+        t.status.state == TaskState::Completed
+    })
+    .await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
+    assert_eq!(
+        rig.model.requests()[1].messages.last(),
+        Some(&adam_model::Message::tool_result("q-call", "no"))
+    );
+}
+
+// ---- what is not judged ----
+
+#[tokio::test]
+async fn a_call_that_cannot_be_read_back_is_accepted() {
+    let (tool, _, ui) = asked_with_v7().await;
+    // Nine questions are more than a form holds: the arguments cannot be normalized again.
+    let many: Vec<Value> = (0..9)
+        .map(|n| json!({"id": format!("q{n}"), "question": "Q?", "type": "confirm"}))
+        .collect();
+    assert_eq!(
+        tool.read_answer(
+            "c1",
+            &json!({"question": "Q", "choices": many}),
+            Some(&ui),
+            &payload("ask-c1", json!({"answers": []}))
+        ),
+        AnswerCheck::Accept
+    );
+}
+
+#[tokio::test]
+async fn a_note_is_the_words_of_the_forms_box_and_nothing_else() {
+    let screen = screen(V7, V7_LOCK);
+    let ask = |free: bool| {
+        json!({"question": "Q", "freeInput": free,
+               "choices": [{"id": "ok", "question": "Sure?", "type": "confirm"}]})
+    };
+    let yes = |note: Value| json!({"answers": [{"id": "ok", "values": ["yes"]}], "note": note});
+    for (free, note, want) in [
+        (true, json!("hi"), None),
+        (true, json!(null), Some("unexpected")),
+        (true, json!(5), Some("unexpected")),
+        (false, json!("hi"), Some("unexpected")),
+        (false, json!(null), Some("unexpected")),
+    ] {
+        let (tool, args, ui) = asked_on(&screen, ask(free)).await;
+        assert_eq!(
+            verdict(&tool, &args, &ui, "ask-c1", yes(note.clone())),
+            want.map(|rule| ("*".to_owned(), rule.to_owned())),
+            "free box {free}, note {note}"
+        );
+    }
+    // No note at all is fine either way.
+    for free in [true, false] {
+        let (tool, args, ui) = asked_on(&screen, ask(free)).await;
+        let none = json!({"answers": [{"id": "ok", "values": ["yes"]}]});
+        assert_eq!(verdict(&tool, &args, &ui, "ask-c1", none), None);
+    }
+}
+
+#[tokio::test]
+async fn an_answer_out_of_order_that_also_has_a_foreign_member_is_unknown_first() {
+    let (tool, args, ui) = asked_with_v7().await;
+    let mut answers = good();
+    answers.as_array_mut().unwrap().swap(0, 1);
+    assert_eq!(
+        verdict(
+            &tool,
+            &args,
+            &ui,
+            "ask-c1",
+            json!({"answers": answers, "extra": 1})
+        ),
+        Some(("*".into(), "unknown".into()))
+    );
+    assert_eq!(
+        verdict(
+            &tool,
+            &args,
+            &ui,
+            "ask-c1",
+            json!({"answers": good(), "extra": 1})
+        ),
+        Some(("*".into(), "unexpected".into()))
     );
 }

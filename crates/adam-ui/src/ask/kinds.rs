@@ -7,9 +7,10 @@
 //! from the version number: the catalog says the schema is the better test, and a later version may
 //! add more.
 
+use adam_a2a_runtime::is_format_or_control;
 use serde_json::{Map, Value, json};
 
-use super::answer::{Bound, Check, Decimal, QuestionSpec, check_values, is_day};
+use super::answer::{Bound, Check, Decimal, QuestionSpec, check_values, is_day, parse_whole};
 use super::{
     ChoiceOption, DefaultArg, Form, Kind, MAX_LABEL, MAX_OPTIONS, MIN_OPTIONS, Question, clipped,
     resolve_defaults,
@@ -30,11 +31,25 @@ const MAX_HELP: usize = 300;
 const SHOWN: usize = 40;
 
 /// A number the model may write as a JSON number or as a string.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub(super) enum Scalar {
     Text(String),
     Number(serde_json::Number),
+}
+
+impl Scalar {
+    /// What the model gave for `member` of question `id`, or what it got wrong, naming the member.
+    pub(super) fn of(id: &str, member: &str, given: Value) -> Result<Self, String> {
+        match given {
+            Value::String(text) => Ok(Self::Text(text)),
+            Value::Number(number) => Ok(Self::Number(number)),
+            other => Err(format!(
+                "`{member}` of question `{id}` is {}, which is neither a string nor a number: \
+                 write it as a string like \"12.5\" or a number",
+                shown(&other.to_string())
+            )),
+        }
+    }
 }
 
 /// What the model said about the members of the five kinds, as it said it.
@@ -139,10 +154,11 @@ fn decimal_text(id: &str, member: &str, given: Scalar) -> Result<String, String>
     ))
 }
 
-/// A whole number the model gave as a string or a JSON number.
+/// A whole number the model gave as a string or a JSON number: a string in the grammar of a scale's
+/// points (`0` or `7`, never `07` or `+1`).
 fn whole_of(id: &str, member: &str, given: Scalar) -> Result<i64, String> {
     let parsed = match &given {
-        Scalar::Text(text) => text.trim().parse::<i64>().ok(),
+        Scalar::Text(text) => parse_whole(text.trim()).map(i64::from),
         Scalar::Number(number) => number.as_i64().or_else(|| {
             number
                 .as_f64()
@@ -152,6 +168,21 @@ fn whole_of(id: &str, member: &str, given: Scalar) -> Result<i64, String> {
         }),
     };
     parsed.ok_or_else(|| format!("`{member}` of question `{id}` is not a whole number"))
+}
+
+/// `text` has nothing the person cannot see: no hidden, control or bidirectional character (a line
+/// break and a tab are allowed when `breaks` says the member may have lines).
+pub(super) fn plain(id: &str, member: &str, text: &str, breaks: bool) -> Result<(), String> {
+    match text
+        .chars()
+        .find(|c| !(breaks && matches!(c, '\t' | '\n' | '\r')) && is_format_or_control(*c))
+    {
+        Some(hidden) => Err(format!(
+            "`{member}` of question `{id}` has a character the person cannot see (U+{:04X}): write plain words",
+            u32::from(hidden)
+        )),
+        None => Ok(()),
+    }
 }
 
 /// A label of 1 to `most` characters, or nothing.
@@ -168,6 +199,7 @@ fn label_of(
             "`{member}` of question `{id}` has to be 1 to {most} characters"
         ));
     }
+    plain(id, member, &text, false)?;
     Ok(Some(text))
 }
 
@@ -207,25 +239,15 @@ pub(super) fn finish(
                 None => {}
                 Some(DefaultArg::One(word)) => {
                     let word = word.trim();
-                    let said = |label: Option<&str>, fallback: &str| {
-                        label.unwrap_or(fallback).eq_ignore_ascii_case(word)
+                    let Some(safe) =
+                        confirm_answer(word, ext.yes_label.as_deref(), ext.no_label.as_deref())
+                    else {
+                        return Err(format!(
+                            "the default of question `{id}` is {}: use \"yes\" or \"no\", the safe answer",
+                            shown(word)
+                        ));
                     };
-                    let yes =
-                        word.eq_ignore_ascii_case("yes") || said(ext.yes_label.as_deref(), "Yes");
-                    let no = word.eq_ignore_ascii_case("no") || said(ext.no_label.as_deref(), "No");
-                    out.default_text = Some(
-                        match (yes, no) {
-                            (true, false) => "yes",
-                            (false, true) => "no",
-                            _ => {
-                                return Err(format!(
-                                    "the default of question `{id}` is {}: use \"yes\" or \"no\", the safe answer",
-                                    shown(word)
-                                ));
-                            }
-                        }
-                        .to_owned(),
-                    );
+                    out.default_text = Some(safe.to_owned());
                 }
                 Some(DefaultArg::Many(_)) => return Err(not_that("a list")),
                 Some(DefaultArg::Number(_)) => return Err(not_that("a number")),
@@ -359,6 +381,25 @@ pub(super) fn finish(
         ));
     }
     Ok(out)
+}
+
+/// The answer `word` is to a yes or no whose buttons say `yes_label` and `no_label` ("Yes" and "No"
+/// when absent): `yes` or `no`, or one of the two labels, in any case. `None` when it is neither,
+/// or when it says both.
+pub(super) fn confirm_answer(
+    word: &str,
+    yes_label: Option<&str>,
+    no_label: Option<&str>,
+) -> Option<&'static str> {
+    let word = word.to_lowercase();
+    let says = |label: &str| label.to_lowercase() == word;
+    let yes = word == "yes" || says(yes_label.unwrap_or("Yes"));
+    let no = word == "no" || says(no_label.unwrap_or("No"));
+    match (yes, no) {
+        (true, false) => Some("yes"),
+        (false, true) => Some("no"),
+        _ => None,
+    }
 }
 
 /// What is wrong with the question's default as an answer, if it has one.
