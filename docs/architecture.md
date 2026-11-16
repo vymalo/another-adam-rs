@@ -1211,6 +1211,45 @@ stateDiagram-v2
     Kept --> [*]: the janitor removes it with the run
 ```
 
+A **command that keeps running** (`start_command`, a development server) writes into the same file as it prints, line by line,
+after the secrets are scrubbed, and has a record `<id>.cmd` beside it. The coder holds the process; nothing outlives its run.
+Who stops it, and the lifecycle, are in [The coder agent](reference/coder-agent.md#commands-that-keep-running).
+
+```mermaid
+sequenceDiagram
+    participant A as CoderAgent::step
+    participant C as Commands (ToolEnv)
+    participant W as the sweep component<br/>BACKGROUND_SWEEP_SECS
+    participant S as Store
+    participant J as Janitor
+    participant E as Environment
+    A->>C: stop_run, when the root run is done or failed, or parks on the person
+    Note over A,C: a cancel commits Failed and never calls the agent's step
+    loop every BACKGROUND_SWEEP_SECS
+        W->>C: sweep
+        C->>S: load_run for each run that has a command
+        S-->>C: finished, or not known
+        C->>C: stop_run, and stop a command whose record names another owner
+    end
+    J->>S: the standing of each workspace
+    J->>C: stop_run, before the release
+    J->>E: release(run)
+    W->>C: stop_all, when the worker stops
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Starting: reserved and recorded
+    Starting --> Running: spawned
+    Running --> Exited: ended by itself
+    Running --> Stopped: a stop, its lifetime, or the run ended
+    Starting --> Gone: another owner's record
+    Running --> Gone: another owner's record
+    Exited --> [*]
+    Stopped --> [*]
+    Gone --> [*]
+```
+
 ## The two agents
 
 | | [`adam-coder`](../bin/adam-coder/README.md) | [`adam-agent`](../bin/adam-agent/README.md) |

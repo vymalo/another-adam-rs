@@ -49,6 +49,7 @@ sequenceDiagram
 | `start_scratch { name? }` | `RunWorkspace::add_scratch_for` for the run and its conversation (and then `Environment::seal`, like `prepare_workspace` and `publish_scratch`: a run pod mounts each slot on its own, [below](#a-pod-of-its-own-for-each-run)) (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. A project the conversation's earlier tasks made is returned with the files it holds listed. The result says the project **stays for the conversation** (the next tasks find it; it goes after days with no task in it) and that nothing reaches a repository unless it is published, and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
 | `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **that is granted** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that sends the model to `run` (to make something with a command) or to the file tools (to change code). Writes to ignored paths (build output) are not changes. **For looking**: see `run` for making and `run_checks` for checking |
+| `start_command { command, cwd?, repo?, wait?, wait_for? }`, `stop_command { id }`, `list_commands {}` | **a command that keeps running** (a development server, a watcher), read with `read_output` and gone with its run ([below](#commands-that-keep-running-start_command-stop_command-list_commands)). `start_command` (tier `edits`, a slot the run may write, never a reference) waits `wait` seconds (default 5, 1 to 120), or until a line has `wait_for`, or until it ends, and answers with the id (the call's output id), the first page of the output so far and its last line, `[running: N lines so far; next page: offset=N+1]`; `stop_command` and `list_commands` are tier `plan` |
 | `read_output { id, offset?, limit? }` | a kept output, **one page at a time** ([Kept output](#kept-output-read_output-and-the-timeout-of-a-command)): the plain lines of what a command printed (or of a long MCP result) behind the id its result named, at most 2,000 lines or 50 KiB, and a last line `[more: N lines left; next page: offset=K]` or `[end: N lines]`; a negative `offset` reads from the end. The same call gives the same bytes. Tier `plan`; read in the coder's own process, never in a run pod. An id that is not one, that nobody kept (or whose run's files were removed) or that belongs to another run is an error result that says which |
 | `run { command, cwd?, repo?, timeout? }` | **making something with a command, and keeping it**: `npm run render`, `python chart.py`, an install, a build. Runs exactly as `run_command` does (the run's environment, the same shell, `cwd` rule, `CHECK_TIMEOUT_SECS` and output cap, secrets hidden from the child, a missing tool reported as a missing toolchain), but the **files it changes stay**, and the result lists what `git status` shows (files the project ignores are kept too and are not listed). It is **never a check**: no `checks` artifact, no cycle, nothing written to the run's notes, so the gate cannot see it; the files it changed make an earlier green check stale, which the result says. It cannot touch git: the same record as `run_command`'s is compared after the command, minus the files, and a command that changed `HEAD`, the branch, a ref, the `.git` file, the configuration or `info/exclude` is **undone entirely, its files included**, and refused ([below](#making-something-with-a-command)). A timeout kills the process group and what it had written stays. Progress lines: `running: <command>`, then `changed files: <command>` or `ran: <command>` |
 | `request_repository { repo_url, reason, reference? }` | **asks the person** whether another repository may join the workspace: the run parks (`input-required`) on a question **the tool writes**, which names the repository and quotes the model's `reason` (one line, at most 300 characters: `May I add the repository acme/lib (https://github.com/acme/lib) to this workspace? The agent says why: "..."`) and offers `Yes, add acme/lib` and `No`, as a form (one `Choices` question, id `consent`) on a screen that can draw it and as text on one that cannot (the same machinery as `ask_user`'s `choices`, [below](#asking-with-choices)). Only a yes adds the repository (it is then **granted**: the model calls `prepare_workspace` with it); the model never grants, see [the rules](#another-repository-only-with-the-persons-yes). A repository already granted is a result that says so (nobody is asked); one the person turned down (an explicit `no`) is an error result that says not to ask again; a message that is neither a yes nor a no (`wait`, `?`) records nothing, and the tool asks again; one the workspace's policy would refuse (its host is not in `ALLOWED_REPO_HOSTS`, or it is a local path) is an error result **before** anyone is asked. In a run another agent started it asks nobody and says so in an error result ([below](#when-another-agent-asks-nobody-to-agree)). `asks_user()` is `true`, so a subagent cannot have it | With `reference` (the name of one a prepared repository listed in its `.agents/references.json`) it asks to **read** that repository and never change it: [References](#references).
@@ -1594,6 +1595,38 @@ stateDiagram-v2
   Answered --> [*]
 ```
 
+### Commands that keep running: `start_command`, `stop_command`, `list_commands`
+
+[ADR 0044](../../docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 16.
+`bin/adam-coder/src/tools/background.rs`; the diagrams are in [The coder agent](../../docs/reference/coder-agent.md#commands-that-keep-running).
+
+* **The id is the call's output id** (`adam_llm_agent::output_id_of`), so a start step that runs again has the same id, and the
+  output is read with `read_output`, whose schema did not change. The output is appended to `<root>/outputs/<run>/<id>.txt` as it
+  arrives, scrubbed **before** it is written (`StreamScrubber`: no secret, split or not, is ever on the volume) and folded into lines
+  (`LineFolder`: only complete lines are written, so a page of lines already there is the same bytes on every read). `FileKept` knows
+  the id is live (`open_live`, `end_live`, `is_live`), and the last line of the last page is `[running: N lines so far; next page: offset=N+1]`. The
+  file stops at 16 MiB (`CoderSettings::background_output_max`) or when the run has no room (64 MiB); then only the last 64 KiB stay in
+  memory, for `stop_command` and `list_commands`.
+* **The record** `<id>.cmd` (JSON, `0600`): the command (scrubbed, 1 KiB), slot, cwd, exec id, **owner** (a token this process made at
+  start), the pid and its start time, `state` (`starting`, `running`, `exited`, `stopped`, `gone`). A worker that starts, stops or lists
+  reads the run's records: one that says `running` and that this process does not hold is of a worker that is gone, so its process is
+  killed (by exec id, and by pid when the start time still matches) and the record says `gone: the worker that ran it restarted; start
+  it again`. The janitor removes `outputs/<run>` with the workspace, records included.
+* **Replay.** The registry (`Commands`, `ToolEnv::commands`) finds the command of the id: the call returns its view and starts nothing.
+  Otherwise the earlier try's process is killed and the command starts again, its output begun again. At most one process per id.
+* **When it stops:** `stop_command`; `BACKGROUND_COMMAND_MAX_SECS`; the root run ends (`CoderAgent::step`, at once; a cancel never calls
+  the agent, so `Commands::sweep` reads the run's standing every `BACKGROUND_SWEEP_SECS` and stops what is over); the run parks on the
+  person (`ask_user`); `rebuild_environment`; the janitor's release; the worker's shutdown. A process group is killed, and what a pod or
+  a devcontainer holds is stopped by exec id.
+* **Limits:** at most `BACKGROUND_COMMANDS_MAX` run at once in a run (refused with the number and how to stop one). Commands belong to the
+  **root run**: a subagent's tools reach them, and the read-only helpers cannot start one (tier `plan`). Time limits of the tools: see
+  `own_limit`.
+* **Git.** The slot's git state is read at the start and at the end; a change (HEAD, a ref, `.git`, the configuration) is **reported and
+  not undone**, because the run's own `commit_and_push` moves them too. `run_command`'s undo guard names the commands that keep running in
+  its slot when it refuses.
+* **Sandbox time (ADR 0043)** is reported at the call that sees the end; a command stopped by the sweep or the run's end goes unmetered.
+* The prompt names the three tools in one line (the guidance is in the tool descriptions, which are fixed for the process).
+
 ### Making something with a command
 
 `run` is `run_command`'s sibling for the jobs that need a command to **make** something: generate or export a file, install
@@ -2061,6 +2094,7 @@ way; every problem is reported at once at startup):
 | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
 | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart (at least 1) | `5` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` (and of one `run_command` and one `run`): the time limit is also **the most a call's `timeout` may ask for**; the output size is what is shown of a long output, a quarter of it the head and the rest the tail (the whole is kept) | `900`, `16384` |
+| `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS`, `BACKGROUND_SWEEP_SECS` | commands of one run that keep running at once (1 to 16), how long each may run (60 to 86400 s), and how often the sweep stops the commands of a run that is over (1 to 3600 s). **`0` is refused** (exit 78, the message names the variable): the bound of the three is what keeps a process from outliving its run | `4`, `3600`, `15` |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. The shipped `mcp.json` does not need it any more (the GitHub server is the sidecar, over http); the chart and `compose.yaml` still set it for one release, for an agent folder written before the sidecar. The image does not set it (it also carries `adam-agent`, which must refuse local processes unless its own deployment opts in) | `false` |
@@ -2493,6 +2527,17 @@ Everything is offline (`cargo test -p adam-coder`; with
 `ADAM_TEST_POSTGRES_URL` set the Postgres variants run too, each case in a
 database of its own, so the role needs `CREATEDB`):
 
+* **Commands that keep running** (`tests/background.rs`, real processes with short lifetimes and sweeps through the settings;
+  `tests/janitor.rs`): `start_read_stop_locally` (3,000 lines then `sleep 600`: pages 1 and 2001, the
+  running line, the same bytes twice, stop, `[end: 3000 lines]`), `a_command_that_ends_inside_the_wait_gives_the_result_of_run`,
+  `a_start_run_again_with_the_same_call_starts_one_process`, `a_replay_in_another_process_kills_the_old_one_and_starts_again`,
+  `a_restarted_worker_says_gone_and_kills_by_exec_id`, `a_pod_command_is_stopped_through_adam_exec_kill`,
+  `output_is_scrubbed_before_it_is_written` (a secret of three lines split across two reads, nothing of it on the volume at any time),
+  `output_stops_at_the_cap`, `the_lifetime_ends_it`, `more_than_the_maximum_is_refused`, `a_finished_root_run_stops_its_commands`,
+  `a_park_on_the_person_stops_the_commands`, `a_cancelled_run_is_reached_by_the_sweep`,
+  `three_identical_reads_of_a_quiet_command_are_refused`, `git_changes_of_a_background_command_are_reported_at_stop`, and in
+  `tests/janitor.rs` `the_sweep_stops_background_commands_before_release`. A kind scenario (a development server in a run pod,
+  `curl localhost:PORT` from `run_command`, a second repository stopping it) is **not** written: only CI with a cluster could prove it.
 * The git sandbox, with a real `adam-git-sandbox` process (built by the test): `src/tools/gitcli.rs`
   (`sandboxed_tests`) asks the questions the tools ask (`working_tree_id`, `status_text`, `head_sha`, `repo_state`,
   `commits_ahead`) of a scratch project whose configuration runs a program as a clean filter and of a worktree: the program runs under
