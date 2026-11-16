@@ -28,8 +28,8 @@
 //!
 //! * **The output** is `<root>/outputs/<root run>/<id>.txt`, as for every kept output, appended
 //!   line by line while the process runs. It is scrubbed **before** it is written
-//!   ([`StreamScrubber`](adam_llm_agent::StreamScrubber): a secret split between two reads is never
-//!   on the volume) and folded into lines ([`LineFolder`](adam_llm_agent::LineFolder)); only complete
+//!   ([`StreamScrubber`]: a secret split between two reads is never
+//!   on the volume) and folded into lines ([`LineFolder`]); only complete
 //!   lines are written, so a page of lines already there is the same bytes on every read, and only
 //!   the page's last line, `[running: n lines so far; next page: offset=n+1]`, moves. The file
 //!   stops at [`MAX_KEPT_BYTES`](adam_llm_agent::MAX_KEPT_BYTES) and at the run's room, with the
