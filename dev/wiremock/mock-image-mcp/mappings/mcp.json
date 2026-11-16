@@ -1,0 +1,195 @@
+{
+  "mappings": [
+    {
+      "name": "mcp: initialize",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "initialize"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"protocolVersion\":\"{{jsonPath request.body '$.params.protocolVersion'}}\",\"capabilities\":{\"tools\":{\"listChanged\":false},\"prompts\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"mock-image-mcp\",\"version\":\"0.0.0\"},\"instructions\":\"Call `draw` with a short `prompt` to make one picture. It answers with one PNG image, which is shared with the person as a file.\"}}"
+      }
+    },
+    {
+      "name": "mcp: notifications",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "matches": "notifications/.*"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 202
+      }
+    },
+    {
+      "name": "mcp: tools/list",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "tools/list"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"tools\":[{\"name\":\"draw\",\"description\":\"Make a picture from a short prompt.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\"}},\"required\":[\"prompt\"]}}]}}"
+      }
+    },
+    {
+      "name": "mcp: tools/call draw",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "tools/call"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.params.name",
+              "equalTo": "draw"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"content\":[{\"type\":\"image\",\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC\",\"mimeType\":\"image/png\"}]}}"
+      }
+    },
+    {
+      "name": "mcp: prompts/list",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "prompts/list"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"prompts\":[{\"name\":\"scene\",\"description\":\"Paint a scene about a subject.\",\"arguments\":[{\"name\":\"subject\",\"description\":\"What to paint.\",\"required\":true}]}]}}"
+      }
+    },
+    {
+      "name": "mcp: prompts/get scene",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "prompts/get"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.params.name",
+              "equalTo": "scene"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"description\":\"Paint a scene.\",\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"[mock:paint] Paint a scene of {{jsonPath request.body '$.params.arguments.subject'}}.\"}}]}}"
+      }
+    },
+    {
+      "name": "mcp: ping",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "ping"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{}}"
+      }
+    },
+    {
+      "name": "mcp: GET (no standalone stream)",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/mcp"
+      },
+      "response": {
+        "status": 405
+      }
+    },
+    {
+      "name": "mcp: DELETE (no session to end)",
+      "priority": 1,
+      "request": {
+        "method": "DELETE",
+        "urlPath": "/mcp"
+      },
+      "response": {
+        "status": 405
+      }
+    }
+  ]
+}

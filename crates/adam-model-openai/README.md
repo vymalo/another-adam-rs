@@ -160,7 +160,7 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
   sent as one string; the usage parts of a completion and of a stream's last chunk, absent ones, and reasoning beside a smaller
   completion count; made-up ids for calls with none: random, distinct, the same in the stream and the message).
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
-  streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`)
+  streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`, `mock-painter`)
   played from its first request to its final answer both as a completion and as a stream, which must say the same, with the
   coder's last answer arriving over time: the guard that the SSE twins of `dev/wiremock/mock-openai` do not drift from the
   scripts they copy. Passes without doing anything unless `ADAM_TEST_MOCK_OPENAI_URL` is set (CI's `compose` job sets it).

@@ -258,7 +258,7 @@ jobs:
           docker compose --profile app config -q
           docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app config -q
       - name: Start postgres and the mocks
-        run: docker compose up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server
+        run: docker compose up -d --build --wait postgres mock-openai mock-github mock-github-mcp mock-image-mcp git-server
       - name: Smoke-test each service
         run: |
           set -eu
@@ -345,6 +345,14 @@ jobs:
             -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" = 401
           curl -fsS http://127.0.0.1:8085/mcp -H 'Authorization: Bearer x' -H 'Content-Type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -e '.result.tools | length == 12' > /dev/null
+          # mock-image-mcp (the painter's image server): `initialize` carries instructions, and `tools/call`
+          # of `draw` answers with one image content block.
+          curl -fsS http://127.0.0.1:8086/mcp -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+            | jq -e '.result.instructions | contains("draw")' > /dev/null
+          curl -fsS http://127.0.0.1:8086/mcp -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"draw","arguments":{"prompt":"x"}}}' \
+            | jq -e '.result.content[0] | .type == "image" and .mimeType == "image/png"' > /dev/null
           # git-server: clone, push a branch, see it on the remote.
           git clone -q http://127.0.0.1:8083/local/sandbox.git "$RUNNER_TEMP/sandbox"
           cd "$RUNNER_TEMP/sandbox"
@@ -360,6 +368,7 @@ jobs:
           ADAM_TEST_MOCK_OPENAI_URL: http://127.0.0.1:8081
           ADAM_TEST_MOCK_GITHUB_URL: http://127.0.0.1:8082
           ADAM_TEST_MOCK_GITHUB_MCP_URL: http://127.0.0.1:8085/mcp
+          ADAM_TEST_MOCK_IMAGE_MCP_URL: http://127.0.0.1:8086/mcp
         run: cargo test -p adam-model-openai -p adam-workspace -p adam-mcp --test wiremock_compose
       - name: Logs
         if: failure()

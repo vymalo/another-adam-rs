@@ -87,6 +87,19 @@ services:
     volumes:
       - ./dev/wiremock/mock-github-mcp/mappings:/home/wiremock/mappings:ro
 
+  # An image MCP server's streamable HTTP endpoint, as the painter agent (dev/agents/painter) sees it:
+  # `initialize` (with `instructions`), `tools/list` (`draw`), `tools/call` of `draw` (one `image` content
+  # block, a 1x1 PNG), `prompts/list` and `prompts/get` of `scene`. No authentication. The painter's
+  # `mcp.json` names it, so the agent needs MCP_ALLOW_INSECURE (plain http to another container):
+  # dev/painter-e2e.sh starts the agent with AGENT_MCP_ALLOW_INSECURE=true.
+  # Endpoint: http://127.0.0.1:8086/mcp
+  mock-image-mcp:
+    <<: *wiremock
+    command: ["--global-response-templating"]
+    ports: ["127.0.0.1:${MOCK_IMAGE_MCP_PORT:-8086}:8080"]
+    volumes:
+      - ./dev/wiremock/mock-image-mcp/mappings:/home/wiremock/mappings:ro
+
   # A git remote for the coder: bare repositories over smart HTTP, seeded with
   # local/sandbox.git (a README and a `just check` script). No authentication.
   # Clone URL: http://127.0.0.1:8083/local/sandbox.git
@@ -271,7 +284,8 @@ services:
       # The mounted folder below: what the agent says and offers, read at startup.
       ADAM_AGENT_DIR: /etc/adam/agent
       # What an `mcp.json` in the folder may name: nothing but https and loopback unless set here.
-      # MCP_ALLOW_INSECURE: "true" # development only: plain http to another container
+      # Development only: plain http to another container (the painter's image server).
+      MCP_ALLOW_INSECURE: ${AGENT_MCP_ALLOW_INSECURE:-false}
     ports: ["127.0.0.1:${AGENT_PORT:-8084}:8080"]
     volumes:
       - ${AGENT_FOLDER:-./dev/agents/assistant/agent}:/etc/adam/agent:ro

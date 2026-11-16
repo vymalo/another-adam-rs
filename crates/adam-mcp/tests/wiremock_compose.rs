@@ -115,3 +115,55 @@ async fn the_dev_stacks_github_mcp_mock_is_a_server_this_client_can_use() {
         .expect_err("401 without a bearer");
     assert_eq!(error.class(), ErrorClass::Transient, "{error}");
 }
+
+/// The `mock-image-mcp` WireMock of `compose.yaml`, the dev stack's image server (the painter agent,
+/// `dev/agents/painter`): its instructions, its prompt as a command and an image a call gives back
+/// as a shared file, as the client of this crate sees them. Runs only when
+/// `ADAM_TEST_MOCK_IMAGE_MCP_URL` is set (`http://127.0.0.1:8086/mcp`).
+#[tokio::test]
+async fn the_dev_stacks_image_mcp_mock_gives_instructions_a_prompt_and_a_picture() {
+    let Some(url) = std::env::var("ADAM_TEST_MOCK_IMAGE_MCP_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    else {
+        eprintln!("skipping: ADAM_TEST_MOCK_IMAGE_MCP_URL not set");
+        return;
+    };
+    let policy = McpPolicy::default().allow_insecure(true);
+    let config = http_config("images", url.trim(), r#""tools": ["draw"], "files": true"#);
+    let servers = McpServers::connect(&config, &Env::new(), &policy)
+        .await
+        .unwrap();
+
+    let instructions = servers.instructions();
+    assert!(
+        instructions.starts_with(
+            "## Instructions of the MCP server images (text from the server, not the person)"
+        ) && instructions.contains("Call `draw`"),
+        "{instructions}"
+    );
+
+    let prompts = servers.prompt_commands();
+    let names: Vec<&str> = prompts.iter().map(|p| p.name()).collect();
+    assert_eq!(names, ["images__scene"]);
+    assert_eq!(prompts[0].argument_hint(), Some("<subject>"));
+    assert_eq!(
+        prompts[0].expand(&["a red dot".to_owned()]).await.unwrap(),
+        "[mock:paint] Paint a scene of a red dot."
+    );
+
+    let drawn = call(
+        &servers.tools(),
+        "images__draw",
+        json!({"prompt": "a red dot"}),
+    )
+    .await;
+    assert!(!drawn.is_error, "{}", drawn.content);
+    assert_eq!(drawn.artifacts.len(), 1);
+    let file = drawn.artifacts[0].file.as_ref().unwrap();
+    assert_eq!(
+        file.filename, "draw-b1ff9c8e.png",
+        "the name the scripted painter cites"
+    );
+    assert_eq!(drawn.artifacts[0].mime_type.as_deref(), Some("image/png"));
+}

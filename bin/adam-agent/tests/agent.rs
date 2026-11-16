@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1789,5 +1790,87 @@ async fn a_prompt_that_is_not_text_is_refused_before_anything_is_stored() {
     assert!(
         matches!(&error, adam_a2a::BackendError::InvalidParams(why) if why.contains("not text")),
         "{error:?}"
+    );
+}
+
+/// The shipped painter reads cleanly, names its image server with a longer timeout than the default
+/// and says in its mcp.json that the images are shared as files.
+#[tokio::test]
+async fn the_shipped_painter_loads_without_a_warning() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/agents/painter");
+    let loaded = folder::load(&dir).expect("the painter loads");
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.def.name(), "painter");
+    let card = card_of(&loaded.def, &url()).unwrap();
+    assert_eq!(card.name, "Painter");
+    let images = &loaded.def.manifest().mcp.as_ref().unwrap().servers["images"];
+    assert!(images.shares_files());
+    assert_eq!(images.settings().timeout_secs, Some(120));
+    assert_eq!(images.settings().connect_timeout_secs, Some(10));
+    assert!(images.settings().instructions && images.settings().prompts);
+}
+
+/// The painter's scenario of the compose stack, on the test server: the instructions of the image
+/// server reach the model's prompt, the model draws, the picture is a file of the task, and the
+/// words name it.
+#[tokio::test]
+async fn the_painter_draws_and_shares_the_picture_with_the_servers_instructions_in_its_prompt() {
+    let script = adam_mcp_testkit::Script {
+        instructions: Some("Call `draw` with a short `prompt`.".into()),
+        prompts: Vec::new(),
+    };
+    let server = TestHttpServer::start_scripted(None, script).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/agents/painter/agent");
+    let agent = tmp.path().join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::copy(from.join("instructions.md"), agent.join("instructions.md")).unwrap();
+    // The shipped file with the test server in place of the compose name, and the test server's tool.
+    let shipped = std::fs::read_to_string(from.join("mcp.json")).unwrap();
+    let mcp = shipped
+        .replace("http://mock-image-mcp:8080/mcp", &server.url())
+        .replace("\"draw\"", "\"screenshot\"");
+    std::fs::write(agent.join("mcp.json"), mcp).unwrap();
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "paint-call-1".into(),
+        name: "images__screenshot".into(),
+        arguments: json!({}),
+        ..Default::default()
+    }])
+    .push_text("I painted it.");
+    let model: DynModel = mock.clone();
+    let agents = build(
+        folder::load(tmp.path()).unwrap().def,
+        None,
+        Some(worker_parts(model)),
+    )
+    .await
+    .unwrap();
+    let service = service_over(agents, &store());
+    let worker = Worker::start(&service);
+    let done = ask(&service, "paint a red dot").await;
+    worker.stop().await;
+    assert_eq!(said(&done), Some("I painted it."));
+    let requests = mock.requests();
+    let system = requests[0].system.as_deref().unwrap();
+    assert!(
+        system.contains(
+            "## Instructions of the MCP server images (text from the server, not the person)\n\n\
+             Call `draw` with a short `prompt`."
+        ),
+        "{system}"
+    );
+    assert_eq!(
+        requests[0].system, requests[1].system,
+        "the same on every call"
+    );
+    let shared = done.artifacts.as_deref().unwrap_or_default();
+    assert!(
+        shared.iter().any(|a| a
+            .parts
+            .iter()
+            .any(|p| p.media_type.as_deref() == Some("image/png"))),
+        "{shared:?}"
     );
 }

@@ -460,6 +460,27 @@ async fn the_scripted_models_stream_what_they_complete() {
     .await;
     assert_eq!(cards.len(), 2);
     grows(&cards, 2, "the researcher's answer");
+
+    // The painter: it draws once the instructions of its MCP server are in its prompt, and says so
+    // when they are not (which is how the compose scenario proves they reach the model).
+    let heading = "## Instructions of the MCP server images (text from the server, not the person)";
+    let painted = play(
+        &client,
+        "mock-painter",
+        &format!("You paint.\n\n{heading}\n\nCall draw."),
+        user("[mock:paint] a red dot"),
+    )
+    .await;
+    assert_eq!(painted.len(), 2, "the call, then the answer");
+    grows(&painted, 2, "the painter's answer");
+    let blind = play(
+        &client,
+        "mock-painter",
+        "You paint.",
+        user("[mock:paint] a red dot"),
+    )
+    .await;
+    assert_eq!(blind.len(), 1, "no instructions, no drawing");
 }
 
 /// The scratch script: a project is built and checked, the model asks where to put it (the run

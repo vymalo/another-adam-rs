@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "images": {
+      "type": "http",
+      "url": "http://mock-image-mcp:8080/mcp",
+      "tools": [
+        "draw"
+      ],
+      "files": true,
+      "timeoutSecs": 120,
+      "connectTimeoutSecs": 10
+    }
+  }
+}

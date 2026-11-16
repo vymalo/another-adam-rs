@@ -28,7 +28,8 @@ name: coder
 # folder it serves and a changed folder must change the answer after a restart
 # (dev/agent-e2e.sh), the coder asks three questions as one form and goes on with the
 # answers (dev/coder-choices-e2e.sh), and the same service on the researcher folder answers with
-# source cards and a graph on a screen that draws them (dev/agent-cards-e2e.sh). There is no second
+# source cards and a graph on a screen that draws them (dev/agent-cards-e2e.sh), and on the painter folder
+# it makes a picture with an image MCP server and shares it as a file (dev/painter-e2e.sh). There is no second
 # image. On main the very image that passed is the one pushed.
 #
 # The bump follows the pattern of vymalo/another-agentic-system#11 (deploy-bump):
@@ -391,6 +392,10 @@ jobs:
           # mock-researcher, and puts the default back): sources as cards and a graph on a screen with
           # catalog version 3, words only on one without Cards or without a catalog.
           sh dev/agent-cards-e2e.sh
+          # The painter folder (it restarts `agent` on a copy of it, the model mock-painter and plain
+          # http to the image server, and puts the default back): the instructions of the image server
+          # reach the model, the picture is a shared file, and the server's prompt is a command.
+          sh dev/painter-e2e.sh
           # The same coder scenarios again, the coder now a GitHub App installation instead of a token
           # (dev/compose.github-app.yaml: an init service makes a throwaway key, GITHUB_TOKEN is off).
           # Last, because the scripts above restart the coder without the override. Each asserts that
