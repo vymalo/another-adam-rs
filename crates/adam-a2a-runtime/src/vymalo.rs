@@ -43,11 +43,16 @@ pub const MAX_ACTION_CONTEXT_CHARS: usize = 4096;
 /// the action names and its `context` as it came (`{answers, note?}`). It is beside `text`, which
 /// is what the model reads, so that what answers a question can be checked against the form that
 /// asked it without parsing the text. Absent from a message that is not a form's answer.
+///
+/// A message that holds more than one form action (in one part or in several) carries the first
+/// one's `surface` and `context` and, beside them, `actions`: how many there are. The model reads
+/// the text of all of them, so a reader that checks the answer refuses such a message.
 pub const PAYLOAD_FORM: &str = "form";
 
-/// The most bytes of an action's context kept as [`PAYLOAD_FORM`]; a larger one is kept as
+/// The most bytes of an action's context kept as [`PAYLOAD_FORM`]: the 16 KiB an action may carry
+/// (`docs/api/agui.md` of `vymalo/another-agentic-system`, "Actions"). A larger one is kept as
 /// `{"oversize": true}`, which no form accepts.
-const MAX_FORM_CONTEXT_BYTES: usize = 256 * 1024;
+const MAX_FORM_CONTEXT_BYTES: usize = 16 * 1024;
 
 /// The largest whole number a double holds exactly (2^53 - 1): what a catalog may contain.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -107,15 +112,13 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// [`default_inbound`](crate::default_inbound).
 pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
     let mut chunks: Vec<String> = Vec::new();
-    let mut form: Option<Value> = None;
+    let mut forms: Vec<Value> = Vec::new();
     for part in &message.parts {
         match &part.content {
             PartContent::Text(text) => chunks.push(typed_text(text)),
             PartContent::Data(data) if claims_a2ui(part) => {
                 chunks.extend(action_texts(data));
-                if form.is_none() {
-                    form = form_of(data);
-                }
+                forms.extend(forms_of(data));
             }
             PartContent::Data(data) => chunks.push(data.to_string()),
             _ => {}
@@ -126,7 +129,10 @@ pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
         return Err("the message has no text".to_owned());
     }
     let mut payload = json!({ "text": text });
-    if let Some(form) = form {
+    if let Some(mut form) = forms.first().cloned() {
+        if forms.len() > 1 {
+            form["actions"] = json!(forms.len());
+        }
         payload[PAYLOAD_FORM] = form;
     }
     if let Some(context) = message.metadata.as_ref().and_then(context_of)
@@ -239,29 +245,32 @@ pub fn form_answer_surface(line: &str) -> Option<Option<&str>> {
     is_form_surface(surface).then_some(Some(surface))
 }
 
-/// The first form's submit in an A2UI data part, as [`PAYLOAD_FORM`]: the action `answer` of a
+/// Every form's submit in an A2UI data part, as [`PAYLOAD_FORM`]: the action `answer` of a
 /// surface `ask_user` drew, with its context whatever it holds (the receiver judges its shape).
-fn form_of(data: &Value) -> Option<Value> {
+fn forms_of(data: &Value) -> Vec<Value> {
     let messages: Vec<&Value> = match data {
         Value::Array(items) => items.iter().collect(),
         other => vec![other],
     };
-    messages.into_iter().find_map(|m| {
-        let action = m.get("action")?;
-        let surface = action
-            .get("surfaceId")
-            .and_then(Value::as_str)
-            .filter(|surface| is_form_surface(surface))?;
-        (action.get("name").and_then(Value::as_str) == Some(ANSWER_ACTION)).then(|| {
-            let context = action.get("context").cloned().unwrap_or(Value::Null);
-            let context = if context.to_string().len() > MAX_FORM_CONTEXT_BYTES {
-                json!({"oversize": true})
-            } else {
-                context
-            };
-            json!({"surface": surface, "context": context})
+    messages
+        .into_iter()
+        .filter_map(|m| {
+            let action = m.get("action")?;
+            let surface = action
+                .get("surfaceId")
+                .and_then(Value::as_str)
+                .filter(|surface| is_form_surface(surface))?;
+            (action.get("name").and_then(Value::as_str) == Some(ANSWER_ACTION)).then(|| {
+                let context = action.get("context").cloned().unwrap_or(Value::Null);
+                let context = if context.to_string().len() > MAX_FORM_CONTEXT_BYTES {
+                    json!({"oversize": true})
+                } else {
+                    context
+                };
+                json!({"surface": surface, "context": context})
+            })
         })
-    })
+        .collect()
 }
 
 /// One action as what the model reads.
@@ -745,6 +754,70 @@ mod tests {
         assert_eq!(
             vymalo_inbound(&big).unwrap().payload[PAYLOAD_FORM]["context"],
             json!({"oversize": true})
+        );
+    }
+
+    #[test]
+    fn the_context_kept_for_the_receiver_is_the_16_kib_an_action_may_carry() {
+        assert_eq!(MAX_FORM_CONTEXT_BYTES, 16 * 1024);
+        let of_size = |bytes: usize| {
+            let base = json!({"answers": [{"id": "a", "values": [""]}]})
+                .to_string()
+                .len();
+            json!({"answers": [{"id": "a", "values": ["x".repeat(bytes - base)]}]})
+        };
+        let kept = |context: Value| {
+            let m = action_message(json!({
+                "name": "answer", "surfaceId": "ask-1", "sourceComponentId": "c",
+                "timestamp": "t", "context": context
+            }));
+            vymalo_inbound(&m).unwrap().payload[PAYLOAD_FORM]["context"].clone()
+        };
+        let at_the_limit = of_size(16 * 1024);
+        assert_eq!(at_the_limit.to_string().len(), 16 * 1024);
+        assert_eq!(kept(at_the_limit.clone()), at_the_limit);
+        assert_eq!(kept(of_size(16 * 1024 + 1)), json!({"oversize": true}));
+    }
+
+    #[test]
+    fn a_message_with_several_form_actions_says_how_many_beside_the_first() {
+        let submit = |surface: &str| {
+            json!({"version": "v0.9.1", "action": {
+                "name": "answer", "surfaceId": surface, "sourceComponentId": "c",
+                "timestamp": "t", "context": {"answers": [{"id": "a", "values": ["x"]}]}}})
+        };
+        let one = Message::new(Role::User, vec![a2ui_part(json!([submit("ask-1")]))]);
+        assert_eq!(
+            vymalo_inbound(&one).unwrap().payload[PAYLOAD_FORM]
+                .get("actions")
+                .cloned(),
+            None,
+            "one action is no count"
+        );
+        let in_one_part = Message::new(
+            Role::User,
+            vec![a2ui_part(json!([submit("ask-1"), submit("ask-2")]))],
+        );
+        let in_two_parts = Message::new(
+            Role::User,
+            vec![
+                a2ui_part(json!([submit("ask-1")])),
+                a2ui_part(json!([submit("ask-2")])),
+            ],
+        );
+        for m in [in_one_part, in_two_parts] {
+            let form = &vymalo_inbound(&m).unwrap().payload[PAYLOAD_FORM];
+            assert_eq!(form["surface"], "ask-1", "{form}");
+            assert_eq!(form["actions"], 2, "{form}");
+        }
+        // An action that is no form's submit is not counted.
+        let other = json!({"version": "v0.9.1", "action": {
+            "name": "other", "surfaceId": "ask-3", "sourceComponentId": "c", "timestamp": "t"}});
+        let mixed = Message::new(Role::User, vec![a2ui_part(json!([submit("ask-1"), other]))]);
+        assert!(
+            vymalo_inbound(&mixed).unwrap().payload[PAYLOAD_FORM]
+                .get("actions")
+                .is_none()
         );
     }
 
