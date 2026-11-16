@@ -37,6 +37,7 @@ use crate::connection::{Connection, Recipe, Transport};
 use crate::error::Error;
 use crate::expand::{Env, Expander};
 use crate::policy::McpPolicy;
+use crate::prompts::{PromptCommand, command_of};
 use crate::redact::Redactor;
 use crate::text::{MAX_DESCRIPTION_BYTES, cap_text};
 use crate::tool::{McpTool, Target};
@@ -61,6 +62,10 @@ struct Server {
     name: String,
     target: Target,
     tools: Vec<Arc<McpTool>>,
+    /// What the server said about itself when it initialized, cleaned: `None` when it said
+    /// nothing, the file turned it off, or the server has a bearer per call.
+    instructions: Option<String>,
+    prompts: Vec<PromptCommand>,
 }
 
 impl std::fmt::Debug for McpServers {
@@ -148,19 +153,39 @@ impl McpServers {
             call_timeout,
             per_call,
             files,
+            instructions: want_instructions,
+            prompts: want_prompts,
         } = plan;
         let name = recipe.server.clone();
         let connect_timeout = recipe.connect_timeout;
+        let mut instructions = None;
+        let mut prompts = Vec::new();
         let (target, listed) = match per_call {
-            // A bound server is listed with the listing bearer, and dialled again per call.
+            // A bound server is listed with the listing bearer, and dialled again per call: it has
+            // no session to keep, so it gives no instructions and no prompts.
             Some(per_call) => {
                 let per_call = Arc::new(per_call);
                 let listed = per_call.list().await?;
                 (Target::PerCall(per_call), listed)
             }
             None => {
-                let (connection, listed) = Connection::open(recipe).await?;
-                (Target::Kept(connection), listed)
+                let (connection, offer) = Connection::open(recipe, want_prompts).await?;
+                if want_instructions {
+                    instructions = offer
+                        .instructions
+                        .as_deref()
+                        .and_then(|text| clean_instructions(text, connection.redactor()));
+                }
+                for prompt in &offer.prompts {
+                    match command_of(&name, prompt, &connection, call_timeout) {
+                        Ok(command) => prompts.push(command),
+                        Err(why) => tracing::warn!(
+                            server = %name,
+                            "an MCP prompt is not served as a command: {why}"
+                        ),
+                    }
+                }
+                (Target::Kept(connection), offer.tools)
             }
         };
         let selected = match select_tools(&name, listed, allow.as_deref()) {
@@ -189,6 +214,8 @@ impl McpServers {
             name,
             target,
             tools,
+            instructions,
+            prompts,
         })
     }
 
@@ -199,6 +226,60 @@ impl McpServers {
             .iter()
             .flat_map(|server| server.tools.iter())
             .fold(ToolSet::new(), |set, tool| set.dyn_tool(tool.clone()))
+    }
+
+    /// What the servers said about themselves when they initialized, as one text to append to the
+    /// agent's instructions: a heading per server (`## Instructions of the MCP server <name> (text
+    /// from the server, not the person)`), in the order of their names, each text scrubbed of the
+    /// values `${VAR}` put into the file, stripped of control and format characters and cut to
+    /// [`MAX_SERVER_INSTRUCTIONS_BYTES`] (all together: [`MAX_INSTRUCTIONS_BYTES`]). Empty when no
+    /// server said anything, or the file turned it off (`instructions: false`).
+    ///
+    /// Fixed once the servers are connected: ask it **once**, when the agent is bound, and never per
+    /// turn, so that the prompt a model sees does not change between two calls.
+    pub fn instructions(&self) -> String {
+        let mut out = String::new();
+        for server in &self.servers {
+            let Some(text) = &server.instructions else {
+                continue;
+            };
+            let heading = format!(
+                "## Instructions of the MCP server {} (text from the server, not the person)\n\n",
+                server.name
+            );
+            let section = format!("{heading}{text}");
+            let separator = if out.is_empty() { "" } else { "\n\n" };
+            if out.len() + separator.len() + section.len() > MAX_INSTRUCTIONS_BYTES {
+                tracing::warn!(
+                    server = %server.name,
+                    "the MCP servers' instructions are over {MAX_INSTRUCTIONS_BYTES} bytes together: \
+                     this server's and the next ones' are left out"
+                );
+                break;
+            }
+            out.push_str(separator);
+            out.push_str(&section);
+        }
+        out
+    }
+
+    /// The prompts of the servers as commands named `<server>__<prompt>`, in the order of the
+    /// servers' names and each server's own order, at most [`MAX_PROMPT_COMMANDS`]. A server that
+    /// is not connected, has `prompts: false`, or has a bearer per call gives none.
+    pub fn prompt_commands(&self) -> Vec<PromptCommand> {
+        let all: Vec<PromptCommand> = self
+            .servers
+            .iter()
+            .flat_map(|server| server.prompts.iter().cloned())
+            .collect();
+        if all.len() > MAX_PROMPT_COMMANDS {
+            tracing::warn!(
+                prompts = all.len(),
+                "the MCP servers have more prompts than the {MAX_PROMPT_COMMANDS} an agent serves \
+                 as commands: the rest are left out"
+            );
+        }
+        all.into_iter().take(MAX_PROMPT_COMMANDS).collect()
     }
 
     /// The names of the tools, as [`tools`](Self::tools) names them.
@@ -237,6 +318,36 @@ fn skippable(error: &Error) -> bool {
     )
 }
 
+/// The most bytes of one server's `instructions` that reach the model (2 KiB).
+pub const MAX_SERVER_INSTRUCTIONS_BYTES: usize = 2 * 1024;
+
+/// The most bytes of every server's `instructions` together (8 KiB).
+pub const MAX_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+
+/// The most prompts an agent serves as commands, as many as the files of a folder may (50).
+pub const MAX_PROMPT_COMMANDS: usize = adam_agent_fs::MAX_COMMANDS;
+
+/// What a server said about itself, ready to read: scrubbed of the values `${VAR}` put into the
+/// file, control and format characters removed (a newline and a tab stay), trimmed, and cut to
+/// [`MAX_SERVER_INSTRUCTIONS_BYTES`] on a character boundary. `None` when nothing is left.
+fn clean_instructions(text: &str, redactor: &Redactor) -> Option<String> {
+    // Scrubbed first, whole: a secret that straddled the cut would no longer be recognised.
+    let scrubbed = redactor.scrub(text);
+    let cleaned: String = scrubbed
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !adam_a2a_runtime::is_format_or_control(*c))
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut end = trimmed.len().min(MAX_SERVER_INSTRUCTIONS_BYTES);
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(trimmed[..end].trim_end().to_owned())
+}
+
 /// What the first pass decided for one server.
 struct Plan {
     recipe: Recipe,
@@ -246,6 +357,10 @@ struct Plan {
     per_call: Option<PerCall>,
     /// `files: true`: the files of its results are shared.
     files: bool,
+    /// `instructions` of the entry (on unless the file says `false`).
+    instructions: bool,
+    /// `prompts` of the entry (on unless the file says `false`).
+    prompts: bool,
 }
 
 impl Plan {
@@ -260,6 +375,7 @@ impl Plan {
                 tool: None,
             });
         }
+        let (call_timeout, connect_timeout) = timeouts(name, server, policy);
         let mut redactor = Redactor::default();
         let mut expander = Expander::new(name, env, &mut redactor);
         let (command_as_written, transport, allow, per_call) = match server {
@@ -384,7 +500,7 @@ impl Plan {
                         parsed.clone(),
                         expanded_headers.clone(),
                         expander.redactor().clone(),
-                        policy.connect_timeout_value(),
+                        connect_timeout,
                     )
                 });
                 (
@@ -404,14 +520,59 @@ impl Plan {
                 command_as_written,
                 transport,
                 redactor: Arc::new(redactor),
-                connect_timeout: policy.connect_timeout_value(),
+                connect_timeout,
             },
             allow,
-            call_timeout: policy.call_timeout_value(),
+            call_timeout,
             per_call,
             files: server.shares_files(),
+            instructions: server.settings().instructions,
+            prompts: server.settings().prompts,
         })
     }
+}
+
+/// How long a call and a connection of `server` may take: what the file asks (`timeoutSecs`,
+/// `connectTimeoutSecs`) or, when it says nothing, the policy's default, and never more than the
+/// deployment's cap ([`McpPolicy::max_call`]): a value over it is lowered, with a warning.
+fn timeouts(
+    name: &str,
+    server: &McpServer,
+    policy: &McpPolicy,
+) -> (std::time::Duration, std::time::Duration) {
+    let cap = policy.max_call_value();
+    let bounded = |key: &str, asked: Option<u64>, default: std::time::Duration| match asked {
+        None => default,
+        Some(secs) => {
+            let asked = std::time::Duration::from_secs(secs);
+            if asked > cap {
+                tracing::warn!(
+                    server = name,
+                    key,
+                    asked_secs = secs,
+                    cap_secs = cap.as_secs(),
+                    "the MCP server asks for longer than the deployment allows \
+                     (MCP_MAX_CALL_SECS): lowered to the cap"
+                );
+                cap
+            } else {
+                asked
+            }
+        }
+    };
+    let settings = server.settings();
+    (
+        bounded(
+            "timeoutSecs",
+            settings.timeout_secs,
+            policy.call_timeout_value(),
+        ),
+        bounded(
+            "connectTimeoutSecs",
+            settings.connect_timeout_secs,
+            policy.connect_timeout_value(),
+        ),
+    )
 }
 
 /// What the model may be shown as a tool name: `^[A-Za-z0-9_-]{1,64}$`.
@@ -703,6 +864,7 @@ mod tests {
             tools: None,
             optional: false,
             files: false,
+            settings: Default::default(),
         }
     }
 
@@ -724,6 +886,7 @@ mod tests {
             tools: None,
             optional: false,
             files: false,
+            settings: Default::default(),
         };
         // The refusal is a plan error: nothing was started, and the command was never looked up.
         let error = plan_error(stdio, &McpPolicy::default());
@@ -741,6 +904,7 @@ mod tests {
             tools: None,
             optional: false,
             files: false,
+            settings: Default::default(),
         };
         let env = Env::new()
             .var("MCP_TOKEN", "tok-4c1e9d7a")
@@ -809,6 +973,7 @@ mod tests {
             tools: None,
             optional: false,
             files: false,
+            settings: Default::default(),
         };
         assert!(Plan::new("srv", &server, &env, &McpPolicy::default()).is_ok());
     }
@@ -852,6 +1017,7 @@ mod tests {
             tools: None,
             optional: false,
             files: false,
+            settings: Default::default(),
         };
         let error = plan_error(server, &McpPolicy::default());
         assert!(matches!(&error, Error::Header { header, .. } if header == "Authorization"));

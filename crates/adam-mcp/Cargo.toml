@@ -9,6 +9,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# `is_format_or_control`: what a card and a prompt may not show.
+adam-a2a-runtime.workspace = true
 adam-agent-fs.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true

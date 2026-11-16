@@ -18,6 +18,11 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long one tool call waits for its answer (the default of [`McpPolicy::call_timeout`]).
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The longest an agent's own files may ask one tool call, or one connection, of a server to take
+/// (the default of [`McpPolicy::max_call`]): 15 minutes. A larger `timeoutSecs` or
+/// `connectTimeoutSecs` in an `mcp.json` is lowered to the cap, with a warning at startup.
+pub const DEFAULT_MAX_CALL: Duration = Duration::from_secs(900);
+
 /// The longest a call to the thread-tools endpoint may be waited for, whatever the tool says (the
 /// default of [`McpPolicy::thread_tools_max_call`]): one hour.
 pub const DEFAULT_THREAD_TOOLS_MAX_CALL: Duration = Duration::from_secs(3600);
@@ -110,6 +115,7 @@ pub struct McpPolicy {
     inherit_env: bool,
     connect_timeout: Duration,
     call_timeout: Duration,
+    max_call: Duration,
     thread_tools_max_call: Duration,
     bindings: BTreeMap<String, Binding>,
 }
@@ -129,6 +135,7 @@ impl std::fmt::Debug for McpPolicy {
             .field("inherit_env", &self.inherit_env)
             .field("connect_timeout", &self.connect_timeout)
             .field("call_timeout", &self.call_timeout)
+            .field("max_call", &self.max_call)
             .field("thread_tools_max_call", &self.thread_tools_max_call)
             .field("bearer_per_call", &bound)
             .finish()
@@ -144,6 +151,7 @@ impl Default for McpPolicy {
             inherit_env: false,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             call_timeout: DEFAULT_CALL_TIMEOUT,
+            max_call: DEFAULT_MAX_CALL,
             thread_tools_max_call: DEFAULT_THREAD_TOOLS_MAX_CALL,
             bindings: BTreeMap::new(),
         }
@@ -221,6 +229,19 @@ impl McpPolicy {
     #[must_use]
     pub fn call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    /// The longest an agent's files may ask of one server: a `timeoutSecs` or a
+    /// `connectTimeoutSecs` of an `mcp.json` above it is lowered to it, with a warning when the
+    /// servers are connected. **The deployment's, not the agent's:** the files never decide alone
+    /// how long a call may take. Default 15 minutes ([`DEFAULT_MAX_CALL`]). A zero is raised to one
+    /// millisecond. The `MCP_MAX_CALL_SECS` variable of the binaries. It does not change
+    /// [`call_timeout`](Self::call_timeout) or [`connect_timeout`](Self::connect_timeout), which
+    /// are what a server that says nothing gets.
+    #[must_use]
+    pub fn max_call(mut self, cap: Duration) -> Self {
+        self.max_call = cap.max(Duration::from_millis(1));
         self
     }
 
@@ -309,6 +330,11 @@ impl McpPolicy {
     /// The call timeout.
     pub fn call_timeout_value(&self) -> Duration {
         self.call_timeout
+    }
+
+    /// The cap on what an agent's files may ask of one server.
+    pub fn max_call_value(&self) -> Duration {
+        self.max_call
     }
 
     /// The cap on a call to the thread-tools endpoint.

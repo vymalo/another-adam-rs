@@ -1227,6 +1227,87 @@ fn files_is_a_boolean_that_defaults_to_false_and_is_no_unknown_key() {
     );
 }
 
+fn parse_servers(text: &str) -> (Option<adam_agent_fs::McpConfig>, Vec<String>) {
+    let mut diagnostics = Vec::new();
+    let config = adam_agent_fs::parse_mcp(std::path::Path::new("mcp.json"), text, &mut diagnostics);
+    (
+        config,
+        diagnostics.iter().map(ToString::to_string).collect(),
+    )
+}
+
+#[test]
+fn timeouts_instructions_and_prompts_are_read_per_server() {
+    let (config, diagnostics) = parse_servers(
+        r#"{"mcpServers":{
+            "slow":{"type":"http","url":"https://s.example.com","timeoutSecs":300,
+                    "connectTimeoutSecs":90,"instructions":false,"prompts":false},
+            "plain":{"command":"y"}}}"#,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let config = config.unwrap();
+    let slow = config.servers["slow"].settings();
+    assert_eq!(slow.timeout_secs, Some(300));
+    assert_eq!(slow.connect_timeout_secs, Some(90));
+    assert!(!slow.instructions && !slow.prompts);
+    let plain = config.servers["plain"].settings();
+    assert!(plain.is_default());
+    assert_eq!(
+        (plain.timeout_secs, plain.connect_timeout_secs),
+        (None, None)
+    );
+    assert!(
+        plain.instructions && plain.prompts,
+        "on unless the file says false"
+    );
+}
+
+#[test]
+fn a_timeout_that_is_zero_negative_or_not_a_whole_number_refuses_the_server() {
+    for bad in ["0", "-5", "1.5", "\"60\"", "true", "null"] {
+        for key in ["timeoutSecs", "connectTimeoutSecs"] {
+            let (config, diagnostics) = parse_servers(&format!(
+                r#"{{"mcpServers":{{"a":{{"command":"x","{key}":{bad}}},"b":{{"command":"y"}}}}}}"#
+            ));
+            // `null` is the same as no key; anything else refuses that server and keeps the rest.
+            let config = config.unwrap();
+            if bad == "null" {
+                assert!(diagnostics.is_empty(), "{bad}: {diagnostics:#?}");
+                assert!(config.servers.contains_key("a"));
+                continue;
+            }
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.contains(key) && d.contains("at least 1")),
+                "{key}={bad}: {diagnostics:#?}"
+            );
+            assert!(!config.servers.contains_key("a"), "{key}={bad}");
+            assert!(config.servers.contains_key("b"));
+        }
+    }
+}
+
+#[test]
+fn digest_unchanged_without_keys() {
+    // The JSON the digest covers, as it was before the keys existed: a folder that does not use
+    // them keeps its digest.
+    let (config, diagnostics) = parse_servers(
+        r#"{"mcpServers":{"a":{"command":"x","files":true},
+                          "b":{"type":"http","url":"https://b.example.com"}}}"#,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let json = serde_json::to_string(&config.unwrap()).unwrap();
+    assert_eq!(
+        json,
+        r#"{"servers":{"a":{"Stdio":{"command":"x","args":[],"env":{},"tools":null,"optional":false,"files":true}},"b":{"Remote":{"kind":"Http","url":"https://b.example.com","headers":{},"tools":null,"optional":false}}}}"#
+    );
+    // A key that is set is in the JSON, so that it changes the digest.
+    let (config, _) = parse_servers(r#"{"mcpServers":{"a":{"command":"x","timeoutSecs":5}}}"#);
+    let json = serde_json::to_string(&config.unwrap()).unwrap();
+    assert!(json.contains(r#""settings":{"timeout_secs":5"#), "{json}");
+}
+
 #[test]
 fn files_on_a_remote_subagent_is_read_and_defaults_to_false() {
     let dir = write(&[

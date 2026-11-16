@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::diagnostic::{Diagnostic, Sink};
-use crate::schema::{McpConfig, McpServer, RawMcp, RawServer, RemoteKind, scan_references};
+use crate::schema::{
+    McpConfig, McpServer, McpSettings, RawMcp, RawServer, RemoteKind, scan_references,
+};
 
 /// The longest model-facing tool name (`<server>__<tool>`) providers accept, as the plan sets
 /// it (the OpenAI function-name limit).
@@ -144,6 +146,18 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
         }
     }
 
+    let mut asked = |key: &str, value: Option<&serde_json::Value>| {
+        seconds(name, key, value).unwrap_or_else(|message| {
+            fail(sink, message);
+            None
+        })
+    };
+    let settings = McpSettings {
+        timeout_secs: asked("timeoutSecs", raw.timeout_secs.as_ref()),
+        connect_timeout_secs: asked("connectTimeoutSecs", raw.connect_timeout_secs.as_ref()),
+        instructions: raw.instructions.unwrap_or(true),
+        prompts: raw.prompts.unwrap_or(true),
+    };
     let command = raw.command.as_deref().map(str::trim);
     let url = raw.url.as_deref().map(str::trim);
     let server = match (declared, command, url) {
@@ -160,6 +174,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
                 tools: raw.tools,
                 optional: raw.optional.unwrap_or(false),
                 files: raw.files.unwrap_or(false),
+                settings,
             }
         }
         (Declared::Unset, None, Some(_)) => {
@@ -226,10 +241,30 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
                 tools: raw.tools,
                 optional: raw.optional.unwrap_or(false),
                 files: raw.files.unwrap_or(false),
+                settings,
             }
         }
     };
     ok.then_some(server)
+}
+
+/// A number of seconds a key asks for: a whole number, at least 1, or the sentence that says why
+/// not. The deployment caps what is asked.
+fn seconds(
+    server: &str,
+    key: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.as_u64().filter(|secs| *secs >= 1) {
+        Some(secs) => Ok(Some(secs)),
+        None => Err(format!(
+            "server `{server}`: `{key}` must be a whole number of seconds, at least 1 (zero and \
+             negative values are refused)"
+        )),
+    }
 }
 
 /// A server name the model can be shown in `<server>__<tool>`. It has no `__` and does not end in

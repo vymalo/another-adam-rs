@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{HeaderName, HeaderValue};
-use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, Tool as ListedTool};
+use rmcp::model::{
+    ClientCapabilities, ClientConfig, Implementation, Prompt as ListedPrompt, Tool as ListedTool,
+};
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
@@ -300,6 +302,15 @@ struct Live {
     closed: bool,
 }
 
+/// What a server offered when it was connected.
+pub(crate) struct Offer {
+    pub(crate) tools: Vec<ListedTool>,
+    /// The `instructions` of its `initialize` answer, as it sent them.
+    pub(crate) instructions: Option<String>,
+    /// Its prompts, when it has the capability and the file did not turn them off.
+    pub(crate) prompts: Vec<ListedPrompt>,
+}
+
 /// A server, kept: the recipe, and the session that is live now (if any).
 pub(crate) struct Connection {
     recipe: Recipe,
@@ -307,10 +318,45 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    /// Connect for the first time and list the tools. A failure is a startup error.
-    pub(crate) async fn open(recipe: Recipe) -> Result<(Arc<Self>, Vec<ListedTool>), Error> {
+    /// Connect for the first time and list the tools, and the prompts when `want_prompts` and the
+    /// server has any. A failure to list the tools is a startup error; a failure to list the prompts
+    /// is a warning and no prompt: they are a convenience, never a reason to stop.
+    pub(crate) async fn open(
+        recipe: Recipe,
+        want_prompts: bool,
+    ) -> Result<(Arc<Self>, Offer), Error> {
         let service = recipe.dial().await?;
         let tools = list_with(&recipe, &service).await?;
+        let peer = service.peer();
+        let (instructions, has_prompts) = match peer.peer_info() {
+            Some(info) => (
+                info.instructions.clone(),
+                info.capabilities.prompts.is_some(),
+            ),
+            None => (None, false),
+        };
+        let prompts = if want_prompts && has_prompts {
+            match tokio::time::timeout(recipe.connect_timeout, peer.list_all_prompts()).await {
+                Ok(Ok(prompts)) => prompts,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        server = %recipe.server,
+                        error = %recipe.scrub(&adam_error::report(&error)),
+                        "the MCP server's prompts could not be listed: it serves none as commands"
+                    );
+                    Vec::new()
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        server = %recipe.server,
+                        "the MCP server did not list its prompts in time: it serves none as commands"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let connection = Arc::new(Self {
             recipe,
             live: tokio::sync::Mutex::new(Live {
@@ -319,12 +365,24 @@ impl Connection {
                 closed: false,
             }),
         });
-        Ok((connection, tools))
+        Ok((
+            connection,
+            Offer {
+                tools,
+                instructions,
+                prompts,
+            },
+        ))
     }
 
     /// The values this server's messages may not repeat.
     pub(crate) fn redactor(&self) -> &Redactor {
         &self.recipe.redactor
+    }
+
+    /// Scrub a message that came from the server, and cap it.
+    pub(crate) fn scrub(&self, text: &str) -> String {
+        self.recipe.scrub(text)
     }
 
     /// The peer to call, and the number of its session. A session that is gone is replaced, once,

@@ -14,7 +14,9 @@ pub use agent::{
     SkillSelection, ToolList,
 };
 pub use command::CommandFrontmatter;
-pub use mcp::{EnvRef, McpConfig, McpServer, RemoteKind, Segment, split_env_references};
+pub use mcp::{
+    EnvRef, McpConfig, McpServer, McpSettings, RemoteKind, Segment, split_env_references,
+};
 pub use names::{is_agent_name, is_env_name, is_skill_name, is_tool_name};
 pub use reference::{
     MAX_REFERENCES, REFERENCE_BRANCH_MAX, REFERENCE_DESCRIPTION_MAX, REFERENCE_URL_MAX,

@@ -1458,6 +1458,7 @@ async fn an_optional_server_with_a_mistake_in_its_file_is_still_an_error() {
                 tools: None,
                 optional: true,
                 files: false,
+                settings: Default::default(),
             },
         )]),
     };

@@ -44,6 +44,12 @@ pub enum McpServer {
         /// one it had before the key existed.
         #[serde(skip_serializing_if = "is_false")]
         files: bool,
+        /// The per-server settings of the adam extensions `timeoutSecs`, `connectTimeoutSecs`,
+        /// `instructions` and `prompts`. Left out of the JSON when they are all as they are
+        /// without the keys, so the digest of a folder that does not use them is the one it had
+        /// before they existed.
+        #[serde(skip_serializing_if = "McpSettings::is_default")]
+        settings: McpSettings,
     },
     /// A server reached over the network (`type` and `url`).
     Remote {
@@ -64,10 +70,61 @@ pub enum McpServer {
         /// one it had before the key existed.
         #[serde(skip_serializing_if = "is_false")]
         files: bool,
+        /// The per-server settings of the adam extensions `timeoutSecs`, `connectTimeoutSecs`,
+        /// `instructions` and `prompts`. Left out of the JSON when they are all as they are
+        /// without the keys, so the digest of a folder that does not use them is the one it had
+        /// before they existed.
+        #[serde(skip_serializing_if = "McpSettings::is_default")]
+        settings: McpSettings,
     },
 }
 
+/// What an `mcp.json` entry says about timeouts, the server's own instructions and its prompts
+/// (adam extensions; every key is optional).
+///
+/// The seconds are what the **file** asks for: the deployment caps them (`MCP_MAX_CALL_SECS`), so
+/// an agent's files never decide alone how long a call may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct McpSettings {
+    /// `timeoutSecs`: how long one tool call of this server is waited for. `None` is the
+    /// deployment's default (60 s). At least 1.
+    pub timeout_secs: Option<u64>,
+    /// `connectTimeoutSecs`: how long the server may take to start, initialize and list its tools.
+    /// `None` is the deployment's default (30 s). At least 1.
+    pub connect_timeout_secs: Option<u64>,
+    /// `instructions: false` turns off the text the server returns when it initializes (it is
+    /// appended to the agent's instructions once, at bind time). On by default.
+    pub instructions: bool,
+    /// `prompts: false` stops the server's prompts from becoming commands. On by default.
+    pub prompts: bool,
+}
+
+impl Default for McpSettings {
+    fn default() -> Self {
+        Self {
+            timeout_secs: None,
+            connect_timeout_secs: None,
+            instructions: true,
+            prompts: true,
+        }
+    }
+}
+
+impl McpSettings {
+    /// Whether every key is as it is when the file does not say it.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl McpServer {
+    /// The timeouts, instructions and prompts keys of the entry.
+    pub fn settings(&self) -> &McpSettings {
+        match self {
+            Self::Stdio { settings, .. } | Self::Remote { settings, .. } => settings,
+        }
+    }
+
     /// Whether the server may be missing: `optional: true` in the file.
     pub fn is_optional(&self) -> bool {
         match self {
@@ -276,6 +333,12 @@ pub(crate) struct RawServer {
     pub(crate) tools: Option<Vec<String>>,
     pub(crate) optional: Option<bool>,
     pub(crate) files: Option<bool>,
+    #[serde(rename = "timeoutSecs")]
+    pub(crate) timeout_secs: Option<Value>,
+    #[serde(rename = "connectTimeoutSecs")]
+    pub(crate) connect_timeout_secs: Option<Value>,
+    pub(crate) instructions: Option<bool>,
+    pub(crate) prompts: Option<bool>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
 }

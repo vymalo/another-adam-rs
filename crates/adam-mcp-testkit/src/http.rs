@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Counters, TestServer};
+use crate::{Counters, Script, TestServer};
 
 /// What the server saw, shared by every incarnation of it (a [`restart`](TestHttpServer::restart)
 /// keeps counting).
@@ -34,6 +34,7 @@ struct Seen {
 struct Gate {
     seen: Arc<Seen>,
     token: Option<String>,
+    script: Arc<Script>,
 }
 
 async fn gate(State(gate): State<Gate>, request: Request, next: Next) -> Response {
@@ -82,9 +83,16 @@ impl TestHttpServer {
     /// Start a server. With `Some(token)` every request must carry `Authorization: Bearer
     /// <token>`.
     pub async fn start(require_token: Option<&str>) -> Self {
+        Self::start_scripted(require_token, Script::default()).await
+    }
+
+    /// [`start`](Self::start) a server that says and serves what `script` says: its instructions
+    /// and its prompts.
+    pub async fn start_scripted(require_token: Option<&str>, script: Script) -> Self {
         let gate = Gate {
             seen: Arc::default(),
             token: require_token.map(str::to_owned),
+            script: Arc::new(script),
         };
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -101,8 +109,14 @@ impl TestHttpServer {
     fn serve(listener: TcpListener, gate: &Gate) -> Running {
         let stop = CancellationToken::new();
         let counters = Arc::clone(&gate.seen.counters);
+        let script = Arc::clone(&gate.script);
         let service = StreamableHttpService::new(
-            move || Ok(TestServer::counting(Arc::clone(&counters))),
+            move || {
+                Ok(TestServer::scripted(
+                    Arc::clone(&counters),
+                    Arc::clone(&script),
+                ))
+            },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().with_cancellation_token(stop.child_token()),
         );
@@ -159,6 +173,11 @@ impl TestHttpServer {
     /// like `slow`, counts as soon as it arrives).
     pub fn calls(&self) -> usize {
         self.gate.seen.counters.calls.load(Ordering::SeqCst)
+    }
+
+    /// How many `prompts/get` requests reached the handler, across restarts.
+    pub fn prompt_gets(&self) -> usize {
+        self.gate.seen.counters.prompt_gets.load(Ordering::SeqCst)
     }
 
     /// Stop serving: the listener closes and the open sessions end. The port is kept for
