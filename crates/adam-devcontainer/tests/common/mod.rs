@@ -256,6 +256,43 @@ impl Rig {
         slot.path().to_owned()
     }
 
+    /// A reference on a local bare remote with these files, added to the run as a read-only slot.
+    pub async fn reference(
+        &self,
+        ws: &RunWorkspace,
+        name: &str,
+        files: &[(&str, &str)],
+    ) -> PathBuf {
+        let remote = self.tmp.path().join(format!("{name}-ref.git"));
+        let seed = self.tmp.path().join(format!("{name}-ref-seed"));
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&seed).unwrap();
+        git(
+            &remote,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        );
+        git(&seed, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(seed.join("README.md"), "hi\n").unwrap();
+        for (file, content) in files {
+            let path = seed.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "--quiet", "origin", "main"]);
+        let slot = ws
+            .add_reference(&RepoRef::new(remote.to_str().unwrap(), "main"), name)
+            .await
+            .unwrap();
+        assert!(!slot.writable());
+        slot.path().to_owned()
+    }
+
     /// `podman inspect` of a container as the stub's `up` made it: the binds are what the override
     /// asked for, recomputed here from the slots (an oracle independent of the code under test).
     pub async fn inspect_for(&self, ws: &RunWorkspace) {
@@ -264,16 +301,24 @@ impl Rig {
         let tools = self.env.install_tools().await.unwrap();
         let mut mounts = vec![bind(&run_dir, &run_dir, true)];
         for slot in &slots {
-            if let Some(wt) = slot.worktree() {
+            if let Some(wt) = slot.checkout() {
                 mounts.push(bind(wt.mirror(), wt.mirror(), false));
             }
             let git = slot.path().join(".git");
             mounts.push(bind(&git, &git, false));
+            if !slot.writable() {
+                mounts.push(bind(slot.path(), slot.path(), false));
+            }
         }
         mounts.push(bind(&tools, Path::new("/opt/adam/bin"), false));
+        // The first slot the run works in is the one at the folder its repository names.
+        let first = slots
+            .iter()
+            .find(|slot| slot.writable())
+            .unwrap_or(&slots[0]);
         mounts.push(bind(
-            slots[0].path(),
-            &PathBuf::from(format!("/workspaces/{}", slots[0].dir())),
+            first.path(),
+            &PathBuf::from(format!("/workspaces/{}", first.dir())),
             true,
         ));
         self.put(

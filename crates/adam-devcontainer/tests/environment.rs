@@ -279,6 +279,71 @@ async fn the_first_slot_decides_and_a_scratch_slot_counts() {
     assert!(steps.latest().iter().any(|s| s.id == "environment-ignored"));
 }
 
+/// A reference is read and never worked in: its `devcontainer.json` never decides the environment, even
+/// when it joined first, and the container gets its directory read-only on top of the run's.
+#[tokio::test]
+async fn a_reference_never_decides_the_environment_and_is_mounted_read_only() {
+    let rig = Rig::new();
+    let ws = rig.run(RUN);
+    // The reference joined first, with a devcontainer.json of its own that would choose the image.
+    let design = rig
+        .reference(
+            &ws,
+            "design",
+            &[(
+                ".devcontainer/devcontainer.json",
+                r#"{"image":"from-the-reference"}"#,
+            )],
+        )
+        .await;
+    rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
+        .await;
+    rig.inspect_for(&ws).await;
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+
+    let file = rig.override_file(RUN);
+    assert_eq!(
+        file["build"]["dockerfile"], "Dockerfile",
+        "the repository's file decides: {file}"
+    );
+    assert!(file.get("image").is_none(), "{file}");
+    let mounts = file["mounts"].to_string();
+    assert!(
+        mounts.contains(&format!("source={0},target={0},readonly", design.display())),
+        "the reference is its own read-only mount: {mounts}"
+    );
+    assert!(
+        mounts.contains(&format!("{}/.git", design.display())),
+        "its git file too: {mounts}"
+    );
+}
+
+/// A workspace that holds only a reference has nothing to run in: it is refused, in words that say
+/// why, and no container is made from the reference's devcontainer.json.
+#[tokio::test]
+async fn a_workspace_of_only_a_reference_has_nothing_to_run_in() {
+    let rig = Rig::new();
+    let ws = rig.run(RUN);
+    rig.reference(
+        &ws,
+        "design",
+        &[(
+            ".devcontainer/devcontainer.json",
+            r#"{"image":"from-the-reference"}"#,
+        )],
+    )
+    .await;
+    let err = error_of(rig.env.ensure(&ws, &Steps::default()).await);
+    assert!(matches!(err, EnvError::Refused(_)), "{err:?}");
+    let said = err.to_string();
+    assert!(
+        said.contains("A reference is read and never run in")
+            && said.contains("commands need a repository or a project"),
+        "{said}"
+    );
+    assert!(rig.cli("up").is_empty(), "no container was made");
+}
+
 #[tokio::test]
 async fn several_devcontainer_folders_use_the_first_and_a_step_says_so() {
     let rig = Rig::new();

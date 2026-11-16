@@ -1165,6 +1165,39 @@ mod tests {
         );
     }
 
+    /// A run that has a reference and no repository gets a pod (unlike a devcontainer, which has no
+    /// file to build from): the reference is mounted read-only and a command runs in it.
+    #[tokio::test]
+    async fn a_run_with_only_a_reference_gets_a_pod_and_runs_commands_in_it() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        let design = ws
+            .add_reference(&fx.remote("design"), "design")
+            .await
+            .unwrap();
+        let session = fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        let mounts = fx.work_mounts(&pod_name(RUN));
+        assert!(
+            mounts
+                .iter()
+                .any(|(path, _, ro)| Path::new(path) == design.path() && *ro),
+            "the reference is a read-only mount: {mounts:?}"
+        );
+        let prepared = session
+            .prepare(&ExecSpec::shell("cat README.md", design.path()))
+            .unwrap();
+        let args: Vec<String> = prepared
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter()
+                .any(|a| a.contains(&design.path().display().to_string())),
+            "the command runs in the reference's directory: {args:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_legacy_worktree_of_a_run_is_outside_its_directory_and_gets_no_mount() {
         let fx = fixture(settings());

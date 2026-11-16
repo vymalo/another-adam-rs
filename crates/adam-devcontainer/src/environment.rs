@@ -996,7 +996,9 @@ impl Environment for DevContainer {
         slots.sort_by_key(|slot| !slot.writable());
         let Some(first) = slots.first().filter(|slot| slot.writable()) else {
             return Err(EnvError::Refused(
-                "the workspace has no repository or project yet: there is nothing to run in"
+                "the workspace has no repository or project yet: there is nothing to run in. A \
+                 reference is read and never run in, and has no devcontainer of its own: commands \
+                 need a repository or a project"
                     .to_owned(),
             ));
         };

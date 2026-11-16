@@ -43,7 +43,7 @@ let environment = DevContainer::new(settings);
 
 ## Which file is used
 
-The **first slot** of the run, in the order the slots joined (a scratch project counts, a reference never does: it is placed after the others), decides **once**, for the
+The **first slot** of the run, in the order the slots joined (a scratch project counts, a reference never does: it is placed after the others, and a workspace of only references is refused with `EnvError::Refused`: a reference has no devcontainer of its own), decides **once**, for the
 whole run. In it, in the containers.dev order: `.devcontainer/devcontainer.json`, then `.devcontainer.json`,
 then `.devcontainer/<folder>/devcontainer.json` (the first folder in sorted order; a step names the others). A
 slot with none gets `Settings::default_image`. Later repositories are mounted into the same container and their
