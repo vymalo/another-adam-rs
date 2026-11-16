@@ -325,6 +325,8 @@ impl CoderAgent {
             .state(env.clone())
             // Where `read_output` and the long results of MCP servers keep what they hold.
             .state(Arc::new(adam_llm_agent::KeptStore(env.kept.clone())))
+            // Where the bytes of the images the model sees are kept: never in the journal or the state.
+            .state(Arc::new(crate::images::store(&env.images)))
             // What a call was given and what it answered go into its step: the process's secrets
             // are scrubbed from both first (ADR 0011).
             .step_io(env.redactor.step_io())

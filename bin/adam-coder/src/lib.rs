@@ -28,6 +28,7 @@
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`harden`] | `make_non_dumpable` (it lives in `adam-service`, and `adam-agent` calls it too): a same-user child cannot read the coder's `/proc/<pid>/environ` |
 //! | [`mcp_secrets`] | the variables an agent's `mcp.json` files read as `${VAR}`: hidden from the processes of runs (`HidingEnvironment`) and registered with the redactor, but never `PATH`, `HOME`, `MODEL_API_KEY` and the like |
+//! | [`images`] | [`FileImages`](images::FileImages): the bytes of the images the model sees, on the workspace volume per conversation, checked by hash when they are read back |
 //! | [`janitor`] | [`Janitor`]: the sweep that removes the workspaces of finished runs, a worker component of the process |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router (an [`adam_service::Service`] for the coder's agent); [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes (from `adam-service`) |
 //! | [`config`] | the binary's environment variables (the ones every agent binary shares are `adam-service`'s) |
@@ -87,6 +88,7 @@ pub mod exit;
 pub mod files;
 pub mod github_mcp;
 pub use adam_service::harden;
+pub mod images;
 pub mod janitor;
 pub mod kept;
 pub mod mcp_secrets;

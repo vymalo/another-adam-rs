@@ -881,6 +881,7 @@ async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
             call_id,
             content,
             is_error,
+            ..
         } => {
             assert_eq!(call_id, "e1");
             assert!(!is_error, "{content}");
@@ -1202,6 +1203,7 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
             call_id,
             content,
             is_error,
+            ..
         } => {
             assert_eq!(call_id, "m1");
             assert_eq!(content, "ping");

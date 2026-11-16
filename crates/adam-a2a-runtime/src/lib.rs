@@ -35,6 +35,7 @@ mod backend;
 mod caller;
 mod commands;
 mod convert;
+mod files_in;
 mod ids;
 mod list;
 mod person;
@@ -55,6 +56,7 @@ pub use commands::{
 pub use convert::{
     InboundFn, PromptFn, artifact_id, artifact_of, default_inbound, default_prompt, task_state,
 };
+pub use files_in::{MAX_INBOUND_IMAGE_BYTES, MAX_INBOUND_IMAGES};
 pub use ids::task_id_for;
 pub use list::MAX_SCAN;
 pub use person::{CONTEXT_PERSON, person_said};

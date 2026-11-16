@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::compaction::{Compaction, CompactionReason, PromptSize};
+use crate::images::{InboundImage, KeptImage, StateImage};
 use crate::plan::Plan;
 use crate::source::ToolNote;
 
@@ -77,6 +78,8 @@ pub(crate) fn parse_user_text(payload: &Value) -> Result<String, String> {
         Value::String(s) => Ok(s.clone()),
         Value::Object(o) => match o.get("text") {
             Some(Value::String(s)) => Ok(s.clone()),
+            // A message that is only an image has no words.
+            None if !crate::images::parse_inbound_images(payload).is_empty() => Ok(String::new()),
             _ => Err("payload object has no string field \"text\"".into()),
         },
         _ => Err("payload must be {\"text\": \"...\"} or a JSON string".into()),
@@ -380,6 +383,21 @@ pub struct Conversation {
     /// of the call that kept a text journals it once more (in its result).
     #[serde(default, skip_serializing_if = "is_empty_map")]
     pub kept_outputs: Arc<BTreeMap<String, String>>,
+    /// The bytes of the images this run's history names, by SHA-256, **when the agent has no
+    /// [`ImageStore`](crate::ImageStore)** (an agent that is only a folder): base64, and counted
+    /// with [`kept_outputs`](Self::kept_outputs) against [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES),
+    /// so the worst-case state is what it was. An agent with a store has none here: the state holds
+    /// references only. A run that continues another carries the ones its carried history still
+    /// names. Absent from state written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "is_empty_images")]
+    pub images: Arc<BTreeMap<String, StateImage>>,
+    /// The images of the message that started the run, until the first step admits them (the start
+    /// of a run is synchronous and cannot keep a file). At most
+    /// [`MAX_INBOUND_IMAGES`](crate::MAX_INBOUND_IMAGES) and
+    /// [`MAX_INBOUND_IMAGE_BYTES`](crate::MAX_INBOUND_IMAGE_BYTES), once, in one state. Absent from
+    /// state written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_images: Vec<InboundImage>,
     /// Calls of the last assistant message that have no result yet, in order.
     /// Only non-empty while a step is in flight or the run is parked on
     /// [`pending_wait`](Self::pending_wait).
@@ -998,9 +1016,74 @@ impl Conversation {
         }
     }
 
-    /// The bytes of the outputs the run keeps in its own state.
+    /// The bytes the run keeps in its own state: its kept outputs and its images (what
+    /// [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES) bounds).
     pub fn kept_bytes(&self) -> usize {
-        self.kept_outputs.values().map(String::len).sum()
+        self.kept_outputs.values().map(String::len).sum::<usize>()
+            + self
+                .images
+                .values()
+                .map(|image| image.data.len() / 4 * 3)
+                .sum::<usize>()
+    }
+
+    /// The images the history holds: the image parts of its messages, the ones still waiting
+    /// behind an owed tool result, and the images of its tool results. What the model is sent each
+    /// request, and what [`MODEL_IMAGE_MAX_COUNT`](crate::ImageGate) bounds.
+    pub fn image_count(&self) -> usize {
+        self.messages
+            .iter()
+            .chain(&self.deferred)
+            .map(|m| m.images().len())
+            .sum()
+    }
+
+    /// Every image the history names, in order: what the bytes are looked up for.
+    pub(crate) fn image_refs(&self) -> Vec<&adam_model::ImageRef> {
+        self.messages
+            .iter()
+            .chain(&self.deferred)
+            .flat_map(Message::images)
+            .collect()
+    }
+
+    /// Keep the bytes of the images a call asked the run to keep, if they fit the room the run has:
+    /// the call was told its room, so an image over it was never offered.
+    pub(crate) fn keep_images(&mut self, kept: Vec<KeptImage>) {
+        for image in kept {
+            if self.kept_bytes() + image.data.len() / 4 * 3 <= crate::kept::MAX_RUN_KEPT_BYTES {
+                Arc::make_mut(&mut self.images).insert(
+                    image.sha256,
+                    StateImage {
+                        media_type: image.media_type,
+                        data: image.data,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Forget the state-kept images that no message names any more.
+    pub(crate) fn drop_unnamed_images(&mut self) {
+        if self.images.is_empty() {
+            return;
+        }
+        let named: std::collections::BTreeSet<&str> = self
+            .messages
+            .iter()
+            .chain(&self.deferred)
+            .flat_map(Message::images)
+            .map(|image| image.sha256.as_str())
+            .collect();
+        if self.images.keys().any(|sha| !named.contains(sha.as_str())) {
+            let keep: BTreeMap<String, StateImage> = self
+                .images
+                .iter()
+                .filter(|(sha, _)| named.contains(sha.as_str()))
+                .map(|(sha, image)| (sha.clone(), image.clone()))
+                .collect();
+            self.images = Arc::new(keep);
+        }
     }
 
     fn continued_within(&self, text: impl Into<String>, from: RunId, cap: usize) -> Self {
@@ -1027,12 +1110,23 @@ impl Conversation {
                 .into_iter()
                 .collect(),
             pinned_calls: self.pinned_calls.clone(),
+            images: Arc::clone(&self.images),
             ..Self::default()
         }
+        .with_unnamed_images_dropped()
+    }
+
+    fn with_unnamed_images_dropped(mut self) -> Self {
+        self.drop_unnamed_images();
+        self
     }
 }
 
 fn is_empty_map(map: &Arc<BTreeMap<String, String>>) -> bool {
+    map.is_empty()
+}
+
+fn is_empty_images(map: &Arc<BTreeMap<String, StateImage>>) -> bool {
     map.is_empty()
 }
 

@@ -20,9 +20,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_llm_agent::{StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
-use adam_model::ToolSpec;
-use adam_runtime::ReceivedFiles;
+use adam_llm_agent::{StepStyle, Tool, ToolCtx, ToolError, ToolOutput, keep_image};
+use adam_model::{ImageOrigin, ToolSpec};
+use adam_runtime::{MAX_ARTIFACT_FILE_BYTES, ReceivedFiles, checked_media_type, extension_of};
 use async_trait::async_trait;
 use base64::Engine as _;
 use rmcp::ServiceError;
@@ -139,8 +139,75 @@ impl McpTool {
         redactor: &Redactor,
         outcome: Result<CallToolResponse, ServiceError>,
     ) -> (ToolOutput, bool) {
-        let (output, broken) = self.describe_whole(ctx, redactor, outcome);
+        // The images of the answer, when the model of this run can see them and the deployment
+        // sends what an MCP server returns (`MODEL_IMAGE_SOURCES` has `mcp`): taken before the
+        // answer is turned into text, which describes them. With none of that, nothing here runs and
+        // the result is what it always was.
+        let images = match &outcome {
+            Ok(CallToolResponse::Complete(result))
+                if result.is_error != Some(true) && ctx.sees_images_from(ImageOrigin::Mcp) =>
+            {
+                image_blocks(result)
+            }
+            _ => Vec::new(),
+        };
+        let (mut output, broken) = self.describe_whole(ctx, redactor, outcome);
+        if !images.is_empty() && !output.is_error {
+            output = self.admit_images(ctx, images, output).await;
+        }
         (keep_overflow(ctx, output).await, broken)
+    }
+
+    /// Offer the images of a result to the model: each admitted one rides on the result and is
+    /// named by a line, and each one that is not is a line that says why. The bytes are kept by the
+    /// run, never in the text. An image is not scrubbed, which is why the source is the
+    /// deployment's to allow.
+    async fn admit_images(
+        &self,
+        ctx: &ToolCtx,
+        images: Vec<(String, String)>,
+        mut output: ToolOutput,
+    ) -> ToolOutput {
+        let mut lines = Vec::new();
+        for (n, (data, mime)) in images.into_iter().enumerate() {
+            // The cap is checked on the length of the base64, before anything is decoded.
+            if data.len() / 4 * 3 > MAX_ARTIFACT_FILE_BYTES {
+                lines.push(format!(
+                    "[image not shown: {mime} from `{}` is over the {} MiB one image may be]",
+                    self.remote,
+                    MAX_ARTIFACT_FILE_BYTES / (1024 * 1024)
+                ));
+                continue;
+            }
+            let Some(bytes) = decode(&data) else {
+                lines.push(format!(
+                    "[image not shown: {mime} from `{}` is not valid base64]",
+                    self.remote
+                ));
+                continue;
+            };
+            let name = format!(
+                "{}-{}.{}",
+                self.remote,
+                n + 1,
+                extension_of(&checked_media_type(Some(&mime), &bytes))
+            );
+            let outcome = keep_image(ctx, &bytes, Some(&mime), Some(&name), ImageOrigin::Mcp).await;
+            match (&outcome.image, outcome.stand_in.clone()) {
+                (Some(image), _) => lines.push(format!(
+                    "[image shown to you after this result: {}]",
+                    image.label()
+                )),
+                (None, Some(line)) => lines.push(line),
+                (None, None) => {}
+            }
+            output = output.with_image(outcome);
+        }
+        if !lines.is_empty() {
+            output.content.push('\n');
+            output.content.push_str(&lines.join("\n"));
+        }
+        output
     }
 
     /// [`describe`](Self::describe) before a long text is kept.
@@ -445,6 +512,18 @@ pub(crate) fn map_result(
     };
     output.artifacts = artifacts;
     output
+}
+
+/// The image blocks of a result: base64 and the media type the server declared.
+fn image_blocks(result: &CallToolResult) -> Vec<(String, String)> {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(image) => Some((image.data.clone(), image.mime_type.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One content block as text. What a model cannot read (an image, a blob) is described, not

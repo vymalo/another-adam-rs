@@ -45,24 +45,29 @@ pub fn default_prompt(view: &RunView) -> Option<String> {
 
 /// The default [`InboundFn`]: the message's text parts (and data parts,
 /// rendered as JSON) joined by blank lines become `{"text": ...}` with kind
-/// `message` and the A2A `messageId` as the inbound id. A message without any
-/// text is rejected. A line of text that begins as a form's answer does is marked
+/// `message` and the A2A `messageId` as the inbound id. The file parts are read as
+/// [`files_in`](crate) says: an image goes in the payload, any other file or link is a line of the
+/// text. A message without any text and without an image is rejected. A line of text that begins as a form's answer does is marked
 /// `(typed) `, as [`vymalo_inbound`](crate::vymalo_inbound) marks it: typed words never
 /// pass for the person's click on a form, whichever inbound function a host chose.
 pub fn default_inbound(message: &Message) -> Result<Inbound, String> {
     let mut chunks = Vec::new();
+    let mut files = crate::files_in::Files::default();
     for part in &message.parts {
         match &part.content {
             a2a::PartContent::Text(t) => chunks.push(crate::vymalo::typed_text(t)),
             a2a::PartContent::Data(v) => chunks.push(v.to_string()),
-            _ => {}
+            _ => chunks.extend(files.part(part)),
         }
     }
     let text = chunks.join("\n\n");
-    if text.trim().is_empty() {
+    // A message that is only an image has no words and is a message.
+    if text.trim().is_empty() && !files.has_images() {
         return Err("the message has no text".to_owned());
     }
-    Ok(Inbound::new("message", json!({ "text": text })).with_id(message.message_id.clone()))
+    let mut payload = json!({ "text": text });
+    files.put_in(&mut payload);
+    Ok(Inbound::new("message", payload).with_id(message.message_id.clone()))
 }
 
 /// The A2A task state of a run.

@@ -225,9 +225,15 @@ pub(crate) fn estimate(
 /// Estimated tokens the request holds at least after a cut at `at` (characters / 4): the
 /// instructions and tools (`fixed_chars`), the task, which stays whole, and the messages from `at`.
 pub(crate) fn projected(messages: &[Message], at: usize, fixed_chars: usize) -> usize {
+    // The task stays whole: its first part, which is words, and the images the person sent with it.
     let task = match messages.first() {
         Some(Message::User { content }) => {
             content.first().map_or(0, |p| p.as_text().chars().count())
+                + content
+                    .iter()
+                    .filter(|p| matches!(p, ContentPart::Image(_)))
+                    .count()
+                    * crate::history::IMAGE_CHARS
         }
         _ => 0,
     };
@@ -377,6 +383,7 @@ pub(crate) fn facts_of(
                 call_id,
                 content,
                 is_error,
+                ..
             } if !is_error => {
                 if pinned_calls.contains(call_id) {
                     facts.pinned.push(bounded(content, PINNED_EACH_BYTES));

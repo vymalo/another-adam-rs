@@ -108,6 +108,7 @@ fn result(request: &ModelRequest, id: &str) -> (String, bool) {
                 call_id,
                 content,
                 is_error,
+                ..
             } if call_id == id => Some((content.clone(), *is_error)),
             _ => None,
         })

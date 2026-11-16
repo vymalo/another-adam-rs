@@ -505,6 +505,7 @@ async fn unknown_tool_and_tool_errors_go_back_to_the_model() {
             call_id,
             content,
             is_error,
+            ..
         } => {
             assert_eq!(call_id, "c1");
             assert!(*is_error);
@@ -2195,6 +2196,7 @@ async fn max_tool_calls_answers_an_oversized_turn_not_run_and_then_closes() {
             call_id,
             content,
             is_error,
+            ..
         } = &state.messages[2 + i]
         else {
             panic!("{:?}", state.messages)
@@ -2282,6 +2284,7 @@ async fn invalid_tool_arguments_are_an_error_result_and_the_run_completes() {
         call_id,
         content,
         is_error,
+        ..
     } = &state.messages[2]
     else {
         panic!("{:?}", state.messages)

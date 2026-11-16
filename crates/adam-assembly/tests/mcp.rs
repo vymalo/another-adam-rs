@@ -104,6 +104,7 @@ fn last_tool_result(request: &ModelRequest, id: &str) -> (String, bool) {
             call_id,
             content,
             is_error,
+            ..
         } if call_id == id => (content.clone(), *is_error),
         other => panic!("the last message is not the result of `{id}`: {other:?}"),
     }

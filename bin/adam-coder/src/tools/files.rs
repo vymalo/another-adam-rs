@@ -70,7 +70,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use adam::prelude::*;
-use adam_llm_agent::paging;
+use adam_llm_agent::{keep_image, paging};
+use adam_model::ImageOrigin;
 use adam_workspace::safe_fs::{BeneathError, Dir, Meta, SlotDir, WalkError, race};
 
 use super::gitcli::GitAt;
@@ -435,6 +436,81 @@ fn read_in_until(
         Err(paging::PageError::Io(e)) => Err(format!("cannot read `{shown}`: {e}")),
         Err(paging::PageError::Window(why)) => Err(why),
     }
+}
+
+/// The most bytes of a file read as an image: what `MODEL_IMAGE_MAX_BYTES` can be at most.
+const IMAGE_READ_MAX: u64 = 4 * 1024 * 1024;
+
+/// What a file that is an image gave.
+enum ImageFile {
+    Bytes(Vec<u8>),
+    /// Its size, when it is over [`IMAGE_READ_MAX`]: nothing was read.
+    TooBig(u64),
+}
+
+/// `rel` as an image, or `None` when it is not one (or cannot be read: the text read says why). The
+/// type is the file's first bytes: PNG, JPEG, GIF or WebP, never an SVG, which is text. The path is
+/// confined as every read is.
+fn read_image_in(root: &SlotDir, rel: &str, stop: &AtomicBool) -> Option<ImageFile> {
+    use std::io::Read as _;
+    let (file, meta) = open_for_read(root, rel).ok()?;
+    if !meta.is_file() || meta.size() < 8 {
+        return None;
+    }
+    let mut file = StopRead { inner: file, stop };
+    let mut head = [0u8; 16];
+    let n = file.read(&mut head).ok()?;
+    let kind = adam_runtime::sniff_image(&head[..n])?;
+    if kind == "image/svg+xml" {
+        return None;
+    }
+    if meta.size() > IMAGE_READ_MAX {
+        return Some(ImageFile::TooBig(meta.size()));
+    }
+    let mut bytes = head[..n].to_vec();
+    file.take(IMAGE_READ_MAX + 1 - n as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= IMAGE_READ_MAX).then_some(ImageFile::Bytes(bytes))
+}
+
+/// Offer the image at `path` of `slot` to the model: the result says it is one and the image
+/// follows it, or says why it is not shown. `None` when the file is not an image.
+async fn read_image(ctx: &ToolCtx, slot: &adam_workspace::Slot, path: &str) -> Option<ToolOutput> {
+    let (root, rel) = (Arc::clone(slot.root()), path.to_owned());
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&stop);
+    let work = async {
+        tokio::task::spawn_blocking(move || read_image_in(&root, &rel, &seen))
+            .await
+            .map_err(|e| format!("the read was interrupted: {e}"))
+    };
+    let read = super::find::within(super::find::DEADLINE, &stop, work)
+        .await
+        .ok()??;
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let bytes = match read {
+        ImageFile::Bytes(bytes) => bytes,
+        ImageFile::TooBig(size) => {
+            return Some(ToolOutput::text(format!(
+                "[image not shown: `{path}` is {size} bytes, over the 4 MiB the most this \
+                 deployment can send to the model]"
+            )));
+        }
+    };
+    let outcome = keep_image(ctx, &bytes, None, Some(name), ImageOrigin::Workspace).await;
+    let said = match (&outcome.image, &outcome.stand_in) {
+        (Some(image), _) => format!(
+            "`{path}` is an image ({}, {}, {}\u{d7}{}), shown to you after this result",
+            image.media_type,
+            adam_model::human_bytes(image.bytes),
+            image.width,
+            image.height
+        ),
+        (None, Some(line)) => line.clone(),
+        (None, None) => return None,
+    };
+    Some(ToolOutput::text(said).with_image(outcome))
 }
 
 fn binary_notice(shown: &str, len: u64) -> String {
@@ -811,7 +887,8 @@ pub(super) fn push_published_note(text: &mut String, slot: &adam_workspace::Slot
 
 /// Read a text file of your worktree, one page at a time (at most 2000 lines). Each line starts
 /// with its number. If the last line says `[more: ... offset=N]`, call again with offset N. A
-/// negative offset reads from the end. A binary file is not shown. Example:
+/// negative offset reads from the end. A binary file is not shown, except an image (PNG, JPEG, GIF
+/// or WebP) when you can see images: it comes after the result. Example:
 /// {"path":"src/main.rs","offset":2001}
 #[tool(label = "Read a file", icon = "read", paged)]
 #[allow(clippy::too_many_arguments)] // the model's arguments, one each
@@ -844,6 +921,15 @@ pub async fn read_file(
     };
     ctx.emit_progress(format!("read {path} ({})", slot.dir()))
         .await;
+    // An image is offered to a model that can see it: shown after the result, or said in a line
+    // when the deployment's limits keep it from the model. For a model that cannot see (or a
+    // source the deployment does not send) the file is read as any other, and a binary one is
+    // "not shown", as it always was.
+    if ctx.sees_images_from(ImageOrigin::Workspace)
+        && let Some(output) = read_image(ctx, &slot, path).await
+    {
+        return Ok(output);
+    }
     let (root, rel) = (Arc::clone(slot.root()), path.to_owned());
     let stop = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&stop);

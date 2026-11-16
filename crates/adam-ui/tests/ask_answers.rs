@@ -906,6 +906,7 @@ async fn the_sixth_bad_answer_gives_the_model_an_error_and_the_run_goes_on() {
         call_id,
         content,
         is_error,
+        ..
     }) = requests[1].messages.last()
     else {
         panic!(

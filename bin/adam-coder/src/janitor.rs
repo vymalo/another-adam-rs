@@ -45,6 +45,7 @@ use adam_error::BoxError;
 use adam_workspace::{DynEnvironment, Local, Workspaces};
 use tokio_util::sync::CancellationToken;
 
+use crate::images::FileImages;
 use crate::kept::FileKept;
 use crate::redact::Redactor;
 use crate::tools::Commands;
@@ -71,6 +72,7 @@ pub struct Sweep {
 pub struct Janitor {
     workspaces: Workspaces,
     kept: FileKept,
+    images: FileImages,
     every: Option<Duration>,
     environment: DynEnvironment,
     scratch_idle: Option<Duration>,
@@ -98,6 +100,7 @@ impl Janitor {
     pub fn new(workspaces: Workspaces, every: Option<Duration>) -> Self {
         Self {
             kept: FileKept::new(workspaces.root(), Redactor::default()),
+            images: FileImages::new(workspaces.root()),
             workspaces,
             every,
             environment: Arc::new(Local),
@@ -193,6 +196,17 @@ impl Janitor {
                         && let Err(e) = self.kept.remove_run(&run).await
                     {
                         tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the kept output of a finished run");
+                    }
+                    // The images of its conversation go when the conversation has had no task for as
+                    // long as a scratch project is kept: the same test, the same sweep.
+                    if removed.is_ok() && !keep_scratch {
+                        let scope = adam_llm_agent::image_scope(
+                            record.as_ref().and_then(|r| r.conversation_id.as_deref()),
+                            &run,
+                        );
+                        if let Err(e) = self.images.remove_scope(&scope).await {
+                            tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the images of a finished run");
+                        }
                     }
                     match removed {
                         Ok(0) => {

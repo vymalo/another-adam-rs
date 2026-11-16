@@ -105,6 +105,7 @@ use adam_workspace::{
 };
 use serde_json::Value;
 
+use crate::images::FileImages;
 use crate::kept::FileKept;
 use crate::redact::Redactor;
 use sandbox::Meter;
@@ -294,6 +295,9 @@ pub struct ToolEnv {
     /// scrubbed with [`redactor`](Self::redactor) before they are written. Rebuilt by
     /// [`ToolEnv::with_redactor`].
     pub kept: Arc<FileKept>,
+    /// Where the bytes of the images the model sees are kept: files under
+    /// `<workspace root>/images`, per conversation, their hash checked when they are read back.
+    pub images: Arc<FileImages>,
     /// The person's screen as tools (`ask_user` with choices, `show`, `ui_catalog`) and as a
     /// tool source (the tools of the conversation's endpoint): the catalogs this process has read
     /// are shared by the tools and the source, so both come from this one value. Under the
@@ -332,6 +336,7 @@ impl ToolEnv {
             FileKept::new(workspaces.root(), Redactor::default())
                 .with_run_max(settings.run_kept_max),
         );
+        let images = Arc::new(FileImages::new(workspaces.root()));
         Self {
             workspaces,
             code_host,
@@ -339,6 +344,7 @@ impl ToolEnv {
             notes,
             redactor: Redactor::default(),
             kept,
+            images,
             ui: Ui::new(McpPolicy::default()).with_ask_lead(ASK_LEAD),
             environment: Arc::new(Local),
             unavailable_wait: None,
@@ -1253,6 +1259,9 @@ impl Tool for Redacting {
                 if let Some(kept) = &mut out.kept {
                     kept.text = r.scrub_string(std::mem::take(&mut kept.text));
                 }
+                // `out.images` and `out.kept_images` are references and bytes, not text, and are not
+                // scrubbed: an image is sent only from the sources the deployment allows
+                // (docs/reference/coder-agent.md, Secrets).
                 for artifact in &mut out.artifacts {
                     r.scrub_value(&mut artifact.data);
                     // A text file may hold what the process knows to hide (a token a command

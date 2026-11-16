@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
-use adam_model::ToolSpec;
+use adam_model::{ImageRef, ToolSpec};
 use adam_runtime::{
     Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, Inbound, MAX_RUN_FILE_BYTES,
     RunEvent, SandboxUsage, StepEvent, StepIcon, StepKind, StepState,
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
+use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
 use crate::plan::Plan;
 use crate::source::ToolNote;
@@ -406,6 +407,22 @@ pub struct ToolOutput {
     /// Absent from a journal written before it existed, and not written while it is `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Images the result returns, by reference: [`keep_image`](crate::keep_image) admits and keeps
+    /// them, [`with_image`](Self::with_image) adds one. The history holds them on the tool's message,
+    /// and a model that sees is sent them after the run of tool messages; the references hold no
+    /// byte. Never read from an error result.
+    ///
+    /// Absent from a journal written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageRef>,
+    /// The bytes of [`images`](Self::images), for the run to keep **in its own state**: only when
+    /// the agent has no [`ImageStore`](crate::ImageStore) ([`keep_image`](crate::keep_image) says
+    /// which). Journaled with the result, like [`kept`](Self::kept), so a replay keeps the same
+    /// images.
+    ///
+    /// Absent from a journal written before it existed, and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_images: Vec<KeptImage>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -427,6 +444,8 @@ impl ToolOutput {
             kept: None,
             reported: Vec::new(),
             pinned: false,
+            images: Vec::new(),
+            kept_images: Vec::new(),
         }
     }
 
@@ -445,7 +464,18 @@ impl ToolOutput {
             kept: None,
             reported: Vec::new(),
             pinned: false,
+            images: Vec::new(),
+            kept_images: Vec::new(),
         }
+    }
+
+    /// Add the image `outcome` admitted ([`keep_image`](crate::keep_image)) to the result. An image
+    /// that was not admitted adds nothing: its line is [`ImageOutcome::stand_in`], for the text.
+    #[must_use]
+    pub fn with_image(mut self, outcome: ImageOutcome) -> Self {
+        self.images.extend(outcome.image);
+        self.kept_images.extend(outcome.kept.map(|kept| *kept));
+        self
     }
 
     /// Announce `text` as the run's answer: once the run finishes, `text` is what it answered, and
@@ -701,6 +731,9 @@ pub struct ToolCtx {
     plan: Option<Arc<Plan>>,
     /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
     scrub: Option<Scrubber>,
+    /// What the call needs to admit images ([`keep_image`](crate::keep_image)); `None` for a
+    /// detached context, which admits none.
+    images: Option<Arc<ImagePolicy>>,
 }
 
 /// A function from a text to the same text with its secrets replaced.
@@ -754,7 +787,47 @@ impl ToolCtx {
             scrub: None,
             kept_left: 0,
             kept: Arc::default(),
+            images: None,
         }
+    }
+
+    /// Say how the run admits images: the gate for the model, the conversation's scope for the
+    /// keeper, and the keeper in the agent's state. The agent loop does it for every call.
+    #[must_use]
+    pub(crate) fn with_images(mut self, gate: ImageGate, scope: String) -> Self {
+        let store = self.state::<ImageStore>().map(|s| (*s).clone());
+        self.images = Some(Arc::new(ImagePolicy {
+            gate: std::sync::Mutex::new(gate),
+            store,
+            scope,
+        }));
+        self
+    }
+
+    /// Whether the model of this run can see images at all: a tool that would read or fetch an
+    /// image only to have it replaced by a line may say so instead, and not read it.
+    pub fn sees_images(&self) -> bool {
+        self.images.as_ref().is_some_and(|p| {
+            p.gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sees()
+        })
+    }
+
+    /// Whether the model sees images that come from `origin`: it sees them and the deployment
+    /// sends that source.
+    pub fn sees_images_from(&self, origin: adam_model::ImageOrigin) -> bool {
+        self.images.as_ref().is_some_and(|p| {
+            p.gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sees_from(origin)
+        })
+    }
+
+    pub(crate) fn image_policy(&self) -> Option<&ImagePolicy> {
+        self.images.as_deref()
     }
 
     /// Give the call a function that scrubs secrets out of a text. A layer that scrubs the results

@@ -1,6 +1,6 @@
 {
   "name": "read_file",
-  "description": "Read a text file of your worktree, one page at a time (at most 2000 lines). Each line starts with its number. If the last line says `[more: ... offset=N]`, call again with offset N. A negative offset reads from the end. A binary file is not shown. Example: {\"path\":\"src/main.rs\",\"offset\":2001}",
+  "description": "Read a text file of your worktree, one page at a time (at most 2000 lines). Each line starts with its number. If the last line says `[more: ... offset=N]`, call again with offset N. A negative offset reads from the end. A binary file is not shown, except an image (PNG, JPEG, GIF or WebP) when you can see images: it comes after the result. Example: {\"path\":\"src/main.rs\",\"offset\":2001}",
   "parameters": {
     "type": "object",
     "properties": {

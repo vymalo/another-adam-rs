@@ -85,6 +85,8 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// | an A2UI data part (`application/a2ui+json`) with the action `answer` of a surface `ask-<id>` that carries Choices answers | the text `The person answered through the interface (form ask-<id>):` (the surface the answer is for: [`form_answer_surface`]) and one line `- <question id>: <values>` per answer, an "other" as `other: "<text>"`, the words of a typed question as `text: "<text>"`, and a last line `Note: "<text>"` when the form's free box was used |
 /// | any other A2UI action | `The person used the interface: action "<name>" on surface "<id>" with context <compact JSON, cut at 4 KiB>` |
 /// | any other data part | its JSON, as the default reading does |
+/// | a `raw` part that is a PNG, JPEG, GIF or WebP | an entry of the payload's `images`, at most 4 and 2 MiB a message (over that, a line in the text) |
+/// | any other `raw` part, a `url` part | one line of the text, `[attached: ...; only images are read]` or `[linked: <url>]`; a link is never fetched |
 /// | `metadata[ui-catalog/v1]` `{catalogId, version, digest, inline}` | context [`CONTEXT_UI_REF`] `{catalogId, version, digest}` |
 /// | the renderer's capabilities (`a2uiClientCapabilities.v0.9.1`, else `.v0.9`, else `a2uiRendererCapabilities.v1.0`) holding an inline catalog with the ref's `catalogId` | context [`CONTEXT_UI_CATALOG`] `{catalogId, version, digest, catalog}` |
 /// | `metadata[thread-tools/v1]` `{url, token, expiresAt}` | context [`CONTEXT_THREAD_TOOLS`], the same three members |
@@ -113,6 +115,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut forms: Vec<Value> = Vec::new();
+    let mut files = crate::files_in::Files::default();
     for part in &message.parts {
         match &part.content {
             PartContent::Text(text) => chunks.push(typed_text(text)),
@@ -121,14 +124,16 @@ pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
                 forms.extend(forms_of(data));
             }
             PartContent::Data(data) => chunks.push(data.to_string()),
-            _ => {}
+            _ => chunks.extend(files.part(part)),
         }
     }
     let text = chunks.join("\n\n");
-    if text.trim().is_empty() {
+    // A message that is only an image has no words and is a message.
+    if text.trim().is_empty() && !files.has_images() {
         return Err("the message has no text".to_owned());
     }
     let mut payload = json!({ "text": text });
+    files.put_in(&mut payload);
     if let Some(mut form) = forms.first().cloned() {
         if forms.len() > 1 {
             form["actions"] = json!(forms.len());

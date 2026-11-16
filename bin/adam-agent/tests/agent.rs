@@ -705,6 +705,7 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
             call_id,
             content,
             is_error,
+            ..
         } => {
             assert_eq!(
                 (call_id.as_str(), content.as_str(), *is_error),
@@ -1056,6 +1057,7 @@ async fn a_researcher_searches_a_stateless_mcp_server_and_answers_with_its_sourc
             call_id,
             content,
             is_error,
+            ..
         } => {
             assert_eq!(call_id, "r1");
             assert_eq!(content, SEARCH_RESULT);

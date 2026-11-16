@@ -290,6 +290,7 @@ fn answers_of(rig: &Rig) -> Vec<(String, String, bool)> {
                 call_id,
                 content,
                 is_error,
+                ..
             } => Some((call_id.clone(), content.clone(), *is_error)),
             _ => None,
         })

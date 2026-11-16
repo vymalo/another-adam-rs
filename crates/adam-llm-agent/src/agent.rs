@@ -31,6 +31,10 @@ use crate::conversation::{
     parse_root_step, parse_session, parse_user_text,
 };
 use crate::history::record_shortenings;
+use crate::images::{
+    ImageGate, ImageStore, InboundImage, Item, KeptImage, admit_inbound, answer_with, described,
+    image_data, image_scope, parse_inbound_images, parts_of, state_bytes,
+};
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
 use crate::paging::backstop;
 use crate::plan::Plan;
@@ -109,6 +113,7 @@ fn shortened_for_overflow(messages: &[Message]) -> Vec<Message> {
                 call_id,
                 content,
                 is_error,
+                images,
             } => {
                 let len = content.chars().count();
                 let short = (len > OVERFLOW_OUTPUT_CHARS)
@@ -120,6 +125,7 @@ fn shortened_for_overflow(messages: &[Message]) -> Vec<Message> {
                     call_id: call_id.clone(),
                     content: short.unwrap_or_else(|| content.clone()),
                     is_error: *is_error,
+                    images: images.clone(),
                 }
             }
             other => other.clone(),
@@ -160,6 +166,8 @@ struct CallFacts {
     /// The outputs the run keeps in its own state, and how many bytes it may still keep there.
     kept: Arc<BTreeMap<String, String>>,
     kept_left: usize,
+    /// What the run admits as images from now on: the gate for this model and what the history holds.
+    images: ImageGate,
 }
 
 /// What the model is asked in the closing turn, the last model call of a run that reached
@@ -876,7 +884,12 @@ impl LlmAgent {
     /// refused one is not used: the run stays parked on the question the tool made in its place, and
     /// the refusal is returned for the caller to journal. A tool may also end the question: the call
     /// then gets an error result.
-    fn absorb_inbox(&self, state: &mut Conversation, inbox: Vec<Inbound>) -> Absorbed {
+    fn absorb_inbox(
+        &self,
+        state: &mut Conversation,
+        inbox: Vec<Inbound>,
+        admitted: &HashMap<String, Vec<Item>>,
+    ) -> Absorbed {
         let mut texts = Vec::new();
         for inbound in inbox {
             // A message the run has read is not read again: the orchestration layer sends the same
@@ -892,7 +905,8 @@ impl LlmAgent {
                     if let Some(context) = parse_context(&inbound.payload) {
                         state.merge_context(context);
                     }
-                    texts.push((text, inbound.payload));
+                    let items = admitted.get(&inbound.id).cloned().unwrap_or_default();
+                    texts.push((text, inbound.payload, items));
                 }
                 Err(reason) => {
                     tracing::warn!(inbound = %inbound.id, kind = %inbound.kind, %reason, "ignoring unreadable inbound message");
@@ -910,7 +924,7 @@ impl LlmAgent {
         // The first message that the tool accepts answers the question; one it refuses leaves the
         // run parked on the question the tool asked in its place, and the next is read against that.
         while let Some(PendingWait::Question(q)) = &state.pending_wait {
-            let Some((answer, payload)) = texts.next() else {
+            let Some((answer, payload, items)) = texts.next() else {
                 return Absorbed {
                     waiting: true,
                     refusals,
@@ -943,14 +957,31 @@ impl LlmAgent {
                     );
                     refusals.push((call_id, refusal));
                 }
+                // What the person attached to the answer is the tool result's images.
                 AnswerCheck::Read(said) => {
-                    given(state, Message::tool_result(call_id.clone(), said))
+                    let (said, images) = answer_with(said, &items);
+                    given(
+                        state,
+                        Message::tool_result_with_images(call_id.clone(), said, images),
+                    );
                 }
-                AnswerCheck::Accept => given(state, Message::tool_result(call_id.clone(), answer)),
+                AnswerCheck::Accept => {
+                    let (answer, images) = answer_with(answer, &items);
+                    given(
+                        state,
+                        Message::tool_result_with_images(call_id.clone(), answer, images),
+                    );
+                }
             }
         }
-        for (text, _) in texts {
-            let message = Message::user_text(text);
+        for (text, _, items) in texts {
+            let message = if items.is_empty() {
+                Message::user_text(text)
+            } else {
+                Message::User {
+                    content: parts_of(&text, &items),
+                }
+            };
             if state.pending_calls.is_empty() {
                 state.messages.push(message);
             } else {
@@ -961,6 +992,109 @@ impl LlmAgent {
             waiting: false,
             refusals,
         }
+    }
+
+    /// What the run admits as images from now on: the gate for this model, and what the history
+    /// holds, so that a call admits the images the run has room for and no more.
+    fn image_gate(&self, state: &Conversation) -> ImageGate {
+        let limits = self.model.input_modalities(&self.model_alias).images;
+        let room = self
+            .extensions
+            .get::<ImageStore>()
+            .is_none()
+            .then(|| MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()));
+        ImageGate::new(limits, state.image_count(), room)
+    }
+
+    /// Admit and keep the images of the start message (`state.pending_images`) and of each message of
+    /// `inbox`, each in a journaled step of its own that records what became of every image: the
+    /// references of the ones kept and the line that stands in the place of the others. A replay
+    /// reads the same records. The images of the start message are attached to it; the others are
+    /// returned by the id of their message, for [`absorb_inbox`](Self::absorb_inbox).
+    async fn admit_images(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        inbox: &[Inbound],
+    ) -> Result<HashMap<String, Vec<Item>>, AgentError> {
+        let mut admitted = HashMap::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let waiting = inbox
+            .iter()
+            .any(|i| !state.has_read(&i.id) && !parse_inbound_images(&i.payload).is_empty());
+        if state.pending_images.is_empty() && !waiting {
+            return Ok(admitted);
+        }
+        let mut gate = self.image_gate(state);
+        if !state.pending_images.is_empty() {
+            let pending = std::mem::take(&mut state.pending_images);
+            let items = self
+                .admit_step(ctx, state, "image:start", &pending, &mut gate)
+                .await?;
+            if let Some(Message::User { content }) = state
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| matches!(m, Message::User { .. }))
+            {
+                // The words of the message come first and an empty text part is not kept: a message
+                // that is only an image has no words.
+                content.retain(
+                    |p| !matches!(p, adam_model::ContentPart::Text { text } if text.is_empty()),
+                );
+                content.extend(parts_of("", &items));
+            }
+        }
+        for inbound in inbox {
+            if state.has_read(&inbound.id) || !seen.insert(inbound.id.as_str()) {
+                continue;
+            }
+            let images = parse_inbound_images(&inbound.payload);
+            if images.is_empty() {
+                continue;
+            }
+            let name = format!("image:{}", inbound.id);
+            let items = self
+                .admit_step(ctx, state, &name, &images, &mut gate)
+                .await?;
+            admitted.insert(inbound.id.clone(), items);
+        }
+        Ok(admitted)
+    }
+
+    /// One journaled step that admits `images`: what it records is the decision for each image, never
+    /// a byte. The bytes of an admitted image are kept by the store the agent has, inside the step,
+    /// or, with none, in the run's own state, from the message that still holds them.
+    async fn admit_step(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        name: &str,
+        images: &[InboundImage],
+        gate: &mut ImageGate,
+    ) -> Result<Vec<Item>, AgentError> {
+        let store = self.extensions.get::<ImageStore>().map(|s| (*s).clone());
+        let scope = image_scope(
+            ctx.conversation_id(),
+            &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
+        );
+        let (mut inside, offered, keeper, scope_in) =
+            (gate.clone(), images.to_vec(), store.clone(), scope);
+        let recorded: Result<Vec<Item>, String> = ctx
+            .step(name, move || async move {
+                Ok(admit_inbound(&offered, &mut inside, keeper.as_ref(), &scope_in).await)
+            })
+            .await?;
+        let items = recorded.unwrap_or_default();
+        for item in &items {
+            if let Item::Image(image) = item {
+                gate.took(image);
+            }
+        }
+        if store.is_none() {
+            state.keep_images(state_bytes(images, &items));
+        }
+        Ok(items)
     }
 
     /// What the tool that asked says about `payload`, the message that answers its question: the
@@ -1116,8 +1250,33 @@ impl LlmAgent {
         let emitter = ctx.emitter();
         let stream_text = self.stream_text;
         let cancel = ctx.cancel_token();
+        // The bytes of the images of the history are read here, inside the step, for this call only:
+        // they are never in the journal and never in the history. A model that cannot see is given
+        // none, whatever the history holds.
+        let sees = self
+            .model
+            .input_modalities(&self.model_alias)
+            .images
+            .is_some();
+        let named: Vec<adam_model::ImageRef> = state.image_refs().into_iter().cloned().collect();
+        let images_store = self.extensions.get::<ImageStore>().map(|s| (*s).clone());
+        let images_scope = image_scope(
+            ctx.conversation_id(),
+            &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
+        );
+        let images_state = Arc::clone(&state.images);
         let recorded: Result<Recorded, ModelFailure> = ctx
             .step(&format!("model:{turn}"), move || async move {
+                if !named.is_empty() {
+                    request.image_data = image_data(
+                        named.iter().collect(),
+                        sees,
+                        images_store.as_ref(),
+                        &images_scope,
+                        &images_state,
+                    )
+                    .await;
+                }
                 // The sources are read here, inside the step, so that a replay of a turn whose model
                 // call is recorded does not read them again: only the answer is journaled, not the
                 // tools it was given.
@@ -1499,10 +1658,10 @@ impl LlmAgent {
 
         let mut request = ModelRequest::new(self.model_alias.clone());
         request.system = self.instructions.clone();
-        request.messages = match reason {
+        request.messages = described(&match reason {
             CompactionReason::Budget => state.messages.clone(),
             CompactionReason::Overflow => shortened_for_overflow(&state.messages[..cut.index]),
-        };
+        });
         request.messages.push(Message::user_text(COMPACTION_TURN));
         request.tools = self.specs.clone();
         request.tool_choice = ToolChoice::None;
@@ -1606,6 +1765,8 @@ impl LlmAgent {
             rejected,
             output_id_of,
         );
+        // The images of the turns that were summarised away are not kept for anything any more.
+        state.drop_unnamed_images();
         let dropped = state.compactions.last().map_or(0, |c| c.dropped_turns);
         ctx.emit(RunEvent::Step(step(StepState::Completed).with_detail(
             format!(
@@ -1933,6 +2094,7 @@ impl LlmAgent {
                         output_cut: state.output_cut,
                         kept: Arc::clone(&state.kept_outputs),
                         kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
+                        images: self.image_gate(state),
                     },
                 )
                 .await?;
@@ -1947,6 +2109,7 @@ impl LlmAgent {
                     kept,
                     reported,
                     pinned,
+                    kept_images,
                 } => {
                     if pinned {
                         state.pinned_calls.push(call.id.clone());
@@ -1961,6 +2124,7 @@ impl LlmAgent {
                     // What the call asked the run to keep, within what the run may keep: the call was
                     // told its room (`ToolCtx::kept_left`), so a result over it was never offered.
                     state.keep_output(kept);
+                    state.keep_images(kept_images);
                     if !reported.is_empty() {
                         Self::count_rounds(ctx, state, false).await?;
                     }
@@ -2104,6 +2268,7 @@ impl LlmAgent {
             output_cut,
             kept,
             kept_left,
+            images,
         } = facts;
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
         // What the listing that offered this tool said about it. Only a source's tool has a note: the
@@ -2146,6 +2311,7 @@ impl LlmAgent {
                 kept: None,
                 reported: Vec::new(),
                 pinned: false,
+                kept_images: Vec::new(),
             };
             return Ok((answered, SandboxUsage::new()));
         }
@@ -2154,7 +2320,14 @@ impl LlmAgent {
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
             .with_note(note.cloned())
             .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used))
-            .with_kept(kept_left, kept);
+            .with_kept(kept_left, kept)
+            .with_images(
+                images,
+                image_scope(
+                    ctx.conversation_id(),
+                    &root.0.unwrap_or_else(|| ctx.run_id()).to_string(),
+                ),
+            );
         let args = call.arguments.clone();
         // What a source holds back is refused here too, inside the step that records the answer:
         // the model was shown the tools of a turn that may be over, or named one it was not shown.
@@ -2225,6 +2398,7 @@ impl LlmAgent {
                     kept: None,
                     reported: Vec::new(),
                     pinned: false,
+                    kept_images: Vec::new(),
                 };
                 return Ok((answered, SandboxUsage::new()));
             }
@@ -2282,15 +2456,16 @@ impl LlmAgent {
                     std::mem::take(&mut output.reported)
                 };
                 let pinned = output.pinned && !output.is_error;
-                let (message, artifacts, answer, plan, outcome, kept) = output_message(
-                    ctx,
-                    &call.id,
-                    &call.name,
-                    self.pages(&call.name),
-                    output,
-                    files_used,
-                )
-                .await;
+                let (message, artifacts, answer, plan, outcome, kept, kept_images) =
+                    output_message(
+                        ctx,
+                        &call.id,
+                        &call.name,
+                        self.pages(&call.name),
+                        output,
+                        files_used,
+                    )
+                    .await;
                 // What the step says is what the model is told (the refusal of a file included).
                 let said = match &message {
                     Message::Tool {
@@ -2313,6 +2488,7 @@ impl LlmAgent {
                     kept,
                     reported,
                     pinned,
+                    kept_images,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -2340,6 +2516,7 @@ impl LlmAgent {
                     kept: None,
                     reported: Vec::new(),
                     pinned: false,
+                    kept_images: Vec::new(),
                 }
             }
             Err(ToolError::Transient(reason)) => {
@@ -2475,6 +2652,7 @@ impl LlmAgent {
                 call_id: id,
                 content,
                 is_error,
+                ..
             } if id == call_id => Some((content.as_str(), *is_error)),
             _ => None,
         });
@@ -2599,17 +2777,19 @@ impl LlmAgent {
                     Self::count_rounds(ctx, state, false).await?;
                 }
                 let used = files_kept(&state.artifacts);
-                let (message, artifacts, answer, plan, outcome, kept) = output_message(
-                    ctx,
-                    &wait.call_id,
-                    &wait.tool,
-                    self.pages(&wait.tool),
-                    output,
-                    used,
-                )
-                .await;
+                let (message, artifacts, answer, plan, outcome, kept, kept_images) =
+                    output_message(
+                        ctx,
+                        &wait.call_id,
+                        &wait.tool,
+                        self.pages(&wait.tool),
+                        output,
+                        used,
+                    )
+                    .await;
                 add_artifact_refs(&mut state.artifacts, artifacts);
                 state.keep_output(kept);
+                state.keep_images(kept_images);
                 if let Some(answer) = answer {
                     state.announce(answer);
                 }
@@ -2694,6 +2874,7 @@ async fn output_message(
     Option<Box<Plan>>,
     StepState,
     Option<Box<KeptOutput>>,
+    Vec<KeptImage>,
 ) {
     let mut used = files_used;
     let mut refused: Vec<String> = Vec::new();
@@ -2745,14 +2926,25 @@ async fn output_message(
         .filter(|_| !output.is_error)
         .map(|text| Announcement { text, ends_turn });
     let plan = output.plan.take().filter(|_| !output.is_error);
+    // The images of a result that failed are not shown: the person's screen and the model read the
+    // text, and an image nobody chose to send is not kept.
+    let (images, kept_images) = if output.is_error {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            std::mem::take(&mut output.images),
+            std::mem::take(&mut output.kept_images),
+        )
+    };
     let message = Message::Tool {
         call_id: call_id.to_owned(),
         // After the journal: the journal holds the whole output, and the cut (which the history, the
         // model and the step event carry) is a pure function of it.
         content: backstop(&output.content, tool, paged).into_owned(),
         is_error: output.is_error,
+        images,
     };
-    (message, refs, answer, plan, outcome, kept)
+    (message, refs, answer, plan, outcome, kept, kept_images)
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -2760,6 +2952,7 @@ async fn output_message(
 fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     let text = start_text(&input)?;
     let mut conversation = Conversation::new(text);
+    conversation.pending_images = parse_inbound_images(&input.payload);
     conversation.root_run = parse_root_run(&input.payload);
     conversation.root_step = parse_root_step(&input.payload);
     conversation.session = parse_session(&input.payload);
@@ -2806,6 +2999,7 @@ fn continue_conversation(
     }
     let text = start_text(input)?;
     let mut conversation = prior.continued(text, prior_run);
+    conversation.pending_images = parse_inbound_images(&input.payload);
     // A round of a session works for the run that started it, as the first one did, and says what
     // the session is.
     conversation.root_run = parse_root_run(&input.payload);
@@ -2932,6 +3126,9 @@ enum ToolResult {
         reported: Vec<RunId>,
         /// The result is pinned ([`ToolOutput::pinned`]), from a result that is not an error.
         pinned: bool,
+        /// The bytes of the images the result returns, for the run to keep in its own state (only
+        /// when the agent has no image store), from a result that is not an error.
+        kept_images: Vec<KeptImage>,
     },
     NeedsInput {
         question: String,
@@ -3279,6 +3476,8 @@ impl Agent for LlmAgent {
         ) {
             state.shortenings.push(state.turns);
             state.last_prompt = None;
+            // The images of a result that was shortened left the history with it.
+            state.drop_unnamed_images();
         }
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx
             .take_inbox()
@@ -3311,7 +3510,10 @@ impl Agent for LlmAgent {
             Some(PendingWait::Question(q)) => Some((q.tool.clone(), q.call_id.clone())),
             _ => None,
         };
-        let absorbed = self.absorb_inbox(&mut state, inbox);
+        // The images that came with a message are admitted and kept in journaled steps of their
+        // own, before the message is read: it is read from the references those steps recorded.
+        let admitted = self.admit_images(ctx, &mut state, &inbox).await?;
+        let absorbed = self.absorb_inbox(&mut state, inbox, &admitted);
         for (call_id, refusal) in &absorbed.refusals {
             ctx.emit(RunEvent::Custom {
                 kind: "answer_refused".into(),

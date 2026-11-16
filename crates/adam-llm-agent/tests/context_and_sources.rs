@@ -1139,7 +1139,7 @@ async fn a_source_tool_cannot_wait_on_a_remote_task_and_the_call_is_an_error_res
     assert_eq!(view.output.clone().expect("output")["text"], "noted");
     let state = conversation(&view);
     assert!(
-        matches!(&state.messages[2], Message::Tool { call_id, content, is_error: true }
+        matches!(&state.messages[2], Message::Tool { call_id, content, is_error: true, .. }
             if call_id == "c1" && content.contains("`start_task`") && content.contains("is gone")),
         "{:?}",
         state.messages[2]

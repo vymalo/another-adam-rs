@@ -1,6 +1,6 @@
 //! Fitting the history into the model's context budget.
 
-use adam_model::Message;
+use adam_model::{ContentPart, Message};
 
 /// Prefix of the marker appended to a truncated tool output. Public through
 /// the crate root so callers and tests can recognise truncation.
@@ -139,10 +139,23 @@ pub(crate) fn shorten_output(content: &str, excess: usize, id: Option<&str>) -> 
     (shortened.chars().count() < len).then_some(shortened)
 }
 
+/// What an image counts in the estimate, in characters: 4,000, about 1,000 tokens at a character
+/// to a quarter of a token. *Unverified*: what an image costs depends on the provider and on the
+/// size of the image.
+pub(crate) const IMAGE_CHARS: usize = 4_000;
+
+/// Characters of one content part.
+fn part_chars(p: &ContentPart) -> usize {
+    match p {
+        ContentPart::Text { text } => text.chars().count(),
+        ContentPart::Image(_) => IMAGE_CHARS,
+    }
+}
+
 /// Characters a message contributes to the estimate.
 pub(crate) fn message_chars(m: &Message) -> usize {
     match m {
-        Message::User { content } => content.iter().map(|p| p.as_text().chars().count()).sum(),
+        Message::User { content } => content.iter().map(part_chars).sum(),
         Message::Assistant {
             content,
             tool_calls,
@@ -150,16 +163,15 @@ pub(crate) fn message_chars(m: &Message) -> usize {
         } => {
             // The reasoning a client echoes is sent, so it counts.
             reasoning.as_deref().map_or(0, |r| r.chars().count())
-                + content
-                    .iter()
-                    .map(|p| p.as_text().chars().count())
-                    .sum::<usize>()
+                + content.iter().map(part_chars).sum::<usize>()
                 + tool_calls
                     .iter()
                     .map(|c| c.name.chars().count() + c.arguments.to_string().chars().count())
                     .sum::<usize>()
         }
-        Message::Tool { content, .. } => content.chars().count(),
+        Message::Tool {
+            content, images, ..
+        } => content.chars().count() + images.len() * IMAGE_CHARS,
     }
 }
 
@@ -219,19 +231,39 @@ pub(crate) fn record_shortenings(
             break;
         }
         let Message::Tool {
-            content, call_id, ..
+            content,
+            call_id,
+            images,
+            ..
         } = m
         else {
             continue;
         };
-        let len = content.chars().count();
-        let id = output_id_of(call_id);
-        let Some(shortened) = shorten_output(content, total - target, id.as_deref()) else {
-            continue; // would not get shorter
-        };
-        total = total - len + shortened.chars().count();
-        *content = shortened;
-        shortened_any = true;
+        // The images of an old result go with its text: each becomes one line that names it, after
+        // what is left of the text, and the model reads it again by calling the tool. Once: the
+        // result has no image after that, so a replay finds nothing more to take out.
+        let removal = (!images.is_empty()).then(|| {
+            let lines: Vec<String> = images.iter().map(crate::images::removed_line).collect();
+            lines.join("\n")
+        });
+        if let Some(added) = &removal {
+            total = total - images.len() * IMAGE_CHARS + added.chars().count() + 1;
+        }
+        if removal.is_none() || total > target {
+            let len = content.chars().count();
+            let id = output_id_of(call_id);
+            if let Some(shortened) = shorten_output(content, total - target, id.as_deref()) {
+                total = total - len + shortened.chars().count();
+                *content = shortened;
+                shortened_any = true;
+            }
+        }
+        if let Some(added) = removal {
+            images.clear();
+            content.push('\n');
+            content.push_str(&added);
+            shortened_any = true;
+        }
     }
     shortened_any
 }
@@ -635,8 +667,8 @@ mod tests {
                 for (i, (before, after)) in messages.iter().zip(&fitted).enumerate() {
                     match (before, after) {
                         (
-                            Message::Tool { call_id: a, content: old, is_error: ea },
-                            Message::Tool { call_id: b, content: new, is_error: eb },
+                            Message::Tool { call_id: a, content: old, is_error: ea, .. },
+                            Message::Tool { call_id: b, content: new, is_error: eb, .. },
                         ) => {
                             prop_assert_eq!(a, b, "tool call ids are kept");
                             prop_assert_eq!(ea, eb);
