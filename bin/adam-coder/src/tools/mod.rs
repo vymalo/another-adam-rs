@@ -1032,7 +1032,12 @@ impl Tool for Redacting {
         ui: Option<&Value>,
         payload: &Value,
     ) -> AnswerCheck {
-        self.inner.read_answer(call_id, args, ui, payload)
+        // A refusal and an ending are made from the call's own arguments, which are not scrubbed:
+        // they are scrubbed like the question the call asked.
+        let r = &self.redactor;
+        self.inner
+            .read_answer(call_id, args, ui, payload)
+            .scrubbed(|text| r.scrub_string(text), |ui| r.scrub_value(ui))
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
