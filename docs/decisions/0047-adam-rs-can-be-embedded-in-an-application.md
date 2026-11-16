@@ -1,6 +1,8 @@
 # 0047. adam-rs can be embedded in an application
 
-Status: **Proposed** (2026-11-16). Nothing is built. The owner's words (2026-11-15): *"I just want adam-rs to be the
+Status: **Accepted** (2026-11-16), an owner decision: the six decisions at the end are confirmed as written. Nothing is
+built; by the owner's order of the same day it is built after ADR 0044 and after
+[ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md). The owner's words (2026-11-15): *"I just want adam-rs to be the
 agent at the core of it. It'll use a sqlite on desktop. So we need to develop traits and features, so that we shall have
 it possible for adam-rs to be embedded e.g. into a flutter app via frb, knowing that the core state of the app would be
 managed by the rust part"*; *"It'll just be a library"*; *"We can use hexagonal port and adapter around adam-rs, so that
@@ -140,7 +142,9 @@ is still `Runnable`: at the next start the engine releases its own leases and th
 
 Slices 1 to 8 need nothing of what is left of ADR 0044.
 
-## Decisions for the owner to confirm
+## Decisions the owner confirmed
+
+Confirmed on 2026-11-16, all six as written.
 
 1. The A2A types crate (data only, no HTTP) stays an **internal** dependency of `adam-engine`, because decision 1 reuses
    `RuntimeTaskBackend`. Removing it from the tree is one more slice: move that logic below the A2A layer.

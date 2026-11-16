@@ -291,8 +291,9 @@ Each is testable alone.
 | 12 | **Commands** and the `commands/v1` extension | a card lists them; metadata and `/name` expand the same; an unknown one is `InvalidParams` | nothing |
 | 13 | **References** as read-only slots | a write there is refused; a repository-declared one asks | 7 |
 | 14 | **MCP**: timeouts per server, server instructions, prompts; the image example | a slow server is bounded by its own setting | nothing |
-| 15 | **Modalities**: images in, then images out | built against a named provider | a deployment that names one |
+| 15 | **Modalities**: images in (15a). Images out, made inline by a model that can (15b), are **deferred** by the owner (2026-11-16) until a provider is named: an image is made by an MCP server | built against a named provider | a deployment that names one |
 | 16 | **Commands that keep running** | started, read, stopped; gone with the pod | 3 |
+| 17 | **Diagnostics from a language server** (added by the owner, 2026-11-16): a tool that asks a language server for the errors and warnings of a file, off unless the image or the host has the server | a scripted server answers; with no server the tool says so | 16 |
 
 ## The owner's answers (2026-11-14)
 
