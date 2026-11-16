@@ -19,6 +19,7 @@
 //! A question may `show` what it asks about (catalog version 8): see `ask/shown.rs`.
 
 mod answer;
+mod blocks;
 mod kinds;
 mod reask;
 mod shown;
@@ -903,6 +904,14 @@ fn marker(m: usize, total: usize) -> String {
     }
 }
 
+/// The call ends asking `form` as text, unless what it shows is too long to be read in words.
+fn in_words(question: &str, form: &Form) -> Result<ToolOutput, ToolError> {
+    if let Err(problem) = shown::check_words(&shown::all_words(form)) {
+        return Ok(ToolOutput::error(problem));
+    }
+    Err(ToolError::needs_input(as_text(question, form)))
+}
+
 /// `question` followed by the form as text, for a screen that cannot draw it: the person answers in
 /// words.
 fn as_text(question: &str, form: &Form) -> String {
@@ -1130,7 +1139,7 @@ impl Tool for AskUser {
                     tracing::debug!(
                         "a kind the screen lacks does not fit its older form; the form goes in the text"
                     );
-                    return Err(ToolError::needs_input(as_text(&question, &form)));
+                    return in_words(&question, &form);
                 };
                 // What the questions show is drawn where the screen can, and said in words where not.
                 let arranged = match shown::arrange(&catalog, &drawn) {
@@ -1155,7 +1164,7 @@ impl Tool for AskUser {
                         version = catalog.version(),
                         "the form needs more than the screen's Choices has; it goes in the text"
                     );
-                    return Err(ToolError::needs_input(as_text(&question, &form)));
+                    return in_words(&question, &form);
                 };
                 if let Err(problem) = catalog.validate(&instance) {
                     return Ok(ToolOutput::error(format!(
@@ -1169,7 +1178,7 @@ impl Tool for AskUser {
                 let id = ask_surface_id(ctx.call_id());
                 let ui = surface(&id, catalog.catalog_id(), components);
                 if arranged.is_some()
-                    && let Err(problem) = shown::check_size(&ui)
+                    && let Err(problem) = shown::check_size(&ui).and(shown::check_words(words))
                 {
                     return Ok(ToolOutput::error(problem));
                 }
@@ -1177,12 +1186,12 @@ impl Tool for AskUser {
             }
             Resolved::Found(_) => {
                 tracing::debug!("the screen has no Choices component; the options go in the text");
-                Err(ToolError::needs_input(as_text(&question, &form)))
+                in_words(&question, &form)
             }
-            Resolved::NoCatalog => Err(ToolError::needs_input(as_text(&question, &form))),
+            Resolved::NoCatalog => in_words(&question, &form),
             Resolved::Unreadable(reason) => {
                 tracing::debug!(%reason, "the screen's components could not be read; the options go in the text");
-                Err(ToolError::needs_input(as_text(&question, &form)))
+                in_words(&question, &form)
             }
         }
     }

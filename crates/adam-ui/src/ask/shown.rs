@@ -4,21 +4,28 @@
 //!
 //! The model writes the components, adam-ui gives them their ids (`q<i>-s<j>`: question `i`, entry
 //! `j`) and puts them in the surface; the screen's `Choices` names them by id in its own `show`. What
-//! the contract refuses is refused here before anything is drawn, naming the member: a component off
-//! the closed list of seven, more than 4 in a question or 8 in a form, an `Image` with no `alt`.
-//! Nothing a shown component holds can reach the surface unseen by the person: a hidden, control or
-//! bidirectional character in any of its text is refused, because a confirmation that shows a diff
-//! is read by a person who trusts what is drawn.
+//! the contract refuses is refused here before anything is drawn, on every screen and with no
+//! catalog, naming the block and the member: a component off the closed list of seven, more than 4 in
+//! a question or 8 in a form, a member missing, of the wrong type or past a limit of its component
+//! (`blocks.rs` holds the table, a test holds it equal to the catalog of version 8), an `Image` with
+//! no `alt`, a `Chart` series with other than one value per label.
+//!
+//! A control or format character in any text of a block (a zero-width or bidirectional one among them)
+//! is refused, because a confirmation that shows a diff is read by a person who trusts what is drawn.
+//! A tab and a line break are text. Blank characters that are neither control nor format (U+2028 and
+//! U+2029, U+034F, the variation selectors, U+115F, U+1160, U+3164, U+FFA0, U+2800) are not refused.
 //!
 //! What a screen does with it is read from the screen's `Choices` schema, not from its version:
 //!
 //! * **it takes `show`:** the components are loose in the surface and the question names them.
-//! * **it does not** (versions 2 to 7): the components go in a `Column` **above** the form, as the
-//!   contract says an agent does for a client of version 7, and the question's `help` says so.
-//! * **it has no `Column`, or lacks the component:** the content goes **in words** in the question
-//!   the person reads first, in full, and the `help` points at it.
+//! * **it does not** (versions 2 to 7): the components go in a `Column` **above** the form, each
+//!   question's under a caption that names the question and the blocks, as the contract advises for a
+//!   client of version 7 (one form; the captions are this crate's).
+//! * **it has no `Column`, or lacks the component:** the content goes **in words** after the question
+//!   the person reads first, under the same caption, and nothing is left half placed.
 //!
-//! Nothing shown is ever dropped: a form is asked as text, with the same words.
+//! The blocks of a question are numbered in the order the model listed them, and a caption or a
+//! `Block <n>:` says the number wherever the block lands. The model's `help` is never touched.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -26,8 +33,8 @@ use std::fmt::Write as _;
 use adam_a2a_runtime::is_format_or_control;
 use serde_json::{Map, Value, json};
 
-use super::kinds::MAX_HELP;
-use super::{Form, clipped};
+use super::reask::QUOTED_QUESTION;
+use super::{Form, Question, blocks, clipped};
 use crate::catalog::Catalog;
 
 /// The components a question may show: the contract's closed list.
@@ -40,8 +47,6 @@ pub(super) const MAX_PER_QUESTION: usize = 4;
 pub(super) const MAX_PER_FORM: usize = 8;
 /// The most bytes of the operations of a surface, written as JSON: what the screen reads.
 const MAX_SURFACE_BYTES: usize = 64 * 1024;
-/// The longest words of a question quoted before what it shows.
-const QUOTED_QUESTION: usize = 80;
 /// The id the `Choices` has when a `Column` is the root.
 const FORM_ID: &str = "ask";
 
@@ -122,20 +127,7 @@ fn one(id: &str, n: usize, position: usize, entry: Value) -> Result<Shown, Strin
             SHOWABLE.join(", ")
         ));
     }
-    // The ids are made here, so that one is never shown twice and none is placed anywhere else.
-    props.remove("id");
     if component == "Image" {
-        let hash = props
-            .get("artifact")
-            .and_then(Value::as_str)
-            .map(|hash| hash.trim().to_ascii_lowercase())
-            .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
-        let Some(hash) = hash else {
-            return Err(format!(
-                "{at} is an `Image` whose `artifact` is not the sha256 (64 hexadecimal digits) of an image \
-                 file you shared in this conversation: never a URL or a path"
-            ));
-        };
         let alt = props
             .get("alt")
             .and_then(Value::as_str)
@@ -145,8 +137,12 @@ fn one(id: &str, n: usize, position: usize, entry: Value) -> Result<Shown, Strin
                 "{at} is an `Image` with no `alt`: say what it shows in words, it is never decoration"
             ));
         }
-        props.insert("artifact".into(), json!(hash));
+        if let Some(Value::String(hash)) = props.get_mut("artifact") {
+            *hash = hash.trim().to_ascii_lowercase();
+        }
     }
+    blocks::check(&component, &props)
+        .map_err(|problem| format!("{at} ({component}): {problem}"))?;
     for (member, value) in &props {
         plain(&at, member, value)?;
     }
@@ -159,8 +155,8 @@ fn one(id: &str, n: usize, position: usize, entry: Value) -> Result<Shown, Strin
     })
 }
 
-/// `value` has no hidden, control or bidirectional character in any text (a line break and a tab are
-/// text): a diff or a graph is read by a person who trusts that what is drawn is what is there.
+/// `value` has no control or format character in any text (a line break and a tab are text): a
+/// diff or a graph is read by a person who trusts that what is drawn is what is there.
 fn plain(at: &str, path: &str, value: &Value) -> Result<(), String> {
     match value {
         Value::String(text) => match text
@@ -168,7 +164,9 @@ fn plain(at: &str, path: &str, value: &Value) -> Result<(), String> {
             .find(|c| !matches!(c, '\t' | '\n' | '\r') && is_format_or_control(*c))
         {
             Some(hidden) => Err(format!(
-                "{at} has a character the person cannot see (U+{:04X}) in `{path}`: write plain text",
+                "{at} has a character the person cannot see (U+{:04X}) in `{path}`: a control or format \
+                 character is refused. Write it as a visible escape such as \\u{{{:04X}}}, or say it in words",
+                u32::from(hidden),
                 u32::from(hidden)
             )),
             None => Ok(()),
@@ -209,7 +207,7 @@ fn takes_show(catalog: &Catalog) -> bool {
 
 /// What a form that shows something is made of on one screen.
 pub(super) struct Arranged {
-    /// The form with where each component went, and a `help` that points at it.
+    /// The form with where each component went.
     pub(super) form: Form,
     column: Option<Value>,
     above: Vec<Value>,
@@ -231,6 +229,46 @@ impl Arranged {
         components.extend(self.loose.iter().cloned());
         components
     }
+}
+
+/// The caption of the blocks of question `n` that are written or drawn apart from it.
+fn caption(n: usize, question: &Question, positions: &[usize]) -> String {
+    let numbers = match positions {
+        [one] => one.to_string(),
+        [rest @ .., last] => format!(
+            "{} and {last}",
+            rest.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        [] => String::new(),
+    };
+    format!(
+        "For question {n} (\"{}\"), block{} {numbers} of {}:",
+        clipped(&question.question, QUOTED_QUESTION),
+        if positions.len() == 1 { "" } else { "s" },
+        question.shown.len()
+    )
+}
+
+/// The caption component placed above the form for question `n`.
+fn caption_component(n: usize, text: &str) -> Value {
+    json!({"id": format!("q{n}-cap"), "component": "Text", "text": text})
+}
+
+/// The words of the blocks of question `n` that `said` picks, under their caption, or nothing.
+fn words_of(n: usize, question: &Question, said: impl Fn(&Shown) -> bool) -> String {
+    let blocks: Vec<&Shown> = question.shown.iter().filter(|s| said(s)).collect();
+    if blocks.is_empty() {
+        return String::new();
+    }
+    let positions: Vec<usize> = blocks.iter().map(|s| s.position).collect();
+    let mut words = format!("\n\n{}", caption(n, question, &positions));
+    for shown in blocks {
+        let _ = write!(words, "\nBlock {}: {}", shown.position, describe(shown));
+    }
+    words
 }
 
 /// `form` as the screen of `catalog` draws what it shows, or `None` when it shows nothing. What the
@@ -260,68 +298,75 @@ pub(super) fn arrange(catalog: &Catalog, form: &Form) -> Result<Option<Arranged>
             };
         }
     }
-    let ids = |form: &Form, placed: Placed| -> Vec<String> {
-        form.questions
+    // What goes above the form is under a caption of its own; a screen whose `Text` does not take
+    // the caption has the question's blocks in words.
+    let mut captions: Vec<Option<Value>> = Vec::new();
+    for (i, q) in form.questions.iter_mut().enumerate() {
+        let positions: Vec<usize> = q
+            .shown
             .iter()
-            .flat_map(|q| &q.shown)
-            .filter(|s| s.placed == placed)
-            .map(|s| s.id.clone())
-            .collect()
-    };
-    let mut children = ids(&form, Placed::Above);
-    let any_above = !children.is_empty();
-    let drawn = any_above || !ids(&form, Placed::Native).is_empty();
+            .filter(|s| s.placed == Placed::Above)
+            .map(|s| s.position)
+            .collect();
+        let component = (!positions.is_empty())
+            .then(|| caption_component(i + 1, &caption(i + 1, q, &positions)))
+            .filter(|component| catalog.validate(component).is_ok());
+        if component.is_none() {
+            for shown in &mut q.shown {
+                if shown.placed == Placed::Above {
+                    shown.placed = Placed::Words;
+                }
+            }
+        }
+        captions.push(component);
+    }
+    let mut children = Vec::new();
+    for (q, caption) in form.questions.iter().zip(&captions) {
+        if let Some(caption) = caption {
+            children.push(caption["id"].as_str().unwrap_or_default().to_owned());
+        }
+        children.extend(
+            q.shown
+                .iter()
+                .filter(|s| s.placed == Placed::Above)
+                .map(|s| s.id.clone()),
+        );
+    }
+    let drawn = form
+        .questions
+        .iter()
+        .flat_map(|q| &q.shown)
+        .any(|s| s.placed != Placed::Words);
     children.push(FORM_ID.to_owned());
     let column = json!({"id": "root", "component": "Column", "children": children});
     let column = (drawn && catalog.validate(&column).is_ok()).then_some(column);
     if column.is_none() {
+        // Nothing is half placed: with no `Column` there is nowhere to put a block.
         for shown in form.questions.iter_mut().flat_map(|q| &mut q.shown) {
-            if shown.placed == Placed::Above {
-                shown.placed = Placed::Words;
-            }
+            shown.placed = Placed::Words;
         }
+        captions.iter_mut().for_each(|caption| *caption = None);
     }
     let (mut above, mut loose) = (Vec::new(), Vec::new());
     let mut words = String::new();
-    for q in &mut form.questions {
-        let mut note = Vec::new();
-        let mut said = String::new();
+    for ((i, q), caption) in form.questions.iter().enumerate().zip(captions) {
+        above.extend(caption);
         for shown in &q.shown {
             match shown.placed {
                 Placed::Above => above.push(shown.instance()),
                 Placed::Native => loose.push(shown.instance()),
-                Placed::Words => {
-                    let _ = write!(said, "\n{}", describe(shown));
-                }
+                Placed::Words => {}
             }
         }
-        if q.shown.iter().any(|s| s.placed == Placed::Above) {
-            note.push("What it asks about is shown above the form.");
-        }
-        if !said.is_empty() {
-            note.push("What it asks about is written above the form.");
-            let _ = write!(
-                words,
-                "\n\nAbout \"{}\":{said}",
-                clipped(&q.question, QUOTED_QUESTION)
-            );
-        }
-        if !note.is_empty() {
-            let help = q.help.take().unwrap_or_default();
-            q.help = Some(clipped(
-                format!("{} {help}", note.join(" ")).trim_end(),
-                MAX_HELP,
-            ));
-        }
+        words.push_str(&words_of(i + 1, q, |s| s.placed == Placed::Words));
     }
-    let arranged = Arranged {
+    Ok(Some(Arranged {
         form,
         column,
         above,
         loose,
         words,
-    };
-    Ok(Some(arranged))
+    }))
 }
 
 /// The surface is no larger than a screen reads.
@@ -336,13 +381,36 @@ pub(super) fn check_size(messages: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// What `form` shows, in words, for a screen that draws no component: after each question's words.
-pub(super) fn as_text(question: &super::Question) -> String {
+/// The words of what a form shows are no longer than the surface of one may be.
+pub(super) fn check_words(words: &str) -> Result<(), String> {
+    if words.len() > MAX_SURFACE_BYTES {
+        return Err(format!(
+            "what the form shows is too large: written out it is {} bytes and at most {MAX_SURFACE_BYTES} \
+             are read. Show less, or shorter code",
+            words.len()
+        ));
+    }
+    Ok(())
+}
+
+/// What every question of `form` shows, in words: for a form asked as text.
+pub(super) fn all_words(form: &Form) -> String {
+    form.questions.iter().map(as_text).collect::<String>()
+}
+
+/// What a question shows, in words, to follow the question in a form asked as text: each block under
+/// its number.
+pub(super) fn as_text(question: &Question) -> String {
     let mut text = String::new();
     for shown in &question.shown {
         // Not indented: code is shown as it is, and a diff keeps its first characters.
-        text.push('\n');
-        text.push_str(&describe(shown));
+        let _ = write!(
+            text,
+            "\nBlock {} of {}: {}",
+            shown.position,
+            question.shown.len(),
+            describe(shown)
+        );
     }
     text
 }
@@ -363,25 +431,11 @@ pub(super) fn undrawn_words(form: &Form, ui: &Value) -> String {
         .flatten()
         .filter_map(|component| component.get("id")?.as_str())
         .collect();
-    let mut words = String::new();
-    for q in &form.questions {
-        let said: String = q
-            .shown
-            .iter()
-            .filter(|s| !drawn.contains(s.id.as_str()))
-            .fold(String::new(), |mut said, s| {
-                let _ = write!(said, "\n{}", describe(s));
-                said
-            });
-        if !said.is_empty() {
-            let _ = write!(
-                words,
-                "\n\nAbout \"{}\":{said}",
-                clipped(&q.question, QUOTED_QUESTION)
-            );
-        }
-    }
-    words
+    form.questions
+        .iter()
+        .enumerate()
+        .map(|(i, q)| words_of(i + 1, q, |s| !drawn.contains(s.id.as_str())))
+        .collect()
 }
 
 fn text_of<'a>(props: &'a Map<String, Value>, member: &str) -> Option<&'a str> {
@@ -392,8 +446,21 @@ fn text_of<'a>(props: &'a Map<String, Value>, member: &str) -> Option<&'a str> {
         .filter(|text| !text.is_empty())
 }
 
-/// A shown component as words and, for code, as the code: everything the person would have seen,
-/// nothing cut.
+/// The fence of a block of code: longer than any run of backticks in it, so that the code cannot end
+/// the block early.
+fn fenced(code: &str, info: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in code.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}{info}\n{code}\n{fence}")
+}
+
+/// A shown component as words and, for code, as the code: every member that is content, nothing cut.
+/// The members that only say how to draw (`weight`, `Text.variant`, `Cards.layout`) are not said.
 fn describe(shown: &Shown) -> String {
     let props = &shown.props;
     let say = |member: &str| text_of(props, member);
@@ -410,21 +477,36 @@ fn describe(shown: &Shown) -> String {
             say("text").unwrap_or_default()
         ),
         "Code" | "Mermaid" => {
-            let (what, language) = if shown.component == "Code" {
-                (
-                    titled("Code", say("title").or_else(|| say("filename"))),
-                    say("language").unwrap_or_default(),
-                )
+            let (mut what, language) = if shown.component == "Code" {
+                (titled("Code", say("title")), say("language"))
             } else {
-                (titled("A diagram", say("title")), "mermaid")
+                (titled("A diagram", say("title")), Some("mermaid"))
             };
-            let mut text = format!(
-                "{what}:\n```{language}\n{}\n```",
-                props
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-            );
+            let details: Vec<String> = [
+                say("filename").map(|file| format!("file {file}")),
+                language
+                    .filter(|_| shown.component == "Code")
+                    .map(|language| format!("language {language}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !details.is_empty() {
+                let _ = write!(what, " ({})", details.join(", "));
+            }
+            // The language names the fence only when it is a plain word.
+            let info = language
+                .filter(|l| {
+                    l.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '_' | '.' | '#')
+                    })
+                })
+                .unwrap_or_default();
+            let code = props
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut text = format!("{what}:\n{}", fenced(code, info));
             if let Some(caption) = say("caption") {
                 let _ = write!(text, "\n{caption}");
             }
@@ -450,6 +532,16 @@ fn describe(shown: &Shown) -> String {
                     if !member(name).is_empty() {
                         let _ = write!(text, "{open}{}{close}", member(name));
                     }
+                }
+                let tags: Vec<&str> = card
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                if !tags.is_empty() {
+                    let _ = write!(text, " [tags: {}]", tags.join(", "));
                 }
             }
             text
@@ -506,5 +598,33 @@ fn describe(shown: &Shown) -> String {
             text.push_str(" - a file shared in this conversation");
             text
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A message whose JSON text is `bytes` long: the quotes are two of them.
+    fn message(text: &str) -> Value {
+        Value::String(text.to_owned())
+    }
+
+    #[test]
+    fn the_bound_of_a_surface_is_in_utf8_bytes_exactly() {
+        assert!(check_size(&message(&"x".repeat(MAX_SURFACE_BYTES - 2))).is_ok());
+        assert!(check_size(&message(&"x".repeat(MAX_SURFACE_BYTES - 1))).is_err());
+        // 21845 three-byte characters are 65535 bytes and 21845 characters.
+        assert!(check_size(&message(&"€".repeat(21844))).is_ok());
+        assert!(check_size(&message(&"€".repeat(21845))).is_err());
+        assert!(check_size(&message(&format!("{}é", "x".repeat(MAX_SURFACE_BYTES - 3)))).is_err());
+    }
+
+    #[test]
+    fn the_bound_of_words_is_in_utf8_bytes_exactly() {
+        assert!(check_words(&"x".repeat(MAX_SURFACE_BYTES)).is_ok());
+        assert!(check_words(&"x".repeat(MAX_SURFACE_BYTES + 1)).is_err());
+        assert!(check_words(&"€".repeat(21845)).is_ok());
+        assert!(check_words(&"€".repeat(21846)).is_err());
     }
 }

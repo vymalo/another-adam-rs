@@ -26,7 +26,7 @@ const MAX_END_LABEL: usize = 60;
 /// The most points of a scale: `to` is at most 10 and `from` at least 0.
 const MAX_TO: i64 = 10;
 /// The longest `help` of a question: the component's limit.
-pub(super) const MAX_HELP: usize = 300;
+const MAX_HELP: usize = 300;
 /// The longest a value quoted back to the model is.
 const SHOWN: usize = 40;
 

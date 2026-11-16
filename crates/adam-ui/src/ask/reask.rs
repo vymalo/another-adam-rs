@@ -20,7 +20,7 @@ use super::{
 use crate::surface::{ask_attempt, ask_retry_surface_id};
 
 /// The longest words of a question quoted back to the person.
-const QUOTED_QUESTION: usize = 80;
+pub(super) const QUOTED_QUESTION: usize = 80;
 
 /// How many times a form is asked again after an answer that does not fit. The next bad answer ends
 /// the question: the model is told, as an error, and may ask another way.
@@ -320,11 +320,41 @@ fn ask_again(
     let surface = ask_retry_surface_id(call_id, attempt);
     set_surface(&mut asked, &surface);
     carry_answers(&mut asked, drawn, context, &verdict.valid);
-    let refusal = Refusal::new(format!("{said}\n{lead}"), Some(asked), rule);
+    let asked = fits(&mut asked, form).then_some(asked);
+    let refusal = Refusal::new(format!("{said}\n{lead}"), asked, rule);
     match &verdict.question {
         Some(id) => refusal.about(id.clone()),
         None => refusal,
     }
+}
+
+/// The surface asked again is no larger than a screen reads, which the defaults carried may have
+/// pushed it over: the defaults are dropped, the texts first, until it fits. `false` when it does not
+/// fit with none (the form is then asked in words). A form that shows nothing is left as it is.
+fn fits(asked: &mut Value, form: &Form) -> bool {
+    if form.questions.iter().all(|q| q.shown.is_empty()) {
+        return true;
+    }
+    for texts in [true, false] {
+        while shown::check_size(asked).is_err() {
+            let carried = root_of_mut(asked)
+                .and_then(|root| root.get_mut("questions")?.as_array_mut())
+                .and_then(|questions| {
+                    questions.iter_mut().find(|q| {
+                        let text = matches!(
+                            q.get("type").and_then(Value::as_str),
+                            Some("text" | "longText")
+                        );
+                        q.get("default").is_some() && text == texts
+                    })
+                });
+            let Some(Value::Object(question)) = carried else {
+                break;
+            };
+            question.remove("default");
+        }
+    }
+    shown::check_size(asked).is_ok()
 }
 
 /// The id of the surface the interface creates.
