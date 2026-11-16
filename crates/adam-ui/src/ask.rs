@@ -1050,7 +1050,7 @@ impl Tool for AskUser {
     }
 
     /// The answer of a form is judged by the catalog's rules for the five kinds of version 7
-    /// before the model reads it: see [`reask`].
+    /// before the model reads it: see the crate README ("The tools").
     fn read_answer(
         &self,
         call_id: &str,
