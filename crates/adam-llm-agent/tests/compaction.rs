@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
+use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{
     COMPACTION_TURN, CompactionReason, Conversation, Limits, LlmAgent, LlmAgentBuilder, Plan,
     PlanItem, PlanStatus, ReadOutput, SessionAgent, SessionTools, Tool, ToolCtx, ToolError,
@@ -1001,6 +1001,52 @@ async fn a_replay_applies_the_cut_the_journal_recorded() {
         state.compactions[0].dropped_turns, 9,
         "eleven turns, the two the first budget kept stay"
     );
+}
+
+#[tokio::test]
+async fn a_recorded_cut_that_is_not_a_turn_start_is_not_applied() {
+    // The journal of a run holds the cut its summary was made for. Learn the entry from a run, then
+    // give another run, which makes the same calls, an entry whose cut is a tool result.
+    let learn = Rig::new(BUDGET);
+    script_one_compaction(&learn.mock, "S");
+    let run = learn.start().await;
+    learn.finish(run).await;
+    let entries = learn.arm.store.journal_list(run).await.unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e.name == "compact:0:4")
+        .expect("the summary step")
+        .clone();
+    for bad_cut in [0, 2, 1000] {
+        let mut payload = entry.payload.clone();
+        let at = if payload.pointer("/Ok/cut").is_some() {
+            "/Ok/cut"
+        } else {
+            "/cut"
+        };
+        let cut = payload.pointer_mut(at).expect("the cut");
+        *cut = json!(bad_cut);
+        let rig = Rig::new(BUDGET);
+        for n in 0..4 {
+            rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 1200)]);
+        }
+        rig.mock
+            .push_tool_calls(vec![big("c4", 100)])
+            .push_text("done");
+        let run = rig.start().await;
+        rig.arm
+            .store
+            .journal_put(
+                run,
+                adam_core::JournalEntry::ok(entry.seq, &entry.name, payload),
+            )
+            .await
+            .unwrap();
+        let (_, state) = rig.finish(run).await;
+        assert!(state.compactions.is_empty(), "cut {bad_cut}: {state:#?}");
+        assert_eq!(state.compact_failed, Some(4), "cut {bad_cut}");
+        assert_eq!(first_part(&state.messages[0]), "go");
+    }
 }
 
 #[tokio::test]
