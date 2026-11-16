@@ -81,9 +81,12 @@ read the exact strings in the file at your rev.
    8 to a form, each one of `Text`, `Image`, `Mermaid`, `Code`, `Cards`, `Callout` or `Chart` (a diff goes in `Code`). The
    agent gives the blocks the ids `q<i>-s<j>`, makes the surface a `Column` holding the form (`ask`) and the loose blocks,
    and the form's questions name them in their own `show` (ids of components of the same surface, each shown once and
-   placed nowhere else). A screen whose `Choices` schema has no `show` (versions 2 to 7) is never sent the member: the blocks
-   it can draw go in the `Column` above the form, the rest is said in words in the question's text, and a form asked again
-   shows the same blocks. A client therefore sees the shown components as ordinary components of the form's surface.
+   placed nowhere else). Every block is checked on every screen (its required members, types and limits as the catalog of version 8
+   has them) and refused naming the member, as is a `Chart` series with other than one value per label and any control or
+   format character in a text (a tab and a line break are text). A screen whose `Choices` schema has no `show` (versions 2 to 7)
+   is never sent the member: the blocks it can draw go in the `Column` above the form, the rest is said in words in the
+   question's text, each question's under a caption that names the question and the numbers of its blocks (the order the model
+   listed them), and the model's `help` is left as written. A form asked again shows the same blocks. A client therefore sees the shown components as ordinary components of the form's surface.
    The orchestrator relays an answer and checks none of it. See `crates/adam-ui/README.md` ("The tools")
    and the contract page `ui-catalog-v1.md` in the docs/api directory of `vymalo/another-agentic-system`;
    `adam-a2a-runtime` (`crates/adam-a2a-runtime/README.md`) reads the messages a screen sends

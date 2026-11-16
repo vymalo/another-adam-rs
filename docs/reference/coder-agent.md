@@ -112,8 +112,11 @@ prompt (`agent/instructions.md`) says only which is which, and the descriptions 
 [`adam-ui`](../../crates/adam-ui/README.md) has their members and limits). The schema is one value for every screen. A screen
 whose `Choices` lacks a kind gets the nearest older form, or words. A question may also `show` what it asks about
 (`show: [{component, ...}]`, 1 to 4 blocks of `Text`, `Image`, `Mermaid`, `Code`, `Cards`, `Callout` or `Chart`, 8 in a form;
-catalog version 8): the coder shows the diff or the command it asks consent for, drawn with the question, and a screen that
-cannot draw a block gets it in words. The coder reads the answer to a form
+catalog version 8): the coder shows the diff or the command it asks consent for, drawn with the question. A block is
+checked on every screen (members, types and limits of its component) and refused naming the member. A screen that cannot
+draw a block, or whose `Choices` has no `show`, gets each question's blocks under a caption that names the question and
+the block numbers, drawn above the form or written out; the model's `help` is not changed. A control or format
+character in a block is refused, and the message says to write it as a visible escape or in words. The coder reads the answer to a form
 before the model does: an answer that breaks a rule of the catalog (a number out of its range, a day outside its bounds, a rank
 that is not every option once) is **not used**. The person is told which question and why, in a message of the same task, and
 is asked the same form again on a new surface (`ask-<call>.r<n>`) with what they got right as its defaults; the run stays

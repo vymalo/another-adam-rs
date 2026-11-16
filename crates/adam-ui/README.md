@@ -121,24 +121,36 @@ inbound function reads a screen's action as JSON text.
   `Callout`, `Chart` (never a `Table`, a `Diff`, a container or another `Choices`: a `Code` block carries a diff). The model
   writes the components, adam-ui gives them the ids `q<i>-s<j>` and the screen draws them with the question, between its words and
   its control; nothing shown takes an answer or changes it. It is made for consent: a `confirm` whose `show` is the diff, the
-  command or the text it asks about. Refused before drawing, naming the block (``block 2 of `show` of question `go` ``): a
-  component off the list, more than 4 in a question or 8 in a form, a `show` that is not a list of objects, an `Image` with no
-  `alt` or whose `artifact` is not a sha256 (never a URL or a path; the hash is written in lower case), a block that breaks its
-  component's own schema, a hidden, control or bidirectional character in any of its text (a line break and a tab are text), a
-  surface over 64 KiB. Whether the thread holds the file an `Image` names is the web's rule (`artifact`): the tool, like `show`
-  and an option's `image`, has no list of the conversation's files to ask. **What a screen does with it is read from its `Choices`
-  schema** (the question's `show`), not from the version:
+  command or the text it asks about. **Every block is checked the same way on every screen, and with no catalog**, before
+  anything is drawn, naming the block and the member (``block 2 of `show` of question `go` (Code): `code` is missing``): a
+  component off the list; more than 4 in a question or 8 in a form; a member missing, of the wrong type or past a limit of its
+  component (`src/ask/blocks.rs` holds the table and a test holds it equal to the vendored catalog of version 8, member by
+  member); an `Image` with no `alt` or whose `artifact` is not 64 lower-case hexadecimal digits (never a URL or a path; capitals
+  are written in lower case); a `Chart` series with other than one value for each label; a control or format character in any
+  text (a zero-width or bidirectional one among them: the message names the code point and the member and says to write it as a
+  visible escape such as `\u{200D}`, or to say it in words). A tab, a line feed and a carriage return are text. Characters that are
+  blank but neither control nor format (U+2028, U+2029, U+034F, the variation selectors, U+115F, U+1160, U+3164, U+FFA0,
+  U+2800) are **not** refused. The surface and, for a screen that gets words, the words are each at most 64 KiB in UTF-8 bytes.
+  Whether the thread holds the file an `Image` names is the web's rule (`artifact`): the tool, like an option's `image`, has no
+  list of the conversation's files to ask. **What a screen does with it is read from its `Choices` schema** (the question's
+  `show`), not from the version:
 
   | The screen | What `ask_user` sends |
   |---|---|
   | takes `show` (version 8) | a `Column` as the root, holding the form (id `ask`) whose questions name their blocks in `show`; the blocks loose in the surface, children of nothing |
-  | does not (versions 2 to 7) | no `show`; the blocks it can draw go **in the `Column` above the form**, in order, the contract's advice for a client of version 7, and the question's `help` says so |
-  | cannot draw a block (no `Column`, or a component it lacks) | that block **in words** after the question the person reads first (`About "<question>":` and the text, code in a fenced block, a chart as its numbers), in full, and the `help` points at it |
-  | has no catalog, or none with `Choices` | the question as text with every block in words under it, code verbatim |
+  | does not (versions 2 to 7) | no `show`; the blocks it can draw go **in the `Column` above the form**, each question's under a `Text` caption (`For question 2 ("Push to main?"), blocks 1 and 3 of 3:`) |
+  | cannot draw a block (a component it lacks, or no `Column`: then no block is drawn) | that block **in words** after the question the person reads first, under the same caption, each as `Block <n>: ...` |
+  | has no catalog, or none with `Choices` | the question as text with every block under it as `Block <n> of <k>: ...`, code verbatim |
 
-  Nothing shown is dropped. A form asked again after a refused answer shows the same blocks (the same surface with a new id, and
-  the words of the blocks the screen could not draw again in the question). The spec does not change with the screen. A form
-  that shows nothing is the form of version 7, byte for byte.
+  The blocks of a question are numbered in the order the model listed them; the number is said wherever the block lands, so the
+  order can be read back when some blocks are drawn and some are words. The model's own `help` is never changed. What the words
+  say: `Code` and `Mermaid` the title, filename, language, code (in a fence longer than any run of backticks in it) and caption;
+  `Cards` the title and, for each card, title, subtitle, body, link and tags; `Callout` the tone, title and text; `Chart` the
+  type, title, unit, labels with each series' values, and caption; `Image` the alt text and caption; `Text` its text. Members
+  that only say how to draw (`weight`, `Text.variant`, `Cards.layout`) are not said. A form asked again after a refused answer shows the same blocks (the same surface with a new id, and
+  the words of the blocks the screen could not draw again in the question); the defaults carried to it are dropped, the texts
+  first, if they would make it larger than a screen reads. The spec does not change with the screen. A form that shows nothing is
+  the form of version 7, byte for byte.
 
   | Limit | |
   |---|---|
@@ -429,16 +441,19 @@ stateDiagram-v2
   right answers as defaults, never wakes the model, and reads words unchecked; each rule of the catalog; and the
   catalog's **133 conformance vectors** and its whole-answer, invalid-question and surface blocks
   (`tests/fixtures/choices-v7-vectors.json`, a test fails when a case is deleted).
-* `tests/ask_v8.rs` and `src/ask/shown.rs`: a question that shows (see *A question shows what it asks about*) against the
-  published catalogs of versions 8, 7, 5 and 2 (`catalog-v8.json`, digest `sha256:22c33310...` pinned): each of the seven
-  components is a valid instance of the web's schema, with goldens `tests/golden/ask_form_v8_show.json` and
-  `ask_form_v8_consent.json`; version 7 gets no `show` and the blocks above the form, version 5 and 2 the words of what they
-  cannot draw, no catalog every block in words (code verbatim); every refusal names its block; the spec is one value; a form
-  asked again shows the same blocks, valid for its screen; a replay makes the same surface; and the 46 cases of the contract's
-  `v8-surfaces` (`tests/fixtures/choices-v8-vectors.json`) are held to the tool one by one, each in a class (the same result,
-  made impossible by construction because the tool gives the ids, only the web can know, not about a question), so that a
-  case that changes class is a decision. The coder's `tests/ask_answers.rs` shows that a secret in a shown block reaches
-  neither the surface nor the question, on versions 8, 7 and 5 and in every form asked again.
+* `tests/ask_v8.rs`, `src/ask/blocks.rs` and `src/ask/shown.rs`: a question that shows (see *A question shows what it asks
+  about*) against the published catalogs of versions 8, 7, 5 and 2 (`catalog-v8.json`, digest `sha256:22c33310...` pinned): each
+  of the seven components is a valid instance of the web's schema, with goldens `tests/golden/ask_form_v8_show.json` and
+  `ask_form_v8_consent.json`, and `ask_show_words.txt` (every member of every component, said in words); version 7 gets no `show`
+  and the blocks above the form under captions, versions 5 and 2 the words of what they cannot draw, a screen with no `Column` and
+  no catalog every block in words (code verbatim); every refusal names its block, on every screen; the spec is one value; a form
+  asked again shows the same blocks, valid for its screen, from a surface that was written out as JSON and read back; and the 46
+  cases of the contract's `v8-surfaces` (`tests/fixtures/choices-v8-vectors.json`) are run through the tool, each in a class: a
+  drawn case is compared with the vector's components in their order, a refused one with the block it names, one the tool makes
+  impossible by construction (it gives the ids) has the surface it draws walked for the rule, one only the web can judge (the
+  thread's files) is drawn, and the others are not about a question, so that a case that changes class is a decision. The coder's
+  `tests/ask_answers.rs` shows that a secret in a shown block reaches neither the surface nor the question, on versions 8, 7 and
+  5 and in every form asked again.
 * `tests/agent.rs`: a whole agent behind A2A over the fake thread-tools endpoint of
   [`adam-mcp-testkit`](../adam-mcp-testkit/README.md): the three questions as one form, the person's answer as an
   action and the model's next words, a tool the endpoint lists offered and called, a refetch over the thread tools,
