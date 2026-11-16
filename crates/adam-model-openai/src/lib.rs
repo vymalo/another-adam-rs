@@ -72,7 +72,9 @@ use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use adam_error::{BoxError, Classify, ErrorClass};
-use adam_model::{Message, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse};
+use adam_model::{
+    InputModalities, Message, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
+};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -230,6 +232,7 @@ pub struct OpenAiCompatible {
     echo_reasoning: Option<ReasoningField>,
     prompt_cache_key: bool,
     context_windows: BTreeMap<String, u64>,
+    input_modalities: BTreeMap<String, InputModalities>,
 }
 
 /// What [`OpenAiCompatible`] says its provider is ([`ModelClient::provider`]): the protocol it
@@ -253,6 +256,7 @@ impl fmt::Debug for OpenAiCompatible {
             .field("echo_reasoning", &self.echo_reasoning)
             .field("prompt_cache_key", &self.prompt_cache_key)
             .field("context_windows", &self.context_windows)
+            .field("input_modalities", &self.input_modalities)
             .finish_non_exhaustive()
     }
 }
@@ -307,6 +311,7 @@ impl OpenAiCompatible {
             echo_reasoning: None,
             prompt_cache_key: false,
             context_windows: BTreeMap::new(),
+            input_modalities: BTreeMap::new(),
         })
     }
 
@@ -317,6 +322,21 @@ impl OpenAiCompatible {
     #[must_use]
     pub fn with_context_window(mut self, model: impl Into<String>, window: u64) -> Self {
         self.context_windows.insert(model.into(), window);
+        self
+    }
+
+    /// Say that the model the alias `model` can read what `modalities` says, as the deployment
+    /// declared it (`MODEL_INPUT_MODALITIES`): what [`ModelClient::input_modalities`] answers for
+    /// that alias, and text only for any other, which fails closed. The client sends an image
+    /// only as a `data:` URL part of a message and only when the request carries its bytes
+    /// ([`ModelRequest::image_data`](adam_model::ModelRequest::image_data)).
+    #[must_use]
+    pub fn with_input_modalities(
+        mut self,
+        model: impl Into<String>,
+        modalities: InputModalities,
+    ) -> Self {
+        self.input_modalities.insert(model.into(), modalities);
         self
     }
 
@@ -453,6 +473,13 @@ impl ModelClient for OpenAiCompatible {
 
     fn context_window(&self, model: &str) -> Option<u64> {
         self.context_windows.get(model).copied()
+    }
+
+    fn input_modalities(&self, model: &str) -> InputModalities {
+        self.input_modalities
+            .get(model)
+            .cloned()
+            .unwrap_or_default()
     }
 
     #[tracing::instrument(name = "model.complete", skip_all, fields(model = %req.model, url = %self.url))]

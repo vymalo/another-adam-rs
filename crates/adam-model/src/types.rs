@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +36,51 @@ pub struct ModelRequest {
     /// wire is the client's choice. Never the id itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// The bytes of the images that `messages` name ([`ImageRef::sha256`]), for a client that can
+    /// send them. The agent loop fills it inside the step that calls the model and never journals
+    /// it: it is not serialized, so neither a journal nor a stored history ever holds a byte of an
+    /// image. A reference with no entry here is sent as its stand-in text.
+    #[serde(skip)]
+    pub image_data: ImageData,
+}
+
+/// The bytes of the images of one [`ModelRequest`], by SHA-256. Its `Debug` says how many and how
+/// large, never the bytes.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ImageData(BTreeMap<String, Arc<[u8]>>);
+
+impl ImageData {
+    /// No image.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hold `bytes` for the image whose SHA-256 is `sha256`.
+    pub fn insert(&mut self, sha256: impl Into<String>, bytes: Arc<[u8]>) {
+        self.0.insert(sha256.into(), bytes);
+    }
+
+    /// The bytes of the image with this SHA-256.
+    pub fn get(&self, sha256: &str) -> Option<&Arc<[u8]>> {
+        self.0.get(sha256)
+    }
+
+    /// How many images.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there is no image.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for ImageData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes: usize = self.0.values().map(|b| b.len()).sum();
+        write!(f, "ImageData({} images, {bytes} bytes)", self.0.len())
+    }
 }
 
 impl ModelRequest {
@@ -94,6 +140,12 @@ pub enum Message {
         /// Whether the tool failed.
         #[serde(default)]
         is_error: bool,
+        /// Images the tool returned, by reference (never the bytes). A client with a model that
+        /// sees sends them after the run of tool messages; a client without one says each in a
+        /// line. Empty for nearly every result, and then not serialized, so a history with no
+        /// image is the same bytes as before and an older journal decodes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
 }
 
@@ -120,6 +172,7 @@ impl Message {
             call_id: call_id.into(),
             content: content.into(),
             is_error: false,
+            images: Vec::new(),
         }
     }
 
@@ -129,7 +182,29 @@ impl Message {
             call_id: call_id.into(),
             content: content.into(),
             is_error: true,
+            images: Vec::new(),
         }
+    }
+
+    /// A successful tool result that also returns images.
+    pub fn tool_result_with_images(
+        call_id: impl Into<String>,
+        content: impl Into<String>,
+        images: Vec<ImageRef>,
+    ) -> Self {
+        Self::Tool {
+            call_id: call_id.into(),
+            content: content.into(),
+            is_error: false,
+            images,
+        }
+    }
+
+    /// A user message of `text` and the images that go with it.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageRef>) -> Self {
+        let mut content = vec![ContentPart::text(text)];
+        content.extend(images.into_iter().map(ContentPart::Image));
+        Self::User { content }
     }
 
     /// The text of the message: all text parts concatenated (for a tool
@@ -140,6 +215,21 @@ impl Message {
                 content.iter().map(ContentPart::as_text).collect()
             }
             Self::Tool { content, .. } => content.clone(),
+        }
+    }
+
+    /// The images of the message: the image parts of a user or assistant message, or the images a
+    /// tool returned.
+    pub fn images(&self) -> Vec<&ImageRef> {
+        match self {
+            Self::User { content } | Self::Assistant { content, .. } => content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Image(image) => Some(image),
+                    ContentPart::Text { .. } => None,
+                })
+                .collect(),
+            Self::Tool { images, .. } => images.iter().collect(),
         }
     }
 
@@ -161,7 +251,7 @@ impl Message {
     }
 }
 
-/// A piece of message content. Only text for now; images come later.
+/// A piece of message content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -170,6 +260,9 @@ pub enum ContentPart {
         /// The text.
         text: String,
     },
+    /// An image, by reference. The bytes are not here: they are kept by the agent and reach the
+    /// model through [`ModelRequest::image_data`].
+    Image(ImageRef),
 }
 
 impl ContentPart {
@@ -178,12 +271,130 @@ impl ContentPart {
         Self::Text { text: text.into() }
     }
 
-    /// The text of this part.
+    /// The text of this part: empty for an image.
     pub fn as_text(&self) -> &str {
         match self {
             Self::Text { text } => text,
+            Self::Image(_) => "",
         }
     }
+}
+
+/// Where an image came from. Closed on purpose: a new origin must fail to compile wherever the
+/// deployment's allowed sources are checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageOrigin {
+    /// The person sent it.
+    Person,
+    /// A tool read it from the run's workspace (the coder's `read_file`).
+    Workspace,
+    /// An MCP server's result held it.
+    Mcp,
+}
+
+impl ImageOrigin {
+    /// The word a deployment writes for this origin (`MODEL_IMAGE_SOURCES`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Workspace => "workspace",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
+/// An image a message names. It holds what a request needs to say about the image and no byte of
+/// it: the bytes are looked up by `sha256`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRef {
+    /// SHA-256 of the bytes, 64 lower-case hexadecimal digits.
+    pub sha256: String,
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`, checked against the bytes.
+    pub media_type: String,
+    /// The size of the image in bytes.
+    pub bytes: u64,
+    /// Width in pixels, read from the header.
+    pub width: u32,
+    /// Height in pixels, read from the header.
+    pub height: u32,
+    /// A name for people and the model to call it by: a file name, never a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Where it came from.
+    pub origin: ImageOrigin,
+}
+
+impl ImageRef {
+    /// What a client says in place of an image whose bytes it does not have.
+    pub fn missing_line(&self) -> String {
+        format!(
+            "[image not shown: {} could not be loaded; read it again if it matters]",
+            self.label()
+        )
+    }
+
+    /// `shot.png (image/png, 120 KiB, 800×600)`: the name when there is one, then the type, the
+    /// size and the dimensions.
+    pub fn label(&self) -> String {
+        let name = self.name.as_deref().unwrap_or("image");
+        format!(
+            "{name} ({}, {}, {}\u{d7}{})",
+            self.media_type,
+            human_bytes(self.bytes),
+            self.width,
+            self.height
+        )
+    }
+}
+
+/// `1.4 MiB`, `120.0 KiB` or `812 bytes`.
+pub fn human_bytes(len: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let f = len as f64;
+    if len < 1024 {
+        format!("{len} bytes")
+    } else if len < 1024 * 1024 {
+        format!("{:.1} KiB", f / 1024.0)
+    } else {
+        format!("{:.1} MiB", f / (1024.0 * 1024.0))
+    }
+}
+
+/// What a deployment says its model can read besides text, for one model alias. Text only unless
+/// the deployment declares more: it is never guessed from a model's name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct InputModalities {
+    /// The limits for images, or `None` when the model is not declared to see.
+    pub images: Option<ImageLimits>,
+}
+
+impl InputModalities {
+    /// Text only.
+    pub fn text_only() -> Self {
+        Self::default()
+    }
+
+    /// Text and images within `limits`.
+    pub fn with_images(limits: ImageLimits) -> Self {
+        Self {
+            images: Some(limits),
+        }
+    }
+}
+
+/// The limits on the images a run sends to a model that sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageLimits {
+    /// The most bytes of one image.
+    pub max_bytes: u64,
+    /// The most images one run admits.
+    pub max_count: usize,
+    /// The longest side of an image, in pixels.
+    pub max_side: u32,
+    /// The origins the deployment lets reach the model.
+    pub sources: std::collections::BTreeSet<ImageOrigin>,
 }
 
 /// A tool the model may call.
@@ -722,5 +933,83 @@ mod tests {
         let r = ModelResponse::tool_calls(vec![tool_call()]);
         assert_eq!(r.finish, FinishReason::ToolCalls);
         assert_eq!(r.message.tool_calls()[0].name, "weather");
+    }
+
+    fn shot() -> ImageRef {
+        ImageRef {
+            sha256: "ab".repeat(32),
+            media_type: "image/png".into(),
+            bytes: 120 * 1024,
+            width: 800,
+            height: 600,
+            name: Some("shot.png".into()),
+            origin: ImageOrigin::Workspace,
+        }
+    }
+
+    #[test]
+    fn a_text_only_message_serializes_as_before() {
+        // The bytes a history without an image has always been: no `images` member on a tool
+        // message, and a request's image data never in it.
+        assert_eq!(
+            serde_json::to_string(&Message::tool_result("c1", "ok")).unwrap(),
+            r#"{"role":"tool","call_id":"c1","content":"ok","is_error":false}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Message::user_text("hi")).unwrap(),
+            r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#
+        );
+    }
+
+    #[test]
+    fn an_old_tool_message_decodes() {
+        let old = r#"{"role":"tool","call_id":"c1","content":"ok"}"#;
+        let message: Message = serde_json::from_str(old).unwrap();
+        assert_eq!(message, Message::tool_result("c1", "ok"));
+        assert!(message.images().is_empty());
+    }
+
+    #[test]
+    fn an_image_is_a_reference_and_round_trips() {
+        let user = Message::user_with_images("look", vec![shot()]);
+        roundtrip(user.clone());
+        let json = serde_json::to_value(&user).unwrap();
+        assert_eq!(json["content"][1]["type"], "image");
+        assert_eq!(json["content"][1]["sha256"], "ab".repeat(32));
+        assert_eq!(user.text(), "look");
+        assert_eq!(user.images().len(), 1);
+        let tool = Message::tool_result_with_images("c1", "an image", vec![shot()]);
+        roundtrip(tool.clone());
+        assert_eq!(tool.images().len(), 1);
+    }
+
+    #[test]
+    fn image_data_is_never_serialized() {
+        let mut request = ModelRequest::new("m");
+        request
+            .image_data
+            .insert("ab".repeat(32), Arc::from(&b"\x89PNG-bytes"[..]));
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            !json.contains("image_data") && !json.contains("PNG"),
+            "{json}"
+        );
+        let back: ModelRequest = serde_json::from_str(&json).unwrap();
+        assert!(back.image_data.is_empty());
+        // Nor does its Debug say a byte of it.
+        let debug = format!("{:?}", request.image_data);
+        assert!(
+            !debug.contains("PNG") && debug.contains("1 images"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn the_label_names_the_image_by_what_the_model_may_say() {
+        assert_eq!(
+            shot().label(),
+            "shot.png (image/png, 120.0 KiB, 800\u{d7}600)"
+        );
+        assert_eq!(human_bytes(1_468_006), "1.4 MiB");
     }
 }

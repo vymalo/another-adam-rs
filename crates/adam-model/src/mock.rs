@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 
 use crate::{
-    ContentPart, DynModel, Message, ModelClient, ModelDelta, ModelError, ModelRequest,
-    ModelResponse, ToolCall,
+    ContentPart, DynModel, ImageLimits, InputModalities, Message, ModelClient, ModelDelta,
+    ModelError, ModelRequest, ModelResponse, ToolCall,
 };
 
 /// One call a [`MockModel`] received.
@@ -62,6 +62,7 @@ pub struct MockModel {
     inner: Mutex<Inner>,
     provider: Option<String>,
     context_windows: Vec<(String, u64)>,
+    images: Option<ImageLimits>,
 }
 
 impl std::fmt::Debug for MockModel {
@@ -98,6 +99,14 @@ impl MockModel {
     #[must_use]
     pub fn with_context_window(mut self, model: impl Into<String>, window: u64) -> Self {
         self.context_windows.push((model.into(), window));
+        self
+    }
+
+    /// Say the model sees images within `limits`, for every alias
+    /// ([`ModelClient::input_modalities`]). A mock sees none by default.
+    #[must_use]
+    pub fn seeing_images(mut self, limits: ImageLimits) -> Self {
+        self.images = Some(limits);
         self
     }
 
@@ -183,6 +192,13 @@ impl ModelClient for MockModel {
             .iter()
             .find(|(alias, _)| alias == model)
             .map(|(_, window)| *window)
+    }
+
+    fn input_modalities(&self, _model: &str) -> InputModalities {
+        match &self.images {
+            Some(limits) => InputModalities::with_images(limits.clone()),
+            None => InputModalities::text_only(),
+        }
     }
 
     async fn stream(

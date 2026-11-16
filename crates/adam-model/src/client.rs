@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use crate::{ModelDelta, ModelError, ModelRequest, ModelResponse};
+use crate::{InputModalities, ModelDelta, ModelError, ModelRequest, ModelResponse};
 
 /// A language model behind some API.
 ///
@@ -38,6 +38,14 @@ pub trait ModelClient: Send + Sync + 'static {
         let _ = model;
         None
     }
+
+    /// What the model the alias `model` names can read besides text, as the deployment declared
+    /// it. Text only (the default) unless somebody said otherwise: it is never guessed from the
+    /// name of a model, and an alias nobody declared stays text only.
+    fn input_modalities(&self, model: &str) -> InputModalities {
+        let _ = model;
+        InputModalities::text_only()
+    }
 }
 
 /// A shared, type-erased [`ModelClient`].
@@ -62,5 +70,33 @@ impl<T: ModelClient + ?Sized> ModelClient for Arc<T> {
 
     fn context_window(&self, model: &str) -> Option<u64> {
         (**self).context_window(model)
+    }
+
+    fn input_modalities(&self, model: &str) -> InputModalities {
+        (**self).input_modalities(model)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ImageLimits, ImageOrigin, MockModel};
+
+    #[test]
+    fn arc_forwards_input_modalities() {
+        let limits = ImageLimits {
+            max_bytes: 10,
+            max_count: 2,
+            max_side: 64,
+            sources: [ImageOrigin::Person].into(),
+        };
+        let seeing = Arc::new(MockModel::new().seeing_images(limits.clone()));
+        assert_eq!(seeing.input_modalities("m").images, Some(limits));
+        let shared: DynModel = seeing.clone();
+        let twice: Arc<DynModel> = Arc::new(shared);
+        assert!(twice.input_modalities("m").images.is_some());
+        // A client that says nothing is text only.
+        let blind: DynModel = Arc::new(MockModel::new());
+        assert_eq!(blind.input_modalities("m"), InputModalities::text_only());
     }
 }

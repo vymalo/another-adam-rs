@@ -4,9 +4,10 @@
 use std::collections::BTreeMap;
 
 use adam_model::{
-    ContentPart, FinishReason, Message, ModelDelta, ModelError, ModelRequest, ModelResponse,
-    ToolCall, ToolChoice, Usage,
+    ContentPart, FinishReason, ImageData, ImageRef, Message, ModelDelta, ModelError, ModelRequest,
+    ModelResponse, ToolCall, ToolChoice, Usage,
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -95,8 +96,31 @@ pub(crate) fn build_request(
     if let Some(system) = req.system.as_deref().filter(|s| !s.is_empty()) {
         messages.push(text_message("system", system));
     }
+    // The images the tool messages of one run of tool messages return go in one user message after
+    // the run, so each body's `messages` starts with the one before it: what the placement depends
+    // on is only what came before.
+    let mut tool_images: Vec<(&str, &ImageRef)> = Vec::new();
     for message in &req.messages {
-        messages.push(wire_message(message, options.echo_reasoning)?);
+        if !matches!(message, Message::Tool { .. }) && !tool_images.is_empty() {
+            messages.push(tool_images_message(
+                std::mem::take(&mut tool_images),
+                &req.image_data,
+            ));
+        }
+        if let Message::Tool {
+            call_id, images, ..
+        } = message
+        {
+            tool_images.extend(images.iter().map(|image| (call_id.as_str(), image)));
+        }
+        messages.push(wire_message(
+            message,
+            options.echo_reasoning,
+            &req.image_data,
+        )?);
+    }
+    if !tool_images.is_empty() {
+        messages.push(tool_images_message(tool_images, &req.image_data));
     }
 
     let tools: Vec<Value> = req
@@ -176,39 +200,95 @@ fn text_message<'a>(role: &'static str, text: &str) -> WireMessage<'a> {
 }
 
 /// Message content: **one string**, the text parts joined with a blank line, for every message
-/// whose parts are all text (today, every one).
+/// whose parts are all text.
 ///
 /// A user message that has several text parts (a continued conversation merges the messages that
 /// would otherwise sit next to each other, see `Conversation::continued`) is stored with its parts
 /// and sent as the text it says. A plain string is the form of `content` that every
 /// OpenAI-compatible server takes; an array of typed parts is not taken by all of them, nor by
 /// every chat template (*unverified* for each server: chat templates that insist on a string
-/// content are the reason), so it is kept for a part that is not text. [`ContentPart`] has only
-/// `Text` today, so this match fails to compile when a variant is added, which is where to send
-/// that part, and the text parts around it, as typed parts.
-fn content_value(parts: &[ContentPart]) -> Option<Value> {
+/// content are the reason), so an array is sent only for a message that holds an image. The
+/// [`ContentPart`] match fails to compile when a variant is added, which is where to send it.
+fn content_value(parts: &[ContentPart], data: &ImageData) -> Option<Value> {
     if parts.is_empty() {
         return None;
     }
-    let text = parts
+    if !parts
         .iter()
-        .map(|part| match part {
-            ContentPart::Text { text } => text.as_str(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    Some(Value::String(text))
+        .any(|part| matches!(part, ContentPart::Image(_)))
+    {
+        let text = parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => text.as_str(),
+                ContentPart::Image(_) => "",
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        return Some(Value::String(text));
+    }
+    let mut typed = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            ContentPart::Text { text } if text.is_empty() => {}
+            ContentPart::Text { text } => typed.push(json!({"type": "text", "text": text})),
+            ContentPart::Image(image) => typed.push(image_part(image, data)),
+        }
+    }
+    Some(Value::Array(typed))
 }
 
-fn wire_message(
-    message: &Message,
+/// An image as a typed part: a data URL with the bytes, or, with no bytes to send, the line that
+/// says so. No `detail` member is sent.
+fn image_part(image: &ImageRef, data: &ImageData) -> Value {
+    match data.get(&image.sha256) {
+        Some(bytes) => json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!(
+                    "data:{};base64,{}",
+                    image.media_type,
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                ),
+            },
+        }),
+        None => json!({"type": "text", "text": image.missing_line()}),
+    }
+}
+
+/// The user message that follows a run of tool messages whose results returned images.
+fn tool_images_message<'a>(images: Vec<(&str, &ImageRef)>, data: &ImageData) -> WireMessage<'a> {
+    let names = images
+        .iter()
+        .map(|(call, image)| format!("{call} {}", image.name.as_deref().unwrap_or("image")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut parts = vec![json!({
+        "type": "text",
+        "text": format!("Images from tool results: {names}"),
+    })];
+    parts.extend(images.iter().map(|(_, image)| image_part(image, data)));
+    WireMessage {
+        role: "user",
+        content: Some(Value::Array(parts)),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        reasoning: None,
+    }
+}
+
+fn wire_message<'a>(
+    message: &'a Message,
     echo: Option<ReasoningField>,
-) -> Result<WireMessage<'_>, ModelError> {
+    data: &ImageData,
+) -> Result<WireMessage<'a>, ModelError> {
     Ok(match message {
         Message::User { content } => WireMessage {
             role: "user",
             // An empty user message is still a message; send an empty string.
-            content: Some(content_value(content).unwrap_or_else(|| Value::String(String::new()))),
+            content: Some(
+                content_value(content, data).unwrap_or_else(|| Value::String(String::new())),
+            ),
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning: None,
@@ -238,7 +318,7 @@ fn wire_message(
                     "function": {"name": call.name, "arguments": arguments},
                 }));
             }
-            let content = content_value(content);
+            let content = content_value(content, data);
             WireMessage {
                 role: "assistant",
                 // With tool calls, `null` content is the canonical form; without,
@@ -1170,7 +1250,7 @@ mod tests {
             tool_calls: vec![call],
             reasoning: None,
         };
-        let wire = wire_message(&message, None).unwrap();
+        let wire = wire_message(&message, None, &ImageData::new()).unwrap();
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["tool_calls"][0]["function"]["arguments"], "{}");
         let text = json.to_string();
@@ -1466,5 +1546,165 @@ mod tests {
         );
         assert_eq!(deltas, vec![ModelDelta::Text("ok".into())]);
         assert_eq!(asm.finish().unwrap().message.text(), "ok");
+    }
+
+    fn png_ref(sha: &str, name: &str, origin: adam_model::ImageOrigin) -> ImageRef {
+        ImageRef {
+            sha256: sha.into(),
+            media_type: "image/png".into(),
+            bytes: 8,
+            width: 2,
+            height: 2,
+            name: Some(name.into()),
+            origin,
+        }
+    }
+
+    fn with_data(req: &mut ModelRequest, sha: &str, bytes: &[u8]) {
+        req.image_data.insert(sha, std::sync::Arc::from(bytes));
+    }
+
+    fn messages(req: &ModelRequest) -> Vec<Value> {
+        body(req, false, MaxTokensField::MaxTokens)["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_user_image_is_a_data_url_part() {
+        let mut req = ModelRequest::new("gw-model");
+        req.messages = vec![Message::user_with_images(
+            "what is this",
+            vec![png_ref("s1", "shot.png", adam_model::ImageOrigin::Person)],
+        )];
+        with_data(&mut req, "s1", b"\x89PNG0123");
+        let sent = messages(&req);
+        assert_eq!(
+            sent[0],
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORzAxMjM="}},
+            ]})
+        );
+        // An image-only message has no empty text part.
+        req.messages = vec![Message::User {
+            content: vec![
+                ContentPart::text(""),
+                ContentPart::Image(png_ref("s1", "shot.png", adam_model::ImageOrigin::Person)),
+            ],
+        }];
+        assert_eq!(messages(&req)[0]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tool_images_follow_the_tool_block_as_one_user_message() {
+        let mut req = ModelRequest::new("gw-model");
+        req.messages = vec![
+            Message::user_text("go"),
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![
+                    ToolCall::new("c1", "read_file", json!({})),
+                    ToolCall::new("c2", "read_file", json!({})),
+                ],
+                reasoning: None,
+            },
+            Message::tool_result_with_images(
+                "c1",
+                "an image",
+                vec![png_ref("s1", "a.png", adam_model::ImageOrigin::Workspace)],
+            ),
+            Message::tool_result_with_images(
+                "c2",
+                "an image",
+                vec![png_ref("s2", "b.png", adam_model::ImageOrigin::Workspace)],
+            ),
+        ];
+        with_data(&mut req, "s1", b"one");
+        with_data(&mut req, "s2", b"two");
+        let sent = messages(&req);
+        let roles: Vec<&str> = sent.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool", "user"]);
+        // The tool messages stay text.
+        assert_eq!(sent[2]["content"], "an image");
+        let parts = sent[4]["content"].as_array().unwrap();
+        assert_eq!(
+            parts[0]["text"],
+            "Images from tool results: c1 a.png; c2 b.png"
+        );
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,b25l");
+        // A next turn goes after the user message, and a request that ends with it is its prefix.
+        let mut next = req.clone();
+        next.messages.push(Message::assistant_text("it is a cat"));
+        let longer = messages(&next);
+        assert_eq!(longer[..5], sent[..]);
+        assert_eq!(longer[5]["role"], "assistant");
+    }
+
+    #[test]
+    fn a_missing_image_is_its_stand_in() {
+        let mut req = ModelRequest::new("gw-model");
+        req.messages = vec![
+            Message::user_with_images(
+                "look",
+                vec![png_ref("gone", "shot.png", adam_model::ImageOrigin::Person)],
+            ),
+            Message::tool_result_with_images(
+                "c1",
+                "an image",
+                vec![png_ref("gone", "b.png", adam_model::ImageOrigin::Workspace)],
+            ),
+        ];
+        let sent = messages(&req);
+        let text = sent[0]["content"][1]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("[image not shown: shot.png (image/png"),
+            "{text}"
+        );
+        assert!(!sent.iter().any(|m| m.to_string().contains("image_url")));
+    }
+
+    #[test]
+    fn each_body_with_images_starts_with_the_one_before() {
+        let mut req = ModelRequest::new("gw-model");
+        req.system = Some("sys".into());
+        req.messages = vec![Message::user_with_images(
+            "look",
+            vec![png_ref("s1", "shot.png", adam_model::ImageOrigin::Person)],
+        )];
+        with_data(&mut req, "s1", b"bytes-of-the-first-image");
+        let mut previous = messages(&req);
+        for turn in 0..3 {
+            req.messages.push(Message::Assistant {
+                content: vec![],
+                tool_calls: vec![ToolCall::new(format!("c{turn}"), "read_file", json!({}))],
+                reasoning: None,
+            });
+            let sha = format!("t{turn}");
+            req.messages.push(Message::tool_result_with_images(
+                format!("c{turn}"),
+                "an image",
+                vec![png_ref(&sha, "x.png", adam_model::ImageOrigin::Workspace)],
+            ));
+            with_data(&mut req, &sha, sha.as_bytes());
+            let now = messages(&req);
+            assert!(now.len() > previous.len());
+            assert_eq!(now[..previous.len()], previous[..], "turn {turn}");
+            previous = now;
+        }
+    }
+
+    #[test]
+    fn a_text_only_request_never_sends_an_array() {
+        let v = body(&request(), false, MaxTokensField::MaxTokens);
+        assert!(
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| !m["content"].is_array())
+        );
     }
 }

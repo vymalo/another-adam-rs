@@ -12,6 +12,7 @@ rust-version.workspace = true
 adam-error.workspace = true
 adam-model.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 futures.workspace = true
 httpdate.workspace = true
 reqwest.workspace = true

@@ -1539,6 +1539,7 @@ async fn each_failure_maps_to_the_exit_code_of_its_cause() {
         echo_reasoning: None,
         context_window: None,
         prompt_cache_key: adam_service::PromptCacheKey::Off,
+        images: None,
     };
     let error = AgentError::Model(model.client().err().expect("not a URL"));
     assert_eq!(exit_code(&error), 78);

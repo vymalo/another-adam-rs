@@ -24,6 +24,12 @@
 //! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
 //! | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (no `contextWindow`) |
 //! | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: with `conversation` each request carries a `prompt_cache_key` that is the same for every request of one conversation (a SHA-256 of its id cut to 32 hex digits), so that a gateway with a prompt cache routes them together; anything else is a startup error ([`ModelConfig::prompt_cache_key`]) | `off` |
+//! | `MODEL_INPUT_MODALITIES` | `text` or `text,image`: what the model `MODEL` names can read. With `image`, an image the person sends or a tool returns reaches the model, within the four limits below; without it a request carries a line of text in the image's place. Never guessed from a model name ([`ModelConfig::images`]) | `text` |
+//! | `MODEL_IMAGE_MAX_BYTES` | the most bytes of one image sent to the model (1 to 4194304); needs `image` in `MODEL_INPUT_MODALITIES` | `1048576` |
+//! | `MODEL_IMAGE_MAX_COUNT` | the most images one run admits (1 to 32); needs `image` | `8` |
+//! | `MODEL_IMAGE_MAX_SIDE` | the longest side of an image sent, in pixels (64 to 16384); needs `image` | `4096` |
+//! | `MODEL_IMAGE_SOURCES` | which images may reach the model: a subset of `person`, `workspace`, `mcp` (an MCP server's result can carry expanded credentials, so it is opt-in); needs `image` | `person,workspace` |
+//! | `MODEL_OUTPUT_MODALITIES` | `text`. `image` is refused: a model that makes images inline is not built for any provider yet (an image is made by an MCP server) | `text` |
 //! | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the MCP servers of an agent folder may be ([`McpSettings`], feature `mcp`) | `false` each |
 //! | `MCP_MAX_CALL_SECS` | the longest one MCP server is waited for, a call and a connection each: what `timeoutSecs` and `connectTimeoutSecs` ask for and the defaults (60 s and 30 s) are lowered to it, and a value the file asks for is at least 1 s; a larger value is lowered to it with a warning (1 to 86400; [`McpSettings`], feature `mcp`) | `900` |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400; [`McpSettings`], feature `mcp`) | `3600` |
@@ -57,11 +63,12 @@ use adam_a2a::CardSigner;
 use adam_a2a::push::PushPolicy;
 use adam_error::{Classify, ErrorClass};
 use adam_host::Role;
-use adam_model::DynModel;
+use adam_model::{DynModel, ImageLimits, ImageOrigin, InputModalities};
 use adam_model_openai::{
     OpenAiCompatible, OpenAiConfig, OpenAiConfigError, ReasoningField, endpoint_for_logs,
 };
 use secrecy::SecretString;
+use std::collections::BTreeSet;
 use url::Url;
 
 use crate::service::RuntimeOptions;
@@ -542,7 +549,24 @@ pub struct ModelConfig {
     pub context_window: Option<u64>,
     /// `MODEL_PROMPT_CACHE_KEY`: whether the client sends the conversation's `prompt_cache_key`.
     pub prompt_cache_key: PromptCacheKey,
+    /// `MODEL_INPUT_MODALITIES` and the `MODEL_IMAGE_*` limits: what the model [`alias`](Self::alias)
+    /// names may be sent as images. `None` (the default) is text only. The client says it for that
+    /// alias only, so a subagent on another alias stays text only.
+    pub images: Option<ImageLimits>,
 }
+
+/// The defaults of the `MODEL_IMAGE_*` variables, and their ranges.
+pub const IMAGE_MAX_BYTES_DEFAULT: u64 = 1024 * 1024;
+/// The largest `MODEL_IMAGE_MAX_BYTES`.
+pub const IMAGE_MAX_BYTES_LIMIT: u64 = 4 * 1024 * 1024;
+/// The default `MODEL_IMAGE_MAX_COUNT`.
+pub const IMAGE_MAX_COUNT_DEFAULT: usize = 8;
+/// The largest `MODEL_IMAGE_MAX_COUNT`.
+pub const IMAGE_MAX_COUNT_LIMIT: usize = 32;
+/// The default `MODEL_IMAGE_MAX_SIDE`.
+pub const IMAGE_MAX_SIDE_DEFAULT: u32 = 4096;
+/// The range of `MODEL_IMAGE_MAX_SIDE`.
+pub const IMAGE_MAX_SIDE_RANGE: std::ops::RangeInclusive<u32> = 64..=16_384;
 
 /// `MODEL_PROMPT_CACHE_KEY`: whether the requests of a conversation carry a key that routes them to
 /// the same prompt cache. Off by default: a gateway that rejects members it does not know would
@@ -573,6 +597,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("echo_reasoning", &self.echo_reasoning)
             .field("context_window", &self.context_window)
             .field("prompt_cache_key", &self.prompt_cache_key)
+            .field("images", &self.images)
             .finish_non_exhaustive()
     }
 }
@@ -608,6 +633,7 @@ impl ModelConfig {
             echo_reasoning: parse_echo_reasoning(&get("MODEL_ECHO_REASONING"), problems),
             context_window: parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems),
             prompt_cache_key: parse_prompt_cache_key(&get("MODEL_PROMPT_CACHE_KEY"), problems),
+            images: parse_images(&get, problems),
         }
     }
 
@@ -627,11 +653,143 @@ impl ModelConfig {
         if let Some(window) = self.context_window {
             client = client.with_context_window(self.alias.clone(), window);
         }
+        if let Some(limits) = &self.images {
+            client = client.with_input_modalities(
+                self.alias.clone(),
+                InputModalities::with_images(limits.clone()),
+            );
+        }
         if let Some(extra) = &self.extra_body {
             client = client.with_extra_body(extra.clone())?;
         }
         Ok(std::sync::Arc::new(client))
     }
+}
+
+/// The words of a `MODEL_*_MODALITIES` value: a comma-separated list of `text` and `image`, which
+/// must hold `text`. `None`, with a problem, for anything else.
+fn parse_modalities(name: &str, raw: &str, problems: &mut Vec<String>) -> Option<Vec<String>> {
+    let words: Vec<String> = raw
+        .split(',')
+        .map(|w| w.trim().to_ascii_lowercase())
+        .collect();
+    if words
+        .iter()
+        .any(|w| !matches!(w.as_str(), "text" | "image"))
+        || words.is_empty()
+    {
+        problems.push(format!("{name} must be `text` or `text,image`"));
+        return None;
+    }
+    if !words.iter().any(|w| w == "text") {
+        problems.push(format!("{name} must include `text`"));
+        return None;
+    }
+    Some(words)
+}
+
+/// `MODEL_INPUT_MODALITIES`, the `MODEL_IMAGE_*` limits and `MODEL_OUTPUT_MODALITIES`: the limits
+/// when the model sees images, `None` for text only. An image variable set while the model is text
+/// only is a problem that names it, so a deployer is never silently ignored; so is `image` in
+/// `MODEL_OUTPUT_MODALITIES`.
+fn parse_images(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<ImageLimits> {
+    if let Some(raw) = get("MODEL_OUTPUT_MODALITIES")
+        && let Some(words) = parse_modalities("MODEL_OUTPUT_MODALITIES", &raw, problems)
+        && words.iter().any(|w| w == "image")
+    {
+        problems.push(
+            "MODEL_OUTPUT_MODALITIES: `image` is not built for any provider yet; an image is made by an MCP server"
+                .into(),
+        );
+    }
+    let sees = match get("MODEL_INPUT_MODALITIES") {
+        None => false,
+        Some(raw) => parse_modalities("MODEL_INPUT_MODALITIES", &raw, problems)
+            .is_some_and(|words| words.iter().any(|w| w == "image")),
+    };
+    let limits = [
+        "MODEL_IMAGE_MAX_BYTES",
+        "MODEL_IMAGE_MAX_COUNT",
+        "MODEL_IMAGE_MAX_SIDE",
+        "MODEL_IMAGE_SOURCES",
+    ];
+    if !sees {
+        for name in limits {
+            if get(name).is_some() {
+                problems.push(format!(
+                    "{name} is set but MODEL_INPUT_MODALITIES does not include `image`: set it to `text,image` or remove {name}"
+                ));
+            }
+        }
+        return None;
+    }
+    let number = |name: &str,
+                  default: u64,
+                  range: std::ops::RangeInclusive<u64>,
+                  problems: &mut Vec<String>| {
+        match get(name) {
+            None => default,
+            Some(raw) => match raw.trim().parse::<u64>() {
+                Ok(n) if range.contains(&n) => n,
+                _ => {
+                    problems.push(format!(
+                        "{name} must be a whole number from {} to {}",
+                        range.start(),
+                        range.end()
+                    ));
+                    default
+                }
+            },
+        }
+    };
+    let max_bytes = number(
+        "MODEL_IMAGE_MAX_BYTES",
+        IMAGE_MAX_BYTES_DEFAULT,
+        1..=IMAGE_MAX_BYTES_LIMIT,
+        problems,
+    );
+    let max_count = number(
+        "MODEL_IMAGE_MAX_COUNT",
+        IMAGE_MAX_COUNT_DEFAULT as u64,
+        1..=IMAGE_MAX_COUNT_LIMIT as u64,
+        problems,
+    );
+    let max_side = number(
+        "MODEL_IMAGE_MAX_SIDE",
+        u64::from(IMAGE_MAX_SIDE_DEFAULT),
+        u64::from(*IMAGE_MAX_SIDE_RANGE.start())..=u64::from(*IMAGE_MAX_SIDE_RANGE.end()),
+        problems,
+    );
+    let sources = match get("MODEL_IMAGE_SOURCES") {
+        None => BTreeSet::from([ImageOrigin::Person, ImageOrigin::Workspace]),
+        Some(raw) => {
+            let mut set = BTreeSet::new();
+            for word in raw.split(',').map(str::trim) {
+                match word {
+                    "person" => set.insert(ImageOrigin::Person),
+                    "workspace" => set.insert(ImageOrigin::Workspace),
+                    "mcp" => set.insert(ImageOrigin::Mcp),
+                    _ => {
+                        problems.push(
+                            "MODEL_IMAGE_SOURCES must be a comma-separated subset of `person`, `workspace`, `mcp`"
+                                .into(),
+                        );
+                        return None;
+                    }
+                };
+            }
+            set
+        }
+    };
+    Some(ImageLimits {
+        max_bytes,
+        max_count: usize::try_from(max_count).unwrap_or(IMAGE_MAX_COUNT_DEFAULT),
+        max_side: u32::try_from(max_side).unwrap_or(IMAGE_MAX_SIDE_DEFAULT),
+        sources,
+    })
 }
 
 /// `MODEL_EXTRA_BODY`: a JSON object, or a problem. The message names what is wrong and never
@@ -1439,6 +1597,124 @@ mod tests {
             assert!(mentions(&problems, "MODEL_CONTEXT_WINDOW"), "{problems:?}");
             assert_eq!(model.context_window, None, "{bad}");
         }
+    }
+
+    #[test]
+    fn input_modalities_parse_and_refuse() {
+        use adam_model::ImageOrigin;
+        let mut vars = model_vars();
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.images, None, "text only is the default");
+        for text in ["text", " TEXT ", "  "] {
+            vars.insert("MODEL_INPUT_MODALITIES", text);
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{text}: {problems:?}");
+            assert_eq!(model.images, None, "{text}");
+        }
+        for both in ["text,image", "image, text"] {
+            vars.insert("MODEL_INPUT_MODALITIES", both);
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{both}: {problems:?}");
+            let limits = model.images.expect("images");
+            assert_eq!(limits.max_bytes, 1_048_576);
+            assert_eq!(limits.max_count, 8);
+            assert_eq!(limits.max_side, 4096);
+            assert_eq!(
+                limits.sources,
+                std::collections::BTreeSet::from([ImageOrigin::Person, ImageOrigin::Workspace])
+            );
+        }
+        vars.insert("MODEL_INPUT_MODALITIES", "text,image");
+        vars.insert("MODEL_IMAGE_MAX_BYTES", "4194304");
+        vars.insert("MODEL_IMAGE_MAX_COUNT", "32");
+        vars.insert("MODEL_IMAGE_MAX_SIDE", "64");
+        vars.insert("MODEL_IMAGE_SOURCES", "mcp, person");
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        let limits = model.images.expect("images");
+        assert_eq!(
+            (limits.max_bytes, limits.max_count, limits.max_side),
+            (4_194_304, 32, 64)
+        );
+        assert!(limits.sources.contains(&ImageOrigin::Mcp));
+        assert!(!limits.sources.contains(&ImageOrigin::Workspace));
+
+        for (name, bad) in [
+            ("MODEL_INPUT_MODALITIES", "image"),
+            ("MODEL_INPUT_MODALITIES", "text,audio"),
+            ("MODEL_INPUT_MODALITIES", "text,,image"),
+            ("MODEL_IMAGE_MAX_BYTES", "0"),
+            ("MODEL_IMAGE_MAX_BYTES", "4194305"),
+            ("MODEL_IMAGE_MAX_COUNT", "0"),
+            ("MODEL_IMAGE_MAX_COUNT", "33"),
+            ("MODEL_IMAGE_MAX_SIDE", "63"),
+            ("MODEL_IMAGE_MAX_SIDE", "16385"),
+            ("MODEL_IMAGE_MAX_SIDE", "big"),
+            ("MODEL_IMAGE_SOURCES", "person,web"),
+            ("MODEL_IMAGE_SOURCES", ""),
+        ] {
+            let mut vars = model_vars();
+            vars.insert("MODEL_INPUT_MODALITIES", "text,image");
+            vars.insert(name, bad);
+            let (_, problems) = model_problems(&vars);
+            // A blank value is unset.
+            if bad.is_empty() {
+                assert!(problems.is_empty(), "{name}={bad:?}: {problems:?}");
+            } else {
+                assert!(mentions(&problems, name), "{name}={bad:?}: {problems:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn image_settings_without_image_are_a_problem() {
+        for name in [
+            "MODEL_IMAGE_MAX_BYTES",
+            "MODEL_IMAGE_MAX_COUNT",
+            "MODEL_IMAGE_MAX_SIDE",
+            "MODEL_IMAGE_SOURCES",
+        ] {
+            for modalities in [None, Some("text")] {
+                let mut vars = model_vars();
+                if let Some(m) = modalities {
+                    vars.insert("MODEL_INPUT_MODALITIES", m);
+                }
+                vars.insert(name, "person");
+                let (model, problems) = model_problems(&vars);
+                assert_eq!(problems.len(), 1, "{name}: {problems:?}");
+                assert!(mentions(&problems, name), "{problems:?}");
+                assert_eq!(model.images, None);
+            }
+        }
+    }
+
+    #[test]
+    fn output_image_is_refused_until_built() {
+        let mut vars = model_vars();
+        vars.insert("MODEL_OUTPUT_MODALITIES", "text");
+        assert!(model_problems(&vars).1.is_empty());
+        for bad in ["text,image", "image,text", "image"] {
+            vars.insert("MODEL_OUTPUT_MODALITIES", bad);
+            let (_, problems) = model_problems(&vars);
+            assert!(
+                mentions(&problems, "MODEL_OUTPUT_MODALITIES"),
+                "{bad}: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_reaches_the_wire_only_for_alias_model() {
+        use adam_model::ModelClient as _;
+        let mut vars = model_vars();
+        let client = model_problems(&vars).0.client().expect("client");
+        assert!(client.input_modalities("large").images.is_none());
+        vars.insert("MODEL_INPUT_MODALITIES", "text,image");
+        let client = model_problems(&vars).0.client().expect("client");
+        assert!(client.input_modalities("large").images.is_some());
+        // A subagent on another alias is text only, whatever the deployment said of `MODEL`.
+        assert!(client.input_modalities("small").images.is_none());
     }
 
     #[test]

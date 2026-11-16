@@ -26,6 +26,14 @@
 //! provider that **requires** it (DeepSeek's thinking mode with tools, *verified 2026-10-05*) is
 //! served by a client set to echo it, which then keeps it in [`Message::Assistant::reasoning`].
 //!
+//! # Images
+//!
+//! A message names an image by reference ([`ContentPart::Image`], [`Message::Tool`]'s `images`):
+//! its SHA-256, type, size, dimensions and origin, never its bytes, so no history and no journal
+//! holds one. A client that can send them reads them from [`ModelRequest::image_data`], which the
+//! agent loop fills for the one call and which is never serialized. Whether a model can see is the
+//! deployment's word, [`ModelClient::input_modalities`], text only by default.
+//!
 //! # Testing agents
 //!
 //! [`MockModel`] is a scripted [`ModelClient`] that records the requests it
@@ -66,6 +74,7 @@ pub use client::{DynModel, ModelClient};
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
 pub use types::{
-    ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, Message, ModelDelta, ModelRequest,
-    ModelResponse, ToolCall, ToolChoice, ToolSpec, Usage,
+    ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits, ImageOrigin,
+    ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse, ToolCall,
+    ToolChoice, ToolSpec, Usage, human_bytes,
 };
