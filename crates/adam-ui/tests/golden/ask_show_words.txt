@@ -1,0 +1,27 @@
+Before I ship.
+
+1. Which change?
+Block 1 of 4: Code "The build" (file Makefile, language make):
+```make
+all:
+	cc a.c
+
+```
+Block 2 of 4: A diagram "The flow":
+```mermaid
+graph TD; A-->B
+```
+How it runs
+Block 3 of 4: warning - Heads up: This cannot be undone.
+Block 4 of 4: Plain words
+   a) A
+   b) B
+2. Go on? (yes: "Yes" / no: "No")
+Block 1 of 3: Cards "Options":
+- Card A (first): the body <https://example.com/a> [tags: x, y]
+- Card B
+Block 2 of 3: A line chart "Latency" in ms:
+- p50: Mon 3, Tue 4
+- p99: Mon 30, Tue 40.5
+Last week
+Block 3 of 3: A picture: The page (Today) - a file shared in this conversation

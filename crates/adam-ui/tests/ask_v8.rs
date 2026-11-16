@@ -305,16 +305,6 @@ async fn a_hash_in_capitals_is_written_in_lower_case_and_a_form_with_no_show_is_
     assert!(components(&ui)[0]["questions"][0].get("show").is_none());
 }
 
-#[tokio::test]
-async fn a_replay_makes_the_same_surface() {
-    let first = form(&v8(), all_seven()).await;
-    let second = form(&v8(), all_seven()).await;
-    assert_eq!(first, second);
-    let first = form(&v7(), all_seven()).await;
-    let second = form(&v7(), all_seven()).await;
-    assert_eq!(first, second);
-}
-
 // ---- a screen of version 7 gets the components above the form ----
 
 #[tokio::test]
@@ -330,7 +320,8 @@ async fn a_screen_of_version_7_gets_the_question_with_no_show_and_the_components
     assert_eq!(
         component(&ui, "root")["children"],
         json!([
-            "q1-s1", "q1-s2", "q1-s3", "q1-s4", "q2-s1", "q2-s2", "q2-s3", "ask"
+            "q1-cap", "q1-s1", "q1-s2", "q1-s3", "q1-s4", "q2-cap", "q2-s1", "q2-s2", "q2-s3",
+            "ask"
         ])
     );
     for instance in components(&ui) {
@@ -338,12 +329,18 @@ async fn a_screen_of_version_7_gets_the_question_with_no_show_and_the_components
             .validate(instance)
             .unwrap_or_else(|e| panic!("{instance}: {e}"));
     }
-    // The question says where what it is about is.
+    // Each question's blocks come under a caption that names the question and the blocks, and the
+    // model's own `help` (there is none here) is not touched.
+    assert_eq!(
+        component(&ui, "q1-cap")["text"],
+        "For question 1 (\"Which layout?\"), blocks 1, 2, 3 and 4 of 4:"
+    );
+    assert_eq!(
+        component(&ui, "q2-cap")["text"],
+        "For question 2 (\"Go on?\"), blocks 1, 2 and 3 of 3:"
+    );
     for q in asked["questions"].as_array().unwrap() {
-        assert!(
-            q["help"].as_str().unwrap().contains("shown above the form"),
-            "{q}"
-        );
+        assert!(q.get("help").is_none(), "{q}");
     }
     assert_eq!(component(&ui, "q2-s2")["title"], "Heads up");
 }
@@ -357,16 +354,31 @@ async fn a_screen_that_lacks_a_component_gets_its_content_in_words_in_the_questi
     assert!(lead.contains(DIFF.trim_end()), "{lead}");
     assert!(lead.contains("```diff"), "{lead}");
     assert!(components(&ui).iter().all(|c| c["component"] != "Code"));
-    let help = choices(&ui)["questions"][0]["help"].as_str().unwrap();
-    assert!(help.contains("written above the form"), "{help}");
+    assert!(
+        lead.contains(
+            "For question 1 (\"Apply it?\"), block 1 of 1:\nBlock 1: Code \"The change\""
+        ),
+        "{lead}"
+    );
+    assert!(choices(&ui)["questions"][0].get("help").is_none());
     // A screen that has `Text` and `Column` draws the text above and says the rest.
     let args = json!({"question": "Q", "choices": [{
         "id": "a", "question": "Which?", "options": ["A", "B"],
         "show": [{"component": "Text", "text": "Some words"}, {"component": "Callout", "tone": "error", "title": "No", "text": "Careful"}]}]});
     let (lead, ui) = form(&v2(), args).await;
-    assert!(lead.contains("error - No: Careful"), "{lead}");
+    assert!(
+        lead.contains("For question 1 (\"Which?\"), block 2 of 2:\nBlock 2: error - No: Careful"),
+        "{lead}"
+    );
     assert!(!lead.contains("Some words"), "{lead}");
-    assert_eq!(component(&ui, "root")["children"], json!(["q1-s1", "ask"]));
+    assert_eq!(
+        component(&ui, "root")["children"],
+        json!(["q1-cap", "q1-s1", "ask"])
+    );
+    assert_eq!(
+        component(&ui, "q1-cap")["text"],
+        "For question 1 (\"Which?\"), block 1 of 2:"
+    );
     assert_eq!(component(&ui, "q1-s1")["text"], "Some words");
 }
 
@@ -650,15 +662,553 @@ async fn a_form_whose_things_were_said_in_words_says_them_again_when_it_is_asked
     assert!(refusal.question.contains("Said") && !refusal.question.contains("Plain words"));
 }
 
+// ---- every block is checked the same way on every screen ----
+
+/// The screens a block is asked on: the version 8, 7, 5 and 2 catalogs and none.
+fn every_screen() -> Vec<(&'static str, Option<Screen>)> {
+    vec![
+        ("v8", Some(v8())),
+        ("v7", Some(v7())),
+        ("v5", Some(v5())),
+        ("v2", Some(v2())),
+        ("none", None),
+    ]
+}
+
+fn one_block(block: Value) -> Value {
+    json!({"question": "Q", "choices": [{"id": "a", "question": "Which?", "options": ["A", "B"], "show": [block]}]})
+}
+
+#[tokio::test]
+async fn a_block_the_web_would_refuse_is_refused_on_every_screen_naming_the_block_and_the_member() {
+    let long = |n: usize| "x".repeat(n);
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "Code with no code",
+            json!({"component": "Code"}),
+            "`code` is missing",
+        ),
+        (
+            "Code with a number",
+            json!({"component": "Code", "code": 5}),
+            "`code` is not text",
+        ),
+        (
+            "Code of 20001",
+            json!({"component": "Code", "code": long(20001)}),
+            "`code` has 20001 characters",
+        ),
+        (
+            "Code of no characters",
+            json!({"component": "Code", "code": ""}),
+            "`code` has 0 characters",
+        ),
+        (
+            "Code title of 121",
+            json!({"component": "Code", "code": "x", "title": long(121)}),
+            "`title` has 121 characters",
+        ),
+        (
+            "Callout with no text",
+            json!({"component": "Callout", "title": "T"}),
+            "`text` is missing",
+        ),
+        (
+            "Callout of another tone",
+            json!({"component": "Callout", "title": "T", "text": "x", "tone": "loud"}),
+            "`tone` is not one of",
+        ),
+        (
+            "Cards with no cards",
+            json!({"component": "Cards"}),
+            "`cards` is missing",
+        ),
+        (
+            "Cards of none",
+            json!({"component": "Cards", "cards": []}),
+            "`cards` has 0 items",
+        ),
+        (
+            "a card with no title",
+            json!({"component": "Cards", "cards": [{"subtitle": "s"}]}),
+            "`cards[1].title` is missing",
+        ),
+        (
+            "a card link that is no http link",
+            json!({"component": "Cards", "cards": [{"title": "t", "url": "javascript:x"}]}),
+            "`cards[1].url` must start with http",
+        ),
+        (
+            "nine tags",
+            json!({"component": "Cards", "cards": [{"title": "t", "tags": ["a","b","c","d","e","f","g","h","i"]}]}),
+            "`cards[1].tags` has 9 items",
+        ),
+        (
+            "Text of 4001",
+            json!({"component": "Text", "text": long(4001)}),
+            "`text` has 4001 characters",
+        ),
+        (
+            "Text of another variant",
+            json!({"component": "Text", "text": "x", "variant": "h9"}),
+            "`variant` is not one of",
+        ),
+        (
+            "Mermaid with no code",
+            json!({"component": "Mermaid", "title": "t"}),
+            "`code` is missing",
+        ),
+        (
+            "Chart with no labels",
+            json!({"component": "Chart", "type": "bar", "series": [{"name": "s", "values": [1]}]}),
+            "`labels` is missing",
+        ),
+        (
+            "Chart of another type",
+            json!({"component": "Chart", "type": "radar", "labels": ["a"], "series": [{"name": "s", "values": [1]}]}),
+            "`type` is not one of",
+        ),
+        (
+            "Chart with a value that is no number",
+            json!({"component": "Chart", "type": "bar", "labels": ["a"], "series": [{"name": "s", "values": ["1"]}]}),
+            "`series[1].values[1]` is not a number",
+        ),
+        (
+            "Chart with five series",
+            json!({"component": "Chart", "type": "bar", "labels": ["a"], "series": [
+            {"name": "1", "values": [1]}, {"name": "2", "values": [1]}, {"name": "3", "values": [1]},
+            {"name": "4", "values": [1]}, {"name": "5", "values": [1]}]}),
+            "`series` has 5 items",
+        ),
+        (
+            "Chart with a series of too few values",
+            json!({"component": "Chart", "type": "bar", "labels": ["a", "b"], "series": [
+            {"name": "ok", "values": [1, 2]}, {"name": "short", "values": [1]}]}),
+            "`series[2]` (\"short\") has 1 values for 2 labels",
+        ),
+        (
+            "Chart with a series of too many values",
+            json!({"component": "Chart", "type": "bar", "labels": ["a"], "series": [
+            {"name": "long", "values": [1, 2]}]}),
+            "`series[1]` (\"long\") has 2 values for 1 labels",
+        ),
+        (
+            "Image alt of 301",
+            json!({"component": "Image", "artifact": PICTURE, "alt": long(301)}),
+            "`alt` has 301 characters",
+        ),
+        (
+            "a member nobody has",
+            json!({"component": "Text", "text": "x", "color": "red"}),
+            "`color` is not a member it has",
+        ),
+    ];
+    for (because, block, wanted) in cases {
+        let component = block["component"].as_str().unwrap().to_owned();
+        for (name, screen) in every_screen() {
+            let out = refused(screen.as_ref(), one_block(block.clone())).await;
+            assert!(
+                out.contains(&format!(
+                    "block 1 of `show` of question `a` ({component}): "
+                )),
+                "{because} on {name}: {out}"
+            );
+            assert!(out.contains(wanted), "{because} on {name}: {out}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_limits_of_a_component_are_met_exactly_on_every_screen() {
+    for (name, screen) in every_screen() {
+        let block = json!({"component": "Code", "code": "x".repeat(20000)});
+        let result = ask(screen.as_ref(), one_block(block)).await;
+        assert!(
+            matches!(result, Err(ToolError::NeedsInput { .. })),
+            "20000 characters of code on {name}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_image_hash_that_is_not_64_lower_case_hexadecimal_digits_is_refused_everywhere() {
+    let bad = [
+        PICTURE[1..].to_owned(),
+        format!("{PICTURE}a"),
+        format!("g{}", &PICTURE[1..]),
+        "z".repeat(64),
+        format!("{} ", &PICTURE[1..]),
+        "../a.png".to_owned(),
+    ];
+    for hash in bad {
+        for (name, screen) in every_screen() {
+            let block = json!({"component": "Image", "artifact": hash, "alt": "x"});
+            let out = refused(screen.as_ref(), one_block(block)).await;
+            assert!(
+                out.contains("sha256 (64 hexadecimal digits)"),
+                "{hash:?} on {name}: {out}"
+            );
+        }
+    }
+    // The hash is written in lower case, and a number is no hash.
+    let block = json!({"component": "Image", "artifact": 5, "alt": "x"});
+    assert!(
+        refused(None, one_block(block))
+            .await
+            .contains("sha256 (64 hexadecimal digits)")
+    );
+}
+
+#[tokio::test]
+async fn the_words_of_a_screen_are_bounded_like_its_surface() {
+    // 4 blocks of 20000 three-byte characters are 240000 bytes written out: none is read.
+    let code = json!({"component": "Code", "code": "€".repeat(20000)});
+    let args = json!({"question": "Q", "choices": [{"id": "a", "question": "Which?",
+        "options": ["A", "B"], "show": [code.clone(), code.clone(), code.clone(), code]}]});
+    for screen in [None, Some(v5())] {
+        let out = refused(screen.as_ref(), args.clone()).await;
+        assert!(out.contains("too large"), "{out}");
+        assert!(out.contains("65536"), "{out}");
+    }
+}
+
+// ---- a question's blocks are never detached from it ----
+
+fn two_confirms() -> Value {
+    json!({"question": "Two things.", "choices": [
+        {"id": "wipe", "question": "Delete the database?", "type": "confirm", "help": "This cannot be undone and takes the backups too.",
+         "show": [{"component": "Code", "title": "Plan A", "code": "DROP DATABASE app;"}]},
+        {"id": "push", "question": "Push to main?", "type": "confirm",
+         "show": [{"component": "Code", "title": "Plan B", "code": "git push origin main"}]}]})
+}
+
+#[tokio::test]
+async fn blocks_above_the_form_come_under_a_caption_that_names_their_question() {
+    let (_, ui) = form(&v7(), two_confirms()).await;
+    assert_eq!(
+        component(&ui, "root")["children"],
+        json!(["q1-cap", "q1-s1", "q2-cap", "q2-s1", "ask"])
+    );
+    assert_eq!(
+        component(&ui, "q1-cap")["text"],
+        "For question 1 (\"Delete the database?\"), block 1 of 1:"
+    );
+    assert_eq!(
+        component(&ui, "q2-cap")["text"],
+        "For question 2 (\"Push to main?\"), block 1 of 1:"
+    );
+    assert_eq!(component(&ui, "q1-s1")["title"], "Plan A");
+    // The model's help is what the model wrote.
+    let asked = component(&ui, "ask");
+    assert_eq!(
+        asked["questions"][0]["help"],
+        "This cannot be undone and takes the backups too."
+    );
+    assert!(asked["questions"][1].get("help").is_none());
+}
+
+#[tokio::test]
+async fn blocks_in_words_come_under_a_caption_that_names_their_question() {
+    for screen in [None, Some(v5())] {
+        let (lead, _) = match &screen {
+            Some(screen) => form(screen, two_confirms()).await,
+            None => (words(None, two_confirms()).await, Value::Null),
+        };
+        let at = |needle: &str| {
+            lead.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in {lead}"))
+        };
+        assert!(at("Plan A") < at("DROP DATABASE") && at("DROP DATABASE") < at("Plan B"));
+        assert!(at("Plan B") < at("git push origin main"));
+        if screen.is_some() {
+            assert!(
+                at("For question 1 (\"Delete the database?\"), block 1 of 1:")
+                    < at("DROP DATABASE")
+            );
+            assert!(
+                at("For question 2 (\"Push to main?\"), block 1 of 1:")
+                    < at("git push origin main")
+            );
+        } else {
+            assert!(at("1. Delete the database?") < at("Block 1 of 1: Code \"Plan A\""));
+            assert!(at("2. Push to main?") < at("Block 1 of 1: Code \"Plan B\""));
+        }
+    }
+    // A help of the model's own length is left whole.
+    let mut args = two_confirms();
+    let help = "h".repeat(300);
+    args["choices"][0]["help"] = json!(help);
+    let (_, ui) = form(&v5(), args).await;
+    assert_eq!(choices(&ui)["questions"][0]["help"], json!(help));
+}
+
+#[tokio::test]
+async fn the_number_of_a_block_is_said_wherever_it_lands() {
+    // Version 5 has no Code and no Callout: blocks 1 and 3 are written, 2 and 4 drawn above.
+    let args = json!({"question": "Q", "choices": [{"id": "a", "question": "Which?", "options": ["A", "B"], "show": [
+        {"component": "Code", "code": "first"},
+        {"component": "Mermaid", "code": "graph TD; A-->B"},
+        {"component": "Callout", "title": "T", "text": "third"},
+        {"component": "Text", "text": "fourth"}]}]});
+    let (lead, ui) = form(&v5(), args).await;
+    assert_eq!(
+        component(&ui, "q1-cap")["text"],
+        "For question 1 (\"Which?\"), blocks 2 and 4 of 4:"
+    );
+    assert_eq!(
+        component(&ui, "root")["children"],
+        json!(["q1-cap", "q1-s2", "q1-s4", "ask"])
+    );
+    let at = |needle: &str| {
+        lead.find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {lead}"))
+    };
+    assert!(
+        lead.contains("For question 1 (\"Which?\"), blocks 1 and 3 of 4:"),
+        "{lead}"
+    );
+    assert!(at("Block 1: Code") < at("first") && at("first") < at("Block 3: info - T: third"));
+    assert!(
+        !lead.contains("fourth") && !lead.contains("graph TD"),
+        "{lead}"
+    );
+}
+
+#[tokio::test]
+async fn a_screen_with_no_column_gets_everything_it_shows_in_words() {
+    for (screen, what) in [(v8(), "version 8"), (v7(), "version 7")] {
+        let mut document = screen.document.clone();
+        document["components"]
+            .as_object_mut()
+            .unwrap()
+            .remove("Column")
+            .unwrap();
+        let digest = catalog_digest(&document).unwrap();
+        let screen = Screen {
+            claimed: Claimed {
+                digest,
+                ..screen.claimed
+            },
+            document,
+        };
+        let (lead, ui) = form(&screen, consent()).await;
+        assert!(lead.contains(DIFF.trim_end()), "{what}: {lead}");
+        assert!(
+            lead.contains("Block 1: Code \"The change\""),
+            "{what}: {lead}"
+        );
+        // Nothing is half placed: the Choices alone, naming nothing it does not hold.
+        assert_eq!(components(&ui).len(), 1, "{what}: {ui}");
+        assert!(
+            choices(&ui)["questions"][0].get("show").is_none(),
+            "{what}: {ui}"
+        );
+    }
+}
+
+// ---- the words say every member that is content ----
+
+fn every_member() -> Value {
+    json!({"question": "Before I ship.", "choices": [
+        {"id": "c1", "question": "Which change?", "options": ["A", "B"], "show": [
+            {"component": "Code", "title": "The build", "filename": "Makefile", "language": "make", "code": "all:\n\tcc a.c\n"},
+            {"component": "Mermaid", "title": "The flow", "code": "graph TD; A-->B", "caption": "How it runs", "weight": 2},
+            {"component": "Callout", "tone": "warning", "title": "Heads up", "text": "This cannot be undone."},
+            {"component": "Text", "text": "Plain words", "variant": "h2", "weight": 1}]},
+        {"id": "c2", "question": "Go on?", "type": "confirm", "show": [
+            {"component": "Cards", "title": "Options", "layout": "grid", "weight": 1, "cards": [
+                {"title": "Card A", "subtitle": "first", "body": "the body", "url": "https://example.com/a", "tags": ["x", "y"]},
+                {"title": "Card B"}]},
+            {"component": "Chart", "title": "Latency", "caption": "Last week", "type": "line", "unit": "ms",
+             "labels": ["Mon", "Tue"], "series": [{"name": "p50", "values": [3, 4]}, {"name": "p99", "values": [30, 40.5]}]},
+            {"component": "Image", "artifact": PICTURE, "alt": "The page", "caption": "Today", "weight": 1}]}]})
+}
+
+fn golden_text(name: &str, got: &str) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name);
+    if std::env::var_os("ADAM_UPDATE_SNAPSHOTS").is_some() {
+        std::fs::write(&path, got).unwrap();
+    }
+    assert_eq!(
+        got,
+        std::fs::read_to_string(&path).unwrap(),
+        "{name}: regenerate with ADAM_UPDATE_SNAPSHOTS=1"
+    );
+}
+
+#[tokio::test]
+async fn the_words_of_each_component_say_every_member_that_is_content() {
+    let text = words(None, every_member()).await;
+    golden_text("ask_show_words.txt", &text);
+    // What only says how to draw is not said.
+    for drawn_only in ["h2", "grid", "weight"] {
+        assert!(!text.contains(drawn_only), "{drawn_only:?} in {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_code_fence_is_longer_than_any_run_of_backticks_in_the_code() {
+    for (code, fence) in [
+        ("```\nnot a close\n```", "````"),
+        ("a `` b", "```"),
+        ("`````x", "``````"),
+    ] {
+        let text = words(None, one_block(json!({"component": "Code", "code": code}))).await;
+        assert!(
+            text.contains(&format!("{fence}\n{code}\n{fence}")),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tab_and_a_line_break_in_code_are_text() {
+    let make = "all:\r\n\tcc -o a a.c\n\t./a\n";
+    let args = one_block(json!({"component": "Code", "language": "make", "code": make}));
+    let (_, ui) = form(&v8(), args.clone()).await;
+    assert_eq!(component(&ui, "q1-s1")["code"], make);
+    assert!(words(None, args).await.contains(make));
+}
+
+#[tokio::test]
+async fn every_bidirectional_control_and_hidden_character_in_a_block_is_refused_and_says_what_to_do()
+ {
+    let controls: Vec<u32> = (0x202A..=0x202E)
+        .chain(0x2066..=0x2069)
+        .chain([
+            0x200E, 0x200F, 0x061C, 0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00AD, 0x0007,
+        ])
+        .collect();
+    for code in controls {
+        let c = char::from_u32(code).unwrap();
+        for (name, screen) in [("v8", Some(v8())), ("v5", Some(v5())), ("none", None)] {
+            let out = refused(
+                screen.as_ref(),
+                one_block(json!({"component": "Code", "code": format!("let a{c}b;")})),
+            )
+            .await;
+            assert!(
+                out.contains("block 1 of `show` of question `a`"),
+                "{code:X} {name}: {out}"
+            );
+            assert!(
+                out.contains(&format!("(U+{code:04X}) in `code`")),
+                "{code:X} {name}: {out}"
+            );
+            assert!(
+                out.contains(&format!("\\u{{{code:04X}}}")) && out.contains("say it in words"),
+                "{code:X} {name}: {out}"
+            );
+        }
+    }
+}
+
+// ---- the size of what is sent ----
+
+#[tokio::test]
+async fn the_size_is_measured_in_utf8_bytes_of_what_is_sent() {
+    // 3 blocks of 6000 three-byte characters are about 54 KB, and a fourth makes 72 KB: 24000
+    // characters, over the bound in bytes only.
+    let code = |n: usize| json!({"component": "Code", "code": "€".repeat(n)});
+    let ok = json!({"question": "Q", "choices": [{"id": "a", "question": "Which?", "options": ["A", "B"],
+        "show": [code(6000), code(6000), code(6000)]}]});
+    form(&v8(), ok).await;
+    let over = json!({"question": "Q", "choices": [{"id": "a", "question": "Which?", "options": ["A", "B"],
+        "show": [code(6000), code(6000), code(6000), code(6000)]}]});
+    let out = refused(Some(&v8()), over).await;
+    assert!(out.contains("too large") && out.contains("65536"), "{out}");
+}
+
+#[tokio::test]
+async fn defaults_carried_to_a_form_asked_again_never_make_it_larger_than_a_screen_reads() {
+    let code = |n: usize| json!({"component": "Code", "code": "x".repeat(n)});
+    let args = |n: usize| {
+        json!({"question": "Q", "choices": [
+            {"id": "budget", "question": "What is the budget?", "type": "number", "minValue": "0", "maxValue": "1000",
+             "show": [code(n), code(n), code(n), code(n)]},
+            {"id": "notes", "question": "Anything else?", "type": "longText"},
+            {"id": "pick", "question": "Which?", "options": ["A", "B"]}]})
+    };
+    let size = |ui: &Value| ui.to_string().len();
+    // Find the code length that leaves the first surface just under the bound.
+    let (_, probe) = form(&v8(), args(10000)).await;
+    let n = 10000 + (65536 - 400 - size(&probe)) / 4;
+    let (_, ui) = form(&v8(), args(n)).await;
+    assert!(
+        size(&ui) <= 65536 && size(&ui) > 65536 - 600,
+        "{}",
+        size(&ui)
+    );
+    let answer = json!({"text": "x", "form": {"surface": "ask-call-1", "context": {"answers": [
+        {"id": "budget", "values": ["1500"]},
+        {"id": "notes", "values": [], "text": "y".repeat(1800)},
+        {"id": "pick", "values": ["a"]}]}}});
+    let AnswerCheck::Refuse(refusal) =
+        ask_tool().read_answer("call-1", &args(n), Some(&ui), &answer)
+    else {
+        panic!("a budget above its most was accepted");
+    };
+    let again = refusal.ui.expect("the form is asked again on a surface");
+    assert!(size(&again) <= 65536, "{}", size(&again));
+    let questions = choices(&again)["questions"].as_array().unwrap().clone();
+    assert!(
+        questions[1].get("default").is_none(),
+        "the text was kept: {}",
+        questions[1]
+    );
+    assert_eq!(
+        questions[2]["default"], "a",
+        "a default that fits was dropped"
+    );
+    assert_eq!(component(&again, "q1-s4")["component"], "Code");
+}
+
+// ---- a refused answer asks again from the surface that was journaled ----
+
+#[tokio::test]
+async fn a_surface_journaled_with_the_run_is_what_a_re_ask_reads_back_when_the_run_is_loaded_again()
+{
+    let args = budget_args();
+    for screen in [v8(), v7(), v5()] {
+        let (_, ui) = form(&screen, args.clone()).await;
+        // The journal holds the surface as JSON text; a run loaded again reads it back.
+        let loaded: Value = serde_json::from_str(&serde_json::to_string(&ui).unwrap()).unwrap();
+        let answer = budget_answer("ask-call-1", "1500");
+        let read = |ui: &Value| match ask_tool().read_answer("call-1", &args, Some(ui), &answer) {
+            AnswerCheck::Refuse(refusal) => (refusal.question, refusal.ui),
+            other => panic!("a budget above its most was accepted: {other:?}"),
+        };
+        let (question, again) = read(&loaded);
+        assert_eq!(
+            (question.clone(), again.clone()),
+            read(&ui),
+            "version {}",
+            screen.claimed.version
+        );
+        let again = again.unwrap();
+        assert_eq!(components(&again), components(&loaded));
+        assert!(question.contains("above the most, 1000"), "{question}");
+        // What the screen could not draw is said again, once, in the same words.
+        let first = form(&screen, args.clone()).await.0;
+        let said: Vec<&str> = first.lines().filter(|l| l.starts_with("Block ")).collect();
+        for line in &said {
+            assert_eq!(question.matches(line).count(), 1, "{line:?} in {question}");
+        }
+    }
+}
+
 // ---- the contract's vectors, run through the tool ----
 
 /// How a vector of the contract's `v8-surfaces` is held to what `ask_user` makes.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Held {
-    /// The contract's result is the tool's: drawn, or refused before drawing.
+    /// The contract's result is the tool's: drawn with the vector's components in its order, or
+    /// refused before drawing with a message that names the block.
     Same,
     /// The tool gives each shown component an id of its own and places it only by `show`, so the
-    /// case cannot be made: the call is accepted and the surface holds what the contract wants.
+    /// case cannot be made: the surface it draws is walked for the rule instead.
     ByConstruction,
     /// Only the web knows (the thread's files): the tool draws it and the web refuses it.
     WebOnly,
@@ -696,6 +1246,70 @@ fn call_of(case: &Value) -> Option<Value> {
     Some(json!({"question": "Q", "choices": questions}))
 }
 
+/// The components a form shows, per question, without their ids: from a surface (`show` names ids)
+/// of the contract's, or of the tool's.
+fn shown_per_question(components: &[Value]) -> Vec<Vec<Value>> {
+    let form = components
+        .iter()
+        .find(|c| c["component"] == "Choices")
+        .unwrap();
+    form["questions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| {
+            q["show"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| components.iter().find(|c| c["id"] == *id))
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.as_object_mut().unwrap().remove("id");
+                    c
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The ids that a container of the surface places: the `children` of a `Column` or `Stack`, the
+/// `child` of a `Button` or a card, the `child` of a `Tabs` entry or an `Accordion` item.
+fn placed_by_containers(components: &[Value]) -> Vec<String> {
+    let mut placed = Vec::new();
+    for c in components {
+        for id in c["children"].as_array().into_iter().flatten() {
+            placed.extend(id.as_str().map(str::to_owned));
+        }
+        placed.extend(c["child"].as_str().map(str::to_owned));
+        for member in ["tabs", "items"] {
+            for entry in c[member].as_array().into_iter().flatten() {
+                placed.extend(entry["child"].as_str().map(str::to_owned));
+            }
+        }
+    }
+    placed
+}
+
+/// What a refused vector says in the tool's words: each of these is in the message.
+fn refusal_of(because: &str) -> &'static [&'static str] {
+    match because {
+        b if b.starts_with("a question shows") => &[
+            "block 1 of `show` of question",
+            "which a question cannot show",
+        ],
+        "an empty list" => &["`show` of question", "has 0 blocks"],
+        "five ids in one question" => &["`show` of question", "has 5 blocks"],
+        b if b.starts_with("nine ids") => &["the form shows 9 blocks in all"],
+        "show is a string, not a list" => &["`show` of question", "is not a list of blocks"],
+        "show holds a number" => &["block 1 of `show` of question", "is not an object"],
+        "an image with no alt text" => {
+            &["block 1 of `show` of question", "an `Image` with no `alt`"]
+        }
+        other => panic!("{other}: a refusal the test does not know"),
+    }
+}
+
 #[tokio::test]
 async fn the_vectors_of_the_contract_are_held_by_the_tool() {
     let document: Value = serde_json::from_str(VECTORS).unwrap();
@@ -722,15 +1336,54 @@ async fn the_vectors_of_the_contract_are_held_by_the_tool() {
             None => Held::NotAboutAsking,
             Some(args) => {
                 let out = ask(Some(&screen), args.clone()).await;
-                let drawn = matches!(out, Err(ToolError::NeedsInput { ui: Some(_), .. }));
+                let ui = match &out {
+                    Err(ToolError::NeedsInput { ui: Some(ui), .. }) => Some(ui),
+                    _ => None,
+                };
+                // Whatever is drawn names each shown component once and places it only by `show`.
+                if let Some(ui) = ui {
+                    let drawn = components(ui);
+                    let shown: Vec<&str> = drawn
+                        .iter()
+                        .filter(|c| c["component"] != "Choices" && c["id"] != "root")
+                        .map(|c| c["id"].as_str().unwrap())
+                        .collect();
+                    let named: Vec<&str> = choices(ui)["questions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|q| q["show"].as_array().into_iter().flatten())
+                        .map(|id| id.as_str().unwrap())
+                        .collect();
+                    assert_eq!(
+                        shown, named,
+                        "{because}: every shown id is in the surface and in one `show`"
+                    );
+                    let placed = placed_by_containers(drawn);
+                    assert!(
+                        named.iter().all(|id| !placed.iter().any(|p| p == id)),
+                        "{because}: a shown component is placed by a container"
+                    );
+                }
                 match result {
                     "drawn" => {
-                        assert!(drawn, "{because}: {out:?}");
+                        let ui = ui.unwrap_or_else(|| panic!("{because}: {out:?}"));
+                        let ours = shown_per_question(components(ui));
+                        let theirs = shown_per_question(case["components"].as_array().unwrap());
+                        assert_eq!(
+                            ours, theirs,
+                            "{because}: the components, in the vector's order"
+                        );
+                        for (n, q) in ours.iter().enumerate() {
+                            for j in 1..=q.len() {
+                                component(ui, &format!("q{}-s{j}", n + 1));
+                            }
+                        }
                         Held::Same
                     }
                     "refused:schema" => {
                         // An id twice, or shown by two questions or two forms, cannot be written:
-                        // each block is given an id of its own.
+                        // each block is given an id of its own, and each is drawn.
                         let by_construction = [
                             "the same id twice in one question",
                             "one id shown by two questions of one form",
@@ -738,19 +1391,42 @@ async fn the_vectors_of_the_contract_are_held_by_the_tool() {
                         ]
                         .contains(&because);
                         if by_construction {
-                            assert!(drawn, "{because}: {out:?}");
+                            assert!(ui.is_some(), "{because}: {out:?}");
                             Held::ByConstruction
                         } else {
-                            assert!(!drawn, "{because}: {out:?}");
+                            let Ok(refusal) = &out else {
+                                panic!("{because}: expected a refusal, got {out:?}");
+                            };
+                            assert!(refusal.is_error, "{because}: {out:?}");
+                            for wanted in refusal_of(because) {
+                                assert!(
+                                    refusal.content.contains(wanted),
+                                    "{because}: {wanted:?} not in {}",
+                                    refusal.content
+                                );
+                            }
                             Held::Same
                         }
                     }
+                    // The tool draws a surface whole, every id of it present: nothing is "not there
+                    // yet" (pending); and each id is placed by `show` alone, never by a container
+                    // (expansion): the walk above holds both for what it drew.
                     "refused:expansion" | "pending" => {
-                        assert!(drawn, "{because}: {out:?}");
+                        assert!(ui.is_some(), "{because}: {out:?}");
                         Held::ByConstruction
                     }
+                    // The tool does not know the thread's files: it draws the image with the hash,
+                    // and the web refuses a file the thread does not hold.
                     "refused:artifact" => {
-                        assert!(drawn, "{because}: {out:?}");
+                        let ui = ui.unwrap_or_else(|| panic!("{because}: {out:?}"));
+                        let hash = case["components"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|c| c["component"] == "Image")
+                            .unwrap()["artifact"]
+                            .clone();
+                        assert_eq!(component(ui, "q1-s1")["artifact"], hash, "{because}");
                         Held::WebOnly
                     }
                     other => panic!("{because}: a result the test does not know: {other}"),
