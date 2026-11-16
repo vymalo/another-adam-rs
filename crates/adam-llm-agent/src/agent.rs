@@ -145,8 +145,8 @@ use crate::state::Extensions;
 use crate::step_io::StepIo;
 use crate::text_stream;
 use crate::tool::{
-    DEFAULT_TOOL_TIME_LIMIT, DynTool, RemotePoll, StepStyle, TOOL_STOP_GRACE, Tool, ToolCtx,
-    ToolError, ToolOutput,
+    AnswerCheck, DEFAULT_TOOL_TIME_LIMIT, DynTool, Refusal, RemotePoll, StepStyle, TOOL_STOP_GRACE,
+    Tool, ToolCtx, ToolError, ToolOutput,
 };
 use crate::toolset::ToolSet;
 
@@ -802,6 +802,14 @@ fn silent_call(agent: &LlmAgent, state: &Conversation, name: &str) -> bool {
         .is_some_and(|n| n.reports_step)
 }
 
+/// What the run made of the messages that arrived: see [`LlmAgent::absorb_inbox`].
+struct Absorbed {
+    /// The run is parked on a question and nothing answered it.
+    waiting: bool,
+    /// The answers a tool refused (`Tool::read_answer`), each with the call it was for.
+    refusals: Vec<(String, Refusal)>,
+}
+
 /// What a part of a step decided.
 enum Flow {
     /// Nothing terminal happened; carry on.
@@ -860,7 +868,11 @@ impl LlmAgent {
     ///
     /// A wait on a child run is not touched here: user messages queue behind
     /// the owed tool result like any other.
-    fn absorb_inbox(&self, state: &mut Conversation, inbox: Vec<Inbound>) -> bool {
+    ///
+    /// The answer is read by the tool that asked ([`Tool::read_answer`]) before the model sees it. A
+    /// refused one is not used: the run stays parked on the question the tool made in its place, and
+    /// the refusal is returned for the caller to journal.
+    fn absorb_inbox(&self, state: &mut Conversation, inbox: Vec<Inbound>) -> Absorbed {
         let mut texts = Vec::new();
         for inbound in inbox {
             // A message the run has read is not read again: the orchestration layer sends the same
@@ -876,7 +888,7 @@ impl LlmAgent {
                     if let Some(context) = parse_context(&inbound.payload) {
                         state.merge_context(context);
                     }
-                    texts.push(text);
+                    texts.push((text, inbound.payload));
                 }
                 Err(reason) => {
                     tracing::warn!(inbound = %inbound.id, kind = %inbound.kind, %reason, "ignoring unreadable inbound message");
@@ -890,18 +902,38 @@ impl LlmAgent {
             state.announced = None;
             state.announced_final = false;
         }
-        if let Some(PendingWait::Question(q)) = &state.pending_wait {
-            let Some(answer) = texts.next() else {
-                return false;
+        let mut refusals = Vec::new();
+        // The first message that the tool accepts answers the question; one it refuses leaves the
+        // run parked on the question the tool asked in its place, and the next is read against that.
+        while let Some(PendingWait::Question(q)) = &state.pending_wait {
+            let Some((answer, payload)) = texts.next() else {
+                return Absorbed {
+                    waiting: true,
+                    refusals,
+                };
             };
-            let call_id = q.call_id.clone();
-            state.pending_wait = None;
-            if state.pending_calls.first().is_some_and(|c| c.id == call_id) {
-                state.pending_calls.remove(0);
+            let (call_id, tool, ui) = (q.call_id.clone(), q.tool.clone(), q.ui.clone());
+            match self.read_answer(state, &tool, &call_id, ui.as_ref(), &payload) {
+                AnswerCheck::Refuse(refusal) => {
+                    state.pending_wait = Some(PendingWait::Question(PendingQuestion {
+                        call_id: call_id.clone(),
+                        tool,
+                        question: refusal.question.clone(),
+                        ui: refusal.ui.clone(),
+                        stream: None,
+                    }));
+                    refusals.push((call_id, refusal));
+                }
+                _ => {
+                    state.pending_wait = None;
+                    if state.pending_calls.first().is_some_and(|c| c.id == call_id) {
+                        state.pending_calls.remove(0);
+                    }
+                    state.messages.push(Message::tool_result(call_id, answer));
+                }
             }
-            state.messages.push(Message::tool_result(call_id, answer));
         }
-        for text in texts {
+        for (text, _) in texts {
             let message = Message::user_text(text);
             if state.pending_calls.is_empty() {
                 state.messages.push(message);
@@ -909,7 +941,28 @@ impl LlmAgent {
                 state.deferred.push(message);
             }
         }
-        true
+        Absorbed {
+            waiting: false,
+            refusals,
+        }
+    }
+
+    /// What the tool that asked says about `payload`, the message that answers its question: the
+    /// call is the one the run holds in `pending_calls`. A tool or a call that is no longer there
+    /// accepts, so the answer reaches the model as before.
+    fn read_answer(
+        &self,
+        state: &Conversation,
+        tool: &str,
+        call_id: &str,
+        ui: Option<&Value>,
+        payload: &Value,
+    ) -> AnswerCheck {
+        let call = state.pending_calls.iter().find(|c| c.id == call_id);
+        match (self.tool(tool), call) {
+            (Some(tool), Some(call)) => tool.read_answer(call_id, &call.arguments, ui, payload),
+            _ => AnswerCheck::Accept,
+        }
     }
 
     /// When a run that waits for a child looks at it next.
@@ -3242,8 +3295,24 @@ impl Agent for LlmAgent {
             Some(PendingWait::Question(q)) => Some((q.tool.clone(), q.call_id.clone())),
             _ => None,
         };
-        if !self.absorb_inbox(&mut state, inbox) {
-            // Woken without an answer (nothing usable arrived): keep waiting.
+        let absorbed = self.absorb_inbox(&mut state, inbox);
+        for (call_id, refusal) in &absorbed.refusals {
+            ctx.emit(RunEvent::Custom {
+                kind: "answer_refused".into(),
+                payload: json!({
+                    "call_id": call_id,
+                    "question": refusal.subject,
+                    "rule": refusal.rule,
+                }),
+            })
+            .await;
+        }
+        if !absorbed.refusals.is_empty() {
+            ctx.read_already(&state.read_ids);
+        }
+        if absorbed.waiting {
+            // Woken without an answer (nothing usable arrived), or the answer was refused and the
+            // tool asked again: keep waiting.
             return Ok(Transition::Park {
                 state,
                 wake_at: None,

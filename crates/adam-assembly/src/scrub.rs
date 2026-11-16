@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_llm_agent::{RemotePoll, StateKey, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
+use adam_llm_agent::{
+    AnswerCheck, RemotePoll, StateKey, StepStyle, Tool, ToolCtx, ToolError, ToolOutput,
+};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -91,6 +93,16 @@ impl Tool for Scrubbed {
 
     fn time_limit(&self) -> Option<Duration> {
         self.inner.time_limit()
+    }
+
+    fn read_answer(
+        &self,
+        call_id: &str,
+        args: &Value,
+        ui: Option<&Value>,
+        payload: &Value,
+    ) -> AnswerCheck {
+        self.inner.read_answer(call_id, args, ui, payload)
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {

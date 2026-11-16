@@ -39,6 +39,16 @@ pub const MAX_MENTIONS: usize = 16;
 /// The most characters of an action's `context` that the text for the model carries.
 pub const MAX_ACTION_CONTEXT_CHARS: usize = 4096;
 
+/// The payload member of the inbound message that answers a form: `{surface, context}`, the surface
+/// the action names and its `context` as it came (`{answers, note?}`). It is beside `text`, which
+/// is what the model reads, so that what answers a question can be checked against the form that
+/// asked it without parsing the text. Absent from a message that is not a form's answer.
+pub const PAYLOAD_FORM: &str = "form";
+
+/// The most bytes of an action's context kept as [`PAYLOAD_FORM`]; a larger one is kept as
+/// `{"oversize": true}`, which no form accepts.
+const MAX_FORM_CONTEXT_BYTES: usize = 256 * 1024;
+
 /// The largest whole number a double holds exactly (2^53 - 1): what a catalog may contain.
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
@@ -97,11 +107,15 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// [`default_inbound`](crate::default_inbound).
 pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
     let mut chunks: Vec<String> = Vec::new();
+    let mut form: Option<Value> = None;
     for part in &message.parts {
         match &part.content {
             PartContent::Text(text) => chunks.push(typed_text(text)),
             PartContent::Data(data) if claims_a2ui(part) => {
                 chunks.extend(action_texts(data));
+                if form.is_none() {
+                    form = form_of(data);
+                }
             }
             PartContent::Data(data) => chunks.push(data.to_string()),
             _ => {}
@@ -112,6 +126,9 @@ pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
         return Err("the message has no text".to_owned());
     }
     let mut payload = json!({ "text": text });
+    if let Some(form) = form {
+        payload[PAYLOAD_FORM] = form;
+    }
     if let Some(context) = message.metadata.as_ref().and_then(context_of)
         && !context.is_empty()
     {
@@ -220,6 +237,31 @@ pub fn form_answer_surface(line: &str) -> Option<Option<&str>> {
     }
     let surface = rest.strip_prefix(" (form ")?.strip_suffix("):")?;
     is_form_surface(surface).then_some(Some(surface))
+}
+
+/// The first form's submit in an A2UI data part, as [`PAYLOAD_FORM`]: the action `answer` of a
+/// surface `ask_user` drew, with its context whatever it holds (the receiver judges its shape).
+fn form_of(data: &Value) -> Option<Value> {
+    let messages: Vec<&Value> = match data {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    messages.into_iter().find_map(|m| {
+        let action = m.get("action")?;
+        let surface = action
+            .get("surfaceId")
+            .and_then(Value::as_str)
+            .filter(|surface| is_form_surface(surface))?;
+        (action.get("name").and_then(Value::as_str) == Some(ANSWER_ACTION)).then(|| {
+            let context = action.get("context").cloned().unwrap_or(Value::Null);
+            let context = if context.to_string().len() > MAX_FORM_CONTEXT_BYTES {
+                json!({"oversize": true})
+            } else {
+                context
+            };
+            json!({"surface": surface, "context": context})
+        })
+    })
 }
 
 /// One action as what the model reads.
@@ -639,6 +681,71 @@ mod tests {
              - skipped: (nothing chosen)"
         );
         assert!(got.payload.get("context").is_none());
+    }
+
+    #[test]
+    fn the_answer_of_a_form_keeps_its_surface_and_context_as_they_came_beside_the_text() {
+        let context = json!({"answers": [{"id": "n", "values": [250.5]}], "note": "x"});
+        let m = action_message(json!({
+            "name": "answer", "surfaceId": "ask-call_1.r1", "sourceComponentId": "root",
+            "timestamp": "t", "context": context
+        }));
+        let got = vymalo_inbound(&m).unwrap();
+        assert_eq!(
+            got.payload[PAYLOAD_FORM],
+            json!({"surface": "ask-call_1.r1", "context": context})
+        );
+        // A value that is not a string is no line of the text, and the context still says it.
+        assert!(
+            got.payload["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("The person used the interface"),
+            "{}",
+            got.payload["text"]
+        );
+        // An action with no context at all is still a form's submit, and says so.
+        let bare = action_message(
+            json!({"name": "answer", "surfaceId": "ask-1", "sourceComponentId": "c", "timestamp": "t"}),
+        );
+        assert_eq!(
+            vymalo_inbound(&bare).unwrap().payload[PAYLOAD_FORM],
+            json!({"surface": "ask-1", "context": null})
+        );
+    }
+
+    #[test]
+    fn only_a_forms_own_submit_is_a_forms_answer_and_a_larger_context_is_one_no_form_accepts() {
+        for action in [
+            json!({"name": "other", "surfaceId": "ask-1", "context": {"answers": []}}),
+            json!({"name": "answer", "surfaceId": "chat-1", "context": {"answers": []}}),
+        ] {
+            let m = action_message(action);
+            assert!(
+                vymalo_inbound(&m)
+                    .unwrap()
+                    .payload
+                    .get(PAYLOAD_FORM)
+                    .is_none(),
+                "{m:?}"
+            );
+        }
+        let text = Message::new(Role::User, vec![Part::text("yes")]);
+        assert!(
+            vymalo_inbound(&text)
+                .unwrap()
+                .payload
+                .get(PAYLOAD_FORM)
+                .is_none()
+        );
+        let big = action_message(json!({
+            "name": "answer", "surfaceId": "ask-1", "sourceComponentId": "c", "timestamp": "t",
+            "context": {"answers": [{"id": "a", "values": ["x".repeat(MAX_FORM_CONTEXT_BYTES)]}]}
+        }));
+        assert_eq!(
+            vymalo_inbound(&big).unwrap().payload[PAYLOAD_FORM]["context"],
+            json!({"oversize": true})
+        );
     }
 
     #[test]

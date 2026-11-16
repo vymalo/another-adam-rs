@@ -881,6 +881,16 @@ impl Tool for Gated {
         self.inner.step_style()
     }
 
+    fn read_answer(
+        &self,
+        call_id: &str,
+        args: &Value,
+        ui: Option<&Value>,
+        payload: &Value,
+    ) -> AnswerCheck {
+        self.inner.read_answer(call_id, args, ui, payload)
+    }
+
     /// A tool that has a bound of its own declares that bound and half a minute more, so the
     /// bound, which says what happened, fires first ([`own_limit`]); the agent's default applies
     /// only to a tool with none, and every such tool is named in [`QUICK_TOOLS`].
@@ -1013,6 +1023,16 @@ impl Tool for Redacting {
 
     fn time_limit(&self) -> Option<Duration> {
         self.inner.time_limit()
+    }
+
+    fn read_answer(
+        &self,
+        call_id: &str,
+        args: &Value,
+        ui: Option<&Value>,
+        payload: &Value,
+    ) -> AnswerCheck {
+        self.inner.read_answer(call_id, args, ui, payload)
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
