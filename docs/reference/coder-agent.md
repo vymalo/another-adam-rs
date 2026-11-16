@@ -110,7 +110,10 @@ prompt (`agent/instructions.md`) says only which is which, and the descriptions 
 `ask_user` has eleven kinds of question: `single`, `multiple`, `select`, `images`, `text` and `longText`, and `confirm`,
 `number`, `scale`, `date` and `rank` ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 6;
 [`adam-ui`](../../crates/adam-ui/README.md) has their members and limits). The schema is one value for every screen. A screen
-whose `Choices` lacks a kind gets the nearest older form, or words. The coder reads the answer to a form
+whose `Choices` lacks a kind gets the nearest older form, or words. A question may also `show` what it asks about
+(`show: [{component, ...}]`, 1 to 4 blocks of `Text`, `Image`, `Mermaid`, `Code`, `Cards`, `Callout` or `Chart`, 8 in a form;
+catalog version 8): the coder shows the diff or the command it asks consent for, drawn with the question, and a screen that
+cannot draw a block gets it in words. The coder reads the answer to a form
 before the model does: an answer that breaks a rule of the catalog (a number out of its range, a day outside its bounds, a rank
 that is not every option once) is **not used**. The person is told which question and why, in a message of the same task, and
 is asked the same form again on a new surface (`ask-<call>.r<n>`) with what they got right as its defaults; the run stays

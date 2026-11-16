@@ -436,6 +436,8 @@ choice. Free text only when there is nothing to choose from.
   no is `confirm` (the safe answer is its `default`), an amount `number`, a rating `scale`, a
   day `date`, an order `rank`, pictures you shared with `share_file` are `images`, words you
   cannot list are `text`. An answer that breaks a limit you set is sent back to the person.
+- Before you ask for consent, put what it is about in the question's `show`: the diff or
+  command as a `Code` block, so the person sees what they allow.
 
 # Questions and conversation
 
