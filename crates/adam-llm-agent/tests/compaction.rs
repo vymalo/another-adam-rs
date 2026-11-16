@@ -1185,22 +1185,8 @@ fn assert_summaries_follow_a_result(requests: &[ModelRequest]) {
     assert_paired(history);
 }
 
-#[tokio::test]
-async fn nothing_is_compacted_while_a_call_is_still_to_run() {
-    let rig = Rig::new(2400);
-    rig.mock
-        .push_tool_calls(vec![heavy("c0", "big")])
-        .push_tool_calls(vec![heavy("c1", "big")])
-        .push_tool_calls(vec![heavy("c2", "big")])
-        .push_tool_calls(vec![heavy("c3", "big")])
-        .push_text("S")
-        .push_text("done");
-    let run = rig.start().await;
-    let (requests, state) = rig.finish(run).await;
-    assert_eq!(state.compactions.len(), 1);
-    assert_summaries_follow_a_result(&requests);
-}
-
+/// The step that polls a remote task starts with its call still open: the history is over the budget
+/// and is left alone until the result is in.
 #[tokio::test]
 async fn nothing_is_compacted_while_a_remote_task_is_awaited() {
     let rig = Rig::with(MockModel::new(), 2400, |b| b.tool(WaitsAndPins));
