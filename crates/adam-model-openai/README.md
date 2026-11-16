@@ -62,6 +62,15 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   chunk that is not JSON, and a complete non-streamed body whose choice has no `finish_reason` (absent or
   `null`), stay `Protocol`: a server that never sends it fails fast, not after every retry.
 
+## Images
+
+`OpenAiCompatible::with_input_modalities(alias, modalities)` is what `ModelClient::input_modalities` answers for that alias, and text only for any other (a subagent on another alias fails closed); `adam-service` sets it from `MODEL_INPUT_MODALITIES` for the alias `MODEL`. On the wire (*unverified* on every provider: the OpenAI API reference answered 403 on 2026-11-15, so the shapes are from memory):
+
+* a user message that holds an image is an **array** `[{"type":"text","text":...},{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]`, no `detail`; one with no image stays a string, so every text-only body is the bytes it was;
+* the images of a **run of tool messages** follow it in one user message, `Images from tool results: c1 shot.png; c2 b.png`, then the parts: the tool messages stay text (a tool-role message that holds an image is *unverified*), and each body's `messages` starts with the one before it;
+* an image with no bytes in `ModelRequest::image_data` is its stand-in line. A chat template that insists on string content rejects the array: the setting is off by default for that reason.
+
+## Reasoning
 ## Reasoning
 
 A model in thinking mode sends its reasoning beside its answer, and this client reads it:

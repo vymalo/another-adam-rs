@@ -377,6 +377,61 @@ task ends or waits, cumulative, whoever reads it, `totals` always present, `[]` 
 and `{"environment": "devcontainer"}` have no `usage`: the commands were not measured, which is not zero. A run that never asked for an
 environment has no `sandbox`.
 
+## Images in
+
+A message may carry pictures as standard A2A file parts. **Off by default**: with no `MODEL_INPUT_MODALITIES=text,image` a model gets one line of text in an image's place and the task goes on ([environment](environment.md), [what the model is told](errors.md#an-image-the-model-is-not-sent)). Nothing here is specific to a client.
+
+| Part | Becomes |
+|---|---|
+| `raw` whose bytes are a PNG, JPEG, GIF or WebP (sniffed, whatever `mediaType` says) | an entry of the inbound payload's `images` (`{name, mediaType, data}`, base64); at most 4 images and 2 MiB a message (`MAX_INBOUND_IMAGES`, `MAX_INBOUND_IMAGE_BYTES`: the inbox is in the run's durable state until the message is read) |
+| the same, past either bound | the line `[image not shown: shot.png (image/png, 3.0 MiB) is over what one message may carry (4 images and 2 MiB)]` in the text |
+| any other `raw` part (a PDF; an SVG is text) | the line `[attached: report.pdf (application/pdf, 84.0 KiB); only images are read]` |
+| a `url` part | the line `[linked: <url>]`: **a link is never fetched** |
+
+A message that is only a picture is accepted. A file name and a media type are untrusted: they are cut to letters, digits and `._-() ` and to a `type/subtype` before any line quotes them.
+
+```mermaid
+sequenceDiagram
+    participant P as Person
+    participant F as default_inbound and vymalo_inbound
+    participant S as Store inbox
+    participant L as LlmAgent step
+    participant K as KeptImages or Conversation images
+    participant M as ModelClient
+    P->>F: message with text and raw parts
+    F->>S: deliver text and images
+    L->>S: take_inbox
+    L->>L: admit_images, a journaled step image per message
+    L->>K: keep scope sha256 bytes
+    Note over L: the step records only ImageRefs and stand-in lines
+    L->>L: absorb_inbox, a user message of text and image refs
+    L->>K: model_turn loads the bytes of the history images
+    L->>M: complete with request image_data
+    M-->>L: answer
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Offered
+    Offered --> StandIn: model cannot see, source, type, size, side, count
+    Offered --> Admitted: the gate says yes
+    Admitted --> Kept: keep (store or state)
+    Kept --> Sent: every request names it
+    Sent --> Removed: shortening of an old tool result
+    Sent --> Summarised: compaction drops its turn
+    StandIn --> [*]
+    Removed --> [*]
+    Summarised --> [*]
+```
+
+* **Admitted once, recorded.** The decision is a journaled step per message (`image:start` for the start message, `image:<message id>` for a later one) and lives in the history as an `ImageRef` (SHA-256, type, size, dimensions, origin), so a replay, another worker and every later turn send the same images and each request's prompt starts with the one before it. A message with no picture is read as it always was.
+* **The size is read from the header** (`adam_runtime::image_size`: PNG, JPEG, GIF, WebP; a hand-written reader with bounded loops). An image is never decoded or resized.
+* **Where the bytes are.** Never in the history or the journal. The coder keeps them on its volume per conversation ([`coder-agent.md`](coder-agent.md#images)); an agent that is only a folder keeps them in the run's state, base64, within the 4 MiB it shares with kept outputs, and its tool steps journal the bytes of a kept image as they journal a kept output.
+* **An answer to a question** (`ask_user`) may carry pictures: they are the images of the tool result.
+* **On the wire** an image is a `data:` URL part of a user message (`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`, no `detail`); a message with no picture is still a string. A tool's pictures follow the run of tool messages in one user message, `Images from tool results: <call id> <name>; ...`. Both shapes are *unverified* on every provider ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)).
+
+Code: `crates/adam-a2a-runtime/src/files_in.rs`, `crates/adam-llm-agent/src/images.rs`, `crates/adam-model-openai/src/wire.rs`.
+
 ## Streamed text
 
 A model turn streams by default (`LlmAgentBuilder::stream_text`): the journaled step `model:<turn>` calls

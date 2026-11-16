@@ -2062,6 +2062,11 @@ crash after it was posted and before the call was journaled posts it again when 
   (`ModelError::RateLimited` -> `AgentError::Transient` with a `retry_after`):
   the retry waits at least that long, whatever the backoff says.
 
+## Images
+
+With `MODEL_INPUT_MODALITIES=text,image` (off by default) `read_file` of a PNG, JPEG, GIF or WebP answers `` `shot.png` is an image (image/png, 120.0 KiB, 800×600), shown to you after this result `` and the picture follows in the history; an SVG is text and a file that is not one of the four is read as before. An image over a limit, or a source (`workspace`) the deployment does not send, is a line (or the binary notice) and never an error. The bytes are `<WORKSPACE_ROOT>/images/<scope>/<sha256>.<ext>` per conversation (`FileImages`, `src/images.rs`: private, no link followed, 64 MiB a scope, **the hash checked when a file is read back**: a rewritten file is a line, not an image), never in the journal or the state; the janitor removes a conversation's images when its scratch projects go (`SCRATCH_IDLE_DAYS`). **An image is not scrubbed** ([Secrets](../../docs/reference/coder-agent.md#secrets)). Tests: `read_file_of_a_png_is_an_image_for_a_seeing_model`, `a_rewritten_image_file_is_refused_by_its_hash`, `file_images_conformance`, `images_go_with_an_idle_conversation`.
+
+## Configuration
 ## Configuration
 
 Environment variables (`src/config.rs` is the reference for the coder's own, and

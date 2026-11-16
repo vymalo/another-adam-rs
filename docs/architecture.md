@@ -1211,6 +1211,14 @@ stateDiagram-v2
     Kept --> [*]: the janitor removes it with the run
 ```
 
+The **images** a model sees are kept the same way, apart from the text: the history holds an `ImageRef` (SHA-256,
+type, size, dimensions, origin) and never a byte, and the journal holds the reference too. The bytes are on the coder's
+volume, `<root>/images/<scope>/<sha256>.<ext>`, per conversation, with the hash checked when they are read back; an agent
+that is only a folder keeps them in the run's state (base64, within the 4 MiB it shares with kept outputs). Whether they
+are sent at all is the deployment's word (`MODEL_INPUT_MODALITIES`), recorded once for each image as it enters the
+history, so the prompt a request starts with only grows. See [Images in](reference/a2a-server.md#images-in) and
+[the coder](reference/coder-agent.md#images).
+
 A **command that keeps running** (`start_command`, a development server) writes into the same file as it prints, line by line,
 after the secrets are scrubbed, and has a record `<id>.cmd` beside it. The coder holds the process (the worker that started it is its
 owner and writes a beat into the record at every sweep); the other workers see it through the record, and stop it by writing a stop

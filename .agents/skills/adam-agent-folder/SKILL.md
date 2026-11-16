@@ -87,6 +87,12 @@ before you rely on a detail here.
      At most 4 MiB a file, 6 MiB a run; a subagent's
      files stay on its own run. Without the key a file is described and dropped. Rules:
      `crates/adam-mcp/README.md` ("Files"), `docs/decisions/0033-files-from-mcp-results-are-shared-files.md`.
+   * Pictures for the model are the **deployment's** word, not a key of `mcp.json`: with
+     `MODEL_INPUT_MODALITIES=text,image` and `mcp` in `MODEL_IMAGE_SOURCES` (default `person,workspace`: a server's
+     call can carry credentials, and an image is never scrubbed) an image block of a result is also offered to the
+     model, within `MODEL_IMAGE_MAX_BYTES`, `_COUNT` and `_SIDE`; with `files: true` it is shared too, with the same
+     SHA-256. Otherwise it is `[image not included: image/png]`. An agent folder keeps the bytes in the run's state
+     (4 MiB with its long outputs). `docs/reference/agent-files.md` ("Pictures for the model").
    * `"timeoutSecs"` and `"connectTimeoutSecs"` on a server (whole seconds from 1; 60 and 30 without them) are its
      own call and connection timeouts; the deployment caps the effective value, defaults included, with
      `MCP_MAX_CALL_SECS` (900), so a larger one is lowered with a warning, and `0` or a negative number refuses

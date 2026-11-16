@@ -879,6 +879,16 @@ stores and shows it as it does a shared file ([ADR 0033](../decisions/0033-files
 
 The sequence and the states are in [`adam-mcp`](../../crates/adam-mcp/README.md#files-files-true).
 
+### Pictures for the model (`mcp` in `MODEL_IMAGE_SOURCES`)
+
+An image block of a result is **not** put in front of the model unless the deployment says so: `MODEL_INPUT_MODALITIES=text,image` (the model sees) **and** `mcp` in `MODEL_IMAGE_SOURCES` (default `person,workspace`: an MCP server's call can carry credentials that were expanded into it, and an image is not scrubbed). A server entry has no key for it; the deployment decides, for every server. When it does:
+
+* each image block is admitted by the run's limits (`MODEL_IMAGE_MAX_*`) and rides on the tool result; the result's text says `[image shown to you after this result: paint-1.png (image/png, 84.0 KiB, 800×600)]`, or why it is not (`[image not shown: ...]`);
+* with `files: true` it is **also** shared as a file, as above: the two lines name the same SHA-256, and the run keeps the bytes once, by that hash;
+* with neither, the text is what it always was, `[image not included: image/png]`.
+
+An image a tool returns is shown to a model **after** the run of tool results, in one user message ([wire](a2a-server.md#images-in)); a shortening of the history takes the images of an old result out, as a line, and a compaction summarises them away with their turn.
+
 *Verified 2026-09-29* (<https://docs.rs/rmcp/3.5.0>): `rmcp` 3.5.0 is Apache-2.0 with `rust-version` 1.88; its
 SSE transport was removed in 0.11.0 and the specification calls HTTP+SSE deprecated
 (<https://modelcontextprotocol.io/specification/2025-03-26/basic/transports>).

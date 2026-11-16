@@ -67,6 +67,21 @@ implementation has to change.
 The persisted JSON shapes of `Message` are shown in the crate docs
 (`src/lib.rs`) and are meant to stay stable.
 
+## Images
+
+A message names an image by reference and never holds its bytes (ADR 0044 slice 15a).
+
+| Item | What |
+|---|---|
+| `ContentPart::Image(ImageRef)` | an image in a user or assistant message. `ImageRef { sha256, media_type, bytes, width, height, name?, origin }`; `ContentPart::as_text` of one is `""` |
+| `ImageOrigin` | `Person`, `Workspace`, `Mcp`: **closed** on purpose, so a new origin fails to compile wherever a deployment's allowed sources are checked |
+| `Message::Tool { images }` | the images a tool returned (default empty, not serialized while empty: a history with no image is the same bytes as before, and an older journal decodes). `Message::images()`, `tool_result_with_images`, `user_with_images` |
+| `ModelRequest::image_data` (`ImageData`) | the bytes of the images `messages` name, by SHA-256, **never serialized**: the agent loop fills it inside the step that calls the model. `Debug` says how many, never the bytes. A reference with no entry is sent as `ImageRef::missing_line()` |
+| `ModelClient::input_modalities(model) -> InputModalities` | what the deployment declared the model of that alias can read: text only by default, never guessed from a name (`InputModalities::images: Option<ImageLimits { max_bytes, max_count, max_side, sources }>`, `#[non_exhaustive]`). `Arc<T>` forwards it. `MockModel::seeing_images(limits)` |
+
+**Breaking** for code that builds or matches these types: `ContentPart` gains a variant, `Message::Tool` a field and `ModelRequest` a field (`..Default::default()` or `..` fixes a literal or a pattern); `ModelClient` gains a provided method, so no implementer breaks.
+
+## Errors
 ## Errors
 
 `ModelError` implements `Classify`; the runtime decides from the class (see

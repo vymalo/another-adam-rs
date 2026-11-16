@@ -865,6 +865,23 @@ request that is not a summary request; a summary request (`tool_choice: none`, i
 the recorded shortenings and the recorded compactions; every request after a compaction extends the first one
 after it.
 
+## Images in (ADR 0044 slice 15a)
+
+An image the person sends, or one a tool returns, reaches a model the deployment declares can see (`ModelClient::input_modalities`, for the alias `MODEL` only); any other model is given one line of text, and a request never fails because of an image. **Off by default.** The picture, with the states, is in [the A2A server](../../docs/reference/a2a-server.md#images-in).
+
+| Item | What |
+|---|---|
+| `ImageGate::check` | the admission, in order: the capability, the source (`person`, `workspace`, `mcp`), the type by its bytes (an SVG is text), the size, the dimensions from the header (`adam_runtime::image_size`), the count of images the history holds. Pure; `took` counts one that was admitted and kept. A stand-in is a line, never an error ([the lines](../../docs/reference/errors.md#an-image-the-model-is-not-sent)) |
+| `keep_image(ctx, bytes, claimed, name, origin) -> ImageOutcome` | what a tool calls, like `keep_long`: admit, keep, and say what the model is shown. `ToolOutput::with_image(outcome)` adds it; `ToolCtx::sees_images()` and `sees_images_from(origin)` tell a tool whether to bother; `ToolCtx::with_image_limits` makes a seeing context for a test. `ToolOutput` gains `images` and `kept_images` |
+| `KeptImages`, `ImageStore`, `kept_images_conformance` | where the bytes live when the agent has a store in its state (the coder's volume): `keep(scope, sha256, media_type, bytes)`, `load(scope, sha256)`, the hash checked again on load. `MemoryImages` passes it. `image_scope(conversation, root_run)` is the 32-hex scope |
+| `Conversation::images`, `pending_images` | with **no** store the bytes are in the run's state, base64, counted with `kept_outputs` against `MAX_RUN_KEPT_BYTES` (a tool's step journals them as it journals a kept output), and pruned when no message names them; `pending_images` holds the start message's until the first step admits them. Neither is written while empty |
+| `user_message_with_images`, `InboundImage`, `IMAGES_KEY` | an inbound message with pictures: payload `{"text", "images": [{name, mediaType, data}]}`, at most `MAX_INBOUND_IMAGES` and `MAX_INBOUND_IMAGE_BYTES`. A message that is only a picture is a message |
+
+* **Once, recorded.** The first step admits the start message's pictures and each later message's in a journaled step (`image:start`, `image:<message id>`) that records the decisions and no byte; the answer to a question gives the tool result its images. The same bytes are sent by every later request; a text-only conversation serializes byte for byte as before.
+* **The history.** An image counts 4,000 characters (about 1,000 tokens, *unverified*). A shortening that touches an old tool result also replaces its images by `[image removed from the history: shot.png; read it again to see it]`, once, recorded with the turn; the person's are never shortened. A compaction summarises the images of the turns it drops away with them (the summary request is the request before it, bytes included, so the cache serves it; a prompt rejected as too long is summarised with each image said in words); the task's own pictures stay with the first message, after the marker; the turns that stay keep theirs.
+* **Rule 3.** `ImageOrigin` is closed. **Breaking:** `ToolOutput`, `Conversation` and `Message::Tool` gain fields (`ToolOutput::text` and `Conversation::default()` still build).
+
+## Compaction (ADR 0044 slice 9)
 ## Compaction (ADR 0044 slice 9)
 
 A history that reaches its budget is summarised once, at a journaled step `compact:<n>:<turn>`, and a prompt the

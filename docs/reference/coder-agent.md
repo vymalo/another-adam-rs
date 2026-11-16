@@ -451,8 +451,16 @@ which updates the same pull request. Details: [coder README](../../bin/adam-code
 
 Conversation, journal and run state are in Postgres. Under `WORKSPACE_ROOT` (default `/work`) are files: the
 shared git mirrors (`<root>/git/`), the workspaces of runs (`<root>/workspaces/<run>/<slot>`) and the per-run
-notes (`<root>/coder/<run>.json`: failures counted, last checks, pushed branches, grants) and the **kept output** of long commands and MCP results (`<root>/outputs/<run>/<id>.txt`: scrubbed of the process's secrets, read with `read_output`, removed with the run). **Git is the durable
+notes (`<root>/coder/<run>.json`: failures counted, last checks, pushed branches, grants), the **kept output** of long commands and MCP results (`<root>/outputs/<run>/<id>.txt`: scrubbed of the process's secrets, read with `read_output`, removed with the run) and the **images** the model sees (`<root>/images/<scope>/<sha256>.<ext>`, per conversation, [below](#images)). **Git is the durable
 artifact**: a lost database loses the run ledger, not the pushed branches or the pull requests.
+
+## Images
+
+With `MODEL_INPUT_MODALITIES=text,image` (off by default, [environment](environment.md)) the coder's model is sent the pictures a person attaches and the ones `read_file` finds.
+
+* **`read_file` of a PNG, JPEG, GIF or WebP** answers `` `shot.png` is an image (image/png, 120.0 KiB, 800×600), shown to you after this result `` and the image follows in the history. A file whose first bytes are not one of those four is read as before (a binary file is "not shown"; an SVG is text and is read). The same holds for a file of a reference slot: it is a read like any other, with the source `workspace`. For a model that cannot see, or a deployment that does not send the source `workspace` (`MODEL_IMAGE_SOURCES`), a PNG is the binary file it always was. An image over a limit is a line in the result, never an error ([the lines](errors.md#an-image-the-model-is-not-sent)).
+* **The bytes are on the volume**, not in the journal or the state: `<WORKSPACE_ROOT>/images/<scope>/<sha256>.<ext>` (`bin/adam-coder/src/images.rs`, `FileImages`). The scope is 32 hex digits of a SHA-256 of the conversation's id (of the root run's id with none), so a later task of the conversation still sees the first screenshot. Directories `0700`, files `0600` made with `O_EXCL`, no link followed, at most 64 MiB a scope and 4 MiB an image. **The hash is checked when a file is read back**: a command of the local environment runs as the same user and can rewrite a file, and a changed file is never sent (the model is given the line "could not be loaded" instead).
+* **The janitor** removes a scope when the conversation has had no task for as long as it keeps scratch projects (`SCRATCH_IDLE_DAYS`, 7 by default; `0` removes it with the finished run). A scope a crash left behind goes with the next finished run of its conversation.
 
 ## Secrets
 
@@ -464,6 +472,7 @@ artifact**: a lost database loses the run ledger, not the pushed branches or the
 | The model key | in no run environment: a devcontainer gets no key file and a run pod no `MODEL_API_KEY` ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)); a command never sees it. A variable an `mcp.json` names, `MODEL_API_KEY` included, is hidden from every command and redacted |
 | Commands | `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the environment of a command |
 | Everything | a `Redactor` scrubs the process's own secrets from every tool result, event and failure text |
+| Images | **an image is not scrubbed**: the `Redactor` reads text, and what is in a picture it cannot read. An image reaches the model only from a source the deployment allows (`MODEL_IMAGE_SOURCES`, `person,workspace` by default). A command cannot see the coder's secrets (the table above), so a picture in a repository holds one only if a command could already have read it, and such a command could already have got it past the scrubber in an encoded text. An MCP server's picture is off by default because a server's call can carry credentials that were expanded into it. The person's pictures are the person's own. The coder's `read_file` never scrubs the bytes it offers |
 
 ## Limits and cancel
 

@@ -46,6 +46,12 @@ orchestrator's side, and exists on its main once that change merges).
 The URIs are `https://agents.vymalo.com/a2a/extensions/<name>/v1` (A2UI has its own URI);
 read the exact strings in the file at your rev.
 
+**Pictures are not an extension.** A message may carry a picture as a standard A2A `raw` part (a PNG, JPEG, GIF
+or WebP, at most 4 and 2 MiB a message; any other file or a `url` part is one line of the text, and a link is
+never fetched). Whether the model is sent it is the deployment's word (`MODEL_INPUT_MODALITIES=text,image`, off
+by default); otherwise it is a line of text. `docs/reference/a2a-server.md` ("Images in") at the pinned revision,
+`https://github.com/vymalo/another-adam-rs/blob/main/docs/reference/a2a-server.md`.
+
 1. **Activation (client side).** Name the extension URIs you want in the `A2A-Extensions`
    request header (comma-separated) and, in a message you send, in `message.extensions`
    (`crates/adam-a2a/README.md`, "Extensions a request activates"). The handler activates only the
