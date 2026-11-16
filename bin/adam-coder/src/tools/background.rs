@@ -1033,6 +1033,47 @@ async fn ask_stop(kept: &FileKept, run: &str, id: &str, why: &str) -> bool {
     true
 }
 
+/// What a worker runs beside the janitor to stop commands whose run is over: [`Commands::sweep_loop`]
+/// at the deployment's interval (`BACKGROUND_SWEEP_SECS`), over the registry the tools hold.
+#[derive(Debug, Clone)]
+pub struct CommandsSweep {
+    commands: Commands,
+    every: Duration,
+}
+
+impl CommandsSweep {
+    /// The sweep of `commands`, every `every`.
+    pub fn new(commands: &Commands, every: Duration) -> Self {
+        Self {
+            commands: commands.clone(),
+            every,
+        }
+    }
+
+    /// How often it looks.
+    pub fn every(&self) -> Duration {
+        self.every
+    }
+
+    /// The registry it sweeps.
+    pub fn commands(&self) -> &Commands {
+        &self.commands
+    }
+
+    /// Sweep until `stop` fires, and then stop what this worker holds.
+    ///
+    /// # Errors
+    ///
+    /// Never; the type is the component's.
+    pub async fn run(
+        self,
+        store: DynStore,
+        stop: CancellationToken,
+    ) -> Result<(), adam_error::BoxError> {
+        self.commands.sweep_loop(store, stop, self.every).await
+    }
+}
+
 async fn wait_all_ended(commands: &[Arc<Command>], limit: Duration) {
     let deadline = Instant::now() + limit;
     while commands.iter().any(|c| c.running()) && Instant::now() < deadline {
@@ -1754,10 +1795,16 @@ async fn stop_elsewhere(env: &ToolEnv, ctx: &ToolCtx, run: &str, id: &str) -> Ou
         let exec = ExecId::new(record.exec.clone());
         let _ = tokio::time::timeout(kill_wait, session.kill(&exec)).await;
     }
-    let asked = ask_stop(&env.kept, run, id, "stop_command").await;
-    let wait = (env.settings.background_sweep + Duration::from_secs(2)).min(END_WAIT);
+    if !ask_stop(&env.kept, run, id, "stop_command").await {
+        // It ended while the request was written.
+        return Ok(ToolOutput::text(read_record(env, run, id).map_or_else(
+            || format!("no command `{id}` was started in this run\n"),
+            |now| record_view(&now, id),
+        )));
+    }
+    let wait = (env.settings.background_sweep + Duration::from_secs(1)).min(END_WAIT);
     let deadline = Instant::now() + wait;
-    while asked {
+    loop {
         match read_record(env, run, id) {
             Some(now) if now.state.is_running() => {}
             Some(now) => return Ok(ToolOutput::text(record_view(&now, id))),
@@ -1772,10 +1819,6 @@ async fn stop_elsewhere(env: &ToolEnv, ctx: &ToolCtx, run: &str, id: &str) -> Ou
         tokio::time::sleep(POLL).await;
         // The owner's beat can write the record in the instant of the request: asked again.
         let _ = ask_stop(&env.kept, run, id, "stop_command").await;
-    }
-    if !asked && let Some(now) = read_record(env, run, id) {
-        // It ended while the request was written.
-        return Ok(ToolOutput::text(record_view(&now, id)));
     }
     Ok(ToolOutput::text(format!(
         "$ {}\nstop asked: `{id}` runs on another worker, which stops it at its next sweep (within \

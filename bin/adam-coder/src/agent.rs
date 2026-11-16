@@ -1234,6 +1234,25 @@ fn expect_assembled(assembled: Result<CoderAgent, Box<AssemblyError>>) -> CoderA
     assembled.expect("the coder's embedded agent must assemble")
 }
 
+/// Why the commands that keep running of a run end with this step, when they do: the root run is
+/// over (done or failed), or a run of the tree parks on a question to the person, who may take a
+/// while. The end of a child run ends nothing, and a park on anything else (a subagent, a task on
+/// another system, a timer) leaves them running.
+fn commands_end_with(transition: &Transition<Conversation>, child: bool) -> Option<&'static str> {
+    match transition {
+        Transition::Done { .. } | Transition::Fail { .. } if !child => Some("the run ended"),
+        Transition::Park { state, .. }
+            if matches!(
+                state.pending_wait,
+                Some(adam_llm_agent::PendingWait::Question(_))
+            ) =>
+        {
+            Some("the run waits for the person's answer")
+        }
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl Agent for CoderAgent {
     type State = Conversation;
@@ -1277,20 +1296,7 @@ impl Agent for CoderAgent {
         // (a cancel never calls this, and the sweep of `BACKGROUND_SWEEP_SECS` reaches those), and
         // when the run parks on the person, who may take a while: a server nobody can use is not
         // kept for days.
-        // The end of a child run ends nothing; a park of any run of the tree on a question to the
-        // person stops the root's commands.
-        let stop = match &transition {
-            Transition::Done { .. } | Transition::Fail { .. } if !child => Some("the run ended"),
-            Transition::Park { state, .. }
-                if matches!(
-                    state.pending_wait,
-                    Some(adam_llm_agent::PendingWait::Question(_))
-                ) =>
-            {
-                Some("the run waits for the person's answer")
-            }
-            _ => None,
-        };
+        let stop = commands_end_with(&transition, child);
         if let Some(why) = stop {
             let root = root.to_string();
             // At once on this worker, and a stop request in the record of what another worker holds:
@@ -1475,6 +1481,82 @@ mod tier_tests {
         assert_eq!(tier::in_context(&edits.context), AccessTier::Edits);
         // The earlier task's state is not touched.
         assert_eq!(tier::in_context(&prior.context), AccessTier::Plan);
+    }
+}
+
+#[cfg(test)]
+mod commands_tests {
+    //! When the commands that keep running of a run end with a step.
+
+    use adam_llm_agent::{PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait};
+
+    use super::*;
+
+    fn parked(wait: Option<PendingWait>) -> Transition<Conversation> {
+        Transition::Park {
+            state: Conversation {
+                pending_wait: wait,
+                ..Conversation::default()
+            },
+            wake_at: None,
+        }
+    }
+
+    #[test]
+    fn a_question_to_the_person_and_the_end_of_the_root_run_stop_them_and_nothing_else_does() {
+        let question = || {
+            PendingWait::Question(PendingQuestion {
+                call_id: "c".into(),
+                tool: "ask_user".into(),
+                question: "go on?".into(),
+                ui: None,
+                stream: None,
+            })
+        };
+        assert_eq!(
+            commands_end_with(&parked(Some(question())), false),
+            Some("the run waits for the person's answer")
+        );
+        // A child run that asks the person parks the root's commands too.
+        assert!(commands_end_with(&parked(Some(question())), true).is_some());
+        for wait in [
+            PendingWait::Run(PendingRun {
+                call_id: "c".into(),
+                tool: "explorer".into(),
+                run: adam_core::RunId::new(),
+            }),
+            PendingWait::Remote(PendingRemote {
+                call_id: "c".into(),
+                tool: "ask_agent".into(),
+                task: "t".into(),
+                deadline: None,
+            }),
+            PendingWait::Session(PendingSession {
+                call_id: "c".into(),
+                tool: "subagent_read".into(),
+                session: adam_core::RunId::new(),
+            }),
+        ] {
+            assert_eq!(commands_end_with(&parked(Some(wait)), false), None);
+        }
+        assert_eq!(commands_end_with(&parked(None), false), None, "a timer");
+        let done = || Transition::Done {
+            state: Conversation::default(),
+            output: json!({}),
+        };
+        let failed = || Transition::Fail {
+            state: Conversation::default(),
+            error: "no".into(),
+        };
+        assert_eq!(commands_end_with(&done(), false), Some("the run ended"));
+        assert_eq!(commands_end_with(&failed(), false), Some("the run ended"));
+        // The end of a child run ends nothing: the root goes on.
+        assert_eq!(commands_end_with(&done(), true), None);
+        assert_eq!(commands_end_with(&failed(), true), None);
+        assert_eq!(
+            commands_end_with(&Transition::Continue(Conversation::default()), false),
+            None
+        );
     }
 }
 

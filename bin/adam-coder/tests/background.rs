@@ -20,7 +20,7 @@ use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::{AGENT_NAME, CoderAgent, CoderSettings, Redactor, ToolEnv};
 use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus};
 use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput};
-use adam_model::{DynModel, MockModel, ModelRequest};
+use adam_model::{DynModel, MockModel, ModelError, ModelRequest};
 use adam_runtime::{CollectingSink, Inbound, Runtime};
 use common::{FakeEnvironment, Fixture, MODEL_KEY, call};
 use serde_json::{Value, json};
@@ -936,15 +936,38 @@ async fn a_worktree_that_cannot_be_read_at_the_end_says_nothing_about_git() {
 
 #[tokio::test]
 async fn a_command_is_never_started_in_a_reference() {
-    let rig = Rig::new().await;
-    // A reference is a slot the run may not write: its name is refused before anything is started.
+    use adam::agent_fs::ReferenceDef;
+    use adam_coder::tools::files::ReadFile;
+    let fx = Fixture::new().await;
+    let design = fx.extra_remote("design", &[("tokens.css", "--blue: #00f;\n")]);
+    let url = design.to_string_lossy().into_owned();
+    let fx = fx.referencing(vec![ReferenceDef {
+        name: "design".into(),
+        url,
+        branch: None,
+        description: "Tokens".into(),
+    }]);
+    let rig = Rig::from(fx).await;
+    // The first read makes the reference a slot of the run.
+    let read = ReadFile
+        .call(
+            &rig.call_ctx("read-1"),
+            json!({"path": "tokens.css", "repo": "design"}),
+        )
+        .await
+        .unwrap();
+    assert!(!read.is_error, "{}", read.content);
+    assert!(rig.worktree().parent().unwrap().join("design").is_dir());
+    let marker = rig.worktree().parent().unwrap().join("design/started.txt");
     let out = rig
         .start(
             "start-1",
-            json!({"command": "sleep 600", "repo": "no-such-slot"}),
+            json!({"command": "echo started > started.txt; sleep 647", "repo": "design", "wait": 1}),
         )
         .await;
     assert!(out.is_error, "{}", out.content);
+    assert!(out.content.contains("is a reference"), "{}", out.content);
+    assert!(!marker.exists(), "nothing was started in the reference");
     assert!(rig.states().is_empty());
 }
 
@@ -969,10 +992,15 @@ struct Driven {
 
 impl Driven {
     fn new(fx: &Fixture, script: impl FnOnce(&MockModel)) -> Self {
+        Self::with_env(fx.env.clone(), script)
+    }
+
+    /// The run is stepped by the worker whose tools are `env`.
+    fn with_env(env: Arc<ToolEnv>, script: impl FnOnce(&MockModel)) -> Self {
         let mock = Arc::new(MockModel::new());
         script(&mock);
         let model: DynModel = mock.clone();
-        let agent = CoderAgent::new(model, "test-model", fx.env.clone());
+        let agent = CoderAgent::new(model, "test-model", env);
         let store: DynStore = Arc::new(MemoryStore::new());
         let rt = Runtime::builder(store.clone())
             .agent(agent)
@@ -1064,17 +1092,10 @@ async fn a_finished_root_run_stops_its_commands() {
     });
     let run = driven.start(&format!("look at {url}")).await;
     let status = driven.settle(run).await;
-    assert!(
-        matches!(status, RunStatus::Done | RunStatus::Parked),
-        "{status:?}"
-    );
+    assert_eq!(status, RunStatus::Done);
     // At once, in the agent's step: nothing waited for the sweep.
     let why = stopped_why(&fx, run);
-    assert_eq!(why.len(), 1, "{why:?}");
-    assert!(
-        why[0] == "the run ended" || why[0].contains("waits for the person"),
-        "{why:?}"
-    );
+    assert_eq!(why, ["the run ended"], "{status:?}");
     assert_eq!(fx.env.commands.running_count(&run.to_string()), 0);
     driven.finish().await;
 }
@@ -1774,4 +1795,450 @@ async fn two_starts_at_once_at_one_below_the_maximum_take_one_place() {
     for call in ["a", "b", "c"] {
         rig.stop(&rig.id_of(call)).await;
     }
+}
+
+// ------------------------------------------------------- the run ends or parks on another worker
+
+/// The commands another worker holds are asked to stop by the worker that steps the run, and their
+/// owner's sweep does it.
+#[tokio::test]
+async fn a_park_stepped_by_another_worker_stops_the_command_within_a_sweep() {
+    let fx = Fixture::with(short_sweep).await;
+    let url = fx.remote_url();
+    let stepping = another_env(&fx);
+    let driven = Driven::with_env(stepping.clone(), |m| {
+        m.push_tool_calls(vec![call(
+            "c1",
+            "prepare_workspace",
+            json!({"repo_url": url, "base_branch": "main"}),
+        )]);
+        // The owner of the command starts it while this call runs.
+        m.push_tool_calls(vec![call(
+            "c2",
+            "run_command",
+            json!({"command": "sleep 3"}),
+        )]);
+        m.push_tool_calls(vec![call(
+            "c3",
+            "ask_user",
+            json!({"question": "Shall I go on?"}),
+        )]);
+    });
+    let run = driven.start(&format!("look at {url}")).await;
+    let run_id = run.to_string();
+    until("the workspace", || {
+        common::slot_dir(&fx.root, &run_id).join(".git").exists()
+    })
+    .await;
+    let sweeping = Sweeping::of(&fx.env, &driven.store, Duration::from_millis(200));
+    let ctx = ToolCtx::detached("tool", "a1", Arc::new(CollectingSink::new()))
+        .with_state(fx.env.clone())
+        .with_state(Arc::new(KeptStore(fx.env.kept.clone())))
+        .with_root_run(run);
+    let started = StartCommand
+        .call(&ctx, json!({"command": TREE, "wait_for": "up", "wait": 20}))
+        .await
+        .unwrap();
+    assert!(!started.is_error, "{}", started.content);
+    let id = adam_llm_agent::output_id_of(&ctx);
+    let leader = {
+        let bytes = fx.env.kept.get_record(&run_id, &id).unwrap().unwrap();
+        let record: Value = serde_json::from_slice(&bytes).unwrap();
+        u32::try_from(record["pid"].as_u64().unwrap()).unwrap()
+    };
+    until("the tree", || group_members(leader).len() >= 3).await;
+    let tree = group_members(leader);
+
+    assert_eq!(driven.settle(run).await, RunStatus::Parked);
+    until_gone("the tree", &tree).await;
+    until("it to be settled", || stopped_why(&fx, run).len() == 1).await;
+    assert_eq!(
+        stopped_why(&fx, run),
+        ["the run waits for the person's answer"]
+    );
+    assert!(
+        stepping.commands.states(&run_id).is_empty(),
+        "the worker that stepped the run held nothing"
+    );
+    sweeping.finish().await;
+    driven.finish().await;
+}
+
+/// A run that fails ends its commands too.
+#[tokio::test]
+async fn a_root_run_that_fails_stops_its_commands_in_the_step() {
+    let fx = Fixture::new().await;
+    let url = fx.remote_url();
+    let driven = Driven::new(&fx, |m| {
+        m.push_tool_calls(vec![call(
+            "c1",
+            "prepare_workspace",
+            json!({"repo_url": url, "base_branch": "main"}),
+        )]);
+        m.push_tool_calls(vec![call(
+            "c2",
+            "start_command",
+            json!({"command": "echo up; sleep 648", "wait_for": "up", "wait": 20}),
+        )]);
+        m.push_error(ModelError::invalid_request(
+            "the provider refuses the request",
+        ));
+    });
+    let run = driven.start(&format!("look at {url}")).await;
+    assert_eq!(driven.settle(run).await, RunStatus::Failed);
+    assert_eq!(stopped_why(&fx, run), ["the run ended"]);
+    assert_eq!(fx.env.commands.running_count(&run.to_string()), 0);
+    driven.finish().await;
+}
+
+// ------------------------------------------------------------------------------ the output budget
+
+/// The run's own budget is kept while a command streams.
+#[tokio::test]
+async fn output_that_streams_past_the_runs_budget_stops_with_the_line_that_says_so() {
+    let rig = Rig::with(|s| s.run_kept_max = 64 * 1024).await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": "seq 1 100000; echo end; sleep 650", "wait_for": "end", "wait": 30}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    rig.stop(&id).await;
+    let size = std::fs::metadata(rig.file_of(&id)).unwrap().len();
+    assert!(
+        (60 * 1024..=80 * 1024).contains(&size),
+        "the file stops at the run's budget, to within one read: {size}"
+    );
+    let page = rig.read(&id, -3).await;
+    assert!(
+        page.contains("(output cut: a run keeps at most 64 KiB of output)"),
+        "{page}"
+    );
+}
+
+/// A run with no room left refuses the next command before anything is spawned.
+#[tokio::test]
+async fn a_start_in_a_run_with_no_room_left_is_refused_before_anything_is_spawned() {
+    let rig = Rig::with(|s| s.run_kept_max = 64 * 1024).await;
+    let first = rig
+        .start(
+            "a",
+            json!({"command": "seq 1 11000; echo end; sleep 651", "wait_for": "end", "wait": 30}),
+        )
+        .await;
+    assert!(!first.is_error, "{}", first.content);
+    let marker = rig.worktree().join("spawned.txt");
+    let refused = rig
+        .start(
+            "b",
+            json!({"command": "echo spawned > spawned.txt; sleep 652", "wait": 1}),
+        )
+        .await;
+    assert!(
+        refused.is_error && refused.content.contains("Nothing was started"),
+        "{}",
+        refused.content
+    );
+    assert!(!marker.exists(), "no process was spawned");
+    assert_eq!(rig.fx.env.commands.running_count(&rig.run()), 1);
+    rig.stop(&rig.id_of("a")).await;
+}
+
+// ------------------------------------------------------------------------------------- the rest
+
+#[tokio::test]
+async fn what_a_command_writes_to_stderr_is_kept_too() {
+    let rig = Rig::new().await;
+    let out = rig
+        .start(
+            "start-1",
+            json!({"command": "echo to-stdout; echo to-stderr >&2; sleep 653", "wait_for": "to-stderr", "wait": 20}),
+        )
+        .await;
+    assert!(out.content.contains("to-stderr"), "{}", out.content);
+    let id = rig.id_of("start-1");
+    let page = rig.read(&id, 1).await;
+    assert!(
+        page.contains("to-stdout") && page.contains("to-stderr"),
+        "{page}"
+    );
+    rig.stop(&id).await;
+}
+
+/// A start whose future is dropped while it tells about it reserves nothing.
+#[tokio::test]
+async fn a_start_that_is_dropped_before_it_has_a_supervisor_leaves_nothing_behind() {
+    struct Blocking(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl adam_runtime::EventSink for Blocking {
+        async fn emit(&self, _run: RunId, _agent: &str, _event: adam_runtime::RunEvent) {
+            self.0.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+    let rig = Rig::with(|s| s.background_commands_max = 1).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let ctx = ToolCtx::detached("tool", "blocked", Arc::new(Blocking(entered.clone())))
+        .with_state(rig.fx.env.clone())
+        .with_state(Arc::new(KeptStore(rig.fx.env.kept.clone())))
+        .with_root_run(rig.ctx.run_id());
+    let id = adam_llm_agent::output_id_of(&ctx);
+    {
+        let call = StartCommand.call(&ctx, json!({"command": "sleep 654", "wait": 1}));
+        tokio::select! {
+            _ = call => panic!("the call cannot finish"),
+            () = entered.notified() => {}
+        }
+        // The future is dropped here, while it is telling about what it starts.
+    }
+    assert!(rig.states().is_empty(), "{:?}", rig.states());
+    assert!(!rig.fx.env.kept.is_live(&rig.run(), &id));
+    // The limit is free.
+    let out = rig
+        .start("next", json!({"command": "sleep 655", "wait": 1}))
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    rig.stop(&rig.id_of("next")).await;
+}
+
+/// The environment is made again by `rebuild_environment`: what runs in it stops, with the reason.
+#[tokio::test]
+async fn rebuilding_the_environment_stops_the_commands_with_the_true_reason() {
+    use adam_coder::tools::environment::RebuildEnvironment;
+    let fake = FakeEnvironment::new(None);
+    let rig = Rig::from(Fixture::new().await.using(fake.clone())).await;
+    let out = rig
+        .start(
+            "start-1",
+            json!({"command": "echo up; sleep 656", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    let id = rig.id_of("start-1");
+    let pid = rig.pid_of(&id);
+    let rebuilt = RebuildEnvironment
+        .call(&rig.call_ctx("rebuild"), json!({}))
+        .await
+        .unwrap();
+    assert!(!rebuilt.is_error, "{}", rebuilt.content);
+    until_gone("the process", &[pid]).await;
+    until("it to be settled", || {
+        rig.states().iter().all(|(_, s)| !s.is_running())
+    })
+    .await;
+    assert!(
+        matches!(
+            &rig.states()[0].1,
+            CommandState::Stopped { why } if why.contains("its environment was made again")
+        ),
+        "{:?}",
+        rig.states()
+    );
+}
+
+/// A command in a pod or a devcontainer that a signal ended and nobody asked: the model is told the
+/// likely reason. In this container the same signal is only a signal.
+#[tokio::test]
+async fn a_signal_nobody_asked_for_says_what_the_likely_reason_is_in_a_pod() {
+    let fake = FakeEnvironment::new(None);
+    let rig = Rig::from(Fixture::new().await.using(fake.clone())).await;
+    let out = rig
+        .start(
+            "start-1",
+            json!({"command": "echo up; sleep 657", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    let id = rig.id_of("start-1");
+    let pid = rig.pid_of(&id);
+    kill(pid);
+    until("it to end", || {
+        rig.states().iter().all(|(_, s)| !s.is_running())
+    })
+    .await;
+    let listed = rig.list().await;
+    assert!(
+        listed.contains(&format!("{id} stopped: its environment was made again (a new repository, a reference or a rebuild)"))
+            && listed.contains("start it again if it is still needed"),
+        "{listed}"
+    );
+
+    let local = Rig::new().await;
+    let out = local
+        .start(
+            "start-1",
+            json!({"command": "echo up; sleep 658", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    let id = local.id_of("start-1");
+    kill(local.pid_of(&id));
+    until("it to end", || {
+        local.states().iter().all(|(_, s)| !s.is_running())
+    })
+    .await;
+    assert!(
+        local
+            .list()
+            .await
+            .contains(&format!("{id} ended by a signal")),
+        "{}",
+        local.list().await
+    );
+}
+
+fn kill(pid: u32) {
+    let status = std::process::Command::new("kill")
+        .args(["-s", "KILL", "--"])
+        .arg(format!("-{pid}"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// The time a command ran is metered once, at the call that sees its end.
+#[tokio::test]
+async fn the_time_of_a_command_is_metered_once_at_the_call_that_sees_its_end() {
+    let fake = FakeEnvironment::new(None);
+    fake.session.as_pod(Some(250), Some(512 * 1024 * 1024));
+    let rig = Rig::from(Fixture::new().await.using(fake)).await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": "echo up; sleep 659", "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    assert!(
+        rig.call_ctx("start-1")
+            .reported_sandbox()
+            .entries()
+            .is_empty(),
+        "a command that runs is not metered yet"
+    );
+    let id = rig.id_of("start-1");
+    rig.stop(&id).await;
+    let at_stop = rig.call_ctx("stop").reported_sandbox();
+    let [entry] = at_stop.entries() else {
+        panic!("one entry at the call that sees the end: {at_stop:?}");
+    };
+    assert_eq!(entry.commands, 1);
+    // Later calls that see the same end report nothing more.
+    rig.list().await;
+    rig.stop(&id).await;
+    assert!(rig.call_ctx("list").reported_sandbox().entries().is_empty());
+    assert_eq!(
+        rig.call_ctx("stop").reported_sandbox().entries()[0].commands,
+        1
+    );
+    // A command that ends inside its wait is metered at the call that started it.
+    let quick = rig
+        .start("quick", json!({"command": "echo hi", "wait": 20}))
+        .await;
+    assert!(quick.content.contains("exit code 0"), "{}", quick.content);
+    assert_eq!(
+        rig.call_ctx("quick").reported_sandbox().entries()[0].commands,
+        1
+    );
+    rig.list().await;
+    assert!(rig.call_ctx("list").reported_sandbox().entries().is_empty());
+}
+
+// ------------------------------------------------------------------------------ the wiring
+
+/// The tools, the janitor and the sweep of a worker share one registry, and the sweep runs at the
+/// interval the deployment configured.
+#[tokio::test]
+async fn a_worker_wires_one_registry_to_the_tools_the_janitor_and_the_sweep() {
+    let fx = Fixture::new().await;
+    let vars = [
+        ("DATABASE_URL", "postgres://u:p@db/adam"),
+        ("MODEL_BASE_URL", "https://gw.example/v1"),
+        ("MODEL_API_KEY", "sk-secret"),
+        ("MODEL", "coder-large"),
+        ("GITHUB_TOKEN", "ghp_secret"),
+        ("A2A_BEARER_TOKENS", "one"),
+        ("PUBLIC_URL", "http://coder.svc:8080/"),
+        ("BACKGROUND_SWEEP_SECS", "7"),
+    ];
+    let config = adam_coder::Config::from_lookup(|k| {
+        vars.iter()
+            .find(|(name, _)| *name == k)
+            .map(|(_, v)| (*v).to_owned())
+    })
+    .unwrap();
+    let worker = config.worker.expect("a worker");
+    let janitor = adam_coder::Janitor::new(fx.env.workspaces.clone(), None);
+    assert_ne!(janitor.commands().owner(), fx.env.commands.owner());
+    let (janitor, sweep) = adam_coder::wire_commands(&fx.env, janitor, &worker);
+    assert_eq!(janitor.commands().owner(), fx.env.commands.owner());
+    assert_eq!(sweep.commands().owner(), fx.env.commands.owner());
+    assert_eq!(sweep.every(), Duration::from_secs(7));
+}
+
+/// The component the worker runs stops the commands of a cancelled run within its interval, with
+/// nobody calling the agent.
+#[tokio::test]
+async fn the_sweep_component_stops_the_commands_of_a_cancelled_run_within_its_interval() {
+    let rig = Rig::with(short_sweep).await;
+    let store = open_store(&rig).await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": TREE, "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let id = rig.id_of("start-1");
+    let leader = rig.pid_of(&id);
+    until("the tree", || group_members(leader).len() >= 3).await;
+    let tree = group_members(leader);
+    let sweep = adam_coder::CommandsSweep::new(&rig.fx.env.commands, Duration::from_millis(200));
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(sweep.run(store.clone(), token.clone()));
+    // Still open: nothing is stopped by looking.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(alive(leader));
+    // A cancel commits `Failed` and never calls the agent.
+    let record = store.load_run(rig.ctx.run_id()).await.unwrap().unwrap();
+    store
+        .commit_run(
+            rig.ctx.run_id(),
+            record.version,
+            adam_core::RunUpdate::new(RunStatus::Failed, record.state),
+        )
+        .await
+        .unwrap();
+    until_gone("the tree", &tree).await;
+    until("it to be settled", || {
+        rig.states().iter().all(|(_, s)| !s.is_running())
+    })
+    .await;
+    assert!(matches!(
+        &rig.states()[0].1,
+        CommandState::Stopped { why } if why == "the run ended"
+    ));
+    token.cancel();
+    handle.await.unwrap().unwrap();
+}
+
+/// A registry that goes (a worker that ends, a test that forgot to stop) takes what it holds with
+/// it: the groups, not only the leaders.
+#[tokio::test]
+async fn dropping_the_registry_kills_the_groups_it_holds() {
+    let rig = Rig::new().await;
+    let started = rig
+        .start(
+            "start-1",
+            json!({"command": TREE, "wait_for": "up", "wait": 20}),
+        )
+        .await;
+    assert!(!started.is_error, "{}", started.content);
+    let leader = rig.pid_of(&rig.id_of("start-1"));
+    until("the tree", || group_members(leader).len() >= 3).await;
+    let tree = group_members(leader);
+    drop(rig);
+    until_gone("the tree", &tree).await;
 }

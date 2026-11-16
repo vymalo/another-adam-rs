@@ -662,3 +662,133 @@ async fn the_sweep_stops_background_commands_before_release() {
         "{states:?}"
     );
 }
+
+/// An environment that holds a run no workspace of this volume has any more: the janitor stops its
+/// commands before it releases what holds them.
+#[tokio::test]
+async fn the_orphan_sweep_stops_background_commands_before_release() {
+    use adam_coder::tools::background::{CommandState, StartCommand};
+    use adam_llm_agent::{Tool as _, ToolCtx};
+    use adam_runtime::CollectingSink;
+
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let run = run_in(&store, RunStatus::Failed).await;
+    let run_id = run.to_string();
+    workspace_of(&fx, &run_id).await;
+    let ctx = ToolCtx::detached("tool", "c1", Arc::new(CollectingSink::new()))
+        .with_state(fx.env.clone())
+        .with_root_run(run);
+    let started = StartCommand
+        .call(&ctx, json!({"command": "sleep 661", "wait": 1}))
+        .await
+        .unwrap();
+    assert!(!started.is_error, "{}", started.content);
+    // The workspace is gone (a crash between two removals); the environment still holds the run.
+    std::fs::remove_dir_all(workspace_dir(&fx, &run_id)).unwrap();
+    let _ = std::fs::remove_dir_all(fx.root.join("worktrees").join(&run_id));
+    let _ = std::fs::remove_dir_all(fx.root.join("meta").join(&run_id));
+    let _ = std::fs::remove_file(fx.root.join("workspaces").join(format!("{run_id}.lock")));
+    let watching = Arc::new(Watching {
+        inner: FakeEnvironment::new(Some(&fx.root)),
+        commands: fx.env.commands.clone(),
+        running_at_release: std::sync::Mutex::default(),
+    });
+    *watching.inner.held.lock().unwrap() = vec![run_id.clone()];
+    let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)))
+        .with_environment(watching.clone())
+        .with_commands(fx.env.commands.clone());
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert_eq!(report.orphans, std::slice::from_ref(&run_id), "{report:?}");
+    assert_eq!(
+        *watching.running_at_release.lock().unwrap(),
+        [(run_id.clone(), 0)],
+        "none ran any more when the environment was released"
+    );
+    assert!(
+        fx.env
+            .commands
+            .states(&run_id)
+            .iter()
+            .all(|(_, state)| matches!(
+                state,
+                CommandState::Stopped { why } if why == "the run ended"
+            )),
+        "{:?}",
+        fx.env.commands.states(&run_id)
+    );
+}
+
+/// What a worker that is gone left running for a finished run is killed by pid before the janitor
+/// removes the records that name it, and so is what is left of its group.
+#[tokio::test]
+async fn the_janitor_kills_what_the_records_of_a_finished_run_name_before_it_removes_them() {
+    use std::os::unix::process::CommandExt as _;
+
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let run = run_in(&store, RunStatus::Done).await.to_string();
+    workspace_of(&fx, &run).await;
+    let mut leader = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sleep 662 & wait")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = leader.id();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let start: u64 = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let id = adam_llm_agent::output_id(&run, "orphan");
+    let record = json!({
+        "command": "orphan", "slot": "remote", "cwd": "", "exec": "bg-orphan-1",
+        "owner": "a-worker-that-is-gone", "pid": pid, "start": start, "started_at": 1,
+        "state": "running", "ran_secs": null, "lines": 0, "git": null,
+        // A beat that is fresh: the run is over, so it does not matter.
+        "beat": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    });
+    fx.env
+        .kept
+        .put_record(&run, &id, &serde_json::to_vec(&record).unwrap())
+        .unwrap();
+    let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)))
+        .with_commands(fx.env.commands.clone());
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(report.failed.is_empty(), "{report:?}");
+    let began = std::time::Instant::now();
+    while leader.try_wait().unwrap().is_none() {
+        assert!(began.elapsed() < Duration::from_secs(10), "still running");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Nothing of the group is left either.
+    let left = std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|p| {
+            std::fs::read_to_string(format!("/proc/{p}/stat")).is_ok_and(|s| {
+                s.rsplit_once(") ").is_some_and(|(_, rest)| {
+                    rest.split_whitespace().nth(2) == Some(pid.to_string().as_str())
+                        && !rest.starts_with('Z')
+                })
+            })
+        })
+        .count();
+    assert_eq!(left, 0, "what the leader left in its group");
+}

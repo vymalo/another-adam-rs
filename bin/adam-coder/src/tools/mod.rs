@@ -137,7 +137,7 @@ pub mod share;
 pub mod shell;
 pub mod skills;
 
-pub use background::{BACKGROUND_TOOLS, Commands};
+pub use background::{BACKGROUND_TOOLS, Commands, CommandsSweep};
 pub use notes::{NotesStore, RunNotes};
 pub use references::{References, ReferencesError, ReferencesSource};
 

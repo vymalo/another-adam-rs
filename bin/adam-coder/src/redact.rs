@@ -397,6 +397,43 @@ mod tests {
 
     use super::*;
 
+    /// A secret split at every byte position between two reads: what could still be its start is
+    /// held back, whole, until the next read shows whether it goes on, and what is written is the
+    /// scrub of the whole.
+    #[test]
+    fn a_secret_split_at_every_position_is_never_written_in_part() {
+        let secret = "Zq9#Lm2$Xv7!Pw4@Hn8%";
+        let longer = format!("{secret}-and-more");
+        let redactor = Redactor::new([secret, longer.as_str()]);
+        let scrub = |text: &str| redactor.scrub(text).into_owned();
+        let partial = |text: &str| redactor.partial_secret_len(text);
+        for k in 1..secret.len() {
+            assert_eq!(
+                partial(&format!("before {}", &secret[..k])),
+                k,
+                "split at {k}"
+            );
+        }
+        // The shorter secret, whole, is the start of the longer one: it is held too.
+        assert_eq!(partial(&format!("before {secret}")), secret.len());
+        for text in [secret.to_owned(), longer.clone()] {
+            for k in 1..text.len() {
+                let (first, rest) = text.split_at(k);
+                let mut scrubber = adam_llm_agent::StreamScrubber::new(redactor.margin());
+                let mut written = scrubber.push(format!("a {first}").as_bytes(), &scrub);
+                written.push_str(&scrubber.release(&scrub, &partial));
+                assert!(
+                    !written.contains(&first[..first.len().min(3)]),
+                    "split at {k}: {written:?} holds the start of the secret"
+                );
+                written.push_str(&scrubber.push(format!("{rest} b").as_bytes(), &scrub));
+                written.push_str(&scrubber.release(&scrub, &partial));
+                written.push_str(&scrubber.finish(&scrub));
+                assert_eq!(written, "a [redacted] b", "split at {k} of {text}");
+            }
+        }
+    }
+
     #[test]
     fn replaces_every_occurrence_and_the_base64_forms() {
         let r = Redactor::new(["sk-secret-value"]);

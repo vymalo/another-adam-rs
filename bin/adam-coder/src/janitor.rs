@@ -135,6 +135,11 @@ impl Janitor {
         self
     }
 
+    /// The registry of commands this janitor stops what runs for the runs it releases.
+    pub fn commands(&self) -> &Commands {
+        &self.commands
+    }
+
     /// One sweep: the workspaces of finished and unknown runs are removed. Stops early, between
     /// two runs, when `stop` is cancelled.
     pub async fn sweep(&self, store: &dyn Store, stop: &CancellationToken) -> Sweep {

@@ -495,6 +495,24 @@ async fn a_command_is_devcontainer_exec_with_adam_exec_and_nothing_secret_on_the
         "every command has an id of its own"
     );
     assert!(prepared.exec.as_str().starts_with("dc-"));
+    assert!(!prepared.exec.is_background());
+
+    // A process that outlives its call has an id that `adam-exec active-fg` leaves out, and the
+    // `adam-exec` it runs under is given that same id.
+    let background = session
+        .prepare(&ExecSpec::shell("devbox-tool serve", &slot).background())
+        .unwrap();
+    assert!(
+        background.exec.as_str().starts_with("bg-dc-") && background.exec.is_background(),
+        "{}",
+        background.exec
+    );
+    let args: Vec<String> = background
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(args[args.len() - 3], background.exec.as_str());
 }
 
 /// ADR 0038: what a devcontainer gets from the coder is the exec script and the repository's own
