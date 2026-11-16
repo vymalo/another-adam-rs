@@ -3606,3 +3606,140 @@ mod artifact_ref_tests {
         assert_eq!(names(&refs), ["plan2", "logo"]);
     }
 }
+
+#[cfg(test)]
+mod compaction_gate_tests {
+    use super::*;
+    use crate::compaction::Compaction;
+    use adam_model::MockModel;
+
+    fn agent(max_history_tokens: u32) -> LlmAgent {
+        let model: DynModel = Arc::new(MockModel::new());
+        LlmAgent::builder("t", model, "m")
+            .limits(Limits {
+                max_history_tokens,
+                ..Limits::default()
+            })
+            .build()
+    }
+
+    /// A history of `turns` turns whose results are `size` letters, and `turns` model turns made.
+    fn history(turns: usize, size: usize) -> Conversation {
+        let mut state = Conversation::new("task");
+        for n in 0..turns {
+            state.messages.push(Message::Assistant {
+                content: vec![],
+                tool_calls: vec![adam_model::ToolCall {
+                    id: format!("c{n}"),
+                    name: "t".into(),
+                    arguments: json!({}),
+                    ..Default::default()
+                }],
+                reasoning: None,
+            });
+            state
+                .messages
+                .push(Message::tool_result(format!("c{n}"), "x".repeat(size)));
+        }
+        state.turns = u32::try_from(turns).unwrap();
+        state
+    }
+
+    fn reported(state: &mut Conversation, input_tokens: u64) {
+        state.last_prompt = Some(PromptSize {
+            input_tokens,
+            messages: state.messages.len(),
+        });
+    }
+
+    fn made(turn: u32) -> Compaction {
+        Compaction {
+            turn,
+            dropped_turns: 2,
+            reason: CompactionReason::Budget,
+            summarised: true,
+            sessions: false,
+            rejected: None,
+            skills: vec![],
+            pointers: vec![],
+            pinned: vec![],
+        }
+    }
+
+    #[test]
+    fn a_history_that_has_reached_the_budget_exactly_is_due() {
+        let agent = agent(2000);
+        let mut state = history(12, 40);
+        reported(&mut state, 1999);
+        assert!(!agent.compaction_due(&state));
+        reported(&mut state, 2000);
+        assert!(agent.compaction_due(&state));
+    }
+
+    #[test]
+    fn no_second_compaction_is_due_at_the_turn_of_the_first() {
+        let agent = agent(2000);
+        let mut state = history(12, 40);
+        reported(&mut state, 5000);
+        state.compactions = vec![made(state.turns)];
+        assert!(!agent.compaction_due(&state));
+        state.compactions = vec![made(state.turns - 1)];
+        assert!(agent.compaction_due(&state));
+    }
+
+    #[test]
+    fn a_failed_summary_is_tried_again_after_eight_turns() {
+        let agent = agent(2000);
+        let mut state = history(12, 40);
+        reported(&mut state, 5000);
+        state.compact_failed = Some(state.turns - (RETRY_AFTER_TURNS - 1));
+        assert!(!agent.compaction_due(&state));
+        state.compact_failed = Some(state.turns - RETRY_AFTER_TURNS);
+        assert!(agent.compaction_due(&state));
+    }
+
+    #[test]
+    fn eight_compactions_are_the_most_a_run_makes() {
+        let agent = agent(2000);
+        let mut state = history(12, 40);
+        reported(&mut state, 5000);
+        state.compactions = vec![made(0); MAX_COMPACTIONS - 1];
+        assert!(agent.cut_for(&state, CompactionReason::Budget).is_some());
+        assert!(agent.cut_for(&state, CompactionReason::Overflow).is_some());
+        state.compactions = vec![made(0); MAX_COMPACTIONS];
+        assert!(agent.cut_for(&state, CompactionReason::Budget).is_none());
+        assert!(agent.cut_for(&state, CompactionReason::Overflow).is_none());
+    }
+
+    #[test]
+    fn a_rejection_cuts_by_the_estimate_when_it_is_smaller_than_the_budget() {
+        let agent = agent(100_000);
+        let state = history(12, 400);
+        let estimate = agent.estimated_tokens(&state);
+        assert!(estimate < 25_000, "{estimate}");
+        let cut = agent.cut_for(&state, CompactionReason::Overflow).unwrap();
+        assert_eq!(
+            Some(cut),
+            compaction::cut_point(&state.messages, estimate),
+            "a quarter of what the history is, not of what it may be"
+        );
+        let by_budget = agent.cut_for(&state, CompactionReason::Budget).unwrap();
+        assert!(cut.dropped_turns > by_budget.dropped_turns);
+    }
+
+    #[test]
+    fn a_compaction_that_would_leave_the_request_over_the_budget_is_not_due() {
+        // Each turn is about a thousand tokens, and the newest one stays.
+        let mut state = history(12, 4000);
+        let over = agent(900);
+        reported(&mut state, 20_000);
+        assert!(over.estimated_tokens(&state) >= 900);
+        assert!(over.cut_for(&state, CompactionReason::Budget).is_some());
+        assert!(
+            !over.compaction_due(&state),
+            "the tail alone is over the budget"
+        );
+        let room = agent(1100);
+        assert!(room.compaction_due(&state), "the tail fits");
+    }
+}

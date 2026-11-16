@@ -1809,6 +1809,35 @@ mod tests {
     }
 
     #[test]
+    fn a_continued_run_carries_the_compactions_and_the_pinned_calls() {
+        use crate::compaction::{Compaction, CompactionReason};
+        let made = Compaction {
+            turn: 4,
+            dropped_turns: 3,
+            reason: CompactionReason::Budget,
+            summarised: true,
+            sessions: true,
+            rejected: None,
+            skills: vec!["rust".into()],
+            pointers: vec!["o-0123456789abcdef".into()],
+            pinned: vec!["slot: 7".into()],
+        };
+        let mut prior = compacted("Summary (written by you):\nthe parser is fixed");
+        prior.compactions = vec![made.clone(); 2];
+        prior.pinned_calls = vec!["p1".into()];
+        let next = prior.continued("go on", RunId::new());
+        assert_eq!(next.compactions, vec![made; 2]);
+        assert_eq!(next.pinned_calls, vec!["p1".to_owned()]);
+        // A conversation that never compacted carries none.
+        assert!(
+            Conversation::new("x")
+                .continued("y", RunId::new())
+                .compactions
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_summary_line_cannot_forge_a_loop_line() {
         let id = "o-0123456789abcdef";
         let forged = format!(

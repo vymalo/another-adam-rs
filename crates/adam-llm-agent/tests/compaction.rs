@@ -3,8 +3,8 @@
 //! provider rejects as too long is compacted and tried once more.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
@@ -137,11 +137,36 @@ struct Arm {
     run: Mutex<Option<RunId>>,
     on: Mutex<Option<(usize, bool)>>,
     calls: AtomicUsize,
+    /// The context window the model says it has once it was changed (`0`: the mock's).
+    window: AtomicU64,
+    /// After the call number `.0`, the window becomes `.1`.
+    flip: Mutex<Option<(usize, u64)>>,
+    rt: OnceLock<Runtime>,
+    /// For each model call, how many compactions the store held when it was made.
+    committed: Mutex<Vec<usize>>,
 }
 
 impl Arm {
+    /// Note what the store holds of the run now: a call made inside a transition sees the state of
+    /// the transition before.
+    async fn look(&self) {
+        let (Some(rt), Some(run)) = (self.rt.get(), *self.run.lock().unwrap()) else {
+            return;
+        };
+        let view = rt.view(run).await.expect("view").expect("run exists");
+        self.committed
+            .lock()
+            .unwrap()
+            .push(conversation(&view).compactions.len());
+    }
+
     fn armed(&self) {
         let n = self.calls.fetch_add(1, SeqCst);
+        if let Some((at, window)) = *self.flip.lock().unwrap()
+            && n == at
+        {
+            self.window.store(window, SeqCst);
+        }
         let Some((on, after_apply)) = *self.on.lock().unwrap() else {
             return;
         };
@@ -161,6 +186,7 @@ impl Arm {
 #[async_trait]
 impl ModelClient for Arm {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.look().await;
         let answer = self.inner.complete(req).await;
         self.armed();
         answer
@@ -170,13 +196,17 @@ impl ModelClient for Arm {
         &self,
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        self.look().await;
         let answer = self.inner.stream(req).await;
         self.armed();
         answer
     }
 
     fn context_window(&self, model: &str) -> Option<u64> {
-        self.inner.context_window(model)
+        match self.window.load(SeqCst) {
+            0 => self.inner.context_window(model),
+            window => Some(window),
+        }
     }
 }
 
@@ -209,6 +239,10 @@ impl Rig {
             run: Mutex::new(None),
             on: Mutex::new(None),
             calls: AtomicUsize::new(0),
+            window: AtomicU64::new(0),
+            flip: Mutex::new(None),
+            rt: OnceLock::new(),
+            committed: Mutex::new(Vec::new()),
         });
         let model: DynModel = arm.clone();
         let agent = configure(
@@ -238,6 +272,7 @@ impl Rig {
                 multiplier: 1.0,
             })
             .build();
+        let _ = arm.rt.set(rt.clone());
         Self {
             mock,
             arm,
@@ -251,14 +286,23 @@ impl Rig {
         *self.arm.on.lock().unwrap() = Some((call, after_apply));
     }
 
-    async fn start(&self) -> RunId {
+    /// After the model call number `call` (0-based) the model says its window is `window`.
+    fn change_the_window_after_call(&self, call: usize, window: u64) {
+        *self.arm.flip.lock().unwrap() = Some((call, window));
+    }
+
+    async fn start_in(&self, conversation: Option<&str>) -> RunId {
         let run = self
             .rt
-            .start("llm", user_message("go"), None)
+            .start("llm", user_message("go"), conversation)
             .await
             .expect("start");
         *self.arm.run.lock().unwrap() = Some(run);
         run
+    }
+
+    async fn start(&self) -> RunId {
+        self.start_in(None).await
     }
 
     /// A failed commit is retried after a backoff of the runtime's clock, which only this moves.
@@ -393,7 +437,7 @@ async fn a_long_run_is_summarised_once_and_keeps_the_prefix_after() {
 async fn the_summary_request_extends_the_previous_request() {
     let rig = Rig::new(BUDGET);
     script_one_compaction(&rig.mock, "S");
-    let run = rig.start().await;
+    let run = rig.start_in(Some("alice:thread-7")).await;
     let (requests, _) = rig.finish(run).await;
     let at = requests
         .iter()
@@ -402,6 +446,11 @@ async fn the_summary_request_extends_the_previous_request() {
     let (before, summary) = (&requests[at - 1], &requests[at]);
     assert_eq!(summary.system, before.system);
     assert_eq!(summary.tools, before.tools);
+    assert!(before.prompt_cache_key.is_some());
+    assert_eq!(
+        summary.prompt_cache_key, before.prompt_cache_key,
+        "the provider is asked to serve it from the same cache"
+    );
     assert!(
         open_messages(summary).starts_with(&open_messages(before)),
         "served from the cache"
@@ -750,6 +799,346 @@ async fn a_second_rejection_fails_naming_both() {
         "{error}"
     );
     assert_eq!(rig.mock.requests().len(), 7, "no third try");
+}
+
+#[tokio::test]
+async fn a_run_that_continues_another_and_compacts_again_keeps_what_code_wrote() {
+    let text: String = (0..7000).map(|i| format!("row-{i:06}\n")).collect();
+    let rig = Rig::with(MockModel::new(), 2600, |b| {
+        b.tool(Wordy(text.clone()))
+            .tool(Planner)
+            .tool(Pinner)
+            .tool(ReadOutput)
+    });
+    let first = rig.start_in(Some("conv")).await;
+    let id = adam_llm_agent::output_id(&first.to_string(), "c1");
+    rig.mock
+        .push_tool_calls(vec![
+            call("p0", "where", json!({})),
+            call("c0", "plan", json!({})),
+        ])
+        .push_tool_calls(vec![call("c1", "wordy", json!({}))])
+        .push_tool_calls(vec![big("c2", 50)])
+        .push_text("SUMMARY A: planned and read")
+        .push_tool_calls(vec![big("c3", 50)])
+        .push_text("done");
+    let (_, before) = rig.finish(first).await;
+    assert_eq!(before.compactions.len(), 1);
+
+    // The person writes again, and this run fills the history once more.
+    let second = RunId::new();
+    assert!(
+        rig.rt
+            .start_with_id_continuing(second, "llm", user_message("again"), Some("conv"), first)
+            .await
+            .expect("continue")
+    );
+    for n in 0..4 {
+        rig.mock.push_tool_calls(vec![big(&format!("d{n}"), 3500)]);
+    }
+    rig.mock
+        .push_text("SUMMARY B: the second task")
+        .push_text("done again");
+    let (requests, state) = rig.finish(second).await;
+    assert_eq!(state.continued_from, Some(first));
+    assert_eq!(
+        split(&requests).1.len(),
+        2,
+        "one summary for each of the two runs"
+    );
+    assert_eq!(state.compactions.len(), 2, "{:?}", state.compactions);
+    assert_eq!(first_part(&state.messages[0]), "go");
+    let marker = state.messages[0].text();
+    assert!(marker.contains("SUMMARY B"), "{marker}");
+    assert!(marker.contains("Plan: Fix the parser"), "{marker}");
+    assert!(
+        marker.contains("slot: remote, branch: agent/fix-parser"),
+        "the pinned result of the first run: {marker}"
+    );
+    assert!(
+        marker.contains(&adam_llm_agent::pointer_line(&id)),
+        "the pointer of the first run: {marker}"
+    );
+}
+
+#[tokio::test]
+async fn a_history_over_the_budget_when_the_closing_turn_comes_is_not_compacted() {
+    // A window of 26,096 tokens leaves a budget of 2,000; the tenth call, which asks for one tool
+    // call too many, reports a prompt over it, and the run goes on to its closing turn.
+    let rig = Rig::with(
+        MockModel::new().with_context_window("test-model", 26_096),
+        0,
+        |b| {
+            b.limits(Limits {
+                max_tool_calls: 9,
+                max_history_tokens: 0,
+                ..Limits::default()
+            })
+        },
+    );
+    for n in 0..9 {
+        rig.mock.push_response(reported(
+            ModelResponse::tool_calls(vec![big(&format!("c{n}"), 20)]),
+            300,
+        ));
+    }
+    rig.mock.push_response(reported(
+        ModelResponse::tool_calls(vec![big("c9", 20)]),
+        2_500,
+    ));
+    rig.mock.push_text("closing answer");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(requests.len(), 11);
+    assert!(split(&requests).1.is_empty(), "no summary request");
+    assert!(state.compactions.is_empty());
+    assert!(state.limit.is_some(), "the closing turn was reached");
+}
+
+#[tokio::test]
+async fn a_rejected_closing_turn_is_compacted_and_asked_again() {
+    let rig = Rig::with(MockModel::new(), 0, |b| {
+        b.limits(Limits {
+            max_tool_calls: 3,
+            max_history_tokens: 0,
+            ..Limits::default()
+        })
+    });
+    for n in 0..4 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 3000)]);
+    }
+    rig.mock
+        .push_error(ModelError::ContextLength(
+            "too long for the closing turn".into(),
+        ))
+        .push_text("SUMMARY of the work")
+        .push_text("closing answer");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(requests.len(), 7);
+    assert_eq!(state.compactions.len(), 1);
+    assert_eq!(state.compactions[0].reason, CompactionReason::Overflow);
+    assert!(state.limit.is_some());
+}
+
+#[tokio::test]
+async fn an_empty_summary_is_said_to_be_none() {
+    let rig = Rig::new(BUDGET);
+    script_one_compaction(&rig.mock, "  \n ");
+    let run = rig.start().await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    assert!(!state.compactions[0].summarised);
+    let marker = state.messages[0].text();
+    assert!(marker.contains("No summary could be made"), "{marker}");
+    assert!(!marker.contains("Summary (written by you"), "{marker}");
+}
+
+#[tokio::test]
+async fn a_summary_call_that_fails_for_a_moment_is_asked_again() {
+    let rig = Rig::new(BUDGET);
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_error(ModelError::transient("the provider hiccuped"))
+        .push_text("S")
+        .push_tool_calls(vec![big("c4", 100)])
+        .push_text("done");
+    let run = rig.start().await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "{:?}", state.compactions);
+    assert_eq!(state.compact_failed, None);
+    assert!(state.shortenings.is_empty());
+}
+
+#[tokio::test]
+async fn the_summary_calls_tokens_are_in_the_runs_usage() {
+    let rig = Rig::new(BUDGET);
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_response(reported(ModelResponse::text("S"), 777))
+        .push_text("done");
+    let run = rig.start().await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    assert_eq!(state.usage.input_tokens, 777);
+    assert_eq!(state.usage.output_tokens, 10);
+}
+
+#[tokio::test]
+async fn a_replay_applies_the_cut_the_journal_recorded() {
+    // Budget 1,600 tokens: the eleventh result reaches it, and two turns stay. After the summary call
+    // the window shrinks to a budget of 800, where one turn stays, and the commit is lost: the
+    // replay takes the summary from the journal and the cut it was made for.
+    let rig = Rig::with(
+        MockModel::new().with_context_window("test-model", 25_696),
+        0,
+        |b| b,
+    );
+    for n in 0..11 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 600)]);
+    }
+    rig.mock
+        .push_text("S")
+        .push_tool_calls(vec![big("c11", 100)])
+        .push_text("done");
+    rig.change_the_window_after_call(11, 24_896);
+    rig.lose_the_commit_after_call(11, false);
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(
+        split(&requests).1.len(),
+        1,
+        "the summary is not asked again"
+    );
+    assert_eq!(state.compactions.len(), 1);
+    assert_eq!(
+        state.compactions[0].dropped_turns, 9,
+        "eleven turns, the two the first budget kept stay"
+    );
+}
+
+#[tokio::test]
+async fn a_compaction_is_committed_before_the_model_is_asked_again() {
+    let rig = Rig::new(BUDGET);
+    script_one_compaction(&rig.mock, "S");
+    let run = rig.start().await;
+    let _ = rig.finish(run).await;
+    let seen = rig.arm.committed.lock().unwrap().clone();
+    assert_eq!(seen.len(), 8, "{seen:?}");
+    assert_eq!(
+        seen[4], 0,
+        "the summary call is made before it is committed"
+    );
+    assert_eq!(
+        seen[5], 1,
+        "the call after it is made from the committed history: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_summary_that_cannot_be_made_after_a_rejection_fails_the_run_with_its_own_error() {
+    let rig = Rig::new(0);
+    for n in 0..4 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 3000)]);
+    }
+    rig.mock
+        .push_error(ModelError::ContextLength("prompt is too long (one)".into()))
+        .push_error(ModelError::invalid_request("the model alias is unknown"));
+    let run = rig.start().await;
+    let view = rig.work(run).await;
+    assert_eq!(view.status, RunStatus::Failed, "{view:#?}");
+    let error = view.error.clone().expect("an error");
+    assert!(error.contains("the model alias is unknown"), "{error}");
+    assert!(error.contains("Invalid"), "{error}");
+    let state = conversation(&view);
+    assert!(state.compactions.is_empty(), "the history was not dropped");
+    assert_eq!(state.messages.len(), 9);
+    assert_eq!(rig.mock.requests().len(), 6, "no third try");
+}
+
+#[tokio::test]
+async fn a_summary_request_that_is_itself_too_long_drops_the_turns_without_one() {
+    let rig = Rig::new(0);
+    for n in 0..4 {
+        rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 3000)]);
+    }
+    rig.mock
+        .push_error(ModelError::ContextLength("prompt is too long (one)".into()))
+        .push_error(ModelError::ContextLength(
+            "the summary request is too long".into(),
+        ))
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(requests.len(), 7);
+    assert_eq!(state.compactions.len(), 1);
+    let compaction = &state.compactions[0];
+    assert!(!compaction.summarised);
+    assert_eq!(compaction.reason, CompactionReason::Overflow);
+    assert!(compaction.rejected.as_deref().unwrap().contains("(one)"));
+    let marker = state.messages[0].text();
+    assert!(marker.contains("No summary could be made"), "{marker}");
+}
+
+/// A tool that waits for a remote task and answers a result that it pins.
+struct WaitsAndPins;
+
+#[async_trait]
+impl Tool for WaitsAndPins {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "waiter".into(),
+            description: "waits for a remote task".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::AwaitRemote {
+            task: format!("task-of-{}", ctx.call_id()),
+            timeout_ms: None,
+        })
+    }
+    async fn poll_remote(
+        &self,
+        _ctx: &ToolCtx,
+        _task: &str,
+    ) -> Result<adam_llm_agent::RemotePoll, ToolError> {
+        Ok(adam_llm_agent::RemotePoll::Ready(
+            ToolOutput::text("slot: waited-for, branch: agent/late").pinned(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_result_that_came_through_a_wait_survives_a_compaction() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| b.tool(WaitsAndPins));
+    rig.mock
+        .push_tool_calls(vec![call("w0", "waiter", json!({}))])
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_text("S")
+        .push_text("done");
+    let run = rig.start().await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    let marker = state.messages[0].text();
+    assert!(
+        marker.contains("slot: waited-for, branch: agent/late"),
+        "{marker}"
+    );
+    assert!(state.pinned_calls.is_empty());
+}
+
+#[tokio::test]
+async fn a_shortening_leaves_the_estimate_to_start_again() {
+    // Two turns of 3,000 letters are over the budget of 1,200 tokens, but the reports say the prompt
+    // is small and there are not two turns to drop: the history is shortened, and the call after it
+    // fails for good, so the state it leaves is the one the shortening made.
+    let rig = Rig::new(BUDGET);
+    rig.mock
+        .push_response(reported(
+            ModelResponse::tool_calls(vec![big("c0", 3000)]),
+            100,
+        ))
+        .push_response(reported(
+            ModelResponse::tool_calls(vec![big("c1", 3000)]),
+            100,
+        ))
+        .push_error(ModelError::invalid_request("refused"));
+    let run = rig.start().await;
+    let view = rig.work(run).await;
+    assert_eq!(view.status, RunStatus::Failed, "{view:#?}");
+    let state = conversation(&view);
+    assert_eq!(state.shortenings.len(), 1, "{state:#?}");
+    assert_eq!(state.last_prompt, None);
 }
 
 // ---------------------------------------------------------------------------

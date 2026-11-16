@@ -931,6 +931,12 @@ async fn a_compaction_is_the_only_break_besides_shortenings() {
 
     // Every request after the compaction extends the first one after it.
     let turns: Vec<&ModelRequest> = requests.iter().filter(|r| !is_summary(r)).collect();
+    // The head of every request that is a model turn is the same bytes, whatever side of the
+    // compaction it is on.
+    assert!(
+        turns.iter().all(|r| head(r) == head(turns[0])),
+        "system, tools and tool choice never move"
+    );
     let first_after = turns[at as usize];
     for later in &turns[at as usize..] {
         assert!(open_messages(later).starts_with(&open_messages(first_after)));
@@ -945,4 +951,39 @@ async fn a_compaction_is_the_only_break_besides_shortenings() {
         "{content:?}"
     );
     assert!(state.is_omission_marker(0, 1));
+}
+
+/// The summary request takes what the sources add to a request, as a model turn does: the tools
+/// they offer, in the same order, so the head is the bytes the provider has cached.
+#[tokio::test]
+async fn the_summary_request_has_the_tools_of_the_sources_too() {
+    let names = ["delta", "alpha", "charlie"].map(str::to_owned).to_vec();
+    let rig = Rig::summarising(SIX_TURNS_BUDGET, |b| {
+        b.tool_source(Shuffled::new(names, false))
+    });
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_text("SUMMARY")
+        .push_tool_calls(vec![big("c4", 100)])
+        .push_text("done");
+    let run = rig.start_in(Some("alice:thread-7")).await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    let at = requests
+        .iter()
+        .position(is_summary)
+        .expect("a summary request");
+    let (before, summary) = (&requests[at - 1], &requests[at]);
+    assert_eq!(
+        names_of(summary),
+        ["big", "handle", "alpha", "charlie", "delta"],
+        "the tools of the source, in name order"
+    );
+    assert_eq!(summary.tools, before.tools);
+    assert_eq!(summary.system, before.system);
+    assert_eq!(summary.prompt_cache_key, before.prompt_cache_key);
+    assert!(summary.prompt_cache_key.is_some());
 }

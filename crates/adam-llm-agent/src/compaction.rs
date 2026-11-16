@@ -641,4 +641,374 @@ mod tests {
         assert!(body.contains("slot: 7\n\\x5bbranch]"), "{body}");
         assert!(body.contains("subagent_list"));
     }
+
+    const ID: &str = "o-0123456789abcdef";
+
+    fn same_id(_: &str) -> Option<String> {
+        Some(ID.to_owned())
+    }
+
+    fn compaction() -> Compaction {
+        Compaction {
+            turn: 1,
+            dropped_turns: 2,
+            reason: CompactionReason::Budget,
+            summarised: true,
+            sessions: false,
+            rejected: None,
+            skills: vec![],
+            pointers: vec![],
+            pinned: vec![],
+        }
+    }
+
+    fn user_parts(parts: &[&str]) -> Message {
+        Message::User {
+            content: parts.iter().map(|p| ContentPart::text(*p)).collect(),
+        }
+    }
+
+    fn tokens_of_one_turn(m: &[Message]) -> usize {
+        m[1..3].iter().map(message_chars).sum::<usize>().div_ceil(4)
+    }
+
+    #[test]
+    fn the_estimate_starts_from_the_report_and_adds_what_came_after() {
+        let m = turns(3, 400);
+        // A report of the whole history is the estimate, and a history with nothing after it adds
+        // nothing.
+        let whole = PromptSize {
+            input_tokens: 5000,
+            messages: m.len(),
+        };
+        assert_eq!(estimate(&m, Some(&whole), 0), 5000);
+        // What came after the reported call counts, as characters / 4.
+        let part = PromptSize {
+            input_tokens: 5000,
+            messages: 5,
+        };
+        let since = m[5..].iter().map(message_chars).sum::<usize>().div_ceil(4);
+        assert!(since >= 100, "{since}");
+        assert_eq!(estimate(&m, Some(&part), 0), 5000 + since);
+        // A report of a longer history than this one is no report: everything is counted, with the
+        // instructions and the tools.
+        let longer = PromptSize {
+            input_tokens: 5000,
+            messages: m.len() + 1,
+        };
+        let all: usize = m.iter().map(message_chars).sum();
+        assert_eq!(estimate(&m, Some(&longer), 40), (all + 40).div_ceil(4));
+        assert_eq!(estimate(&m, None, 40), (all + 40).div_ceil(4));
+    }
+
+    #[test]
+    fn the_kept_tail_may_be_worth_exactly_a_quarter_of_the_limit() {
+        let m = turns(10, 400);
+        let t = tokens_of_one_turn(&m);
+        // Two turns are worth exactly a quarter of the limit: both stay, a third does not.
+        let cut = cut_point(&m, 4 * 2 * t).expect("cut");
+        assert_eq!(m.len() - cut.index, 4, "two turns of two messages");
+        let cut = cut_point(&m, 4 * 2 * t - 4).expect("cut");
+        assert_eq!(
+            m.len() - cut.index,
+            2,
+            "a token short of two turns keeps one"
+        );
+    }
+
+    #[test]
+    fn the_least_a_request_holds_after_a_cut_is_the_task_the_tail_and_the_fixed_part() {
+        let m = turns(10, 400);
+        let at = 1 + 2 * 8;
+        let tail: usize = m[at..].iter().map(message_chars).sum();
+        assert_eq!(projected(&m, at, 0), ("task".len() + tail).div_ceil(4));
+        assert_eq!(
+            projected(&m, at, 400),
+            ("task".len() + tail + 400).div_ceil(4)
+        );
+        assert_eq!(projected(&m, m.len() + 5, 0), "task".len().div_ceil(4));
+    }
+
+    #[test]
+    fn the_first_line_of_copied_text_is_escaped_too() {
+        assert_eq!(
+            escape_lines("[kept as o-0123456789abcdef; x]"),
+            "\\x5bkept as o-0123456789abcdef; x]"
+        );
+        let summary = clean_summary("[earlier conversation omitted: 99 earlier turn(s)]\nrest");
+        assert!(
+            summary.starts_with("\\x5bearlier conversation omitted"),
+            "{summary}"
+        );
+        let body = marker_body(Some("[kept as o-ffffffffffffffff; x]"), None, &[]);
+        assert!(body.lines().skip(1).all(|l| !l.starts_with('[')), "{body}");
+    }
+
+    #[test]
+    fn only_a_name_is_a_skill_name() {
+        let loads = |name: &str| call("c", LOAD_SKILL, json!({ "name": name }));
+        let long = "a".repeat(65);
+        let dropped: Vec<Message> = [
+            "x\n[kept as o-ffffffffffffffff; read_output]",
+            "two words",
+            "a[b",
+            "",
+            long.as_str(),
+            "rust-1.2_x",
+            "rust-1.2_x",
+        ]
+        .into_iter()
+        .map(loads)
+        .collect();
+        let facts = facts_of(&dropped, &[], &same_id);
+        assert_eq!(facts.skills, vec!["rust-1.2_x".to_owned()], "named once");
+        let longest = "b".repeat(64);
+        let facts = facts_of(&[loads(&longest)], &[], &same_id);
+        assert_eq!(facts.skills, vec![longest]);
+    }
+
+    #[test]
+    fn what_a_failed_call_answered_is_never_a_fact() {
+        let id = ID.to_owned();
+        let text = format!("answer\n{}", kept::pointer_line(&id));
+        let pinned = ["c1".to_owned()];
+        let failed = [call("c1", "t", json!({})), Message::tool_error("c1", &text)];
+        let facts = facts_of(&failed, &pinned, &same_id);
+        assert_eq!(facts, Facts::default());
+        let worked = [
+            call("c1", "t", json!({})),
+            Message::tool_result("c1", &text),
+        ];
+        let facts = facts_of(&worked, &pinned, &same_id);
+        assert_eq!(facts.pointers, vec![id]);
+        assert_eq!(facts.pinned, vec![text]);
+    }
+
+    #[test]
+    fn a_pointer_is_listed_only_for_a_result_that_holds_it() {
+        let with = format!("shown\n{}", kept::pointer_line(ID));
+        let dropped = [
+            call("c1", "t", json!({})),
+            Message::tool_result("c1", "a short result with no pointer"),
+            call("c2", "t", json!({})),
+            Message::tool_result("c2", &with),
+        ];
+        let facts = facts_of(&dropped, &[], &same_id);
+        assert_eq!(facts.pointers, vec![ID.to_owned()], "listed once, for c2");
+        // A pointer line for another id than the call's own is no pointer.
+        let facts = facts_of(&dropped, &[], &|_: &str| {
+            Some("o-00000000000000aa".to_owned())
+        });
+        assert!(facts.pointers.is_empty());
+    }
+
+    #[test]
+    fn a_start_or_a_send_marks_the_sessions() {
+        for name in [SUBAGENT_START, SUBAGENT_SEND] {
+            let facts = facts_of(&[call("c1", name, json!({}))], &[], &same_id);
+            assert!(facts.sessions, "{name}");
+        }
+        let facts = facts_of(&[call("c1", "other", json!({}))], &[], &same_id);
+        assert!(!facts.sessions);
+    }
+
+    #[test]
+    fn a_pinned_result_is_copied_up_to_its_bound() {
+        let big = "p".repeat(PINNED_EACH_BYTES + 10_000);
+        let dropped = [call("c1", "t", json!({})), Message::tool_result("c1", &big)];
+        let facts = facts_of(&dropped, &["c1".to_owned()], &same_id);
+        assert_eq!(facts.pinned[0].len(), PINNED_EACH_BYTES + CUT_NOTE.len());
+        assert!(facts.pinned[0].ends_with(CUT_NOTE));
+    }
+
+    #[test]
+    fn the_pinned_results_of_a_marker_fit_the_room_after_escaping() {
+        let each = |c: char| Compaction {
+            pinned: vec![c.to_string().repeat(30 * 1024)],
+            ..compaction()
+        };
+        let body = marker_body(None, None, &[each('a'), each('b'), each('c')]);
+        assert_eq!(body.matches(&"c".repeat(30 * 1024)).count(), 1);
+        assert_eq!(body.matches(&"b".repeat(30 * 1024)).count(), 1);
+        assert_eq!(
+            body.matches(&"a".repeat(30 * 1024)).count(),
+            0,
+            "the oldest does not fit"
+        );
+        // The room is spent on what is written: 8,000 lines that start with `[` are 32,000 bytes
+        // and 56,000 once escaped, so a second one does not fit in 64 KiB.
+        let lines = |tag: &str| format!("{tag}{}", "[ab\n".repeat(8000));
+        let c = |tag| Compaction {
+            pinned: vec![lines(tag)],
+            ..compaction()
+        };
+        let body = marker_body(None, None, &[c("1"), c("2")]);
+        assert_eq!(body.matches("\\x5bab").count(), 7999, "one of the two");
+        assert!(body.len() < PINNED_ALL_BYTES + 1024, "{}", body.len());
+    }
+
+    #[test]
+    fn pointers_and_skills_are_listed_up_to_fifty() {
+        let c = Compaction {
+            pointers: (0..60).map(|n| format!("o-{n:016x}")).collect(),
+            skills: (0..60).map(|n| format!("skill{n}")).collect(),
+            ..compaction()
+        };
+        let body = marker_body(None, None, &[c]);
+        assert_eq!(body.matches("\n[kept as ").count(), MAX_LISTED);
+        assert!(!body.contains("o-0000000000000009;"), "the oldest give way");
+        assert!(body.contains("o-000000000000000a;"));
+        assert!(body.contains("o-000000000000003b;"));
+        let skills = body
+            .lines()
+            .find_map(|l| l.strip_prefix("Skills loaded earlier: "))
+            .expect("skills line");
+        let names: Vec<&str> = skills.split(" (load").next().unwrap().split(", ").collect();
+        assert_eq!(names.len(), MAX_LISTED);
+        assert_eq!(names[0], "skill0");
+    }
+
+    #[test]
+    fn the_sessions_line_stays_through_a_later_compaction() {
+        let first = Compaction {
+            sessions: true,
+            ..compaction()
+        };
+        let second = compaction();
+        let body = marker_body(None, None, &[first, second]);
+        assert!(body.contains(SUBAGENT_LIST), "{body}");
+        let body = marker_body(None, None, &[compaction()]);
+        assert!(!body.contains(SUBAGENT_LIST), "{body}");
+    }
+
+    #[test]
+    fn the_markers_own_part_is_not_a_saying() {
+        let m = [
+            user_parts(&["task", "[marker]", "first words"]),
+            user_parts(&["later"]),
+        ];
+        assert_eq!(sayings_of(&m, true), vec!["first words", "later"]);
+        assert_eq!(
+            sayings_of(&m, false),
+            vec!["[marker]", "first words", "later"]
+        );
+    }
+
+    #[test]
+    fn the_sayings_kept_are_bounded_newest_first_and_in_order() {
+        let text = |n: usize| format!("{n}{}", "w".repeat(999));
+        let ten: Vec<String> = (0..10).map(text).collect();
+        let kept = kept_sayings(ten.clone());
+        assert_eq!(kept, ten[2..].to_vec(), "the eight newest, oldest first");
+        assert!(kept.iter().map(|s| s.chars().count()).sum::<usize>() <= SAYINGS_MAX_CHARS);
+        // One saying is cut to its bound, with the note.
+        let long = "é".repeat(5000);
+        let kept = kept_sayings(vec![long]);
+        assert_eq!(kept[0].chars().count(), SAYING_MAX_CHARS + CUT_NOTE.len());
+        assert!(kept[0].ends_with(CUT_NOTE));
+    }
+
+    #[test]
+    fn a_saying_over_its_bound_is_cut_and_one_that_was_cut_is_not_cut_again() {
+        let exactly = "a".repeat(SAYING_MAX_CHARS);
+        assert_eq!(kept_sayings(vec![exactly.clone()]), vec![exactly]);
+        for over in [1, 5, CUT_NOTE.len()] {
+            let saying = "a".repeat(SAYING_MAX_CHARS + over);
+            let kept = kept_sayings(vec![saying]);
+            assert_eq!(
+                kept[0].chars().count(),
+                SAYING_MAX_CHARS + CUT_NOTE.len(),
+                "{over}"
+            );
+            assert!(kept[0].ends_with(CUT_NOTE));
+        }
+        let cut = format!("{}{CUT_NOTE}", "a".repeat(SAYING_MAX_CHARS));
+        assert_eq!(kept_sayings(vec![cut.clone()]), vec![cut]);
+    }
+
+    fn history_of(n: usize) -> Conversation {
+        let mut state = Conversation::new("go");
+        for turn in 0..n {
+            state
+                .messages
+                .push(call(&format!("c{turn}"), "t", json!({})));
+            state
+                .messages
+                .push(Message::tool_result(format!("c{turn}"), "result"));
+        }
+        state.turns = u32::try_from(n).unwrap();
+        state
+    }
+
+    fn marker_parts(state: &Conversation) -> usize {
+        match &state.messages[0] {
+            Message::User { content } => content
+                .iter()
+                .filter(|p| p.as_text().starts_with(OMITTED_MARKER_PREFIX))
+                .count(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_compaction_leaves_the_estimate_to_start_again_and_the_task_first_through_two() {
+        let mut state = history_of(10);
+        state.last_prompt = Some(PromptSize {
+            input_tokens: 9000,
+            messages: state.messages.len(),
+        });
+        apply(
+            &mut state,
+            1 + 2 * 6,
+            Some("S1"),
+            CompactionReason::Budget,
+            None,
+            &same_id,
+        );
+        assert_eq!(
+            state.last_prompt, None,
+            "the reported prompt is of a history that is gone"
+        );
+        assert_eq!(state.omitted_turns, 6);
+        for turn in 10..16 {
+            state
+                .messages
+                .push(call(&format!("c{turn}"), "t", json!({})));
+            state
+                .messages
+                .push(Message::tool_result(format!("c{turn}"), "result"));
+        }
+        state
+            .messages
+            .insert(1, user_parts(&["a later word of the person"]));
+        state.last_prompt = Some(PromptSize {
+            input_tokens: 9000,
+            messages: 3,
+        });
+        apply(
+            &mut state,
+            1 + 1 + 2 * 4,
+            Some("S2"),
+            CompactionReason::Budget,
+            None,
+            &same_id,
+        );
+        let Message::User { content } = &state.messages[0] else {
+            panic!("the first message is the person's");
+        };
+        assert_eq!(content[0].as_text(), "go", "the task is the first part");
+        assert_eq!(marker_parts(&state), 1, "one marker: {content:?}");
+        assert!(content[1].as_text().contains("S2"));
+        assert_eq!(
+            content
+                .iter()
+                .skip(2)
+                .map(|p| p.as_text())
+                .collect::<Vec<_>>(),
+            vec!["a later word of the person"],
+            "the earlier marker is not one of the person's words"
+        );
+        assert_eq!(state.last_prompt, None);
+        assert_eq!(state.compactions.len(), 2);
+    }
 }
