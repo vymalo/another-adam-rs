@@ -52,6 +52,7 @@ use serde_json::{Value, json};
 
 use super::create::{CREATE_REPOSITORY, CREATED_PREFIX, consent_of};
 use super::named::key_of_argument;
+use super::notes::RunNotes;
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// The tool's name.
@@ -72,6 +73,14 @@ pub(crate) fn is_answered_by_the_person(tool: &str) -> bool {
     tool == ASK_USER || is_consent_tool(tool)
 }
 
+/// Whether `call` is a question about reading a repository as a reference. Its answer is a consent
+/// to that and **names no repository**, whether it came back as a form or as words: the words of a
+/// yes (`Yes, read acme/lib`) hold the address, and a person who typed them did not name it as the
+/// repository to work on.
+pub(crate) fn is_reference_question(call: &ToolCall) -> bool {
+    call.name == REQUEST_REPOSITORY && reference_of(&call.arguments).is_some()
+}
+
 /// Whether `tool` asks a question of its own writing, whose answer is a consent.
 pub(crate) fn is_consent_tool(tool: &str) -> bool {
     tool == REQUEST_REPOSITORY || tool == CREATE_REPOSITORY
@@ -88,17 +97,24 @@ pub(crate) struct Asked {
     pub yes: String,
 }
 
-/// What a call of a consent tool asked the person, from its arguments. `None` when the arguments
-/// are not something that could have been asked (nothing was asked, so nothing was answered).
-pub(crate) fn asked_by(tool: &str, arguments: &Value) -> Option<Asked> {
+/// What a call of a consent tool asked the person, from its arguments and the run's notes. `None`
+/// when the arguments are not something that could have been asked (nothing was asked, so nothing
+/// was answered): a question about a reference that no prepared repository declared at that address
+/// was never put.
+pub(crate) fn asked_by(tool: &str, arguments: &Value, notes: &RunNotes) -> Option<Asked> {
     match tool {
         REQUEST_REPOSITORY => {
             let url = arguments.get("repo_url")?.as_str()?;
             let key = key_of_argument(url)?;
             let display = display_name(url)?;
-            Some(if reference_of(arguments).is_some() {
+            Some(if let Some(name) = reference_of(arguments) {
+                // The branch is the declaration's, recorded when the repository was prepared.
+                let (_, declared) = notes.declared_reference(name)?;
+                if key_of_argument(&declared.url).as_deref() != Some(key.as_str()) {
+                    return None;
+                }
                 Asked {
-                    subject: reference_subject(&key),
+                    subject: reference_subject(&key, declared.branch.as_deref()),
                     yes: read_label(&display),
                 }
             } else {
@@ -149,9 +165,13 @@ pub(crate) fn yes_label(display: &str) -> String {
 /// What a subject starts with when the question was about reading a repository as a reference.
 pub(crate) const REFERENCE_SUBJECT_PREFIX: &str = "reference:";
 
-/// The subject of the consent to read the repository with `key` as a reference.
-pub(crate) fn reference_subject(key: &str) -> String {
-    format!("{REFERENCE_SUBJECT_PREFIX}{key}")
+/// The subject of the consent to read the repository with `key` as a reference, at `branch` (`None`:
+/// its default branch). Another branch of the same repository is another question.
+pub(crate) fn reference_subject(key: &str, branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!("{REFERENCE_SUBJECT_PREFIX}{key}@{branch}"),
+        None => format!("{REFERENCE_SUBJECT_PREFIX}{key}"),
+    }
 }
 
 /// Whether `subject` is the consent to read a repository as a reference.
@@ -786,6 +806,58 @@ mod tests {
             choices[0]["options"],
             json!([{"value": "yes", "label": "Yes, add it"}, {"value": "no", "label": "No"}])
         );
+    }
+
+    #[test]
+    fn a_question_about_a_reference_is_for_its_repository_and_branch_and_none_other() {
+        use super::super::notes::{DeclaredReference, RepoReferencesNote};
+        let mut notes = RunNotes::default();
+        let declare = |name: &str, branch: Option<&str>| DeclaredReference {
+            name: name.to_owned(),
+            url: "https://github.com/acme/lib".to_owned(),
+            branch: branch.map(str::to_owned),
+            description: "d".to_owned(),
+        };
+        notes.repo_references.insert(
+            "app".to_owned(),
+            RepoReferencesNote {
+                references: vec![declare("lib", None), declare("lib-dev", Some("dev"))],
+                ..RepoReferencesNote::default()
+            },
+        );
+        let asking = |url: &str, reference: &str| json!({"repo_url": url, "reason": "r", "reference": reference});
+        let lib = "https://github.com/acme/lib";
+        let subject = |reference: &str| {
+            asked_by(REQUEST_REPOSITORY, &asking(lib, reference), &notes).map(|a| a.subject)
+        };
+        assert_eq!(
+            subject("lib").as_deref(),
+            Some("reference:github.com/acme/lib")
+        );
+        assert_eq!(
+            subject("lib-dev").as_deref(),
+            Some("reference:github.com/acme/lib@dev"),
+            "another branch is another question"
+        );
+        // Nothing was asked: no declaration of that name, or one at another address.
+        assert_eq!(subject("nope"), None);
+        assert_eq!(
+            asked_by(
+                REQUEST_REPOSITORY,
+                &asking("https://github.com/acme/other", "lib"),
+                &notes
+            ),
+            None
+        );
+        // A repository's own question is its key, as before, whatever the notes hold.
+        let plain = asked_by(
+            REQUEST_REPOSITORY,
+            &json!({"repo_url": lib, "reason": "r"}),
+            &notes,
+        )
+        .unwrap();
+        assert_eq!(plain.subject, "github.com/acme/lib");
+        assert_eq!(plain.yes, "Yes, add acme/lib");
     }
 
     #[test]

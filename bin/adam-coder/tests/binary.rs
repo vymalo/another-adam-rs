@@ -804,6 +804,43 @@ async fn a_worker_whose_folder_cannot_be_assembled_exits_78_naming_the_problem()
     db.finish().await;
 }
 
+/// `ADAM_REFERENCES_FILE` is the deployment's file: one that is not a file of references, or one
+/// that names an address the workspaces' policy refuses (a host nobody allowed), stops a worker at
+/// startup with exit 78 naming the variable or the reference, and not at the first read of a run.
+#[tokio::test]
+async fn a_references_file_a_worker_cannot_use_exits_78_naming_it() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let cases: [(&str, &str, &[&str]); 2] = [
+        ("[]", "is not usable", &["ADAM_REFERENCES_FILE"]),
+        (
+            r#"{"references": [{"name": "elsewhere", "url": "https://evil.example/acme/x", "description": "a host nobody allowed"}]}"#,
+            "cannot be read by this deployment",
+            &["`elsewhere`"],
+        ),
+    ];
+    for (text, wants, names) in cases {
+        let file = tmp.path().join("references.json");
+        std::fs::write(&file, text).unwrap();
+        let mut env = role_env("worker", &db.url(), tmp.path());
+        env.push((
+            "ADAM_REFERENCES_FILE".into(),
+            file.to_string_lossy().into_owned(),
+        ));
+        let mut p = Proc::spawn(&env);
+        let status = p.exit_within(Duration::from_secs(60)).await;
+        assert_eq!(status.code(), Some(78), "{text}: {}", p.logs());
+        let err = failure(&p)["error"].as_str().unwrap().to_owned();
+        assert!(err.contains(wants), "{wants:?} missing from:\n{err}");
+        for name in names {
+            assert!(err.contains(name), "{name} missing from:\n{err}");
+        }
+    }
+    db.finish().await;
+}
+
 /// `mcp.json` in the folder: a worker connects the servers it names at startup (with the token
 /// from the environment in the header), serves, and stops on SIGTERM with exit code 0. A control
 /// plane steps no run, so it connects none of them (the server it names is down and it starts).

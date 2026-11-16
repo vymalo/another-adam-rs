@@ -22,6 +22,25 @@
 //! (`check_out`): the mirror is fetched and the checkout made by the coder's own git (its sandbox,
 //! when the deployment has one), never in a run pod. Reading is tier `plan`. A run with one repository
 //! and one reference still defaults to the repository for a write and for a read that names no slot.
+//! The first read says which commit it holds and the run's notes keep it: a reference made again
+//! (its directory was lost) is checked out at that commit, and a commit that is gone is said, never
+//! replaced by the branch's tip.
+//!
+//! **Names.** A reference is reached by its name; the repository it holds is reached by its address,
+//! and when the run also works in that repository (a slot of its own) the address is the working
+//! copy's and the name stays the reference's. A name that is the directory of another slot is never
+//! answered with that slot: a repository's own declaration of such a name is not offered, and for a
+//! static reference the lookup says it is both.
+//!
+//! **What a yes is.** A yes to `request_repository` with `reference` is a yes to reading **that
+//! address at that branch** (another branch of one repository is another question) and nothing
+//! else. It names no repository to work on, in a form's answer and in typed words alike (a typed
+//! `Yes, read acme/lib` holds the address): `prepare_workspace` of it is still refused. What is read
+//! there can end up in what the run writes (a commit, a pull request), so the question says so. A
+//! reference a repository declared is fetched with the credentials of a repository: the bounds are
+//! the person's yes to the exact address and branch shown, the workspaces' policy for the address
+//! (allowed hosts, the owners a GitHub App acts for) and an http(s) address with no credentials, no
+//! query string and no fragment. Nothing ties the reference's owner to the repository's.
 //!
 //! **Writing is refused at three places.** The tools: every tool that acts in a slot asks
 //! `ToolEnv::slot_to_write`, which refuses a slot that is not
@@ -112,6 +131,14 @@ pub enum ReferencesError {
     /// for a definition that was built by hand).
     #[error("the agent's references are not usable: {0}")]
     Agent(String),
+    /// The workspaces' policy refuses a reference's address (a host or an owner nobody allowed).
+    #[error("the reference `{name}` cannot be read by this deployment: {why}")]
+    Refused {
+        /// The reference.
+        name: String,
+        /// Why, in the workspaces' words.
+        why: String,
+    },
 }
 
 impl Classify for ReferencesError {
@@ -186,6 +213,28 @@ impl References {
     pub fn of(defs: Vec<ReferenceDef>) -> Result<Self, ReferencesError> {
         check_references(&defs).map_err(ReferencesError::Agent)?;
         Ok(Self { defs })
+    }
+
+    /// Check each reference's address against the policy of `workspaces` (the allowed hosts, the
+    /// owners a GitHub App acts for): a reference the deployment could never read is a mistake of
+    /// its files, found at startup and not at the first read.
+    ///
+    /// # Errors
+    ///
+    /// [`ReferencesError::Refused`] for the first address the policy refuses.
+    pub fn check_against(
+        &self,
+        workspaces: &adam_workspace::Workspaces,
+    ) -> Result<(), ReferencesError> {
+        for def in &self.defs {
+            workspaces
+                .check_repository(&RepoRef::new(def.url.as_str(), "main"))
+                .map_err(|e| ReferencesError::Refused {
+                    name: def.name.clone(),
+                    why: e.to_string(),
+                })?;
+        }
+        Ok(())
     }
 
     /// The reference called `name`.
@@ -309,9 +358,14 @@ pub fn slot_use(name: &str) -> Option<SlotUse> {
     })
 }
 
-/// What the model is told when it tries to write to a reference.
+/// What the model is told when it tries to write to the reference in `slot`.
 pub(super) fn refusal(slot: &Slot) -> String {
-    let name = paging::escape_name(slot.dir().as_bytes());
+    refusal_named(slot.dir())
+}
+
+/// What the model is told when it tries to write to the reference called `name`.
+pub(super) fn refusal_named(name: &str) -> String {
+    let name = paging::escape_name(name.as_bytes());
     format!(
         "`{name}` is a reference: it is read and never changed, so nothing is written, committed, \
          pushed or opened there. Read it with read_file, list_files, find_files or search_files \
@@ -405,6 +459,14 @@ pub(super) async fn at_prepare(
         .values()
         .flat_map(|n| n.references.iter().map(|r| r.name.clone()))
         .collect();
+    let workspace = env.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
+    let dirs: Vec<String> = workspace
+        .slots()
+        .await
+        .map_err(|e| workspace_error(&e))?
+        .iter()
+        .map(|s| s.dir().to_owned())
+        .collect();
     let note = match read {
         // No file: nothing declared, and nothing to say. Recorded, so that it is not read again.
         Err(Fail::Missing) => RepoReferencesNote {
@@ -417,7 +479,7 @@ pub(super) async fn at_prepare(
             ..RepoReferencesNote::default()
         },
         Ok(text) => match read_references_leniently(&text) {
-            Ok(read) => shape(ctx, env, &taken, read),
+            Ok(read) => shape(ctx, env, &taken, &dirs, read),
             Err(why) => RepoReferencesNote {
                 call_id: ctx.call_id().to_owned(),
                 skipped: vec![format!("{REPOSITORY_FILE} is not usable: {why}")],
@@ -440,6 +502,7 @@ fn shape(
     ctx: &ToolCtx,
     env: &ToolEnv,
     taken: &[String],
+    dirs: &[String],
     read: ReferencesRead,
 ) -> RepoReferencesNote {
     let mut note = RepoReferencesNote {
@@ -455,7 +518,16 @@ fn shape(
                 .push(format!("`{shown}`: the name is declared elsewhere already"));
             continue;
         }
-        if let Err(why) = declared_address_ok(&def.url) {
+        // A name that is a directory of this workspace would be read as that slot, never as the
+        // reference: it is not offered.
+        if dirs.contains(&def.name) {
+            note.skipped.push(format!(
+                "`{shown}`: the name is the directory of a slot of this workspace already"
+            ));
+            continue;
+        }
+        let url = def.url.trim().to_owned();
+        if let Err(why) = declared_address_ok(&url) {
             note.skipped.push(format!("`{shown}`: {why}"));
             continue;
         }
@@ -463,7 +535,7 @@ fn shape(
         let one_line = scrubbed.split_whitespace().collect::<Vec<_>>().join(" ");
         note.references.push(DeclaredReference {
             name: def.name,
-            url: def.url.trim().to_owned(),
+            url,
             branch: def.branch,
             description: shorten(&one_line, adam::agent_fs::REFERENCE_DESCRIPTION_MAX),
         });
@@ -600,7 +672,7 @@ pub(super) async fn ask_to_read(
     if env.is_granted(ctx, &notes, &key).await {
         return Ok(ToolOutput::text(ALREADY_GRANTED));
     }
-    let subject = reference_subject(&key);
+    let subject = reference_subject(&key, declared.branch.as_deref());
     if notes.agreed(super::consent::REQUEST_REPOSITORY, &subject) {
         return Ok(ToolOutput::text(REFERENCE_ALREADY_AGREED));
     }
@@ -611,12 +683,22 @@ pub(super) async fn ask_to_read(
         )));
     }
     let origin = paging::escape_name(slot.as_bytes());
+    let at = match declared.branch.as_deref() {
+        Some(branch) => format!(
+            "{}, branch {}",
+            listing_text(&paging::escape_name(declared.url.as_bytes())),
+            listing_text(&paging::escape_name(branch.as_bytes()))
+        ),
+        None => format!(
+            "{}, its default branch",
+            listing_text(&paging::escape_name(declared.url.as_bytes()))
+        ),
+    };
     let lead = format!(
-        "May I read the repository {display} ({}) as a reference, which the repository {origin} lists in {REPOSITORY_FILE}?",
-        listing_text(&paging::escape_name(declared.url.as_bytes()))
+        "May I read the repository {display} ({at}) as a reference, which the repository {origin} lists in {REPOSITORY_FILE}?"
     );
     let why = format!(
-        "Read only: nothing in it is ever changed. The repository {origin} says: \"{}\". The agent says why: \"{}\"",
+        "Read only: nothing in it is ever changed. What the agent reads there can end up in what it writes (a commit, a pull request). The repository {origin} says: \"{}\". The agent says why: \"{}\"",
         listing_text(&quoted_reason(&declared.description)),
         listing_text(&quoted_reason(reason))
     );
@@ -638,35 +720,106 @@ pub(super) async fn ask_to_read(
 
 // ----------------------------------------------------------------------------- checking one out
 
+/// Whether `name` is a reference of this run: one the agent or the deployment declares, or one a
+/// prepared repository declared.
+pub(super) async fn is_declared(env: &ToolEnv, ctx: &ToolCtx, name: &str) -> Result<bool, Outcome> {
+    if env.references.get(name).is_some() {
+        return Ok(true);
+    }
+    let notes = env
+        .notes
+        .load(&ctx.root_run_id().to_string())
+        .await
+        .map_err(|e| Err(notes_error(&e)))?;
+    Ok(notes.declared_reference(name).is_some())
+}
+
+/// What the model is told when `name` is both a reference and the directory of another slot: `Some`
+/// when `held`, the slot with that directory, is not that reference (nor the working copy of its
+/// repository), so that the other slot is never answered in its place.
+pub(super) async fn name_clash(
+    env: &ToolEnv,
+    ctx: &ToolCtx,
+    held: &Slot,
+    name: &str,
+) -> Result<Option<String>, Outcome> {
+    if held.reference().is_some() {
+        return Ok(None);
+    }
+    let declared_url = match env.references.get(name) {
+        Some(def) => Some(def.url.clone()),
+        None => env
+            .notes
+            .load(&ctx.root_run_id().to_string())
+            .await
+            .map_err(|e| Err(notes_error(&e)))?
+            .declared_reference(name)
+            .map(|(_, declared)| declared.url.clone()),
+    };
+    let Some(url) = declared_url else {
+        return Ok(None);
+    };
+    let (declared, holds) = (
+        key_of_argument(&url),
+        held.worktree()
+            .and_then(|wt| key_of_argument(&wt.repo().url)),
+    );
+    if declared.is_some() && declared == holds {
+        // The reference's repository is one the run works on: it is read in its own slot.
+        return Ok(None);
+    }
+    let shown = paging::escape_name(name.as_bytes());
+    let what = match held.checkout() {
+        Some(wt) => format!(
+            "the repository {}",
+            paging::escape_name(wt.repo().url.as_bytes())
+        ),
+        None => "a scratch project".to_owned(),
+    };
+    Ok(Some(format!(
+        "`{shown}` is the name of the reference {} and the directory of a slot of this workspace that \
+         holds {what}: nothing was read, because either answer could be the wrong one. Name the slot by \
+         its repository's address; the reference cannot be read under that name while the slot has it.",
+        listing_text(&paging::escape_name(url.as_bytes()))
+    )))
+}
+
 /// The slot of the reference `name`, checked out now if it is not yet: `Ok(None)` when `name` is no
 /// reference of this run (the caller says what slots there are).
 ///
 /// A reference the agent or the deployment declares is checked out without a question. One a
-/// repository declared needs the person's yes recorded for **its recorded address**; without it the
-/// result for the model says how to ask. The address is checked like a repository's, the base branch
-/// is the declaration's or the repository's default, and the fetch and the checkout are the
-/// workspace's (the coder's own git, never a run pod). Reading is tier `plan`.
+/// repository declared needs the person's yes recorded for **its recorded address and branch**;
+/// without it the result for the model says how to ask. The address is checked like a repository's,
+/// the base branch is the declaration's or the repository's default, and the fetch and the checkout
+/// are the workspace's (the coder's own git, never a run pod). Reading is tier `plan`.
+///
+/// The first checkout records the commit it holds in the run's notes and says it in the result of the
+/// call; a reference made again (its directory was lost) is checked out at that commit and never at
+/// where the branch is by then.
 pub(super) async fn check_out(
     env: &ToolEnv,
     ctx: &ToolCtx,
     name: &str,
 ) -> Result<Option<Slot>, Outcome> {
     let run = ctx.root_run_id().to_string();
+    let notes = env
+        .notes
+        .load(&run)
+        .await
+        .map_err(|e| Err(notes_error(&e)))?;
     let def = if let Some(def) = env.references.get(name) {
         def.clone()
     } else {
-        let notes = env
-            .notes
-            .load(&run)
-            .await
-            .map_err(|e| Err(notes_error(&e)))?;
         let Some((slot, declared)) = notes.declared_reference(name) else {
             return Ok(None);
         };
         let shown = shorten(&paging::escape_name(name.as_bytes()), 80);
         let key = key_of_argument(&declared.url);
         let agreed = key.as_deref().is_some_and(|key| {
-            notes.agreed(super::consent::REQUEST_REPOSITORY, &reference_subject(key))
+            notes.agreed(
+                super::consent::REQUEST_REPOSITORY,
+                &reference_subject(key, declared.branch.as_deref()),
+            )
         });
         if !agreed {
             let origin = paging::escape_name(slot.as_bytes());
@@ -693,6 +846,7 @@ pub(super) async fn check_out(
         .workspaces
         .run(&run)
         .map_err(|e| Err(workspace_error(&e)))?;
+    let pinned = notes.reference_commits.get(&def.name).cloned();
     let base = match def.branch.clone() {
         Some(base) => base,
         None => match env.workspaces.default_branch(&def.url).await {
@@ -711,13 +865,63 @@ pub(super) async fn check_out(
     ctx.emit_progress(format!("checking out the reference {shown} ({base})"))
         .await;
     let repo = RepoRef::new(def.url.as_str(), base.as_str());
-    match workspace.add_reference(&repo, &def.name).await {
-        Ok(slot) => {
-            // The pod of a run that has one is told of the new slot, read-only.
-            let _ = env.seal(ctx, &workspace).await;
-            Ok(Some(slot))
-        }
-        Err(e) => Err(unreadable(&def.name, &e)),
+    let slot = match workspace
+        .add_reference_at(&repo, &def.name, pinned.as_deref())
+        .await
+    {
+        Ok(slot) => slot,
+        Err(e) => return Err(unreadable(&def.name, &e)),
+    };
+    // The pod of a run that has one is told of the new slot, read-only. What the pod does not
+    // mount yet is the model's to know: a command that already runs there sees it writable.
+    if let Some(note) = env.seal(ctx, &workspace).await {
+        env.tell(ctx, note);
+    }
+    let commit = match (&pinned, slot.reference()) {
+        (Some(pinned), _) => Some(pinned.clone()),
+        (None, Some(wt)) => match wt.head_commit().await {
+            Ok(commit) => {
+                record_commit(env, &run, &def.name, &commit).await;
+                Some(commit)
+            }
+            Err(e) => {
+                tracing::warn!(run, reference = %def.name, error = %e, "cannot read the commit a reference was checked out at");
+                None
+            }
+        },
+        (None, None) => None,
+    };
+    if let Some(commit) = commit {
+        let again = if pinned.is_some() {
+            ", made again at the commit it was first read at"
+        } else {
+            ""
+        };
+        env.tell(
+            ctx,
+            format!(
+                "Reference `{shown}` is at commit {} of {} (branch {base}){again}. It stays at that commit for this run.",
+                commit.chars().take(12).collect::<String>(),
+                listing_text(&paging::escape_name(def.url.as_bytes())),
+            ),
+        );
+    }
+    Ok(Some(slot))
+}
+
+/// Keep the commit the reference `name` was first read at in the run's notes. A failure is logged and
+/// the reference is read anyway: it is made again at the branch's tip then.
+async fn record_commit(env: &ToolEnv, run: &str, name: &str, commit: &str) {
+    let recorded = async {
+        let mut notes = env.notes.load(run).await?;
+        notes
+            .reference_commits
+            .insert(name.to_owned(), commit.to_owned());
+        env.notes.save(run, &notes).await
+    }
+    .await;
+    if let Err(e) = recorded {
+        tracing::warn!(run, reference = name, error = %e, "cannot record the commit a reference was read at");
     }
 }
 

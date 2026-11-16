@@ -133,6 +133,10 @@ async fn build_agent(
         &def.manifest().frontmatter.references,
         worker.references_file.as_deref(),
     )?;
+    // An address the workspaces' policy refuses is found now, not at the first read.
+    references
+        .check_against(&workspaces)
+        .context("checking the references against the workspaces' policy")?;
     if !references.is_empty() {
         tracing::info!(
             references = ?references.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),

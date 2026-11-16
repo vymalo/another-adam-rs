@@ -290,6 +290,9 @@ pub struct ToolEnv {
     /// repository a run works on and never written ([`references`]). None until
     /// [`ToolEnv::with_references`].
     pub references: References,
+    /// What a tool wants to add to its own result without being the one that builds it (a slot
+    /// made while reading: which commit it holds): by call, taken by [`Gated`] when the call ends.
+    notices: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 impl ToolEnv {
@@ -309,6 +312,7 @@ impl ToolEnv {
             unavailable_wait: None,
             credentials_hint: "GITHUB_TOKEN is valid and may push and open pull requests for the repository",
             references: References::default(),
+            notices: std::sync::Mutex::default(),
         }
     }
 
@@ -696,6 +700,26 @@ impl ToolEnv {
         }
     }
 
+    /// Add `line` to the result of the call `ctx` is running, after what the tool wrote: for what a
+    /// helper learned that the tool's own text does not carry (see [`references::check_out`]).
+    pub(crate) fn tell(&self, ctx: &ToolCtx, line: String) {
+        self.notices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(Self::call_key(ctx))
+            .or_default()
+            .push(line);
+    }
+
+    /// What was [`tell`](Self::tell)ed for the call `ctx` is running, once.
+    fn told(&self, ctx: &ToolCtx) -> Vec<String> {
+        self.notices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&Self::call_key(ctx))
+            .unwrap_or_default()
+    }
+
     /// The slot of the run's workspace that a tool **looks at**, or the message to give the model:
     /// it has no workspace yet, or it did not say which of several slots (see [`resolve_slot`]).
     ///
@@ -709,6 +733,34 @@ impl ToolEnv {
         ctx: &ToolCtx,
         repo: Option<&str>,
     ) -> Result<Slot, Outcome> {
+        self.slot_named(ctx, repo, false).await
+    }
+
+    /// The slot of the run's workspace that a tool **changes**: [`slot_to_read`](Self::slot_to_read),
+    /// and **never a reference**. This is the one gate of the tools: a slot that is not
+    /// [`writable`](Slot::writable) is the model's to be told about, and nothing is written. A write
+    /// that does not ask here is a defect, and a test calls every tool that writes with a reference
+    /// ([`references::slot_use`]). A reference that was never read is refused by its name and **not
+    /// checked out**: nothing is fetched for a write that cannot happen.
+    pub(crate) async fn slot_to_write(
+        &self,
+        ctx: &ToolCtx,
+        repo: Option<&str>,
+    ) -> Result<Slot, Outcome> {
+        let slot = self.slot_named(ctx, repo, true).await?;
+        if slot.writable() {
+            Ok(slot)
+        } else {
+            Err(Ok(ToolOutput::error(references::refusal(&slot))))
+        }
+    }
+
+    async fn slot_named(
+        &self,
+        ctx: &ToolCtx,
+        repo: Option<&str>,
+        to_write: bool,
+    ) -> Result<Slot, Outcome> {
         let run = ctx.root_run_id().to_string();
         let workspace = self
             .workspaces
@@ -718,34 +770,32 @@ impl ToolEnv {
             .slots()
             .await
             .map_err(|e| Err(workspace_error(&e)))?;
-        // A name that is no slot yet may be a reference that was never read: made now.
+        // A bare name may be a reference's: made now when it is read and was never read, and refused
+        // by its name when it is written. A slot that has the name as its directory and is not that
+        // reference is never answered in its place.
         if let Some(name) = repo.and_then(non_empty)
             && !name.contains(['/', ':'])
-            && !slots.iter().any(|slot| slot.dir() == name)
-            && let Some(slot) = references::check_out(self, ctx, name).await?
         {
-            return Ok(slot);
+            match slots.iter().find(|slot| slot.dir() == name) {
+                Some(held) => {
+                    if let Some(said) = references::name_clash(self, ctx, held, name).await? {
+                        return Err(Ok(ToolOutput::error(said)));
+                    }
+                }
+                None if to_write => {
+                    if references::is_declared(self, ctx, name).await? {
+                        return Err(Ok(ToolOutput::error(references::refusal_named(name))));
+                    }
+                }
+                None => {
+                    if let Some(slot) = references::check_out(self, ctx, name).await? {
+                        return Ok(slot);
+                    }
+                }
+            }
         }
         resolve_slot(slots, repo, &self.settings.default_repo_host)
             .map_err(|why| Ok(ToolOutput::error(why)))
-    }
-
-    /// The slot of the run's workspace that a tool **changes**: [`slot_to_read`](Self::slot_to_read),
-    /// and **never a reference**. This is the one gate of the tools: a slot that is not
-    /// [`writable`](Slot::writable) is the model's to be told about, and nothing is written. A write
-    /// that does not ask here is a defect, and a test calls every tool that writes with a reference
-    /// ([`references::slot_use`]).
-    pub(crate) async fn slot_to_write(
-        &self,
-        ctx: &ToolCtx,
-        repo: Option<&str>,
-    ) -> Result<Slot, Outcome> {
-        let slot = self.slot_to_read(ctx, repo).await?;
-        if slot.writable() {
-            Ok(slot)
-        } else {
-            Err(Ok(ToolOutput::error(references::refusal(&slot))))
-        }
     }
 }
 
@@ -756,7 +806,8 @@ impl ToolEnv {
 ///   them all (it is the model's to say which). A reference is never the default: a run with one
 ///   repository and one reference works in the repository.
 /// * `repo` given: the slot with that directory, else the slot of the repository it addresses
-///   (`https://github.com/acme/lib`, `acme/lib`, a local path: compared as [`named`] keys).
+///   (`https://github.com/acme/lib`, `acme/lib`, a local path: compared as [`named`] keys); when a
+///   reference and a slot the run works in hold that repository, the slot the run works in.
 pub(crate) fn resolve_slot(
     mut slots: Vec<Slot>,
     repo: Option<&str>,
@@ -815,14 +866,19 @@ pub(crate) fn resolve_slot(
     };
     let wanted = named::key_of_argument(repo)
         .or_else(|| named::named_in(repo, default_host).into_iter().next());
+    // The slot with that directory; else the slot of the repository the address names, and when a
+    // reference and a slot the run works in hold the same repository, the one the run works in (the
+    // reference is still reached by its own name).
     let at = slots
         .iter()
         .position(|slot| slot.dir() == repo)
         .or_else(|| {
             let wanted = wanted.as_deref()?;
+            let holding = |slot: &&Slot| key_of(slot).as_deref() == Some(wanted);
             slots
                 .iter()
-                .position(|slot| key_of(slot).as_deref() == Some(wanted))
+                .position(|slot| slot.writable() && holding(&slot))
+                .or_else(|| slots.iter().position(|slot| holding(&slot)))
         });
     match at {
         Some(at) => Ok(slots.remove(at)),
@@ -986,7 +1042,19 @@ impl Tool for Gated {
                 )));
             }
         }
-        self.inner.call(ctx, args).await
+        let result = self.inner.call(ctx, args).await;
+        // Taken whatever the result, so nothing outlives the call.
+        let told = self.env.told(ctx);
+        match result {
+            Ok(mut output) if !told.is_empty() => {
+                for line in told {
+                    output.content.push_str("\n\n");
+                    output.content.push_str(&line);
+                }
+                Ok(output)
+            }
+            other => other,
+        }
     }
 }
 

@@ -482,6 +482,10 @@ pub struct RunNotes {
     /// (`request_repository` with `reference`), and only the address recorded here is ever fetched.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repo_references: BTreeMap<String, RepoReferencesNote>,
+    /// The commit each reference was first read at, by reference name: a reference made again (its
+    /// directory was lost) is checked out at this commit, never at where the branch is by then.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reference_commits: BTreeMap<String, String>,
 }
 
 /// One reference a repository declared, as `prepare_workspace` listed it.
@@ -1449,5 +1453,28 @@ mod tests {
         assert!(store.load("../etc/passwd").await.is_err());
         assert!(store.save("a/b", &RunNotes::default()).await.is_err());
         assert!(store.load("").await.is_err());
+    }
+
+    #[test]
+    fn a_yes_to_reading_a_reference_is_recorded_and_names_no_repository() {
+        let consent = |tool: &str, subject: &str| Consent {
+            call_id: "q1".to_owned(),
+            tool: tool.to_owned(),
+            subject: subject.to_owned(),
+            agreed: true,
+        };
+        let mut notes = RunNotes::default();
+        assert!(notes.record_consents([consent(
+            "request_repository",
+            "reference:github.com/acme/lib@dev"
+        )]));
+        assert!(notes.named_repos.is_empty(), "{:?}", notes.named_repos);
+        assert!(notes.agreed("request_repository", "reference:github.com/acme/lib@dev"));
+        // The same words for another branch, or for the repository as a repository, are others.
+        assert!(!notes.agreed("request_repository", "reference:github.com/acme/lib"));
+        assert!(!notes.agreed("request_repository", "github.com/acme/lib"));
+        // A yes to adding a repository names it.
+        notes.record_consents([consent("request_repository", "github.com/acme/lib")]);
+        assert_eq!(notes.named_repos, ["github.com/acme/lib"]);
     }
 }

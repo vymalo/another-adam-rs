@@ -426,11 +426,9 @@ async fn write_tools_refuse_reference() {
         for url in [ghost, design_url.as_str()] {
             let refused = rig.call(name, address_args(name, url)).await;
             assert!(refused.is_error, "{name} {url}: {}", refused.content);
+            // The reference's own guard, not another gate that happens to refuse too.
             assert!(
-                refused.content.contains("reference")
-                    || refused
-                        .content
-                        .contains("not a repository the person named"),
+                refused.content.contains("is a reference of this workspace"),
                 "{name} {url}: {}",
                 refused.content
             );
@@ -441,6 +439,15 @@ async fn write_tools_refuse_reference() {
             "{name} left the reference alone"
         );
     }
+    // A reference named by its name is the reference, not a bare name read as another repository.
+    let by_name = rig
+        .call("merge_pull_request", json!({"repo": "design", "number": 1}))
+        .await;
+    assert!(
+        by_name.is_error && by_name.content.contains("is a reference of this workspace"),
+        "{}",
+        by_name.content
+    );
     // The ones that only look are not refused.
     for name in &reads {
         assert_ne!(slot_use(name), Some(SlotUse::Writes), "{name}");
@@ -816,16 +823,25 @@ fn mirrors(root: &Path) -> Vec<String> {
 /// The fixture's repository with a `.agents/references.json` that lists the references `entries`
 /// (`name`, `url`, `description`), and a git server with the repository `lib` behind it.
 async fn declaring(entries: &[(&str, &str, &str)]) -> (Fixture, GitHttp) {
+    declaring_raw(|base| {
+        entries
+            .iter()
+            .map(|(name, url, description)| {
+                json!({"name": name, "url": url.replace("{base}", base), "description": description})
+            })
+            .collect()
+    })
+    .await
+}
+
+/// [`declaring`] with the entries as the file holds them (a branch, for one), made from the server's
+/// base address.
+async fn declaring_raw(entries: impl FnOnce(&str) -> Vec<Value>) -> (Fixture, GitHttp) {
     let fx = Fixture::new().await.reaching_local_http();
     let served = fx.tmp.path().join("served");
     bare_repo(&served, "lib", &[("greeting.txt", "hello from lib\n")]);
     let server = serve_git(served).await;
-    let list: Vec<Value> = entries
-        .iter()
-        .map(|(name, url, description)| {
-            json!({"name": name, "url": url.replace("{base}", &server.base), "description": description})
-        })
-        .collect();
+    let list = entries(&server.base);
     fx.commit_to_main(
         ".agents/references.json",
         &json!({ "references": list }).to_string(),
@@ -1173,4 +1189,745 @@ async fn an_address_the_coder_refuses_for_a_repository_is_refused_for_a_referenc
         .await;
     assert!(read.is_error, "{}", read.content);
     assert_eq!(mirrors(&rig.fx.root), ["remote.git"], "nothing was fetched");
+}
+
+// ------------------------------------------------------------------------ what the person said
+
+/// A coder on a `Runtime` with a model script: parked on a question, answered, then ended.
+struct Live {
+    rt: Runtime,
+    run: RunId,
+    mock: Arc<MockModel>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl Live {
+    async fn start(fx: &Fixture, text: &str, script: impl FnOnce(&MockModel)) -> Self {
+        let mock = Arc::new(MockModel::new());
+        script(&mock);
+        let model: DynModel = mock.clone();
+        let agent = CoderAgent::new(model, "test-model", fx.env.clone());
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let rt = Runtime::builder(store)
+            .agent(agent)
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+        let worker = {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                let _ = rt
+                    .run_worker(async {
+                        let _ = rx.await;
+                    })
+                    .await;
+            })
+        };
+        let run = rt
+            .start(
+                AGENT_NAME,
+                Inbound::new("message", json!({ "text": text })),
+                None,
+            )
+            .await
+            .unwrap();
+        Self {
+            rt,
+            run,
+            mock,
+            stop: Some(stop),
+            worker,
+        }
+    }
+
+    /// Wait until the run waits for the person; what the form says is returned.
+    async fn parked(&self) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let view = self.rt.view(self.run).await.unwrap().unwrap();
+            if view.waiting {
+                return format!("{view:?}");
+            }
+            assert!(Instant::now() < deadline, "timed out: {view:#?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Stop the worker.
+    async fn finish(mut self) {
+        let _ = self.stop.take().map(|stop| stop.send(()));
+        self.worker.await.unwrap();
+    }
+
+    /// Deliver `answer`, wait for the run to end or wait again, and stop the worker.
+    async fn answered(mut self, answer: Inbound, fx: &Fixture) -> (RunNotes, Arc<MockModel>) {
+        self.rt.deliver(self.run, answer).await.unwrap();
+        wait_done(&self.rt, self.run).await;
+        let _ = self.stop.take().map(|stop| stop.send(()));
+        self.worker.await.unwrap();
+        let notes = fx.env.notes.load(&self.run.to_string()).await.unwrap();
+        (notes, self.mock)
+    }
+}
+
+/// Words that say yes to reading a repository as a reference name no repository to work on: the
+/// words of the label hold its address, and a person who typed them said yes to reading it, not that
+/// it is the repository of the task. Whether the question went out as a form or as text.
+#[tokio::test]
+async fn a_typed_yes_to_reading_a_reference_names_no_repository() {
+    let lib = "https://github.com/acme/lib";
+    let lib_key = key_of_argument(lib).unwrap();
+    let (fx, _server) = declaring(&[("lib", lib, "The shared library")]).await;
+    let remote = fx.remote_url();
+    let live = Live::start(
+        &fx,
+        &format!("In {remote}, add the shared greeting."),
+        |mock| {
+            mock.push_tool_calls(vec![call(
+                "p1",
+                "prepare_workspace",
+                json!({"repo_url": remote, "base_branch": "main"}),
+            )])
+            .push_tool_calls(vec![call(
+                "q1",
+                "request_repository",
+                json!({"repo_url": lib, "reason": "the greeting is in the library", "reference": "lib"}),
+            )])
+            .push_tool_calls(vec![call(
+                "x1",
+                "prepare_workspace",
+                json!({"repo_url": lib}),
+            )])
+            .push_text("Done.");
+        },
+    )
+    .await;
+    live.parked().await;
+    let (notes, mock) = live
+        .answered(
+            Inbound::new("message", json!({"text": "Yes, read acme/lib"})),
+            &fx,
+        )
+        .await;
+    assert!(
+        !notes.named_repos.contains(&lib_key),
+        "the words of a yes to reading name nothing: {:?}",
+        notes.named_repos
+    );
+    let add = result_of(&mock, "x1");
+    assert!(add.contains("not a repository the person named"), "{add}");
+    assert!(!fx.root.join("git").join("github.com").join("acme").exists());
+}
+
+// ----------------------------------------------------- a reference and a working copy of one repository
+
+/// A reference and the working copy of the same repository both exist: the working copy is reached by
+/// the repository's address (to read and to write), the reference by its own name, and the reference
+/// stays where it was read.
+#[tokio::test]
+async fn a_reference_and_the_working_copy_of_one_repository_are_reached_by_their_own_names() {
+    let fx = Fixture::new().await;
+    let remote = fx.remote_url();
+    let fx = fx.referencing(vec![def("design", &remote, "The repository, read")]);
+    let rig = Rig::new(fx, AccessTier::Auto).await;
+    rig.named(&remote).await;
+
+    // Read as a reference first.
+    let first = rig
+        .call("read_file", json!({"path": "README.md", "repo": "design"}))
+        .await;
+    assert!(!first.is_error, "{}", first.content);
+    // The person names it, and it is prepared: a slot of its own, writable.
+    let prepared = rig
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )
+        .await;
+    assert!(!prepared.is_error, "{}", prepared.content);
+    assert!(rig.slot("remote").is_dir() && rig.slot("design").is_dir());
+
+    // By address: the working copy.
+    let written = rig
+        .call(
+            "write_file",
+            json!({"path": "mine.txt", "content": "mine\n", "repo": remote}),
+        )
+        .await;
+    assert!(!written.is_error, "{}", written.content);
+    assert!(rig.slot("remote").join("mine.txt").is_file());
+    assert!(!rig.slot("design").join("mine.txt").exists());
+    let by_address = rig
+        .call("read_file", json!({"path": "mine.txt", "repo": remote}))
+        .await;
+    assert!(
+        by_address.content.contains("mine"),
+        "{}",
+        by_address.content
+    );
+    // By name: the reference, as it was read.
+    let by_name = rig
+        .call("read_file", json!({"path": "mine.txt", "repo": "design"}))
+        .await;
+    assert!(by_name.is_error, "{}", by_name.content);
+    let still = rig
+        .call("read_file", json!({"path": "README.md", "repo": "design"}))
+        .await;
+    assert!(!still.is_error, "{}", still.content);
+    // And a write that names the reference is still refused.
+    let refused = rig
+        .call(
+            "write_file",
+            json!({"path": "x.txt", "content": "x", "repo": "design"}),
+        )
+        .await;
+    assert!(
+        refused.is_error && refused.content.contains("is a reference"),
+        "{}",
+        refused.content
+    );
+}
+
+/// What the person named is theirs to change, whatever else reads it: the reference's guard stands
+/// aside for a repository they named.
+#[tokio::test]
+async fn a_repository_the_person_named_is_not_refused_as_a_reference() {
+    let (fx, _url) = with_design().await;
+    let ghost = "https://github.com/acme/ghost";
+    let mut refs: Vec<ReferenceDef> = fx.env.references.iter().cloned().collect();
+    refs.push(def("ghost", ghost, "Nobody has read it"));
+    let fx = fx.referencing(refs);
+    let rig = Rig::new(fx, AccessTier::Bypass).await;
+    let unnamed = rig
+        .call(
+            "rename_repository",
+            json!({"repo": ghost, "new_name": "renamed"}),
+        )
+        .await;
+    assert!(
+        unnamed.is_error && unnamed.content.contains("is a reference of this workspace"),
+        "{}",
+        unnamed.content
+    );
+    rig.named(ghost).await;
+    let named = rig
+        .call(
+            "rename_repository",
+            json!({"repo": ghost, "new_name": "renamed"}),
+        )
+        .await;
+    assert!(
+        !named.content.contains("is a reference of this workspace"),
+        "named too, so allowed: {}",
+        named.content
+    );
+}
+
+// ----------------------------------------------------------------------- a write fetches nothing
+
+/// A write that names a reference nobody read is refused by the name: nothing is fetched or checked
+/// out for a write that cannot happen. For a static reference and for one a repository declared.
+#[tokio::test]
+async fn a_write_to_a_reference_nobody_read_fetches_nothing() {
+    let (fx, _server) = declaring(&[LIB_ENTRY]).await;
+    let ghost = "https://github.com/acme/ghost";
+    let fx = fx.referencing(vec![def("ghost", ghost, "Nobody has read it")]);
+    let remote = fx.remote_url();
+    let rig = Rig::new(fx, AccessTier::Bypass).await;
+    rig.named(&remote).await;
+    let prepared = rig
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )
+        .await;
+    assert!(!prepared.is_error, "{}", prepared.content);
+    assert_eq!(mirrors(&rig.fx.root), ["remote.git"]);
+
+    for name in ["ghost", "lib"] {
+        for (tool, args) in [
+            (
+                "write_file",
+                json!({"path": "a.txt", "content": "a", "repo": name}),
+            ),
+            ("commit_and_push", json!({"message": "m", "repo": name})),
+            ("run", json!({"command": "true", "repo": name})),
+        ] {
+            let refused = rig.call(tool, args).await;
+            assert!(
+                refused.is_error && refused.content.contains("is a reference"),
+                "{tool} {name}: {}",
+                refused.content
+            );
+        }
+        assert!(!rig.slot(name).exists(), "{name} was not checked out");
+    }
+    assert_eq!(
+        mirrors(&rig.fx.root),
+        ["remote.git"],
+        "nothing was fetched for a write"
+    );
+}
+
+// ----------------------------------------------------------------- a name that is a slot's directory
+
+/// A name that is the directory of another slot is never answered with that slot: a static reference
+/// says it is both, and a repository's own declaration of such a name is not offered.
+#[tokio::test]
+async fn a_reference_name_that_is_a_slots_directory_is_never_read_as_that_slot() {
+    let (fx, _server) = declaring(&[
+        LIB_ENTRY,
+        (
+            "remote",
+            "https://github.com/acme/other",
+            "the slot's own name",
+        ),
+    ])
+    .await;
+    let fx = fx.referencing(vec![def(
+        "notes",
+        "https://github.com/acme/notes",
+        "A reference whose name a project will take",
+    )]);
+    let remote = fx.remote_url();
+    let rig = Rig::new(fx, AccessTier::Auto).await;
+    rig.named(&remote).await;
+    // A scratch project takes the static reference's name.
+    let scratch = rig.call("start_scratch", json!({"name": "notes"})).await;
+    assert!(!scratch.is_error, "{}", scratch.content);
+    let read = rig
+        .call("read_file", json!({"path": "x", "repo": "notes"}))
+        .await;
+    assert!(
+        read.is_error
+            && read.content.contains("the name of the reference")
+            && read.content.contains("a scratch project")
+            && read.content.contains("https://github.com/acme/notes"),
+        "{}",
+        read.content
+    );
+    let wrote = rig
+        .call(
+            "write_file",
+            json!({"path": "x", "content": "x", "repo": "notes"}),
+        )
+        .await;
+    assert!(
+        wrote.is_error && wrote.content.contains("the name of the reference"),
+        "{}",
+        wrote.content
+    );
+    assert!(!rig.slot("notes").join("x").exists());
+
+    // A repository declares a reference called as its own slot: it is not offered, and says why.
+    let prepared = rig
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )
+        .await;
+    assert!(!prepared.is_error, "{}", prepared.content);
+    assert!(prepared.content.contains("- lib: "), "{}", prepared.content);
+    assert!(
+        prepared
+            .content
+            .contains("`remote`: the name is the directory of a slot of this workspace already"),
+        "{}",
+        prepared.content
+    );
+    assert!(
+        !prepared.content.contains("- remote: "),
+        "{}",
+        prepared.content
+    );
+}
+
+// ---------------------------------------- the commit a reference was read at, and the pod that has it
+
+/// The first read says which commit it holds and records it; the reference made again (its directory
+/// is gone) is at that commit, not at where the branch is by then.
+#[tokio::test]
+async fn a_reference_made_again_is_at_the_commit_it_was_first_read_at() {
+    let (fx, _url) = with_design().await;
+    let seed = fx.tmp.path().join("seed-design");
+    let remote = fx.tmp.path().join("other").join("design.git");
+    let rig = Rig::new(fx, AccessTier::Plan).await;
+    let first = rig
+        .call("read_file", json!({"path": "tokens.css", "repo": "design"}))
+        .await;
+    assert!(!first.is_error, "{}", first.content);
+    let commit = git(&remote, &["rev-parse", "main"]);
+    assert!(
+        first.content.contains(&format!(
+            "Reference `design` is at commit {}",
+            &commit[..12]
+        )),
+        "the first read says the commit: {}",
+        first.content
+    );
+    assert_eq!(
+        rig.notes().await.reference_commits.get("design"),
+        Some(&commit)
+    );
+    // A second read in the same run says nothing more.
+    let again = rig
+        .call("read_file", json!({"path": "tokens.css", "repo": "design"}))
+        .await;
+    assert!(
+        !again.content.contains("Reference `design` is at"),
+        "{}",
+        again.content
+    );
+
+    // The branch moves on; the directory is lost.
+    std::fs::write(seed.join("tokens.css"), "--blue: #f00;\n").unwrap();
+    git(&seed, &["add", "-A"]);
+    git(&seed, &["commit", "--quiet", "-m", "later"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    assert_ne!(git(&remote, &["rev-parse", "main"]), commit);
+    std::fs::remove_dir_all(rig.slot("design")).unwrap();
+
+    let back = rig
+        .call("read_file", json!({"path": "tokens.css", "repo": "design"}))
+        .await;
+    assert!(!back.is_error, "{}", back.content);
+    assert!(back.content.contains("--blue: #00f;"), "{}", back.content);
+    assert!(
+        back.content
+            .contains("made again at the commit it was first read at"),
+        "{}",
+        back.content
+    );
+    assert_eq!(
+        git(&rig.slot("design"), &["rev-parse", "HEAD"]),
+        commit,
+        "the commit it was read at, not the branch's tip"
+    );
+    assert_eq!(
+        rig.notes().await.reference_commits.get("design"),
+        Some(&commit)
+    );
+}
+
+/// A pod that already runs cannot be told of the new slot: the model is told, as `prepare_workspace`
+/// tells it, in the result of the read that made the reference.
+#[tokio::test]
+async fn the_first_read_says_when_the_pod_does_not_mount_the_reference_yet() {
+    let fx = Fixture::new().await;
+    let fake = common::FakeEnvironment::new(Some(&fx.root));
+    *fake.seal_fails.lock().unwrap() =
+        Some(|| adam_workspace::EnvError::Unavailable("a command runs in the pod".to_owned()));
+    let design = fx.extra_remote("design", &DESIGN_FILES);
+    let fx = fx
+        .using(fake)
+        .referencing(vec![def("design", &design.to_string_lossy(), "Tokens")]);
+    let rig = Rig::new(fx, AccessTier::Plan).await;
+    let read = rig
+        .call("read_file", json!({"path": "tokens.css", "repo": "design"}))
+        .await;
+    assert!(!read.is_error, "{}", read.content);
+    assert!(read.content.contains("--blue: #00f;"), "{}", read.content);
+    assert!(
+        read.content
+            .contains("the slot is made, but the run's pod does not mount it yet"),
+        "{}",
+        read.content
+    );
+}
+
+// --------------------------------------------------------------------- what a yes is a yes to
+
+fn branch_on(root: &Path, name: &str, branch: &str, file: &str, content: &str) {
+    let seed = root.join(format!("seed-{name}"));
+    git(&seed, &["checkout", "--quiet", "-b", branch]);
+    std::fs::write(seed.join(file), content).unwrap();
+    git(&seed, &["add", "-A"]);
+    git(&seed, &["commit", "--quiet", "-m", branch]);
+    git(&seed, &["push", "--quiet", "origin", branch]);
+    git(&seed, &["checkout", "--quiet", "main"]);
+}
+
+fn agreed_to(subject: &str) -> adam_coder::tools::notes::Consent {
+    adam_coder::tools::notes::Consent {
+        call_id: "q9".into(),
+        tool: "request_repository".into(),
+        subject: subject.into(),
+        agreed: true,
+    }
+}
+
+/// A yes is a yes to **that question**: the repository and the branch the declaration names. A
+/// yes to another question (another repository, another reference, another branch of the same
+/// repository) reads nothing here, and a declined reference stays declined.
+#[tokio::test]
+async fn a_yes_reads_the_reference_it_was_given_to_and_no_other() {
+    let (fx, server) = declaring_raw(|base| {
+        let lib = format!("{base}/acme/lib.git");
+        vec![
+            json!({"name": "lib", "url": lib, "description": "the library"}),
+            json!({"name": "lib-release", "url": lib, "branch": "release", "description": "its release"}),
+            json!({"name": "side", "url": format!("{base}/acme/side.git"), "description": "another"}),
+        ]
+    })
+    .await;
+    bare_repo(
+        &fx.tmp.path().join("served"),
+        "side",
+        &[("side.txt", "side\n")],
+    );
+    branch_on(
+        &fx.tmp.path().join("served"),
+        "lib",
+        "release",
+        "greeting.txt",
+        "hello from release\n",
+    );
+    let remote = fx.remote_url();
+    let lib_key = key_of_argument(&format!("{}/acme/lib.git", server.base)).unwrap();
+    let side_key = key_of_argument(&format!("{}/acme/side.git", server.base)).unwrap();
+    let rig = Rig::new(fx, AccessTier::Auto).await;
+    rig.named(&remote).await;
+    let prepared = rig
+        .call(
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )
+        .await;
+    assert!(!prepared.is_error, "{}", prepared.content);
+
+    // A yes to another repository's reference, and the one to this repository's other branch.
+    rig.change_notes(|notes| {
+        notes.record_consents([agreed_to(&format!("reference:{side_key}"))]);
+    })
+    .await;
+    for name in ["lib", "lib-release"] {
+        let read = rig
+            .call("read_file", json!({"path": "greeting.txt", "repo": name}))
+            .await;
+        assert!(
+            read.is_error && read.content.contains("has not agreed"),
+            "{name}: {}",
+            read.content
+        );
+    }
+    assert_eq!(mirrors(&rig.fx.root), ["remote.git"], "nothing was fetched");
+    // A yes to the default branch is not a yes to the other branch.
+    rig.change_notes(|notes| {
+        notes.record_consents([agreed_to(&format!("reference:{lib_key}"))]);
+    })
+    .await;
+    let read = rig
+        .call("read_file", json!({"path": "greeting.txt", "repo": "lib"}))
+        .await;
+    assert!(read.content.contains("hello from lib"), "{}", read.content);
+    let other = rig
+        .call(
+            "read_file",
+            json!({"path": "greeting.txt", "repo": "lib-release"}),
+        )
+        .await;
+    assert!(
+        other.is_error && other.content.contains("has not agreed"),
+        "{}",
+        other.content
+    );
+    // The yes to that branch reads that branch, and not the default branch's file.
+    rig.change_notes(|notes| {
+        notes.record_consents([agreed_to(&format!("reference:{lib_key}@release"))]);
+    })
+    .await;
+    let release = rig
+        .call(
+            "read_file",
+            json!({"path": "greeting.txt", "repo": "lib-release"}),
+        )
+        .await;
+    assert!(
+        release.content.contains("hello from release"),
+        "{}",
+        release.content
+    );
+    assert!(
+        release.content.contains("(branch release)"),
+        "{}",
+        release.content
+    );
+}
+
+/// The question names the branch, says that what is read can end up in what is written, and a no
+/// is final: asking again is refused with the person's no, with no new form.
+#[tokio::test]
+async fn the_question_names_the_branch_and_a_no_is_final() {
+    let (fx, server) = declaring_raw(|base| {
+        vec![json!({
+            "name": "lib", "url": format!("{base}/acme/lib.git"), "branch": "release",
+            "description": "the library",
+        })]
+    })
+    .await;
+    let lib = format!("{}/acme/lib.git", server.base);
+    let remote = fx.remote_url();
+    let live = Live::start(&fx, &format!("In {remote}, add the greeting."), |mock| {
+        mock.push_tool_calls(vec![call(
+            "p1",
+            "prepare_workspace",
+            json!({"repo_url": remote, "base_branch": "main"}),
+        )])
+        .push_tool_calls(vec![call(
+            "q1",
+            "request_repository",
+            json!({"repo_url": lib, "reason": "the greeting", "reference": "lib"}),
+        )])
+        .push_tool_calls(vec![call(
+            "q2",
+            "request_repository",
+            json!({"repo_url": lib, "reason": "again", "reference": "lib"}),
+        )])
+        .push_text("Done.");
+    })
+    .await;
+    let shown = live.parked().await;
+    assert!(shown.contains("branch release"), "{shown}");
+    assert!(
+        shown.contains("can end up in what it writes (a commit, a pull request)"),
+        "{shown}"
+    );
+    let answer = common::form_answer("ask-q1", json!([{"id": "consent", "values": ["no"]}]), None);
+    let (notes, mock) = live.answered(answer, &fx).await;
+    assert_eq!(notes.consents.len(), 1, "{:?}", notes.consents);
+    assert!(!notes.consents[0].agreed);
+    assert!(
+        notes.consents[0].subject.ends_with("@release"),
+        "{}",
+        notes.consents[0].subject
+    );
+    let again = result_of(&mock, "q2");
+    assert!(
+        again.contains("declined to let") && again.contains("Do not ask again"),
+        "a no is final: {again}"
+    );
+}
+
+// ----------------------------------------------------------------- the branch a reference is read at
+
+/// A declared branch is the one read: the file is the branch's, not the default branch's.
+#[tokio::test]
+async fn a_declared_branch_is_the_one_that_is_read() {
+    let fx = Fixture::new().await;
+    let design = fx.extra_remote("design", &[("tokens.css", "--blue: main;\n")]);
+    branch_on(
+        fx.tmp.path(),
+        "design",
+        "release",
+        "tokens.css",
+        "--blue: release;\n",
+    );
+    let mut release = def("design", &design.to_string_lossy(), "Tokens");
+    release.branch = Some("release".into());
+    let fx = fx.referencing(vec![release]);
+    let rig = Rig::new(fx, AccessTier::Plan).await;
+    let read = rig
+        .call("read_file", json!({"path": "tokens.css", "repo": "design"}))
+        .await;
+    assert!(!read.is_error, "{}", read.content);
+    assert!(
+        read.content.contains("--blue: release;"),
+        "{}",
+        read.content
+    );
+    assert!(
+        read.content.contains("(branch release)"),
+        "{}",
+        read.content
+    );
+}
+
+/// A reference is read by the repository's address too, when no slot of the run works in it.
+#[tokio::test]
+async fn a_reference_is_read_by_its_repositorys_address() {
+    let (fx, url) = with_design().await;
+    let rig = Rig::new(fx, AccessTier::Plan).await;
+    let first = rig
+        .call("read_file", json!({"path": "tokens.css", "repo": "design"}))
+        .await;
+    assert!(!first.is_error, "{}", first.content);
+    let by_address = rig
+        .call("read_file", json!({"path": "tokens.css", "repo": url}))
+        .await;
+    assert!(!by_address.is_error, "{}", by_address.content);
+    assert!(
+        by_address.content.contains("--blue: #00f;"),
+        "{}",
+        by_address.content
+    );
+}
+
+// ----------------------------------------------------------------------------- what ends a run
+
+/// A file shared from a reference is somebody else's text, not a result of the run: a run with a
+/// scratch project that shared only that, and ends on a question, waits for the person.
+#[tokio::test]
+async fn a_file_shared_from_a_reference_does_not_deliver_the_run() {
+    let (fx, _url) = with_design().await;
+    let live = Live::start(&fx, "Make me a colour file", |mock| {
+        mock.push_tool_calls(vec![call("s1", "start_scratch", json!({"name": "notes"}))])
+            .push_tool_calls(vec![call(
+                "f1",
+                "share_file",
+                json!({"path": "tokens.css", "repo": "design"}),
+            )])
+            .push_text("Which blue do you want?");
+    })
+    .await;
+    wait_done(&live.rt, live.run).await;
+    let view = live.rt.view(live.run).await.unwrap().unwrap();
+    assert!(
+        view.waiting,
+        "nothing of the run's own was shared, so the question waits: {view:#?}"
+    );
+    let shared = fx
+        .env
+        .notes
+        .load(&live.run.to_string())
+        .await
+        .unwrap()
+        .shared;
+    assert!(shared.is_empty(), "{shared:?}");
+    live.finish().await;
+}
+
+/// What the person's own scratch work shared still delivers the run, a reference beside it or not:
+/// the question at its end does not park it.
+#[tokio::test]
+async fn a_scratch_result_shared_beside_a_reference_delivers_the_run() {
+    let (fx, _url) = with_design().await;
+    let live = Live::start(&fx, "Put the design's blue in a file for me", |mock| {
+        mock.push_tool_calls(vec![call("s1", "start_scratch", json!({"name": "notes"}))])
+            .push_tool_calls(vec![call(
+                "r1",
+                "read_file",
+                json!({"path": "tokens.css", "repo": "design"}),
+            )])
+            .push_tool_calls(vec![call(
+                "w1",
+                "write_file",
+                json!({"path": "blue.txt", "content": "#00f\n", "repo": "notes"}),
+            )])
+            .push_tool_calls(vec![call(
+                "f1",
+                "share_file",
+                json!({"path": "blue.txt", "repo": "notes"}),
+            )])
+            .push_text("Here it is. Anything else?");
+    })
+    .await;
+    wait_done(&live.rt, live.run).await;
+    let view = live.rt.view(live.run).await.unwrap().unwrap();
+    assert_eq!(
+        view.status,
+        RunStatus::Done,
+        "the shared file is the result: {view:#?}"
+    );
+    live.finish().await;
 }

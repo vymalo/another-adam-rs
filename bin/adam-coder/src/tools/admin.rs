@@ -127,8 +127,10 @@ async fn target(
         && let Ok(workspace) = env.workspaces.run(&ctx.root_run_id().to_string())
         && let Ok(slots) = workspace.slots().await
         && let Ok(slot) = resolve_slot(slots, non_empty(repo), host)
-        && let Some(wt) = slot.worktree()
+        && let Some(wt) = slot.checkout()
     {
+        // A reference's slot gives the repository's own address, never its name read as a
+        // repository's: the guard below judges that address.
         address = Some(wt.repo().url.clone());
     }
     let Some(address) = address.or_else(|| address_of(repo, host)) else {

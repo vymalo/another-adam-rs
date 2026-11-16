@@ -1134,7 +1134,7 @@ branch of its own, made by the first read that names it and removed with the run
 | Declared by | How | Consent |
 |---|---|---|
 | the agent's folder | `references:` in the frontmatter of `instructions.md` ([Agent files](../../docs/reference/agent-files.md#references-references)) | none |
-| the deployment | `ADAM_REFERENCES_FILE`, a JSON file `{"references": [{"name", "url", "branch"?, "description"}]}`, **added** to the agent's own; a name both declare is exit 78 | none |
+| the deployment | `ADAM_REFERENCES_FILE`, a JSON file `{"references": [{"name", "url", "branch"?, "description"}]}`, **added** to the agent's own; a name both declare is exit 78, and so is an address the workspaces' policy refuses (an allowed host, an owner a GitHub App acts for): the process says which reference at startup (`References::check_against`) | none |
 | a repository the run works on | its `.agents/references.json`, same shape | the person's yes to `request_repository` with `reference` |
 
 * **The model is told** the names and descriptions of the first two in the system prompt, through [`ReferencesSource`](src/tools/references.rs),
@@ -1147,18 +1147,31 @@ branch of its own, made by the first read that names it and removed with the run
   `ToolEnv::slot_to_read` makes the reference on first use (`RunWorkspace::add_reference`: the mirror is fetched and the
   checkout made by the coder's own git, its sandbox when it has one, never in a run pod; the base is the declared branch, else
   the repository's default). Reading is tier `plan`, and so is the first checkout. A reference is never the default slot.
+  The first read says which commit the reference holds (`ToolEnv::tell` adds a line to the result of the call, taken by the
+  tool wrapper) and the notes keep it (`RunNotes::reference_commits`): a reference made again is checked out at that commit,
+  and a pod that cannot take the new slot yet (a command runs in it) is said in the same result. The address of a reference's
+  repository reaches the reference only while no slot of the run works in that repository: then it reaches that slot (to read
+  and to write), and the reference's own name still reaches the reference. A name that is also the directory of another slot
+  answers neither (`references::name_clash`).
 * **Asking.** `request_repository { repo_url, reason, reference }` takes the address the declaration recorded (another is
   refused, and so is a name nobody declared); an address the workspace refuses for a repository, or that is not http(s), is
-  refused before the person is asked. The form names the repository that lists it, quotes what its declaration says and says
-  the repository is read only. The yes is the consent `reference:<key>` (`consent::reference_subject`), recorded by the
-  agent from the conversation like every consent, and it never names the repository: `prepare_workspace` of it is still
-  refused. Nothing is fetched before the yes, and a no is final.
+  refused before the person is asked. The form names the repository that lists it and its branch, quotes what its declaration
+  says, says the repository is read only and that what the agent reads there can end up in what it writes (a commit, a pull
+  request). The yes is the consent `reference:<key>`, with `@<branch>` when the declaration names one
+  (`consent::reference_subject`; another branch is another question), recorded by the agent from the conversation like every
+  consent, and it never names the repository, as a click or as typed words (`person_sayings` leaves the answer to a
+  question about a reference out): `prepare_workspace` of it is still refused. Nothing is fetched before the yes, and a no is
+  final. A reference a repository declares is fetched with a repository's credentials and nothing ties its owner to the
+  repository's, so the bounds are the yes to the exact address and branch, the workspaces' policy for the address, and an
+  http(s) address with no credentials, query string or fragment.
 * **Writing is refused** by `ToolEnv::slot_to_write`, the one function every tool that changes a slot asks
   (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `commit_and_push`, `open_pull_request`), and by the
   tools that act by address: `merge_pull_request`, `rename_repository` and `delete_repository` refuse the repository of a
   reference unless the person named it too, and so does `publish_scratch`. `tools::references::slot_use` classifies every
   tool of the coder, and `tests/references.rs` calls each tool it says writes with a reference: a tool added without
-  being classified fails it.
+  being classified fails it. A write that names a reference nobody read is refused by the name, and nothing is fetched.
+  A file shared from a reference is not a result of the run (`share_file` records only the shares of a slot the run
+  works in), so it does not end a scratch run as delivered.
 * **`run_command` in a reference** keeps the look-around guard (what changes a file, `HEAD` or the git state is undone and
   refused). Without run pods (or a devcontainer, which mounts it read-only) nothing else stops a command from writing a file
   that `.gitignore` excludes: only the tool layer protects a reference there.
@@ -2072,7 +2085,7 @@ way; every problem is reported at once at startup):
 | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (the image sets them) | `devcontainer`, `podman-remote` |
 | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
 | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file (exit 78 naming the variable otherwise). A server name the agent already has is refused (exit 78, nothing is replaced). It is read with the loader of `mcp.json` (`${VAR}`, `tools`, `optional`). See [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file) | unset: only the agent's own servers |
-| `ADAM_REFERENCES_FILE` | roles that run workers: a file `{"references": [{"name", "url", "branch"?, "description"}]}` of repositories to **read** beside the one a run works on and never write, **added** to the `references:` of the agent's files ([References](#references)); it must be an existing file of valid references (exit 78 naming the variable otherwise), and a name the agent already declares is exit 78 too | unset: only the agent's own references |
+| `ADAM_REFERENCES_FILE` | roles that run workers: a file `{"references": [{"name", "url", "branch"?, "description"}]}` of repositories to **read** beside the one a run works on and never write, **added** to the `references:` of the agent's files ([References](#references)); it must be an existing file of valid references whose addresses the workspaces' policy accepts (exit 78 naming the variable or the reference otherwise), and a name the agent already declares is exit 78 too | unset: only the agent's own references |
 
 Everything from `MODEL_BASE_URL` down, except `ADAM_AGENT_DIR` (every role reads that one), is read by the roles that run workers (`all`, `worker`)
 only (the `MCP_ALLOW_*` flags too: a control plane connects no MCP server), and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.

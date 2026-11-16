@@ -126,6 +126,11 @@ mod tests {
         assert_eq!(exit_code(&chained), 78);
         let missing = References::load(&[], Some(&dir.path().join("none.json"))).unwrap_err();
         assert_eq!(coded(missing), 78);
+        let refused = ReferencesError::Refused {
+            name: "design".into(),
+            why: "host not allowed".into(),
+        };
+        assert_eq!(coded(refused), 78);
     }
 
     /// A mistake in the agent files, or the files and the code disagreeing, is the deployment's:
