@@ -1163,6 +1163,61 @@ async fn a_pinned_result_that_came_through_a_wait_survives_a_compaction() {
     assert!(state.pinned_calls.is_empty());
 }
 
+/// A call whose arguments weigh 750 tokens: calls are no tool output, so a shortening leaves them.
+fn heavy(id: &str, name: &str) -> ToolCall {
+    call(
+        id,
+        name,
+        json!({"n": 10, "tag": id, "pad": "p".repeat(3000)}),
+    )
+}
+
+/// Every summary request ends, before its instruction, with a result and no call left open.
+fn assert_summaries_follow_a_result(requests: &[ModelRequest]) {
+    let summaries: Vec<&ModelRequest> = requests.iter().filter(|r| is_summary(r)).collect();
+    assert_eq!(summaries.len(), 1);
+    let history = &summaries[0].messages[..summaries[0].messages.len() - 1];
+    assert!(
+        matches!(history.last(), Some(Message::Tool { .. })),
+        "a call is still open: {:?}",
+        history.last()
+    );
+    assert_paired(history);
+}
+
+#[tokio::test]
+async fn nothing_is_compacted_while_a_call_is_still_to_run() {
+    let rig = Rig::new(2400);
+    rig.mock
+        .push_tool_calls(vec![heavy("c0", "big")])
+        .push_tool_calls(vec![heavy("c1", "big")])
+        .push_tool_calls(vec![heavy("c2", "big")])
+        .push_tool_calls(vec![heavy("c3", "big")])
+        .push_text("S")
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    assert_summaries_follow_a_result(&requests);
+}
+
+#[tokio::test]
+async fn nothing_is_compacted_while_a_remote_task_is_awaited() {
+    let rig = Rig::with(MockModel::new(), 2400, |b| b.tool(WaitsAndPins));
+    rig.mock
+        .push_tool_calls(vec![heavy("c0", "big")])
+        .push_tool_calls(vec![heavy("c1", "big")])
+        .push_tool_calls(vec![heavy("c2", "big")])
+        .push_tool_calls(vec![heavy("w0", "waiter")])
+        .push_tool_calls(vec![big("c4", 100)])
+        .push_text("S")
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+    assert_summaries_follow_a_result(&requests);
+}
+
 #[tokio::test]
 async fn a_shortening_leaves_the_estimate_to_start_again() {
     // Two turns of 3,000 letters are over the budget of 1,200 tokens, but the reports say the prompt
