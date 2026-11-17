@@ -3,6 +3,7 @@
 // says `stream: true` (the last chunk, with empty `choices`, carries `usage`, as
 // `stream_options.include_usage` asks). Behaviour is switched through `model.behavior`.
 import http from 'node:http';
+import { nextTurn } from './agent-script.mjs';
 
 export const FIXED_USAGE = Object.freeze({ prompt: 1000, completion: 200, cached: 400, reasoning: 50, cacheWrite: 0 });
 
@@ -20,6 +21,7 @@ export function createScriptedModel(initial = {}) {
     reset: false, // destroy the socket after reading the request
     onRequest: null, // called with the recorded request when it arrives
     padBytes: 0, // a plain answer's content is this long
+    script: null, // 'agents': drive adam and OpenCode through the self-test tasks (agent-script.mjs)
     endless: false, // a stream that never ends: `endlessChunkBytes` of text every `endlessEveryMs`, honouring backpressure
     endlessChunkBytes: 100,
     endlessEveryMs: 5,
@@ -67,8 +69,11 @@ export function createScriptedModel(initial = {}) {
           return res.end(text);
         }
         const base = { id: 'chatcmpl-scripted', object: 'chat.completion', created: 1, model: body?.model ?? 'unknown' };
+        const turn = behavior.script === 'agents' ? nextTurn(body) : null;
+        const toolCall = turn?.tool ? [{ id: turn.tool.id, type: 'function', function: { name: turn.tool.name, arguments: JSON.stringify(turn.tool.args) } }] : null;
         if (body?.stream !== true) {
-          const out = { ...base, choices: [{ index: 0, message: { role: 'assistant', content: 'done'.padEnd(behavior.padBytes, 'x') }, finish_reason: 'stop' }] };
+          const message = toolCall ? { role: 'assistant', content: null, tool_calls: toolCall } : { role: 'assistant', content: turn ? turn.text : 'done'.padEnd(behavior.padBytes, 'x') };
+          const out = { ...base, choices: [{ index: 0, message, finish_reason: toolCall ? 'tool_calls' : 'stop' }] };
           if (!behavior.omitUsage) out.usage = usageObject();
           return json(200, out);
         }
@@ -76,10 +81,12 @@ export function createScriptedModel(initial = {}) {
         res.on('close', () => {
           if (!res.writableFinished) stats.aborted += 1;
         });
-        const frames = [
-          { ...base, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: 'do' } }], usage: null },
-          { ...base, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'ne' }, finish_reason: 'stop' }], usage: null },
-        ];
+        const chunk = (choice) => ({ ...base, object: 'chat.completion.chunk', choices: [{ index: 0, ...choice }], usage: null });
+        const frames = toolCall
+          ? [chunk({ delta: { role: 'assistant', tool_calls: toolCall.map((c, index) => ({ index, ...c })) } }), chunk({ delta: {}, finish_reason: 'tool_calls' })]
+          : turn
+            ? [chunk({ delta: { role: 'assistant', content: turn.text } }), chunk({ delta: {}, finish_reason: 'stop' })]
+            : [chunk({ delta: { role: 'assistant', content: 'do' } }), chunk({ delta: { content: 'ne' }, finish_reason: 'stop' })];
         if (!behavior.omitUsage && body?.stream_options?.include_usage === true) {
           frames.push({ ...base, object: 'chat.completion.chunk', choices: [], usage: usageObject() });
         }
