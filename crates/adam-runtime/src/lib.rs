@@ -89,6 +89,7 @@ mod envelope;
 mod erased;
 mod events;
 mod file;
+mod lines;
 mod notify;
 mod retry;
 mod runtime;
@@ -114,6 +115,7 @@ pub use file::{
     MAX_FILES_PER_RESULT, ReceivedFiles, checked_media_type, extension_of, human_size, image_size,
     sniff_image,
 };
+pub use lines::{SystemLine, is_system_line, safe_file_name};
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
