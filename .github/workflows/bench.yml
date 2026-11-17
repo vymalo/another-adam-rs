@@ -1,0 +1,32 @@
+name: bench
+
+# The benchmark harness (bench/): its own tests, no model, no network beyond 127.0.0.1.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bench/**'
+      - '.github/workflows/bench.yml'
+  pull_request:
+    paths:
+      - 'bench/**'
+      - '.github/workflows/bench.yml'
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # A quoted glob: `node --test <directory>` is not read as a directory by every Node version.
+      - run: node --test "bench/test/*.test.mjs"
