@@ -316,6 +316,60 @@ test('the egress window connects a service to the network with the internet and 
   assert.ok(calls.some((c) => c.includes('grader') && c.includes('ps')), 'the grader\'s window is the grader\'s own container');
 });
 
+test('R7: two windows on the grader never overlap: one connects, runs and disconnects before the next connects', async (t) => {
+  const events = [];
+  const id = 'f'.repeat(12);
+  const { stack } = makeStack(t, {
+    exec: async (file, args) => {
+      if (args.includes('network')) events.push(`${args[args.indexOf('network') + 1]}`);
+      return { exitCode: 0, stdout: args.includes('ps') ? `${id}\n` : '', stderr: '' };
+    },
+  });
+  const slow = (name) => async () => {
+    events.push(`${name} start`);
+    await new Promise((r) => setTimeout(r, 20));
+    events.push(`${name} end`);
+  };
+  await Promise.all([stack.graderWindow(slow('a')), stack.graderWindow(slow('b'))]);
+  assert.deepEqual(events, ['connect', 'a start', 'a end', 'disconnect', 'connect', 'b start', 'b end', 'disconnect']);
+});
+
+test('R7: no grading runs on the grader while a window is open, and gradings without a window run together', async (t) => {
+  const events = [];
+  const id = 'f'.repeat(12);
+  const { stack } = makeStack(t, {
+    exec: async (file, args) => {
+      if (args.includes('network')) events.push(args[args.indexOf('network') + 1]);
+      return { exitCode: 0, stdout: args.includes('ps') ? `${id}\n` : '', stderr: '' };
+    },
+  });
+  const work = (name, ms = 20) => async () => {
+    events.push(`${name} start`);
+    await new Promise((r) => setTimeout(r, ms));
+    events.push(`${name} end`);
+  };
+  // two gradings are in flight, a pull asks for the window, a third grading arrives after the pull asked
+  const g1 = stack.graderShared(work('g1'));
+  const g2 = stack.graderShared(work('g2'));
+  await new Promise((r) => setTimeout(r, 5));
+  const pull = stack.graderWindow(work('pull'));
+  const g3 = stack.graderShared(work('g3'));
+  await Promise.all([g1, g2, pull, g3]);
+  const at = (e) => events.indexOf(e);
+  assert.ok(at('g1 start') < at('g2 end') && at('g2 start') < at('g1 end'), 'gradings overlap');
+  assert.ok(at('connect') > at('g1 end') && at('connect') > at('g2 end'), 'the window opens only when the gradings have ended');
+  assert.ok(at('g3 start') > at('disconnect'), 'a grading that came after the pull waits until the window is closed');
+  assert.ok(at('pull start') > at('connect') && at('pull end') < at('disconnect'));
+});
+
+test('R7: a window that fails still releases the grader to the next one', async (t) => {
+  const id = 'f'.repeat(12);
+  const { stack } = makeStack(t, { exec: async (file, args) => ({ exitCode: 0, stdout: args.includes('ps') ? `${id}\n` : '', stderr: '' }) });
+  await assert.rejects(stack.graderWindow(async () => { throw new Error('pull failed'); }), /pull failed/);
+  assert.equal(await stack.graderWindow(async () => 'next'), 'next');
+  assert.equal(await stack.graderShared(async () => 'shared'), 'shared');
+});
+
 test('the coder\'s address is the loopback port the compose file publishes, through the relay', () => {
   const stack = new Stack({ composeFile: COMPOSE, home: '/h', tasksDir: '/t', seccomp: '/s', meterPort: 1, ports: { coder1: 20001, coder2: 20002 } });
   assert.equal(stack.coderUrl(1), 'http://127.0.0.1:20001/');

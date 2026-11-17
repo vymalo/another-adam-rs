@@ -9,7 +9,7 @@
 
 export const SELF_TASKS = Object.freeze({
   hello: { file: 'hello.txt', content: 'hello\n' },
-  wrong: { file: 'hello.txt', content: 'goodbye\n' },
+  wrong: { file: 'bye.txt', content: 'goodbye\n' },
   'fix-add': { file: 'add.mjs', content: 'export const add = (a, b) => a + b;\n' },
 });
 
@@ -28,12 +28,25 @@ export function identifyAgent(tools) {
 
 const textOf = (content) => (typeof content === 'string' ? content : Array.isArray(content) ? content.map((p) => p?.text ?? '').join('') : '');
 
-/** The task named by `[mock:<name>]` in a user message, or null. */
+/**
+ * What each self-test statement says, for the scripted model alone: the statements carry no switch, so a real model reads exactly
+ * what a task says. `wrong` asks for a file the scripted model writes with the wrong content.
+ */
+const STATEMENTS = [
+  ['wrong', /`bye\.txt`/],
+  ['hello', /`hello\.txt`/],
+  ['fix-add', /`add\.mjs`/],
+];
+
+/** The task a user message names: by `[mock:<name>]` when a test writes one, else by what the statement says. Null for neither. */
 export function taskMarker(messages) {
   for (const m of messages ?? []) {
     if (m?.role !== 'user') continue;
-    const hit = /\[mock:([a-z-]+)\]/.exec(textOf(m.content));
+    const text = textOf(m.content);
+    const hit = /\[mock:([a-z-]+)\]/.exec(text);
     if (hit && Object.hasOwn(SELF_TASKS, hit[1])) return hit[1];
+    const said = STATEMENTS.find(([, re]) => re.test(text));
+    if (said) return said[0];
   }
   return null;
 }

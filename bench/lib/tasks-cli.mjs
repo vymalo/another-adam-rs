@@ -11,7 +11,7 @@ import { parseArgs } from 'node:util';
 import { ConfigError, assertOutsideRepo, benchHome, loadConfig } from './config.mjs';
 import { PodmanRemote, ContainerError } from './containers.mjs';
 import { checkTask } from './envcheck.mjs';
-import { lintStatement } from './lint.mjs';
+import { findCheckCommand, lintStatement } from './lint.mjs';
 import { classifyPath, gitIn, mine } from './mine.mjs';
 import { OwnTaskError, loadOwnSpecs, materializeOwn, ownChecksum, ownImageTag, prepareOwnContext } from './own.mjs';
 import { buildLock, lockText, selectTasks } from './select.mjs';
@@ -128,15 +128,31 @@ async function cmdLint(config, p, argv, out) {
   for (const e of errors) out(`${e.id}: ${e.problems.join('; ')}`);
   const wanted = argv.length ? specs.filter((s) => argv.includes(s.id)) : specs;
   let warned = 0;
+  let refused = 0;
   for (const spec of wanted) {
+    const clone = config.tasks.clones[spec.clone];
+    if (clone) {
+      const git = gitIn(clone);
+      const found = findCheckCommand((file) => {
+        try {
+          return git(['show', `${spec.base}:${file}`]);
+        } catch {
+          return null;
+        }
+      });
+      if (!found) {
+        out(`${spec.id}: refused: its repository at the base has no test command a coder would find (a test script, a Cargo.toml, a go.mod, a test target, a test configuration, or one named in the README). Without one the agent has nothing to run and ends "completed" whatever it wrote; add one to the repository or drop the task`);
+        refused++;
+      }
+    }
     const statement = fs.readFileSync(path.join(spec.dir, 'instruction.md'), 'utf8');
     for (const w of lintStatement(statement, goldSourceDiff(spec, config))) {
       out(`${spec.id}: warning: the statement names the ${w.kind} ${JSON.stringify(w.token)}, which only the gold change adds (an "Interface" section may name what the tests call)`);
       warned++;
     }
   }
-  out(`${wanted.length} statement(s) read, ${warned} warning(s)`);
-  return 0;
+  out(`${wanted.length} statement(s) read, ${warned} warning(s), ${refused} refused`);
+  return refused > 0 ? 1 : 0;
 }
 
 const containersOf = (config, make) => (make ? make(config) : new PodmanRemote(config.tasks.podman));

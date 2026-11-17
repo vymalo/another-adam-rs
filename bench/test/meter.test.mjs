@@ -576,3 +576,34 @@ test('a chunked upload with no content-length is counted in total and refused wi
   assert.equal(status, 413);
   assert.equal(s.model.requests.length, 0);
 });
+
+test('S1: a client that closes the stream right after [DONE] is charged the usage the meter already saw, not the worst case', async (t) => {
+  const s = await setup(t, { behavior: { holdAfterDoneMs: 400 } });
+  const { baseUrl } = s.open();
+  const res = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true, stream_options: { include_usage: true } }) });
+  const reader = res.body.getReader();
+  let text = '';
+  const decoder = new TextDecoder();
+  while (!text.includes('[DONE]')) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value);
+  }
+  await reader.cancel(); // adam closes at [DONE]
+  await until(() => callRecords(s.ledger, 'settled').length === 1, 'the call was settled');
+  const settled = callRecords(s.ledger, 'settled')[0];
+  assert.equal(settled.costMicro, SCRIPTED_COST, 'the scripted usage times the price, not the worst case');
+  assert.notEqual(settled.usageMissing, true);
+  assert.equal(settled.usage.input, 1000);
+});
+
+test('S1: a client that closes before any usage was seen is still charged the worst case', async (t) => {
+  const s = await setup(t, { behavior: { omitUsage: true, endless: true, endlessChunkBytes: 100, endlessEveryMs: 5 } });
+  const { baseUrl } = s.open();
+  const ctl = new AbortController();
+  const res = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', body: JSON.stringify({ messages: [], stream: true }), signal: ctl.signal });
+  await res.body.getReader().read();
+  ctl.abort();
+  await until(() => callRecords(s.ledger, 'settled').length === 1, 'settled');
+  assert.equal(callRecords(s.ledger, 'settled')[0].costMicro, callRecords(s.ledger, 'pending')[0].worstMicro);
+});

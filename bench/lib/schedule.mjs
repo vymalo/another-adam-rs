@@ -1,20 +1,21 @@
-// Several runs at once, one in each slot.
+// Several runs at once, one in each slot, a block at a time.
 //
-// The specs are in block order. Each slot's worker takes the next spec when it is free, so the slots hold
-// runs of the same few blocks. The cap is held by reservations (cap.mjs); this file adds the waiting:
-//   * a run that does not fit while other runs are active waits for one of them to end, because what it
-//     reserved is free again then (a reservation is a ceiling, not a spend);
-//   * a run that does not fit and has nothing to wait for really crosses the cap: it is recorded NotStarted and
-//     nothing after it is started (blocks are never begun and left half).
-// The check "does it fit" and the reservation itself run with no `await` between them, so two slots cannot both
-// take the last of the budget (Node runs one of them first).
+// The specs are in block order. Each slot's worker takes the next spec when it is free, so the slots hold runs of the same
+// few blocks. The cap is held by reservations (cap.mjs); this file adds whole blocks and the waiting:
+//   * before the first run of a block starts, the whole block is held: the budgets of all its runs that are still to start must
+//     fit under the cap, with what is spent, what is reserved and what other started blocks still hold. The hold is given back
+//     run by run as the block's runs reserve. A block that does not fit is not started: nothing of it is even planned, so a
+//     stop at the cap leaves whole blocks, and a later start with room (a higher cap) begins with it;
+//   * a block that does not fit while other runs are active waits for one of them to end, because what a run did not spend is
+//     free when it closes. A block that does not fit with nothing to wait for ends the schedule.
+// Starting is one at a time, in order, and the check and the first reservation run with no `await` between them.
 //
-// A harness crash (HarnessCrash, a test's stand-in for a kill) ends the schedule: every worker stops taking
-// specs, and the first crash is thrown after the workers have settled.
+// A harness crash (HarnessCrash, a test's stand-in for a kill) ends the schedule: every worker stops taking specs, and the first
+// crash is thrown after the workers have settled.
 import { resumeActions } from './ledger.mjs';
 import { advance, resumeLedger } from './runner.mjs';
 
-const TERMINAL = new Set(['Done', 'NotStarted', 'StoppedByCap']);
+const TERMINAL = new Set(['Done', 'StoppedByCap']);
 export const MAX_PASSES = 3;
 
 /**
@@ -47,17 +48,31 @@ export async function runSchedule({ deps, specs, slots, onOutcome = () => {} }) 
     // Starting is one at a time, in the order of the specs: a run that waits for budget is not passed by the next one.
     // `advance` reserves before its first await, so the reservation is made inside the turn that checked it fits.
     let gate = Promise.resolve();
+    const held = new Map(); // block -> what its runs still to start have been promised
+    const heldTotal = () => [...held.values()].reduce((x, y) => x + y, 0);
+    const toStart = (spec) => {
+      const state = deps.ledger.fold().get(spec.run)?.state;
+      return state === undefined || state === 'Planned';
+    };
     const claim = (slot) => {
       const turn = gate.then(async () => {
         if (capHit || crash) return null;
         const spec = queue.shift();
         if (!spec) return null;
-        const view = deps.ledger.fold().get(spec.run);
-        if (view === undefined || view.state === 'Planned') {
-          const need = reserveFor(spec);
-          while (!deps.book.canReserve(need) && active > 0 && !capHit && !crash) await new Promise((resolve) => waiters.push(resolve));
+        const key = spec.block ?? spec.run;
+        if (!held.has(key)) {
+          const need = [spec, ...queue.filter((q) => (q.block ?? q.run) === key)].filter(toStart).reduce((sum, q) => sum + reserveFor(q), 0);
+          const fits = () => deps.book.committedMicro() + heldTotal() + need <= deps.book.capMicro;
+          while (!fits() && active > 0 && !capHit && !crash) await new Promise((resolve) => waiters.push(resolve));
           if (capHit || crash) return null;
+          if (!fits()) {
+            capHit = true; // this block does not fit and nothing is left to give room: not started, not even planned
+            return null;
+          }
+          held.set(key, need);
         }
+        if (toStart(spec)) held.set(key, Math.max(0, held.get(key) - reserveFor(spec)));
+        if (held.get(key) === 0 && ![...queue].some((q) => (q.block ?? q.run) === key)) held.delete(key);
         active++;
         maxActive = Math.max(maxActive, active);
         return { running: advance({ deps, spec: { ...spec, slot } }) };

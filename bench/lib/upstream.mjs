@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { safeEnv } from './grade.mjs';
 
 export class UpstreamError extends Error {
   constructor(message) {
@@ -12,7 +13,8 @@ export class UpstreamError extends Error {
   }
 }
 
-const git = (dir, args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+// Host git runs in the allow-listed environment (grade.mjs `safeEnv`): the harness's own environment holds the model's key.
+const git = (dir, args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: safeEnv() });
 
 /** Parse `sha256sum` output: `<hex>  <path>` or `<hex> *<path>`. Returns Map path -> hex. Refuses unsafe paths. */
 export function parseSums(text) {
@@ -100,7 +102,7 @@ export function fetchUpstream({ url, commit, dir, sumsDir = 'v2' }) {
   try {
     if (!fs.existsSync(path.join(dir, '.git'))) {
       fs.mkdirSync(path.dirname(dir), { recursive: true });
-      execFileSync('git', cloneArgs(url, dir), { stdio: 'pipe' });
+      execFileSync('git', cloneArgs(url, dir), { stdio: 'pipe', env: safeEnv() });
     }
     const origin = git(dir, ['remote', 'get-url', 'origin']).trim();
     if (origin !== url) throw new UpstreamError('the existing upstream clone has another origin than the configured URL: remove it or fix tasks.upstreamUrl');

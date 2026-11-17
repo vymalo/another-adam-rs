@@ -1,28 +1,31 @@
 // `bench pilot | confirm | run | regrade`. See bench/README.md, "Pilot and run".
 //
-// The pilot is the first blocks of the full plan, run with the configuration's per-run budget. Its finished runs are in
-// the same ledger as the full run's, so the full run does not repeat them. `bench pilot` ends with a projection and a
-// file, `$BENCH_HOME/pilot-budget.json`; `bench confirm` is the owner's yes; `bench run` refuses to start without it.
+// The pilot is the first blocks of the plan, run with the configuration's per-run budget (its runs have the prefix `pilot.` and
+// the phase `pilot`). Its finished runs give a budget for each arm and a projection, written to `$BENCH_HOME/pilot-budget.json`;
+// `bench confirm` is the owner's yes; `bench run` refuses to start without it and runs every block again under the confirmed
+// budget. The pilot's results are reported apart and are never in the rates. Every run of the ledger carries the digest of the
+// configuration it was made under, and a command refuses a ledger of another one.
 //
 // A command takes `make`, which opens what it needs (the stack, the meter, the ledger, the tasks) and returns
-// { deps, tasks, slots, close }. The real one is `realHarness`; the tests pass a fake that
-// uses the same pieces on a scripted model.
+// { deps, tasks, slots, close }. The real one is `realHarness`; the tests pass a fake that uses the same pieces on a scripted model.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { AdamAgent } from './agents/adam.mjs';
 import { OpenCodeAgent } from './agents/opencode.mjs';
-import { BudgetError, confirmProposal, lockDigest, pilotEstimate, proposalBody, renderEstimate, requireConfirmed } from './budget.mjs';
+import { MIN_PER_ARM, BudgetError, assertLedgerBound, configFingerprint, confirmProposal, digestKey, pilotEstimate, proposalBody, renderEstimate, requireConfirmed } from './budget.mjs';
 import { CapBook } from './cap.mjs';
 import { ConfigError, assertOutsideRepo, benchHome, loadConfig } from './config.mjs';
+import { PodmanRemote } from './containers.mjs';
 import { formatUSD } from './cost.mjs';
-import { Ledger } from './ledger.mjs';
+import { ensureImage, once } from './images.mjs';
+import { Ledger, readLedger } from './ledger.mjs';
 import { createMeter } from './meter.mjs';
 import { buildBlocks, specsOf } from './plan.mjs';
 import { PINS, coderRef } from './pins.mjs';
 import { buildReport } from './report.mjs';
-import { regradeInvalid } from './runner.mjs';
+import { advance, regradeInvalid } from './runner.mjs';
 import { runSchedule } from './schedule.mjs';
 import { SLOTS, Stack } from './stack.mjs';
 import { fetchPublic, paths, readJson } from './tasks-cli.mjs';
@@ -44,6 +47,7 @@ export class SelectionError extends Error {
 }
 
 const proposalFile = (home) => path.join(home, 'pilot-budget.json');
+const ledgerFile = (home) => path.join(home, 'ledger.jsonl');
 const readText = (file) => {
   try {
     return fs.readFileSync(file, 'utf8');
@@ -90,20 +94,26 @@ export function loadSelected(config, p) {
   return { tasks: out };
 }
 
-/** The real harness: the stack, the meter, the ledger and the two drivers. Needs the container services; unverified here. */
-export async function realHarness({ env, config, log }) {
+/**
+ * The real harness: the stack, the meter, the ledger and the two drivers. Needs the container services; unverified here.
+ * Whatever fails after the meter listens, or after the stack starts, closes the meter and brings the stack down.
+ */
+export async function realHarness({ env, config, log, inject = {} }) {
+  const { load = loadSelected, makeStack = (o) => new Stack(o), makeMeter = createMeter, makeOrigin = () => new PodmanRemote(config.tasks.podman) } = inject;
   const home = benchHome(env);
   assertOutsideRepo(home, 'BENCH_HOME');
   if (config.concurrency > SLOTS) throw new ConfigError('concurrency', `the stack has ${SLOTS} slots`);
   fs.mkdirSync(home, { recursive: true, mode: 0o755 });
   const p = paths(env);
-  const { tasks } = loadSelected(config, p);
-  const ledger = Ledger.open(path.join(home, 'ledger.jsonl'));
+  const { tasks } = load(config, p);
+  const ledger = Ledger.open(ledgerFile(home));
+  let meter = null;
+  let stack = null;
   try {
     const book = CapBook.fromFold(config.capMicro, ledger.fold());
-    const meter = createMeter({ config, ledger, book, env });
+    meter = makeMeter({ config, ledger, book, env });
     await meter.listen(Number(env.BENCH_METER_PORT ?? 18090), env.BENCH_METER_BIND ?? '127.0.0.1');
-    const stack = new Stack({
+    stack = makeStack({
       composeFile: path.join(BENCH_DIR, 'compose.yaml'),
       home,
       tasksDir: path.join(BENCH_DIR, 'tasks'),
@@ -117,21 +127,38 @@ export async function realHarness({ env, config, log }) {
     const slots = config.concurrency;
     for (let slot = 1; slot <= slots; slot++) await stack.pullWindow(slot, () => stack.containers(slot).pull(coderRef(PINS)));
     await stack.graderWindow(() => stack.graderContainers().pull(coderRef(PINS)));
-    // A task image is pulled onto a slot's service once, and onto the grader once, with the internet only for that window.
-    // An own task's image was built where `bench tasks build` ran; it is not pulled (see README, "Unverified").
-    const pulled = new Set();
-    const pullImage = async (slot, task) => {
-      if (task.source === 'own') return;
-      const key = `${slot}|${task.image.ref}`;
-      if (!pulled.has(key)) {
-        await stack.pullWindow(slot, () => stack.containers(slot).pull(task.image.ref));
-        pulled.add(key);
-      }
-      if (!pulled.has(`grader|${task.image.ref}`)) {
-        await stack.graderWindow(() => stack.graderContainers().pull(task.image.ref));
-        pulled.add(`grader|${task.image.ref}`);
-      }
-    };
+
+    // A task image is made present on a slot's service once, and on the grader once, with the internet only for the window of a
+    // pull. `once` keeps the in-flight promise, so two slots never pull the same image twice. An own task's image was built where
+    // `bench tasks build` ran: it is saved from there into an archive the harness makes itself and loaded into the service.
+    const first = once();
+    const origin = makeOrigin();
+    const archives = path.join(home, 'archives');
+    const archiveOf = (ref) => path.join(archives, `${ref.replace(/[^A-Za-z0-9._-]/g, '_')}.tar`);
+    const putOwn = (ref, target, service, window) =>
+      ensureImage({
+        ref,
+        source: { hasImage: (r) => origin.hasImage(r), save: (r, f) => first(`save|${r}`, () => (fs.mkdirSync(archives, { recursive: true }), origin.save(r, f))) },
+        target,
+        archive: archiveOf(ref),
+        load: (file) => window(() => stack.loadImage(service, file)),
+      });
+    const pullImage = (slot, task) =>
+      first(`slot${slot}|${task.image.ref}`, () =>
+        task.source === 'own'
+          ? putOwn(task.image.ref, stack.containers(slot), `podman-${slot}`, (fn) => fn())
+          : stack.pullWindow(slot, () => stack.containers(slot).pull(task.image.ref)),
+      );
+    const pullGraderImage = (task) =>
+      first(`grader|${task.image.ref}`, () =>
+        task.source === 'own' ? putOwn(task.image.ref, stack.graderContainers(), 'grader', (fn) => fn()) : stack.graderWindow(() => stack.graderContainers().pull(task.image.ref)),
+      );
+    // Before any money is spent: every own image is on every slot and on the grader.
+    for (const task of tasks.filter((t) => t.source === 'own')) {
+      for (let slot = 1; slot <= slots; slot++) await pullImage(slot, task);
+      await pullGraderImage(task);
+    }
+
     const deps = {
       ledger,
       book,
@@ -140,6 +167,7 @@ export async function realHarness({ env, config, log }) {
       config,
       home,
       pullImage,
+      pullGraderImage,
       log,
       agents: {
         adam: new AdamAgent({ pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow }),
@@ -156,21 +184,25 @@ export async function realHarness({ env, config, log }) {
       },
     };
   } catch (e) {
+    await meter?.close().catch(() => {});
+    await stack?.down().catch(() => {});
     ledger.close();
     throw e;
   }
 }
 
-const plan = (harness, config) => {
+const plans = (harness, config) => {
   const blocks = buildBlocks({ tasks: harness.tasks, agents: AGENTS, arms: Object.keys(config.arms), seed: config.tasks.seed });
-  return { blocks, specs: specsOf(blocks, { selfRepo: config.tasks.selfRepo }) };
+  const opts = { selfRepo: config.tasks.selfRepo };
+  return { blocks, specs: specsOf(blocks, opts), pilotSpecs: (n) => specsOf(blocks.slice(0, n), { ...opts, pilot: true }), allPilotSpecs: specsOf(blocks, { ...opts, pilot: true }) };
 };
 
 const setupRecord = (config, ctx) => ({
   kind: 'setup',
   modelLabel: config.modelLabel,
   seed: config.tasks.seed,
-  taskLock: lockDigest(ctx.lockTexts).slice(0, 12),
+  digest: ctx.fingerprint.digest,
+  fields: ctx.fingerprint.fields,
   adamImage: `${ctx.pins.coder.image}:${ctx.pins.coder.tag}`,
   adamRevision: ctx.pins.coder.revision,
   opencodeVersion: ctx.pins.opencode.version,
@@ -183,29 +215,39 @@ const progress = (out) => (o) => out(`${o.run}: ${o.state}${o.pass === undefined
 async function cmdPilot(argv, ctx) {
   const { values } = parseArgs({ args: argv, options: { blocks: { type: 'string' } }, allowPositionals: false });
   const count = values.blocks === undefined ? PILOT_BLOCKS : Number(values.blocks);
-  if (!Number.isInteger(count) || count < 1 || count > 100) throw new SelectionError('--blocks is a whole number from 1 to 100');
+  const least = Math.ceil(MIN_PER_ARM / AGENTS.length);
+  if (!Number.isInteger(count) || count < least || count > 100) {
+    throw new SelectionError(`--blocks is a whole number from ${least} to 100: a block gives ${AGENTS.length} runs for each arm and an estimate needs ${MIN_PER_ARM}`);
+  }
+  const cells = AGENTS.length * Object.keys(ctx.config.arms).length;
+  const blockMicro = cells * ctx.config.perRunBudgetMicro;
+  if (blockMicro > ctx.config.capMicro) throw new BudgetError(`the cap (${formatUSD(ctx.config.capMicro)}) cannot hold one block of ${cells} runs at ${formatUSD(ctx.config.perRunBudgetMicro)} each: raise the cap or lower perRunBudgetUSD`);
   const file = proposalFile(ctx.home);
   fs.rmSync(file, { force: true }); // a new pilot invalidates any earlier confirmation
   const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {} });
   try {
-    const { blocks, specs } = plan(harness, ctx.config);
-    const pilot = blocks.slice(0, count);
-    const pilotSpecs = specs.filter((s) => s.block < pilot.length);
+    const plan = plans(harness, ctx.config);
+    if (count > plan.blocks.length) throw new SelectionError(`--blocks ${count} is more than the ${plan.blocks.length} selected tasks`);
+    const pilotSpecs = plan.pilotSpecs(count);
+    const worst = pilotSpecs.length * ctx.config.perRunBudgetMicro;
+    harness.deps.digest = ctx.fingerprint.digest;
     harness.deps.ledger.append(setupRecord(ctx.config, ctx));
-    ctx.out(`pilot: ${pilot.length} block(s), ${pilotSpecs.length} runs of ${specs.length}, ${harness.slots} slot(s), ${formatUSD(ctx.config.perRunBudgetMicro)} reserved for each run`);
+    ctx.out(`pilot: ${count} block(s), ${pilotSpecs.length} runs, ${harness.slots} slot(s), ${formatUSD(ctx.config.perRunBudgetMicro)} reserved for each run`);
+    if (worst > ctx.config.capMicro) ctx.out(`warning: if every pilot run used its whole reservation it would cost ${formatUSD(worst)}, more than the cap ${formatUSD(ctx.config.capMicro)}; the cap holds, and blocks may stop early`);
     delete harness.deps.reserveMicro;
     await runSchedule({ deps: harness.deps, specs: pilotSpecs, slots: harness.slots, onOutcome: progress(ctx.out) });
     const estimate = pilotEstimate({
       folded: harness.deps.ledger.fold(),
       pilotRuns: new Set(pilotSpecs.map((s) => s.run)),
       arms: Object.keys(ctx.config.arms),
-      totalTasks: blocks.length,
+      totalTasks: plan.blocks.length,
       agents: AGENTS.length,
       capMicro: ctx.config.capMicro,
     });
     ctx.out(renderEstimate(estimate));
-    fs.writeFileSync(file, `${JSON.stringify(proposalBody({ estimate, config: ctx.config, pins: ctx.pins, lockTexts: ctx.lockTexts, pilotBlocks: pilot.length }), null, 2)}\n`);
-    ctx.out(`written: ${file}\nread it, then: bench confirm${estimate.projection.fitsCap ? '' : ' --over-cap'}`);
+    fs.writeFileSync(file, `${JSON.stringify(proposalBody({ estimate, fingerprint: ctx.fingerprint, pilotBlocks: count }), null, 2)}\n`);
+    const flags = [...(estimate.projection.fitsCap ? [] : ['--over-cap']), ...(estimate.censoredArms.length > 0 ? ['--censored'] : [])];
+    ctx.out(`written: ${file}\nread it, then: bench confirm${flags.length ? ` ${flags.join(' ')}` : ''}`);
     return 0;
   } finally {
     await harness.close();
@@ -213,11 +255,11 @@ async function cmdPilot(argv, ctx) {
 }
 
 async function cmdConfirm(argv, ctx) {
-  const { values } = parseArgs({ args: argv, options: { 'over-cap': { type: 'boolean' } }, allowPositionals: false });
+  const { values } = parseArgs({ args: argv, options: { 'over-cap': { type: 'boolean' }, censored: { type: 'boolean' } }, allowPositionals: false });
   const file = proposalFile(ctx.home);
   const proposal = readJson(file, null);
   if (!proposal) throw new BudgetError('no pilot budget to confirm: run `bench pilot` first');
-  fs.writeFileSync(file, `${JSON.stringify(confirmProposal(proposal, { overCap: values['over-cap'] === true }), null, 2)}\n`);
+  fs.writeFileSync(file, `${JSON.stringify(confirmProposal(proposal, { overCap: values['over-cap'] === true, censored: values.censored === true }), null, 2)}\n`);
   ctx.out(`confirmed: ${Object.entries(proposal.perArmMicro).map(([a, m]) => `${a} ${formatUSD(m)}`).join(', ')} per run`);
   return 0;
 }
@@ -225,12 +267,13 @@ async function cmdConfirm(argv, ctx) {
 async function cmdRun(argv, ctx) {
   parseArgs({ args: argv, options: {}, allowPositionals: false });
   // Nothing is started, not even the stack, before the owner's confirmation is checked.
-  const perArm = requireConfirmed(readJson(proposalFile(ctx.home), null), { config: ctx.config, pins: ctx.pins, lockTexts: ctx.lockTexts });
+  const perArm = requireConfirmed(readJson(proposalFile(ctx.home), null), { config: ctx.config, fingerprint: ctx.fingerprint });
   const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {} });
   try {
-    const { blocks, specs } = plan(harness, ctx.config);
+    const { blocks, specs } = plans(harness, ctx.config);
     const { ledger } = harness.deps;
     ledger.append(setupRecord(ctx.config, ctx));
+    harness.deps.digest = ctx.fingerprint.digest;
     harness.deps.reserveMicro = (spec) => perArm[spec.arm];
     ctx.out(`run: ${blocks.length} block(s), ${specs.length} runs, ${harness.slots} slot(s), budget per run ${Object.entries(perArm).map(([a, m]) => `${a} ${formatUSD(m)}`).join(', ')}`);
     const result = await runSchedule({ deps: harness.deps, specs, slots: harness.slots, onOutcome: progress(ctx.out) });
@@ -240,7 +283,7 @@ async function cmdRun(argv, ctx) {
       const st = folded.get(s.run)?.state ?? 'not started';
       states[st] = (states[st] ?? 0) + 1;
     }
-    ctx.out(`ended: ${Object.entries(states).map(([k, n]) => `${k} ${n}`).join(', ')}${result.capHit ? '; stopped at the cap, nothing new was started' : ''}`);
+    ctx.out(`ended: ${Object.entries(states).map(([k, n]) => `${k} ${n}`).join(', ')}${result.capHit ? '; stopped at the cap, the blocks that did not fit were not started (raise the cap and run again to continue)' : ''}`);
     const reportFile = path.join(ctx.home, 'report.md');
     fs.writeFileSync(reportFile, buildReport(ledger.records, { modelLabel: ctx.config.modelLabel, capMicro: ctx.config.capMicro }));
     ctx.out(reportFile);
@@ -250,15 +293,31 @@ async function cmdRun(argv, ctx) {
   }
 }
 
+/** Grade again the runs a regrade left in `Grading` (a kill, or a grader that failed again): from the saved patch, the agent is never run. */
+export async function regradeStranded({ deps, specs }) {
+  const folded = deps.ledger.fold();
+  const out = [];
+  for (const spec of specs) if (folded.get(spec.run)?.state === 'Grading') out.push(await advance({ deps, spec: { ...spec, slot: 1 } }));
+  return out;
+}
+
 async function cmdRegrade(argv, ctx) {
   parseArgs({ args: argv, options: {}, allowPositionals: false });
   const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {} });
   try {
-    const { specs } = plan(harness, ctx.config);
+    const plan = plans(harness, ctx.config);
+    const specs = [...plan.allPilotSpecs, ...plan.specs];
+    harness.deps.digest = ctx.fingerprint.digest;
+    const stranded = await regradeStranded({ deps: harness.deps, specs });
+    for (const o of stranded) progress(ctx.out)(o);
     const folded = harness.deps.ledger.fold();
     const todo = specs.filter((s) => folded.get(s.run)?.state === 'Done' && folded.get(s.run).result?.invalid === true);
-    ctx.out(`regrade: ${todo.length} run(s) whose grading failed in the infrastructure`);
-    for (const spec of todo) progress(ctx.out)(await regradeInvalid({ deps: harness.deps, spec }));
+    ctx.out(`regrade: ${stranded.length} run(s) left in Grading, ${todo.length} run(s) whose grading failed in the infrastructure`);
+    for (const spec of todo) {
+      const o = await regradeInvalid({ deps: harness.deps, spec });
+      progress(ctx.out)(o);
+      if (o.reason) ctx.out(`  ${o.reason}`);
+    }
     return 0;
   } finally {
     await harness.close();
@@ -273,6 +332,9 @@ export async function runCli(command, argv, { env = process.env, out = (l) => pr
     fs.mkdirSync(home, { recursive: true, mode: 0o755 });
     const ctx = { env, home, out, make, pins, config: loadConfig({ env }) };
     ctx.lockTexts = lockTexts ?? readLocks(paths(env));
+    ctx.fingerprint = configFingerprint({ config: ctx.config, pins, lockTexts: ctx.lockTexts, key: digestKey(home) });
+    // The ledger holds runs of one configuration only; nothing here pools two.
+    assertLedgerBound(readLedger(ledgerFile(home)).records, ctx.fingerprint);
     if (command === 'pilot') return await cmdPilot(argv, ctx);
     if (command === 'confirm') return await cmdConfirm(argv, ctx);
     if (command === 'run') return await cmdRun(argv, ctx);

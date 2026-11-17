@@ -43,7 +43,7 @@ const readSysctl = (file, readFile) => {
  * @param {boolean} [o.start]
  * @returns {Promise<{checks: object[], exitCode: number, fallback: string|null}>}
  */
-export async function doctor({ home, pins, exec = runCommand, readFile = fs.readFileSync, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2 }) {
+export async function doctor({ home, pins, exec = runCommand, readFile = fs.readFileSync, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, env = process.env }) {
   const checks = [];
   const run = async (file, args) => {
     try {
@@ -54,7 +54,13 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
   };
 
   const major = Number(nodeVersion.split('.')[0]);
-  checks.push(major >= 22 ? ok('node', `Node ${nodeVersion} (CI runs 24)`) : fail('node', `Node ${nodeVersion} is too old`, 'install Node 22 or newer (24 is what CI uses)'));
+  checks.push(major >= 22 ? ok('node', `Node ${nodeVersion} (CI runs 22 and 24)`) : fail('node', `Node ${nodeVersion} is too old`, 'install Node 22 or newer (CI runs 22 and 24)'));
+
+  // The meter reaches the endpoint with Node's own http client, which uses a proxy from the environment only when asked to.
+  const proxy = env.HTTPS_PROXY ?? env.https_proxy;
+  if (proxy) {
+    checks.push(env.NODE_USE_ENV_PROXY === '1' ? ok('proxy', 'HTTPS_PROXY is set and NODE_USE_ENV_PROXY=1: the meter reaches the endpoint through it') : warn('proxy', 'HTTPS_PROXY is set but the meter would reach the endpoint directly', 'start the harness with NODE_USE_ENV_PROXY=1 if the endpoint is reached through that proxy'));
+  }
 
   // The binary of OpenCode that is mounted is a native linux-x64 executable linked to glibc.
   checks.push(arch === 'x64' ? ok('machine', 'x64: the OpenCode binary of the pins runs here') : fail('machine', `${arch}: the OpenCode binary of the pins is linux-x64`, 'run the benchmark on an x64 Linux machine; a task image with musl (Alpine) cannot run it either, and the environment check says so'));

@@ -6,6 +6,7 @@
 //   * the cells of a block follow a cyclic Latin square: each round of `cells.length` blocks starts from one seeded
 //     permutation of the cells and rotates it by one for each block, so in a round every cell stands at every position
 //     exactly once (no cell is always the first to meet a cold cache or the end of a long day).
+import crypto from 'node:crypto';
 import { mulberry32, seedFrom } from './stats.mjs';
 
 const SAFE = /[^A-Za-z0-9._-]/g;
@@ -20,8 +21,19 @@ function shuffle(items, rand) {
   return a;
 }
 
-/** The run id of a cell of a task: stable, plain, and one per task, agent and arm. */
-export const runId = (taskId, agent, arm) => `${String(taskId).replace(SAFE, '-')}.${agent}.${arm}`.slice(0, 128);
+/**
+ * The run id of a cell of a task, unique by construction: the task part is the id as it is when it is plain and short enough,
+ * else the sanitised id, cut to fit, with a short hash of the whole id; `.agent.arm` is never cut. A pilot run has the prefix `pilot.`.
+ */
+export function runId(taskId, agent, arm, { prefix = '' } = {}) {
+  const id = String(taskId);
+  const suffix = `.${agent}.${arm}`;
+  const room = 128 - prefix.length - suffix.length;
+  const plain = id.replace(SAFE, '-');
+  if (plain === id && id.length <= room) return `${prefix}${id}${suffix}`;
+  const hash = crypto.createHash('sha256').update(id).digest('hex').slice(0, 8);
+  return `${prefix}${plain.slice(0, room - hash.length - 1)}-${hash}${suffix}`;
+}
 
 /** Public tasks are `public`; own tasks of adam-rs's own repository are `own-self`; the other own tasks are `own`. */
 export function sourceOf(task, selfRepo) {
@@ -48,9 +60,27 @@ export function buildBlocks({ tasks, agents, arms, seed }) {
   });
 }
 
-/** The runs of the blocks, in the order they are started. */
-export function specsOf(blocks, { selfRepo = null } = {}) {
-  return blocks.flatMap((b) =>
-    b.cells.map(({ agent, arm }) => ({ run: runId(b.task.id, agent, arm), task: b.task, agent, arm, block: b.index, source: sourceOf(b.task, selfRepo), language: b.task.language ?? null })),
+/**
+ * The runs of the blocks, in the order they are started. `pilot` marks the pilot's runs (phase `pilot`, ids prefixed `pilot.`): the
+ * full run runs the same tasks again under the confirmed budget, and the pilot's results are never in the rates.
+ */
+export function specsOf(blocks, { selfRepo = null, pilot = false } = {}) {
+  const specs = blocks.flatMap((b) =>
+    b.cells.map(({ agent, arm }) => ({
+      run: runId(b.task.id, agent, arm, { prefix: pilot ? 'pilot.' : '' }),
+      task: b.task,
+      agent,
+      arm,
+      block: b.index,
+      phase: pilot ? 'pilot' : 'run',
+      source: sourceOf(b.task, selfRepo),
+      language: b.task.language ?? null,
+    })),
   );
+  const seen = new Set();
+  for (const s of specs) {
+    if (seen.has(s.run)) throw new Error(`two runs would have the same run id (${s.run}): the task ids collide`);
+    seen.add(s.run);
+  }
+  return specs;
 }

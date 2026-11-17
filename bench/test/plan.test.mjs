@@ -52,7 +52,7 @@ test('specs follow the blocks, with a plain unique run id and the block, source 
   assert.deepEqual(specs.slice(0, 4).map((s) => s.block), [0, 0, 0, 0]);
   assert.ok(specs.every((s) => /^[A-Za-z0-9._:-]{1,128}$/.test(s.run)));
   assert.equal(specs[0].run, runId(blocks[0].task.id, blocks[0].cells[0].agent, blocks[0].cells[0].arm));
-  assert.equal(runId('a b/c', 'adam', 'max'), 'a-b-c.adam.max');
+  assert.equal(runId('plain-id', 'adam', 'max'), 'plain-id.adam.max');
   assert.equal(specs[0].language, 'go');
 });
 
@@ -70,4 +70,27 @@ test('the pilot is a prefix: the first blocks of the plan, so its runs are the f
   const all = specsOf(blocks).map((s) => s.run);
   const pilot = specsOf(blocks.slice(0, 3)).map((s) => s.run);
   assert.deepEqual(all.slice(0, pilot.length), pilot);
+});
+
+test('R8: run ids are unique by construction: ids that sanitise alike differ, and a long id never loses its agent and arm', () => {
+  const a = runId('a-b', 'adam', 'max');
+  const b = runId('a/b', 'adam', 'max');
+  const c = runId('a b', 'adam', 'max');
+  assert.equal(new Set([a, b, c]).size, 3);
+  assert.equal(a, 'a-b.adam.max', 'a plain id is left as it is');
+  const long1 = 'x'.repeat(200) + '1';
+  const long2 = 'x'.repeat(200) + '2';
+  for (const agentArm of [['adam', 'max'], ['opencode', 'off']]) {
+    const id = runId(long1, ...agentArm);
+    assert.ok(id.length <= 128);
+    assert.ok(id.endsWith(`.${agentArm[0]}.${agentArm[1]}`), 'the suffix is never cut');
+  }
+  assert.notEqual(runId(long1, 'adam', 'max'), runId(long2, 'adam', 'max'));
+  assert.equal(runId(long1, 'adam', 'max'), runId(long1, 'adam', 'max'), 'stable');
+  assert.ok(/^[A-Za-z0-9._:-]{1,128}$/.test(runId('é/ü?*', 'adam', 'max')));
+});
+
+test('R8: two tasks that would share a run id are an error, not a silently skipped run', () => {
+  const same = [{ id: 'dup', source: 'public' }, { id: 'dup', source: 'public' }];
+  assert.throws(() => specsOf(buildBlocks({ tasks: same, agents: ['adam'], arms: ['max'], seed: '1' })), /same run id/);
 });

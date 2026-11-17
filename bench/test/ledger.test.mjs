@@ -155,7 +155,7 @@ test('resume: every rule', (t) => {
     collecting: 'rerun',
     grading: 'regrade',
     done: 'skip',
-    notstarted: 'skip',
+    notstarted: 'retry',
     stopped: 'skip',
     interrupted: 'rerun',
     infra1: 'retry',
@@ -184,6 +184,8 @@ test('resume: the records it asks for are valid transitions, and a Done run is n
   assert.equal(after.get('done').state, 'Done');
   assert.equal(after.get('done').history.length, folded.get('done').history.length);
   assert.equal(after.get('stopped').state, 'StoppedByCap');
+  assert.equal(after.get('notstarted').state, 'Planned', 'R5: a run the cap kept from starting is planned again by the next start');
+  assert.equal(after.get('notstarted').attempt, 2);
   assert.equal(after.get('planned').state, 'Planned');
 });
 
@@ -317,4 +319,17 @@ test('row 9: a run in Interrupted can end Failed_infra directly', (t) => {
   interrupted(ledger, 'r', 'Interrupted');
   ledger.append(state('r', 'Failed_infra', { final: true }));
   assert.equal(ledger.fold().get('r').final, true);
+});
+
+test('R1 and R3: a Planned record carries its digest and phase into the fold, and a retry carries them on', (t) => {
+  const { ledger } = open(t);
+  ledger.append({ kind: 'state', run: 'p', state: 'Planned', task: 'T1', agent: 'a', arm: 'max', digest: 'abc', phase: 'pilot' });
+  ledger.append({ kind: 'state', run: 'p', state: 'NotStarted', reason: 'cap' });
+  const folded = ledger.fold();
+  assert.equal(folded.get('p').digest, 'abc');
+  assert.equal(folded.get('p').phase, 'pilot');
+  const records = resumeRecords(resumeActions(folded), folded);
+  assert.equal(records[0].state, 'Planned');
+  assert.equal(records[0].digest, 'abc');
+  assert.equal(records[0].phase, 'pilot');
 });

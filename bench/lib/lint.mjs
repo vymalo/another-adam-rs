@@ -63,3 +63,28 @@ export function lintStatement(statement, goldDiff) {
   for (const t of [...a.paths].sort()) if (!o.paths.has(t) && has(body, t)) warnings.push({ kind: 'path', token: t });
   return warnings;
 }
+
+/**
+ * The command a coder would find to check its own work in a repository at the base: a `test` script in `package.json`, a
+ * `Cargo.toml`, a `go.mod`, a Makefile or justfile with a `test` target, a Python test configuration, or a test command its README
+ * or CONTRIBUTING names. `read(path)` returns the file's text or null. Returns what was found, or null.
+ *
+ * An own task whose repository has none sends the agent to work with nothing to run: it ends "completed" and the hidden tests, not
+ * the agent's say, decide. The lint refuses such a task so the owner adds the command to the repository's own files at the base
+ * (they are in the image) or drops the task.
+ */
+export function findCheckCommand(read) {
+  const text = (p) => read(p) ?? '';
+  try {
+    if (JSON.parse(text('package.json') || '{}').scripts?.test) return 'package.json scripts.test';
+  } catch {
+    // not JSON: keep looking
+  }
+  if (read('Cargo.toml') !== null) return 'Cargo.toml (cargo test)';
+  if (read('go.mod') !== null) return 'go.mod (go test)';
+  for (const f of ['Makefile', 'makefile', 'GNUmakefile', 'justfile', 'Justfile']) if (/^test\s*:/m.test(text(f))) return `${f} test target`;
+  for (const f of ['pytest.ini', 'tox.ini', 'conftest.py']) if (read(f) !== null) return f;
+  if (/\[tool\.pytest|\[pytest\]|\[tool\.tox/.test(`${text('pyproject.toml')}${text('setup.cfg')}`)) return 'Python test configuration';
+  const said = /\b(cargo (?:nextest run|test)|npm (?:run )?test|pnpm (?:run )?test|yarn test|go test|pytest|make test)\b/.exec(`${text('README.md')}\n${text('CONTRIBUTING.md')}`);
+  return said ? `${said[1]} (named in the README)` : null;
+}

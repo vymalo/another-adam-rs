@@ -25,6 +25,7 @@ export function createScriptedModel(initial = {}) {
     endless: false, // a stream that never ends: `endlessChunkBytes` of text every `endlessEveryMs`, honouring backpressure
     endlessChunkBytes: 100,
     endlessEveryMs: 5,
+    holdAfterDoneMs: 0, // a stream ends this long after `[DONE]` (a client that closes at `[DONE]` closes first)
     ...initial,
   };
   const requests = [];
@@ -102,7 +103,13 @@ export function createScriptedModel(initial = {}) {
           }
           if (behavior.endless) return endless();
           res.write('data: [DONE]\n\n');
-          res.end();
+          if (behavior.holdAfterDoneMs > 0) {
+            const h = setTimeout(() => {
+              timers.delete(h);
+              res.end();
+            }, behavior.holdAfterDoneMs);
+            timers.add(h);
+          } else res.end();
         };
         const endless = () => {
           if (res.destroyed) return;

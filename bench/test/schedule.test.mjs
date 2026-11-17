@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { CALLS_PER_RUN } from '../lib/agent-script.mjs';
 import { LedgerError } from '../lib/ledger.mjs';
 import { buildBlocks, specsOf } from '../lib/plan.mjs';
-import { HarnessCrash, regradeInvalid } from '../lib/runner.mjs';
+import { HarnessCrash, regradeInvalid, runPlan } from '../lib/runner.mjs';
 import { runSchedule } from '../lib/schedule.mjs';
 import { PER_CALL, fixture, newTracker } from './runnerfix.mjs';
 
@@ -49,46 +49,73 @@ test('the runs start in the order of the blocks', async (t) => {
   assert.deepEqual(planned, specs.map((s) => s.run));
 });
 
-test('two slots racing for the last budget: one run starts, the other never does, and the cap is never crossed', async (t) => {
-  const f = await fixture(t, { capUSD: 3, perRunBudgetUSD: 3, taskNames: NAMES, agentOver: { delayMs: 10 } });
+test('R4: two slots racing for the last budget: the first block runs whole, the second is not started, not even planned, and the cap is never crossed', async (t) => {
+  // a block reserves 4 runs of 3 USD; 12.05 USD holds one block and no part of a second
+  const f = await fixture(t, { capUSD: 12.05, perRunBudgetUSD: 3, taskNames: NAMES, agentOver: { delayMs: 10 } });
   const deps = f.deps();
   const seen = watchCommitted(f, () => deps.book);
   const specs = plan(f, 2);
   const res = await runSchedule({ deps, specs, slots: 2 });
   const states = specs.map((s) => f.ledger.fold().get(s.run)?.state);
-  assert.deepEqual(states.slice(0, 2), ['Done', 'NotStarted']);
-  assert.ok(states.slice(2).every((s) => s === undefined), 'nothing after the refusal was even planned');
+  assert.deepEqual(states, ['Done', 'Done', 'Done', 'Done', undefined, undefined, undefined, undefined]);
   assert.equal(res.capHit, true);
-  assert.ok(seen.max <= 3 * USD, `the cap held ${seen.max}`);
+  assert.ok(seen.max <= 12.05 * USD, `the cap held ${seen.max}`);
   const spent = [...f.ledger.fold().values()].reduce((s, v) => s + v.spentMicro, 0);
-  assert.ok(spent <= 3 * USD);
-  assert.ok(!f.agents.adam.log.concat(f.agents.opencode.log).some((l) => l[0] === 'prepare' && l[1] === specs[1].run), 'the refused run never prepared');
+  assert.ok(spent <= 12.05 * USD);
+  assert.ok(specs.slice(4).every((s) => !f.agents.adam.log.concat(f.agents.opencode.log).some((l) => l[0] === 'prepare' && l[1] === s.run)), 'no run of the second block prepared');
 });
 
-test('a run that does not fit waits for the others to end, and starts when their reservations are free', async (t) => {
-  // 7 USD: two reservations of 3 fit (6), a third does not until one ends and gives back what it did not spend
+test('R4: a block that does not fit even alone is not started, and nothing is written for it', async (t) => {
+  const f = await fixture(t, { capUSD: 11.9, perRunBudgetUSD: 3, taskNames: NAMES });
+  const res = await runSchedule({ deps: f.deps(), specs: plan(f, 2), slots: 2 });
+  assert.equal(res.capHit, true);
+  assert.equal(f.ledger.fold().size, 0);
+});
+
+test('R4: a block waits for the runs of the earlier block to end, then starts; the cap is never crossed', async (t) => {
   const tracker = newTracker();
-  const f = await fixture(t, { capUSD: 7, perRunBudgetUSD: 3, taskNames: NAMES, agentOver: { delayMs: 15, tracker } });
+  const f = await fixture(t, { capUSD: 14, perRunBudgetUSD: 3, taskNames: NAMES, agentOver: { delayMs: 10, tracker } });
   const deps = f.deps();
   const seen = watchCommitted(f, () => deps.book);
-  const specs = plan(f, 2); // 8 runs
+  const specs = plan(f, 2);
   const res = await runSchedule({ deps, specs, slots: 3 });
-  assert.ok(res.outcomes.every((o) => o.state === 'Done'), 'all eight ran, though never three at once');
+  assert.ok(res.outcomes.every((o) => o.state === 'Done'));
   assert.equal(res.capHit, false);
-  assert.equal(tracker.max, 2, 'three workers, but the cap holds only two reservations');
-  assert.ok(seen.max <= 7 * USD, `the cap held ${seen.max}`);
+  assert.ok(seen.max <= 14 * USD, `the cap held ${seen.max}`);
+  const recs = f.ledger.records.filter((r) => r.kind === 'state');
+  const lastDoneOfFirst = Math.max(...specs.slice(0, 4).map((s) => recs.findIndex((r) => r.run === s.run && r.state === 'Done')));
+  const firstPlannedOfSecond = Math.min(...specs.slice(4).map((s) => recs.findIndex((r) => r.run === s.run && r.state === 'Planned')));
+  assert.ok(firstPlannedOfSecond > lastDoneOfFirst, 'the second block started after the first ended: 14 USD cannot hold a block and a part of another');
+  assert.ok(tracker.max <= 3);
+});
+
+test('R5: a run the cap kept from starting is planned again by a later start with room', async (t) => {
+  const f = await fixture(t, { capUSD: 3, perRunBudgetUSD: 3, taskNames: NAMES });
+  const specs = plan(f, 1);
+  const first = await runPlan({ deps: f.deps(), plan: specs.slice(0, 2).map((s) => ({ ...s, slot: 1 })) });
+  assert.deepEqual(first.map((o) => o.state), ['Done', 'NotStarted']);
+  const refused = specs[1].run;
+  const deps = await f.reopen();
+  deps.book.capMicro = 20 * USD; // the owner raised the cap
+  const res = await runSchedule({ deps, specs, slots: 2 });
+  assert.ok(res.outcomes.some((o) => o.run === refused && o.state === 'Done'));
+  const folded = f.ledger.fold();
+  assert.ok(specs.every((s) => folded.get(s.run).state === 'Done'));
+  assert.equal(folded.get(refused).attempt, 2);
+  assert.equal(folded.get(specs[0].run).attempt, 1, 'a Done run is not run again');
 });
 
 test('whatever the interleaving, the cap is never crossed at any record, with prices that make a run spend a lot', async (t) => {
   const prices = { inputPerMTok: 3, cachedInputPerMTok: 0.3, cacheWritePerMTok: 3.75, outputPerMTok: 4000 };
-  const f = await fixture(t, { capUSD: 40, perRunBudgetUSD: 34, prices, taskNames: NAMES, agentOver: { delayMs: 3 } });
+  const f = await fixture(t, { capUSD: 140, perRunBudgetUSD: 34, prices, taskNames: NAMES, agentOver: { delayMs: 3 } });
   const deps = f.deps();
   const seen = watchCommitted(f, () => deps.book);
   const res = await runSchedule({ deps, specs: plan(f, 3), slots: 2 });
-  assert.ok(seen.max <= 40 * USD, `the cap held ${seen.max}`);
+  assert.ok(seen.max <= 140 * USD, `the cap held ${seen.max}`);
   const spent = [...f.ledger.fold().values()].reduce((s, v) => s + v.spentMicro, 0);
-  assert.ok(spent <= 40 * USD, `spent ${spent}`);
+  assert.ok(spent <= 140 * USD, `spent ${spent}`);
   assert.equal(res.capHit, true);
+  assert.ok(spent > 0, 'the first block ran');
 });
 
 test('killed with two runs in flight: the next start runs those two again and no other, and never a Done run', async (t) => {

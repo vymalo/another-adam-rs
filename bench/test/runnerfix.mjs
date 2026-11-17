@@ -98,6 +98,8 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     },
   });
   const windows = [];
+  const shared = [];
+  const gradePulls = [];
   const resets = [];
   const stack = {
     containers: () => slotContainers,
@@ -107,6 +109,7 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     resetWork: async (slot) => resets.push(slot),
     pullWindow: async (slot, fn) => fn(),
     graderWindow: async (fn) => (windows.push('grader'), fn()),
+    graderShared: async (fn) => (shared.push('grader'), fn()),
   };
   const ledgerFile = path.join(home, 'ledger.jsonl');
   let ledger;
@@ -129,6 +132,7 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     agents,
     config,
     home,
+    pullGraderImage: async (task) => void gradePulls.push(task.id),
     prepareBase: async () => ({ dir: '/base/base.git', sha: 'a'.repeat(40), slug: 'demo', workdir: '/app' }),
     ...fixtureHooks,
   });
@@ -145,6 +149,8 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     tasks,
     agents,
     windows,
+    shared,
+    gradePulls,
     resets,
     slotContainers,
     grading,

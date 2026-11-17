@@ -41,6 +41,8 @@ export const runDirName = (run, attempt) => `${run.replace(SAFE_ID, '-')}-a${att
  * @property {string} home     where this phase keeps its results
  * @property {(spec) => number} [reserveMicro]  what a run reserves; default the configuration's per-run budget
  * @property {(slot: number, task) => Promise<void>} [pullImage]  makes the task's image present on the slot's service
+ * @property {(task) => Promise<void>} [pullGraderImage]  makes the task's image present on the grader (also before a grading again)
+ * @property {string} [digest]  the fingerprint of the configuration, written on every Planned record
  * @property {(run: string, state: string) => void} [afterState]  called after each state record is written
  */
 
@@ -57,9 +59,20 @@ async function gradeSaved({ deps, task, patchPath }) {
   const io = deps.stack.graderIO?.();
   const grade = () => gradePatch({ containers, task, patchFile: hasPatch ? patchPath : null, workRoot: work, ...(io ? { io } : {}) });
   const net = task.verifierNetwork;
-  // The grader has no route out; a verifier that needs the network gets it for the window of its grading.
-  return net === 'public' || net === 'default' ? deps.stack.graderWindow(grade) : grade();
+  await deps.pullGraderImage?.(task);
+  // The grader has no route out; a verifier that needs the network gets it for the window of its grading, alone on the grader.
+  if (net === 'public' || net === 'default') return deps.stack.graderWindow(grade);
+  return deps.stack.graderShared ? deps.stack.graderShared(grade) : grade();
 }
+
+/** The size of the saved patch, so a later regrade can tell that it is the one that was graded. */
+const patchBytes = (file) => {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return null;
+  }
+};
 
 function resultOf({ grade, exit, wallMs, selfReported, patchPath, notes, meter }) {
   return {
@@ -74,6 +87,7 @@ function resultOf({ grade, exit, wallMs, selfReported, patchPath, notes, meter }
     suspect: grade.suspect,
     removed: grade.removed,
     patch: patchPath,
+    patchBytes: patchBytes(patchPath),
     ...(notes ? { notes } : {}),
   };
 }
@@ -217,6 +231,12 @@ export async function regradeRun({ deps, spec, attempt }) {
 export async function regradeInvalid({ deps, spec }) {
   const view = deps.ledger.fold().get(spec.run);
   if (view?.state !== 'Done' || view.result?.invalid !== true) return { run: spec.run, state: view?.state, skipped: true };
+  // A patch that is gone or changed would be graded as "no patch" and turn an invalid grade into a valid fail: left invalid.
+  const file = path.join(deps.home, 'runs', runDirName(spec.run, view.attempt), 'model.patch');
+  const bytes = patchBytes(file);
+  if (bytes === null || (Number.isSafeInteger(view.result.patchBytes) && bytes !== view.result.patchBytes)) {
+    return { run: spec.run, state: 'Done', skipped: true, reason: 'the saved patch is missing or is not the one that was graded' };
+  }
   stateRecord(deps, spec.run, 'Grading', { regrade: true });
   return { run: spec.run, ...(await regradeRun({ deps, spec, attempt: view.attempt })) };
 }
@@ -241,7 +261,16 @@ export async function resumeLedger({ deps, slots }) {
 export async function advance({ deps, spec }) {
   let view = deps.ledger.fold().get(spec.run);
   if (!view) {
-    stateRecord(deps, spec.run, 'Planned', { task: spec.task.id, agent: spec.agent, arm: spec.arm, block: spec.block ?? null, source: spec.source ?? spec.task.source ?? null, language: spec.language ?? spec.task.language ?? null });
+    stateRecord(deps, spec.run, 'Planned', {
+      task: spec.task.id,
+      agent: spec.agent,
+      arm: spec.arm,
+      block: spec.block ?? null,
+      source: spec.source ?? spec.task.source ?? null,
+      language: spec.language ?? spec.task.language ?? null,
+      ...(deps.digest ? { digest: deps.digest } : {}),
+      ...(spec.phase ? { phase: spec.phase } : {}),
+    });
     view = deps.ledger.fold().get(spec.run);
   }
   if (view.state === 'Grading') return { run: spec.run, ...(await regradeRun({ deps, spec, attempt: view.attempt })) };

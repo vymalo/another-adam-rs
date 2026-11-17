@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { CALLS_PER_RUN, SELF_TASKS, identifyAgent, nextTurn, stepsDone, taskMarker } from '../lib/agent-script.mjs';
@@ -55,12 +58,23 @@ test('OpenCode is driven through one write in its working directory and one comm
   assert.equal(calls.length + 1, CALLS_PER_RUN.opencode);
 });
 
-test('the wrong task writes the wrong answer, to the same file as hello', () => {
+test('the wrong task asks for another file than hello and the scripted model writes the wrong content in it', () => {
   const hello = play(OPENCODE, '[mock:hello]').calls[0].args;
   const wrong = play(OPENCODE, '[mock:wrong]').calls[0].args;
-  assert.equal(hello.path, wrong.path);
+  assert.ok(hello.path.endsWith('/hello.txt') && wrong.path.endsWith('/bye.txt'));
   assert.equal(hello.content, 'hello\n');
   assert.equal(wrong.content, 'goodbye\n');
+});
+
+test('S3: the self tasks\' statements carry no scripted-model switch, differ from each other, and the scripted model still tells them apart', () => {
+  const read = (id) => fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'tasks', 'self', id, 'instruction.md'), 'utf8');
+  const statements = Object.fromEntries(['hello', 'wrong', 'fix-add'].map((id) => [id, read(id)]));
+  for (const [id, text] of Object.entries(statements)) {
+    assert.ok(!/\[mock:/.test(text), `${id} carries no marker`);
+    assert.equal(taskMarker([{ role: 'user', content: text }]), id, `${id} is told by what it says`);
+  }
+  assert.notEqual(statements.hello, statements.wrong, 'a real model sees two different tasks');
+  assert.equal(new Set(Object.values(statements)).size, 3);
 });
 
 test('stepsDone reads the highest scripted id and ignores the ids of other callers', () => {

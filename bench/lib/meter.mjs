@@ -288,6 +288,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
       let received = 0;
       let idleTimer = null;
       let callTimer = null;
+      let sniffer = null; // what the stream said about usage so far: a client that closes at [DONE] is charged by it
       const clear = () => {
         clearTimeout(idleTimer);
         clearTimeout(callTimer);
@@ -310,7 +311,9 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
         if (res.writableFinished) return;
         clientGone = true;
         upstreamReq?.destroy();
-        settle({ rawUsage: null, reason: 'client_abort' });
+        sniffer?.end();
+        if (sniffer?.usage) settle({ rawUsage: sniffer.usage, status: 200 });
+        else settle({ rawUsage: null, reason: 'client_abort' });
         resolve();
       });
 
@@ -370,7 +373,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
           };
 
           if (stream && /text\/event-stream/i.test(contentType)) {
-            const sniffer = new UsageSniffer();
+            sniffer = new UsageSniffer();
             res.writeHead(status, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
             res.flushHeaders();
             ur.on('data', (c) => {

@@ -147,7 +147,7 @@ test('check, then select: the lock holds ids, checksums and digests only, and dr
 
 test('own tasks: mine, lint, build, check and select, end to end on fixtures', async (t) => {
   const clone = initRepo(t);
-  commitFiles(clone, { 'src/app.ts': lines(5), 'package.json': '{}\n' }, 'chore: start (#1)');
+  commitFiles(clone, { 'src/app.ts': lines(5), 'package.json': '{"scripts":{"test":"vitest run"}}\n' }, 'chore: start (#1)');
   const base = git(clone, 'rev-parse', 'HEAD').trim();
   const commit = commitFiles(clone, { 'src/app.ts': `${lines(5)}export function compute_total_now() {}\n`, 'src/app.test.ts': 'test("x", () => {});\n' }, 'feat: total (#2)');
   const ws = `registry.example.test/workspace@sha256:${SHA('d')}`;
@@ -165,11 +165,11 @@ test('own tasks: mine, lint, build, check and select, end to end on fixtures', a
   fs.writeFileSync(path.join(dir, 'instruction.md'), 'Add a function compute_total_now.\n');
   assert.equal(await s.run(['lint']), 0);
   assert.match(s.outLines.join('\n'), /warning: the statement names the identifier "compute_total_now"/);
-  assert.match(s.outLines.join('\n'), /1 warning\(s\)/);
+  assert.match(s.outLines.join('\n'), /1 warning\(s\), 0 refused/);
   fs.writeFileSync(path.join(dir, 'instruction.md'), 'Add a function that computes the total.\n\n## Interface\nThe tests call `compute_total_now()`.\n');
   s.outLines.length = 0;
   await s.run(['lint']);
-  assert.match(s.outLines.join('\n'), /0 warning\(s\)/);
+  assert.match(s.outLines.join('\n'), /0 warning\(s\), 0 refused/);
 
   const runtime = goodRuntime({ digests: {} });
   assert.equal(await s.run(['build'], () => runtime), 0);
@@ -185,6 +185,21 @@ test('own tasks: mine, lint, build, check and select, end to end on fixtures', a
   assert.deepEqual(lock.tasks.map((x) => x.id), ['demo-2']);
   assert.match(lock.tasks[0].image, /^sha256:/);
   assert.equal('upstreamCommit' in lock, false);
+});
+
+test('S4: lint refuses an own task whose repository has no test command a coder would find', async (t) => {
+  const clone = initRepo(t);
+  commitFiles(clone, { 'src/app.ts': lines(5), 'package.json': '{}\n' }, 'chore: start (#1)');
+  const base = git(clone, 'rev-parse', 'HEAD').trim();
+  const commit = commitFiles(clone, { 'src/app.ts': `${lines(5)}export const x = 1;\n`, 'src/app.test.ts': 'test("x", () => {});\n' }, 'feat: x (#2)');
+  const s = setup(t, { tasks: { clones: { demo: clone }, selfRepo: 'demo' } });
+  const dir = path.join(s.repoTasks, 'own', 'demo-2');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'own.json'), JSON.stringify({ id: 'demo-2', repo: 'demo', clone: 'demo', commit, base, testCommand: 'npx vitest run' }));
+  fs.writeFileSync(path.join(dir, 'instruction.md'), 'Add a constant.\n');
+  assert.equal(await s.run(['lint']), 1);
+  assert.match(s.outLines.join('\n'), /demo-2: refused: its repository at the base has no test command a coder would find/);
+  assert.match(s.outLines.join('\n'), /1 refused/);
 });
 
 test('the local configuration refuses a bad tasks block, and an unknown subcommand is a usage error', async (t) => {

@@ -88,6 +88,55 @@ export function secretsOf(value) {
   return parts;
 }
 
+/**
+ * Gradings share a service; a window with the internet is alone on it. A writer that is waiting holds back new readers, so
+ * a pull is not starved by a stream of gradings. Both release in a `finally`: a failure never leaves the service locked.
+ */
+export class RWLock {
+  #readers = 0;
+  #writing = false;
+  #queue = [];
+
+  async shared(fn) {
+    await new Promise((resolve) => {
+      this.#queue.push({ write: false, resolve });
+      this.#pump();
+    });
+    try {
+      return await fn();
+    } finally {
+      this.#readers--;
+      this.#pump();
+    }
+  }
+
+  async exclusive(fn) {
+    await new Promise((resolve) => {
+      this.#queue.push({ write: true, resolve });
+      this.#pump();
+    });
+    try {
+      return await fn();
+    } finally {
+      this.#writing = false;
+      this.#pump();
+    }
+  }
+
+  #pump() {
+    while (this.#queue.length > 0) {
+      const next = this.#queue[0];
+      if (this.#writing) return;
+      if (next.write) {
+        if (this.#readers > 0) return;
+        this.#writing = true;
+      } else this.#readers++;
+      this.#queue.shift();
+      next.resolve();
+    }
+  }
+}
+
 export class Stack {
   /**
    * @param {object} o
@@ -108,6 +157,13 @@ export class Stack {
     this.stackDir = path.join(home, 'stack');
     this.baseEnv = baseEnv;
     this.secrets = new Set();
+    this.gates = new Map();
+  }
+
+  /** One lock for each service whose network is opened for a window: its windows and its gradings are told apart by it. */
+  gate(service) {
+    if (!this.gates.has(service)) this.gates.set(service, new RWLock());
+    return this.gates.get(service);
   }
 
   slotService(prefix, slot) {
@@ -353,6 +409,17 @@ export class Stack {
     };
   }
 
+  /** Put an image archive the harness made on its own side into a Podman service (`podman-<slot>` or `grader`), and remove the copy. */
+  async loadImage(service, hostFile) {
+    const inside = '/tmp/bench-own-image.tar';
+    await this.compose(['cp', hostFile, `${service}:${inside}`], { timeoutMs: 10 * 60 * 1000 });
+    try {
+      await this.containersIn(service).load(inside);
+    } finally {
+      await this.execIn(service, `rm -f ${inside}`).catch(() => {});
+    }
+  }
+
   /** Give a Podman service the internet while `fn` runs (a task image is pulled, a verifier needs the network), and take it away after. */
   async withEgress(service, fn) {
     const id = (await this.compose(['ps', '-q', service])).trim();
@@ -371,10 +438,17 @@ export class Stack {
   }
 
   pullWindow(slot, fn) {
-    return this.withEgress(this.slotService('podman', slot), fn);
+    const service = this.slotService('podman', slot);
+    return this.gate(service).exclusive(() => this.withEgress(service, fn));
   }
 
+  /** The grader's window: alone on the grader, so no grading of an agent's patch ever has a route out. */
   graderWindow(fn) {
-    return this.withEgress('grader', fn);
+    return this.gate('grader').exclusive(() => this.withEgress('grader', fn));
+  }
+
+  /** A grading with no network: it runs with others, never while a window is open. */
+  graderShared(fn) {
+    return this.gate('grader').shared(fn);
   }
 }

@@ -158,6 +158,25 @@ export class PodmanRemote {
     return out;
   }
 
+  /** Is the image on this service? (`podman image exists`: exit 0 yes, 1 no, anything else is an error.) */
+  async hasImage(ref) {
+    if (!parseImageRef(ref) && !/^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+$/.test(ref)) throw new ContainerError('the image is not a plain reference');
+    const r = await this.#call([...this.#base(), 'image', 'exists', ref]);
+    if (r.exitCode === 0) return true;
+    if (r.exitCode === 1) return false;
+    throw new ContainerError(`asking for ${ref} failed (exit ${r.exitCode})`);
+  }
+
+  /** Write an image to an archive the harness makes, on the machine this client runs on. */
+  async save(ref, file) {
+    await this.#must(['save', '--format', 'oci-archive', '-o', file, ref], `saving ${ref}`);
+  }
+
+  /** Load an archive (a path on the machine this client runs on). */
+  async load(file) {
+    await this.#must(['load', '-q', '-i', file], 'loading an image');
+  }
+
   async build(context, tag, dockerfile, buildArgs = {}) {
     await this.#must(['build', '-t', tag, '-f', dockerfile, ...buildArgsFlags(buildArgs), context], `building ${tag}`);
   }
@@ -208,6 +227,15 @@ export class FakeContainers {
   }
   async digestOf(ref) {
     return this.digests[ref] ?? `sha256:${'a'.repeat(64)}`;
+  }
+  async hasImage(ref) {
+    return this.images?.has(ref) ?? false;
+  }
+  async save(ref, file) {
+    this.saved = [...(this.saved ?? []), [ref, file]];
+  }
+  async load(file) {
+    this.loaded = [...(this.loaded ?? []), file];
   }
   async build(context, tag, dockerfile, buildArgs = {}) {
     buildArgsFlags(buildArgs); // the same refusals as the real thing
