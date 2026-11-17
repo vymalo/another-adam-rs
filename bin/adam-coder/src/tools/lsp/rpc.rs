@@ -281,8 +281,8 @@ impl Client {
     /// Queue `body` and wait until it was written. Dropping this call after the message is queued
     /// does not stop its write, and before that nothing was written: never half a message.
     async fn send(&self, body: &Value) -> Result<(), RpcError> {
-        let frame = frame_of(body)
-            .ok_or_else(|| RpcError::Closed("cannot write a message".to_owned()))?;
+        let frame =
+            frame_of(body).ok_or_else(|| RpcError::Closed("cannot write a message".to_owned()))?;
         let (done, written) = oneshot::channel();
         let gone = || {
             RpcError::Closed(
@@ -777,7 +777,10 @@ mod tests {
             client.notify("big", json!({"text": big})),
         )
         .await;
-        assert!(dropped.is_err(), "the write is still going when it is dropped");
+        assert!(
+            dropped.is_err(),
+            "the write is still going when it is dropped"
+        );
         // The next message must not land in the middle of the first.
         let after = tokio::spawn({
             let client = client.clone();
@@ -861,7 +864,10 @@ mod tests {
                 .await
                 .unwrap();
             // After the first message, anything that is not one closes the client.
-            their_write.write_all(b"banner again\r\n\r\n").await.unwrap();
+            their_write
+                .write_all(b"banner again\r\n\r\n")
+                .await
+                .unwrap();
             their_write
         });
         let got = client
@@ -885,6 +891,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), client.wait_closed())
             .await
             .expect("closed");
-        assert!(client.closed().unwrap().contains("64 KiB"), "{:?}", client.closed());
+        assert!(
+            client.closed().unwrap().contains("64 KiB"),
+            "{:?}",
+            client.closed()
+        );
     }
 }

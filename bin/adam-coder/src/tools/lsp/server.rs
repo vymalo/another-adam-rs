@@ -6,20 +6,28 @@
 //! stateDiagram-v2
 //!     [*] --> Probing
 //!     Probing --> Missing: not on PATH
-//!     Probing --> Starting: found
+//!     Probing --> Waiting: found
+//!     Waiting --> Refused: the bound is reached and every server is working
+//!     Waiting --> Starting: a place under the bound
 //!     Starting --> Initializing: spawned, piped
+//!     Starting --> Failed: its run's servers were stopped meanwhile
 //!     Initializing --> Indexing: initialize answered
-//!     Initializing --> Dead: no answer in 60 s
+//!     Initializing --> Failed: no answer in 60 s, exited, or its call was dropped
 //!     Indexing --> Ready: no progress open, quiet for 300 ms
 //!     Ready --> Indexing: progress begins
-//!     Ready --> Stopped: idle, park, run over, rebuild, release, worker stops
-//!     Indexing --> Stopped: idle, park, run over, rebuild, release, worker stops
-//!     Indexing --> Dead: crash, bad framing, no answer, wrote to a reference
-//!     Ready --> Dead: crash, bad framing, no answer, wrote to a reference
-//!     Dead --> Starting: the next call
+//!     Ready --> Stopped: idle, park, run over, rebuild, release, worker stops, room for another
+//!     Indexing --> Stopped: idle, park, run over, rebuild, release, worker stops, room for another
+//!     Ready --> Stopped: crash, output that is not messages, no answer, wrote where it must not
+//!     Indexing --> Stopped: crash, output that is not messages, no answer, wrote where it must not
 //!     Missing --> [*]
+//!     Refused --> [*]
+//!     Failed --> [*]
 //!     Stopped --> [*]
 //! ```
+//!
+//! A stopped server is replaced by the next call. A server counts toward the bound from the moment its
+//! start is decided until its process is gone (one being started or stopped included), and room is
+//! made one call at a time ([`Servers::get_or_start`]).
 //!
 //! A server is **never** trusted to be one thing: what it sends is bounded (`rpc`), what it asks is
 //! answered by `Shared` (`workspace/applyEdit` is refused: the client never declares the
@@ -28,10 +36,10 @@
 //! a run end with the run: [`Servers::stop_run`] is called wherever
 //! [`Commands::stop_run`](super::super::background::Commands::stop_run) is.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -41,7 +49,7 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::Child;
 use tokio::sync::{Notify, watch};
 
-use super::position::{Encoding, file_uri};
+use super::position::{Encoding, file_uri, path_of_uri};
 use super::rpc::{Client, Peer, RpcError};
 use super::table::{Language, Mode, ServerSpec, Settings};
 use crate::redact::Redactor;
@@ -56,7 +64,7 @@ pub const STDERR_KEPT: usize = 16 * 1024;
 /// How long a server is quiet (no progress begins or ends) before it counts as ready.
 pub const SETTLE: Duration = Duration::from_millis(300);
 /// How long a call waits for a first `publishDiagnostics` of a file from a server that is not
-/// indexing, before it says the server sent none.
+/// indexing, before it answers that none was received ([`Diagnostics::Nothing`]: not a clean file).
 pub const FIRST_PUBLISH_GRACE: Duration = Duration::from_secs(3);
 /// How long no new `publishDiagnostics` of a file must be seen before the set is taken as complete.
 pub const PUBLISH_SETTLE: Duration = Duration::from_millis(300);
@@ -111,15 +119,29 @@ struct Fixed {
 
 #[derive(Default)]
 struct Live {
-    progress: HashSet<String>,
+    /// The tokens of the progress that is open, oldest first, at most [`MAX_PROGRESS`].
+    progress: Vec<String>,
     quiescent: Option<bool>,
     last_event: Option<Instant>,
+    /// What the server published last, by the file's normal address: one entry per file, at most
+    /// [`MAX_OPEN_FILES`] (the oldest publication is dropped for the next).
     published: HashMap<String, Published>,
+    /// The publications so far, in all: each is numbered by it, so a number never goes back.
+    counter: u64,
 }
 
 struct Published {
     items: Vec<Value>,
     seq: u64,
+}
+
+/// The most progress tokens held open at once: a server that opens more has the oldest forgotten.
+const MAX_PROGRESS: usize = 64;
+
+/// The address of a file as the coder spells it, whatever the server's spelling (`%2d` for `-`, a
+/// lower-case escape, `localhost`): the key everything published is held and found by.
+fn normal_uri(uri: &str) -> String {
+    path_of_uri(uri).map_or_else(|| uri.to_owned(), |path| file_uri(&path))
 }
 
 /// The part of a server that its messages change: shared with the reader task.
@@ -195,12 +217,25 @@ impl Shared {
         }
     }
 
-    /// The count of `publishDiagnostics` of `uri` so far, and what the last said.
+    /// The number of the last `publishDiagnostics` of `uri` (0 for none), and what it said.
     fn published(&self, uri: &str) -> (u64, Option<Vec<Value>>) {
         self.live()
             .published
-            .get(uri)
+            .get(&normal_uri(uri))
             .map_or((0, None), |p| (p.seq, Some(p.items.clone())))
+    }
+
+    /// The number of the last `publishDiagnostics` of `uri`, without what it said.
+    fn published_seq(&self, uri: &str) -> u64 {
+        self.live()
+            .published
+            .get(&normal_uri(uri))
+            .map_or(0, |p| p.seq)
+    }
+
+    /// The server was told the file is closed: what it said of it is not kept.
+    fn forget(&self, uri: &str) {
+        self.live().published.remove(&normal_uri(uri));
     }
 
     /// Wait for `publishDiagnostics` of `uri` after the count was `seen`: the first one within
@@ -218,7 +253,7 @@ impl Shared {
         let mut last_seq = seen;
         let mut last_at: Option<Instant> = None;
         loop {
-            let (seq, items) = self.published(uri);
+            let seq = self.published_seq(uri);
             if seq > last_seq {
                 last_seq = seq;
                 last_at = Some(Instant::now());
@@ -231,7 +266,11 @@ impl Shared {
             };
             let give_up = give_up.min(deadline);
             if now >= give_up {
-                return if seq > seen { items } else { None };
+                return if seq > seen {
+                    self.published(uri).1
+                } else {
+                    None
+                };
             }
             tokio::select! {
                 _ = rx.changed() => {}
@@ -257,11 +296,14 @@ impl Peer for Shared {
                 let mut live = self.live();
                 match kind {
                     "begin" => {
-                        live.progress.insert(token);
+                        if !live.progress.contains(&token) {
+                            live.progress.push(token);
+                            if live.progress.len() > MAX_PROGRESS {
+                                live.progress.remove(0);
+                            }
+                        }
                     }
-                    "end" => {
-                        live.progress.remove(&token);
-                    }
+                    "end" => live.progress.retain(|open| *open != token),
                     _ => {}
                 }
                 live.last_event = Some(Instant::now());
@@ -276,9 +318,21 @@ impl Peer for Shared {
                     .cloned()
                     .unwrap_or_default();
                 let mut live = self.live();
-                let seq = live.published.get(uri).map_or(0, |p| p.seq) + 1;
+                live.counter += 1;
+                let seq = live.counter;
                 live.published
-                    .insert(uri.to_owned(), Published { items, seq });
+                    .insert(normal_uri(uri), Published { items, seq });
+                while live.published.len() > MAX_OPEN_FILES {
+                    let Some(oldest) = live
+                        .published
+                        .iter()
+                        .min_by_key(|(_, p)| p.seq)
+                        .map(|(key, _)| key.clone())
+                    else {
+                        break;
+                    };
+                    live.published.remove(&oldest);
+                }
             }
             // rust-analyzer's own: `quiescent` is false while it works.
             "experimental/serverStatus" => {
@@ -375,22 +429,41 @@ pub enum StartError {
     Failed(String),
     /// `LANGUAGE_SERVERS_MAX` servers are held and every one is working.
     Busy(usize),
+    /// The run's servers were stopped (it parked, ended or remade its environment) while this one
+    /// was starting: it was stopped too.
+    Stopped,
 }
 
-/// Kills the process group of a server that is not held yet, when the call that starts it is
-/// dropped (a time limit, a cancel).
-struct StartGuard(Option<u32>);
+/// Kills a server that is not held yet, when the call that starts it is dropped (a time limit, a
+/// cancel): its process group here, and what the environment holds for its exec id (a pod or a
+/// dev container keeps the process and its descendants beyond this machine's reach).
+struct StartGuard {
+    pid: Option<u32>,
+    session: Arc<dyn EnvSession>,
+    exec: ExecId,
+    kill_wait: Duration,
+    armed: bool,
+}
 
 impl StartGuard {
     fn disarm(&mut self) {
-        self.0 = None;
+        self.armed = false;
     }
 }
 
 impl Drop for StartGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
+        if !self.armed {
+            return;
+        }
+        if let Some(pid) = self.pid {
             crate::tools::background::kill_group_blocking(pid);
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (session, exec, wait) = (self.session.clone(), self.exec.clone(), self.kill_wait);
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(wait, session.kill(&exec)).await;
+            });
         }
     }
 }
@@ -426,6 +499,8 @@ pub struct Server {
     stderr: Arc<Mutex<Tail>>,
     work: tokio::sync::Mutex<Work>,
     busy: AtomicUsize,
+    /// The directory the server was told to build in (a safe rust-analyzer's), removed when it ends.
+    scratch: Option<String>,
     last_used: Mutex<Instant>,
     started: Instant,
     stop: Notify,
@@ -434,7 +509,6 @@ pub struct Server {
     end: Mutex<Option<String>>,
     encoding: Encoding,
     pull: bool,
-    reference: bool,
     idle: Duration,
     kill_wait: Duration,
     extensions: &'static [&'static str],
@@ -453,6 +527,11 @@ impl Server {
     /// The program it runs (as the table names it).
     pub fn program(&self) -> &str {
         &self.spec_program
+    }
+
+    /// Safe or full.
+    pub fn mode(&self) -> Mode {
+        self.key.mode
     }
 
     /// The process id, while it is known.
@@ -478,6 +557,11 @@ impl Server {
     /// Whether the process is there and its pipes are open.
     pub fn is_alive(&self) -> bool {
         !*self.exited.borrow() && self.client.closed().is_none() && lock(&self.stop_why).is_none()
+    }
+
+    /// Whether the process is gone (and what it held is cleaned up).
+    pub fn has_exited(&self) -> bool {
+        *self.exited.borrow()
     }
 
     /// Whether the server is indexing now.
@@ -545,13 +629,15 @@ impl Server {
     /// Take the server for one call, waiting at most `within` for the call before it. The server is
     /// busy (never stopped as idle, never the one stopped for room) until the gate is dropped.
     pub async fn lock(&self, within: Duration) -> Option<Gate<'_>> {
-        self.busy.fetch_add(1, Ordering::AcqRel);
+        // Taken before the wait and given back whatever ends it: the time, a cancel, the gate.
+        let busy = BusyGuard::new(self);
         match tokio::time::timeout(within, self.work.lock()).await {
-            Ok(work) => Some(Gate { server: self, work }),
-            Err(_) => {
-                self.busy.fetch_sub(1, Ordering::AcqRel);
-                None
-            }
+            Ok(work) => Some(Gate {
+                server: self,
+                work,
+                _busy: busy,
+            }),
+            Err(_) => None,
         }
     }
 
@@ -599,17 +685,29 @@ pub enum Reply {
     },
 }
 
+/// A call that has the server or waits for it: the server is not idle, and not the one stopped for
+/// room, while one exists. Given back when it is dropped, however the call ends.
+struct BusyGuard<'a>(&'a Server);
+
+impl<'a> BusyGuard<'a> {
+    fn new(server: &'a Server) -> Self {
+        server.busy.fetch_add(1, Ordering::AcqRel);
+        Self(server)
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.busy.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// One call's hold on a server.
 pub struct Gate<'a> {
     server: &'a Server,
     work: tokio::sync::MutexGuard<'a, Work>,
-}
-
-impl Drop for Gate<'_> {
-    fn drop(&mut self) {
-        self.server.touch();
-        self.server.busy.fetch_sub(1, Ordering::AcqRel);
-    }
+    _busy: BusyGuard<'a>,
 }
 
 /// What a call knows of the file it is about.
@@ -651,40 +749,87 @@ fn mtime_ns(meta: &std::fs::Metadata) -> u128 {
 /// followed through links, not into dependency or build directories, and at most
 /// [`MAX_WATCHED_FILES`].
 fn walk(root: &Path, extensions: &[&str]) -> HashMap<PathBuf, (u64, u128)> {
+    walk_capped(root, extensions, MAX_WATCHED_FILES)
+}
+
+/// The entries of `dir` by name, each with its kind: the order of every walk.
+fn sorted_entries(dir: &Path) -> Vec<(std::ffi::OsString, std::fs::FileType, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<_> = entries
+        .flatten()
+        .filter_map(|e| Some((e.file_name(), e.file_type().ok()?, e.path())))
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// [`walk`] with the most files given. The entries of a directory are visited by name and a
+/// directory's own where it stands, so the files kept at the cap are the first in the order of their
+/// paths, the same on every call: a file does not come and go with the order the file system lists.
+fn walk_capped(root: &Path, extensions: &[&str], cap: usize) -> HashMap<PathBuf, (u64, u128)> {
     let mut found = HashMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    let mut stack = vec![sorted_entries(root).into_iter()];
+    while let Some(top) = stack.last_mut() {
+        let Some((name, kind, path)) = top.next() else {
+            stack.pop();
             continue;
         };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_dir() {
-                let skipped = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| SKIPPED_DIRS.contains(&n));
-                if !skipped {
-                    stack.push(path);
-                }
-            } else if kind.is_file()
-                && path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| extensions.contains(&e))
-                && let Ok(meta) = entry.metadata()
-            {
-                if found.len() >= MAX_WATCHED_FILES {
-                    return found;
-                }
-                found.insert(path, (meta.len(), mtime_ns(&meta)));
+        if kind.is_dir() {
+            if !SKIPPED_DIRS.iter().any(|skipped| name == *skipped) {
+                stack.push(sorted_entries(&path).into_iter());
             }
+        } else if kind.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| extensions.contains(&e))
+            && let Ok(meta) = std::fs::symlink_metadata(&path)
+        {
+            if found.len() >= cap {
+                return found;
+            }
+            found.insert(path, (meta.len(), mtime_ns(&meta)));
         }
     }
     found
+}
+
+/// The `didChangeWatchedFiles` changes between two walks: what was created, changed or deleted,
+/// leaving out the files the server holds open (it is told of those by their text).
+fn watched_changes(
+    before: &HashMap<PathBuf, (u64, u128)>,
+    now: &HashMap<PathBuf, (u64, u128)>,
+    cap: usize,
+    is_open: impl Fn(&Path) -> bool,
+) -> Vec<Value> {
+    // At the cap only the files up to the last one kept are watched: a file that a new one pushed
+    // past it is not deleted, it is out of sight.
+    let last = if now.len() >= cap {
+        now.keys().max()
+    } else {
+        None
+    };
+    let mut changes = Vec::new();
+    for (path, stamp) in now {
+        if is_open(path) {
+            continue;
+        }
+        match before.get(path) {
+            None => changes.push(json!({"uri": file_uri(path), "type": 1})),
+            Some(old) if old != stamp => {
+                changes.push(json!({"uri": file_uri(path), "type": 2}));
+            }
+            Some(_) => {}
+        }
+    }
+    for path in before.keys() {
+        if !now.contains_key(path) && !is_open(path) && last.is_none_or(|last| path <= last) {
+            changes.push(json!({"uri": file_uri(path), "type": 3}));
+        }
+    }
+    changes
 }
 
 /// Read the text of `rel` below `root`, through the held descriptor of the slot.
@@ -806,24 +951,9 @@ impl Gate<'_> {
             .await
             .unwrap_or_default();
         if let Some(before) = &self.work.watched {
-            let mut changes = Vec::new();
-            for (path, stamp) in &now {
-                if self.work.opened.contains_key(path) {
-                    continue;
-                }
-                match before.get(path) {
-                    None => changes.push(json!({"uri": file_uri(path), "type": 1})),
-                    Some(old) if old != stamp => {
-                        changes.push(json!({"uri": file_uri(path), "type": 2}));
-                    }
-                    Some(_) => {}
-                }
-            }
-            for path in before.keys() {
-                if !now.contains_key(path) && !self.work.opened.contains_key(path) {
-                    changes.push(json!({"uri": file_uri(path), "type": 3}));
-                }
-            }
+            let changes = watched_changes(before, &now, MAX_WATCHED_FILES, |path| {
+                self.work.opened.contains_key(path)
+            });
             if !changes.is_empty() {
                 server
                     .client
@@ -878,6 +1008,7 @@ impl Gate<'_> {
     async fn close(&mut self, abs: &Path) -> Result<(), RpcError> {
         self.work.opened.remove(abs);
         self.work.order.retain(|p| p != abs);
+        self.server.shared.forget(&file_uri(abs));
         self.server
             .client
             .notify(
@@ -911,14 +1042,15 @@ impl Gate<'_> {
     }
 
     /// The diagnostics of `target`, errors and warnings: asked for with a pull when the server
-    /// has one, else what it pushed for the file, waited for until `deadline`.
+    /// has one, else what it pushed for the file, waited for until `deadline`. A server that
+    /// published nothing for the file is [`Diagnostics::Nothing`], which is not a clean file.
     pub async fn diagnostics(
         &self,
         target_uri: &str,
         before_seq: u64,
         sent: Synced,
         deadline: Instant,
-    ) -> Result<Vec<Value>, Reply> {
+    ) -> Result<Diagnostics, Reply> {
         let server = self.server;
         if server.pull {
             let reply = server
@@ -929,11 +1061,17 @@ impl Gate<'_> {
                 )
                 .await;
             return match reply {
-                Reply::Done(value) => Ok(value
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default()),
+                Reply::Done(value) => Ok(Diagnostics::Items(
+                    value
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                )),
+                // `ServerCancelled` and `ContentModified`: it is working and asked again later.
+                Reply::Refused { code, .. } if (-32802..=-32801).contains(&code) => {
+                    Err(Reply::Indexing)
+                }
                 other => Err(other),
             };
         }
@@ -942,24 +1080,39 @@ impl Gate<'_> {
         // what the server said last.
         let (seq, stored) = server.shared.published(target_uri);
         if !sent.target_changed && seq > 0 {
-            return Ok(stored.unwrap_or_default());
+            return Ok(Diagnostics::Items(stored.unwrap_or_default()));
         }
         let first = if indexing {
             deadline.saturating_duration_since(Instant::now())
         } else {
             FIRST_PUBLISH_GRACE
         };
-        Ok(server
-            .shared
-            .wait_published(target_uri, before_seq, first, deadline)
-            .await
-            .unwrap_or_default())
+        let waited = first.min(deadline.saturating_duration_since(Instant::now()));
+        Ok(
+            match server
+                .shared
+                .wait_published(target_uri, before_seq, first, deadline)
+                .await
+            {
+                Some(items) => Diagnostics::Items(items),
+                None => Diagnostics::Nothing(waited),
+            },
+        )
     }
 
-    /// How many times the server has published for `uri`, for [`Gate::diagnostics`].
+    /// The number of the server's last publication for `uri`, for [`Gate::diagnostics`].
     pub fn published_seq(&self, uri: &str) -> u64 {
-        self.server.shared.published(uri).0
+        self.server.shared.published_seq(uri)
     }
+}
+
+/// What the server said of a file.
+#[derive(Debug)]
+pub enum Diagnostics {
+    /// The diagnostics it gave (none: the file is clean as far as it can tell).
+    Items(Vec<Value>),
+    /// It published nothing for the file in the time given: the file may not have been looked at.
+    Nothing(Duration),
 }
 
 /// What the registry says about a server it holds.
@@ -993,7 +1146,21 @@ struct Inner {
     list: Mutex<Vec<Arc<Server>>>,
     probes: Mutex<HashMap<ProbeKey, (String, Probe)>>,
     starting: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held while room is made for a server, so that the bound is one decision at a time.
+    room: tokio::sync::Mutex<()>,
+    /// The servers that are being started: they count toward the bound before they are in the list.
+    reserved: AtomicUsize,
+    /// Told when a start ends, for a call that waits for room.
+    freed: Notify,
+    /// Per run, the number of the last time its servers were stopped, and the same for all of them
+    /// (the worker stopping): a start that began before is not registered after.
+    stopped_at: Mutex<HashMap<String, u64>>,
+    stopped_all: AtomicU64,
+    clock: AtomicU64,
 }
+
+/// How many runs' stop numbers are remembered before they are all counted as stopped at once.
+const MAX_REMEMBERED_RUNS: usize = 4096;
 
 impl Drop for Inner {
     /// The last holder is gone (a worker that stops, a test that ends): no server is left behind.
@@ -1060,8 +1227,20 @@ impl Servers {
                 list: Mutex::new(Vec::new()),
                 probes: Mutex::new(HashMap::new()),
                 starting: Mutex::new(HashMap::new()),
+                room: tokio::sync::Mutex::new(()),
+                reserved: AtomicUsize::new(0),
+                freed: Notify::new(),
+                stopped_at: Mutex::new(HashMap::new()),
+                stopped_all: AtomicU64::new(0),
+                clock: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// How many per-key start gates are held (a test reads it: none is kept once a start is over).
+    #[doc(hidden)]
+    pub fn starting_held(&self) -> usize {
+        lock(&self.inner.starting).len()
     }
 
     fn list(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Server>>> {
@@ -1134,6 +1313,8 @@ impl Servers {
     /// Stop every server of `run`, saying why, and forget what was probed for it. Waits until the
     /// processes are gone (at most [`STOP_WAIT`] each, together).
     pub async fn stop_run(&self, run: &str, why: &str) {
+        // Before anything is stopped: a server that is starting now will not be registered.
+        self.mark_stopped(run);
         lock(&self.inner.probes).retain(|(r, _, _), _| r != run);
         let mine: Vec<Arc<Server>> = self
             .list()
@@ -1147,6 +1328,7 @@ impl Servers {
 
     /// Stop every server: this worker is stopping.
     pub async fn stop_all(&self) {
+        self.inner.stopped_all.store(self.tick(), Ordering::Release);
         let all: Vec<Arc<Server>> = self.list().clone();
         Self::stop_all_of(&all, "the worker stopped").await;
         lock(&self.inner.probes).clear();
@@ -1164,12 +1346,36 @@ impl Servers {
 
     /// Forget what is known of `run` that no stop forgets (it is over, and its workspace goes).
     pub fn forget_run(&self, run: &str) {
+        self.mark_stopped(run);
         lock(&self.inner.probes).retain(|(r, _, _), _| r != run);
         self.prune();
     }
 
+    /// Servers that are gone are forgotten; one that is being stopped stays until its process is.
     fn prune(&self) {
-        self.list().retain(|s| s.is_alive());
+        self.list().retain(|s| !s.has_exited());
+    }
+
+    fn tick(&self) -> u64 {
+        self.inner.clock.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn mark_stopped(&self, run: &str) {
+        let at = self.tick();
+        let mut stopped = lock(&self.inner.stopped_at);
+        if stopped.len() >= MAX_REMEMBERED_RUNS {
+            stopped.clear();
+            self.inner.stopped_all.store(at, Ordering::Release);
+        }
+        stopped.insert(run.to_owned(), at);
+    }
+
+    /// What a start of a server of `run` that begins now must be compared with when it ends.
+    fn stop_mark(&self, run: &str) -> (u64, u64) {
+        (
+            lock(&self.inner.stopped_at).get(run).copied().unwrap_or(0),
+            self.inner.stopped_all.load(Ordering::Acquire),
+        )
     }
 
     /// The server for `want`, started when there is none: one held and alive is the one, unless the
@@ -1182,17 +1388,28 @@ impl Servers {
         if let Some(held) = self.held(&want).await {
             return Ok(held);
         }
-        let gate = lock(&self.inner.starting)
-            .entry(want.key.clone())
-            .or_default()
-            .clone();
-        let _starting = gate.lock().await;
+        let gate = StartGate::new(self, &want.key);
+        let _starting = gate.gate.lock().await;
         if let Some(held) = self.held(&want).await {
             return Ok(held);
         }
-        self.make_room(want.max).await?;
+        let marked = self.stop_mark(&want.key.run);
+        let mut reservation = self.make_room(want.max).await?;
         let server = start(&want).await?;
-        self.list().push(server.clone());
+        let mut list = self.list();
+        if self.stop_mark(&want.key.run) != marked {
+            // The run's servers were stopped while this one started: it is stopped too, and never held.
+            drop(list);
+            reservation.release();
+            server
+                .stop("its run's servers were stopped while it started")
+                .await;
+            return Err(StartError::Stopped);
+        }
+        // In the list and no longer reserved at once: the count never dips.
+        list.push(server.clone());
+        reservation.release();
+        drop(list);
         Ok(server)
     }
 
@@ -1212,27 +1429,127 @@ impl Servers {
         Some(found)
     }
 
-    /// Make room for one more server: when `max` are alive, the least recently used one that is not
-    /// working is stopped; when all are working, the call is told so.
-    async fn make_room(&self, max: usize) -> Result<(), StartError> {
+    /// Make room for one more server, one decision at a time. The servers that count are those in
+    /// the list whose process is not gone (one that is being stopped counts until it is) and those
+    /// being started. At `max`, the least recently used server that is not working is stopped; a
+    /// server on its way out or being started is waited for; when every one is working the call is
+    /// told so.
+    async fn make_room(&self, max: usize) -> Result<Reservation, StartError> {
+        enum Next {
+            Reserved,
+            Victim(Arc<Server>),
+            Stopping(Arc<Server>),
+            Starting,
+            Full,
+        }
+        let _room = self.inner.room.lock().await;
         loop {
-            let list = self.list().clone();
-            let alive: Vec<&Arc<Server>> = list.iter().filter(|s| s.is_alive()).collect();
-            if alive.len() < max {
-                return Ok(());
-            }
-            let victim = alive
-                .into_iter()
-                .filter(|s| s.busy.load(Ordering::Acquire) == 0)
-                .min_by_key(|s| *lock(&s.last_used))
-                .cloned();
-            let Some(victim) = victim else {
-                return Err(StartError::Busy(max));
+            let next = {
+                let mut list = self.list();
+                list.retain(|s| !s.has_exited());
+                let reserved = self.inner.reserved.load(Ordering::Acquire);
+                if list.len() + reserved < max {
+                    self.inner.reserved.fetch_add(1, Ordering::AcqRel);
+                    Next::Reserved
+                } else if let Some(victim) = list
+                    .iter()
+                    .filter(|s| s.is_alive() && s.busy.load(Ordering::Acquire) == 0)
+                    .min_by_key(|s| *lock(&s.last_used))
+                {
+                    Next::Victim(victim.clone())
+                } else if let Some(leaving) = list.iter().find(|s| !s.is_alive()) {
+                    Next::Stopping(leaving.clone())
+                } else if reserved > 0 {
+                    Next::Starting
+                } else {
+                    Next::Full
+                }
             };
-            victim
-                .stop("it was the least recently used, and the worker holds its maximum")
-                .await;
-            self.prune();
+            match next {
+                Next::Reserved => {
+                    return Ok(Reservation {
+                        inner: self.inner.clone(),
+                        live: true,
+                    });
+                }
+                Next::Victim(victim) => {
+                    victim
+                        .stop("it was the least recently used, and the worker holds its maximum")
+                        .await;
+                }
+                Next::Stopping(leaving) => {
+                    leaving.wait_exited(STOP_WAIT).await;
+                    if !leaving.has_exited() {
+                        return Err(StartError::Busy(max));
+                    }
+                }
+                Next::Starting => {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        self.inner.freed.notified(),
+                    )
+                    .await;
+                }
+                Next::Full => return Err(StartError::Busy(max)),
+            }
+        }
+    }
+}
+
+/// A place in the bound for a server that is being started.
+struct Reservation {
+    inner: Arc<Inner>,
+    live: bool,
+}
+
+impl Reservation {
+    fn release(&mut self) {
+        if self.live {
+            self.live = false;
+            self.inner.reserved.fetch_sub(1, Ordering::AcqRel);
+            self.inner.freed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for Reservation {
+    /// A start that ends any way (an error, its call dropped) gives its place back.
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// The gate of one key's start, and its removal from the map when the start is over, whether it
+/// ended or its call was dropped.
+struct StartGate<'a> {
+    servers: &'a Servers,
+    key: Key,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> StartGate<'a> {
+    fn new(servers: &'a Servers, key: &Key) -> Self {
+        let gate = lock(&servers.inner.starting)
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        Self {
+            servers,
+            key: key.clone(),
+            gate,
+        }
+    }
+}
+
+impl Drop for StartGate<'_> {
+    fn drop(&mut self) {
+        let mut map = lock(&self.servers.inner.starting);
+        // The map's and this one's: nobody else is waiting for it.
+        if map
+            .get(&self.key)
+            .is_some_and(|held| Arc::strong_count(held) <= 2)
+        {
+            map.remove(&self.key);
         }
     }
 }
@@ -1254,26 +1571,25 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
         .process_group(0);
     let mut child = cmd.spawn().map_err(StartError::Spawn)?;
     let pid = child.id();
-    let mut guard = StartGuard(pid);
+    let mut guard = StartGuard {
+        pid,
+        session: want.session.clone(),
+        exec: prepared.exec.clone(),
+        kill_wait: want.kill_wait,
+        armed: true,
+    };
 
     let stderr = Arc::new(Mutex::new(Tail::default()));
     let mut stderr_task = None;
-    if let Some(mut err) = child.stderr.take() {
+    // Told when stderr cannot be read to its end: a server whose pipe is not drained blocks.
+    let stderr_failed = Arc::new(Notify::new());
+    if let Some(err) = child.stderr.take() {
         let sink = stderr.clone();
         let held = STDERR_KEPT + want.redactor.margin();
+        let failed = stderr_failed.clone();
         stderr_task = Some(tokio::spawn(async move {
-            let mut buf = [0_u8; 4096];
-            while let Ok(n) = err.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-                let mut tail = lock(&sink);
-                tail.total += n as u64;
-                tail.bytes.extend_from_slice(&buf[..n]);
-                let over = tail.bytes.len().saturating_sub(held);
-                if over > 0 {
-                    tail.bytes.drain(..over);
-                }
+            if !drain_stderr(err, &sink, held).await {
+                failed.notify_one();
             }
         }));
     }
@@ -1282,7 +1598,10 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
     };
 
     let language = key.language;
-    let settings = language.settings(want.mode);
+    // A safe rust-analyzer builds in a directory of its own (never the slot, never one shared with
+    // another run), which is removed when it stops.
+    let scratch = (language == Language::Rust && want.mode == Mode::Safe).then(|| scratch_dir(key));
+    let settings = language.settings(want.mode, scratch.as_deref().unwrap_or_default());
     let root_uri = file_uri(&key.root);
     let name = key.root.file_name().map_or_else(
         || "workspace".to_owned(),
@@ -1296,7 +1615,9 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
         .request(
             "initialize",
             json!({
-                "processId": std::process::id(),
+                // The worker's pid means nothing where the server runs (another PID namespace), and we stop
+                // the server ourselves: some servers exit when the pid they were given is gone.
+                "processId": null,
                 "clientInfo": {"name": "adam-coder", "version": env!("CARGO_PKG_VERSION")},
                 "locale": "en",
                 "rootUri": root_uri,
@@ -1389,6 +1710,7 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
         stderr,
         work: tokio::sync::Mutex::new(Work::default()),
         busy: AtomicUsize::new(0),
+        scratch,
         last_used: Mutex::new(Instant::now()),
         started: Instant::now(),
         stop: Notify::new(),
@@ -1397,14 +1719,60 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
         end: Mutex::new(None),
         encoding,
         pull,
-        reference: want.mode == Mode::Safe,
         idle: want.idle,
         kill_wait: want.kill_wait,
         extensions: language.extensions(),
     });
-    tokio::spawn(supervise(server.clone(), child, stderr_task));
+    tokio::spawn(supervise(server.clone(), child, stderr_task, stderr_failed));
     guard.disarm();
     Ok(server)
+}
+
+/// The directory a safe rust-analyzer builds in: one per run, slot and project root, under the
+/// environment's `/tmp`.
+fn scratch_dir(key: &Key) -> String {
+    let id = hash_of(&format!(
+        "{}\0{}\0{}",
+        key.run,
+        key.slot,
+        key.root.display()
+    ));
+    format!("/tmp/adam-rust-analyzer/{id:016x}")
+}
+
+/// Read the server's stderr into `sink`, keeping its last `held` bytes, until it ends. A read that
+/// fails is tried again, and `false` is the answer of a stream that keeps failing: it cannot be
+/// drained, and the server is stopped (it would block on a full pipe).
+async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
+    mut err: R,
+    sink: &Mutex<Tail>,
+    held: usize,
+) -> bool {
+    const FAILURES: u32 = 3;
+    let mut buf = [0_u8; 4096];
+    let mut failed = 0;
+    loop {
+        match err.read(&mut buf).await {
+            Ok(0) => return true,
+            Ok(n) => {
+                failed = 0;
+                let mut tail = lock(sink);
+                tail.total += n as u64;
+                tail.bytes.extend_from_slice(&buf[..n]);
+                let over = tail.bytes.len().saturating_sub(held);
+                if over > 0 {
+                    tail.bytes.drain(..over);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                failed += 1;
+                if failed >= FAILURES {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Stop a process that was started and is not held: its group, its exec id in the environment, and
@@ -1428,11 +1796,32 @@ async fn stop_unheld(
     }
 }
 
+/// Remove what a server built in its scratch directory, where it ran.
+async fn remove_scratch(server: &Server, dir: &str) {
+    let command = format!("rm -rf -- {}", super::sh_quote(dir));
+    let spec = crate::tools::shell::shell_spec(&server.key.root, &command);
+    let Ok(prepared) = server.session.prepare(&spec) else {
+        return;
+    };
+    let mut cmd = prepared.command();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if !matches!(
+        tokio::time::timeout(Duration::from_secs(10), cmd.status()).await,
+        Ok(Ok(status)) if status.success()
+    ) {
+        tracing::warn!("a language server's scratch directory could not be removed");
+    }
+}
+
 /// Own the process until it ends: by itself, or stopped (idle, or asked to).
 async fn supervise(
     server: Arc<Server>,
     mut child: Child,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    stderr_failed: Arc<Notify>,
 ) {
     let pid = child.id();
     let ended = loop {
@@ -1444,6 +1833,23 @@ async fn supervise(
             biased;
             () = server.stop.notified() => break None,
             status = child.wait() => break Some(status),
+            // Its output is not messages any more (bad framing, a write that fails): the process
+            // is of no use and is stopped now, not when it is next called or idle. A process that
+            // ended by itself is given a moment to say so first.
+            () = server.client.wait_closed() => {
+                match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
+                    Ok(status) => break Some(status),
+                    Err(_) => {
+                        let why = server.client.closed().unwrap_or_default();
+                        server.request_stop(&format!("its output stopped being messages: {why}"));
+                        break None;
+                    }
+                }
+            }
+            () = stderr_failed.notified() => {
+                server.request_stop("its stderr could not be read");
+                break None;
+            }
             () = tokio::time::sleep(due_in.max(Duration::from_millis(100))) => {
                 if server.idle_due() {
                     server.request_stop(&format!(
@@ -1487,14 +1893,175 @@ async fn supervise(
     if let Some(task) = stderr_task {
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
+    if let Some(scratch) = &server.scratch {
+        remove_scratch(&server, scratch).await;
+    }
     *lock(&server.end) = Some(how.clone());
     server.client.close(how);
     let _ = server.exited.send(true);
 }
 
-impl Server {
-    /// Whether this server runs in a reference.
-    pub fn in_reference(&self) -> bool {
-        self.reference
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn shared() -> Arc<Shared> {
+        Shared::new(Language::Rust.settings(Mode::Full, ""), json!([]))
+    }
+
+    fn publish(shared: &Shared, uri: &str, message: &str) {
+        shared.notification(
+            "textDocument/publishDiagnostics",
+            json!({"uri": uri, "diagnostics": [{"message": message}]}),
+        );
+    }
+
+    #[test]
+    fn what_a_server_published_is_kept_per_file_and_bounded() {
+        let shared = shared();
+        for n in 0..1000 {
+            publish(&shared, &format!("file:///w/f{n}.rs"), "x");
+        }
+        let held = shared.live().published.len();
+        assert!(held <= MAX_OPEN_FILES, "{held} files are held");
+        // The newest is there, and publishing again replaces a file's entry (one per path).
+        assert!(shared.published("file:///w/f999.rs").1.is_some());
+        publish(&shared, "file:///w/f999.rs", "y");
+        assert_eq!(shared.live().published.len(), held);
+        // The count never goes back, whatever was dropped.
+        let (seq, _) = shared.published("file:///w/f999.rs");
+        publish(&shared, "file:///w/f0.rs", "z");
+        assert!(shared.published("file:///w/f0.rs").0 > seq);
+    }
+
+    #[test]
+    fn a_file_is_found_under_whatever_spelling_the_server_gave_its_address() {
+        let shared = shared();
+        publish(&shared, "file:///w/a%2db.rs", "one");
+        let canonical = file_uri(Path::new("/w/a-b.rs"));
+        assert_eq!(
+            shared.published(&canonical).1.unwrap()[0]["message"],
+            "one",
+            "{canonical}"
+        );
+        publish(&shared, "file:///w/a-b.rs", "two");
+        assert_eq!(shared.published(&canonical).1.unwrap()[0]["message"], "two");
+    }
+
+    #[test]
+    fn the_progress_a_server_has_open_is_bounded() {
+        let shared = shared();
+        for n in 0..1000 {
+            shared.notification(
+                "$/progress",
+                json!({"token": format!("t{n}"), "value": {"kind": "begin"}}),
+            );
+        }
+        let open = shared.live().progress.len();
+        assert!(open <= 64, "{open} tokens are held");
+        assert!(shared.indexing(), "what is held still counts as working");
+    }
+
+    /// A stream that fails once, then gives its text, then ends.
+    struct Flaky {
+        step: u8,
+    }
+
+    impl tokio::io::AsyncRead for Flaky {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.step += 1;
+            match self.step {
+                1 => std::task::Poll::Ready(Err(std::io::Error::other("a read failed"))),
+                2 => {
+                    buf.put_slice(b"said after the failure");
+                    std::task::Poll::Ready(Ok(()))
+                }
+                _ => std::task::Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stderr_is_drained_to_its_end_after_a_read_error() {
+        let sink = Mutex::new(Tail::default());
+        drain_stderr(Flaky { step: 0 }, &sink, 1024).await;
+        assert_eq!(lock(&sink).bytes, b"said after the failure");
+    }
+
+    #[tokio::test]
+    async fn no_start_gate_is_kept_once_a_start_is_over() {
+        let servers = Servers::new();
+        let spec = ServerSpec {
+            program: "sh".to_owned(),
+            launch: "exit 3".to_owned(),
+            env: Vec::new(),
+            version_probe: false,
+        };
+        let root = tempfile::tempdir().unwrap();
+        for n in 0..3 {
+            let want = Want {
+                key: Key {
+                    run: format!("run-{n}"),
+                    slot: "w".to_owned(),
+                    language: Language::Rust,
+                    root: root.path().to_path_buf(),
+                    mode: Mode::Full,
+                },
+                spec: &spec,
+                session: adam_workspace::LocalSession::shared(),
+                mode: Mode::Full,
+                idle: Duration::from_secs(600),
+                max: 4,
+                kill_wait: Duration::from_secs(2),
+                hide: Vec::new(),
+                init_timeout: Duration::from_secs(10),
+                redactor: Redactor::default(),
+            };
+            assert!(servers.get_or_start(want).await.is_err());
+        }
+        assert_eq!(servers.starting_held(), 0);
+    }
+
+    #[test]
+    fn the_files_watched_are_the_first_in_a_fixed_order_and_a_file_moving_past_the_cap_is_no_change()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["h", "e", "b", "g", "a", "d", "c", "f"] {
+            std::fs::write(dir.path().join(format!("{name}.rs")), "x").unwrap();
+        }
+        let sorted = |m: &HashMap<PathBuf, (u64, u128)>| {
+            let mut keys: Vec<String> = m
+                .keys()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            keys.sort();
+            keys
+        };
+        let before = walk_capped(dir.path(), &["rs"], 5);
+        assert_eq!(sorted(&before), ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]);
+        // A file that sorts early appears: the window moves, `e.rs` leaves it. Only the creation
+        // is a change; `e.rs` was not deleted.
+        std::fs::write(dir.path().join("0.rs"), "x").unwrap();
+        let now = walk_capped(dir.path(), &["rs"], 5);
+        assert_eq!(sorted(&now), ["0.rs", "a.rs", "b.rs", "c.rs", "d.rs"]);
+        let changes = watched_changes(&before, &now, 5, |_| false);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0]["type"], 1);
+        assert!(changes[0]["uri"].as_str().unwrap().ends_with("/0.rs"));
+        // A file that is really deleted inside the window is a delete.
+        std::fs::remove_file(dir.path().join("b.rs")).unwrap();
+        let later = walk_capped(dir.path(), &["rs"], 5);
+        let changes = watched_changes(&now, &later, 5, |_| false);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c["type"] == 3 && c["uri"].as_str().unwrap().ends_with("/b.rs")),
+            "{changes:?}"
+        );
     }
 }

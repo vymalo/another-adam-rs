@@ -70,6 +70,8 @@ pub enum Found {
     At(usize),
     /// The symbol is not on the line.
     Missing,
+    /// The symbol is a word, and is on the line only inside longer words (`id` in `valid`).
+    NotAsWord,
     /// It is there, but fewer times than `occurrence` asked.
     Fewer(usize),
 }
@@ -80,38 +82,68 @@ fn is_word(c: char) -> bool {
 
 /// The start (in characters) of the `occurrence`-th (1-based) match of `symbol` on `line`.
 ///
-/// A symbol made of word characters matches whole words first (`id` is not found inside `valid`
-/// while a whole `id` is on the line); with no whole word it matches as text.
+/// A symbol made of word characters matches **whole words only** (`id` is not found inside `valid`),
+/// so that `occurrence` means the same whatever else is on the line; a symbol that is there only
+/// inside other words is [`Found::NotAsWord`], never a guess. A symbol with punctuation in it
+/// (`.b(`) matches as text.
 pub fn find_symbol(line: &str, symbol: &str, occurrence: usize) -> Found {
     let hay: Vec<char> = line.chars().collect();
     let needle: Vec<char> = symbol.chars().collect();
     if needle.is_empty() || needle.len() > hay.len() {
         return Found::Missing;
     }
-    let mut all = Vec::new();
-    let mut whole = Vec::new();
+    let word_like = needle.iter().all(|c| is_word(*c));
+    let mut found = Vec::new();
+    let mut inside_words = false;
     for start in 0..=(hay.len() - needle.len()) {
         if hay[start..start + needle.len()] != needle[..] {
             continue;
         }
-        all.push(start);
         let before = start.checked_sub(1).and_then(|at| hay.get(at));
         let after = hay.get(start + needle.len());
-        if !before.is_some_and(|c| is_word(*c)) && !after.is_some_and(|c| is_word(*c)) {
-            whole.push(start);
+        let whole = !before.is_some_and(|c| is_word(*c)) && !after.is_some_and(|c| is_word(*c));
+        if whole || !word_like {
+            found.push(start);
+        } else {
+            inside_words = true;
         }
     }
-    let word_like = needle.iter().all(|c| is_word(*c));
-    let found = if word_like && !whole.is_empty() {
-        whole
-    } else {
-        all
-    };
     match found.get(occurrence.saturating_sub(1)) {
         Some(at) => Found::At(*at),
+        None if found.is_empty() && inside_words => Found::NotAsWord,
         None if found.is_empty() => Found::Missing,
         None => Found::Fewer(found.len()),
     }
+}
+
+/// The lines of `text` as the protocol counts them: a line ends at `\r\n`, `\n` or a lone `\r`. The
+/// last is a line too, and empty when `text` ends with a break.
+pub fn split_lines(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\n' => {
+                lines.push(&text[start..at]);
+                at += 1;
+                start = at;
+            }
+            b'\r' => {
+                lines.push(&text[start..at]);
+                at += if bytes.get(at + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                start = at;
+            }
+            _ => at += 1,
+        }
+    }
+    lines.push(&text[start..]);
+    lines
 }
 
 /// The `file://` URI of an absolute `path`, percent-encoded.
@@ -200,12 +232,25 @@ mod tests {
         assert_eq!(find_symbol(line, "id", 2), Found::At(17));
         assert_eq!(find_symbol(line, "id", 3), Found::At(24));
         assert_eq!(find_symbol(line, "id", 4), Found::Fewer(3));
-        // With no whole word, text matches.
-        assert_eq!(find_symbol("let valid = 1;", "id", 1), Found::At(7));
+        // Only inside other words: not on the line as a word, never a guess.
+        assert_eq!(find_symbol("let valid = 1;", "id", 1), Found::NotAsWord);
         assert_eq!(find_symbol("let valid = 1;", "nothing", 1), Found::Missing);
+        // `occurrence` counts whole words, whatever else the line has in it.
+        assert_eq!(find_symbol("valid id", "id", 1), Found::At(6));
+        assert_eq!(find_symbol("valid id", "id", 2), Found::Fewer(1));
+        assert_eq!(find_symbol("id valid id", "id", 2), Found::At(9));
         assert_eq!(find_symbol("abc", "", 1), Found::Missing);
         // A symbol with punctuation is matched as text.
         assert_eq!(find_symbol("a.b(c)", ".b(", 1), Found::At(1));
+    }
+
+    #[test]
+    fn lines_end_at_crlf_lf_and_a_lone_cr() {
+        assert_eq!(split_lines("a\nb\r\nc\rd"), ["a", "b", "c", "d"]);
+        assert_eq!(split_lines("a\r\n"), ["a", ""]);
+        assert_eq!(split_lines("a\r\rb"), ["a", "", "b"]);
+        assert_eq!(split_lines(""), [""]);
+        assert_eq!(split_lines("é\rx"), ["é", "x"]);
     }
 
     #[test]

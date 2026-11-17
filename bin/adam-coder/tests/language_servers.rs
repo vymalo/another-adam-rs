@@ -329,15 +329,19 @@ async fn a_server_that_offers_pull_diagnostics_is_asked_for_them() {
 }
 
 #[tokio::test]
-async fn a_clean_file_from_a_server_that_says_nothing_is_not_waited_for_the_whole_wait() {
+async fn a_server_that_publishes_nothing_for_a_file_is_not_waited_for_the_whole_wait_and_is_not_taken_for_a_clean_file()
+ {
     let lsp = Lsp::new(json!({"silent_when_clean": true})).await;
     rust_project(&lsp);
     let started = Instant::now();
     let out = lsp
         .diagnostics(json!({"path": "src/lib.rs", "wait": 60}))
         .await;
+    assert!(!out.is_error, "{}", out.content);
     assert!(
-        out.content.contains("(no errors or warnings)"),
+        out.content
+            .contains("No diagnostics received for `src/lib.rs` within 3 s")
+            && !out.content.contains("(no errors or warnings)"),
         "{}",
         out.content
     );
@@ -346,6 +350,34 @@ async fn a_clean_file_from_a_server_that_says_nothing_is_not_waited_for_the_whol
         "{:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn a_server_that_publishes_an_empty_set_says_the_file_is_clean() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert!(
+        out.content.contains("(no errors or warnings)")
+            && !out.content.contains("No diagnostics received"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn diagnostics_published_under_another_spelling_of_the_address_are_found() {
+    let lsp =
+        Lsp::new(json!({"uri_spelling": "lower_hex", "diagnostics": [diag(1, 0, 0, "found it")]}))
+            .await;
+    rust_project(&lsp);
+    let path = lsp.worktree().display().to_string();
+    assert!(
+        path.contains(['.', '-', '_']),
+        "the test needs a path with a byte the spelling changes: {path}"
+    );
+    let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert!(out.content.contains("found it"), "{}", out.content);
 }
 
 #[tokio::test]
@@ -1124,7 +1156,7 @@ mod references {
     }
 
     /// A rig whose deployment declares the reference `lib` (a Rust project), made by a first read.
-    async fn with_reference(script: Value) -> Lsp {
+    pub(super) async fn with_reference(script: Value) -> Lsp {
         let fx = Fixture::new().await;
         let remote = fx.extra_remote(
             "lib",
@@ -1530,4 +1562,538 @@ async fn with_the_servers_off_the_three_tools_are_not_in_the_set() {
     assert!(tools.get("file_diagnostics").is_none());
     assert!(tools.get("find_definition").is_none());
     assert!(tools.get("find_references").is_none());
+}
+
+// ====================================================================== the review round (2026-11-17)
+
+use adam_a2a::AccessTier;
+use adam_coder::tools::lsp::Mode;
+use adam_coder::tools::lsp::server::{Key, StartError, Want};
+use adam_workspace::{EnvDescription, EnvError, EnvSession, ExecId, ExecSpec, PreparedCommand};
+
+impl Lsp {
+    /// The access tier the run's notes say.
+    async fn set_tier(&self, tier: AccessTier) {
+        let run = self.run();
+        let mut notes = self.fx.env.notes.load(&run).await.unwrap();
+        notes.tier = Some(tier);
+        self.fx.env.notes.save(&run, &notes).await.unwrap();
+    }
+
+    fn init_options(&self, n: usize) -> Value {
+        self.logged("initialize")[n]["params"]["initializationOptions"].clone()
+    }
+}
+
+/// A session that sees what is started and killed through it.
+struct Recording {
+    inner: Arc<dyn EnvSession>,
+    kill_delay: Duration,
+    events: std::sync::Mutex<Vec<&'static str>>,
+    kills: std::sync::Mutex<Vec<ExecId>>,
+}
+
+impl Recording {
+    fn new(kill_delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            inner: adam_workspace::LocalSession::shared(),
+            kill_delay,
+            events: std::sync::Mutex::default(),
+            kills: std::sync::Mutex::default(),
+        })
+    }
+
+    fn events(&self) -> Vec<&'static str> {
+        self.events.lock().unwrap().clone()
+    }
+
+    fn kills(&self) -> Vec<ExecId> {
+        self.kills.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl EnvSession for Recording {
+    fn describe(&self) -> EnvDescription {
+        self.inner.describe()
+    }
+
+    fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {
+        self.events.lock().unwrap().push("prepare");
+        self.inner.prepare(spec)
+    }
+
+    async fn kill(&self, exec: &ExecId) {
+        tokio::time::sleep(self.kill_delay).await;
+        self.kills.lock().unwrap().push(exec.clone());
+        self.events.lock().unwrap().push("kill-done");
+        self.inner.kill(exec).await;
+    }
+}
+
+/// What the registry is asked for a server of the rig's script at `root`.
+fn want<'a>(
+    lsp: &'a Lsp,
+    session: Arc<dyn EnvSession>,
+    root: PathBuf,
+    max: usize,
+    init_timeout: Duration,
+) -> Want<'a> {
+    Want {
+        key: Key {
+            run: lsp.run(),
+            slot: "w".to_owned(),
+            language: Language::Rust,
+            root,
+            mode: Mode::Full,
+        },
+        spec: lsp.fx.env.language_table.get(Language::Rust),
+        session,
+        mode: Mode::Full,
+        idle: Duration::from_secs(600),
+        max,
+        kill_wait: Duration::from_secs(5),
+        hide: Vec::new(),
+        init_timeout,
+        redactor: adam_coder::Redactor::default(),
+    }
+}
+
+// ----------------------------------------------------------------------- 1: the modes
+
+#[tokio::test]
+async fn at_the_plan_tier_a_server_that_writes_into_a_writable_slot_is_restored_and_stopped() {
+    let lsp = Lsp::new(json!({
+        "write_on_request": {"n": 1, "path": "src/generated.rs", "content": "// by the server\n"},
+        "results": {"textDocument/definition": null},
+    }))
+    .await;
+    rust_project(&lsp);
+    lsp.set_tier(AccessTier::Plan).await;
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": "src/lib.rs", "line": 1, "symbol": "first"}),
+        )
+        .await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("`plan` tier") && out.content.contains("as they were"),
+        "{}",
+        out.content
+    );
+    assert!(
+        !lsp.worktree().join("src/generated.rs").exists(),
+        "the file the server wrote is gone"
+    );
+    assert!(lsp.servers().is_empty(), "the server is stopped");
+}
+
+#[tokio::test]
+async fn the_mode_of_a_server_follows_the_tier_safe_at_plan_and_full_above_it() {
+    let lsp = Lsp::new(json!({
+        "write_on_request": {"n": 1, "path": "src/generated.rs", "content": "// by the server\n"},
+        "results": {"textDocument/definition": null},
+    }))
+    .await;
+    rust_project(&lsp);
+    // At plan the slot is read only for it: the reference settings.
+    lsp.set_tier(AccessTier::Plan).await;
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    let safe = lsp.init_options(0);
+    assert_eq!(safe["cargo"]["buildScripts"]["enable"], false, "{safe}");
+    assert_eq!(safe["procMacro"]["enable"], false);
+    // Above it, in a slot the run may write, the project's own build runs, as run_checks runs it,
+    // and the slot is not held to what it was.
+    lsp.set_tier(AccessTier::Edits).await;
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": "src/lib.rs", "line": 1, "symbol": "first"}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        lsp.logged("initialize").len(),
+        2,
+        "a server of its own mode"
+    );
+    let full = lsp.init_options(1);
+    assert!(full["cargo"].get("buildScripts").is_none(), "{full}");
+    assert!(lsp.worktree().join("src/generated.rs").exists());
+}
+
+// ------------------------------------------------------------- 2: a dropped call, a whole frame
+
+#[tokio::test]
+async fn a_call_dropped_in_the_middle_of_a_large_file_leaves_the_server_usable() {
+    let lsp = Lsp::new(json!({
+        "stall_after_initialized_ms": 4000,
+        "diagnostics": [diag(1, 0, 0, "still here")],
+    }))
+    .await;
+    rust_project(&lsp);
+    lsp.put(
+        "src/big.rs",
+        &"// filler of a large file, line by line\n".repeat(95_000),
+    );
+    // The server reads nothing for 4 s: the `didOpen` of 3.6 MiB is stuck in the pipe when the call
+    // is dropped (a time limit, a cancel).
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(1500),
+        lsp.diagnostics(json!({"path": "src/big.rs", "wait": 5})),
+    )
+    .await;
+    assert!(dropped.is_err(), "the call was still writing");
+    let pid = lsp.pid();
+    let out = lsp
+        .diagnostics(json!({"path": "src/lib.rs", "wait": 20}))
+        .await;
+    assert!(
+        out.content.contains("src/lib.rs:1:1: error: still here"),
+        "{}",
+        out.content
+    );
+    assert_eq!(lsp.pid(), pid, "the same server answered");
+}
+
+// ------------------------------------------------------------------- 3: the gate and `busy`
+
+#[tokio::test]
+async fn a_call_dropped_while_waiting_for_the_gate_does_not_keep_the_server_busy() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    lsp.put("tools/Cargo.toml", "[package]\nname = \"tools\"\n");
+    let servers = lsp.fx.env.commands.language_servers();
+    let session = adam_workspace::LocalSession::shared();
+    let first = servers
+        .get_or_start(want(
+            &lsp,
+            session.clone(),
+            lsp.worktree(),
+            1,
+            Duration::from_secs(30),
+        ))
+        .await
+        .unwrap();
+    let held = first.lock(Duration::from_secs(5)).await.expect("the gate");
+    // A second call waits for the gate and is dropped (its time limit, a cancel).
+    let waiting = tokio::time::timeout(
+        Duration::from_millis(300),
+        first.lock(Duration::from_secs(30)),
+    )
+    .await;
+    assert!(waiting.is_err());
+    drop(held);
+    // Nothing works now: at a bound of 1 the next server's room is made by stopping this one.
+    let next = servers
+        .get_or_start(want(
+            &lsp,
+            session,
+            lsp.worktree().join("tools"),
+            1,
+            Duration::from_secs(30),
+        ))
+        .await;
+    assert!(next.is_ok(), "{:?}", next.err());
+}
+
+// ----------------------------------------------------------------------- 4: no process id
+
+#[tokio::test]
+async fn initialize_names_no_process_because_the_workers_pid_means_nothing_elsewhere() {
+    let lsp = Lsp::new(json!({"diagnostics": [diag(1, 0, 0, "x")]})).await;
+    rust_project(&lsp);
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    let init = &lsp.logged("initialize")[0]["params"];
+    assert!(init["processId"].is_null(), "{}", init["processId"]);
+}
+
+// --------------------------------------------------------------- 6: the bound under concurrency
+
+#[tokio::test]
+async fn two_starts_for_different_roots_at_a_bound_of_one_leave_one_server() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    lsp.put("tools/Cargo.toml", "[package]\nname = \"tools\"\n");
+    let servers = lsp.fx.env.commands.language_servers();
+    let session = adam_workspace::LocalSession::shared();
+    let (a, b) = tokio::join!(
+        servers.get_or_start(want(
+            &lsp,
+            session.clone(),
+            lsp.worktree(),
+            1,
+            Duration::from_secs(30)
+        )),
+        servers.get_or_start(want(
+            &lsp,
+            session.clone(),
+            lsp.worktree().join("tools"),
+            1,
+            Duration::from_secs(30)
+        )),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(servers.count(), 1, "the bound holds under concurrency");
+    let pids = [a.pid().unwrap(), b.pid().unwrap()];
+    until("only one of the two processes to be left", || {
+        pids.iter().filter(|p| alive(**p)).count() == 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_server_that_is_being_stopped_still_counts_until_its_process_is_gone() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    lsp.put("tools/Cargo.toml", "[package]\nname = \"tools\"\n");
+    let servers = lsp.fx.env.commands.language_servers();
+    // The environment takes 700 ms to kill what it holds.
+    let session = Recording::new(Duration::from_millis(700));
+    let first = servers
+        .get_or_start(want(
+            &lsp,
+            session.clone(),
+            lsp.worktree(),
+            1,
+            Duration::from_secs(30),
+        ))
+        .await
+        .unwrap();
+    first.request_stop("the test");
+    let second = servers
+        .get_or_start(want(
+            &lsp,
+            session.clone(),
+            lsp.worktree().join("tools"),
+            1,
+            Duration::from_secs(30),
+        ))
+        .await;
+    assert!(second.is_ok(), "{:?}", second.err());
+    // The second was not started before the first was gone.
+    assert_eq!(session.events(), ["prepare", "kill-done", "prepare"]);
+}
+
+// ------------------------------------------------------------------------- 7: stop points
+
+#[tokio::test]
+async fn a_start_that_is_dropped_asks_the_environment_to_kill_what_it_started() {
+    let lsp = Lsp::new(json!({"initialize_never": true})).await;
+    rust_project(&lsp);
+    let servers = lsp.fx.env.commands.language_servers();
+    let session = Recording::new(Duration::ZERO);
+    let started = tokio::time::timeout(
+        Duration::from_millis(1500),
+        servers.get_or_start(want(
+            &lsp,
+            session.clone(),
+            lsp.worktree(),
+            4,
+            Duration::from_secs(60),
+        )),
+    )
+    .await;
+    assert!(
+        started.is_err(),
+        "the start was still waiting for `initialize`"
+    );
+    until("the environment to be asked to kill the exec", || {
+        !session.kills().is_empty()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_start_that_finishes_after_its_run_was_stopped_leaves_no_server() {
+    let lsp = Lsp::new(json!({"initialize_delay_ms": 1500})).await;
+    rust_project(&lsp);
+    let servers = lsp.fx.env.commands.language_servers();
+    let run = lsp.run();
+    let session = adam_workspace::LocalSession::shared();
+    let (started, ()) = tokio::join!(
+        servers.get_or_start(want(
+            &lsp,
+            session,
+            lsp.worktree(),
+            4,
+            Duration::from_secs(30)
+        )),
+        async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            servers.stop_run(&run, "the run parked").await;
+        }
+    );
+    assert!(
+        matches!(&started, Err(StartError::Stopped)),
+        "{:?}",
+        started.as_ref().err()
+    );
+    assert_eq!(servers.count(), 0);
+    let pid: u32 = std::fs::read_to_string(lsp.dir.path().join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    until("the late server's process to be gone", || !alive(pid)).await;
+}
+
+// -------------------------------------------------------------------- 8: a closed client
+
+#[tokio::test]
+async fn a_server_whose_output_stops_being_messages_is_stopped_at_once_with_what_it_started() {
+    let lsp = Lsp::new(json!({
+        "garbage_after_ms": 3000, "spawn_tree": true, "diagnostics": [diag(1, 0, 0, "x")],
+    }))
+    .await;
+    rust_project(&lsp);
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    let pids = lsp.tree().await;
+    // No call is in flight when the garbage comes: nothing else would notice.
+    until("the process tree to be stopped", || {
+        pids.iter().all(|p| !alive(*p))
+    })
+    .await;
+}
+
+// ------------------------------------------------------------------ 9: the scratch directory
+
+#[tokio::test]
+async fn the_safe_rust_analyzer_target_directory_is_private_and_removed_when_the_server_stops() {
+    let a = references::with_reference(json!({})).await;
+    let b = references::with_reference(json!({})).await;
+    let mut targets = Vec::new();
+    for lsp in [&a, &b] {
+        let out = lsp
+            .diagnostics(json!({"path": "src/lib.rs", "repo": "lib"}))
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let options = lsp.init_options(0);
+        let target = options["cargo"]["targetDir"].as_str().unwrap().to_owned();
+        assert!(target.starts_with("/tmp/"), "{target}");
+        targets.push(target);
+    }
+    assert_ne!(targets[0], targets[1], "one per run and slot");
+    for (lsp, target) in [&a, &b].into_iter().zip(&targets) {
+        // What rust-analyzer would have built there.
+        std::fs::create_dir_all(format!("{target}/debug")).unwrap();
+        std::fs::write(format!("{target}/debug/artifact"), "x").unwrap();
+        lsp.fx.env.commands.stop_run(&lsp.run(), "the test").await;
+        assert!(
+            !Path::new(target).exists(),
+            "{target} is removed when the server stops"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------- 11: what is shown
+
+#[tokio::test]
+async fn what_a_server_says_loses_its_direction_controls_and_the_paths_of_other_places() {
+    let message = "reordered \u{202e}txet\u{2066}x\u{2028}y, from \
+                   /usr/local/go/src/fmt/print.go:12:3 and (/home/ana/.cargo/registry/src/x/y.rs)";
+    let lsp = Lsp::new(json!({"diagnostics": [diag(1, 0, 0, message)]})).await;
+    rust_project(&lsp);
+    let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    for bad in ['\u{202e}', '\u{2066}', '\u{2028}'] {
+        assert!(
+            !out.content.contains(bad),
+            "U+{:04X}: {}",
+            u32::from(bad),
+            out.content
+        );
+    }
+    assert!(out.content.contains("\\u{202e}"), "{}", out.content);
+    assert!(
+        !out.content.contains("/usr/local") && !out.content.contains("/home/ana"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content
+            .contains("(outside the workspace) src/fmt/print.go:12:3")
+            && out.content.contains("(outside the workspace) src/x/y.rs"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn the_name_of_a_file_and_the_source_line_of_a_location_lose_their_direction_controls() {
+    let lsp = Lsp::new(json!({"results": {"textDocument/definition": [
+        {"uri": "$FILE", "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}}}
+    ]}}))
+    .await;
+    rust_project(&lsp);
+    let name = "src/evil\u{202e}gnp.rs";
+    lsp.put(name, "// \u{202e}hidden \u{2028}text\npub fn x() {}\n");
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": name, "line": 2, "symbol": "x"}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    for bad in ['\u{202e}', '\u{2028}'] {
+        assert!(
+            !out.content.contains(bad),
+            "U+{:04X}: {}",
+            u32::from(bad),
+            out.content
+        );
+    }
+    assert!(out.content.contains("\\u{202e}"), "{}", out.content);
+}
+
+// ------------------------------------------------------------------------ 12: positions
+
+#[tokio::test]
+async fn a_lone_carriage_return_is_a_line_break_as_the_protocol_counts() {
+    let lsp = Lsp::new(json!({"results": {"textDocument/definition": null}})).await;
+    rust_project(&lsp);
+    lsp.put("src/cr.rs", "pub fn a() {}\rpub fn target_fn() {}\r");
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": "src/cr.rs", "line": 2, "symbol": "target_fn"}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    let asked = &lsp.logged("textDocument/definition")[0]["params"]["position"];
+    assert_eq!(asked["line"], 1, "{asked}");
+    assert_eq!(asked["character"], 7, "{asked}");
+}
+
+#[tokio::test]
+async fn a_symbol_that_is_only_inside_other_words_is_not_on_the_line_as_a_word() {
+    let lsp = Lsp::new(json!({"results": {"textDocument/definition": null}})).await;
+    rust_project(&lsp);
+    lsp.put("src/v.rs", "let valid = 1;\n");
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": "src/v.rs", "line": 1, "symbol": "id"}),
+        )
+        .await;
+    assert!(
+        out.is_error
+            && out
+                .content
+                .contains("not on line 1 of `src/v.rs` as a word")
+            && out.content.contains("let valid = 1;"),
+        "{}",
+        out.content
+    );
+    assert!(lsp.logged("textDocument/definition").is_empty());
+}
+
+#[tokio::test]
+async fn a_pull_that_is_cancelled_while_the_server_works_is_still_indexing_not_a_failure() {
+    let lsp =
+        Lsp::new(json!({"pull": true, "error_on": {"textDocument/diagnostic": -32802}})).await;
+    rust_project(&lsp);
+    let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("still indexing"), "{}", out.content);
 }

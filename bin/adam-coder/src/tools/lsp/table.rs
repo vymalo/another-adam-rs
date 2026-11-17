@@ -3,9 +3,11 @@
 //! A test points [`ServerTable`] at the scripted server of `src/bin/adam-lsp-script.rs`.
 //!
 //! The names of the servers' own settings below are **unverified** (written from memory of each
-//! server's documentation, 2026-11-17; no real server was started while writing them). A name a
-//! server does not know is ignored by it, so a wrong one costs a weaker result and nothing else.
-//! `tests/language_servers.rs` has a gated suite for the real servers (`ADAM_TEST_LANGUAGE_SERVERS=1`).
+//! server's documentation, 2026-11-17). A name a server does not know is ignored by it, so a wrong
+//! one costs a weaker result and nothing else. `tests/real_language_servers.rs` is a gated suite for the
+//! real servers (`ADAM_TEST_LANGUAGE_SERVERS=1`): `rust-analyzer` and `pyright` were run on
+//! 2026-11-17 and reported an error at its line, a definition and references; the other two were not
+//! installed there.
 
 use serde_json::{Value, json};
 
@@ -94,10 +96,11 @@ impl Language {
     }
 
     /// The sections of the server's settings that a `workspace/configuration` request asks for, and
-    /// the options it is started with (`initializationOptions`), for a slot that is written or a
-    /// safe server (read only: no build script, no procedural macro, no check on save, nothing that
-    /// writes beside the files).
-    pub fn settings(self, mode: Mode) -> Settings {
+    /// the options it is started with (`initializationOptions`). A [`Mode::Safe`] server is read only:
+    /// no build script, no procedural macro, no check on save, and a rust-analyzer builds in `scratch`
+    /// (a directory of its own, removed when the server stops); a [`Mode::Full`] one has what the
+    /// project's own build does.
+    pub fn settings(self, mode: Mode, scratch: &str) -> Settings {
         let reference = mode == Mode::Safe;
         match self {
             Self::Rust => {
@@ -106,7 +109,7 @@ impl Language {
                     options = json!({
                         "cargo": {
                             "buildScripts": {"enable": false},
-                            "targetDir": "/tmp/adam-rust-analyzer-target",
+                            "targetDir": scratch,
                         },
                         "procMacro": {"enable": false},
                         "checkOnSave": false,
@@ -283,24 +286,29 @@ mod tests {
 
     #[test]
     fn a_section_is_found_by_its_name_or_its_path() {
-        let settings = Language::Python.settings(Mode::Full);
+        let settings = Language::Python.settings(Mode::Full, "");
         assert_eq!(
             settings.section("python.analysis")["diagnosticMode"],
             "openFilesOnly"
         );
         assert!(settings.section("python.nothing").is_null());
-        let rust = Language::Rust.settings(Mode::Full);
+        let rust = Language::Rust.settings(Mode::Full, "");
         assert_eq!(rust.section("rust-analyzer")["cargo"]["targetDir"], true);
     }
 
     #[test]
     fn a_reference_has_no_build_script_no_macro_and_no_check_on_save() {
-        let read = Language::Rust.settings(Mode::Safe).options;
+        let read = Language::Rust
+            .settings(Mode::Safe, "/tmp/adam-rust-analyzer/x")
+            .options;
         assert_eq!(read["cargo"]["buildScripts"]["enable"], false);
         assert_eq!(read["procMacro"]["enable"], false);
         assert_eq!(read["checkOnSave"], false);
-        assert_ne!(read["cargo"]["targetDir"], true, "a path outside the slot");
-        let write = Language::Rust.settings(Mode::Full).options;
+        assert_eq!(
+            read["cargo"]["targetDir"], "/tmp/adam-rust-analyzer/x",
+            "the directory the coder made, outside the slot"
+        );
+        let write = Language::Rust.settings(Mode::Full, "").options;
         assert!(write["cargo"].get("buildScripts").is_none());
         assert!(write.get("procMacro").is_none());
     }

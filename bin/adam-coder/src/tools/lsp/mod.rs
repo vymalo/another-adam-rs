@@ -17,12 +17,14 @@
 //!     participant S as server (stdio)
 //!     M->>T: {path, wait}
 //!     T->>E: probe: command -v, --version (once per run, slot, language)
-//!     T->>L: the server for (run, slot, language, root)
+//!     T->>E: safe mode only: snapshot of the slot
+//!     T->>L: the server for (run, slot, language, root, mode)
 //!     L->>E: prepare (background) and spawn, stdin piped
 //!     L->>S: initialize, initialized
 //!     T->>S: didOpen or didChange, didChangeWatchedFiles
 //!     S-->>L: $/progress, publishDiagnostics
 //!     L-->>T: ready, or the deadline of wait
+//!     T->>E: safe mode only: snapshot again, put back what changed
 //!     T->>T: sort, cut, scrub, page
 //!     T-->>M: path:line:col lines, [end] or [still indexing]
 //! ```
@@ -31,7 +33,8 @@
 //!
 //! A position is a **line** (from 1) and the **symbol** on it (text), with `occurrence` when the
 //! symbol is there more than once: the column is found here and counted in the encoding the server
-//! agreed to ([`position`]). A symbol that is not on the line is answered with the line as it is.
+//! agreed to ([`position`]). Only whole words count, and a symbol that is not on the line as a word is
+//! answered with the line as it is. A line ends at `\r\n`, `\n` or a lone `\r`.
 //! Every position the model reads is `path:line:col` (from 1, columns in characters), with paths
 //! relative to the slot; a location in another slot of the workspace is `<slot>/<path>` and a
 //! location anywhere else is `(outside the workspace) <last three components>:line`, never a path
@@ -47,11 +50,20 @@
 //!
 //! # What a server may do
 //!
-//! Nothing that writes. The client never declares `workspace.applyEdit` and answers a server that asks
-//! anyway with `applied: false`. In a **reference** the slot is snapshotted when the server starts
-//! (the snapshot of `run_command`) and compared at each call: a difference is restored, the server is
-//! stopped and the tool says so. A server runs where `run_command` runs, as the same user, with the
-//! same variables hidden. Everything it says passes through the redactor before it is cut or shown.
+//! The client never declares `workspace.applyEdit` and answers a server that asks anyway with
+//! `applied: false`. A server has a [`Mode`]: **safe** in a reference and in a run at the access tier
+//! `plan` (the reference settings: no build script, no procedural macro, no check on save, the image's
+//! TypeScript with no plugin), **full** in a slot a run at a higher tier may write (as `run_checks`
+//! there). For a safe server the slot is snapshotted (the snapshot of `run_command`) and compared
+//! after each call, a reference against its state when the server started and a writable slot against
+//! its state before the call: a difference is restored, the server is stopped and the tool says so.
+//!
+//! That is the whole guarantee: **git-visible state of the call's own slot, at call boundaries**. A
+//! write after the last comparison, an ignored file, a path outside the slot and the project code a
+//! server runs while it looks (`cargo metadata`, a `.cargo/config` wrapper, `go list`) are not covered,
+//! and a full server is not compared at all. A server runs where `run_command` runs, as the same user,
+//! with the same variables hidden. Everything it says passes through the redactor before it is cut or
+//! shown, with direction controls and other paths written out.
 
 pub mod position;
 pub mod rpc;
@@ -63,6 +75,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adam::prelude::*;
+use adam_a2a::AccessTier;
 use adam_llm_agent::paging;
 use adam_workspace::{EnvSession, Slot, SlotDir};
 use serde_json::{Value, json};
@@ -70,14 +83,18 @@ use serde_json::{Value, json};
 use super::files::{Access, confine};
 use super::inspect::Snapshot;
 use super::shell::shell_spec;
-use super::{Outcome, ToolEnv, cancelled, non_empty, run_error};
+use super::skills::listing_text;
+use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, run_error};
 use crate::redact::Redactor;
 pub use server::{Probe, ServerInfo, Servers};
 pub use table::{Language, Mode, ServerSpec, ServerTable, Settings};
 
-use position::{Encoding, Found, file_uri, find_symbol, path_of_uri, to_chars, to_server};
+use position::{
+    Encoding, Found, file_uri, find_symbol, path_of_uri, split_lines, to_chars, to_server,
+};
 use server::{
-    INITIALIZE_TIMEOUT, Key, PROBE_TIMEOUT, Reply, Server, StartError, Synced, Target, Want,
+    Diagnostics, INITIALIZE_TIMEOUT, Key, PROBE_TIMEOUT, Reply, Server, StartError, Synced, Target,
+    Want,
 };
 
 /// The names of the three tools.
@@ -435,6 +452,11 @@ impl Call<'_> {
         &self.env.redactor
     }
 
+    /// The path the model gave, as one safe line.
+    fn path_shown(&self) -> String {
+        safe_name(&self.rel.display().to_string())
+    }
+
     /// The text with this machine's paths to the slot taken out, scrubbed.
     fn clean(&self, text: &str) -> String {
         clean_text(self.redactor(), self.slot, text)
@@ -453,13 +475,21 @@ impl Call<'_> {
             Probe::Missing(why) => return Ok(ToolOutput::text(why)),
         }
 
-        // A reference is read and never changed: what it is now is what it must stay.
+        // What a server may do depends on where it runs and on the tier of the run: a reference, and
+        // a run at `plan`, are never changed, so the server there is safe (it builds nothing and
+        // runs no project code beyond what looking needs) and the slot is held to what it was. A
+        // run that may write, in a slot it may write, gets the server `run_checks` there would run.
         let reference = !self.slot.writable();
-        let mode = if reference { Mode::Safe } else { Mode::Full };
-        let before = if reference {
+        let tier = self.tier(&run).await?;
+        let mode = if reference || tier == AccessTier::Plan {
+            Mode::Safe
+        } else {
+            Mode::Full
+        };
+        let before = if mode == Mode::Safe {
             let Some(state) = Snapshot::of_slot(self.slot).await else {
                 return Ok(ToolOutput::error(
-                    "Cannot read the state of the reference, so no language server was used. Try \
+                    "Cannot read the state of the workspace, so no language server was used. Try \
                      again; if it persists, tell the person.",
                 ));
             };
@@ -501,13 +531,20 @@ impl Call<'_> {
                 "The language server of this project is busy with another call. Try again shortly.",
             ));
         };
+        // What the slot must be after this call: a reference, what it was when the server started
+        // (a server may write between calls); a writable slot at `plan`, what it was before this one.
+        let mut per_call = None;
         if let Some(state) = before {
-            match gate.reference() {
-                None => gate.remember_reference(state),
-                Some(was) if *was != state => {
-                    return Ok(self.wrote_to_reference(&server, was).await);
+            if reference {
+                match gate.reference() {
+                    None => gate.remember_reference(state),
+                    Some(was) if *was != state => {
+                        return Ok(self.wrote_to_slot(&server, was).await);
+                    }
+                    Some(_) => {}
                 }
-                Some(_) => {}
+            } else {
+                per_call = Some(state);
             }
         }
 
@@ -539,12 +576,18 @@ impl Call<'_> {
             }
         };
 
-        // Did the server write to a reference? Looked at after the work it did for this call.
-        if reference
-            && let (Some(was), Some(now)) = (gate.reference(), Snapshot::of_slot(self.slot).await)
+        // Did the server write to a slot that is not to change? Looked at after the work it did for
+        // this call.
+        let must_be = if reference {
+            gate.reference()
+        } else {
+            per_call.as_ref()
+        };
+        if let Some(was) = must_be
+            && let Some(now) = Snapshot::of_slot(self.slot).await
             && *was != now
         {
-            return Ok(self.wrote_to_reference(&server, was).await);
+            return Ok(self.wrote_to_slot(&server, was).await);
         }
         drop(gate);
 
@@ -672,6 +715,9 @@ impl Call<'_> {
                 "This worker holds {max} language servers (LANGUAGE_SERVERS_MAX) and every one is \
                  working for a call: try again shortly."
             ),
+            StartError::Stopped => "The language servers of this run were stopped while this one \
+                 was starting (the run parked, or its environment was made again): call again."
+                .to_owned(),
         };
         ToolOutput::error(self.clean(&text))
     }
@@ -699,15 +745,31 @@ impl Call<'_> {
         ToolOutput::error(text)
     }
 
-    /// A server wrote into a reference: put it back, stop the server, say so.
-    async fn wrote_to_reference(&self, server: &Server, baseline: &Snapshot) -> ToolOutput {
+    /// The access tier the run works under, as its notes say (`plan` when none were written).
+    async fn tier(&self, run: &str) -> Result<AccessTier, ToolError> {
+        Ok(self
+            .env
+            .notes
+            .load_existing(run)
+            .await
+            .map_err(|e| notes_error(&e))?
+            .map_or(AccessTier::Plan, |notes| self.env.tier_of(&notes)))
+    }
+
+    /// A server wrote into a slot that is not to change: put it back, stop the server, say so.
+    async fn wrote_to_slot(&self, server: &Server, baseline: &Snapshot) -> ToolOutput {
         let restored = baseline.restore(self.slot).await;
-        server.stop("it changed a reference").await;
+        server.stop("it changed files it must not").await;
+        let why = if self.slot.writable() {
+            "and this run is at the `plan` tier, where nothing is changed"
+        } else {
+            "which is a reference (read, never changed)"
+        };
         ToolOutput::error(format!(
-            "The language server changed files of `{}`, which is a reference (read, never changed). {} \
-             The server was stopped and its answer dropped; the next call starts it again. Use run_checks \
-             or run_command to see what the compiler says.",
-            self.slot.dir(),
+            "The language server changed files of `{}`, {why}. {} The server was stopped and its \
+             answer dropped; the next call starts it again. Use run_checks or run_command to see \
+             what the compiler says.",
+            safe_name(self.slot.dir()),
             if restored {
                 "The files are as they were."
             } else {
@@ -726,19 +788,34 @@ impl Call<'_> {
     ) -> Answer {
         let server = gate.server();
         let items = match gate.diagnostics(uri, seq, synced, deadline).await {
-            Ok(items) => items,
+            Ok(Diagnostics::Items(items)) => items,
+            Ok(Diagnostics::Nothing(waited)) => {
+                // Not an empty set: the server said nothing, so nothing is known of the file.
+                return Answer::Text(
+                    format!(
+                        "No diagnostics received for `{}` within {} s: the server published none \
+                         for it (it may not have looked at the file yet, or it publishes only when \
+                         there is something to say). Call again, with a longer `wait` if it was \
+                         still starting, or use run_checks or run_command with {}.",
+                        self.path_shown(),
+                        waited.as_secs_f64().ceil(),
+                        instead(self.language)
+                    ),
+                    server.indexing(),
+                );
+            }
             Err(Reply::Indexing) => {
                 return Answer::Text(
                     format!(
                         "No diagnostics yet for `{}`: the server is still indexing.",
-                        self.ask.path
+                        self.path_shown()
                     ),
                     true,
                 );
             }
             Err(other) => return self.failed(server, other),
         };
-        let lines: Vec<&str> = self.text.split('\n').collect();
+        let lines: Vec<&str> = split_lines(self.text);
         let enc = server.encoding();
         let mut found: Vec<(u32, u32, String, bool)> = Vec::new();
         for item in &items {
@@ -756,9 +833,7 @@ impl Call<'_> {
                 .and_then(Value::as_u64)
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(0);
-            let source_line = lines
-                .get(line as usize)
-                .map_or("", |l| l.trim_end_matches('\r'));
+            let source_line = lines.get(line as usize).copied().unwrap_or_default();
             let col = to_chars(source_line, character, enc) + 1;
             let message = item
                 .get("message")
@@ -787,7 +862,7 @@ impl Call<'_> {
             let kind = if severity == 2 { "warning" } else { "error" };
             let mut line_text = format!(
                 "{}:{}:{col}: {kind}: {}",
-                self.rel.display(),
+                self.path_shown(),
                 line + 1,
                 paging::escape_text(message.as_bytes()),
             );
@@ -859,12 +934,12 @@ impl Call<'_> {
         let Some((line, symbol, occurrence)) = self.ask.position.clone() else {
             return Answer::Text(String::new(), false);
         };
-        let lines: Vec<&str> = self.text.split('\n').collect();
+        let lines: Vec<&str> = split_lines(self.text);
         let index = usize::try_from(line - 1).unwrap_or(usize::MAX);
-        let Some(source_line) = lines.get(index).map(|l| l.trim_end_matches('\r')) else {
+        let Some(source_line) = lines.get(index).copied() else {
             return Answer::Failed(ToolOutput::error(format!(
                 "`{}` has {} lines: line {line} is past the end",
-                self.ask.path,
+                self.path_shown(),
                 lines.len()
             )));
         };
@@ -874,7 +949,18 @@ impl Call<'_> {
                 return Answer::Failed(ToolOutput::error(format!(
                     "`{}` is not on line {line} of `{}`. The line reads: {}",
                     cut_chars(&self.clean(&symbol), MAX_SYMBOL_CHARS),
-                    self.ask.path,
+                    self.path_shown(),
+                    paging::escape_text(
+                        cut_chars(&self.clean(source_line), MAX_SOURCE_CHARS * 2).as_bytes()
+                    )
+                )));
+            }
+            Found::NotAsWord => {
+                return Answer::Failed(ToolOutput::error(format!(
+                    "`{}` is not on line {line} of `{}` as a word (it is there only inside longer \
+                     words). The line reads: {}",
+                    cut_chars(&self.clean(&symbol), MAX_SYMBOL_CHARS),
+                    self.path_shown(),
                     paging::escape_text(
                         cut_chars(&self.clean(source_line), MAX_SOURCE_CHARS * 2).as_bytes()
                     )
@@ -884,7 +970,7 @@ impl Call<'_> {
                 return Answer::Failed(ToolOutput::error(format!(
                     "`{}` is on line {line} of `{}` {n} time{}, not {occurrence}. The line reads: {}",
                     cut_chars(&self.clean(&symbol), MAX_SYMBOL_CHARS),
-                    self.ask.path,
+                    self.path_shown(),
                     if n == 1 { "" } else { "s" },
                     paging::escape_text(
                         cut_chars(&self.clean(source_line), MAX_SOURCE_CHARS * 2).as_bytes()
@@ -912,7 +998,10 @@ impl Call<'_> {
             Reply::Done(value) => value,
             Reply::Indexing => {
                 return Answer::Text(
-                    format!("No answer yet for `{symbol}`: the server is still indexing."),
+                    format!(
+                        "No answer yet for `{}`: the server is still indexing.",
+                        safe_line(&symbol)
+                    ),
                     true,
                 );
             }
@@ -921,7 +1010,10 @@ impl Call<'_> {
                 if (-32802..=-32800).contains(&code) && server.indexing() =>
             {
                 return Answer::Text(
-                    format!("No answer yet for `{symbol}`: the server is still indexing."),
+                    format!(
+                        "No answer yet for `{}`: the server is still indexing.",
+                        safe_line(&symbol)
+                    ),
                     true,
                 );
             }
@@ -972,7 +1064,60 @@ fn clean_text(redactor: &Redactor, slot: &Slot, text: &str) -> String {
     for prefix in path_strips(slot) {
         text = text.replace(&prefix, "");
     }
-    text
+    listing_text(&hide_foreign_paths(&text))
+}
+
+/// `text` with every path of another place (a run of non-space characters that starts with `/` and
+/// has two names in it: `/usr/local/go/src/fmt/print.go:12:3`) written as `(outside the workspace)
+/// <its last three names>`, as locations are. **Best effort**: a path a server writes in another way
+/// (with a space in it, or without its first `/`) is not found.
+fn hide_foreign_paths(text: &str) -> String {
+    let starts = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '(' | '[' | '{' | '<' | '"' | '\'' | '`' | ',' | ';' | '='
+            )
+    };
+    let ends = |c: char| {
+        c.is_whitespace() || matches!(c, ')' | ']' | '}' | '>' | '"' | '\'' | '`' | ',' | ';')
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < chars.len() {
+        if chars[at] == '/' && (at == 0 || starts(chars[at - 1])) {
+            let mut end = at;
+            while end < chars.len() && !ends(chars[end]) {
+                end += 1;
+            }
+            let token: String = chars[at..end].iter().collect();
+            let names = Path::new(&token)
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count();
+            if names >= 2 {
+                out.push_str("(outside the workspace) ");
+                out.push_str(&last_components(Path::new(&token)));
+                at = end;
+                continue;
+            }
+        }
+        out.push(chars[at]);
+        at += 1;
+    }
+    out
+}
+
+/// `text` as one safe line: a control character is `\xNN`, a direction control or a line separator
+/// is written out (`\u{202e}`), anything else is as it is.
+fn safe_line(text: &str) -> String {
+    listing_text(&paging::escape_text(text.as_bytes()))
+}
+
+/// [`safe_line`] for the name of a file.
+fn safe_name(text: &str) -> String {
+    listing_text(&paging::escape_name(text.as_bytes()))
 }
 
 /// The prefixes of this machine's paths to `slot`, each with its closing `/`.
@@ -1175,7 +1320,7 @@ fn format_locations(
                 loc.character,
                 format!(
                     "(outside the workspace) {}:{}",
-                    paging::escape_text(last_components(&path).as_bytes()),
+                    safe_line(&last_components(&path)),
                     loc.line + 1
                 ),
             )),
@@ -1186,11 +1331,7 @@ fn format_locations(
                         read_files += 1;
                         server::read_text(&mapper.slots[slot].root, &rel)
                             .ok()
-                            .map(|text| {
-                                text.split('\n')
-                                    .map(|l| l.trim_end_matches('\r').to_owned())
-                                    .collect()
-                            })
+                            .map(|text| split_lines(&text).into_iter().map(str::to_owned).collect())
                     } else {
                         None
                     };
@@ -1205,11 +1346,7 @@ fn format_locations(
                     None => (loc.character as usize + 1, None),
                 };
                 let name = mapper.shown(slot, &rel);
-                let mut text = format!(
-                    "{}:{}:{col}",
-                    paging::escape_name(name.as_bytes()),
-                    loc.line + 1
-                );
+                let mut text = format!("{}:{}:{col}", safe_name(&name), loc.line + 1);
                 if let Some(source) = shown_source {
                     let mut said = redactor.scrub(source.trim()).into_owned();
                     for prefix in strip {
@@ -1217,7 +1354,7 @@ fn format_locations(
                     }
                     let said = cut_chars(&said, MAX_SOURCE_CHARS);
                     text.push_str(": ");
-                    text.push_str(&paging::escape_text(said.as_bytes()));
+                    text.push_str(&safe_line(&said));
                 }
                 rows.push((name, loc.line, u32::try_from(col).unwrap_or(u32::MAX), text));
             }
