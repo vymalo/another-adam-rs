@@ -4,12 +4,11 @@ Runs the same tasks through two agents, `adam-coder` and OpenCode, on one model 
 in a pristine image and reports pass rates with intervals and what they cost. Decision and shape:
 [ADR 0048](../docs/decisions/0048-a-benchmark-harness-for-adam-coder-and-opencode.md).
 
-**Built so far (pull requests 1 to 3 of 4):** the meter, the cost and the cap, the ledger, the configuration and its
+**Built (pull requests 1 to 4 of 4):** the meter, the cost and the cap, the ledger, the configuration and its
 guards, the statistics and the report; the task sources (public and own), the statement lint, selection, the
 environment check and grading by patch replay; the compose stack, the adam and OpenCode drivers, the runner, `doctor` and
-the dry run. **Not built yet:** `pilot` and `run` (4), with blocks, several slots at once and the pilot's budget estimate.
-`node bench/bin/bench.mjs pilot`, `run` and `regrade` exit 2 with "not built yet" until then. Node 24 (CI), no
-dependencies: only Node's standard library. **Nothing that needs a container service has run** (the dry run, the stack,
+the dry run; and `pilot`, `confirm`, `run` and `regrade`, with task blocks, slots, the pilot's budget and the final report
+("Pilot and run" below). Node 24 (CI), no dependencies: only Node's standard library. **Nothing that needs a container service has run** (the dry run, the stack,
 `doctor --start`): see "Unverified".
 
 ## What it never holds
@@ -122,13 +121,14 @@ stateDiagram-v2
     Interrupted --> Planned: on resume, the spend stays as waste
     Interrupted --> Failed_infra: the third interruption, for good
     Failed_infra --> Planned: retry, at most two
+    Done --> Grading: bench regrade, only when the grade is invalid
     Done --> [*]
     NotStarted --> [*]
     StoppedByCap --> [*]
 ```
 
 The states and their transitions are `TRANSITIONS` in `bench/lib/ledger.mjs`, which refuses any other. The
-harness that drives a run through them (stack, clone, agent, grading) is not built yet. **Resume** reads the
+harness that drives a run through them is `lib/runner.mjs`. **Resume** reads the
 ledger (`resumeActions`): a `Done`, `NotStarted` or `StoppedByCap` run is never repeated; a run that was
 `Reserved`, `Preparing`, `Running`, `Collecting` or `Interrupted` starts again from scratch; a `Grading` run is
 graded again and never run again; a `Failed_infra` run is retried twice and then given up. A run is allowed
@@ -167,7 +167,8 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/classify.mjs` | infrastructure told apart from the agent, from the meter's record |
 | `bench/lib/base.mjs` | the base of a task: its repository with the dependency links, made in the slot's volume, and the host's own copy of it |
 | `bench/lib/agents/adam.mjs`, `opencode.mjs`, `common.mjs` | the two drivers (prepare, run, collect, cleanup) and what they share |
-| `bench/lib/runner.mjs` | one run through its states, and a plan with resume |
+| `bench/lib/runner.mjs` | one run through its states, resume of the ledger, and a plan one run at a time |
+| `bench/lib/plan.mjs`, `bench/lib/schedule.mjs`, `bench/lib/budget.mjs`, `bench/lib/run-cli.mjs` | task blocks in a seeded balanced order; the slots and the wait for budget; the pilot's budget and its confirmation; `bench pilot`, `confirm`, `run`, `regrade` |
 | `bench/lib/doctor.mjs` | `bench doctor` |
 | `bench/lib/agent-script.mjs`, `dryrun.mjs`, `dryrun-checks.mjs`, `bench/dry-run.sh` | the scripted model's turns, the dry run and what it asserts |
 
@@ -205,7 +206,7 @@ told otherwise.
 * **Backpressure:** an SSE stream is relayed chunk by chunk and the upstream is paused while the client does not read.
 
 **The report** shows pass rates with Wilson intervals, paired differences (exact McNemar, seeded bootstrap), splits
-by source and language, cost, tokens, time, calls, the excluded and flaky runs, and says what it does not claim.
+by source (`public`, `own`, `own-self`) and language, cost per run and per solved task, tokens, the cache-hit rate, time, calls, the infrastructure failures, the excluded and flaky runs, and says what it does not claim.
 Every cost, token and call figure sums **all attempts** of a run. Only `Done` runs count in the rates; the report
 says that runs in `StoppedByCap`, `Failed_infra`, `NotStarted` (and any other state) are left out, and lists them
 with what each wasted. Two `Done` runs for one task, agent and arm are an error that names them. Pipes and line
@@ -557,7 +558,84 @@ task's image ran (adam), in which the coder reported an external cause, or that 
 again, then left out of the rates), never a fail. Grading runs on the `grader` service. `runPlan` first reads the ledger (`resumeActions`), so a start after a kill runs what is left: a `Done` run is not
 repeated, an interrupted one starts again from scratch (its first attempt's spend stays as waste), a `Grading` one is graded
 again from its saved patch. The patch is written to `runs/<run>-a<n>/model.patch` under the results directory before grading. A
-verifier that needs the network gets it for the window of its grading. Blocks, several slots and the pilot are the next pull request's.
+verifier that needs the network gets it for the window of its grading. `runPlan` is one run at a time; the blocks and the slots are `lib/schedule.mjs` ("Pilot and run").
+
+## Pilot and run
+
+The owner's runbook. Each step reads what the one before wrote; nothing past `confirm` starts without the owner.
+
+| Step | Command | What it does |
+|---|---|---|
+| 1 | `bench doctor --start` | the machine, the stack, nested Podman |
+| 2 | `bench tasks fetch`, `mine`, `build`, `check`, `select` | the tasks and the two lock files ("Tasks") |
+| 3 | `bench pilot [--blocks 5]` | the first blocks of the plan, 20 runs, each reserving `perRunBudgetUSD`; prints the projection; writes `$BENCH_HOME/pilot-budget.json` (not confirmed) |
+| 4 | read the projection, then `bench confirm [--over-cap]` | the owner's yes; `--over-cap` accepts a projection above the cap |
+| 5 | `bench run` | the full run; ends by writing `$BENCH_HOME/report.md` |
+| 6 | `bench regrade` | only if some grades are `invalid` (the grader failed, not the agent): grades them again from the saved patch |
+| 7 | `bench report [--show-model-id]` | the report again from the ledger, at any time |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as owner
+    participant C as bench (lib/run-cli.mjs)
+    participant P as plan (lib/plan.mjs)
+    participant S as schedule (lib/schedule.mjs)
+    participant R as runner (lib/runner.mjs)
+    participant B as budget (lib/budget.mjs)
+    participant L as ledger (lib/ledger.mjs)
+    O->>C: bench pilot
+    C->>P: blocks of the selected tasks, seeded
+    C->>S: the first 5 blocks, 2 slots
+    loop each run, in block order
+        S->>R: advance the run in a free slot, after its reservation fits (lib/cap.mjs)
+        R->>L: state records, calls, Done with the grade
+    end
+    C->>B: the pilot's costs, p95 of each arm times 1.5, the projection
+    B-->>O: projection and pilot-budget.json (not confirmed)
+    O->>C: bench confirm
+    O->>C: bench run
+    C->>B: refuse unless confirmed for this configuration, pins and locks
+    C->>S: every block, the pilot's Done runs are skipped
+    S->>R: advance, reserving the confirmed budget of the arm
+    C->>L: report.md from the ledger (lib/report.mjs)
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoBudget
+    NoBudget --> Proposed: bench pilot writes the proposal
+    Proposed --> Confirmed: bench confirm
+    Proposed --> NoBudget: bench pilot again
+    Confirmed --> Running: bench run
+    Confirmed --> NoBudget: configuration, pins or locks changed
+    Running --> Running: killed, started again; only interrupted runs are redone
+    Running --> Ended: every run Done, or the cap reached
+```
+
+The states are those of `lib/budget.mjs` (`proposalBody`, `confirmProposal`, `requireConfirmed`); a new `bench pilot`
+deletes the file first, so an old yes never covers a new pilot.
+
+* **Blocks (`lib/plan.mjs`).** A block is one task through all four cells (two agents, two arms). The tasks are shuffled with the
+  seed of the configuration (`tasks.seed`); the cells of a block follow a cyclic Latin square, so in each round of four blocks
+  every cell stands at every position once. The pilot is the first blocks of the same order, so its runs are the full run's
+  first runs and are not repeated. A run id is `<task>.<agent>.<arm>`. A task's `source` is `public`, `own`, or `own-self`
+  (an own task from `tasks.selfRepo`, adam-rs itself), and the report keeps the three apart.
+* **Slots (`lib/schedule.mjs`).** `concurrency` slots (two by default, at most the stack's two), one run each. Runs start one at a
+  time in block order. A run whose reservation does not fit while others are active **waits** for one to end, because a
+  reservation is a ceiling: what a run did not spend is free when it closes. A run that does not fit with nothing left to wait for
+  is `NotStarted`, and nothing after it starts, so a stop at the cap leaves whole blocks. The reservation is made before the next
+  run is considered, so two slots cannot both take the last of the budget; `lib/cap.mjs` refuses the second anyway.
+* **Budget (`lib/budget.mjs`).** Before the pilot a run reserves `perRunBudgetUSD`. After it, an arm's budget is the 95th percentile
+  (nearest rank) of what its finished pilot runs cost, both agents together, times 1.5, and the projection says what the rest of
+  the run would reserve and, by the mean, spend. The file is valid only for the same model id, prices, arms, limits, context
+  window and pins and the same lock files (their digest is in it). An arm needs three finished pilot runs, or the pilot says so.
+* **Resume.** `bench run` again after a kill: `resumeActions` (`lib/ledger.mjs`) turns what was in flight into
+  `Interrupted` and then `Planned`, a `Grading` run is graded again, a `Done` run is skipped. The scheduler goes over the plan
+  again (at most three passes) so a run that failed in the infrastructure is tried again, as often as the ledger allows.
+* **The end.** `report.md` has, for each agent and arm, the resolve rate with its Wilson interval, the paired differences,
+  cost per run and per **resolved** task, tokens (input, cached, cache write, output), the cache-hit rate (cached over input),
+  wall time, infrastructure failures, and the refused entries; public, own and adam-rs's own tasks are separate rows.
 
 ## `bench doctor`
 
@@ -602,7 +680,7 @@ A2A server), the stack (on a fake `docker`) and the self-test tasks (their gold 
 ## Tests
 
 ```sh
-node --test "bench/test/*.test.mjs"     # about 450 tests, seconds, nothing beyond 127.0.0.1 (fixture git repositories are made in a temp directory)
+node --test "bench/test/*.test.mjs"     # about 520 tests, seconds, nothing beyond 127.0.0.1 (fixture git repositories are made in a temp directory)
 ```
 
 A test of the real OpenCode needs the pinned binary: `BENCH_TEST_OPENCODE_BIN=/path/to/opencode node --test bench/test/opencode.test.mjs`
@@ -613,6 +691,16 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
 `BENCH_TEST_WORKSPACE_IMAGE`, a digest-named base image, and a Podman service that shares the temporary directory). CI is `.github/workflows/bench.yml`, on changes under `bench/`.
 
 ## Unverified
+
+* **Pilot and run against a real stack.** `pilot`, `run` and `regrade` are tested on the fake container interface, the scripted
+  model, a real meter and a real ledger (`bench/test/schedule.test.mjs`, `runcli.test.mjs`); `lib/run-cli.mjs` `realHarness` (the
+  stack, the meter, the pulls of task images, the two drivers together) has never run, and nothing has run two slots at once on a
+  real Podman service.
+* **An own task's image** is built where `bench tasks build` ran (`tasks.podman`); `run` does not copy it to a slot's service, so
+  an own task needs its image present there (the run is `Failed_infra` otherwise). Public images are pulled per slot and on the grader.
+* **A budget below one call's worst case.** The proposal is 1.5 times the 95th percentile of a run's cost; with an endpoint whose
+  calls cost very little against their worst case, that can be below one call's worst case and every call would be refused
+  (`budget_hit`). The projection shows the budgets; read them before confirming.
 
 * Behaviour against a real endpoint: whether it honours `stream_options.include_usage`, reports cached and
   reasoning tokens as the OpenAI reference describes, or accepts `max_tokens` (the meter sets it when the agent sends

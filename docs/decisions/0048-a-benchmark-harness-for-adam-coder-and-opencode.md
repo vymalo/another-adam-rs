@@ -2,8 +2,8 @@
 
 Status: **Accepted** (2026-11-17), an owner decision: the harness, the task mix, one model in two arms, the cap, the
 pilot, resume, and that the owner runs it. Slice 1 (the meter, cost and cap, the ledger, the configuration, the
-statistics and the report) and slice 2 (task sources, selection, the environment check, grading) are built; the agent
-drivers and the runs are not. The five defaults at
+statistics and the report), slice 2 (task sources, selection, the environment check, grading), slice 3 (the agent drivers,
+the stack, the dry run) and slice 4 (the pilot and the run) are built. The five defaults at
 the end are the owner's to confirm.
 
 ## Context
@@ -52,8 +52,8 @@ where the intervals overlap, no real billing, no per-language conclusion below 1
 |---|---|---|
 | 1 | meter, cost and cap, ledger, configuration, statistics, report, this ADR, CI | built |
 | 2 | task sources, selection, the environment check, grading | built (2026-11-17) |
-| 3 | agent drivers, the compose stack, the dry run, `doctor` | not built |
-| 4 | `pilot`, `run`, blocks and slots, the projection | not built |
+| 3 | agent drivers, the compose stack, the dry run, `doctor` | built (2026-11-17) |
+| 4 | `pilot`, `run`, blocks and slots, the projection | built (2026-11-17) |
 
 ## For the owner to confirm
 
@@ -193,3 +193,26 @@ several places where the harness read or deleted files a container made. The dec
 
 *Unverified*, as before: everything that needs a container service. `bench/README.md`, "Unverified", lists what each fix could not
 prove here.
+
+## Amended 2026-11-17: slice 4 is built
+
+`bench pilot`, `confirm`, `run` and `regrade` are in `bench/` (`bench/README.md`, "Pilot and run"). Decisions the slice took, none
+changing the above:
+
+* **The pilot is a prefix of the plan.** The full order is seeded blocks (one task through the two agents and two arms); the cells of
+  a block follow a cyclic Latin square, so each round of four blocks has every cell at every position. The pilot is the first five
+  blocks, in the same ledger, so the full run does not repeat them and the cap counts their spend.
+* **The budget is a file the owner confirms.** After the pilot, an arm's budget is the 95th percentile of its finished runs' cost
+  (both agents together) times 1.5; the projection prints what the rest would reserve and, by the mean, spend. `bench run` refuses
+  to start (before the stack is touched) without `bench confirm`, and the file is void when the model id, prices, arms, limits,
+  context window, pins or the task locks change. A projection above the cap needs `--over-cap`, twice.
+* **Two slots, one at a time to start.** Runs start in block order. A run whose reservation does not fit waits for another to end
+  (a reservation is a ceiling, and what a run did not spend is free); one that does not fit with nothing to wait for is
+  `NotStarted` and nothing after it starts, so a stop at the cap leaves whole blocks.
+* **Regrade needs one new ledger transition**, `Done` to `Grading`, allowed only by `bench regrade` and only for a result that is
+  `invalid`; a valid grade stays final.
+* **The report gains** cost per run, the cache-hit rate (cached over input), a table of infrastructure failures and a cost row for
+  each source; adam-rs's own tasks are the source `own-self`.
+
+*Unverified*: `realHarness` and everything below it that needs a container service (two slots on a real Podman service, the pulls
+of task images, the own-task images on a slot's service, a budget below one call's worst case). `bench/README.md`, "Unverified".
