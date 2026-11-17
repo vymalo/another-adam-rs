@@ -83,7 +83,7 @@ test('the coder image: absent is a warning with the pull command, another image 
   assert.equal(by(other, 'coder image').status, 'fail');
 });
 
-function fakeStack({ nested = true, up = true, stale = [] } = {}) {
+function fakeStack({ nested = true, up = true, stale = [], limits = true } = {}) {
   const calls = [];
   const nestedContainers = () => ({
     pull: async () => calls.push('pull grader'),
@@ -102,7 +102,7 @@ function fakeStack({ nested = true, up = true, stale = [] } = {}) {
     graderWindow: async (fn) => fn(),
     containers: (slot) => ({
       pull: async () => calls.push(`pull ${slot}`),
-      run: async () => (nested ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 125, stdout: '', stderr: 'Error: cannot clone: Operation not permitted\nexit' }),
+      run: async (spec) => (spec.cpus !== undefined && !limits ? { exitCode: 125, stdout: '', stderr: 'Error: --cpus is not supported without cgroups' } : nested ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 125, stdout: '', stderr: 'Error: cannot clone: Operation not permitted\nexit' }),
     }),
   };
 }
@@ -121,6 +121,16 @@ test('with --start a container is run inside each Podman service', async () => {
   assert.deepEqual(stack.calls, ['up', 'pull 1', 'pull 2', 'pull grader']);
   assert.deepEqual(r.checks.filter((c) => c.name.startsWith('nested Podman')).map((c) => c.status), ['ok', 'ok', 'ok']);
   assert.ok(r.checks.some((c) => c.name === 'nested Podman, grader'), 'the grader is checked too');
+});
+
+test('defect 7: --start also asks each Podman service whether it takes the task limits, with the flags the drivers use', async () => {
+  const taken = await run(machine(), { stack: fakeStack(), start: true });
+  assert.deepEqual(taken.checks.filter((c) => c.name.startsWith('task limits')).map((c) => c.status), ['ok', 'ok']);
+  const refused = await run(machine(), { stack: fakeStack({ limits: false }), start: true });
+  const rows = refused.checks.filter((c) => c.name.startsWith('task limits'));
+  assert.deepEqual(rows.map((c) => c.status), ['warn', 'warn'], 'refused limits are a warning, never a failure');
+  assert.match(rows[0].detail, /service's own.*same for both agents/);
+  assert.equal(refused.exitCode, 0);
 });
 
 test('nested Podman that does not work fails with the reason, exits 1 and names the fallback', async () => {

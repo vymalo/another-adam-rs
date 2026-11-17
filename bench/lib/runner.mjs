@@ -53,7 +53,8 @@ async function gradeSaved({ deps, task, patchPath }) {
   const hasPatch = fs.existsSync(patchPath) && fs.statSync(patchPath).size > 0;
   const work = path.join(deps.home, 'work');
   fs.mkdirSync(work, { recursive: true });
-  const grade = () => gradePatch({ containers, task, patchFile: hasPatch ? patchPath : null, workRoot: work });
+  const io = deps.stack.graderIO?.();
+  const grade = () => gradePatch({ containers, task, patchFile: hasPatch ? patchPath : null, workRoot: work, ...(io ? { io } : {}) });
   const net = task.verifierNetwork;
   // The grader has no route out; a verifier that needs the network gets it for the window of its grading.
   return net === 'public' || net === 'default' ? deps.stack.graderWindow(grade) : grade();
@@ -179,13 +180,19 @@ export async function executeRun({ deps, spec, attempt }) {
   }
   const patchPath = path.join(paths.run, 'model.patch');
   fs.writeFileSync(patchPath, collected.patch);
+  // What was refused (entries of the tree, files of the output) and the limits the run had are part of its record.
+  const notes = { ...(collected.notes ?? {}) };
+  const refused = [...(notes.refused ?? []), ...(ran.record?.outputRefused ?? []).map((name) => ({ name, reason: 'a log that is not a plain file' }))];
+  if (refused.length > 0) notes.refused = refused;
+  else delete notes.refused;
+  if (ran.record?.limits) notes.limits = ran.record.limits;
   const meterNote = { settled: stats.settled, upstreamErrors: stats.upstreamErrors, refused: stats.refused };
-  fs.writeFileSync(path.join(paths.run, 'meta.json'), `${JSON.stringify({ exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported ?? null, notes: collected.notes ?? null, meter: meterNote }, null, 2)}\n`);
+  fs.writeFileSync(path.join(paths.run, 'meta.json'), `${JSON.stringify({ exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported ?? null, notes, meter: meterNote }, null, 2)}\n`);
   await agent.cleanup(ctx).catch(() => {});
 
   stateRecord(deps, run, 'Grading');
   const grade = await gradeSaved({ deps, task, patchPath });
-  stateRecord(deps, run, 'Done', { result: resultOf({ grade, exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported, patchPath, notes: collected.notes, meter: meterNote }) });
+  stateRecord(deps, run, 'Done', { result: resultOf({ grade, exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported, patchPath, notes, meter: meterNote }) });
   return { state: 'Done', pass: grade.pass };
 }
 

@@ -87,8 +87,23 @@ test('isolatedGit runs where there is no repository and the protocols are the pl
   t.after(() => process.chdir(before));
   const out = (await isolatedGit(['rev-parse', '--git-dir']).catch((e) => e)).message ?? '';
   assert.match(out, /not a git repository/);
-  await assert.rejects(isolatedGit(['ls-remote', '--', 'file:///etc']), /protocol|not allowed|failed/);
+  const real = initRepo(t);
+  commitFiles(real, { a: 'a' }, 'base');
+  await assert.rejects(isolatedGit(['ls-remote', '--', `file://${real}`]), /transport 'file' not allowed/, 'a repository that exists is still not read over file');
   await assert.rejects(isolatedGit(['ls-remote', '--', 'ext::sh -c true']), /./);
+});
+
+test('isolatedGit\'s directory is under a ceiling: a temporary directory inside a planted repository does not read its configuration', async (t) => {
+  const { port, seen } = await fakeGitServer(t, { heads: ['refs/heads/agent/abc123'] });
+  const planted = initRepo(t);
+  commitFiles(planted, { a: 'a' }, 'base');
+  fs.appendFileSync(path.join(planted, '.git', 'config'), `[http]\n\tproxy = http://127.0.0.1:1\n[url "ssh://x@example.test/"]\n\tinsteadOf = http://127.0.0.1:${port}/\n`);
+  withEnv(t, { TMPDIR: planted });
+  const out = (await isolatedGit(['rev-parse', '--git-dir']).catch((e) => e)).message ?? '';
+  assert.match(out, /not a git repository/, 'the repository above the temporary directory is not found');
+  const heads = await lsRemoteHeads({ url: `http://127.0.0.1:${port}/bench/x-1.git` });
+  assert.deepEqual(heads.map((h) => h.ref), ['agent/abc123']);
+  assert.ok(seen.length > 0, 'reached directly, not through the planted proxy or rewrite');
 });
 
 test('a reward the grading container made a link to a file of the host is not a reward (what a container wrote is read without following links)', async (t) => {

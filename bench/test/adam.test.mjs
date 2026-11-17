@@ -148,10 +148,15 @@ test('prepare: each run has its own random bearer', async (t) => {
   for (const b of seen) assert.match(b, /^[A-Za-z0-9_-]{32}$/);
 });
 
-test('run: polled to its end; the time and the grace are the configured ones; the bearer is in no log line and no saved file (finding 14)', async (t) => {
+test('run: the driver is called with the configured time limit and cancel grace; polled to its end; the bearer is in no log line and no saved file (finding 14)', async (t) => {
   const { agent, ctx, server, logs } = await setup(t, { script: [{ state: 'working' }, { state: 'completed', totals: [{ inputTokens: 100, outputTokens: 20 }] }] });
   await agent.prepare(ctx);
+  const drive = agent.drive.bind(agent);
+  let seen;
+  agent.drive = (o) => ((seen = o), drive(o));
   const r = await agent.run(ctx);
+  assert.equal(seen.limitMs, LIMITS.limitMs);
+  assert.equal(seen.graceMs, LIMITS.cancelGraceMs);
   assert.equal(r.exit, 'done');
   assert.equal(r.taskId, TASK_ID);
   assert.deepEqual(r.selfReported, { input: 100, output: 20, cached: 0, calls: 1 });
@@ -283,4 +288,16 @@ test('a client made for the coder is not printable', () => {
   const c = new A2AClient({ url: 'http://127.0.0.1:1/', bearer: BEARER });
   assert.ok(!JSON.stringify(c).includes(BEARER));
   assert.ok(!String(c).includes(BEARER));
+});
+
+test('M-adam-external-ignored: a failed run whose last message says the model endpoint failed is an external failure; one that says the tests fail, or that finished, is not', async (t) => {
+  const { agent, ctx } = await setup(t);
+  await agent.prepare(ctx);
+  const say = (exit, text) => async () => ({ exit, taskId: 't', finalState: exit, nudges: 0, polls: 1, elapsedMs: 5, lastTask: { status: { message: { parts: [{ text }] } } }, selfReported: null });
+  agent.drive = say('failed', 'the model endpoint is unavailable (HTTP 503 upstream)');
+  assert.equal((await agent.run(ctx)).externalFailure, true);
+  agent.drive = say('failed', 'the tests still fail');
+  assert.equal((await agent.run(ctx)).externalFailure, false);
+  agent.drive = say('done', 'the model endpoint is unavailable (HTTP 503 upstream)');
+  assert.equal((await agent.run(ctx)).externalFailure, false);
 });

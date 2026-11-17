@@ -106,7 +106,7 @@ export class AdamAgent {
       throw e;
     }
     const treeDir = path.join(ctx.paths.scratch, 'tree');
-    await stack.extractTree(slot, found.path, treeDir);
+    const ex = await stack.extractTree(slot, found.path, treeDir);
     const patch = await patchOfTree({ treeDir, base: ctx.base, workRoot: ctx.paths.scratch });
     fs.rmSync(treeDir, { recursive: true, force: true });
     let branch = null;
@@ -115,7 +115,7 @@ export class AdamAgent {
     } catch {
       branch = { error: 'the branches could not be listed' };
     }
-    return { patch, notes: { worktree: { run: found.run, slot: found.slot }, branch } };
+    return { patch, notes: { worktree: { run: found.run, slot: found.slot }, branch, refused: ex?.refused ?? [] } };
   }
 
   async cleanup(ctx) {

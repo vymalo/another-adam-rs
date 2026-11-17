@@ -37,13 +37,13 @@ export class FakeAgent {
       if (res.status === 429) break;
     }
     if (this.forcedExit) return { exit: this.forcedExit, wallMs: 5 };
-    return { exit: ctx.meter.refusal() ? 'budget_hit' : 'done', wallMs: 1000, selfReported: { input: 1, output: 1, calls: this.calls } };
+    return { exit: ctx.meter.refusal() ? 'budget_hit' : 'done', wallMs: 1000, ...(this.record ? { record: this.record } : {}), selfReported: { input: 1, output: 1, calls: this.calls } };
   }
 
   async collect(ctx) {
     this.log.push(['collect', ctx.run]);
     const text = ctx.task.id.startsWith('wrong') ? 'goodbye' : 'hello';
-    return { patch: Buffer.from(`diff --git a/hello.txt b/hello.txt\nnew file mode 100644\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+${text}\n`), notes: { by: this.name } };
+    return { patch: Buffer.from(`diff --git a/hello.txt b/hello.txt\nnew file mode 100644\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+${text}\n`), notes: { by: this.name, ...(this.collectRefused ? { refused: this.collectRefused } : {}) } };
   }
 
   async stop(ctx) {

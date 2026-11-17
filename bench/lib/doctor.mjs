@@ -6,7 +6,12 @@
 // check fails. Nothing is started unless `start` is set.
 import fs from 'node:fs';
 import { runCommand } from './stack.mjs';
+import { probeLimits } from './limits.mjs';
 import { coderRef } from './pins.mjs';
+
+// The limits of a task that has none of its own (lib/task.mjs); the probe uses what a driver would pass.
+const PROBE_CPUS = 1;
+const PROBE_MEMORY_MB = 4096;
 
 export const MIN_FREE_GB = 30;
 export const WARN_FREE_GB = 100;
@@ -134,6 +139,10 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
           await window(() => containers.pull(ref));
           const r = await containers.run({ image: ref, script: 'true', network: 'none', timeoutMs: 120_000 });
           checks.push(r.exitCode === 0 ? ok(`nested Podman, ${label}`, 'a container ran inside the service') : fail(`nested Podman, ${label}`, `a container did not run (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
+          if (r.exitCode === 0 && label !== 'grader') {
+            const p = await probeLimits({ containers, image: ref, cpus: PROBE_CPUS, memoryMb: PROBE_MEMORY_MB });
+            checks.push(p.accepted ? ok(`task limits, ${label}`, 'the service takes --cpus and --memory') : warn(`task limits, ${label}`, `the service refuses --cpus and --memory (${p.detail}): the limits are the service's own, the same for both agents; the run record says so`));
+          }
         } catch (e) {
           checks.push(fail(`Podman service, ${label}`, e.message, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
         }

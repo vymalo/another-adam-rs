@@ -160,7 +160,7 @@ async function phaseEnvCheck(h) {
   const results = [];
   fs.mkdirSync(path.join(h.deps.home, 'work'), { recursive: true });
   for (const id of SELF_IDS) {
-    const r = await checkTask({ containers: h.containers, task: h.tasks[id], workRoot: path.join(h.deps.home, 'work') });
+    const r = await checkTask({ containers: h.containers, task: h.tasks[id], workRoot: path.join(h.deps.home, 'work'), ...(h.stack.graderIO ? { io: h.stack.graderIO() } : {}) });
     results.push({ ok: r.ok, what: `the environment check of ${id} passes`, detail: r.reason ?? '' });
   }
   return report(results, lines);
