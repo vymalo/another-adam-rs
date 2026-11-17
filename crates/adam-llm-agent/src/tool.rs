@@ -937,11 +937,16 @@ impl ToolCtx {
 
     /// `bytes` of the room were used: what a call keeps takes from what it may still keep.
     pub(crate) fn spend_kept(&self, bytes: usize) {
-        let _ = self.kept_left.fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |left| Some(left.saturating_sub(bytes)),
-        );
+        use std::sync::atomic::Ordering::SeqCst;
+        // A compare-and-swap loop: `fetch_update` is deprecated from Rust 1.99 and its
+        // replacement is newer than the minimum version this workspace builds with.
+        let mut left = self.kept_left.load(SeqCst);
+        while let Err(now) =
+            self.kept_left
+                .compare_exchange_weak(left, left.saturating_sub(bytes), SeqCst, SeqCst)
+        {
+            left = now;
+        }
     }
 
     /// The text the run keeps under the output id `id` in its own state.
