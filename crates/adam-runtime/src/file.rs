@@ -81,7 +81,7 @@ const JPEG_MAX_SEGMENTS: usize = 256;
 /// for a size of zero.
 ///
 /// Nothing is decoded: only the first bytes are read, by hand, with every index checked, a JPEG
-/// walked segment by segment for at most [`JPEG_MAX_SEGMENTS`] segments, and no allocation. What
+/// walked segment by segment for at most 256 segments, and no allocation. What
 /// the header says is untrusted: it is a number, never a size to allocate. An SVG has no pixel
 /// size and is `None`.
 pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {

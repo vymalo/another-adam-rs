@@ -475,7 +475,7 @@ impl ToolOutput {
     }
 
     /// Add the image `outcome` admitted ([`keep_image`](crate::keep_image)) to the result. An image
-    /// that was not admitted adds nothing: its line is [`ImageOutcome::stand_in`], for the text.
+    /// that was not admitted adds nothing: its line is `ImageOutcome::stand_in`, for the text.
     #[must_use]
     pub fn with_image(mut self, outcome: ImageOutcome) -> Self {
         self.images.extend(outcome.image);
