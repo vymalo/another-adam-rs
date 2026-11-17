@@ -902,6 +902,74 @@ mod tests {
         assert_eq!(image_size(b""), None);
     }
 
+    /// A JPEG of `before` segments (APP0, 2 bytes each, no data) and then a frame header.
+    fn jpeg_after(before: &[u8], w: u16, h: u16) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8];
+        v.extend_from_slice(before);
+        v.extend_from_slice(&[0xFF, 0xC0, 0, 11, 8]);
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&[1, 1, 0x11, 0]);
+        v
+    }
+
+    #[test]
+    fn a_jpeg_segment_that_is_not_a_frame_is_walked_over() {
+        // JPG (C8) and DAC (CC) look like frame headers by their code and are not: the size is the
+        // real frame's, which comes after them.
+        for code in [0xC8u8, 0xCC] {
+            let segment = [0xFF, code, 0, 7, 9, 9, 9, 9, 9];
+            assert_eq!(
+                image_size(&jpeg_after(&segment, 321, 123)),
+                Some((321, 123)),
+                "{code:#x}"
+            );
+        }
+        // And a table (DHT, C4), as before.
+        let table = [0xFF, 0xC4, 0, 7, 9, 9, 9, 9, 9];
+        assert_eq!(image_size(&jpeg_after(&table, 5, 6)), Some((5, 6)));
+    }
+
+    #[test]
+    fn a_jpeg_is_walked_for_at_most_256_segments() {
+        let app = [0xFF, 0xE0, 0, 2];
+        let segments = |n: usize| app.repeat(n);
+        // The frame is the 256th segment: read. The 257th: given up.
+        assert_eq!(
+            image_size(&jpeg_after(&segments(255), 40, 30)),
+            Some((40, 30))
+        );
+        assert_eq!(image_size(&jpeg_after(&segments(256), 40, 30)), None);
+        assert_eq!(image_size(&jpeg_after(&segments(5000), 40, 30)), None);
+    }
+
+    #[test]
+    fn a_webp_needs_the_code_its_chunk_names() {
+        // The start code of a lossy frame, and the signature of a lossless one.
+        let mut lossy = webp_lossy(640, 480);
+        lossy[23..26].copy_from_slice(&[0, 0, 0]);
+        assert_eq!(image_size(&lossy), None);
+        let mut lossless = webp_lossless(641, 481);
+        lossless[20] = 0x2e;
+        assert_eq!(image_size(&lossless), None);
+        lossless[20] = 0;
+        assert_eq!(image_size(&lossless), None);
+        // The two scale bits of a lossy size are not part of it.
+        let mut scaled = webp_lossy(640, 480);
+        scaled[27] |= 0x40;
+        scaled[29] |= 0xc0;
+        assert_eq!(image_size(&scaled), Some((640, 480)));
+    }
+
+    #[test]
+    fn a_png_whose_first_chunk_is_not_a_header_has_no_size() {
+        let mut v = png(800, 600);
+        v[12..16].copy_from_slice(b"IDAT");
+        assert_eq!(image_size(&v), None);
+        v[12..16].copy_from_slice(b"\0\0\0\0");
+        assert_eq!(image_size(&v), None);
+    }
+
     #[test]
     fn a_truncated_header_has_no_size_and_never_panics() {
         for full in [
