@@ -2,7 +2,7 @@
 //!
 //! * [`segments`] cuts the turn at its **barriers**: a call that runs alone (it says
 //!   [`ToolAccess::Alone`], or the loop forces it), a call the model asked to follow the ones before
-//!   it, a call that repeats the one before it (the doom-loop count needs that result), and every call
+//!   it (`after_previous`, P6, not built: the schedule takes the flag as `Entry::barrier`), a call that repeats the one before it (the doom-loop count needs that result), and every call
 //!   when the limit is 1. A barrier starts when every earlier call is finished and applied, and
 //!   nothing after it starts before it is done.
 //! * [`Queue`] orders the calls of one segment: call *j* waits for each earlier call *i* it conflicts
@@ -24,7 +24,8 @@ pub(crate) struct Entry {
     /// What the call shares with the others.
     pub access: ToolAccess,
     /// The call runs by itself whatever its access says: the loop forces it (a question, a session
-    /// tool, a call that can park the run), the model asked for it, or it repeats the call before it.
+    /// tool, a call that can park the run), the model asked for it (`after_previous`, P6, not built), or
+    /// it repeats the call before it.
     pub barrier: bool,
 }
 

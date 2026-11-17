@@ -175,6 +175,11 @@ pub const MAX_PARALLEL_LIMIT: usize = 32;
 /// task, was called beside other calls: it has nowhere to park there.
 const NOT_ALONGSIDE: &str = "this tool cannot run alongside others: call it alone";
 
+/// Whether a result reports the rounds of sessions: only a call that runs alone may.
+fn reports_rounds(output: &ToolOutput) -> bool {
+    !output.is_error && !output.reported.is_empty()
+}
+
 /// Whether `name` is one of the session tools, which always run alone.
 fn is_session_tool(name: &str) -> bool {
     matches!(
@@ -2593,7 +2598,13 @@ impl LlmAgent {
                         Ok(one) => finished.put(i, one),
                         Err(error) => {
                             // No call starts after a failure; the running ones are waited for.
-                            failure.get_or_insert(error);
+                            // A permanent error outranks a transient one, whichever came first:
+                            // retrying would only repeat it.
+                            let outranks = matches!(&failure, Some(AgentError::Transient { .. }))
+                                && !matches!(&error, AgentError::Transient { .. });
+                            if failure.is_none() || outranks {
+                                failure = Some(error);
+                            }
                             queue.stop();
                         }
                     }
@@ -2692,6 +2703,7 @@ impl LlmAgent {
         )
     }
 
+    #[tracing::instrument(skip_all, fields(run = %emitter.run_id(), tool = %call.name, call_id = %call.id))]
     async fn drive_one(
         &self,
         call: &ToolCall,
@@ -2730,6 +2742,23 @@ impl LlmAgent {
         let outcome: Result<ToolOutput, ToolError> = step.run(move || work).await?;
         // How it ended, said now; `conclude` says it again only if applying the result changes it.
         let live = match &outcome {
+            // Rounds are reported only by a call that runs alone (the loop reads them in a step of
+            // its own, which a segment cannot place between the calls).
+            Ok(output) if reports_rounds(output) => {
+                say_with(
+                    emitter,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((NOT_ALONGSIDE, true)),
+                        notes,
+                    ),
+                )
+                .await;
+                Live { said: None }
+            }
             Ok(output) => {
                 let state = if output.is_error {
                     StepState::Failed
@@ -3031,6 +3060,9 @@ impl LlmAgent {
                 .clone(),
         };
         let answered = match outcome {
+            Ok(output) if live.is_some() && reports_rounds(&output) => {
+                ToolResult::error(&call.id, NOT_ALONGSIDE.to_owned())
+            }
             Ok(mut output) => {
                 let repeat_key = output.repeat_key.as_deref().cloned();
                 let reported = if output.is_error {

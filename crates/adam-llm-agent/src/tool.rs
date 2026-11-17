@@ -418,6 +418,11 @@ pub struct ToolOutput {
     ///
     /// Absent from a journal written before it existed, and not written while empty.
     ///
+    /// **Honoured only from a tool that runs alone.** The loop reads the rounds in a journaled step of
+    /// its own right after the call; beside other calls (ADR 0049) that step has no place between
+    /// them, so a call of a segment of several that reports rounds is answered with an error that
+    /// tells the model to call the tool alone.
+    ///
     /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reported: Vec<adam_core::RunId>,
@@ -752,7 +757,7 @@ pub struct ToolCtx {
     /// it; `None` for the agent's own tools and for a listing that said nothing.
     note: Option<ToolNote>,
     /// The bytes of files the run may still share ([`files_left`](Self::files_left)).
-    files_left: u64,
+    files_left: Arc<std::sync::atomic::AtomicU64>,
     /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
     /// the context, so a tool may hand one to a task it spawns.
     sandbox: Arc<Mutex<SandboxUsage>>,
@@ -815,7 +820,7 @@ impl ToolCtx {
             root_step,
             step,
             note: None,
-            files_left: MAX_RUN_FILE_BYTES as u64,
+            files_left: Arc::new(std::sync::atomic::AtomicU64::new(MAX_RUN_FILE_BYTES as u64)),
             sandbox: Arc::default(),
             plan: None,
             scrub: None,
@@ -840,10 +845,11 @@ impl ToolCtx {
     }
 
     /// Make this call spend the budgets of `first`, a call of the same segment: the room for kept
-    /// outputs and the image gate are one for all the calls that run together.
+    /// outputs, the room for files and the image gate are one for all the calls that run together.
     #[must_use]
     pub(crate) fn sharing_budgets_of(mut self, first: &ToolCtx) -> Self {
         self.kept_left = Arc::clone(&first.kept_left);
+        self.files_left = Arc::clone(&first.files_left);
         self.images.clone_from(&first.images);
         self
     }
@@ -991,7 +997,9 @@ impl ToolCtx {
     /// answers. The agent loop does it for every call.
     #[must_use]
     pub fn with_files_left(mut self, bytes: u64) -> Self {
-        self.files_left = bytes.min(MAX_RUN_FILE_BYTES as u64);
+        self.files_left = Arc::new(std::sync::atomic::AtomicU64::new(
+            bytes.min(MAX_RUN_FILE_BYTES as u64),
+        ));
         self
     }
 
@@ -1001,7 +1009,23 @@ impl ToolCtx {
     /// returns files it did not choose (an MCP server's images, a remote agent's file parts) keeps
     /// its result within this, so that one journal entry stays within the run's cap.
     pub fn files_left(&self) -> u64 {
-        self.files_left
+        self.files_left.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `bytes` of the room for files are taken: call it when the call decides to return files of
+    /// that size. The calls of one segment that run together share the room, so a call that starts
+    /// after this one reads a smaller [`files_left`](Self::files_left). The loop still refuses, when
+    /// the results are applied, a file that would go over the run's cap.
+    pub fn spend_files(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // A compare-and-swap loop: `fetch_update` is deprecated from Rust 1.99.
+        let mut left = self.files_left.load(SeqCst);
+        while let Err(now) =
+            self.files_left
+                .compare_exchange_weak(left, left.saturating_sub(bytes), SeqCst, SeqCst)
+        {
+            left = now;
+        }
     }
 
     /// Give the call the note its source made about the tool when it listed it

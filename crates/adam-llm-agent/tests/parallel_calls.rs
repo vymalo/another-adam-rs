@@ -80,6 +80,10 @@ struct Probe {
     armed: Arc<AtomicBool>,
     /// The call stops when the run is cancelled.
     heeds_cancel: bool,
+    /// For a call that says `poison`: where it writes a journal entry that disagrees with its own.
+    store: Option<DynStore>,
+    /// What `files` calls saw of the room for files, by call id.
+    files_seen: Arc<Mutex<Vec<(String, u64)>>>,
 }
 
 impl Probe {
@@ -89,6 +93,8 @@ impl Probe {
             log: log.clone(),
             armed: Arc::new(AtomicBool::new(false)),
             heeds_cancel: true,
+            store: None,
+            files_seen: Arc::default(),
         }
     }
 }
@@ -122,6 +128,14 @@ impl Tool for Probe {
         *log.starts.lock().unwrap().entry(id.clone()).or_default() += 1;
         let now = log.running.fetch_add(1, SeqCst) + 1;
         log.max_running.fetch_max(now, SeqCst);
+        if let Some(want) = args.get("files").and_then(Value::as_u64) {
+            // Ask for the room before the first await, as the calls of a segment start in order.
+            self.files_seen
+                .lock()
+                .unwrap()
+                .push((id.clone(), ctx.files_left()));
+            ctx.spend_files(want);
+        }
         let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
         let sleep = tokio::time::sleep(Duration::from_millis(ms));
         let stopped = if self.heeds_cancel {
@@ -149,6 +163,23 @@ impl Tool for Probe {
         }
         if args.get("ask").and_then(Value::as_bool) == Some(true) {
             return Err(ToolError::needs_input("which one?"));
+        }
+        if args.get("poison").and_then(Value::as_bool) == Some(true)
+            && let Some(store) = &self.store
+        {
+            // The journal now disagrees with this call's own step: its record is refused.
+            store
+                .journal_put(
+                    ctx.run_id(),
+                    adam_core::JournalEntry::ok(1, "other", json!(1)),
+                )
+                .await
+                .expect("poison the journal");
+        }
+        if args.get("report").and_then(Value::as_bool) == Some(true) {
+            let mut out = ToolOutput::text("reported");
+            out.reported = vec![RunId::new()];
+            return Ok(out);
         }
         log.events.lock().unwrap().push(format!("end:{id}"));
         *log.ends.lock().unwrap().entry(id.clone()).or_default() += 1;
@@ -398,15 +429,9 @@ async fn four_calls_overlap_on_the_real_clock() {
     let log = Arc::new(Log::default());
     h.mock.push_tool_calls(turn(4, 400, "independent"));
     h.mock.push_text("done");
-    let started = Instant::now();
     let (_, view) = h.run(10, "go", &log).await;
     assert_eq!(view.status, RunStatus::Done);
-    assert!(
-        started.elapsed() < Duration::from_millis(1_400),
-        "four calls of 400 ms took {:?}: they did not overlap",
-        started.elapsed()
-    );
-    assert_eq!(log.max_running(), 4);
+    assert_eq!(log.max_running(), 4, "the four calls were running at once");
 }
 
 #[tokio::test(start_paused = true)]
@@ -563,17 +588,33 @@ struct Replayed {
 /// A turn of three calls whose third dies with the process after the first two are recorded; the
 /// run is stepped again by another worker (another limit) once its lease has run out.
 async fn crash_and_replay(first_limit: usize, second_limit: usize) -> Replayed {
+    crash_with_hang(first_limit, second_limit, "c3").await
+}
+
+/// [`crash_and_replay`] with the call `hanging` (one of `c1`, `c2`, `c3`) the one that never returns.
+async fn crash_with_hang(first_limit: usize, second_limit: usize, hanging: &str) -> Replayed {
     let h = Harness::new();
     let log = Arc::new(Log::default());
-    h.mock.push_tool_calls(vec![
-        call("c1", "probe", json!({"ms": 5, "use": "independent"})),
-        call("c2", "probe", json!({"ms": 5, "use": "independent"})),
-        call(
-            "c3",
-            "probe",
-            json!({"ms": 1, "use": "independent", "hang": true}),
-        ),
-    ]);
+    h.mock.push_tool_calls(
+        ["c1", "c2", "c3"]
+            .iter()
+            .map(|id| {
+                if *id == hanging {
+                    call(
+                        id,
+                        "probe",
+                        json!({"ms": 1, "use": "independent", "hang": true}),
+                    )
+                } else {
+                    call(
+                        id,
+                        "probe",
+                        json!({"ms": 5, "use": "independent", "tag": id}),
+                    )
+                }
+            })
+            .collect(),
+    );
     h.mock.push_text("done");
 
     let probe = Probe::new(&log);
@@ -589,17 +630,25 @@ async fn crash_and_replay(first_limit: usize, second_limit: usize) -> Replayed {
     // The process dies while the third call hangs, after the first two recorded their outcomes: the
     // worker is aborted, which drops the transition and leaves the run with its lease.
     let deadline = Instant::now() + Duration::from_secs(20);
-    while log.ends("c1") == 0 || log.ends("c2") == 0 || log.starts("c3") == 0 {
+    while ["c1", "c2", "c3"]
+        .iter()
+        .any(|id| (*id == hanging && log.starts(id) == 0) || (*id != hanging && log.ends(id) == 0))
+    {
         assert!(Instant::now() < deadline, "the turn did not get that far");
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     worker.kill().await;
     armed.store(false, SeqCst);
-    let recorded = h.journal(run).await;
+    let recorded: Vec<String> = h.journal(run).await.into_iter().map(|(_, n)| n).collect();
+    let expected: Vec<String> = ["c1", "c2", "c3"]
+        .iter()
+        .filter(|id| **id != hanging)
+        .map(|id| format!("tool:{id}"))
+        .collect();
     assert_eq!(
-        recorded.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>()[1..],
-        ["tool:c1", "tool:c2"],
-        "only the first two calls were recorded before the crash"
+        recorded[1..],
+        expected[..],
+        "only the calls that returned were recorded before the crash"
     );
 
     // Another worker, another limit, takes the run when the lease has lapsed.
@@ -1098,4 +1147,155 @@ async fn the_calls_of_a_source_run_together_when_the_source_says_they_share_noth
             ]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fixes of the review
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_recorded_call_above_a_gap_is_not_run_again_and_the_journal_is_the_sequential_one() {
+    let uninterrupted = {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(turn(3, 5, "independent"));
+        h.mock.push_text("done");
+        let (run, _) = h.run(1, "go", &log).await;
+        h.journal(run).await
+    };
+    for second in [1usize, 10] {
+        // c1 is slow and never returns; c2 and c3 are recorded above its gap.
+        let replay = crash_with_hang(10, second, "c1").await;
+        assert_eq!(
+            replay.starts,
+            [2, 1, 1],
+            "c2 and c3 are not run again (limit {second})"
+        );
+        assert_eq!(replay.ends, [1, 1, 1]);
+        assert_eq!(
+            replay.journal.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            (0..5).collect::<Vec<u64>>()
+        );
+        assert_eq!(replay.journal, uninterrupted, "limit {second}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_that_reports_rounds_beside_other_calls_is_told_to_run_alone() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"ms": 10, "use": "independent"})),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 10, "use": "independent", "report": true}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    let (run, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    let answers = tool_answers(&view);
+    assert_eq!(answers[0], ("ok:c1".to_owned(), false));
+    assert_eq!(
+        answers[1],
+        (
+            "this tool cannot run alongside others: call it alone".to_owned(),
+            true
+        )
+    );
+    let ends: Vec<StepState> = h
+        .steps(run)
+        .into_iter()
+        .filter(|(id, state)| id == "tool:c2" && state.is_end())
+        .map(|(_, state)| state)
+        .collect();
+    assert_eq!(ends, [StepState::Failed], "its end is said once");
+    let names: Vec<String> = h.journal(run).await.into_iter().map(|(_, n)| n).collect();
+    assert!(
+        names.iter().all(|n| !n.starts_with("usage:")),
+        "no usage step for it: {names:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_calls_see_the_files_each_other_took() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    // The run may share 6 MiB of files; each call wants 4 MiB.
+    let four_mib = 4 * 1024 * 1024u64;
+    h.mock.push_tool_calls(vec![
+        call(
+            "c1",
+            "probe",
+            json!({"ms": 10, "use": "independent", "files": four_mib, "tag": 1}),
+        ),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 10, "use": "independent", "files": four_mib, "tag": 2}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    let probe = Probe::new(&log);
+    let seen = probe.files_seen.clone();
+    let agent = h.agent(10, |b| b.tool(probe));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[0], ("c1".to_owned(), 6 * 1024 * 1024));
+    assert_eq!(
+        seen[1],
+        ("c2".to_owned(), 2 * 1024 * 1024),
+        "the second call is told what the first left"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_permanent_error_wins_over_a_transient_one_whichever_finished_first() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        // c1 poisons its own journal record when it ends, after c2 failed transiently.
+        call(
+            "c1",
+            "probe",
+            json!({"ms": 100, "use": "independent", "poison": true}),
+        ),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 10, "use": "independent", "transient": true}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    let probe = Probe {
+        store: Some(h.store.clone()),
+        ..Probe::new(&log)
+    };
+    probe.armed.store(true, SeqCst);
+    let agent = h.agent(10, |b| b.tool(probe));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Failed, "{view:?}");
+    assert!(
+        view.error
+            .as_deref()
+            .is_some_and(|e| e.contains("non-deterministic")),
+        "{:?}",
+        view.error
+    );
 }
