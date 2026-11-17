@@ -160,13 +160,9 @@ impl Queue {
         self.stopped = true;
     }
 
-    /// How many calls run now.
-    pub(crate) fn running(&self) -> usize {
-        self.running
-    }
-
     /// Whether every call is finished, or none is running and none can start (after
     /// [`stop`](Self::stop)).
+    #[cfg(test)]
     pub(crate) fn is_done(&self) -> bool {
         if self.stopped {
             self.running == 0

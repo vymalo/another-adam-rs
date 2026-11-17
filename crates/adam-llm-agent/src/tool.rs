@@ -839,6 +839,15 @@ impl ToolCtx {
         self
     }
 
+    /// Make this call spend the budgets of `first`, a call of the same segment: the room for kept
+    /// outputs and the image gate are one for all the calls that run together.
+    #[must_use]
+    pub(crate) fn sharing_budgets_of(mut self, first: &ToolCtx) -> Self {
+        self.kept_left = Arc::clone(&first.kept_left);
+        self.images.clone_from(&first.images);
+        self
+    }
+
     /// Say that the model of the call sees images within `limits`, with an empty history and no room
     /// to count in a run's state: for a context made outside a run (a test of a tool that offers
     /// images, [`keep_image`](crate::keep_image)). The agent loop does the same for every call, from
@@ -1462,6 +1471,38 @@ mod tests {
             let json = serde_json::to_value(&poll).unwrap();
             assert_eq!(serde_json::from_value::<RemotePoll>(json).unwrap(), poll);
         }
+    }
+
+    #[test]
+    fn the_calls_of_a_segment_spend_one_room_for_kept_outputs_and_one_image_gate() {
+        let sink: DynEventSink = Arc::new(adam_runtime::NoopSink);
+        let limits = adam_model::ImageLimits {
+            max_bytes: 1024,
+            max_count: 4,
+            max_side: 100,
+            sources: std::collections::BTreeSet::from([adam_model::ImageOrigin::Mcp]),
+        };
+        let one = ToolCtx::detached("a", "c1", sink.clone())
+            .with_kept(1000, Arc::default())
+            .with_image_limits(limits);
+        let two = ToolCtx::detached("b", "c2", sink.clone())
+            .with_kept(1000, Arc::default())
+            .sharing_budgets_of(&one);
+        one.spend_kept(300);
+        assert_eq!(
+            two.kept_left(),
+            700,
+            "what one call keeps is gone for the other"
+        );
+        two.spend_kept(500);
+        assert_eq!(one.kept_left(), 200);
+        assert!(two.sees_images(), "the image gate is the first call's");
+        let alone = ToolCtx::detached("c", "c3", sink).with_kept(1000, Arc::default());
+        assert_eq!(
+            alone.kept_left(),
+            1000,
+            "a call outside the segment has its own"
+        );
     }
 
     #[test]

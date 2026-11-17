@@ -19,7 +19,7 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
@@ -32,6 +32,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
 | `ToolSet`, `tools!` | an ordered group of tools: `tools![Clock, Search::new()]`, `.extend(..)`, `.wrap(\|tool\| ..)` for middleware, `names()`, `get(..)` |
 | `parse_args`, `IntoToolOutput`, `IntoToolResult`, `Json<T>` | read the model's arguments into a struct (a mistake is a `ToolOutput::error` for the model, never a panic; `null` reads as `{}`); return a `String`, `&'static str`, `Value`, `Json<T>` (compact JSON) or a `Result` of one with an error that is `Into<ToolError>` |
+| `ToolAccess`, `Use`, `UseMode`, `path_scope`, `Tool::access`, `ToolSource::access`, `FnTool::with_access` | what a call shares with the other calls of its turn: `Independent`, `Uses(vec![Use::read(scope) \| Use::write(scope)])`, or `Alone` (the default). `#[tool(parallel = ..)]` and `FnTool::with_access` declare it (see *Parallel tool calls*). Both trait methods have defaults, so no implementer breaks; a wrapper that does not forward `access` makes its tool `Alone`. `ToolAccess` and `UseMode` are closed on purpose, `ToolAccess` and `Use` are `#[non_exhaustive]` |
+| `DEFAULT_MAX_PARALLEL`, `MAX_PARALLEL_LIMIT` | 10 and 32 |
 | `FnTool` | a tool from a closure: `FnTool::raw(name, description, schema, \|ctx, args\| async ..)`; with feature `schema`, `FnTool::builder(name).description(..).args::<A>().handler(..)` |
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
@@ -653,6 +655,32 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
   `Conversation` gains `repeats` and `ToolOutput` gains `repeat_key` (struct literals), **a tool that declares no bound of its own is stopped after 300 s**,
   and **cancelling a parent cancels its children** and **a subagent run stops after 30 minutes unless its file says
   otherwise** (`adam-runtime`, `adam-assembly`).
+
+## Parallel tool calls
+
+The calls of one model turn run at the same time, up to `LlmAgentBuilder::max_parallel(n)` (10 by default, clamped to
+1..=32; `1` is one after another). [ADR 0049](../../docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)
+decides it; `src/schedule.rs` is the pure schedule and `run_pending` in `src/agent.rs` the loop.
+
+| | |
+|---|---|
+| What a call shares | `Tool::access(&args) -> ToolAccess`, `ToolSource::access(name, &args)`. A scope is a key with `/` levels; two uses overlap when equal or one is a prefix of the other at a `/`. Two calls conflict when one is `Alone`, or they overlap and one writes. **A tool that declares nothing is `Alone`** |
+| Forced `Alone` | a tool whose `asks_user()` is true, the session tools (`subagent_start`, `_send`, `_read`, `_close`), and any tool that can park the run (it says `Alone`); every call at a limit of 1 |
+| Barriers | an `Alone` call, and a call with the same key as the one before it (the doom-loop count needs that result applied first). A barrier starts after every earlier call finished and was applied, and nothing after it starts before it is done. The calls between two barriers are a segment |
+| In a segment | call *j* waits for each earlier call *i* it conflicts with, otherwise it starts when fewer than the limit run, ready calls in call order. More calls than the limit queue; none is refused |
+| Journal | one step `tool:<call id>` per call, at seqs reserved in call order (`Ctx::reserve_steps`): the journal is the one a sequential loop writes, so a replay works at any limit and a rollback to a sequential build replays |
+| Results | applied in call order after the segment (messages, artifacts, the file budget, kept outputs, plan, the doom-loop count). The room for kept outputs and the image gate are one budget for the segment |
+| Steps | `running` when a call starts, its end when it finishes, each with the call's id; a corrected end follows when applying the result changes it (a file refused by the budget) |
+| Crash | the replay reserves the same seqs: recorded calls do not run again, the others run again (at-least-once, as before) |
+| Transient failure | no new call starts, the running ones are waited for, the transition fails transiently and the retry runs the turn again from a fresh seq |
+| Cancel | no call starts; the loop waits up to `TOOL_STOP_GRACE` (5 s) for the running ones, drops them and fails the run `cancelled` |
+| Undeclared wait | a call in a segment of several that still ends with `NeedsInput` or `Await*` is answered with the error `this tool cannot run alongside others: call it alone` |
+
+Tests: `tests/parallel_calls.rs` (timing on a paused and on the real clock, order of results, conflicts, the journal at three
+limits, a crash in the middle of a segment replayed at the other limit, cancel with and without the grace period, a transient
+failure, `doom_loop`, `max_tool_calls`, a question in the middle of a turn, an undeclared question, a refused file and its
+corrected end, a source's `access`), the unit tests and seven properties of `src/schedule.rs`, and the whole earlier suite,
+unchanged, because every tool still runs alone until it declares a class.
 
 ## Limits and the closing turn
 

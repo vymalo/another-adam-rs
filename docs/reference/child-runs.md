@@ -148,8 +148,11 @@ stateDiagram-v2
 
 What the design refuses to do, and why:
 
-* **No parallel fan-out yet.** An `LlmAgent` runs the calls of one model turn in order, and the first
-  `AwaitRun` parks the run, so three subagent calls in one turn run one after the other. Starting all the
+* **No parallel fan-out of one-shot subagents yet.** An `LlmAgent` runs the calls of one model turn at the same time
+  ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)), but a call that can park the run (a
+  subagent, a remote agent) runs alone, so three subagent calls in one turn run one after the other; background
+  sessions ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) are the way to children
+  side by side. Starting all the
   children first and waiting for all of them needs `pending_wait` to hold several runs.
 * **No asking tools in a subagent.** A child that parks with no timer, for instance because one of its tools asked the
   user something, waits for an answer nobody is placed to give; the time limit above now ends it at its deadline

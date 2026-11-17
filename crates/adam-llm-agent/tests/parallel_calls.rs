@@ -1,0 +1,1101 @@
+//! The tool calls of one model turn run at the same time (ADR 0049, slices P1 to P4): up to the
+//! limit, conflicts keep the model's order, the journal is the sequential one, and the results go back
+//! in call order.
+//!
+//! The tool here, `probe`, declares what a call shares from its own arguments, so each case says
+//! what runs beside what.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
+use adam_llm_agent::{
+    Conversation, LlmAgent, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput, Use, user_message,
+};
+use adam_model::{Message, MockModel, ToolCall, ToolSpec};
+use adam_runtime::{Artifact, CollectingSink, RetryPolicy, RunEvent, RunView, Runtime, StepState};
+use async_trait::async_trait;
+use serde_json::{Value, json};
+use tokio::sync::oneshot;
+
+fn call(id: &str, name: &str, args: Value) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: args,
+        ..Default::default()
+    }
+}
+
+/// What the probes did, in the order it happened.
+#[derive(Default)]
+struct Log {
+    events: Mutex<Vec<String>>,
+    running: AtomicUsize,
+    max_running: AtomicUsize,
+    /// Calls that began, by call id.
+    starts: Mutex<HashMap<String, usize>>,
+    /// Calls that ran to their end, by call id.
+    ends: Mutex<HashMap<String, usize>>,
+}
+
+impl Log {
+    fn count(map: &Mutex<HashMap<String, usize>>, id: &str) -> usize {
+        map.lock().unwrap().get(id).copied().unwrap_or(0)
+    }
+
+    fn starts(&self, id: &str) -> usize {
+        Self::count(&self.starts, id)
+    }
+
+    fn ends(&self, id: &str) -> usize {
+        Self::count(&self.ends, id)
+    }
+
+    fn position(&self, event: &str) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|e| e == event)
+            .unwrap_or_else(|| panic!("no event {event}: {:?}", self.events.lock().unwrap()))
+    }
+
+    fn max_running(&self) -> usize {
+        self.max_running.load(SeqCst)
+    }
+}
+
+/// A tool whose arguments say what the call does:
+/// `ms` (how long it takes), `use` (`independent`, `r:<scope>`, `w:<scope>`; none means the tool
+/// declares nothing and runs alone), `out` (a fixed answer), `hang` and `transient` (stall and fail while the
+/// switch is armed), `ask` (end with a question although it declared nothing of the kind).
+struct Probe {
+    name: &'static str,
+    log: Arc<Log>,
+    /// While set, a call that says `hang` never returns and one that says `transient` fails transiently.
+    armed: Arc<AtomicBool>,
+    /// The call stops when the run is cancelled.
+    heeds_cancel: bool,
+}
+
+impl Probe {
+    fn new(log: &Arc<Log>) -> Self {
+        Self {
+            name: "probe",
+            log: log.clone(),
+            armed: Arc::new(AtomicBool::new(false)),
+            heeds_cancel: true,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Probe {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.into(),
+            description: "probe".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    fn access(&self, args: &Value) -> ToolAccess {
+        match args.get("use").and_then(Value::as_str) {
+            Some("independent") => ToolAccess::Independent,
+            Some(other) => match other.split_once(':') {
+                Some(("r", scope)) => ToolAccess::Uses(vec![Use::read(scope)]),
+                Some(("w", scope)) => ToolAccess::Uses(vec![Use::write(scope)]),
+                _ => ToolAccess::Alone,
+            },
+            None => ToolAccess::Alone,
+        }
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let id = ctx.call_id().to_owned();
+        let log = &self.log;
+        log.events.lock().unwrap().push(format!("start:{id}"));
+        *log.starts.lock().unwrap().entry(id.clone()).or_default() += 1;
+        let now = log.running.fetch_add(1, SeqCst) + 1;
+        log.max_running.fetch_max(now, SeqCst);
+        let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
+        let sleep = tokio::time::sleep(Duration::from_millis(ms));
+        let stopped = if self.heeds_cancel {
+            tokio::select! {
+                () = sleep => false,
+                () = ctx.cancelled() => true,
+            }
+        } else {
+            sleep.await;
+            false
+        };
+        log.running.fetch_sub(1, SeqCst);
+        if stopped {
+            return Err(ToolError::Permanent("stopped".into()));
+        }
+        if self.armed.load(SeqCst) {
+            if args.get("hang").and_then(Value::as_bool) == Some(true) {
+                // Never returns: the process is killed while this call runs.
+                std::future::pending::<()>().await;
+            }
+            if args.get("transient").and_then(Value::as_bool) == Some(true) {
+                self.armed.store(false, SeqCst);
+                return Err(ToolError::Transient("try again".into()));
+            }
+        }
+        if args.get("ask").and_then(Value::as_bool) == Some(true) {
+            return Err(ToolError::needs_input("which one?"));
+        }
+        log.events.lock().unwrap().push(format!("end:{id}"));
+        *log.ends.lock().unwrap().entry(id.clone()).or_default() += 1;
+        Ok(ToolOutput::text(
+            args.get("out")
+                .and_then(Value::as_str)
+                .map_or_else(|| format!("ok:{id}"), str::to_owned),
+        ))
+    }
+}
+
+/// A tool that asks the person.
+struct Asker;
+
+#[async_trait]
+impl Tool for Asker {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ask".into(),
+            description: "ask".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    fn asks_user(&self) -> bool {
+        true
+    }
+
+    /// What it says is not heeded: a tool that asks runs alone.
+    fn access(&self, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::needs_input("which environment?"))
+    }
+}
+
+/// A tool that shares a file of the size it is asked for.
+struct Filer;
+
+#[async_trait]
+impl Tool for Filer {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "filer".into(),
+            description: "filer".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    fn access(&self, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let kib = args.get("kib").and_then(Value::as_u64).unwrap_or(1) as usize;
+        let file = Artifact::file(
+            format!("f-{}", ctx.call_id()),
+            "application/octet-stream",
+            format!("{}.bin", ctx.call_id()),
+            vec![7; kib * 1024],
+        )
+        .expect("a file within the cap");
+        Ok(ToolOutput::text("shared").with_artifact(file))
+    }
+}
+
+struct Harness {
+    mock: Arc<MockModel>,
+    sink: CollectingSink,
+    store: DynStore,
+}
+
+impl Harness {
+    fn new() -> Self {
+        Self {
+            mock: Arc::new(MockModel::new()),
+            sink: CollectingSink::new(),
+            store: Arc::new(MemoryStore::new()),
+        }
+    }
+
+    fn agent(
+        &self,
+        limit: usize,
+        configure: impl FnOnce(adam_llm_agent::LlmAgentBuilder) -> adam_llm_agent::LlmAgentBuilder,
+    ) -> LlmAgent {
+        configure(LlmAgent::builder("llm", self.mock.clone(), "test-model").max_parallel(limit))
+            .build()
+    }
+
+    fn runtime(&self, agent: LlmAgent, ttl: Duration) -> Runtime {
+        Runtime::builder(self.store.clone())
+            .agent(agent)
+            .event_sink(self.sink.clone())
+            .worker_id(format!("w-{}", RunId::new()))
+            .poll_interval(Duration::from_millis(20))
+            .lease_ttl(ttl)
+            .retry(RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+                multiplier: 1.0,
+            })
+            .build()
+    }
+
+    /// Run one task to its end on a fresh runtime.
+    async fn run(&self, limit: usize, text: &str, log: &Arc<Log>) -> (RunId, RunView) {
+        let agent = self.agent(limit, |b| b.tool(Probe::new(log)));
+        let rt = self.runtime(agent, Duration::from_secs(10));
+        let run = rt
+            .start("llm", user_message(text), None)
+            .await
+            .expect("start");
+        let worker = Worker::spawn(&rt);
+        let view = wait_terminal(&rt, run).await;
+        worker.stop().await;
+        (run, view)
+    }
+
+    async fn journal(&self, run: RunId) -> Vec<(u64, String)> {
+        self.store
+            .journal_list(run)
+            .await
+            .expect("journal")
+            .into_iter()
+            .map(|e| (e.seq, e.name))
+            .collect()
+    }
+
+    fn steps(&self, run: RunId) -> Vec<(String, StepState)> {
+        self.sink
+            .events_for(run)
+            .into_iter()
+            .filter_map(|e| match e {
+                RunEvent::Step(step) => Some((step.id, step.state)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+struct Worker {
+    stop: oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<Result<(), adam_runtime::RuntimeError>>,
+}
+
+impl Worker {
+    fn spawn(rt: &Runtime) -> Self {
+        let (stop, rx) = oneshot::channel::<()>();
+        let rt = rt.clone();
+        let handle = tokio::spawn(async move {
+            rt.run_worker(async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        Self { stop, handle }
+    }
+
+    /// The process dies: the worker's task is aborted, and with it every transition it runs.
+    async fn kill(self) {
+        self.handle.abort();
+        let _ = self.handle.await;
+    }
+
+    async fn stop(self) {
+        let _ = self.stop.send(());
+        self.handle
+            .await
+            .expect("worker task")
+            .expect("worker result");
+    }
+}
+
+async fn wait_terminal(rt: &Runtime, run: RunId) -> RunView {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let view = rt.view(run).await.expect("view").expect("run exists");
+        if matches!(view.status, RunStatus::Done | RunStatus::Failed) {
+            return view;
+        }
+        assert!(Instant::now() < deadline, "timed out; last view: {view:#?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn conversation(view: &RunView) -> Conversation {
+    serde_json::from_value(view.state.clone()).expect("state is a Conversation")
+}
+
+fn tool_answers(view: &RunView) -> Vec<(String, bool)> {
+    conversation(view)
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The calls of one turn, `n` of them `c1 ..`, each of `ms` and the use `use_`, with a tag that
+/// makes their arguments differ.
+fn turn(n: usize, ms: u64, use_: &str) -> Vec<ToolCall> {
+    (1..=n)
+        .map(|i| {
+            call(
+                &format!("c{i}"),
+                "probe",
+                json!({"ms": ms, "use": use_, "tag": i}),
+            )
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Time
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn four_calls_take_the_time_of_one_and_at_a_limit_of_one_the_time_of_four() {
+    for (limit, expected) in [(10usize, 1_000u128), (1, 4_000)] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(turn(4, 1_000, "independent"));
+        h.mock.push_text("done");
+        let started = tokio::time::Instant::now();
+        let (_, view) = h.run(limit, "go", &log).await;
+        let took = started.elapsed().as_millis();
+        assert_eq!(view.status, RunStatus::Done);
+        assert!(
+            (expected..expected + 400).contains(&took),
+            "limit {limit}: {took} ms of virtual time, expected about {expected}"
+        );
+        assert_eq!(log.max_running(), if limit == 1 { 1 } else { 4 });
+    }
+}
+
+#[tokio::test]
+async fn four_calls_overlap_on_the_real_clock() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(turn(4, 400, "independent"));
+    h.mock.push_text("done");
+    let started = Instant::now();
+    let (_, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert!(
+        started.elapsed() < Duration::from_millis(1_400),
+        "four calls of 400 ms took {:?}: they did not overlap",
+        started.elapsed()
+    );
+    assert_eq!(log.max_running(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn calls_over_the_limit_queue_and_start_in_call_order() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(turn(5, 100, "independent"));
+    h.mock.push_text("done");
+    let (_, view) = h.run(2, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(log.max_running(), 2);
+    let starts: Vec<String> = log
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.starts_with("start:"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        starts,
+        ["start:c1", "start:c2", "start:c3", "start:c4", "start:c5"]
+    );
+    assert_eq!(
+        tool_answers(&view).len(),
+        5,
+        "no call was refused for the queue"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tool_that_declares_nothing_runs_alone_at_any_limit() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(turn(3, 50, "undeclared"));
+    h.mock.push_text("done");
+    let (_, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(log.max_running(), 1, "the default is Alone");
+}
+
+// ---------------------------------------------------------------------------
+// Order
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn conflicting_calls_keep_the_models_order_and_the_others_run_beside_them() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("w1", "probe", json!({"ms": 50, "use": "w:files/a"})),
+        call("r1", "probe", json!({"ms": 10, "use": "r:files/a"})),
+        call("r2", "probe", json!({"ms": 10, "use": "r:files/b"})),
+    ]);
+    h.mock.push_text("done");
+    let (_, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert!(
+        log.position("end:w1") < log.position("start:r1"),
+        "the read of the edited file waits for the edit"
+    );
+    assert!(
+        log.position("start:r2") < log.position("end:w1"),
+        "the read of another file runs beside the edit"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn results_come_back_in_call_order_whatever_order_the_calls_finish_in() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"ms": 300, "use": "independent"})),
+        call("c2", "probe", json!({"ms": 200, "use": "independent"})),
+        call("c3", "probe", json!({"ms": 100, "use": "independent"})),
+    ]);
+    h.mock.push_text("done");
+    let (run, view) = h.run(10, "go", &log).await;
+    assert_eq!(
+        tool_answers(&view),
+        [
+            ("ok:c1".to_owned(), false),
+            ("ok:c2".to_owned(), false),
+            ("ok:c3".to_owned(), false)
+        ],
+        "the messages are in the order of the calls"
+    );
+    assert!(log.position("end:c3") < log.position("end:c2"));
+    assert!(log.position("end:c2") < log.position("end:c1"));
+
+    // The steps are said as they happen: all three run before any ends, and they end as they finish.
+    let steps = h.steps(run);
+    assert_eq!(
+        steps,
+        [
+            ("tool:c1".to_owned(), StepState::Running),
+            ("tool:c2".to_owned(), StepState::Running),
+            ("tool:c3".to_owned(), StepState::Running),
+            ("tool:c3".to_owned(), StepState::Completed),
+            ("tool:c2".to_owned(), StepState::Completed),
+            ("tool:c1".to_owned(), StepState::Completed),
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_journal_is_the_sequential_journal_whatever_the_limit() {
+    let mut journals = Vec::new();
+    let mut answers = Vec::new();
+    for limit in [1usize, 3, 10] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(vec![
+            call("c1", "probe", json!({"ms": 30, "use": "independent"})),
+            call("c2", "probe", json!({"ms": 20, "use": "w:files/a"})),
+            call("c3", "probe", json!({"ms": 10, "use": "r:files/a"})),
+            call("c4", "probe", json!({"ms": 5})),
+            call("c5", "probe", json!({"ms": 1, "use": "independent"})),
+        ]);
+        h.mock.push_text("done");
+        let (run, view) = h.run(limit, "go", &log).await;
+        assert_eq!(view.status, RunStatus::Done);
+        journals.push(h.journal(run).await);
+        answers.push(tool_answers(&view));
+    }
+    assert_eq!(journals[0], journals[1]);
+    assert_eq!(journals[0], journals[2]);
+    assert_eq!(answers[0], answers[1]);
+    assert_eq!(answers[0], answers[2]);
+    let names: Vec<&str> = journals[0].iter().map(|(_, n)| n.as_str()).collect();
+    assert!(names[0].starts_with("model:"), "{names:?}");
+    assert_eq!(
+        &names[1..6],
+        ["tool:c1", "tool:c2", "tool:c3", "tool:c4", "tool:c5"],
+        "one step per call, at consecutive seqs, in call order"
+    );
+    assert!(names[6].starts_with("model:"), "{names:?}");
+    let seqs: Vec<u64> = journals[0].iter().map(|(s, _)| *s).collect();
+    assert_eq!(seqs, (0..7).collect::<Vec<u64>>());
+}
+
+// ---------------------------------------------------------------------------
+// A crash in the middle of a segment
+// ---------------------------------------------------------------------------
+
+/// What a run left behind: its journal, and how often each call began and ran to its end.
+struct Replayed {
+    journal: Vec<(u64, String)>,
+    answers: Vec<(String, bool)>,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+}
+
+/// A turn of three calls whose third dies with the process after the first two are recorded; the
+/// run is stepped again by another worker (another limit) once its lease has run out.
+async fn crash_and_replay(first_limit: usize, second_limit: usize) -> Replayed {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"ms": 5, "use": "independent"})),
+        call("c2", "probe", json!({"ms": 5, "use": "independent"})),
+        call(
+            "c3",
+            "probe",
+            json!({"ms": 1, "use": "independent", "hang": true}),
+        ),
+    ]);
+    h.mock.push_text("done");
+
+    let probe = Probe::new(&log);
+    probe.armed.store(true, SeqCst);
+    let armed = probe.armed.clone();
+    let agent = h.agent(first_limit, |b| b.tool(probe));
+    let rt = h.runtime(agent, Duration::from_millis(300));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    // The process dies while the third call hangs, after the first two recorded their outcomes: the
+    // worker is aborted, which drops the transition and leaves the run with its lease.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while log.ends("c1") == 0 || log.ends("c2") == 0 || log.starts("c3") == 0 {
+        assert!(Instant::now() < deadline, "the turn did not get that far");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    worker.kill().await;
+    armed.store(false, SeqCst);
+    let recorded = h.journal(run).await;
+    assert_eq!(
+        recorded.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>()[1..],
+        ["tool:c1", "tool:c2"],
+        "only the first two calls were recorded before the crash"
+    );
+
+    // Another worker, another limit, takes the run when the lease has lapsed.
+    let probe = Probe {
+        armed: armed.clone(),
+        ..Probe::new(&log)
+    };
+    let agent = h.agent(second_limit, |b| b.tool(probe));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    Replayed {
+        journal: h.journal(run).await,
+        answers: tool_answers(&view),
+        starts: ["c1", "c2", "c3"].map(|id| log.starts(id)).to_vec(),
+        ends: ["c1", "c2", "c3"].map(|id| log.ends(id)).to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn a_replay_after_a_crash_mid_batch_runs_only_the_calls_that_were_not_recorded() {
+    for (first, second) in [(10, 10), (1, 10), (10, 1)] {
+        let replay = crash_and_replay(first, second).await;
+        assert_eq!(
+            replay.starts[0], 1,
+            "c1 recorded: not run again ({first} then {second})"
+        );
+        assert_eq!(
+            replay.starts[1], 1,
+            "c2 recorded: not run again ({first} then {second})"
+        );
+        assert_eq!(replay.ends, [1, 1, 1]);
+        assert_eq!(
+            replay.starts[2], 2,
+            "c3 began twice: it never recorded the first time"
+        );
+        assert_eq!(
+            replay.answers,
+            [
+                ("ok:c1".to_owned(), false),
+                ("ok:c2".to_owned(), false),
+                ("ok:c3".to_owned(), false)
+            ],
+            "the messages are in call order"
+        );
+        let names: Vec<&str> = replay.journal.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(&names[1..4], ["tool:c1", "tool:c2", "tool:c3"]);
+        assert_eq!(
+            replay.journal.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            (0..5).collect::<Vec<u64>>(),
+            "the seqs of the sequential journal ({first} then {second})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_journal_written_at_one_limit_replays_at_the_other_and_equals_an_uninterrupted_run() {
+    let uninterrupted = {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(vec![
+            call("c1", "probe", json!({"ms": 5, "use": "independent"})),
+            call("c2", "probe", json!({"ms": 5, "use": "independent"})),
+            call("c3", "probe", json!({"ms": 5, "use": "independent"})),
+        ]);
+        h.mock.push_text("done");
+        let (run, _) = h.run(1, "go", &log).await;
+        h.journal(run).await
+    };
+    for (first, second) in [(1, 10), (10, 1)] {
+        let replay = crash_and_replay(first, second).await;
+        assert_eq!(replay.journal, uninterrupted, "{first} then {second}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cancel, failure, doom loop, questions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_cancel_starts_no_further_call_and_the_run_fails_cancelled() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(turn(4, 60_000, "independent"));
+    h.mock.push_text("never asked");
+    let agent = h.agent(2, |b| b.tool(Probe::new(&log)));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while log.starts("c1") + log.starts("c2") < 2 {
+        assert!(Instant::now() < deadline, "two calls did not start");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    rt.cancel(run, "stop").await.expect("cancel");
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Failed);
+    assert!(
+        view.error.as_deref().is_some_and(|e| e.contains("cancel")),
+        "{:?}",
+        view.error
+    );
+    assert_eq!(log.starts("c1"), 1);
+    assert_eq!(log.starts("c2"), 1);
+    assert_eq!(
+        log.starts("c3"),
+        0,
+        "calls that had not started never start"
+    );
+    assert_eq!(log.starts("c4"), 0);
+    assert_eq!(h.mock.remaining(), 1, "the model was not asked again");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_that_does_not_stop_is_dropped_after_the_grace_period() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(turn(2, 3_600_000, "independent"));
+    h.mock.push_text("never asked");
+    let probe = Probe {
+        heeds_cancel: false,
+        ..Probe::new(&log)
+    };
+    let agent = h.agent(10, |b| b.tool(probe));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    while log.starts("c1") + log.starts("c2") < 2 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let cancelled = tokio::time::Instant::now();
+    rt.cancel(run, "stop").await.expect("cancel");
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Failed);
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(60),
+        "the loop did not wait for a call that ignores the cancel: {:?}",
+        cancelled.elapsed()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_transient_failure_stops_new_starts_waits_for_the_running_calls_and_retries_the_turn() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"ms": 100, "use": "independent"})),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 10, "use": "independent", "transient": true}),
+        ),
+        call("c3", "probe", json!({"ms": 10, "use": "independent"})),
+        call("c4", "probe", json!({"ms": 10, "use": "independent"})),
+    ]);
+    // The retry asks the model again, and it asks for the same calls.
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"ms": 100, "use": "independent"})),
+        call("c2", "probe", json!({"ms": 10, "use": "independent"})),
+        call("c3", "probe", json!({"ms": 10, "use": "independent"})),
+        call("c4", "probe", json!({"ms": 10, "use": "independent"})),
+    ]);
+    h.mock.push_text("done");
+    let probe = Probe::new(&log);
+    probe.armed.store(true, SeqCst);
+    let agent = h.agent(2, |b| b.tool(probe));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    assert_eq!(
+        log.starts("c1"),
+        2,
+        "ran in the failed try and again in the retry"
+    );
+    assert_eq!(log.starts("c2"), 2);
+    assert_eq!(
+        log.starts("c3"),
+        1,
+        "the calls that had not started when it failed never started in that try"
+    );
+    assert_eq!(log.starts("c4"), 1);
+    assert_eq!(
+        log.ends("c1"),
+        2,
+        "the failed try waited for the call that was running"
+    );
+    assert!(log.position("end:c1") < log.position("start:c3"));
+    assert_eq!(tool_answers(&view).len(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_identical_calls_in_one_turn_are_refused_as_today() {
+    let mut answers = Vec::new();
+    for limit in [1usize, 10] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        let same = || json!({"ms": 10, "use": "independent", "out": "same"});
+        h.mock.push_tool_calls(vec![
+            call(
+                "c1",
+                "probe",
+                json!({"ms": 10, "use": "independent", "out": "first"}),
+            ),
+            call("c2", "probe", same()),
+            call("c3", "probe", same()),
+            call("c4", "probe", same()),
+            call(
+                "c5",
+                "probe",
+                json!({"ms": 10, "use": "independent", "out": "last"}),
+            ),
+        ]);
+        h.mock.push_text("I will answer with what I know");
+        let (_, view) = h.run(limit, "go", &log).await;
+        assert_eq!(view.status, RunStatus::Done);
+        let got = tool_answers(&view);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[1], ("same".to_owned(), false));
+        assert_eq!(got[2], ("same".to_owned(), false));
+        assert!(got[3].1, "the third identical call is refused: {got:?}");
+        assert!(
+            got[3]
+                .0
+                .starts_with("Not run: this is the third call in a row of `probe`")
+        );
+        assert_eq!(log.ends("c4"), 0, "it did not run");
+        answers.push(got);
+    }
+    assert_eq!(answers[0], answers[1], "the same answers at every limit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_limit_on_tool_calls_is_counted_as_before() {
+    for limit in [1usize, 10] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(turn(4, 10, "independent"));
+        h.mock.push_text("closing words");
+        let agent = h.agent(limit, |b| {
+            b.tool(Probe::new(&log)).limits(adam_llm_agent::Limits {
+                max_tool_calls: 3,
+                ..adam_llm_agent::Limits::default()
+            })
+        });
+        let rt = h.runtime(agent, Duration::from_secs(10));
+        let run = rt
+            .start("llm", user_message("go"), None)
+            .await
+            .expect("start");
+        let worker = Worker::spawn(&rt);
+        let view = wait_terminal(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(
+            log.max_running(),
+            0,
+            "a turn over the limit has none of its calls run"
+        );
+        assert_eq!(tool_answers(&view).len(), 4);
+        assert!(tool_answers(&view).iter().all(|(_, error)| *error));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_question_in_the_middle_of_a_turn_runs_alone_and_the_rest_runs_after_the_answer() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"ms": 10, "use": "independent"})),
+        call("c2", "ask", json!({})),
+        call("c3", "probe", json!({"ms": 10, "use": "independent"})),
+    ]);
+    h.mock.push_text("deploying");
+    let agent = h.agent(10, |b| b.tool(Probe::new(&log)).tool(Asker));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("deploy"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let view = rt.view(run).await.unwrap().unwrap();
+        if view.waiting {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the run did not park");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(log.ends("c1"), 1, "the call before the question finished");
+    assert_eq!(
+        log.starts("c3"),
+        0,
+        "the call after it waits for the answer"
+    );
+    rt.deliver(run, user_message("prod"))
+        .await
+        .expect("deliver");
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(
+        tool_answers(&view),
+        [
+            ("ok:c1".to_owned(), false),
+            ("prod".to_owned(), false),
+            ("ok:c3".to_owned(), false)
+        ],
+        "the results are in call order"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_that_asks_though_it_declared_nothing_of_the_kind_is_told_to_run_alone() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"ms": 10, "use": "independent"})),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 10, "use": "independent", "ask": true}),
+        ),
+        call("c3", "probe", json!({"ms": 10, "use": "independent"})),
+    ]);
+    h.mock.push_text("done");
+    let (run, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done, "the run did not park");
+    let answers = tool_answers(&view);
+    assert_eq!(answers[0], ("ok:c1".to_owned(), false));
+    assert_eq!(
+        answers[1],
+        (
+            "this tool cannot run alongside others: call it alone".to_owned(),
+            true
+        )
+    );
+    assert_eq!(answers[2], ("ok:c3".to_owned(), false));
+    let ends: Vec<StepState> = h
+        .steps(run)
+        .into_iter()
+        .filter(|(id, state)| id == "tool:c2" && state.is_end())
+        .map(|(_, state)| state)
+        .collect();
+    assert_eq!(ends, [StepState::Failed]);
+}
+
+// ---------------------------------------------------------------------------
+// The budgets of a segment, the builder
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_file_the_run_has_no_room_for_is_refused_when_the_results_are_applied_and_its_end_is_corrected()
+ {
+    let h = Harness::new();
+    h.mock.push_tool_calls(vec![
+        call("c1", "filer", json!({"kib": 4096, "tag": 1})),
+        call("c2", "filer", json!({"kib": 4096, "tag": 2})),
+    ]);
+    h.mock.push_text("done");
+    let agent = h.agent(10, |b| b.tool(Filer));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    let answers = tool_answers(&view);
+    assert_eq!(answers[0], ("shared".to_owned(), false));
+    assert!(
+        answers[1].1 && answers[1].0.contains("Not shared"),
+        "{answers:?}"
+    );
+    let c2: Vec<StepState> = h
+        .steps(run)
+        .into_iter()
+        .filter(|(id, _)| id == "tool:c2")
+        .map(|(_, state)| state)
+        .collect();
+    assert_eq!(
+        c2,
+        [StepState::Running, StepState::Completed, StepState::Failed],
+        "the end said as it happened, and the corrected end"
+    );
+}
+
+#[test]
+fn the_limit_is_ten_by_default_and_clamped_to_one_to_thirty_two() {
+    let model = Arc::new(MockModel::new());
+    let limit = |n: Option<usize>| {
+        let builder = LlmAgent::builder("a", model.clone(), "m");
+        match n {
+            Some(n) => builder.max_parallel(n),
+            None => builder,
+        }
+        .build()
+        .max_parallel()
+    };
+    assert_eq!(limit(None), 10);
+    assert_eq!(limit(Some(0)), 1);
+    assert_eq!(limit(Some(1)), 1);
+    assert_eq!(limit(Some(7)), 7);
+    assert_eq!(limit(Some(32)), 32);
+    assert_eq!(limit(Some(1000)), 32);
+}
+
+// ---------------------------------------------------------------------------
+// Sources
+// ---------------------------------------------------------------------------
+
+/// A source of tools that sleep: `slow_*` tools say they share nothing, the others say nothing.
+struct Sleepers {
+    log: Arc<Log>,
+}
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for Sleepers {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        ["slow_a", "slow_b", "plain"]
+            .iter()
+            .map(|name| ToolSpec {
+                name: (*name).into(),
+                description: "sleeps".into(),
+                parameters: json!({"type": "object"}),
+            })
+            .collect()
+    }
+
+    fn access(&self, name: &str, _args: &Value) -> ToolAccess {
+        if name.starts_with("slow_") {
+            ToolAccess::Independent
+        } else {
+            ToolAccess::Alone
+        }
+    }
+
+    async fn call(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        let now = self.log.running.fetch_add(1, SeqCst) + 1;
+        self.log.max_running.fetch_max(now, SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.log.running.fetch_sub(1, SeqCst);
+        Some(Ok(ToolOutput::text(format!("{name}:{}", ctx.call_id()))))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_calls_of_a_source_run_together_when_the_source_says_they_share_nothing() {
+    for (names, together) in [(["slow_a", "slow_b"], 2usize), (["plain", "plain"], 1)] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(vec![
+            call("c1", names[0], json!({"tag": 1})),
+            call("c2", names[1], json!({"tag": 2})),
+        ]);
+        h.mock.push_text("done");
+        let agent = h.agent(10, |b| b.tool_source(Sleepers { log: log.clone() }));
+        let rt = h.runtime(agent, Duration::from_secs(10));
+        let run = rt
+            .start("llm", user_message("go"), None)
+            .await
+            .expect("start");
+        let worker = Worker::spawn(&rt);
+        let view = wait_terminal(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(log.max_running(), together, "{names:?}");
+        assert_eq!(
+            tool_answers(&view),
+            [
+                (format!("{}:c1", names[0]), false),
+                (format!("{}:c2", names[1]), false)
+            ]
+        );
+    }
+}

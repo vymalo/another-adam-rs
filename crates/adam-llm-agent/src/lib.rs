@@ -145,7 +145,6 @@ mod images;
 mod kept;
 pub mod paging;
 mod plan;
-#[allow(dead_code)] // used by the loop in the next commit
 mod schedule;
 #[cfg(feature = "schema")]
 mod schema;
@@ -161,7 +160,8 @@ mod typed;
 pub use access::{ToolAccess, Use, UseMode, path_scope};
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
-    BuildError, CLOSING_TURN, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,
+    BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
+    LlmAgentBuilder, LlmStarter, MAX_PARALLEL_LIMIT,
 };
 pub use compaction::{COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize};
 pub use conversation::{

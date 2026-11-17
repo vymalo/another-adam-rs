@@ -1,6 +1,7 @@
 //! [`LlmAgent`]: the durable model <-> tools loop.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -12,15 +13,20 @@ use adam_model::{
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, ChildStatus, Ctx,
-    Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE, RUN_FINISHED_KIND, RunEvent,
-    SESSION_CLOSE_KIND, SandboxUsage, SessionState, SessionSummary, StepEvent, StepIcon, StepKind,
-    StepState, Transition, UsageEvent, UsageTotals, child_run_id,
+    Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE, RUN_FINISHED_KIND, ReservedStep,
+    RunEvent, SESSION_CLOSE_KIND, SandboxUsage, SessionState, SessionSummary, StepEvent, StepIcon,
+    StepKind, StepState, Transition, UsageEvent, UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::FutureExt;
+use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::access::ToolAccess;
 use crate::compaction::{
     self, COMPACTION_TURN, CompactionReason, MAX_COMPACTIONS, OVERFLOW_OUTPUT_CHARS, PromptSize,
     RETRY_AFTER_TURNS, SUMMARY_OUTPUT_TOKENS,
@@ -39,6 +45,7 @@ use crate::images::{
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
 use crate::paging::backstop;
 use crate::plan::Plan;
+use crate::schedule::{self, Entry, Ordered, Queue, Segment};
 use crate::sessions::{SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START};
 
 /// Whether the history holds a call that started a session or sent to one.
@@ -156,6 +163,53 @@ use crate::tool::{
     Tool, ToolCtx, ToolError, ToolOutput,
 };
 use crate::toolset::ToolSet;
+
+/// The most tool calls of one turn that run at the same time unless
+/// [`LlmAgentBuilder::max_parallel`] says otherwise.
+pub const DEFAULT_MAX_PARALLEL: usize = 10;
+
+/// The most [`LlmAgentBuilder::max_parallel`] accepts: a larger value is this.
+pub const MAX_PARALLEL_LIMIT: usize = 32;
+
+/// What the model is told when a tool that asks the person, or waits for a child run or a remote
+/// task, was called beside other calls: it has nowhere to park there.
+const NOT_ALONGSIDE: &str = "this tool cannot run alongside others: call it alone";
+
+/// Whether `name` is one of the session tools, which always run alone.
+fn is_session_tool(name: &str) -> bool {
+    matches!(
+        name,
+        SUBAGENT_START | SUBAGENT_SEND | SUBAGENT_READ | SUBAGENT_CLOSE
+    )
+}
+
+/// What a call needs to run its step, made before the call starts.
+struct Prepared {
+    tool_ctx: ToolCtx,
+    /// The sources and what they see of the run, to check what a source holds back.
+    holding: Option<(Vec<DynToolSource>, SourceCtx)>,
+    unjournaled: Arc<Mutex<SandboxUsage>>,
+}
+
+/// How a call of a segment ended.
+enum Finished {
+    /// The call took no step (bad arguments, a tool nobody has): what the model is told.
+    Said(String),
+    /// The recorded outcome of the call's step.
+    Ran {
+        outcome: Box<Result<ToolOutput, ToolError>>,
+        unjournaled: Arc<Mutex<SandboxUsage>>,
+        live: Live,
+    },
+}
+
+/// What was said about the end of a call's step as it happened, so that applying the result says it
+/// again only when it changes.
+struct Live {
+    /// The state and the text of an end that applying the result may change; `None` for an end
+    /// that it cannot.
+    said: Option<(StepState, String)>,
+}
 
 /// What the run state says to the call it is about to run.
 #[derive(Clone)]
@@ -396,6 +450,7 @@ pub struct LlmAgentBuilder {
     stream_text: bool,
     step_io: StepIo,
     session_agents: Vec<String>,
+    max_parallel: usize,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -528,6 +583,18 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The most tool calls of one model turn that run at the same time: `10` by default, and
+    /// `n` clamped to `1..=32`. The calls of a turn run together as far as their
+    /// [`Tool::access`] allows (a tool that declares nothing runs alone), the ones over the limit wait
+    /// in a queue and start in call order, and the results go back to the model in call order. `1`
+    /// runs the calls one after another. It is not a field of [`Limits`]: those are built by literals.
+    /// See [ADR 0049](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md).
+    #[must_use]
+    pub fn max_parallel(mut self, n: usize) -> Self {
+        self.max_parallel = n.clamp(1, MAX_PARALLEL_LIMIT);
+        self
+    }
+
     /// How the step of a tool call reports what the tool was given and what it answered: the
     /// arguments on the report that starts the step, the result (or the error) on the one that ends
     /// it, each scrubbed by [`StepIo::redact`] and then cut to the contract's bounds (4 KiB in, 8 KiB
@@ -629,6 +696,7 @@ impl LlmAgentBuilder {
             stream_text: self.stream_text,
             step_io: self.step_io,
             session_agents: self.session_agents.into(),
+            max_parallel: self.max_parallel,
         }
     }
 }
@@ -647,7 +715,10 @@ impl LlmAgentBuilder {
 /// 2. The model is called in a journaled step `model:<turn>` with the history
 ///    and tool specs.
 /// 3. Each requested tool runs as its own journaled step `tool:<call id>` and
-///    its result is appended. Then the step returns `Continue`, so every
+///    its result is appended, in the order of the calls. The calls of the turn run at the same
+///    time, up to [`LlmAgentBuilder::max_parallel`], except where [`Tool::access`] says two
+///    conflict: a tool that declares nothing runs alone, after the calls before it (ADR 0049). Then
+///    the step returns `Continue`, so every
 ///    turn is committed before the next begins. A turn without tool calls
 ///    returns `Done` with `{"text": <final text>, "artifacts": [{name,
 ///    mime_type}...]}`. When a tool announced the answer
@@ -787,6 +858,8 @@ pub struct LlmAgent {
     step_io: StepIo,
     /// The registered names of the subagents whose sessions the turn-end wait looks at.
     session_agents: Arc<[String]>,
+    /// The most tool calls of a turn that run at the same time.
+    max_parallel: usize,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -808,9 +881,16 @@ impl std::fmt::Debug for LlmAgent {
 }
 
 /// Send a step report, unless `silent`: the system behind the tool's source reports its calls itself.
-async fn say(ctx: &mut Ctx, silent: bool, event: RunEvent) {
+async fn say(ctx: &Ctx, silent: bool, event: RunEvent) {
     if !silent {
         ctx.emit(event).await;
+    }
+}
+
+/// [`say`] through an [`Emitter`], for the calls of a segment, which run while the `Ctx` is not at hand.
+async fn say_with(emitter: &Emitter, silent: bool, event: RunEvent) {
+    if !silent {
+        emitter.emit(event).await;
     }
 }
 
@@ -865,12 +945,19 @@ impl LlmAgent {
             stream_text: true,
             step_io: StepIo::default(),
             session_agents: Vec::new(),
+            max_parallel: DEFAULT_MAX_PARALLEL,
         }
     }
 
     /// The limits in force.
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The most tool calls of a turn that run at the same time
+    /// ([`LlmAgentBuilder::max_parallel`]).
+    pub fn max_parallel(&self) -> usize {
+        self.max_parallel
     }
 
     fn tool(&self, name: &str) -> Option<&DynTool> {
@@ -2067,7 +2154,12 @@ impl LlmAgent {
         Ok(())
     }
 
-    /// Run the owed tool calls in order, each as its own journaled step.
+    /// Run the owed tool calls, in segments (ADR 0049): a call that runs alone, one the model asked to
+    /// follow the ones before it or that repeats the call before it, is a segment of its own and runs
+    /// as one journaled step `tool:<call id>`; the calls between two of those run at the same time,
+    /// as far as their [`Tool::access`] allows and up to [`max_parallel`](LlmAgentBuilder::max_parallel),
+    /// each as its own journaled step at a seq reserved in call order. Results are applied in call order
+    /// either way.
     ///
     /// `notices` are the finished-child messages this transition received: a call that starts a
     /// child which already finished (its message got here first) is answered at once.
@@ -2081,6 +2173,14 @@ impl LlmAgent {
             // A cancel stops the turn between its calls too: the ones still owed do not start.
             if ctx.is_cancelled() {
                 return Ok(Flow::Fail(CANCELLED.into()));
+            }
+            // The calls that run beside this one: none unless the schedule puts several together.
+            let together = self.together(state);
+            if together >= 2 {
+                match self.run_segment(ctx, state, together).await? {
+                    Some(flow) => return Ok(flow),
+                    None => continue,
+                }
             }
             // `doom_loop`: the third call in a row with the same tool, the same arguments and the
             // same result as the two before it does not run. Decided from the committed state alone.
@@ -2318,6 +2418,540 @@ impl LlmAgent {
         Ok(Flow::Next)
     }
 
+    /// What the call shares with the other calls of its turn: the tool's own declaration
+    /// ([`Tool::access`]), a source's ([`ToolSource::access`]), and [`ToolAccess::Alone`] for what the
+    /// loop forces: a tool that asks the person, the session tools, and (through the default) any
+    /// tool that does not declare. A call that takes no step (bad arguments, a tool nobody has) shares
+    /// nothing.
+    fn access_of(&self, call: &ToolCall) -> ToolAccess {
+        if call.invalid_arguments.is_some() {
+            return ToolAccess::Independent;
+        }
+        match self.tool(&call.name) {
+            Some(tool) => {
+                if tool.asks_user() || is_session_tool(&call.name) {
+                    ToolAccess::Alone
+                } else {
+                    tool.access(&call.arguments)
+                }
+            }
+            None if self.sources.is_empty() => ToolAccess::Independent,
+            None => self
+                .sources
+                .iter()
+                .map(|source| source.access(&call.name, &call.arguments))
+                .find(|access| !access.is_alone())
+                .unwrap_or(ToolAccess::Alone),
+        }
+    }
+
+    /// How many of the owed calls, from the first, run together as one segment: `1` when the first
+    /// runs by itself (the common case: a tool that declares nothing runs alone).
+    fn together(&self, state: &Conversation) -> usize {
+        let calls = &state.pending_calls;
+        if self.max_parallel <= 1 || calls.len() < 2 {
+            return 1;
+        }
+        let mut before = state.repeats.as_ref().map(|r| r.key.clone());
+        let entries: Vec<Entry> = calls
+            .iter()
+            .map(|call| {
+                let key = call_key(call);
+                // The doom-loop count of a call needs the result of the one before it.
+                let barrier = before.as_deref() == Some(key.as_str());
+                before = Some(key);
+                Entry {
+                    access: self.access_of(call),
+                    barrier,
+                }
+            })
+            .collect();
+        match schedule::segments(&entries, self.max_parallel).first() {
+            Some(Segment::Together(range)) if range.start == 0 => range.end,
+            _ => 1,
+        }
+    }
+
+    /// Run the first `n` owed calls at the same time ([`schedule`]): reserve their journal steps in
+    /// call order, drive them in this task, and apply the results in call order. `Some(flow)` ends the
+    /// transition (a cancel); `None` means the segment is applied and the loop goes on.
+    async fn run_segment(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        n: usize,
+    ) -> Result<Option<Flow>, AgentError> {
+        let calls: Vec<ToolCall> = state.pending_calls[..n].to_vec();
+        let notes = state.source_notes.clone();
+        let accesses: Vec<ToolAccess> = calls.iter().map(|c| self.access_of(c)).collect();
+        let shortcuts: Vec<Option<String>> = calls
+            .iter()
+            .map(|c| self.shortcut(c, state.output_cut))
+            .collect();
+
+        // One journal step for each call that runs a tool, at seqs in call order: the ones a
+        // sequential loop would take.
+        let takes_step: Vec<bool> = shortcuts.iter().map(Option::is_none).collect();
+        let names: Vec<String> = calls
+            .iter()
+            .zip(&takes_step)
+            .filter(|(_, takes)| **takes)
+            .map(|(c, _)| format!("tool:{}", c.id))
+            .collect();
+        let mut steps = ctx.reserve_steps(&names).await?.into_iter();
+        let base = steps.as_slice().first().map_or(0, ReservedStep::seq);
+        let seqs = schedule::step_seqs(base, &takes_step);
+
+        // What each call is given, built from the state as the segment begins: the budgets of the
+        // segment (room for kept outputs, the image gate) are one, shared by its calls.
+        let used = files_kept(&state.artifacts);
+        let root = (
+            state.root_run,
+            state.root_step.as_deref(),
+            state.plan.as_ref(),
+        );
+        let mut first: Option<ToolCtx> = None;
+        let mut slots: Vec<Option<(Option<Prepared>, Option<ReservedStep>)>> =
+            Vec::with_capacity(n);
+        for (i, call) in calls.iter().enumerate() {
+            if shortcuts[i].is_some() {
+                slots.push(Some((None, None)));
+                continue;
+            }
+            let facts = CallFacts {
+                files_used: used,
+                output_cut: state.output_cut,
+                kept: Arc::clone(&state.kept_outputs),
+                kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
+                images: self.image_gate(state),
+            };
+            let mut one = self.prepare(ctx, &state.context, root, &notes, call, facts);
+            match &first {
+                Some(head) => one.tool_ctx = one.tool_ctx.sharing_budgets_of(head),
+                None => first = Some(one.tool_ctx.clone()),
+            }
+            let step = steps.next().ok_or_else(|| {
+                AgentError::permanent("a call of a segment has no reserved step".to_owned())
+            })?;
+            debug_assert_eq!(
+                Some(step.seq()),
+                seqs[i],
+                "the seq a sequential loop gives call {i}"
+            );
+            slots.push(Some((Some(one), Some(step))));
+        }
+
+        let emitter = ctx.emitter();
+        let cancel = ctx.cancel_token();
+        let mut queue = Queue::new(&accesses, self.max_parallel);
+        let mut running = FuturesUnordered::new();
+        let mut finished: Ordered<Finished> = Ordered::new(n);
+        let mut failure: Option<AgentError> = None;
+        let mut cancelled = false;
+        let mut grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        loop {
+            if !cancelled && cancel.is_cancelled() {
+                cancelled = true;
+                queue.stop();
+                grace = Some(Box::pin(tokio::time::sleep(TOOL_STOP_GRACE)));
+            }
+            for i in queue.ready() {
+                let Some((prepared, step)) = slots[i].take() else {
+                    continue;
+                };
+                running.push(
+                    self.drive(
+                        i,
+                        &calls[i],
+                        &notes,
+                        &emitter,
+                        shortcuts[i].clone(),
+                        prepared,
+                        step,
+                    )
+                    .boxed(),
+                );
+            }
+            if running.is_empty() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = cancel.cancelled(), if !cancelled => {}
+                () = async {
+                    match grace.as_mut() {
+                        Some(sleep) => sleep.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // The calls that were running did not stop in time: their futures are dropped.
+                    return Ok(Some(Flow::Fail(CANCELLED.into())));
+                }
+                Some((i, done)) = running.next() => {
+                    queue.finish(i);
+                    match done {
+                        Ok(one) => finished.put(i, one),
+                        Err(error) => {
+                            // No call starts after a failure; the running ones are waited for.
+                            failure.get_or_insert(error);
+                            queue.stop();
+                        }
+                    }
+                }
+            }
+        }
+        if cancelled {
+            return Ok(Some(Flow::Fail(CANCELLED.into())));
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let results = finished.into_ordered().ok_or_else(|| {
+            AgentError::permanent("a call of a segment did not finish".to_owned())
+        })?;
+
+        // The results are applied in the order of the calls, whatever order they finished in.
+        for (call, done) in calls.iter().zip(results) {
+            let key = call_key(call);
+            let (result, reported) = match done {
+                Finished::Said(said) => (ToolResult::error(&call.id, said), SandboxUsage::new()),
+                Finished::Ran {
+                    outcome,
+                    unjournaled,
+                    live,
+                } => {
+                    self.conclude(
+                        ctx,
+                        &notes,
+                        call,
+                        *outcome,
+                        &unjournaled,
+                        files_kept(&state.artifacts),
+                        Some(live),
+                    )
+                    .await?
+                }
+            };
+            state.sandbox_usage.merge(&reported);
+            let ToolResult::Answered {
+                message,
+                artifacts,
+                answer,
+                repeat_key,
+                plan,
+                kept,
+                reported,
+                pinned,
+                kept_images,
+            } = result
+            else {
+                return Err(AgentError::permanent(
+                    "a call of a segment of several was left unanswered".to_owned(),
+                ));
+            };
+            if pinned {
+                state.pinned_calls.push(call.id.clone());
+            }
+            if let Some(answer) = answer {
+                state.announce(answer);
+            }
+            record_answer(state, key, &message, repeat_key);
+            if let Some(plan) = plan {
+                state.plan = Some(*plan);
+            }
+            state.keep_output(kept);
+            state.keep_tool_images(kept_images);
+            if !reported.is_empty() {
+                Self::count_rounds(ctx, state, false).await?;
+            }
+            state.messages.push(message);
+            add_artifact_refs(&mut state.artifacts, artifacts);
+            state.pending_calls.remove(0);
+        }
+        Ok(None)
+    }
+
+    /// One call of a segment, from its start to its finish: say that it runs, run its step, and say
+    /// how it ended, **as it happens**; applying the result to the run is left to the caller, in call
+    /// order. An `Err` is a failure of the transition (a transient tool error, the journal).
+    #[allow(clippy::too_many_arguments)] // one call's pieces, handed over once
+    async fn drive(
+        &self,
+        i: usize,
+        call: &ToolCall,
+        notes: &[ToolNote],
+        emitter: &Emitter,
+        shortcut: Option<String>,
+        prepared: Option<Prepared>,
+        step: Option<ReservedStep>,
+    ) -> (usize, Result<Finished, AgentError>) {
+        (
+            i,
+            self.drive_one(call, notes, emitter, shortcut, prepared, step)
+                .await,
+        )
+    }
+
+    async fn drive_one(
+        &self,
+        call: &ToolCall,
+        notes: &[ToolNote],
+        emitter: &Emitter,
+        shortcut: Option<String>,
+        prepared: Option<Prepared>,
+        step: Option<ReservedStep>,
+    ) -> Result<Finished, AgentError> {
+        let silent = self
+            .source_note(notes, &call.name)
+            .is_some_and(|n| n.reports_step);
+        say_with(emitter, silent, self.start_event(call, notes)).await;
+        if let Some(said) = shortcut {
+            say_with(
+                emitter,
+                silent,
+                self.step_end(
+                    &call.name,
+                    &call.id,
+                    StepState::Failed,
+                    Some((&said, true)),
+                    notes,
+                ),
+            )
+            .await;
+            return Ok(Finished::Said(said));
+        }
+        let (Some(prepared), Some(step)) = (prepared, step) else {
+            return Err(AgentError::permanent(
+                "a call of a segment has no step to run".to_owned(),
+            ));
+        };
+        let unjournaled = prepared.unjournaled.clone();
+        let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
+        let outcome: Result<ToolOutput, ToolError> = step.run(move || work).await?;
+        // How it ended, said now; `conclude` says it again only if applying the result changes it.
+        let live = match &outcome {
+            Ok(output) => {
+                let state = if output.is_error {
+                    StepState::Failed
+                } else {
+                    StepState::Completed
+                };
+                let text =
+                    backstop(&output.content, &call.name, self.pages(&call.name)).into_owned();
+                say_with(
+                    emitter,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        state,
+                        Some((&text, output.is_error)),
+                        notes,
+                    ),
+                )
+                .await;
+                Live {
+                    said: Some((state, text)),
+                }
+            }
+            Err(ToolError::Permanent(reason)) => {
+                say_with(
+                    emitter,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((reason, true)),
+                        notes,
+                    ),
+                )
+                .await;
+                Live { said: None }
+            }
+            Err(ToolError::Transient(reason)) => {
+                say_with(
+                    emitter,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((reason, true)),
+                        notes,
+                    ),
+                )
+                .await;
+                return Err(AgentError::transient(format!(
+                    "tool `{}` failed: {reason}",
+                    call.name
+                )));
+            }
+            // A call that asks or waits cannot run beside others: the model is told to call it
+            // alone (a tool that can do it must say `Alone`).
+            Err(_) => {
+                say_with(
+                    emitter,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((NOT_ALONGSIDE, true)),
+                        notes,
+                    ),
+                )
+                .await;
+                Live { said: None }
+            }
+        };
+        Ok(Finished::Ran {
+            outcome: Box::new(outcome),
+            unjournaled,
+            live,
+        })
+    }
+
+    /// What the model is told for a call that takes no journal step: its arguments were not JSON, or
+    /// nobody has the tool and the agent has no source to ask. `None` for a call that runs a tool.
+    fn shortcut(&self, call: &ToolCall, output_cut: bool) -> Option<String> {
+        if let Some(raw) = &call.invalid_arguments {
+            return Some(invalid_arguments(&call.name, raw, output_cut));
+        }
+        // A name that is none of the agent's own: an agent with no source says so at once, one with
+        // sources asks them, inside the step that records the answer.
+        // Consequence: this records NOTHING, so an agent with no source whose journal holds a
+        // `tool:<id>` step for a tool it no longer has (the tool was removed between two versions)
+        // would fail replay (a recorded step with no step asked for it: non-determinism). An agent
+        // with sources answers an unknown tool inside the journaled step, and replays. The coder
+        // always installs sources, which is what makes ADR 0038's removal of a tool safe.
+        (self.tool(&call.name).is_none() && self.sources.is_empty())
+            .then(|| self.unknown_tool(&call.name))
+    }
+
+    /// The report that starts the step of `call`: what the call was given (and, with a title the tool
+    /// has for itself, what to call it: `Tool::step_style`).
+    fn start_event(&self, call: &ToolCall, notes: &[ToolNote]) -> RunEvent {
+        let mut start =
+            self.style_of(&call.name, notes)
+                .event(&call.name, &call.id, StepState::Running);
+        if let Some((input, max)) = self.step_io.input(&call.arguments) {
+            start = start.with_input_within(input, max);
+        }
+        RunEvent::Step(start)
+    }
+
+    /// What a call needs to run, made from the `Ctx` while it can still be read.
+    fn prepare(
+        &self,
+        ctx: &Ctx,
+        context: &Map<String, Value>,
+        root: (Option<RunId>, Option<&str>, Option<&Plan>),
+        notes: &[ToolNote],
+        call: &ToolCall,
+        facts: CallFacts,
+    ) -> Prepared {
+        let CallFacts {
+            files_used,
+            kept,
+            kept_left,
+            images,
+            ..
+        } = facts;
+        let note = self.source_note(notes, &call.name);
+        let root_run = root.0.unwrap_or_else(|| ctx.run_id()).to_string();
+        let tool_ctx = self
+            .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
+            .with_note(note.cloned())
+            .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used))
+            .with_kept(kept_left, kept)
+            .with_images(
+                images,
+                image_scope(ctx.conversation_id(), &root_run),
+                root_run,
+            );
+        // What a source holds back is refused here too, inside the step that records the answer:
+        // the model was shown the tools of a turn that may be over, or named one it was not shown.
+        let holding = (!self.sources.is_empty()).then(|| {
+            (
+                self.sources.clone(),
+                SourceCtx::new(
+                    ctx.run_id(),
+                    root.0.unwrap_or_else(|| ctx.run_id()),
+                    ctx.conversation_id().map(str::to_owned),
+                    Arc::new(context.clone()),
+                ),
+            )
+        });
+        Prepared {
+            tool_ctx,
+            holding,
+            // What the call reported as sandbox usage rides in its result, which the step journals; a
+            // call that ends in an error has no result to carry it, and leaves it here.
+            unjournaled: Arc::new(Mutex::new(SandboxUsage::new())),
+        }
+    }
+
+    /// The work of the journaled step `tool:<call id>`, which runs only if nothing is recorded: the
+    /// call to the agent's own tool or to a source's, within its time limit, after the check of what a
+    /// source holds back.
+    fn step_work(
+        &self,
+        call: &ToolCall,
+        note: Option<&ToolNote>,
+        prepared: Prepared,
+    ) -> BoxFuture<'static, Result<ToolOutput, ToolError>> {
+        let Prepared {
+            tool_ctx,
+            holding,
+            unjournaled,
+        } = prepared;
+        let args = call.arguments.clone();
+        let name = call.name.clone();
+        let own = self.tool(&call.name).cloned();
+        let sources = self.sources.clone();
+        let unknown = self.unknown_tool(&call.name);
+        let source_limit = note
+            .and_then(|n| n.timeout_ms)
+            .map_or(DEFAULT_TOOL_TIME_LIMIT, |ms| {
+                Duration::from_millis(ms) + SOURCE_LIMIT_MARGIN
+            });
+        async move {
+            if let Some((sources, source_ctx)) = &holding
+                && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
+                    .await
+                    .into_iter()
+                    .next()
+            {
+                return Ok(ToolOutput::error(held.reason));
+            }
+            let called = match own {
+                Some(tool) => {
+                    let limit = tool.time_limit().unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
+                    within(&tool_ctx, &name, limit, |ctx| async move {
+                        tool.call(&ctx, args).await
+                    })
+                    .await
+                }
+                None => {
+                    let tool_name = name.clone();
+                    within(&tool_ctx, &name, source_limit, |ctx| async move {
+                        for source in &sources {
+                            if let Some(answer) = source.call(&ctx, &tool_name, args.clone()).await
+                            {
+                                return answer;
+                            }
+                        }
+                        Ok(ToolOutput::error(unknown))
+                    })
+                    .await
+                }
+            };
+            with_reported_sandbox(&tool_ctx, &unjournaled, called)
+        }
+        .boxed()
+    }
+
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), tool = %call.name, call_id = %call.id))]
     async fn run_tool(
         &self,
@@ -2328,33 +2962,16 @@ impl LlmAgent {
         call: &ToolCall,
         facts: CallFacts,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
-        let CallFacts {
-            files_used,
-            output_cut,
-            kept,
-            kept_left,
-            images,
-        } = facts;
-        let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
-        // What the listing that offered this tool said about it. Only a source's tool has a note: the
-        // agent's own tools win a name clash.
-        let note = self.source_note(notes, &call.name);
+        let files_used = facts.files_used;
         // The system behind the source reports each call itself: the agent reports no step of its own.
-        let silent = note.is_some_and(|n| n.reports_step);
-        // The report that starts the step says what the call was given (and, with a title the tool
-        // has for itself, what to call it: `Tool::step_style`).
-        let mut start =
-            self.style_of(&call.name, notes)
-                .event(&call.name, &call.id, StepState::Running);
-        if let Some((input, max)) = self.step_io.input(&call.arguments) {
-            start = start.with_input_within(input, max);
-        }
-        say(ctx, silent, RunEvent::Step(start)).await;
+        let silent = self
+            .source_note(notes, &call.name)
+            .is_some_and(|n| n.reports_step);
+        say(ctx, silent, self.start_event(call, notes)).await;
 
-        // Arguments that were not JSON: nothing runs, and the model is told what it sent. The
-        // answer comes from the recorded model turn alone, so a replay gives the same one.
-        if let Some(raw) = &call.invalid_arguments {
-            let said = invalid_arguments(&call.name, raw, output_cut);
+        // Arguments that were not JSON, or a tool nobody has: nothing runs, and the model is told
+        // why. The answer comes from the recorded model turn alone, so a replay gives the same one.
+        if let Some(said) = self.shortcut(call, facts.output_cut) {
             say(
                 ctx,
                 silent,
@@ -2367,141 +2984,43 @@ impl LlmAgent {
                 ),
             )
             .await;
-            let answered = ToolResult::Answered {
-                message: Message::tool_error(call.id.clone(), said),
-                artifacts: Vec::new(),
-                answer: None,
-                repeat_key: None,
-                plan: None,
-                kept: None,
-                reported: Vec::new(),
-                pinned: false,
-                kept_images: Vec::new(),
-            };
-            return Ok((answered, SandboxUsage::new()));
+            return Ok((ToolResult::error(&call.id, said), SandboxUsage::new()));
         }
+        let prepared = self.prepare(ctx, context, root, notes, call, facts);
+        let unjournaled = prepared.unjournaled.clone();
+        let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
+        let outcome: Result<ToolOutput, ToolError> =
+            ctx.step(&format!("tool:{}", call.id), move || work).await?;
+        self.conclude(ctx, notes, call, outcome, &unjournaled, files_used, None)
+            .await
+    }
 
-        let root_run = root.0.unwrap_or_else(|| ctx.run_id()).to_string();
-        let tool_ctx = self
-            .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
-            .with_note(note.cloned())
-            .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used))
-            .with_kept(kept_left, kept)
-            .with_images(
-                images,
-                image_scope(ctx.conversation_id(), &root_run),
-                root_run,
-            );
-        let args = call.arguments.clone();
-        // What a source holds back is refused here too, inside the step that records the answer:
-        // the model was shown the tools of a turn that may be over, or named one it was not shown.
-        let holding = (!self.sources.is_empty()).then(|| {
-            (
-                self.sources.clone(),
-                SourceCtx::new(
-                    ctx.run_id(),
-                    root.0.unwrap_or_else(|| ctx.run_id()),
-                    ctx.conversation_id().map(str::to_owned),
-                    Arc::new(context.clone()),
-                ),
-                call.name.clone(),
-            )
-        });
-        // What the call reported as sandbox usage rides in its result, which the step journals; a
-        // call that ends in an error has no result to carry it, and leaves it here.
-        let unjournaled = Arc::new(Mutex::new(SandboxUsage::new()));
-        let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
-            Some(tool) => {
-                let unjournaled = unjournaled.clone();
-                let name = call.name.clone();
-                ctx.step(&format!("tool:{}", call.id), move || async move {
-                    if let Some((sources, source_ctx, name)) = &holding
-                        && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
-                            .await
-                            .into_iter()
-                            .next()
-                    {
-                        return Ok(ToolOutput::error(held.reason));
-                    }
-                    let limit = tool.time_limit().unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
-                    let called = within(&tool_ctx, &name, limit, |ctx| async move {
-                        tool.call(&ctx, args).await
-                    })
-                    .await;
-                    with_reported_sandbox(&tool_ctx, &unjournaled, called)
-                })
-                .await?
-            }
-            // A name that is none of the agent's own: an agent with no source says so at once,
-            // one with sources asks them, inside the step that records the answer.
-            // Consequence: this branch records NOTHING, so an agent with no source whose journal holds a
-            // `tool:<id>` step for a tool it no longer has (the tool was removed between two versions)
-            // would fail replay (a recorded step with no step asked for it: non-determinism). An agent
-            // with sources answers an unknown tool inside the journaled step below, and replays. The
-            // coder always installs sources, which is what makes ADR 0038's removal of a tool safe.
-            None if self.sources.is_empty() => {
-                let unknown = self.unknown_tool(&call.name);
-                say(
-                    ctx,
-                    silent,
-                    self.step_end(
-                        &call.name,
-                        &call.id,
-                        StepState::Failed,
-                        Some((&unknown, true)),
-                        notes,
-                    ),
-                )
-                .await;
-                let answered = ToolResult::Answered {
-                    message: Message::tool_error(call.id.clone(), unknown),
-                    artifacts: Vec::new(),
-                    answer: None,
-                    repeat_key: None,
-                    plan: None,
-                    kept: None,
-                    reported: Vec::new(),
-                    pinned: false,
-                    kept_images: Vec::new(),
-                };
-                return Ok((answered, SandboxUsage::new()));
-            }
-            None => {
-                let sources = self.sources.clone();
-                let name = call.name.clone();
-                let unknown = self.unknown_tool(&call.name);
-                let source_limit = note
-                    .and_then(|n| n.timeout_ms)
-                    .map_or(DEFAULT_TOOL_TIME_LIMIT, |ms| {
-                        Duration::from_millis(ms) + SOURCE_LIMIT_MARGIN
-                    });
-                let unjournaled = unjournaled.clone();
-                ctx.step(&format!("tool:{}", call.id), move || async move {
-                    if let Some((sources, source_ctx, name)) = &holding
-                        && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
-                            .await
-                            .into_iter()
-                            .next()
-                    {
-                        return Ok(ToolOutput::error(held.reason));
-                    }
-                    let tool_name = name.clone();
-                    let called = within(&tool_ctx, &name, source_limit, |ctx| async move {
-                        for source in &sources {
-                            if let Some(answer) = source.call(&ctx, &tool_name, args.clone()).await
-                            {
-                                return answer;
-                            }
-                        }
-                        Ok(ToolOutput::error(unknown))
-                    })
-                    .await;
-                    with_reported_sandbox(&tool_ctx, &unjournaled, called)
-                })
-                .await?
-            }
+    /// What the call's recorded outcome means for the run: the message that answers it, its artifacts
+    /// and what it asks the run to keep, or a wait. The step's end is said here, unless `live` says
+    /// the call's end was already said as it happened and applying the result did not change it.
+    /// `live` is `Some` for a call of a segment of several, which cannot ask or wait.
+    #[allow(clippy::too_many_arguments)] // the call's pieces, handed over once
+    async fn conclude(
+        &self,
+        ctx: &Ctx,
+        notes: &[ToolNote],
+        call: &ToolCall,
+        outcome: Result<ToolOutput, ToolError>,
+        unjournaled: &Mutex<SandboxUsage>,
+        files_used: u64,
+        live: Option<Live>,
+    ) -> Result<(ToolResult, SandboxUsage), AgentError> {
+        let silent = self
+            .source_note(notes, &call.name)
+            .is_some_and(|n| n.reports_step);
+        let said_live = |state: StepState, text: Option<&str>| match &live {
+            Some(Live {
+                said: Some((live_state, live_text)),
+            }) => *live_state == state && Some(live_text.as_str()) == text,
+            Some(Live { said: None }) => true,
+            None => false,
         };
-
+        let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
         let reported = match &outcome {
             Ok(output) => output.sandbox.clone(),
             // Tried again: only the try that is kept counts.
@@ -2537,12 +3056,14 @@ impl LlmAgent {
                     } => Some((content.as_str(), *is_error)),
                     _ => None,
                 };
-                say(
-                    ctx,
-                    silent,
-                    self.step_end(&call.name, &call.id, outcome, said, notes),
-                )
-                .await;
+                if !said_live(outcome, said.map(|(text, _)| text)) {
+                    say(
+                        ctx,
+                        silent,
+                        self.step_end(&call.name, &call.id, outcome, said, notes),
+                    )
+                    .await;
+                }
                 ToolResult::Answered {
                     message,
                     artifacts,
@@ -2556,51 +3077,50 @@ impl LlmAgent {
                 }
             }
             Err(ToolError::Permanent(reason)) => {
-                say(
-                    ctx,
-                    silent,
-                    self.step_end(
-                        &call.name,
-                        &call.id,
-                        StepState::Failed,
-                        Some((&reason, true)),
-                        notes,
-                    ),
-                )
-                .await;
-                ToolResult::Answered {
-                    message: Message::tool_error(
-                        call.id.clone(),
-                        backstop(&reason, &call.name, false).into_owned(),
-                    ),
-                    artifacts: Vec::new(),
-                    answer: None,
-                    repeat_key: None,
-                    plan: None,
-                    kept: None,
-                    reported: Vec::new(),
-                    pinned: false,
-                    kept_images: Vec::new(),
+                if live.is_none() {
+                    say(
+                        ctx,
+                        silent,
+                        self.step_end(
+                            &call.name,
+                            &call.id,
+                            StepState::Failed,
+                            Some((&reason, true)),
+                            notes,
+                        ),
+                    )
+                    .await;
                 }
+                ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
             }
             Err(ToolError::Transient(reason)) => {
-                say(
-                    ctx,
-                    silent,
-                    self.step_end(
-                        &call.name,
-                        &call.id,
-                        StepState::Failed,
-                        Some((&reason, true)),
-                        notes,
-                    ),
-                )
-                .await;
+                if live.is_none() {
+                    say(
+                        ctx,
+                        silent,
+                        self.step_end(
+                            &call.name,
+                            &call.id,
+                            StepState::Failed,
+                            Some((&reason, true)),
+                            notes,
+                        ),
+                    )
+                    .await;
+                }
                 return Err(AgentError::transient(format!(
                     "tool `{}` failed: {reason}",
                     call.name
                 )));
             }
+            // Beside other calls a question or a wait has nowhere to park: the model is told to call
+            // the tool alone (its end was said as it happened).
+            Err(
+                ToolError::NeedsInput { .. }
+                | ToolError::AwaitRun { .. }
+                | ToolError::AwaitSession { .. }
+                | ToolError::AwaitRemote { .. },
+            ) if live.is_some() => ToolResult::error(&call.id, NOT_ALONGSIDE.to_owned()),
             Err(ToolError::NeedsInput { question, ui }) => {
                 say(ctx, silent, end(StepState::Waiting)).await;
                 ToolResult::NeedsInput { question, ui }
@@ -3171,6 +3691,23 @@ enum RoundUsage {
         totals: Option<UsageTotals>,
         sandbox: Option<SandboxUsage>,
     },
+}
+
+impl ToolResult {
+    /// An answer that is an error result with `text`, and nothing else.
+    fn error(call_id: &str, text: String) -> Self {
+        Self::Answered {
+            message: Message::tool_error(call_id.to_owned(), text),
+            artifacts: Vec::new(),
+            answer: None,
+            repeat_key: None,
+            plan: None,
+            kept: None,
+            reported: Vec::new(),
+            pinned: false,
+            kept_images: Vec::new(),
+        }
+    }
 }
 
 enum ToolResult {
