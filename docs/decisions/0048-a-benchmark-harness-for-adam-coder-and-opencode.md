@@ -188,7 +188,7 @@ several places where the harness read or deleted files a container made. The dec
 * **The run proves it used the task image** (a container of its digest ran, else `Failed_infra`), **the slot is reaped before and
   after** every run, **the agent is stopped and that is confirmed before its tree is read**, and **the meter's record tells the
   infrastructure from the agent** (`lib/classify.mjs`).
-* **Fairness:** one step limit, one context window (required) and one cancel grace in the configuration (`limits`); OpenCode's exit
+* **Fairness:** one step limit, one context window (required) and one cancel grace in the configuration (`limits`), used the same way: a polite stop, the grace, a forced stop, for both agents; OpenCode's exit
   is the container runtime's; one nudge ever; every request has a timeout; the meter binds to the loopback by default.
 
 *Unverified*, as before: everything that needs a container service. `bench/README.md`, "Unverified", lists what each fix could not

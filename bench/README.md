@@ -314,7 +314,9 @@ patch that touches the grading's own machinery as **suspect**, for a person to r
   `[tool.pytest*]` table, `[[test]]`, `harness`, a `test` script) are kept and flagged **suspect**.
 * **Grading.** The stripped patch is applied in a **new container of the task image, by digest**, `/tests` is mounted
   **read-only in that container only**, `bash /tests/test.sh` runs, and the reward is read from a directory made empty
-  for that attempt, after the container has ended. A pass needs **all** of: exit status 0, a reward of exactly `1` written
+  for that attempt, after the container has ended. The `grader` service mounts nothing of the host: the harness copies the tests and
+  the patch into a directory of its own per grading (`/grade/<id>`, a tmpfs) as tar streams, mounts them read-only, takes the reward
+  out as a tar stream and removes the directory inside the service. A pass needs **all** of: exit status 0, a reward of exactly `1` written
   during the attempt, and no error. A reward of `1` with another exit status is a fail and **suspect**. A patch whose added
   lines mention `reward.txt`, `/logs/verifier`, `/tests/` or `test.sh` is graded as it is and **suspect** too. The agent
   phase has no network; the grading container has the verifier's network.
@@ -339,7 +341,10 @@ environment. So one principle holds everywhere:
 > **The host never runs git in, reads a file from, or deletes a file in a place a container could write.** What a
 > container wrote reaches the host as a tar stream the harness parses with limits (`lib/tarstream.mjs`): regular files and
 > directories only (a symbolic link only in a work tree, and it is never followed), no hard link, device or FIFO, every
-> name normalised and refused if it is absolute or holds `..`, a cap on the bytes, the entries and one file. What the
+> name normalised and refused if it is absolute or holds `..`, a cap on the bytes, the entries and one file. **A bad entry
+> (a FIFO, a device, a link nobody asked for, a file over its cap) is refused and skipped**: its path and reason go to the run
+> record and the report, and the run goes on; only a broken stream (a wrong checksum, a name that leaves the target) or one over
+> the total cap is infrastructure. What the
 > host itself writes, it owns. What a container left is removed by a container (as the owning user) and checked to be gone.
 
 | What | How |
@@ -347,7 +352,7 @@ environment. So one principle holds everywhere:
 | a work tree, a base | `tar -cf -` inside the Podman service, parsed and extracted by `Stack.extractTree` into a directory the harness made |
 | OpenCode's stream, stderr and export | `Stack.readFiles`: the three names only, a size cap, and a link, FIFO or device in their place is refused, logged and kept out |
 | the exit status of OpenCode | the container runtime's (`podman run`'s status and its time-out), never a file the agent could write |
-| the reward of a grading | read without following a link, only if it is a regular file of at most 16 bytes |
+| the reward of a grading | read without following a link or blocking (`O_NOFOLLOW`, `O_NONBLOCK`), only if it is a regular file of at most 16 bytes; on the grader it comes out as a tar stream of that one name |
 | the base of a task | made in the slot's volume by the task image; the host builds its own repository from a tar of the tree; adam's copy is pushed to the git server by a one-shot container with no secret |
 | the pushed branches | `git ls-remote` of an `http://` address on the loopback, run in a new empty directory that is not a repository, with discovery stopped and only plain http allowed |
 | the environment of a host git | an allow-list (`PATH`, locale, temp directory); the model's key, a proxy and any credential are not in it |
@@ -363,7 +368,7 @@ pusher): no other image is added to the dev stack's postgres, WireMock, git serv
 |---|---|
 | `postgres`, `mock-github`, `git-server` | the coders' databases (one for each slot, `postgres-init.sql`), the WireMock mock that makes `open_pull_request` succeed, the dev git server (owner `bench` is made on first push) |
 | `podman-1`, `podman-2` | the Podman service of a slot (4 CPU, 12 GB): what an agent's commands run on. Mounts the slot's work volume and one directory the harness writes, **read-only**; never `$BENCH_HOME`, so no hidden test, gold patch or ledger is visible to it |
-| `grader` | a Podman service of its own, on a network with nothing else, where grading and the environment check run, with the tests mounted read-only into the grading container only |
+| `grader` | a Podman service of its own, on a network with nothing else, where grading and the environment check run; it mounts nothing of the host (a tmpfs `/grade` holds one directory per grading, filled and emptied through tar streams) |
 | `coder-1`, `coder-2` | the pinned coder, recreated for each run, on its slot's network only |
 | `gitbox-1`, `gitbox-2` | `adam-git-sandbox` of the same image: no network, no secret, a read-only root, an in-memory `/tmp`, the work volume; the coder's git runs there (`GIT_SANDBOX_SOCKET`), so what a repository's configuration names cannot read a secret or reach the network |
 | `meter-1`, `meter-2` | TCP relays with one fixed target, the harness's meter on the host |
@@ -441,7 +446,7 @@ The bearer is in a private field of the client: in no log line, error, result or
 of `SendStreamingMessage` is read for latency and the per-call usage reports only. A task that is `input-required` gets one
 fixed reply, `Nobody can answer questions in this run; decide yourself and finish.`, in the same task. The second time it
 parks (a new status timestamp), at the time limit (50 minutes) and when the meter refuses a call, the harness sends
-`CancelTask`. One nudge ever: it is sent once, when the state first parks, and never again because an answer was slow. Exits: `done`, `failed`, `canceled`, `rejected`, `timeout`, `budget_hit`, `stopped_by_cap`, `input_required`,
+`CancelTask`, waits the configured cancel grace and then stops the coder; the run is collected only after that stop is confirmed. One nudge ever: it is sent once, when the state first parks, and never again because an answer was slow. Exits: `done`, `failed`, `canceled`, `rejected`, `timeout`, `budget_hit`, `stopped_by_cap`, `input_required`,
 `infra` (six polls in a row failed, or the task wants a sign-in (`auth-required`): the run is `Interrupted`, then `Failed_infra`, and is tried again at the next start).
 The final tree is the one run directory of the emptied volume, read as a tar stream into a directory the harness owns and turned
 into a patch, after the coder is removed and its devcontainers are reaped and both are confirmed; the pushed `agent/<run>` branch is the cross-check (`crossCheckBranch`).
@@ -495,11 +500,13 @@ of them; the container's time limit (50 minutes) is the only bound, as for adam,
 `timeout`. Turning subagents off would take away a tool that adam has too (its `explorer` and `reviewer`) and the report
 would compare a handicapped agent. The cost is the same as for adam: the meter counts every call of every session. OpenCode's
 own stream shows the main session only, so `selfReported` is lower than the meter's when subagents work; the export has them.
-The refusal of a call is retried by OpenCode, so the harness watches the meter and stops the container itself (`budget_hit`).
+The refusal of a call is retried by OpenCode, so the harness watches the meter and ends the container itself (`budget_hit`). The end
+of a run, at the time limit or on a refusal, is the same for both agents: a polite stop (OpenCode: SIGTERM; adam: `CancelTask`), the
+configured cancel grace, then a forced stop. OpenCode's stderr is capped at 1 MiB inside the container.
 
 **Fairness.** Both agents get the same step limit, the same context window, the same cancel grace and the task's CPU and memory
 for the container they run in (`limits`, `contextWindow` in the configuration; adam's devcontainer is made by the coder, which
-takes no such limit, so its CPU and memory are the service's: not equal). The clock of a run starts when the agent is started
+takes no such limit, so its CPU and memory are the service's: not equal). If the Podman service refuses `--cpus` and `--memory` (it has no cgroups), OpenCode's container gets none, the run record says `limits: service`, and the report lists those runs. The clock of a run starts when the agent is started
 (adam: the first message; OpenCode: the container), and adam's `wallMs` is the time to the decision, not the cancel grace.
 OpenCode needs no network to load its provider (*verified 2026-11-17*: it ran with the proxy dead and a new home).
 
@@ -558,7 +565,7 @@ verifier that needs the network gets it for the window of its grading. Blocks, s
 `kernel.apparmor_restrict_unprivileged_userns` (a rootless Podman cannot make a user namespace when it is 1; the fix is
 printed), the user namespace limits, free disk (a failure under 30 GB, a warning under 100 GB, in `$BENCH_HOME` and in
 Docker's root) and the coder image by digest. With `--start` it brings the stack up and runs a container inside each Podman
-service, and in the grader. Compose 2.24 or newer and an x64 machine are required. Nested Podman has been proven under rootful Docker only (`dev/podman/README.md`). When it does not work the exit is
+service, and in the grader, and asks each Podman service whether it takes the task limits (a refusal is a warning: the limits are then the service's own, the same for both agents). Compose 2.24 or newer and an x64 machine are required. Nested Podman has been proven under rootful Docker only (`dev/podman/README.md`). When it does not work the exit is
 1 and the output says which fallback to use: **1. a rootless Podman on the host** (its socket mounted into the coder and the
 harness), **2. the coder's run pods on a k3d cluster**. Neither fallback is built here.
 
@@ -646,6 +653,5 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
   coder reaches the relays by their names and publishes through `pub-coder-N`; that a pusher with `work-N:/work:ro` can `git fetch`
   from a repository the service's user owns; that `podman ps -a --format json` has `Image` by digest for a container made from
   `name@sha256:...`, which the `no-task-container` check reads; that the devcontainers carry the label of the coder's deployment
-  (the reap does not rely on it: it removes every container of the slot's service); that `--cpus` and `--memory` are accepted by a
-  service whose containers have no cgroups (`cgroups="disabled"`: if not, every OpenCode run is a `runtime` failure and the dry run
-  says so first); the wording the coder uses for a failure with an external cause (`externalFailure` is a pattern, shown in the report).
+  (the reap does not rely on it: it removes every container of the slot's service); whether `--cpus` and `--memory` are accepted by a
+  service whose containers have no cgroups (`cgroups="disabled"`: the probe of `doctor --start` and of each slot asks; a refusal means no limits and a note in the run record); that `podman kill --signal TERM` reaches OpenCode through the script's trap; that the stderr FIFO drain works in the task image's shell; that `/grade` as a tmpfs of the grader is usable by its nested mounts; the wording the coder uses for a failure with an external cause (`externalFailure` is a pattern, shown in the report).
