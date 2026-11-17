@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -294,8 +294,11 @@ impl Ctx {
     /// fails at once with [`AgentError::NonDeterminism`] and takes nothing. Each [`ReservedStep`]
     /// then runs with the contract of [`step`](Self::step): the recorded outcome if there is one,
     /// else `f`, recorded at the step's own seq. A step that is reserved and never run leaves a
-    /// gap in the journal; that happens only when the transition fails anyway (a cancel, an
-    /// error), and the replay fills it.
+    /// gap in the journal. That is harmless when the transition then fails (a cancel, an error: the
+    /// replay fills the gap), and it is what [`step_all`](Self::step_all) and the agent loop of
+    /// `adam-llm-agent` guarantee. A caller that reserves steps and returns `Done` or `Continue`
+    /// without running them all makes a later replay find a different journal: **run every
+    /// reserved step, or fail the transition**.
     ///
     /// # Errors
     ///
@@ -326,8 +329,8 @@ impl Ctx {
     /// what is recorded and runs only the rest (at-least-once, as [`step`](Self::step)). An
     /// `at_once` of `0` is `1`.
     ///
-    /// The first runtime error (a journal failure, a `NonDeterminism`) is returned and the steps
-    /// still running are dropped, which is the failure of the transition.
+    /// The first runtime error (a journal failure, a `NonDeterminism`) is returned: no further step
+    /// starts and the steps still running are dropped, which is the failure of the transition.
     ///
     /// # Errors
     ///
@@ -351,10 +354,8 @@ impl Ctx {
             .map(|(step, (_, f))| step.run(f));
         futures::stream::iter(runs)
             .buffered(at_once.max(1))
-            .collect::<Vec<_>>()
+            .try_collect()
             .await
-            .into_iter()
-            .collect()
     }
 
     /// What the journal holds at `seq`, for the step `name`: `None` when nothing is recorded yet.
@@ -1013,6 +1014,45 @@ mod tests {
                 .map(|e| (e.seq, e.name.as_str()))
                 .collect::<Vec<_>>(),
             vec![(0, "s0"), (1, "s1"), (2, "s2")]
+        );
+    }
+
+    #[tokio::test]
+    async fn step_all_starts_no_step_after_a_runtime_error() {
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        // The first step's recorded outcome no longer decodes: a runtime error when it is read.
+        ctx.store
+            .journal_put(
+                ctx.run_id(),
+                JournalEntry::ok(0, "s0", serde_json::json!("not a number")),
+            )
+            .await
+            .expect("seed");
+        let started = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let steps: Vec<(String, _)> = (0..3)
+            .map(|i| {
+                let started = started.clone();
+                (format!("s{i}"), move || async move {
+                    started
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(i);
+                    Ok::<u8, String>(1)
+                })
+            })
+            .collect();
+        let out = ctx.step_all(steps, 1).await;
+        assert!(
+            matches!(out, Err(AgentError::NonDeterminism { .. })),
+            "{out:?}"
+        );
+        assert!(
+            started
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "no later step started after the error"
         );
     }
 
