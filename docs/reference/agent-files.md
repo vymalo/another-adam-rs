@@ -426,6 +426,10 @@ of `adam-llm-agent`.
   generated `Tool::asks_user` says `true`, and `bind` refuses it on a subagent), `step`, `label` and
   `icon` (how a call is drawn as a step, `Tool::step_style`: the kind, a label instead of the tool's name (give one: it is what the person reads), and an
   icon from the closed vocabulary of the orchestration layer's `steps/v1` (`opencode` is OpenCode's own); [ADR 0007](../decisions/0007-progress-as-steps-and-streamed-text.md)) and
+  `parallel = "independent" | "read" | "write" | "exclusive"` with `path = "<argument>"`, or `access = path::to::fn`
+  (what a call shares with the other calls of its turn, `Tool::access`: the calls of a turn run at the same time and
+  only calls that conflict keep the model's order; a tool that declares nothing runs alone;
+  [ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)) and
   `crate = path` (default `::adam`; `::adam_llm_agent` for a crate that does not use the facade).
   Reserved for later: `approval` (roadmap 5).
 * **Bad model input is the model's problem:** a deserialization failure becomes `ToolOutput::error`

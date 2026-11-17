@@ -655,7 +655,15 @@ impl ReservedStep {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<T, E>> + Send,
     {
-        settle(&self.store, self.run, self.seq, &self.name, self.recorded, f).await
+        settle(
+            &self.store,
+            self.run,
+            self.seq,
+            &self.name,
+            self.recorded,
+            f,
+        )
+        .await
     }
 }
 
@@ -883,8 +891,7 @@ mod tests {
         assert_eq!(seqs, vec![(0, "a"), (1, "b"), (2, "c")]);
         assert!(reserved.iter().all(|r| !r.is_recorded()));
         assert_eq!(ctx.seq, 3);
-        let next: Result<Result<u8, String>, AgentError> =
-            ctx.step("d", || async { Ok(4) }).await;
+        let next: Result<Result<u8, String>, AgentError> = ctx.step("d", || async { Ok(4) }).await;
         assert_eq!(next.expect("step").expect("inner"), 4);
         let journal = ctx.store.journal_list(ctx.run_id()).await.expect("journal");
         assert_eq!(
@@ -902,7 +909,10 @@ mod tests {
         let sink = CollectingSink::new();
         let mut ctx = ctx(&sink).await;
         ctx.store
-            .journal_put(ctx.run_id(), JournalEntry::ok(1, "other", serde_json::json!(1)))
+            .journal_put(
+                ctx.run_id(),
+                JournalEntry::ok(1, "other", serde_json::json!(1)),
+            )
             .await
             .expect("seed");
         let refused = ctx.reserve_steps(&names(&["a", "b", "c"])).await;
@@ -918,7 +928,9 @@ mod tests {
         let runs = Arc::new(Mutex::new(Vec::<&str>::new()));
         let work = |name: &'static str, runs: Arc<Mutex<Vec<&'static str>>>| {
             move || async move {
-                runs.lock().unwrap_or_else(PoisonError::into_inner).push(name);
+                runs.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(name);
                 Ok::<u8, String>(1)
             }
         };
@@ -929,7 +941,10 @@ mod tests {
             .await
             .expect("reserve");
         let b = reserved.remove(1);
-        b.run(work("b", runs.clone())).await.expect("b").expect("ok");
+        b.run(work("b", runs.clone()))
+            .await
+            .expect("b")
+            .expect("ok");
         drop(reserved);
 
         let mut replay = ctx_on(&store, run, 0);
@@ -938,11 +953,17 @@ mod tests {
             .await
             .expect("reserve again");
         assert_eq!(
-            reserved.iter().map(ReservedStep::is_recorded).collect::<Vec<_>>(),
+            reserved
+                .iter()
+                .map(ReservedStep::is_recorded)
+                .collect::<Vec<_>>(),
             vec![false, true, false]
         );
         for (r, name) in reserved.into_iter().zip(["a", "b", "c"]) {
-            r.run(work(name, runs.clone())).await.expect("run").expect("ok");
+            r.run(work(name, runs.clone()))
+                .await
+                .expect("run")
+                .expect("ok");
         }
         assert_eq!(
             *runs.lock().unwrap_or_else(PoisonError::into_inner),
@@ -951,7 +972,10 @@ mod tests {
         );
         let journal = store.journal_list(run).await.expect("journal");
         assert_eq!(
-            journal.iter().map(|e| (e.seq, e.name.as_str())).collect::<Vec<_>>(),
+            journal
+                .iter()
+                .map(|e| (e.seq, e.name.as_str()))
+                .collect::<Vec<_>>(),
             vec![(0, "a"), (1, "b"), (2, "c")]
         );
     }
@@ -984,7 +1008,10 @@ mod tests {
         assert_eq!(ctx.seq, 3);
         let journal = ctx.store.journal_list(ctx.run_id()).await.expect("journal");
         assert_eq!(
-            journal.iter().map(|e| (e.seq, e.name.as_str())).collect::<Vec<_>>(),
+            journal
+                .iter()
+                .map(|e| (e.seq, e.name.as_str()))
+                .collect::<Vec<_>>(),
             vec![(0, "s0"), (1, "s1"), (2, "s2")]
         );
     }

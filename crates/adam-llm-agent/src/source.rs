@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::access::ToolAccess;
 use crate::tool::{ToolCtx, ToolError, ToolOutput};
 
 /// The most tools the sources of an agent may offer on one model turn, all sources together. The
@@ -285,6 +286,17 @@ pub trait ToolSource: Send + Sync + 'static {
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
         let _ = (ctx, tools);
         Vec::new()
+    }
+
+    /// What a call to the tool `name` with `args` shares with the other calls of its model turn,
+    /// as [`Tool::access`](crate::Tool::access) says for the agent's own tools. Answer
+    /// [`ToolAccess::Independent`] or [`ToolAccess::Uses`] **only for a tool this source offers**
+    /// and [`ToolAccess::Alone`] for any other name: the agent takes the first source that answers
+    /// something else. The default is `Alone`, so a source written before this method existed keeps
+    /// its calls one at a time. A source that wraps another must forward it.
+    fn access(&self, name: &str, args: &Value) -> ToolAccess {
+        let _ = (name, args);
+        ToolAccess::Alone
     }
 
     /// Whether `name`, a tool this source listed and the agent leaves out because `taken` (the

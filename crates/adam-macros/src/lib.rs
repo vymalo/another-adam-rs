@@ -50,8 +50,12 @@ mod expand;
 /// `ToolError::NeedsInput`: `Tool::asks_user` says `true`, and a subagent may not have it) and
 /// `step = "subagent"`, `label = "Helper"` and `icon = "agent"` (how a call is drawn as a step,
 /// `Tool::step_style`: the kind, a label instead of the tool's name, and an icon; each from the closed
-/// vocabulary of the `steps/v1` extension, and any other word is an error that lists them) and
-/// `crate = path` (where
+/// vocabulary of the `steps/v1` extension, and any other word is an error that lists them),
+/// `parallel = "independent" | "read" | "write" | "exclusive"` with an optional `path = "<argument>"`,
+/// or `access = path::to::fn` (what a call shares with the other calls of its turn,
+/// `Tool::access`: `read` and `write` use `files`, or `files/<path>` when `path` names a string
+/// argument, normalised lexically and widened to `files` when absolute or with `..`; `access` is a
+/// `fn(&Value) -> ToolAccess`; without any of them the tool runs alone) and `crate = path` (where
 /// `Tool` and `__private` are, default `::adam`; `::adam_llm_agent` for a
 /// crate without the facade).
 #[proc_macro_attribute]

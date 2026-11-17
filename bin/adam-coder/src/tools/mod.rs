@@ -94,7 +94,9 @@ use std::time::Duration;
 
 use adam::mcp::McpPolicy;
 use adam::prelude::*;
-use adam::{AnswerCheck, DynTool, StateKey, StepEvent, StepIcon, StepKind, StepState, StepStyle};
+use adam::{
+    AnswerCheck, DynTool, StateKey, StepEvent, StepIcon, StepKind, StepState, StepStyle, ToolAccess,
+};
 use adam_a2a::AccessTier;
 use adam_error::{Classify, report};
 use adam_model::ToolSpec;
@@ -1052,6 +1054,10 @@ impl Tool for Gated {
         self.inner.step_style()
     }
 
+    fn access(&self, args: &Value) -> ToolAccess {
+        self.inner.access(args)
+    }
+
     fn read_answer(
         &self,
         call_id: &str,
@@ -1213,6 +1219,10 @@ impl Tool for Redacting {
 
     fn step_style(&self) -> StepStyle {
         self.inner.step_style()
+    }
+
+    fn access(&self, args: &Value) -> ToolAccess {
+        self.inner.access(args)
     }
 
     fn time_limit(&self) -> Option<Duration> {
@@ -1740,5 +1750,68 @@ mod redacting_kept_tests {
         let out = tool.call(&ctx, Value::Null).await.unwrap();
         let kept = out.kept.unwrap();
         assert_eq!(kept.text, "line one\nkey=[redacted]\n");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod access_forwarding_tests {
+    //! A layer around a tool says what the tool says about what a call shares: a layer that did
+    //! not would make every tool `Alone`.
+
+    use adam_workspace::{MemoryCodeHost, ScopedToken};
+
+    use super::*;
+
+    /// Reads the file its argument names.
+    struct Reader;
+
+    #[async_trait::async_trait]
+    impl Tool for Reader {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "read_file".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn access(&self, args: &Value) -> ToolAccess {
+            ToolAccess::reads_path("files", args.get("path").and_then(Value::as_str))
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+    }
+
+    #[test]
+    fn redacting_forwards_what_a_call_shares() {
+        let mut layer = Redacting::layer(Redactor::new(["secret-value-0123456789"]));
+        let tool = layer(Arc::new(Reader));
+        assert_eq!(
+            tool.access(&serde_json::json!({"path": "src/a.rs"})),
+            ToolAccess::reads("files/src/a.rs")
+        );
+    }
+
+    #[test]
+    fn gated_forwards_what_a_call_shares() {
+        let root = tempfile::tempdir().unwrap();
+        let workspaces = Workspaces::new(
+            root.path().join("work"),
+            Arc::new(ScopedToken::new("github.com", "t")),
+        );
+        let env = Arc::new(ToolEnv::new(
+            workspaces,
+            Arc::new(MemoryCodeHost::new()),
+            CoderSettings::new(),
+        ));
+        let mut layer = Gated::layer(env);
+        let tool = layer(Arc::new(Reader));
+        assert_eq!(
+            tool.access(&serde_json::json!({"path": "src/a.rs"})),
+            ToolAccess::reads("files/src/a.rs")
+        );
     }
 }

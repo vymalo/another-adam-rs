@@ -1,0 +1,17 @@
+error: unknown `parallel` `readonly` in `#[tool]`; expected one of: independent, read, write, exclusive
+ --> tests/ui/fail/unknown_parallel.rs:4:19
+  |
+4 | #[tool(parallel = "readonly")]
+  |                   ^^^^^^^^^^
+
+error: `path` only goes with `parallel = "read"` or `"write"`
+ --> tests/ui/fail/unknown_parallel.rs:8:41
+  |
+8 | #[tool(parallel = "independent", path = "p")]
+  |                                         ^^^
+
+error: `path = "file"` names no argument of the function; its arguments are: p
+  --> tests/ui/fail/unknown_parallel.rs:12:34
+   |
+12 | #[tool(parallel = "read", path = "file")]
+   |                                  ^^^^^^

@@ -135,6 +135,7 @@
 #[doc(hidden)]
 #[path = "private.rs"]
 pub mod __private;
+mod access;
 mod agent;
 mod compaction;
 mod conversation;
@@ -155,6 +156,7 @@ mod tool;
 mod toolset;
 mod typed;
 
+pub use access::{ToolAccess, Use, UseMode, path_scope};
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
     BuildError, CLOSING_TURN, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter,

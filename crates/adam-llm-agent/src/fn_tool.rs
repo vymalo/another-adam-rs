@@ -10,8 +10,11 @@ use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::access::ToolAccess;
 use crate::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 use crate::typed::IntoToolResult;
+
+type AccessFn = dyn Fn(&Value) -> ToolAccess + Send + Sync;
 
 type Handler = dyn Fn(ToolCtx, Value) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send>>
     + Send
@@ -46,6 +49,7 @@ pub struct FnTool {
     handler: Arc<Handler>,
     asks_user: bool,
     time_limit: Option<Duration>,
+    access: Option<Arc<AccessFn>>,
 }
 
 impl FnTool {
@@ -75,7 +79,25 @@ impl FnTool {
             }),
             asks_user: false,
             time_limit: None,
+            access: None,
         }
+    }
+
+    /// Declare what a call shares with the other calls of its turn, from its arguments, as
+    /// [`Tool::access`] says. Without it the tool is [`ToolAccess::Alone`].
+    #[must_use]
+    pub fn with_access(
+        mut self,
+        access: impl Fn(&Value) -> ToolAccess + Send + Sync + 'static,
+    ) -> Self {
+        self.access = Some(Arc::new(access));
+        self
+    }
+
+    /// [`with_access`](Self::with_access) with one answer for every call.
+    #[must_use]
+    pub fn with_fixed_access(self, access: ToolAccess) -> Self {
+        self.with_access(move |_| access.clone())
     }
 
     /// Declare that the tool can end a call with [`ToolError::NeedsInput`], as
@@ -124,6 +146,12 @@ impl Tool for FnTool {
 
     fn time_limit(&self) -> Option<Duration> {
         self.time_limit
+    }
+
+    fn access(&self, args: &Value) -> ToolAccess {
+        self.access
+            .as_ref()
+            .map_or(ToolAccess::Alone, |access| access(args))
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
@@ -216,6 +244,7 @@ where
             ),
             asks_user: false,
             time_limit: None,
+            access: None,
         }
     }
 }
@@ -233,6 +262,25 @@ mod tests {
             json!({"type": "object"}),
             |_ctx, _args| async move { Ok::<_, ToolError>("answer") },
         )
+    }
+
+    #[test]
+    fn a_tool_runs_alone_unless_it_declares_what_it_shares() {
+        assert_eq!(tool().access(&json!({})), ToolAccess::Alone);
+        assert_eq!(
+            tool()
+                .with_fixed_access(ToolAccess::Independent)
+                .access(&json!({})),
+            ToolAccess::Independent
+        );
+        let by_path = tool().with_access(|args| {
+            ToolAccess::reads_path("files", args.get("path").and_then(Value::as_str))
+        });
+        assert_eq!(
+            by_path.access(&json!({"path": "./src/a.rs"})),
+            ToolAccess::reads("files/src/a.rs")
+        );
+        assert_eq!(by_path.access(&json!({})), ToolAccess::reads("files"));
     }
 
     #[test]

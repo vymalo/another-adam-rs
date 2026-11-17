@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_llm_agent::{
-    AnswerCheck, RemotePoll, StateKey, StepStyle, Tool, ToolCtx, ToolError, ToolOutput,
+    AnswerCheck, RemotePoll, StateKey, StepStyle, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput,
 };
 use adam_model::ToolSpec;
 use async_trait::async_trait;
@@ -104,6 +104,10 @@ impl Tool for Scrubbed {
 
     fn step_style(&self) -> StepStyle {
         self.inner.step_style()
+    }
+
+    fn access(&self, args: &Value) -> ToolAccess {
+        self.inner.access(args)
     }
 
     fn time_limit(&self) -> Option<Duration> {
@@ -208,6 +212,46 @@ mod tests {
                 _ => AnswerCheck::Accept,
             }
         }
+    }
+
+    /// A tool that reads the file its argument names, so that a wrapper that forgets to forward
+    /// `access` is the one that runs it alone.
+    struct Reader;
+
+    #[async_trait]
+    impl Tool for Reader {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "reader".into(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        fn access(&self, args: &Value) -> ToolAccess {
+            ToolAccess::reads_path("files", args.get("path").and_then(Value::as_str))
+        }
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+    }
+
+    #[test]
+    fn what_a_call_shares_is_what_the_wrapped_tool_says() {
+        let wrapped = Scrubbed::new(
+            Arc::new(Reader),
+            Arc::new(|text: &str| text.to_owned()),
+            None,
+        );
+        assert_eq!(
+            wrapped.access(&json!({"path": "a/b.rs"})),
+            ToolAccess::reads("files/a/b.rs")
+        );
+        let alone = Scrubbed::new(
+            Arc::new(Picky),
+            Arc::new(|text: &str| text.to_owned()),
+            None,
+        );
+        assert_eq!(alone.access(&json!({})), ToolAccess::Alone);
     }
 
     #[test]

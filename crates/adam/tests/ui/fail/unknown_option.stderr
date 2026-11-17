@@ -1,4 +1,4 @@
-error: unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon
+error: unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access
  --> tests/ui/fail/unknown_option.rs:4:8
   |
 4 | #[tool(aproval = "always")]

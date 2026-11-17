@@ -48,9 +48,19 @@ struct Options {
     step: Option<LitStr>,
     label: Option<LitStr>,
     icon: Option<LitStr>,
+    parallel: Option<LitStr>,
+    path: Option<LitStr>,
+    access: Option<Path>,
 }
 
-const OPTIONS: &str = "name, type, strict, classify, asks_user, paged, crate, step, label, icon";
+const OPTIONS: &str = "name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access";
+
+/// The words of `#[tool(parallel = ..)]`: what a call shares with the other calls of its turn
+/// (`adam_llm_agent::ToolAccess`).
+const PARALLEL_WORDS: &[&str] = &["independent", "read", "write", "exclusive"];
+
+/// The scope a `read` or a `write` without a better one uses: every file of the run.
+const FILES_SCOPE: &str = "files";
 
 /// The kinds a step may have (`steps/v1`): `adam_runtime::StepKind`, whose variants these are the
 /// words of. The `adam` crate's tests check that the two lists are the same.
@@ -92,6 +102,18 @@ impl Parse for Options {
                 "icon" => {
                     input.parse::<Token![=]>()?;
                     opts.icon.replace(input.parse()?).is_some()
+                }
+                "parallel" => {
+                    input.parse::<Token![=]>()?;
+                    opts.parallel.replace(input.parse()?).is_some()
+                }
+                "path" => {
+                    input.parse::<Token![=]>()?;
+                    opts.path.replace(input.parse()?).is_some()
+                }
+                "access" => {
+                    input.parse::<Token![=]>()?;
+                    opts.access.replace(Path::parse_mod_style(input)?).is_some()
                 }
                 "strict" => opts.strict.replace(key.span()).is_some(),
                 "classify" => std::mem::replace(&mut opts.classify, true),
@@ -189,7 +211,20 @@ struct Analysis {
     paged: bool,
     /// `step`, `label` and `icon`, checked: how a call is drawn as a step.
     step_style: Option<StepStyle>,
+    /// `parallel`, `path` and `access`, checked: what a call shares with the others of its turn.
+    access: Option<AccessDecl>,
     return_span: Span,
+}
+
+/// What `#[tool(parallel = .., path = .., access = ..)]` declares.
+enum AccessDecl {
+    /// `parallel = "independent"` or `"exclusive"`: the `ToolAccess` variant.
+    Plain(Ident),
+    /// `parallel = "read"` or `"write"`: the constructor of `ToolAccess`, and the argument (a
+    /// string) that names the place, when `path` says so.
+    Files { write: bool, path: Option<LitStr> },
+    /// `access = path::to::fn`: a function from the arguments to a `ToolAccess`.
+    With(Path),
 }
 
 /// What `#[tool(step = .., label = .., icon = ..)]` says about how a call is drawn as a step.
@@ -318,6 +353,7 @@ fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
         );
     }
     let step_style = analyse_step_style(&opts, &mut errors);
+    let access = analyse_access(&opts, &params, &mut errors);
     errors.finish()?;
 
     let return_span = match &sig.output {
@@ -337,7 +373,93 @@ fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
         asks_user: opts.asks_user,
         paged: opts.paged,
         step_style,
+        access,
         return_span,
+    })
+}
+
+/// The checked `parallel`, `path` and `access` options; `None` when none was given. Every mistake
+/// is pushed on `errors`.
+fn analyse_access(opts: &Options, params: &[Param], errors: &mut Errors) -> Option<AccessDecl> {
+    if let Some(function) = &opts.access {
+        if let Some(word) = &opts.parallel {
+            errors.push(
+                word.span(),
+                "`parallel` and `access` both say what the call shares: use one",
+            );
+        }
+        if let Some(path) = &opts.path {
+            errors.push(
+                path.span(),
+                "`path` goes with `parallel = \"read\"` or `\"write\"`, not with `access`",
+            );
+        }
+        return Some(AccessDecl::With(function.clone()));
+    }
+    let Some(word) = &opts.parallel else {
+        if let Some(path) = &opts.path {
+            errors.push(
+                path.span(),
+                "`path` goes with `parallel = \"read\"` or `\"write\"`",
+            );
+        }
+        return None;
+    };
+    let value = word.value();
+    if !PARALLEL_WORDS.contains(&value.as_str()) {
+        errors.push(
+            word.span(),
+            format!(
+                "unknown `parallel` `{value}` in `#[tool]`; expected one of: {}",
+                PARALLEL_WORDS.join(", ")
+            ),
+        );
+        return None;
+    }
+    let files = matches!(value.as_str(), "read" | "write");
+    if let Some(path) = &opts.path {
+        if !files {
+            errors.push(
+                path.span(),
+                "`path` only goes with `parallel = \"read\"` or `\"write\"`",
+            );
+        } else {
+            let known: Vec<String> = params
+                .iter()
+                .filter_map(|p| match p {
+                    Param::Model { ident, .. } => Some(ident.unraw().to_string()),
+                    _ => None,
+                })
+                .collect();
+            let has_args = params.iter().any(|p| matches!(p, Param::Args(_)));
+            if !has_args && !known.contains(&path.value()) {
+                errors.push(
+                    path.span(),
+                    format!(
+                        "`path = \"{}\"` names no argument of the function; its arguments are: {}",
+                        path.value(),
+                        if known.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            known.join(", ")
+                        }
+                    ),
+                );
+            }
+        }
+    }
+    Some(if files {
+        AccessDecl::Files {
+            write: value == "write",
+            path: opts.path.clone(),
+        }
+    } else {
+        let variant = if value == "independent" {
+            "Independent"
+        } else {
+            "Alone"
+        };
+        AccessDecl::Plain(Ident::new(variant, word.span()))
     })
 }
 
@@ -735,6 +857,37 @@ impl Analysis {
             }
         });
 
+        let access = self.access.as_ref().map(|decl| match decl {
+            AccessDecl::Plain(variant) => quote! {
+                fn access(&self, _args: &#krate::__private::Value) -> #krate::ToolAccess {
+                    #krate::ToolAccess::#variant
+                }
+            },
+            AccessDecl::Files { write, path } => {
+                let constructor = if *write {
+                    format_ident!("writes_path")
+                } else {
+                    format_ident!("reads_path")
+                };
+                let place = match path {
+                    Some(arg) => quote! {
+                        __args.get(#arg).and_then(#krate::__private::Value::as_str)
+                    },
+                    None => quote!(::core::option::Option::None),
+                };
+                quote! {
+                    fn access(&self, __args: &#krate::__private::Value) -> #krate::ToolAccess {
+                        #krate::ToolAccess::#constructor(#FILES_SCOPE, #place)
+                    }
+                }
+            }
+            AccessDecl::With(function) => quote! {
+                fn access(&self, __args: &#krate::__private::Value) -> #krate::ToolAccess {
+                    #function(__args)
+                }
+            },
+        });
+
         let asks_user = self.asks_user.then(|| {
             quote! {
                 fn asks_user(&self) -> bool {
@@ -807,6 +960,7 @@ impl Analysis {
 
                 #asks_user
                 #paged
+                #access
 
                 #step_style
 
@@ -1159,6 +1313,70 @@ mod tests {
             },
         );
         lacks(&out, "asks_user");
+    }
+
+    #[test]
+    fn parallel_declares_what_a_call_shares() {
+        let item = || {
+            quote! {
+                /// Read.
+                async fn read_file(path: String) -> String { path }
+            }
+        };
+        let out = ok(quote!(parallel = "independent"), item());
+        has(
+            &out,
+            "fnaccess(&self,_args:&::adam::__private::Value)->::adam::ToolAccess{::adam::ToolAccess::Independent}",
+        );
+        let out = ok(quote!(parallel = "exclusive"), item());
+        has(&out, "::adam::ToolAccess::Alone");
+        let out = ok(quote!(parallel = "read"), item());
+        has(
+            &out,
+            "::adam::ToolAccess::reads_path(\"files\",::core::option::Option::None)",
+        );
+        let out = ok(quote!(parallel = "write", path = "path"), item());
+        has(
+            &out,
+            "::adam::ToolAccess::writes_path(\"files\",__args.get(\"path\").and_then(::adam::__private::Value::as_str))",
+        );
+        let out = ok(quote!(access = scope_of), item());
+        has(
+            &out,
+            "fnaccess(&self,__args:&::adam::__private::Value)->::adam::ToolAccess{scope_of(__args)}",
+        );
+        // Without an option the trait's default (`Alone`) stands.
+        let out = ok(quote!(), item());
+        lacks(&out, "fnaccess");
+    }
+
+    #[test]
+    fn a_wrong_parallel_option_is_refused() {
+        let item = || {
+            quote! {
+                /// Read.
+                async fn read_file(path: String) -> String { path }
+            }
+        };
+        let msg = err(quote!(parallel = "readonly"), item());
+        assert!(
+            msg.contains("unknown `parallel` `readonly`")
+                && msg.contains("independent, read, write, exclusive"),
+            "{msg}"
+        );
+        let msg = err(quote!(parallel = "independent", path = "path"), item());
+        assert!(msg.contains("`path` only goes with"), "{msg}");
+        let msg = err(quote!(path = "path"), item());
+        assert!(msg.contains("`path` goes with `parallel"), "{msg}");
+        let msg = err(quote!(parallel = "read", path = "file"), item());
+        assert!(
+            msg.contains("names no argument of the function; its arguments are: path"),
+            "{msg}"
+        );
+        let msg = err(quote!(parallel = "read", access = scope_of), item());
+        assert!(msg.contains("use one"), "{msg}");
+        let msg = err(quote!(access = scope_of, path = "path"), item());
+        assert!(msg.contains("not with `access`"), "{msg}");
     }
 
     #[test]
@@ -1577,7 +1795,7 @@ mod tests {
         );
         assert_eq!(
             msg,
-            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon"
+            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, paged, crate, step, label, icon, parallel, path, access"
         );
         for repeated in [
             quote!(name = "a", name = "b"),

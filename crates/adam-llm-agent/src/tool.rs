@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::access::ToolAccess;
 use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
 use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
@@ -34,10 +35,13 @@ pub const TOOL_STOP_GRACE: Duration = Duration::from_secs(5);
 /// The agent runs every call inside a journaled step: once a call has
 /// returned, its result is recorded and never recomputed, even across a crash
 /// or a change of worker. A call that dies *before* it is recorded (a crash
-/// mid-call, or [`ToolError::Transient`]) runs again, and so does every tool
-/// of the same model turn that ran before it in the failed attempt. A tool
-/// with side effects must therefore be safe to retry: idempotent, or guarded
-/// by a key derived from [`ToolCtx::call_id`].
+/// mid-call, or [`ToolError::Transient`]) runs again, and so does every call
+/// of the same model turn that started in the failed attempt: the calls of a
+/// turn run at the same time, up to the agent's limit
+/// ([`LlmAgentBuilder::max_parallel`](crate::LlmAgentBuilder::max_parallel)), except where
+/// [`access`](Self::access) says they may not. A tool with side effects must
+/// therefore be safe to retry: idempotent, or guarded by a key derived from
+/// [`ToolCtx::call_id`].
 #[async_trait]
 pub trait Tool: Send + Sync + 'static {
     /// Name, description and JSON Schema of the arguments, as shown to the
@@ -115,6 +119,26 @@ pub trait Tool: Send + Sync + 'static {
     /// it forwards [`required_state`](Self::required_state).
     fn step_style(&self) -> StepStyle {
         StepStyle::default()
+    }
+
+    /// What a call with these `args` shares with the other calls of its model turn: the loop runs
+    /// the calls of a turn at the same time and keeps the model's order only between calls that
+    /// conflict ([`ToolAccess`]). `args` are the call's arguments as the model made them, so the
+    /// answer is a function of the recorded turn and the same on every replay.
+    ///
+    /// The default is [`ToolAccess::Alone`]: the call runs by itself, after every call before it,
+    /// which is what a tool that declares nothing needs, because adam cannot know what it shares.
+    /// Declare what the tool really uses (`#[tool(parallel = "read", path = "path")]` writes it
+    /// for a function, [`FnTool::with_access`](crate::FnTool::with_access) for a closure). A tool
+    /// whose [`asks_user`](Self::asks_user) is `true`, the session tools, and a tool that can park
+    /// the run on a child or a remote task run alone whatever they say here.
+    ///
+    /// A tool that wraps another (see [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it, as
+    /// it forwards [`required_state`](Self::required_state): one that does not makes the tool
+    /// `Alone`, which is safe.
+    fn access(&self, args: &Value) -> ToolAccess {
+        let _ = args;
+        ToolAccess::Alone
     }
 
     /// Whether the answer to this tool's own question may be acted on: the loop asks before it

@@ -118,7 +118,10 @@ let tools = tools![AskUser];
 
 The doc comment is the tool's description for the model, parameter doc comments are the property descriptions,
 the arguments struct and its JSON Schema are generated, and the call runs inside the journaled step, so write
-tools that are **safe to repeat**. Embed the folder with `adam_agent_fs::build("agent").emit()` in `build.rs` and
+tools that are **safe to repeat**. The calls of one model turn run at the same time (up to 10 by default); a tool that
+shares something with other calls says so, `#[tool(parallel = "read", path = "path")]`, `"write"`, `"independent"`, or
+`access = my_fn`, and a tool that says nothing runs by itself, after the calls before it
+([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)). Embed the folder with `adam_agent_fs::build("agent").emit()` in `build.rs` and
 `adam::include_agent!()`; bind it with `AgentDef::from_manifest(AGENT)?.bind(tools)?.state(env).model(model, alias)?`.
 Files for the common case, a Rust wrapper around the assembled agent for policy (the coder does this for its
 completion rule). The full contract: [Agent files and `#[tool]`](../reference/agent-files.md#the-tool-contract).
