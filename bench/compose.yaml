@@ -1,0 +1,220 @@
+# The benchmark stack (bench/README.md, "The stack"): the pieces of the dev stack that a headless adam-coder
+# needs, and one Podman service and one coder for each slot. Nothing here is started by hand: `bench` brings it
+# up, writes the per-run settings of a coder to `$BENCH_STACK_DIR/slot-N.env` (mode 0600, removed once the coder
+# is created) and recreates the coder for each run. Every credential in this file is a dummy; the model's key
+# is never here: it lives in the harness's meter, which this stack reaches only through `meter`.
+#
+# Variables the harness sets (a person never needs to): BENCH_HOME (shared with the Podman services at the same
+# path), BENCH_TASKS_DIR (the repository's bench/tasks, read-only), BENCH_STACK_DIR, BENCH_AGENT_DIR (the agent
+# folder of the coder image's revision, without mcp.json), BENCH_METER_PORT, and the optional BENCH_GIT_PORT,
+# BENCH_CODER_1_PORT, BENCH_CODER_2_PORT.
+#
+# Networks:
+#   coder-net  internal; the coders, postgres, git-server, mock-github. No route out.
+#   model-net  internal; the coders, the Podman services and `meter`. A container the Podman service runs
+#              shares the service's network namespace (dev/podman/README.md), so what an agent's commands can
+#              reach is exactly what is on this network: the meter, and nothing else.
+#   egress     a plain bridge: `meter` (to reach the harness on the host), git-server and the coders (a
+#              published port needs one). The Podman services are never on it, except while the harness
+#              pulls a task image (`docker network connect`, then `disconnect`).
+#
+# Two slots, because that is what a 4 CPU, 12 GB Podman service each fits on one desktop. A third needs
+# services `podman-3` and `coder-3`, a database in postgres-init.sql and the three volumes.
+
+name: adam-bench
+
+x-wiremock: &wiremock
+  image: wiremock/wiremock:3.13.2
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/__admin/health"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+    start_period: 5s
+
+x-podman: &podman
+  build:
+    context: ../dev/podman
+    dockerfile: Containerfile
+  image: adam-rs/podman:dev
+  restart: "no"
+  user: "10001:10001"
+  command: ["podman", "system", "service", "--time=0", "unix:///run/podman/podman.sock"]
+  environment:
+    PODMAN_IGNORE_CGROUPSV1_WARNING: "1"
+  security_opt:
+    # The three options of dev/compose.devcontainer.yaml, for the reasons in dev/podman/README.md.
+    # An absolute path, set by the harness: whether Compose resolves a relative one against the project
+    # directory is unverified (dev/podman/README.md).
+    - seccomp=${PODMAN_SECCOMP:?the harness sets PODMAN_SECCOMP to the absolute path of dev/podman/seccomp.json}
+    - systempaths=unconfined
+    - apparmor=unconfined
+  # No privileged, no cap_add, no devices. The service bounds every container it runs together: their own
+  # cgroups are off, so one run at a time per service.
+  cpus: 4
+  mem_limit: 12g
+  pids_limit: 4096
+  networks: [model-net]
+  healthcheck:
+    test: ["CMD", "podman", "--remote", "--url", "unix:///run/podman/podman.sock", "info"]
+    interval: 5s
+    timeout: 10s
+    retries: 24
+    start_period: 5s
+
+x-coder: &coder
+  image: ghcr.io/vymalo/another-adam-rs/coder:sha-2d5d0b3@sha256:347664483a175b96b89fad2e6f42de1c1f9c0d7f4feac0d271eff6316562ac91
+  restart: "no"
+  environment: &coder-env
+    MODEL_API_KEY: bench-dummy-key # the meter holds the real key
+    MODEL: bench-model
+    WORKSPACE_ROOT: /work
+    WORKSPACE_SWEEP_SECS: "0" # the worktree stays until the harness has copied it
+    ALLOWED_REPO_HOSTS: git-server
+    ALLOW_LOCAL_REPOS: "true" # development and tests only: plain http to git-server
+    GITHUB_API_URL: http://mock-github:8080 # open_pull_request succeeds, so a run completes instead of parking
+    GITHUB_TOKEN: bench-dummy-token
+    ADAM_AGENT_DIR: /etc/adam/agent
+    DEVCONTAINER_RUNTIME: podman
+    CONTAINER_HOST: unix:///run/podman/podman.sock
+    DEVCONTAINER_PREPULL: "false"
+    DEVCONTAINER_NETWORK: inherit
+  healthcheck:
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+    interval: 3s
+    timeout: 3s
+    retries: 40
+    start_period: 10s
+
+services:
+  postgres:
+    image: postgres:16
+    restart: "no"
+    environment:
+      POSTGRES_PASSWORD: postgres # dummy, local only, on an internal network
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-bench.sql:ro
+    networks: [coder-net]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+
+  mock-github:
+    <<: *wiremock
+    command: ["--global-response-templating"]
+    volumes:
+      - ../dev/wiremock/mock-github/mappings:/home/wiremock/mappings:ro
+      - ../dev/wiremock/mock-github/__files:/home/wiremock/__files:ro
+    networks: [coder-net]
+
+  git-server:
+    build:
+      context: ../dev/git-server
+    restart: "no"
+    environment:
+      AUTO_CREATE_OWNERS: bench # bench/<slug>.git is made, empty, the first time it is pushed to
+    ports: ["127.0.0.1:${BENCH_GIT_PORT:-18083}:8080"]
+    volumes:
+      - git-data:/srv/git
+    networks: [coder-net, egress]
+
+  # The only way to the model: a TCP relay with one fixed target, the harness's meter on the host.
+  meter:
+    image: ghcr.io/vymalo/another-adam-rs/coder:sha-2d5d0b3@sha256:347664483a175b96b89fad2e6f42de1c1f9c0d7f4feac0d271eff6316562ac91
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    entrypoint: ["node", "/relay.mjs"]
+    environment:
+      RELAY_PORT: "8090"
+      RELAY_TARGET: host.docker.internal:${BENCH_METER_PORT:?the harness sets BENCH_METER_PORT}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./lib/relay.mjs:/relay.mjs:ro
+    networks: [model-net, egress]
+
+  podman-1:
+    <<: *podman
+    volumes:
+      - podman-socket-1:/run/podman
+      - podman-storage-1:/home/agent/.local/share/containers
+      # The coder's workspace volume at the same path as in the coder: a bind source is resolved by the service.
+      - work-1:/work
+      # What the harness gives a container (a patch, the hidden tests, a statement): the same path as on the host.
+      - ${BENCH_HOME:?the harness sets BENCH_HOME}:${BENCH_HOME}
+      - ${BENCH_TASKS_DIR:?the harness sets BENCH_TASKS_DIR}:${BENCH_TASKS_DIR}:ro
+
+  podman-2:
+    <<: *podman
+    volumes:
+      - podman-socket-2:/run/podman
+      - podman-storage-2:/home/agent/.local/share/containers
+      - work-2:/work
+      - ${BENCH_HOME}:${BENCH_HOME}
+      - ${BENCH_TASKS_DIR}:${BENCH_TASKS_DIR}:ro
+
+  coder-1:
+    <<: *coder
+    depends_on:
+      podman-1: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      git-server: { condition: service_healthy }
+      mock-github: { condition: service_healthy }
+      meter: { condition: service_started }
+    environment:
+      <<: *coder-env
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/adam_bench_1
+      PUBLIC_URL: http://127.0.0.1:${BENCH_CODER_1_PORT:-18081}/
+    # The run's own settings: the model address (with the run's meter token), the A2A bearer, the task image.
+    env_file:
+      - path: ${BENCH_STACK_DIR:?the harness sets BENCH_STACK_DIR}/slot-1.env
+        required: false
+    ports: ["127.0.0.1:${BENCH_CODER_1_PORT:-18081}:8080"]
+    volumes:
+      - work-1:/work
+      - podman-socket-1:/run/podman
+      - ${BENCH_AGENT_DIR:?the harness sets BENCH_AGENT_DIR}:/etc/adam/agent:ro
+    networks: [coder-net, model-net, egress]
+
+  coder-2:
+    <<: *coder
+    depends_on:
+      podman-2: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      git-server: { condition: service_healthy }
+      mock-github: { condition: service_healthy }
+      meter: { condition: service_started }
+    environment:
+      <<: *coder-env
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/adam_bench_2
+      PUBLIC_URL: http://127.0.0.1:${BENCH_CODER_2_PORT:-18082}/
+    env_file:
+      - path: ${BENCH_STACK_DIR}/slot-2.env
+        required: false
+    ports: ["127.0.0.1:${BENCH_CODER_2_PORT:-18082}:8080"]
+    volumes:
+      - work-2:/work
+      - podman-socket-2:/run/podman
+      - ${BENCH_AGENT_DIR}:/etc/adam/agent:ro
+    networks: [coder-net, model-net, egress]
+
+networks:
+  coder-net:
+    internal: true
+  model-net:
+    internal: true
+  egress: {}
+
+volumes:
+  postgres-data:
+  git-data:
+  podman-socket-1:
+  podman-socket-2:
+  podman-storage-1:
+  podman-storage-2:
+  work-1:
+  work-2:
