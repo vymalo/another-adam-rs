@@ -145,6 +145,8 @@ mod images;
 mod kept;
 pub mod paging;
 mod plan;
+#[allow(dead_code)] // used by the loop in the next commit
+mod schedule;
 #[cfg(feature = "schema")]
 mod schema;
 mod sessions;

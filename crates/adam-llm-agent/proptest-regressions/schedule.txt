@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 81029340f4da1f8d160999c1d3eec360bc50136736c8212e79b8f4eb4744f6ae # shrinks to (entries, limit, durations) = ([Entry { access: Alone, barrier: false }, Entry { access: Uses([Use { mode: Read, scope: "files" }]), barrier: false }, Entry { access: Uses([Use { mode: Write, scope: "files" }]), barrier: false }], 2, [0])
