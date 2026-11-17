@@ -1392,6 +1392,39 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_on_a_location_source_line_is_scrubbed() {
+        // The tool set scrubs every result once more; this is the line's own scrub.
+        let secret = "ghp_FAKEtoken0123456789abcdefghijklmnop";
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, format!("let t = \"{secret}\";\n")).unwrap();
+        let mapper = Mapper {
+            slots: vec![MappedSlot {
+                dir: "w".to_owned(),
+                path: dir.path().to_path_buf(),
+                canon: std::fs::canonicalize(dir.path()).unwrap(),
+                root: Arc::new(SlotDir::open(dir.path()).unwrap()),
+            }],
+            current: 0,
+        };
+        let at = Loc {
+            uri: file_uri(&file),
+            line: 0,
+            character: 4,
+        };
+        let rows = format_locations(
+            &mapper,
+            &Redactor::new([secret]),
+            &[],
+            vec![at],
+            Encoding::Utf16,
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(!rows[0].contains(secret), "{}", rows[0]);
+        assert!(rows[0].contains("[redacted]"), "{}", rows[0]);
+    }
+
+    #[test]
     fn wait_and_position_are_checked() {
         assert_eq!(wait_of(None).unwrap(), Duration::from_secs(30));
         assert_eq!(wait_of(Some(120)).unwrap(), Duration::from_secs(120));

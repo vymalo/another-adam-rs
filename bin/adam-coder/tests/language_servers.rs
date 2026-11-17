@@ -2403,13 +2403,6 @@ async fn definition_in(name: &str, text: &str, symbol: &str, character: u64) -> 
 }
 
 #[tokio::test]
-async fn a_secret_on_a_location_source_line_is_scrubbed() {
-    let (_lsp, said) = definition_in("s", &format!("let t = \"{GITHUB_TOKEN}\";\n"), "t", 4).await;
-    assert!(!said.contains(GITHUB_TOKEN), "{said}");
-    assert!(said.contains("[redacted]"), "{said}");
-}
-
-#[tokio::test]
 async fn a_location_climbing_out_with_dotdot_is_outside_the_workspace() {
     let lsp = Lsp::new(json!({"results": {"textDocument/definition": [
         {"uri": "$ROOT/../../etc/passwd",
