@@ -100,3 +100,21 @@ test('median and nearest-rank percentile', () => {
   assert.equal(percentile([5], 90), 5);
   assert.equal(percentile([], 90), null);
 });
+
+test('row 16: the exact McNemar test does not underflow for many discordant pairs', () => {
+  assert.equal(mcnemarExact(1000, 1000), 1);
+  assert.equal(mcnemarExact(1100, 1100), 1);
+  assert.equal(mcnemarExact(2000, 2000), 1);
+  // n = 1100, b = 549, c = 551. P(X <= 549) = P(X >= 551) and P(X = 550) is the rest, so
+  //   p = 2 * P(X <= 549) = 1 - C(1100, 550) / 2^1100.
+  // With m = 550, C(2m, m) / 4^m = (1 / sqrt(pi m)) * (1 - 1/(8m) + 1/(128 m^2) + ...)
+  //   = 0.0240571 * 0.9997727 = 0.0240517, so p = 0.9759483.
+  near(mcnemarExact(549, 551), 0.9759483, 1e-6);
+  near(mcnemarExact(551, 549), 0.9759483, 1e-6);
+  // far in the tail the answer is a tiny positive number or 0, never NaN or above 1
+  const tail = mcnemarExact(100, 1000);
+  assert.ok(tail >= 0 && tail < 1e-100, String(tail));
+  assert.equal(mcnemarExact(0, 1100), 0, '2 * 2^-1100 is below the smallest double');
+  // the small cases keep their exact values
+  assert.equal(mcnemarExact(1, 5), 0.21875);
+});

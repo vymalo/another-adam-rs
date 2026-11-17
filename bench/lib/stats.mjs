@@ -23,13 +23,25 @@ export function wilson(successes, n, z = Z95) {
   return { p, low: Math.max(0, center - half), high: Math.min(1, center + half) };
 }
 
-/** P(X <= k) for X ~ Binomial(n, 1/2), summed term by term from the smallest. */
+/**
+ * P(X <= k) for X ~ Binomial(n, 1/2). Up to n = 1000 the terms are summed from the smallest as
+ * they are (exact for small n). Above it 2^-n would underflow, so the terms are built in log
+ * space; a term below the smallest double is dropped (it is that small).
+ */
 function binomialCdfHalf(k, n) {
-  let term = 0.5 ** n;
   let sum = 0;
+  if (n <= 1000) {
+    let term = 0.5 ** n;
+    for (let i = 0; i <= k; i++) {
+      sum += term;
+      term = (term * (n - i)) / (i + 1);
+    }
+    return sum;
+  }
+  let logTerm = -n * Math.LN2;
   for (let i = 0; i <= k; i++) {
-    sum += term;
-    term = (term * (n - i)) / (i + 1);
+    sum += Math.exp(logTerm);
+    logTerm += Math.log(n - i) - Math.log(i + 1);
   }
   return sum;
 }
