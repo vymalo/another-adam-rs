@@ -216,3 +216,29 @@ changing the above:
 
 *Unverified*: `realHarness` and everything below it that needs a container service (two slots on a real Podman service, the pulls
 of task images, the own-task images on a slot's service, a budget below one call's worst case). `bench/README.md`, "Unverified".
+
+## Amended 2026-11-17: after a blind review of slice 4 and a smoke test on a real model
+
+The review found one critical and seven major faults; the smoke test found six more. The decisions, each held by a test
+(`bench/test/fix4.test.mjs` and the files it names in `bench/README.md`):
+
+* **The ledger is bound to one configuration.** Every run carries a keyed fingerprint of the model id, prices, arms, limits, context
+  window, pins, locks, seed and self repository. A command refuses a ledger of another one and says to use a new `BENCH_HOME`;
+  nothing pools two. This supersedes the earlier statement that a pilot is "reused if the configuration digest is unchanged".
+* **The pilot is not a result.** Its blocks run again in the full run under the confirmed budget; the pilot is reported apart and is in
+  no rate. This amends the note of slice 4 that the pilot is a prefix whose runs the full run does not repeat.
+* **The budget has a floor** (1.5 p95 plus the largest worst case of one call, and never under two worst cases), a censored pilot needs
+  `--censored`, and the projection is checked against the live cap at every run.
+* **Whole blocks.** A block is held whole before its first run starts; a block that does not fit is not planned. `NotStarted` is not
+  final: a later start with room plans it again. This amends the slice 4 note that said "a stop at the cap leaves whole blocks"
+  where runs were reserved one at a time.
+* **Host git** of the upstream clone runs in the allow-listed environment. **The grader's network window is alone** on the grader
+  (a shared and an exclusive side of one lock), pulls are one in-flight promise each, and run ids are unique by construction.
+* **Own-task images** are put on the slots and the grader before any money is spent, from an archive the harness makes itself.
+* **The meter settles from the usage it already read** when a client closes at `[DONE]` (it had charged the worst case, about fifty
+  times the cost, on those calls).
+* **The self tasks' statements carry no scripted-model switch**, an own task whose repository has no test command is refused by the
+  lint, `doctor` warns about a proxy without `NODE_USE_ENV_PROXY=1`, and CI runs Node 22 and 24.
+
+*Unverified*, as before: everything that needs a container service, including the archive transfer of an own image and the grader's lock
+under two real slots.
