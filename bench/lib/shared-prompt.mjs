@@ -9,6 +9,7 @@
 // Which sections are shared is a table (`SECTIONS`), decided by a person and recorded in bench/README.md and ADR 0048. A section the
 // table does not know is an error: a new revision of the pin that adds or renames a section must be decided before it is run.
 import { localGit } from './grade.mjs';
+import { applyMap } from './prompt-map.mjs';
 
 export const INSTRUCTIONS_PATH = 'bin/adam-coder/agent/instructions.md';
 export const PREAMBLE = '(the opening paragraphs, before the first heading)';
@@ -74,8 +75,9 @@ export function namedTools(raw, tools) {
 }
 
 /**
- * The shared prompt of an `instructions.md`: { template, text, sections }. `template` is the kept sections as they are in the file;
- * `text` is the same with its variables filled in. Throws when a section is not in the table, or a kept section reads a variable the
+ * The shared prompt of an `instructions.md`: { template, mapped, applied, text, sections }. `template` is the kept sections as they are in the
+ * file (adam's words); `mapped` is the template in OpenCode's words (bench/lib/prompt-map.mjs); `text` is `mapped` with the numbers the file's
+ * front matter gives filled in, and is what OpenCode receives. Throws when a section is not in the table, or a kept section reads a variable the
  * file does not give.
  */
 export function sharedPrompt(instructions) {
@@ -85,12 +87,15 @@ export function sharedPrompt(instructions) {
   const missing = Object.keys(SECTIONS).filter((h) => !sections.some((s) => s.heading === h));
   if (missing.length > 0) throw new Error(`adam's instructions no longer have the section(s) ${missing.join(', ')}: update SECTIONS`);
   const template = kept.map((s) => s.raw).join('');
+  const { mapped, applied } = applyMap(template);
+  const left = namedTools(mapped, adamToolNames(instructions));
+  if (left.length > 0) throw new Error(`the mapped text still names adam's tool(s) ${left.join(', ')}: add them to bench/lib/prompt-map.mjs (a name OpenCode has, or a span that rewrites or drops the sentence)`);
   const vars = frontMatterVars(instructions);
-  const text = template.replace(/\{\{([a-z_]+)\}\}/g, (all, name) => {
+  const text = mapped.replace(/\{\{([a-z_]+)\}\}/g, (all, name) => {
     if (!Object.hasOwn(vars, name)) throw new Error(`a shared section reads {{${name}}}, which the file's front matter does not give`);
     return vars[name];
   });
-  return { template, text, sections };
+  return { template, mapped, applied, text, sections };
 }
 
 /** adam's instructions at a revision of this repository (the harness's own checkout, as `ensureAgentFolder` reads it). */

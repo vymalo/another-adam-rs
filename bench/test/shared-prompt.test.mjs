@@ -8,6 +8,7 @@ import { configFingerprint } from '../lib/budget.mjs';
 import { normalizeConfig } from '../lib/config.mjs';
 import { localGit } from '../lib/grade.mjs';
 import { PINS } from '../lib/pins.mjs';
+import { NAMES, NO_COUNTERPART, SPANS, applyMap, withoutSubstitutions } from '../lib/prompt-map.mjs';
 import { INSTRUCTIONS_PATH, PREAMBLE, SECTIONS, adamToolNames, frontMatterVars, namedTools, readInstructionsAt, sectionsOf, sharedPrompt } from '../lib/shared-prompt.mjs';
 import { rawConfig, tmp } from './helpers.mjs';
 
@@ -84,20 +85,22 @@ test('the variables are filled in from the file\'s own front matter and from not
   const file = await atPin(t);
   if (!file) return;
   assert.deepEqual(frontMatterVars(file), { max_check_cycles: '3', scratch_check_cycles: '5' });
-  const { template, text } = sharedPrompt(file);
+  const { template, mapped, text } = sharedPrompt(file);
   assert.match(template, /\{\{max_check_cycles\}\} times/);
-  assert.match(text, /at most 3 times in\s+a repository, and 5 times in a scratch project/);
-  assert.equal(text, template.replace('{{max_check_cycles}}', '3').replace('{{scratch_check_cycles}}', '5'));
+  assert.match(text, /at most 3 times in\s+a repository \(a cycle is/);
+  assert.equal(text, mapped.replace('{{max_check_cycles}}', '3'));
+  assert.ok(!/\{\{/.test(mapped.replace('{{max_check_cycles}}', '')), 'no other variable is left');
 });
 
 const SYNTH = (extra = '', vars = '  max_check_cycles: 3\n') => `---\nname: coder\nvars:\n${vars}---\nYour name is Adam.\n\n${Object.keys(SECTIONS).filter((h) => h !== PREAMBLE).map((h) => `# ${h}\nbody of ${h} {{max_check_cycles}}\n\n`).join('')}${extra}`;
 
-test('a section the table does not know, or one that went away, is an error that says what to decide', () => {
-  assert.doesNotThrow(() => sharedPrompt(SYNTH()));
+test('a section the table does not know, or one that went away, is an error that says what to decide', async (t) => {
+  assert.throws(() => sharedPrompt(SYNTH()), /does not find its text exactly once/, 'every section is known, but the synthetic text is not adam\'s, so the mapping refuses it');
   assert.throws(() => sharedPrompt(SYNTH('# A new section\nbody\n')), /"A new section".*no decision/);
   assert.throws(() => sharedPrompt(SYNTH().replace('# Helpers\n', '# Subagents\n')), /Subagents/);
   assert.throws(() => sharedPrompt(SYNTH().replace('# Access tiers\nbody of Access tiers {{max_check_cycles}}\n\n', '')), /no longer have the section\(s\) Access tiers/);
-  assert.throws(() => sharedPrompt(SYNTH('', '  scratch_check_cycles: 5\n')), /does not give/);
+  const file = await atPin(t);
+  if (file) assert.throws(() => sharedPrompt(file.replace('  max_check_cycles: 3\n', '')), /does not give/);
 });
 
 test('OpenCode is given exactly the shared text: a file in its read-only input directory, named in the configuration', () => {
@@ -133,4 +136,83 @@ test('the configuration digest includes the shared prompt, so changing it voids 
   assert.deepEqual(Object.keys(fp('one').fields).includes('prompt'), true);
   assert.notEqual(fp('one').fields.prompt, fp('two').fields.prompt);
   assert.ok(!JSON.stringify(fp('a very specific sentence')).includes('specific'), 'the text is not in the fingerprint');
+});
+
+test('OpenCode\'s shared text names no adam-only tool, and none of adam\'s product features', async (t) => {
+  const file = await atPin(t);
+  if (!file) return;
+  const { text } = sharedPrompt(file);
+  assert.deepEqual(namedTools(text, adamToolNames(file)), []);
+  for (const word of ['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository', 'apply_patch', 'run_command', 'read_file', 'write_file', 'edit_file', 'accept_red_checks', 'obscura', 'scratch']) {
+    assert.ok(!text.includes(word), `${word} is not in OpenCode's text`);
+  }
+  for (const own of ['`shell`', '`read`', '`write`', '`edit`']) assert.ok(text.includes(own), `${own} is named`);
+  assert.ok(!text.includes('`patch`'), 'OpenCode 2.3.0 has no patch tool');
+});
+
+test('every adam tool named in the four sections is in the mapping table: a renamed one, or one a sentence was rewritten or dropped for', async (t) => {
+  const file = await atPin(t);
+  if (!file) return;
+  const { template, applied } = sharedPrompt(file);
+  const named = namedTools(template, adamToolNames(file));
+  const handled = new Set([...Object.keys(NAMES), ...NO_COUNTERPART]);
+  assert.deepEqual(named.filter((n) => !handled.has(n)), [], 'no tool is unmapped');
+  // each tool with no counterpart is inside a span the table rewrites or drops; each renamed tool has a rename or sits in a span
+  for (const tool of NO_COUNTERPART) {
+    const inSpan = applied.filter((a) => a.kind !== 'name' && a.original.includes(`\`${tool}`));
+    assert.ok(inSpan.length > 0, `${tool} is handled by a span`);
+  }
+  for (const [from, to] of Object.entries(NAMES)) {
+    const renamed = applied.some((a) => a.id === `name:${from}`) || applied.some((a) => a.kind !== 'name' && a.original.includes(`\`${from}\``));
+    assert.ok(renamed, `${from} is mapped to ${to}`);
+  }
+  assert.deepEqual(NAMES, { run_command: 'shell', run: 'shell', read_file: 'read', write_file: 'write', edit_file: 'edit', apply_patch: 'edit' });
+});
+
+test('the mapped text is the original with only the table\'s substitutions applied, segment by segment', async (t) => {
+  const file = await atPin(t);
+  if (!file) return;
+  const { template, mapped, applied } = sharedPrompt(file);
+  assert.notEqual(mapped, template);
+  // cut every substitution out of both texts: what is left must be the same
+  assert.equal(withoutSubstitutions(template, applied, 'template'), withoutSubstitutions(mapped, applied, 'mapped'));
+  for (const a of applied) {
+    assert.equal(template.slice(a.at, a.at + a.length), a.original, `${a.id}: the original is where it says`);
+    assert.equal(mapped.slice(a.mappedAt, a.mappedAt + a.mappedLength), a.to, `${a.id}: the replacement is where it says`);
+  }
+  // and every span of the table was used once, in the template's order
+  assert.deepEqual(SPANS.map((s) => s.id).sort(), applied.filter((a) => a.kind !== 'name').map((a) => a.id).sort());
+  assert.deepEqual(applied.filter((a) => a.kind === 'drop').map((a) => a.id), ['how-5-screenshot', 'toolchain-result-says', 'ending-delivered-file', 'rules-scratch'].sort((x, y) => applied.findIndex((a) => a.id === x) - applied.findIndex((a) => a.id === y)));
+});
+
+test('a revision of adam\'s file that rewords a mapped sentence, or adds an unmapped tool to a shared section, is an error', () => {
+  assert.throws(() => applyMap('# How to work\nnothing the table knows\n'), /does not find its text exactly once/);
+  const file = (extra) => `---\nname: coder\nvars:\n  max_check_cycles: 3\n---\n# Tools\n\n- \`new_tool { x }\`: does something.\n- \`ask_user { q }\`: asks.\n\n${Object.keys(SECTIONS).filter((h) => h !== PREAMBLE && h !== 'Tools').map((h) => `# ${h}\n${h === 'How to work' ? extra : ''}\n`).join('')}`;
+  assert.throws(() => sharedPrompt(file('call `new_tool` now')), /does not find its text|still names/);
+});
+
+test('the fingerprint covers the mapped text: the digest is of what OpenCode receives', async (t) => {
+  const file = await atPin(t);
+  if (!file) return;
+  const { text } = sharedPrompt(file);
+  const config = normalizeConfig(rawConfig());
+  const fp = (sharedPromptText) => configFingerprint({ config, pins: PINS, lockTexts: ['a', 'b'], key: 'k', sharedPrompt: sharedPromptText });
+  assert.equal(fp(text).digest, fp(sharedPrompt(file).text).digest);
+  assert.notEqual(fp(text).digest, fp(text.replace('`shell`', '`bash`')).digest, 'a changed substitution voids a ledger');
+  assert.notEqual(fp(text).digest, fp(sharedPrompt(file).template).digest, 'adam\'s own words are another text');
+});
+
+test('the README and ADR 0048 show every replaced or dropped phrase, so the owner sees how OpenCode\'s text differs', async (t) => {
+  const file = await atPin(t);
+  if (!file) return;
+  const { applied } = sharedPrompt(file);
+  const norm = (x) => x.replace(/\s*\n\s*/g, ' ').replace(/\|/g, '\\|').trim();
+  const docs = [path.join(REPO, 'bench', 'README.md'), path.join(REPO, 'docs', 'decisions', '0048-a-benchmark-harness-for-adam-coder-and-opencode.md')].map((f) => fs.readFileSync(f, 'utf8'));
+  for (const doc of docs) {
+    for (const a of applied.filter((x) => x.kind !== 'name')) {
+      assert.ok(doc.includes(norm(a.original)), `${a.id}: adam's words are shown`);
+      if (a.to !== '') assert.ok(doc.includes(norm(a.to)), `${a.id}: OpenCode's words are shown`);
+    }
+    for (const [from, to] of Object.entries(NAMES)) assert.ok(doc.includes(`| \`${from}\` | \`${to}\` |`) || doc.includes(`\`${from}\``), `${from} is shown`);
+  }
 });
