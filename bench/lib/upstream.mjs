@@ -69,6 +69,11 @@ export function taskChecksum(relDir, sums) {
   return crypto.createHash('sha256').update(lines.join('\n')).digest('hex');
 }
 
+/** The arguments of the clone; `--` ends the options before the URL and the directory. */
+export function cloneArgs(url, dir) {
+  return ['clone', '-q', '--no-checkout', ...(isLocal(url) ? [] : ['--filter=blob:none']), '--', url, dir];
+}
+
 const isLocal = (url) => !/^[a-z][a-z0-9+.-]*:\/\//i.test(url) || url.startsWith('file://');
 
 /**
@@ -95,7 +100,7 @@ export function fetchUpstream({ url, commit, dir, sumsDir = 'v2' }) {
   try {
     if (!fs.existsSync(path.join(dir, '.git'))) {
       fs.mkdirSync(path.dirname(dir), { recursive: true });
-      execFileSync('git', ['clone', '-q', '--no-checkout', ...(isLocal(url) ? [] : ['--filter=blob:none']), '--', url, dir], { stdio: 'pipe' });
+      execFileSync('git', cloneArgs(url, dir), { stdio: 'pipe' });
     }
     const origin = git(dir, ['remote', 'get-url', 'origin']).trim();
     if (origin !== url) throw new UpstreamError('the existing upstream clone has another origin than the configured URL: remove it or fix tasks.upstreamUrl');

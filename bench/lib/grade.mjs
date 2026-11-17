@@ -34,13 +34,27 @@ export class PatchTooLarge extends Error {
 
 /** What git runs with on the harness's side: no system or global configuration, no hooks, attributes, fsmonitor or textconv. */
 const SAFE_C = ['-c', 'core.quotepath=off', '-c', 'core.autocrlf=false', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null', '-c', 'protocol.ext.allow=never'];
-const safeEnv = () => ({ ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_DIR: undefined, GIT_WORK_TREE: undefined, GIT_INDEX_FILE: undefined });
+const emptyHome = () => {
+  emptyHome.dir ??= fs.mkdtempSync(path.join(os.tmpdir(), 'bench-git-home-'));
+  return emptyHome.dir;
+};
+
+/**
+ * The environment git runs in on the harness's side: no system or global configuration, no configuration that
+ * arrives through the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and its KEY/VALUE pairs), and an
+ * empty HOME and XDG_CONFIG_HOME so no user file is found.
+ */
+export function safeEnv(home = emptyHome()) {
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', HOME: home, XDG_CONFIG_HOME: home };
+  for (const k of Object.keys(env)) if (/^GIT_CONFIG_(PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$/.test(k) || k === 'GIT_DIR' || k === 'GIT_WORK_TREE' || k === 'GIT_INDEX_FILE') delete env[k];
+  return env;
+}
 
 /** A `git(args, { maxBytes })` that runs git in `dir`, safely, and returns stdout as a Buffer. */
-export function localGit(dir) {
+export function localGit(dir, { home } = {}) {
   return (args, { maxBytes = Infinity, input } = {}) =>
     new Promise((resolve, reject) => {
-      const child = spawn('git', [...SAFE_C, '-C', dir, ...args], { stdio: ['pipe', 'pipe', 'pipe'], env: safeEnv() });
+      const child = spawn('git', [...SAFE_C, '-C', dir, ...args], { stdio: ['pipe', 'pipe', 'pipe'], env: safeEnv(home) });
       const chunks = [];
       let size = 0;
       let err = '';
@@ -158,8 +172,10 @@ export async function collectPatch({ tree, baseRepo, base, maxBytes = MAX_PATCH_
   const scratch = fs.mkdtempSync(path.join(workRoot, 'collect-'));
   try {
     const work = path.join(scratch, 'w');
-    execFileSync('git', [...SAFE_C, '-c', 'protocol.file.allow=always', 'clone', '-q', '--no-checkout', '--no-hardlinks', '--', baseRepo, work], { env: safeEnv(), stdio: 'pipe' });
-    const git = localGit(work);
+    const home = path.join(scratch, 'home');
+    fs.mkdirSync(home);
+    execFileSync('git', [...SAFE_C, '-c', 'protocol.file.allow=always', 'clone', '-q', '--no-checkout', '--no-hardlinks', '--', baseRepo, work], { env: safeEnv(home), stdio: 'pipe' });
+    const git = localGit(work, { home });
     await git(['checkout', '-q', '--detach', base]);
     const exclude = await adapterSymlinks(git, base, linkPrefix);
     await copyTree(tree, work, git);
@@ -312,7 +328,9 @@ export async function gradeOnce({ containers, task, patchFile = null, cloneTo = 
     try {
       const file = path.join(logs, 'reward.txt');
       stale = fs.statSync(file).mtimeMs < startedMs - STALE_SLACK_MS;
-      reward = fs.readFileSync(file, 'utf8').trim();
+      // exactly 1 or 0, with at most one newline after it: nothing else is a reward
+      const raw = fs.readFileSync(file, 'utf8');
+      reward = /^[01]\n?$/.test(raw) ? raw.slice(0, 1) : 'invalid';
     } catch {
       reward = null;
     }
