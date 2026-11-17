@@ -103,6 +103,18 @@ test('a section the table does not know, or one that went away, is an error that
   if (file) assert.throws(() => sharedPrompt(file.replace('  max_check_cycles: 3\n', '')), /does not give/);
 });
 
+test('a new adam tool named in a shared section, with no entry in the mapping, is an error and never reaches OpenCode', async (t) => {
+  const file = await atPin(t);
+  if (!file) return;
+  const tools = file.indexOf('\n# Tools\n');
+  const work = file.indexOf('\n# How to work\n');
+  assert.ok(tools >= 0 && work >= 0, 'the file has both sections');
+  const withTool = file
+    .replace('\n# How to work\n', '\n# How to work\nCall `brand_new_tool` before anything else.\n')
+    .replace('\n# Tools\n', '\n# Tools\n- `brand_new_tool`: a tool adam gained after the mapping was written.\n');
+  assert.throws(() => sharedPrompt(withTool), /still names adam's tool\(s\) brand_new_tool/);
+});
+
 test('OpenCode is given exactly the shared text: a file in its read-only input directory, named in the configuration', () => {
   const config = opencodeConfig({ baseUrl: 'http://meter-1:8090/r/abcdefabcdefabcdefabcdef/v1', contextWindow: 131072, instructions: [`/bench/in/${SHARED_PROMPT_FILE}`] });
   assert.deepEqual(config.instructions, ['/bench/in/shared-prompt.md']);
