@@ -565,6 +565,7 @@ mod tests {
             let v: Value = serde_json::from_slice(&read_frame(&mut reader).await.unwrap()).unwrap();
             seen.push(v);
         }
+        drop(reader);
         seen.sort_by_key(|v| v["id"].as_i64());
         assert_eq!(seen[0]["result"], "fine");
         assert_eq!(seen[1]["error"]["code"], -32601);
@@ -578,7 +579,9 @@ mod tests {
             }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // The stream ends when both halves of the server's side are gone.
         drop(their_write);
+        drop(their_read);
         let err = waiting.await.unwrap().unwrap_err();
         assert!(
             matches!(&err, RpcError::Closed(why) if why.contains("ended")),
