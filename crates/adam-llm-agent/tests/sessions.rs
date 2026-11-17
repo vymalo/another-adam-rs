@@ -1792,7 +1792,12 @@ mod cases {
     /// sends it another round that continues it. A session that was not kept open is closed.
     pub async fn cancelling_the_parent_leaves_a_kept_open_session_idle(store: DynStore) {
         let rig = Rig::new().holding(0);
-        rig.child_mock.push_text("round two answer");
+        // Twice: the model call of the cancelled round waits at the gate, and when the gate is
+        // released below it may still be alive (the worker has not dropped its step yet). It then
+        // takes an answer that nobody reads, and round two must still find its own.
+        rig.child_mock
+            .push_text("round two answer")
+            .push_text("round two answer");
         let (parent_agent, child_agent) = (rig.parent(), rig.child());
         let rt = rig.together(&store, &parent_agent, &child_agent);
         let conv = conv_id();
