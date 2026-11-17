@@ -69,6 +69,14 @@ enum Remote {
     Local,
 }
 
+/// Whether the text has an `@` in its authority. An empty user part
+/// (`https://@host/o/r`) parses as no credentials and is refused all the same.
+fn authority_has_at(raw: &str) -> bool {
+    raw.split_once("://")
+        .map(|(_, rest)| rest.split(['/', '\\', '?', '#']).next().unwrap_or(""))
+        .is_some_and(|authority| authority.contains('@'))
+}
+
 impl RepoLocation {
     fn parse(raw: &str) -> WorkspaceResult<Self> {
         let raw = raw.trim();
@@ -81,7 +89,7 @@ impl RepoLocation {
         let url = Url::parse(raw).map_err(|e| invalid(format!("bad repository url: {e}")))?;
         match url.scheme() {
             "http" | "https" => {
-                if !url.username().is_empty() || url.password().is_some() {
+                if !url.username().is_empty() || url.password().is_some() || authority_has_at(raw) {
                     return Err(invalid(
                         "repository urls must not embed credentials; pass them through GitCredentials",
                     ));
@@ -313,6 +321,9 @@ mod tests {
         for url in [
             "https://x-access-token:secret@github.com/o/r.git",
             "https://user@github.com/o/r.git",
+            "https://@github.com/o/r.git",
+            "https://:@github.com/o/r.git",
+            "https://@a/a\\a",
             "https://github.com/o",
             "https://github.com/o/r/extra",
             "https://github.com/o/r?x=1",

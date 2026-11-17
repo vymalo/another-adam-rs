@@ -104,7 +104,7 @@ it writes itself**: every key it did not write is removed and the remote's two k
 ([below](#the-mirrors-configuration-is-put-back-not-trusted)). Who wrote the key does not matter. (A tool such as the coder's
 `run_command` also undoes such writes when it sees them, but nothing relies on that.) The token reaches `git` only through the environment of one
 invocation: never in a remote URL, `.git/config`, logs or error messages.
-URLs with embedded credentials and ssh/scp forms are refused.
+URLs with embedded credentials, an empty user part included (`https://@host/o/r`), and ssh/scp forms are refused.
 
 ### The mirror's configuration is put back, not trusted
 
