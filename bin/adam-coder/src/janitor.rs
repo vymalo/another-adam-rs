@@ -28,6 +28,16 @@
 //! The kept output of a finished run (`<root>/outputs/<run>`, [`crate::kept`]) is removed with its
 //! workspace, and a sweep removes the outputs of finished runs that have no workspace any more.
 //!
+//! The images of a conversation (`<root>/images/<scope>`, [`crate::images`]) have a sweep of their
+//! own, after the workspaces, because a scope can outlive every workspace (a crash between the two
+//! removals, a workspace removed by hand, a conversation that only chatted). The run that kept the
+//! images noted itself in the scope, so the sweep asks the store about **that run's conversation**:
+//! a scope whose conversation has an open run is never removed, whatever `SCRATCH_IDLE_DAYS` is
+//! (`0` included); one whose conversation has had no task for the idle time scratch projects use
+//! goes. A scope that cannot be placed (no note, a run the store does not know, a note that does not
+//! lead to the scope) is removed when nothing in it was written for [`IMAGE_SCOPE_BACKSTOP`] (30
+//! days). When the store cannot answer, the scope stays.
+//!
 //! After that the sweep asks the environment what it still holds
 //! ([`held_runs`](adam_workspace::Environment::held_runs)) and releases what belongs to a run that is
 //! over or unknown, whether or not the run has a workspace on this volume: what a crash left behind.
@@ -50,6 +60,10 @@ use crate::kept::FileKept;
 use crate::redact::Redactor;
 use crate::tools::Commands;
 
+/// How long a scope of images that the sweep cannot place stays after anything in it was last
+/// written.
+pub const IMAGE_SCOPE_BACKSTOP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// What one sweep did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sweep {
@@ -65,6 +79,8 @@ pub struct Sweep {
     /// The runs whose environment was released although the run has no workspace on this volume
     /// (what a crash left behind).
     pub orphans: Vec<String>,
+    /// The scopes of images the sweep removed.
+    pub images: Vec<String>,
 }
 
 /// Removes the workspaces of runs that are over. See the [module documentation](self).
@@ -197,15 +213,21 @@ impl Janitor {
                     {
                         tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the kept output of a finished run");
                     }
-                    // The images of its conversation go when the conversation has had no task for as
-                    // long as a scratch project is kept: the same test, the same sweep.
-                    if removed.is_ok() && !keep_scratch {
-                        let scope = adam_llm_agent::image_scope(
-                            record.as_ref().and_then(|r| r.conversation_id.as_deref()),
-                            &run,
-                        );
-                        if let Err(e) = self.images.remove_scope(&scope).await {
-                            tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the images of a finished run");
+                    // The images of its conversation go when the conversation has no open run and has
+                    // had no task for as long as a scratch project is kept (never kept, at 0).
+                    if removed.is_ok() {
+                        let wanted = match &record {
+                            Some(record) => self.images_are_wanted(store, record).await,
+                            None => false,
+                        };
+                        if !wanted {
+                            let scope = adam_llm_agent::image_scope(
+                                record.as_ref().and_then(|r| r.conversation_id.as_deref()),
+                                &run,
+                            );
+                            if let Err(e) = self.images.remove_scope(&scope).await {
+                                tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the images of a finished run");
+                            }
                         }
                     }
                     match removed {
@@ -230,7 +252,87 @@ impl Janitor {
         self.release_orphans(store, stop, &released, &mut report)
             .await;
         self.sweep_outputs(store, stop).await;
+        self.sweep_images(store, stop, &mut report).await;
         report
+    }
+
+    /// Remove the scopes of images that no conversation wants any more, whatever became of their
+    /// workspaces: see the [module documentation](self).
+    async fn sweep_images(&self, store: &dyn Store, stop: &CancellationToken, report: &mut Sweep) {
+        let scopes = match self.images.scopes().await {
+            Ok(scopes) => scopes,
+            Err(e) => {
+                tracing::warn!(error = %adam_error::report(&e), "cannot list the images to sweep");
+                return;
+            }
+        };
+        for scope in scopes {
+            if stop.is_cancelled() {
+                break;
+            }
+            match self.scope_is_wanted(store, &scope).await {
+                Ok(true) => {}
+                Ok(false) => match self.images.remove_scope(&scope).await {
+                    Ok(()) => {
+                        tracing::info!(%scope, "removed the images of a conversation nobody wants");
+                        report.images.push(scope);
+                    }
+                    Err(e) => {
+                        tracing::warn!(%scope, error = %adam_error::report(&e), "cannot remove the images of a conversation");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(%scope, error = %e, "cannot decide about the images of a conversation; they stay");
+                }
+            }
+        }
+    }
+
+    /// Whether the images under `scope` are still wanted: the run that noted itself in the scope is
+    /// asked about. `Err` leaves them.
+    async fn scope_is_wanted(&self, store: &dyn Store, scope: &str) -> Result<bool, BoxError> {
+        use adam_llm_agent::image_scope;
+        let owner = self.images.owner_of(scope).await?;
+        let record = match owner.as_deref().and_then(|run| run.parse().ok().map(RunId)) {
+            Some(id) => store.load_run(id).await?,
+            None => None,
+        };
+        let run = owner.unwrap_or_default();
+        let wanted = match &record {
+            // The scope of the run's conversation: wanted while the conversation is.
+            Some(record)
+                if record
+                    .conversation_id
+                    .as_deref()
+                    .is_some_and(|c| image_scope(Some(c), &run) == scope) =>
+            {
+                self.images_are_wanted(store, record).await
+            }
+            // The scope of a run with no conversation: wanted while the run is open.
+            Some(record) if image_scope(None, &run) == scope => !record.status.is_terminal(),
+            // A run the store does not know, and a scope that is its own: nothing wants it.
+            None if !run.is_empty() && image_scope(None, &run) == scope => false,
+            // Nobody can say whose it is: it goes when nothing was written in it for a long time.
+            _ => match self.images.last_touched(scope).await? {
+                Some(at) => SystemTime::now()
+                    .duration_since(at)
+                    .is_ok_and(|age| age < IMAGE_SCOPE_BACKSTOP),
+                None => false,
+            },
+        };
+        Ok(wanted)
+    }
+
+    /// Whether the images of the conversation of the finished run `record` are still wanted: a task
+    /// of it is open, or the newest one was last touched within the idle time of a scratch project
+    /// (none when `SCRATCH_IDLE_DAYS` is `0`). When the store cannot say, they are wanted.
+    async fn images_are_wanted(&self, store: &dyn Store, record: &RunRecord) -> bool {
+        let Some(conversation) = record.conversation_id.as_deref() else {
+            return false;
+        };
+        let idle = self.scratch_idle.unwrap_or(Duration::ZERO);
+        self.conversation_has_task_within(store, record, conversation, idle)
+            .await
     }
 
     /// Remove the kept output of runs that are over and have no workspace here any more (a crash
@@ -272,6 +374,19 @@ impl Janitor {
         let Some(conversation) = record.conversation_id.as_deref() else {
             return false;
         };
+        self.conversation_has_task_within(store, record, conversation, idle)
+            .await
+    }
+
+    /// Whether `conversation` has a task open, or had one touched within `idle`. A store that
+    /// cannot say makes it so.
+    async fn conversation_has_task_within(
+        &self,
+        store: &dyn Store,
+        record: &RunRecord,
+        conversation: &str,
+        idle: Duration,
+    ) -> bool {
         let newest = async {
             if store
                 .open_run_for_conversation(&record.agent, conversation)
@@ -304,7 +419,7 @@ impl Janitor {
                 u128::try_from(age).is_ok_and(|age| age < idle.as_millis())
             }
             Err(e) => {
-                tracing::warn!(run = %record.id, error = %adam_error::report(&e), "cannot ask the store about the conversation of a finished run; its scratch projects stay");
+                tracing::warn!(run = %record.id, error = %adam_error::report(&e), "cannot ask the store about the conversation of a finished run; what it holds stays");
                 true
             }
         }

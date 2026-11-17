@@ -110,7 +110,7 @@ pub use config::{
 pub use exit::exit_code;
 pub use files::{AgentFiles, AgentFilesError};
 pub use github_mcp::GitHubReadBearer;
-pub use janitor::Janitor;
+pub use janitor::{IMAGE_SCOPE_BACKSTOP, Janitor};
 pub use redact::{RedactingCredentials, Redactor};
 pub use repos::workspaces_for;
 pub use serve::{environment_for, serve, wire_commands};

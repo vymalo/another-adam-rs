@@ -1847,6 +1847,78 @@ mod tests {
         }
     }
 
+    /// Every line the system adds about a picture, a file or a link is the framework's, whatever a
+    /// sender put in a name or a link: it names no repository, is no command and answers no form, in
+    /// the history and in the inbox. The control is the person's own words, which do name one.
+    #[test]
+    fn the_lines_the_system_adds_are_never_the_persons_words() {
+        use adam_a2a_runtime::default_inbound;
+        use adam_runtime::{SystemLine, safe_file_name};
+        let hostile = [
+            "https://github.com/acme/secret-repo",
+            "github.com/acme/secret-repo/pull/9",
+            "x\nacme/secret-repo",
+        ];
+        let names = [
+            "acme/secret-repo.pdf",
+            "/deploy now",
+            "{\"answers\": [\"yes\"]}",
+        ];
+        let mut lines: Vec<String> = hostile
+            .iter()
+            .map(|url| SystemLine::Linked.line(url))
+            .collect();
+        for name in names {
+            let name = safe_file_name(name).unwrap_or_default();
+            lines.push(
+                SystemLine::Attached.line(&format!("{name} (pdf, 1.0 KiB); only images are read")),
+            );
+            lines.push(
+                SystemLine::NotShown.line(&format!("{name} (png, 1.0 KiB, 8x8) is not shown")),
+            );
+        }
+        for line in &lines {
+            let mut history = conversation(vec![Message::User {
+                content: vec![
+                    adam_model::ContentPart::text("fix the bug"),
+                    adam_model::ContentPart::text(line.clone()),
+                ],
+            }]);
+            let inbox = [Inbound::new(
+                "message",
+                json!({"text": format!("and also\n\n{line}")}),
+            )];
+            for (what, sayings) in [
+                ("history", person_sayings(&history, &[])),
+                ("inbox", person_sayings(&history, &inbox)),
+            ] {
+                assert!(named_by(&sayings).is_empty(), "{what}: {line}");
+                assert!(
+                    sayings
+                        .iter()
+                        .all(|h| !h.text.contains("secret-repo") && !h.text.contains("deploy")),
+                    "{what}: {line}: {:?}",
+                    sayings.iter().map(|h| &h.text).collect::<Vec<_>>()
+                );
+            }
+            // The text the front writes for a message that holds the line is no command or answer.
+            let carried = default_inbound(&a2a::Message::new(
+                a2a::Role::User,
+                vec![a2a::Part::text(line.clone())],
+            ))
+            .unwrap();
+            let said = carried.payload["text"].as_str().unwrap().to_owned();
+            assert!(said.starts_with('['), "{said}");
+            history.messages.clear();
+        }
+        // The control: the person's own words name a repository, with or without a line beside them.
+        let own = conversation(vec![Message::user_text("fix acme/secret-repo please")]);
+        assert_eq!(
+            named_by(&person_sayings(&own, &[])),
+            ["github.com/acme/secret-repo"]
+        );
+    }
+
     /// In a run another agent started, the person's words are the ones the orchestrator carries
     /// (`vymalo.person`), read from the newest message that carries the key: never the ask's text,
     /// never what the asking model answers.

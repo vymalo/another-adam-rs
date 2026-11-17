@@ -30,6 +30,7 @@
 //! those before [`named_in`] reads a word of it.
 
 use adam_a2a_runtime::form_answer_surface;
+use adam_runtime::is_system_line;
 use adam_ui::comparable;
 use adam_workspace::{RepoLocation, RepoRef};
 
@@ -80,7 +81,10 @@ pub fn default_host_key(default_host: &str) -> String {
 /// person's own request the same way, labelled `request`. A block labelled `untrusted` is dropped
 /// with its fence lines, and one that is never closed runs to the end of the text (the quoted text
 /// is not to be trusted to have ended). Every other line is kept, the contents of other fences
-/// included; their fence lines are dropped.
+/// included; their fence lines are dropped. **So are the lines the system adds to a message about a
+/// picture, a file or a link** ([`is_system_line`]): they are the framework's words, never the
+/// person's, whatever a sender put in a name or a link, so they name no repository, are no command
+/// and answer no form.
 pub fn without_untrusted(text: &str) -> String {
     /// An open fence: its character, its length and whether its contents are dropped.
     struct Fence {
@@ -123,13 +127,13 @@ pub fn without_untrusted(text: &str) -> String {
         if let Some(fence) = &open {
             if closes(line, fence) {
                 open = None;
-            } else if !fence.untrusted {
+            } else if !fence.untrusted && !is_system_line(line) {
                 kept.push_str(line);
                 kept.push('\n');
             }
         } else if let Some(fence) = opens(line) {
             open = Some(fence);
-        } else {
+        } else if !is_system_line(line) {
             kept.push_str(line);
             kept.push('\n');
         }

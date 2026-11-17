@@ -899,3 +899,159 @@ async fn images_go_with_an_idle_conversation() {
         "a run with no conversation's"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The sweep of the scopes of images
+// ---------------------------------------------------------------------------------------------
+
+const AN_IMAGE: &[u8] = b"\x89PNG\r\n\x1a\nan image";
+
+/// Keep an image under `scope` and say that `run` keeps it there, as the agent does.
+async fn kept_for(fx: &Fixture, scope: &str, run: &RunId) {
+    use adam_llm_agent::{KeptImages as _, sha256_hex};
+    fx.env
+        .images
+        .note_run(scope, &run.to_string())
+        .await
+        .unwrap();
+    fx.env
+        .images
+        .keep(scope, &sha256_hex(AN_IMAGE), "image/png", AN_IMAGE)
+        .await
+        .unwrap();
+}
+
+/// Make everything in a scope `days` old, as the janitor sees it.
+fn age_scope(fx: &Fixture, scope: &str, days: u64) {
+    let dir = fx.root.join("images").join(scope);
+    let then = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(entry.unwrap().path())
+            .unwrap();
+        file.set_modified(then).unwrap();
+    }
+    std::fs::File::open(&dir)
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+}
+
+async fn sweep(
+    fx: &Fixture,
+    store: &DynStore,
+    idle: Option<Duration>,
+) -> adam_coder::janitor::Sweep {
+    Janitor::new(fx.env.workspaces.clone(), None)
+        .with_scratch_idle(idle)
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await
+}
+
+/// A scope a crash left with no workspace behind it (the workspace was removed and the sweep stopped
+/// before the images) is removed by the sweep of scopes alone, once its conversation is idle.
+#[tokio::test]
+async fn a_scope_left_with_no_workspace_goes() {
+    use adam_llm_agent::image_scope;
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let run = run_of(&store, RunStatus::Done, Some("caller:crashed")).await;
+    let scope = image_scope(Some("caller:crashed"), &run.to_string());
+    kept_for(&fx, &scope, &run).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    // Not idle long enough yet: the conversation may go on.
+    let report = sweep(&fx, &store, Some(Duration::from_secs(3600))).await;
+    assert!(report.images.is_empty(), "{report:?}");
+    assert!(fx.root.join("images").join(&scope).is_dir());
+    // Idle: the scope goes, with no workspace to sweep.
+    let report = sweep(&fx, &store, Some(Duration::from_millis(30))).await;
+    assert_eq!(report.images, std::slice::from_ref(&scope), "{report:?}");
+    assert!(!fx.root.join("images").join(&scope).exists());
+}
+
+/// A run with no conversation keeps its scope while it is open and loses it when it is over.
+#[tokio::test]
+async fn the_scope_of_a_run_with_no_conversation_goes_when_the_run_is_over() {
+    use adam_llm_agent::image_scope;
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let open = run_in(&store, RunStatus::Parked).await;
+    let over = run_in(&store, RunStatus::Done).await;
+    let unknown = RunId::new();
+    let scopes: Vec<String> = [open, over, unknown]
+        .iter()
+        .map(|run| image_scope(None, &run.to_string()))
+        .collect();
+    for (run, scope) in [open, over, unknown].iter().zip(&scopes) {
+        kept_for(&fx, scope, run).await;
+    }
+    let report = sweep(&fx, &store, Some(Duration::from_secs(3600))).await;
+    let mut gone = report.images.clone();
+    gone.sort();
+    let mut want = vec![scopes[1].clone(), scopes[2].clone()];
+    want.sort();
+    assert_eq!(gone, want, "{report:?}");
+    assert!(fx.root.join("images").join(&scopes[0]).is_dir());
+}
+
+/// A conversation with an open task keeps its images whatever `SCRATCH_IDLE_DAYS` is, `0` included
+/// (the janitor then keeps no scratch project, and still no image of a conversation at work).
+#[tokio::test]
+async fn a_scope_of_a_conversation_with_an_open_run_stays_at_zero_idle() {
+    use adam_llm_agent::image_scope;
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let older = run_of(&store, RunStatus::Done, Some("caller:busy")).await;
+    run_of(&store, RunStatus::Parked, Some("caller:busy")).await;
+    let scope = image_scope(Some("caller:busy"), &older.to_string());
+    kept_for(&fx, &scope, &older).await;
+    // The older run has a workspace, so the sweep of finished runs meets it too.
+    workspace_of(&fx, &older.to_string()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    for idle in [None, Some(Duration::ZERO)] {
+        let report = sweep(&fx, &store, idle).await;
+        assert!(report.images.is_empty(), "{idle:?} {report:?}");
+        assert!(
+            fx.root.join("images").join(&scope).is_dir(),
+            "the images of a conversation at work stay ({idle:?})"
+        );
+    }
+}
+
+/// A scope no note leads anywhere is removed when nothing was written in it for 30 days, and not
+/// before. So is one whose note names a run of another conversation.
+#[tokio::test]
+async fn a_scope_nobody_can_place_goes_after_thirty_days() {
+    use adam_llm_agent::{KeptImages as _, image_scope, sha256_hex};
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    // No note at all (written by a build that kept none).
+    let unnoted = image_scope(Some("caller:unnoted"), "r");
+    fx.env
+        .images
+        .keep(&unnoted, &sha256_hex(AN_IMAGE), "image/png", AN_IMAGE)
+        .await
+        .unwrap();
+    // A note that does not lead to the scope.
+    let stranger = run_of(&store, RunStatus::Done, Some("caller:other")).await;
+    let misnoted = image_scope(Some("caller:misnoted"), "r");
+    kept_for(&fx, &misnoted, &stranger).await;
+    let report = sweep(&fx, &store, None).await;
+    assert!(report.images.is_empty(), "fresh: {report:?}");
+    for days in [29, 31] {
+        age_scope(&fx, &unnoted, days);
+        age_scope(&fx, &misnoted, days);
+        let report = sweep(&fx, &store, None).await;
+        if days == 29 {
+            assert!(report.images.is_empty(), "29 days: {report:?}");
+        } else {
+            let mut gone = report.images.clone();
+            gone.sort();
+            let mut want = vec![unnoted.clone(), misnoted.clone()];
+            want.sort();
+            assert_eq!(gone, want, "31 days: {report:?}");
+        }
+    }
+    assert!(!fx.root.join("images").join(&unnoted).exists());
+}

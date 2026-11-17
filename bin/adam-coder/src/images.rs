@@ -101,6 +101,48 @@ fn checked(scope: &str, sha256: &str) -> Result<(), ImageKeepError> {
     Ok(())
 }
 
+/// The bytes of the image file `name` of `dir`, which must be the image whose SHA-256 is `sha256`: a
+/// regular file with one link, of at most [`IMAGE_MAX`] bytes, with that hash. Anything else is
+/// [`ImageKeepError::Corrupt`]: a local command can rewrite, link or replace a file.
+fn read_checked(
+    dir: &Dir,
+    name: &std::ffi::OsStr,
+    sha256: &str,
+) -> Result<Vec<u8>, ImageKeepError> {
+    let (file, _) = match dir.open_regular(name) {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(ImageKeepError::NotFound(sha256.to_owned()));
+        }
+        // A link or something that is not a file is not an image of ours.
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(ImageKeepError::Corrupt),
+        Err(e) => return Err(io_error(&e)),
+    };
+    let meta = file.metadata().map_err(|e| io_error(&e))?;
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::MetadataExt::nlink(&meta) != 1;
+    #[cfg(not(unix))]
+    let linked = false;
+    if !meta.is_file() || linked || meta.len() > IMAGE_MAX {
+        return Err(ImageKeepError::Corrupt);
+    }
+    let mut bytes = Vec::new();
+    file.take(IMAGE_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_error(&e))?;
+    // The file is the image its name says, or it is nothing: a local command can rewrite it.
+    if sha256_hex(&bytes) != sha256 {
+        return Err(ImageKeepError::Corrupt);
+    }
+    Ok(bytes)
+}
+
+/// The file in a scope that names the run that keeps images there ([`FileImages::owner_of`]).
+const OWNER_FILE: &str = "owner";
+
+/// The longest run id the owner file holds.
+const OWNER_MAX: u64 = 64;
+
 impl FileImages {
     /// Images under `<workspace_root>/images`.
     pub fn new(workspace_root: &Path) -> Self {
@@ -168,9 +210,15 @@ impl FileImages {
         for (entry, meta) in dir.entries().map_err(|e| io_error(&e))? {
             let entry_name = entry.to_string_lossy();
             if is_ours(&entry_name) && meta.is_file() {
-                // The same image is kept once, under whatever extension it has.
                 if entry_name.starts_with(sha256) {
-                    return Ok(());
+                    // The same image is kept once, under whatever extension it has, **if what is
+                    // there is the image**: a file a command planted under its name (a hard link,
+                    // other bytes) would be refused at load for good, so it is replaced.
+                    if read_checked(&dir, &entry, sha256).is_ok() {
+                        return Ok(());
+                    }
+                    let _ = dir.unlink(&entry);
+                    continue;
                 }
                 used += meta.size();
             } else if entry_name.starts_with('.') && entry_name.ends_with(".tmp") && meta.is_file()
@@ -230,32 +278,7 @@ impl FileImages {
         else {
             return Err(missing());
         };
-        let (file, _) = match dir.open_regular(std::ffi::OsStr::new(&name)) {
-            Ok(opened) => opened,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(missing()),
-            // A link or something that is not a file is not an image of ours.
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                return Err(ImageKeepError::Corrupt);
-            }
-            Err(e) => return Err(io_error(&e)),
-        };
-        let meta = file.metadata().map_err(|e| io_error(&e))?;
-        #[cfg(unix)]
-        let linked = std::os::unix::fs::MetadataExt::nlink(&meta) != 1;
-        #[cfg(not(unix))]
-        let linked = false;
-        if !meta.is_file() || linked || meta.len() > IMAGE_MAX {
-            return Err(ImageKeepError::Corrupt);
-        }
-        let mut bytes = Vec::new();
-        file.take(IMAGE_MAX + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| io_error(&e))?;
-        // The file is the image its name says, or it is nothing: a local command can rewrite it.
-        if sha256_hex(&bytes) != sha256 {
-            return Err(ImageKeepError::Corrupt);
-        }
-        Ok(bytes)
+        read_checked(&dir, std::ffi::OsStr::new(&name), sha256)
     }
 
     /// The scopes that have images on the volume.
@@ -286,6 +309,82 @@ impl FileImages {
                 .collect();
             scopes.sort();
             Ok(scopes)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// The run that last noted that it keeps images under `scope` ([`KeptImages::note_run`]); `None`
+    /// when none did, or the file is not a run id.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors other than the scope not being there.
+    pub async fn owner_of(&self, scope: &str) -> io::Result<Option<String>> {
+        let (this, scope) = (self.clone(), scope.to_owned());
+        tokio::task::spawn_blocking(move || -> io::Result<Option<String>> {
+            let dir = match this.dir_of(&scope, false) {
+                Ok(dir) => dir,
+                Err(ImageKeepError::NotFound(_)) => return Ok(None),
+                Err(e) => return Err(io::Error::other(e.to_string())),
+            };
+            let (file, _) = match dir.open_regular(std::ffi::OsStr::new(OWNER_FILE)) {
+                Ok(opened) => opened,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            let mut text = String::new();
+            file.take(OWNER_MAX).read_to_string(&mut text)?;
+            let run = text.trim();
+            Ok(run
+                .parse()
+                .map(adam_core::RunId)
+                .is_ok()
+                .then(|| run.to_owned()))
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// When anything in `scope` was last written, to the second; `None` when the scope is not there.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors other than the scope not being there.
+    pub async fn last_touched(&self, scope: &str) -> io::Result<Option<SystemTime>> {
+        let (this, scope) = (self.clone(), scope.to_owned());
+        tokio::task::spawn_blocking(move || -> io::Result<Option<SystemTime>> {
+            let dir = match this.dir_of(&scope, false) {
+                Ok(dir) => dir,
+                Err(ImageKeepError::NotFound(_)) => return Ok(None),
+                Err(e) => return Err(io::Error::other(e.to_string())),
+            };
+            let secs = dir
+                .entries()?
+                .into_iter()
+                .map(|(_, meta)| meta.mtime_secs())
+                .max();
+            // An empty scope is as old as its directory.
+            let secs = match secs {
+                Some(secs) => secs,
+                None => {
+                    let root = SlotDir::open(&this.root)?;
+                    let images = root
+                        .walk(Path::new("images"), false)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    images.lstat(std::ffi::OsStr::new(&scope))?.mtime_secs()
+                }
+            };
+            Ok(Some(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0)),
+            ))
         })
         .await
         .map_err(io::Error::other)?
@@ -377,6 +476,27 @@ impl KeptImages for FileImages {
             .await
             .map_err(|_| join_failed())?
     }
+
+    async fn note_run(&self, scope: &str, run: &str) -> Result<(), ImageKeepError> {
+        let (this, scope, run) = (self.clone(), scope.to_owned(), run.to_owned());
+        tokio::task::spawn_blocking(move || -> Result<(), ImageKeepError> {
+            if !is_hex(&scope, 32) {
+                return Err(ImageKeepError::Malformed(scope.chars().take(40).collect()));
+            }
+            // Only a run id is written: nothing a sender chose reaches a file.
+            if run.parse().map(adam_core::RunId).is_err() {
+                return Ok(());
+            }
+            let _one_at_a_time = KEEP_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = this.dir_of(&scope, true)?;
+            dir.replace_file(std::ffi::OsStr::new(OWNER_FILE), run.as_bytes())
+                .map_err(|e| io_error(&e))
+        })
+        .await
+        .map_err(|_| join_failed())?
+    }
 }
 
 /// The images store of an agent: what goes in its state.
@@ -389,6 +509,8 @@ pub fn store(images: &Arc<FileImages>) -> adam_llm_agent::ImageStore {
 mod tests {
     use super::*;
     use adam_llm_agent::image_scope;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\nthe bytes of an image";
 
@@ -473,6 +595,114 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// One image over what the model is ever sent is not kept; one at the limit is.
+    #[tokio::test]
+    async fn an_image_over_four_mib_is_not_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileImages::new(root.path());
+        let scope = image_scope(Some("c1"), "r1");
+        let mut at = PNG.to_vec();
+        at.resize(IMAGE_MAX as usize, 1);
+        store
+            .keep(&scope, &sha256_hex(&at), "image/png", &at)
+            .await
+            .unwrap();
+        assert_eq!(store.load(&scope, &sha256_hex(&at)).await.unwrap(), at);
+        let mut over = PNG.to_vec();
+        over.resize(IMAGE_MAX as usize + 1, 2);
+        let refused = store
+            .keep(&scope, &sha256_hex(&over), "image/png", &over)
+            .await;
+        assert!(
+            matches!(refused, Err(ImageKeepError::Refused(_))),
+            "{refused:?}"
+        );
+    }
+
+    /// The directory that holds every scope is as private as the scopes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_images_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let store = FileImages::new(root.path());
+        let scope = image_scope(Some("c1"), "r1");
+        store
+            .keep(&scope, &sha256_hex(PNG), "image/png", PNG)
+            .await
+            .unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root.path().join("images")), 0o700);
+        assert_eq!(mode(&root.path().join("images").join(&scope)), 0o700);
+    }
+
+    /// A file a command planted where an image is kept (a second hard link, other bytes) would be
+    /// refused at load for good: keeping the image again replaces it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keeping_an_image_replaces_a_planted_file() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileImages::new(root.path());
+        let scope = image_scope(Some("c1"), "r1");
+        let sha = sha256_hex(PNG);
+        let file = root
+            .path()
+            .join("images")
+            .join(&scope)
+            .join(format!("{sha}.png"));
+        store.keep(&scope, &sha, "image/png", PNG).await.unwrap();
+        // A hard link planted next to it: two links, so the file is refused at load.
+        std::fs::hard_link(&file, root.path().join("planted")).unwrap();
+        assert!(matches!(
+            store.load(&scope, &sha).await,
+            Err(ImageKeepError::Corrupt)
+        ));
+        store.keep(&scope, &sha, "image/png", PNG).await.unwrap();
+        assert_eq!(store.load(&scope, &sha).await.unwrap(), PNG);
+        // Other bytes under its name.
+        std::fs::write(&file, b"not the image").unwrap();
+        assert!(store.load(&scope, &sha).await.is_err());
+        store.keep(&scope, &sha, "image/png", PNG).await.unwrap();
+        assert_eq!(store.load(&scope, &sha).await.unwrap(), PNG);
+        // A link in its place.
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(root.path().join("planted"), &file).unwrap();
+        store.keep(&scope, &sha, "image/png", PNG).await.unwrap();
+        assert_eq!(store.load(&scope, &sha).await.unwrap(), PNG);
+        // The image is still kept once, and what was healthy is left alone.
+        let before = std::fs::metadata(&file).unwrap().ino();
+        store.keep(&scope, &sha, "image/png", PNG).await.unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().ino(), before);
+    }
+
+    /// The run that keeps images in a scope notes itself there: only a run id is written.
+    #[tokio::test]
+    async fn the_run_that_keeps_images_is_noted_in_the_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileImages::new(root.path());
+        let scope = image_scope(Some("c1"), "r1");
+        assert_eq!(store.owner_of(&scope).await.unwrap(), None);
+        assert_eq!(store.last_touched(&scope).await.unwrap(), None);
+        let run = adam_core::RunId::new().to_string();
+        store.note_run(&scope, &run).await.unwrap();
+        assert_eq!(store.owner_of(&scope).await.unwrap(), Some(run.clone()));
+        let newer = adam_core::RunId::new().to_string();
+        store.note_run(&scope, &newer).await.unwrap();
+        assert_eq!(store.owner_of(&scope).await.unwrap(), Some(newer));
+        assert!(store.last_touched(&scope).await.unwrap().is_some());
+        // A name a sender chose is no run id and is not written.
+        store.note_run(&scope, "../../etc/passwd").await.unwrap();
+        assert!(store.owner_of(&scope).await.unwrap().is_some());
+        let other = image_scope(Some("c2"), "r2");
+        store.note_run(&other, "not a run").await.unwrap();
+        assert_eq!(store.owner_of(&other).await.unwrap(), None);
+        // A scope that is not 32 hex digits is refused.
+        assert!(matches!(
+            store.note_run("../x", &run).await,
+            Err(ImageKeepError::Malformed(_))
+        ));
     }
 
     #[tokio::test]

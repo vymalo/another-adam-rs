@@ -8371,3 +8371,46 @@ async fn read_file_of_a_png_is_an_image_for_a_seeing_model() {
     assert!(svg.images.is_empty());
     assert!(svg.content.contains("<svg"), "{}", svg.content);
 }
+
+/// A file that is an image is read for the model up to 4 MiB, and past it is said in a line: the
+/// limit is 4 MiB and not twice that.
+#[tokio::test]
+async fn read_file_of_an_image_is_read_to_four_mib_and_no_further() {
+    use adam_model::ImageOrigin::Workspace;
+
+    const FOUR_MIB: usize = 4 * 1024 * 1024;
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let mut at = png_of(100, 100);
+    at.resize(FOUR_MIB, 7);
+    let mut over = png_of(100, 100);
+    over.resize(FOUR_MIB + 1, 8);
+    std::fs::write(wt.join("at.png"), &at).unwrap();
+    std::fs::write(wt.join("over.png"), &over).unwrap();
+    let sees = rig.ctx.clone().with_image_limits(adam_model::ImageLimits {
+        max_bytes: FOUR_MIB as u64,
+        max_count: 8,
+        max_side: 4096,
+        sources: [Workspace].into(),
+    });
+    let fits = ReadFile
+        .call(&sees, json!({"path": "at.png"}))
+        .await
+        .unwrap();
+    assert!(!fits.is_error, "{}", fits.content);
+    assert_eq!(fits.images.len(), 1, "{}", fits.content);
+    // One byte more is a line that says the size, and nothing rides.
+    let past = ReadFile
+        .call(&sees, json!({"path": "over.png"}))
+        .await
+        .unwrap();
+    assert!(!past.is_error, "{}", past.content);
+    assert!(past.images.is_empty());
+    assert!(
+        past.content
+            .contains("is 4194305 bytes, over the 4 MiB the most this deployment can send"),
+        "{}",
+        past.content
+    );
+}
