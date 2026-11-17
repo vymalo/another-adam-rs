@@ -24,7 +24,7 @@ export const TRANSITIONS = {
   Grading: ['Grading', 'Done'],
   Interrupted: ['Planned', 'Failed_infra'],
   Failed_infra: ['Planned'],
-  Done: [],
+  Done: ['Grading'], // only `bench regrade`, and only for a result that is `invalid` (an infrastructure error in grading)
   NotStarted: [],
   StoppedByCap: [],
 };
@@ -205,7 +205,16 @@ export class Ledger {
     this.now = now;
     this.fd = fs.openSync(file, 'a', 0o600);
     this.states = new Map();
-    for (const r of records) if (r.kind === 'state') this.states.set(r.run, r.state);
+    this.invalid = new Set();
+    for (const r of records) if (r.kind === 'state') this.#track(r);
+  }
+
+  #track(r) {
+    this.states.set(r.run, r.state);
+    if (r.state === 'Done') {
+      if (r.result?.invalid === true) this.invalid.add(r.run);
+      else this.invalid.delete(r.run);
+    }
   }
 
   /** Append one record, fsynced. A state record must follow the lifecycle. */
@@ -215,12 +224,15 @@ export class Ledger {
       const from = this.states.get(record.run);
       const allowed = from === undefined ? ['Planned'] : TRANSITIONS[from];
       if (!allowed.includes(record.state)) throw new LedgerError(`run ${record.run}: ${from ?? '(new)'} cannot become ${record.state}`);
+      if (from === 'Done' && !(record.regrade === true && this.invalid.has(record.run))) {
+        throw new LedgerError(`run ${record.run}: a Done run is graded again only when its grade is invalid, by a regrade`);
+      }
     }
     const stored = { v: 1, t: this.now().toISOString(), ...record };
     fs.writeSync(this.fd, `${JSON.stringify(stored)}\n`);
     fs.fsyncSync(this.fd);
     this.records.push(stored);
-    if (stored.kind === 'state') this.states.set(stored.run, stored.state);
+    if (stored.kind === 'state') this.#track(stored);
     return stored;
   }
 

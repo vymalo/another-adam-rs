@@ -55,6 +55,12 @@ const group = (items, keyFn) => {
 
 const passed = (v) => v.result?.pass === true;
 
+/** Cached input over input, both the meter's; input already holds the cached part. */
+const cacheRate = (runs) => {
+  const input = sum(runs.map((v) => v.tokens.input));
+  return input > 0 ? pct(sum(runs.map((v) => v.tokens.cached)) / input) : 'n/a';
+};
+
 /** One row of pass rates for a list of runs. */
 function rateRow(label, runs) {
   const k = runs.filter(passed).length;
@@ -175,6 +181,18 @@ export function buildReport(foldedOrRecords, opts = {}) {
   h('By source');
   out.push(table(['Source', 'Agent', 'Arm', 'Runs', 'Solved', 'Rate', '95% interval (Wilson)'], [...group(counted, (v) => `${v.source ?? 'unknown'} / ${cellKey(v)}`)].map(([, rs]) => rateRow([rs[0].source ?? 'unknown', rs[0].agent, rs[0].arm], rs))));
 
+  out.push('\nSources: `public` is the public task set, `own` the owner\'s tasks from other repositories, `own-self` the tasks from adam-rs\'s own repository (its agent may know them).\n\n');
+  out.push(
+    table(
+      ['Source', 'Agent', 'Arm', 'Cost', 'Cost per solved task'],
+      [...group(counted, (v) => `${v.source ?? 'unknown'} / ${cellKey(v)}`)].map(([, rs]) => {
+        const cost = sum(rs.map((v) => v.spentMicro));
+        const solved = rs.filter(passed).length;
+        return [rs[0].source ?? 'unknown', rs[0].agent, rs[0].arm, formatUSD(cost), solved ? formatUSD(Math.round(cost / solved)) : 'n/a (none solved)'];
+      }),
+    ),
+  );
+
   h('By language');
   const langRows = [];
   const langNotes = [];
@@ -205,6 +223,8 @@ export function buildReport(foldedOrRecords, opts = {}) {
       sum(rs.map((v) => v.tokens.output)),
       sum(rs.map((v) => v.tokens.reasoning)),
       `${num(t('input'))} / ${num(t('output'))} / ${num(t('reasoning'))}`,
+      formatUSD(Math.round(cost / rs.length)),
+      cacheRate(rs),
     ]);
     const wall = rs.map((v) => v.result?.wallMs).filter((x) => Number.isFinite(x));
     const calls = rs.map((v) => v.calls.settled + v.calls.failed);
@@ -218,9 +238,19 @@ export function buildReport(foldedOrRecords, opts = {}) {
       sum(rs.map((v) => v.calls.usageMissing)),
     ]);
   }
-  out.push(table(['Agent', 'Arm', 'Cost', 'Cost per solved task', 'Input', 'Cached', 'Cache write', 'Output', 'Reasoning (in output)', 'Median per run: input / output / reasoning'], costRows));
+  out.push(table(['Agent', 'Arm', 'Cost', 'Cost per solved task', 'Input', 'Cached', 'Cache write', 'Output', 'Reasoning (in output)', 'Median per run: input / output / reasoning', 'Cost per run', 'Cache-hit rate (cached / input)'], costRows));
   out.push('\n');
   out.push(table(['Agent', 'Arm', 'Wall median', 'Wall p90', 'Model calls (median)', 'Refused calls', 'Calls with no usage (charged worst case)'], timeRows));
+
+  h('Infrastructure failures');
+  out.push('A run that failed in the infrastructure (the environment, the model endpoint, a container that would not stop) is tried again at most twice and is never a fail. Left out of the rates when it never finished.\n\n');
+  const infraRows = [...group(all, cellKey)]
+    .map(([, rs]) => {
+      const hit = rs.filter((v) => v.infraFailures > 0 || v.interruptions > 0 || v.state === 'Failed_infra');
+      return [rs[0].agent, rs[0].arm, hit.length, hit.filter((v) => v.state === 'Done').length, hit.filter((v) => v.state === 'Failed_infra').length, sum(rs.map((v) => v.infraFailures)), sum(rs.map((v) => v.interruptions)), formatUSD(sum(rs.map((v) => v.wastedMicro)))];
+    })
+    .filter((r) => r[2] > 0);
+  out.push(table(['Agent', 'Arm', 'Runs affected', 'Finished after a retry', 'Never finished', 'Infrastructure failures', 'Interruptions', 'Wasted'], infraRows));
 
   h('Per task');
   const cells = [...group(counted, cellKey).keys()];

@@ -8,12 +8,15 @@ import { fakeRepo, tmp } from './helpers.mjs';
 const BENCH = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'bench.mjs');
 const run = (args, env = {}) => spawnSync(process.execPath, [BENCH, ...args], { env: { ...process.env, ...env }, encoding: 'utf8' });
 
-test('the commands of later pull requests exit 2 and say which pull request builds them', () => {
-  for (const [cmd, pr] of [['pilot', 4], ['run', 4], ['regrade', 4]]) {
-    const r = run([cmd, 'anything']);
-    assert.equal(r.status, 2, cmd);
-    assert.match(r.stderr, new RegExp(`${cmd} is not built yet \\(pull request ${pr}\\)`));
+test('pilot, confirm, run and regrade are commands: with no configuration they exit 78, and an unknown option is a usage error', (t) => {
+  const home = tmp(t);
+  const env = { HOME: home, BENCH_HOME: path.join(home, 'results'), BENCH_CONFIG: path.join(home, 'none.json') };
+  for (const cmd of ['pilot', 'confirm', 'run', 'regrade']) {
+    const r = run([cmd], env);
+    assert.equal(r.status, 78, `${cmd}: ${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /not built yet/);
   }
+  assert.match(run(['--help']).stdout, /confirm \[--over-cap\]/);
 });
 
 test('no command and an unknown command are usage errors', () => {

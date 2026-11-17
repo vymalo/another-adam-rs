@@ -45,7 +45,7 @@ const USAGE = `usage: bench tasks <command>
                              write bench/tasks/public.lock.json and own.lock.json
 `;
 
-const readJson = (file, fallback) => {
+export const readJson = (file, fallback) => {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch {
@@ -81,7 +81,7 @@ const need = (config, field) => {
   return v;
 };
 
-function fetchPublic(config, p) {
+export function fetchPublic(config, p) {
   const up = fetchUpstream({ url: config.tasks.upstreamUrl, commit: need(config, 'upstreamCommit'), dir: p.upstream, sumsDir: config.tasks.upstreamDir });
   return up;
 }

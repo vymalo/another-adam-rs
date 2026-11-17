@@ -18,8 +18,8 @@ export const PER_CALL = priceCall({ input: 3_000_000, cachedInput: 300_000, cach
 
 /** An agent that makes `calls` model calls through the meter, as the real ones would, and ends as they end. */
 export class FakeAgent {
-  constructor(name, { origin, calls, crashAfter = {}, fail = {}, exit = null, stopFails = null }) {
-    Object.assign(this, { name, origin, calls, crashAfter, fail, forcedExit: exit, stopFails });
+  constructor(name, { origin, calls, crashAfter = {}, fail = {}, exit = null, stopFails = null, delayMs = 0, tracker = null }) {
+    Object.assign(this, { name, origin, calls, crashAfter, fail, forcedExit: exit, stopFails, delayMs, tracker });
     this.log = [];
   }
 
@@ -30,6 +30,25 @@ export class FakeAgent {
 
   async run(ctx) {
     this.log.push(['run', ctx.run, ctx.attempt]);
+    const t = this.tracker;
+    if (t) {
+      t.current++;
+      t.max = Math.max(t.max, t.current);
+      if (t.slots.has(ctx.slot)) t.collisions++;
+      t.slots.add(ctx.slot);
+    }
+    try {
+      return await this.#run(ctx);
+    } finally {
+      if (t) {
+        t.current--;
+        t.slots.delete(ctx.slot);
+      }
+    }
+  }
+
+  async #run(ctx) {
+    if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
     for (let i = 1; i <= this.calls; i++) {
       const res = await fetch(ctx.meter.baseUrl.replace(/^http:\/\/meter-\d:8090/, this.origin) + '/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }] }) });
       await res.arrayBuffer();
@@ -62,12 +81,15 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
   const { url } = await model.listen();
   t.after(() => model.close());
   const home = tmp(t);
-  const config = normalizeConfig(rawConfig({ endpoint: url, capUSD, perRunBudgetUSD, ...(prices ? { prices } : {}) }));
+  const raw = rawConfig({ endpoint: url, capUSD, perRunBudgetUSD, ...(prices ? { prices } : {}) });
+  const config = normalizeConfig(raw);
   const taskRoot = tmp(t);
   const tasks = Object.fromEntries(taskNames.map((n) => [n, loadTask(makeTask(taskRoot, n, { 'task.toml': `[agent]\nnetwork_mode = "none"\n\n[verifier]\nnetwork_mode = "${verifier}"\n` }))]));
   const slotContainers = new FakeContainers();
+  const grader = { broken: false };
   const grading = new FakeContainers({
     onRun: (spec) => {
+      if (grader.broken) return { exitCode: 98 };
       const logs = spec.mounts.find((m) => m.target === '/logs/verifier').source;
       const patch = spec.mounts.find((m) => m.target === '/patch/model.patch');
       const good = patch && fs.readFileSync(patch.source, 'utf8').includes('+hello');
@@ -118,6 +140,7 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
   t.after(stop);
   return {
     model,
+    raw,
     config,
     tasks,
     agents,
@@ -125,6 +148,7 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     resets,
     slotContainers,
     grading,
+    grader,
     home,
     get ledger() {
       return ledger;
@@ -143,3 +167,5 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
 export const spec = (f, name, agent, extra = {}) => ({ run: `${name}-${agent}-max`, task: f.tasks[name], agent, arm: 'max', slot: 1, ...extra });
 export const history = (f, run) => f.ledger.fold().get(run).history;
 
+
+export const newTracker = () => ({ current: 0, max: 0, slots: new Set(), collisions: 0 });

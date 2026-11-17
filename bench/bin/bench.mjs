@@ -6,9 +6,9 @@
 //   bench tasks <fetch|mine|lint|build|check|select>   task sources and the environment check
 //   bench doctor [--start]  what the machine must have; which fallback to use when nested Podman does not work
 //   bench dry-run [--phase P] [--down]   the whole path on a scripted model, no money (needs a container service)
-//   bench pilot | run | regrade   not built yet (stubs, exit 2)
+//   bench pilot | confirm | run | regrade   the pilot, the owner's confirmation, the full run, grading again
 //
-// Exit codes: 0 done, 1 a check failed, 2 not built yet, 64 usage, 78 bad configuration.
+// Exit codes: 0 done, 1 a check failed, 64 usage, 78 bad configuration.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,9 +20,9 @@ import { LedgerError, readLedger } from '../lib/ledger.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { ReportError, buildReport } from '../lib/report.mjs';
 import { Stack } from '../lib/stack.mjs';
+import { runCli } from '../lib/run-cli.mjs';
 import { runTasks } from '../lib/tasks-cli.mjs';
 
-const STUBS = { pilot: 4, run: 4, regrade: 4 };
 const USAGE = `usage: bench <command>
 
   config                          check the configuration; print what may be shown of it
@@ -34,7 +34,11 @@ const USAGE = `usage: bench <command>
                                   brings the stack up and runs a container in each Podman service; says which fallback to use
   dry-run [--phase all|grades|budget|resume] [--down]
                                   both agents on three self-test tasks and a scripted model: grades, cost, budget, kill and resume
-  pilot | run | regrade           not built yet
+  pilot [--blocks N]              the first blocks of the plan (default 5) with the configuration's per-run budget; prints the
+                                  projection and writes $BENCH_HOME/pilot-budget.json
+  confirm [--over-cap]            the owner's yes to that file; run refuses to start without it
+  run                             the full run: blocks, slots, resume, grading, then report.md
+  regrade                         grade again the runs whose grading failed in the infrastructure
 
 environment: BENCH_CONFIG (default ~/.config/adam-bench/config.json), BENCH_HOME (default ~/.local/share/adam-bench)
 `;
@@ -101,10 +105,6 @@ export async function main(argv, env = process.env) {
       process.stdout.write(USAGE);
       return command === undefined ? 64 : 0;
     }
-    if (command in STUBS) {
-      process.stderr.write(`bench: ${command} is not built yet (pull request ${STUBS[command]})\n`);
-      return 2;
-    }
     if (command === 'config') {
       process.stdout.write(`${describeConfig(loadConfig({ env }))}\n`);
       return 0;
@@ -112,6 +112,7 @@ export async function main(argv, env = process.env) {
     if (command === 'report') return report(rest, env);
     if (command === 'doctor') return await doctorCommand(rest, env);
     if (command === 'dry-run') return await dryRunCommand(rest, env);
+    if (['pilot', 'confirm', 'run', 'regrade'].includes(command)) return await runCli(command, rest, { env });
     if (command === 'tasks') return await runTasks(rest, { env });
     process.stderr.write(`bench: unknown command ${JSON.stringify(command)}\n\n${USAGE}`);
     return 64;
