@@ -10,6 +10,8 @@ same behaviour). Builds on [ADR 0007](0007-progress-as-steps-and-streamed-text.m
 
 *Amended 2026-11-14 ([ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md)):* "one-shot child runs" and "no resume" (the last rows of *What adam-rs does not copy*) are reversed: a subagent can run as a session that is sent further messages. One tool per subagent stays, beside the session tools.
 
+*Amended 2026-11-17 ([ADR 0049](0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)):* slice 2 ("ADR 0037 slices 1-2") is ADR 0049's slices P1 to P4; plugins' deciding hooks run inside each call's step and so may run concurrently for the calls of one turn.
+
 ## Context
 
 OpenCode leaves the coder (ADR 0038), but its loop is well shaped, and the owner wants that shape and a plugin system in

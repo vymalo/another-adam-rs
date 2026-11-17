@@ -612,20 +612,23 @@ sequenceDiagram
         end
         X-->>A: the recorded outcome
         A->>K: emit Custom agent_text (with the stream's id for words before a tool call)
-        loop each tool call of the turn
+        loop each segment of the turn's calls (calls that may run together, or one call that runs alone)
             alt the third call in a row with the same tool, arguments and result (doom_loop)
                 A->>K: emit Step tool:call id running, then failed: answered with an error, not run
             else
-                A->>K: emit Step tool:call id running
-                A->>X: step("tool:call id", run the tool)
-                X->>DB: journal_get(run, seq)
-                opt not recorded
-                    X->>L: call(ctx, args), within the tool's time limit
-                    L->>E: files, git, shell checks, pull request
-                    L->>K: emit Step updates (emit_progress, report_step) and Artifact events
-                    X->>DB: journal_put(run, entry): the result, or the error for a call past its limit
+                A->>X: reserve_steps(tool:call id of each call of the segment), seqs in call order
+                par each call, as soon as no earlier call it conflicts with runs and fewer than max_parallel run
+                    A->>K: emit Step tool:call id running
+                    A->>X: run the reserved step: journal_get(run, seq)
+                    opt not recorded
+                        X->>L: call(ctx, args), within the tool's time limit
+                        L->>E: files, git, shell checks, pull request
+                        L->>K: emit Step updates (emit_progress, report_step) and Artifact events
+                        X->>DB: journal_put(run, entry): the result, or the error for a call past its limit
+                    end
+                    A->>K: emit Step tool:call id completed or failed, when it finishes
                 end
-                A->>K: emit Step tool:call id completed, failed or waiting
+                A->>A: apply the results in call order: messages, artifacts, budgets, doom_loop count
             end
         end
         A-->>T: Transition (Continue, Park, Done, Fail) or AgentError
@@ -646,6 +649,14 @@ sequenceDiagram
   So does a model that makes the same call a third time with the same result and again after the refusal
   (`doom_loop`, `limit: "repeated_call"`). A call that runs past its tool's time limit (300 s unless it says otherwise)
   is stopped inside its step and answered with an error, which the journal keeps.
+* **The calls of a turn run at the same time** ([ADR 0049](decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)),
+  up to `max_parallel` (10 by default). A tool says what a call shares (`Tool::access`); calls that conflict keep the
+  model's order, and a call that is `Alone`, repeats the call before it, or follows a limit of 1 runs by itself, after
+  the calls before it are applied. The seqs of a segment's steps are reserved in call order
+  (`Ctx::reserve_steps`), so the journal is the one a sequential loop writes, and the results are applied in call
+  order whatever order the calls finish in. A tool that declares nothing is `Alone`, so a loop of such tools is
+  sequential. A cancel stops new starts and waits up to 5 s for the running calls; a transient failure stops new
+  starts, waits for the running ones and retries the transition.
 * **Replay is safe, effects are at-least-once.** The effect runs before its outcome is written, so a
   crash in between runs it again. Tools must be safe to repeat.
 * **Waking is polling plus hints.** An idle worker sleeps at most one poll interval; `start` and
