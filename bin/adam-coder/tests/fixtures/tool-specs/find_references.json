@@ -1,0 +1,55 @@
+{
+  "name": "find_references",
+  "description": "Where the symbol on a line of a file is used, by a language server (Rust, TypeScript and JavaScript, Python, Go): each as `path:line:col: the source line`, sorted, a page of at most 100 (the last line says `[more: ... offset=N]` or `[end: ...]`); at most 2000 are collected and the rest is counted. Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once; `include_declaration` (default true) lists the definition too. A first call on a project starts the server and may wait for it to index (`wait` seconds, 1 to 120, default 30). Nothing is changed. Example: {\"path\":\"src/main.rs\",\"line\":12,\"symbol\":\"parse_config\"}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "The file, relative to the worktree root"
+      },
+      "line": {
+        "type": "integer",
+        "format": "int64",
+        "description": "The line, from 1"
+      },
+      "symbol": {
+        "type": "string",
+        "description": "The text on that line the position is at (a name)"
+      },
+      "occurrence": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Which one when the symbol is on the line more than once, from 1 (default 1)"
+      },
+      "include_declaration": {
+        "type": "boolean",
+        "description": "List the definition among the references (default true)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot the file is in: its name, or the repository's address. Leave out when the workspace has one."
+      },
+      "wait": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Seconds to wait for a server that is still indexing, 1 to 120 (default 30)"
+      },
+      "offset": {
+        "type": "integer",
+        "format": "int64",
+        "description": "First reference, from 1; -20 = the last 20"
+      },
+      "limit": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Most references (at most 100)"
+      }
+    },
+    "required": [
+      "path",
+      "line",
+      "symbol"
+    ]
+  }
+}

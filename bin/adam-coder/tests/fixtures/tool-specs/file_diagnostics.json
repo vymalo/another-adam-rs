@@ -1,0 +1,35 @@
+{
+  "name": "file_diagnostics",
+  "description": "What a language server says is wrong in a file: the errors and warnings, as `path:line:col: error: message [source code]`, sorted by line, a page of at most 100 (the last line says `[more: ... offset=N]` or `[end: ...]`). A server for Rust, TypeScript and JavaScript, Python or Go runs in the workspace's environment and is kept between calls: the first call on a project starts it and may wait for it to index (`wait` seconds, 1 to 120, default 30; a first line says when it is still indexing, and the next call finds it warm). Nothing is changed. Where the environment has no server the answer says so: use run_checks or run_command. Example: {\"path\":\"src/lib.rs\"}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "The file, relative to the worktree root (.rs, .ts .tsx .js .jsx, .py, .go)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot the file is in: its name, or the repository's address. Leave out when the workspace has one."
+      },
+      "wait": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Seconds to wait for a server that is still indexing, 1 to 120 (default 30)"
+      },
+      "offset": {
+        "type": "integer",
+        "format": "int64",
+        "description": "First diagnostic, from 1; -20 = the last 20"
+      },
+      "limit": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Most diagnostics (at most 100)"
+      }
+    },
+    "required": [
+      "path"
+    ]
+  }
+}

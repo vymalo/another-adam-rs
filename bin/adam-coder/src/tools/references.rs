@@ -350,7 +350,9 @@ pub fn slot_use(name: &str) -> Option<SlotUse> {
         | "plan_check"
         | "plan_add" => SlotUse::NoSlot,
         "read_file" | "list_files" | "find_files" | "search_files" | "share_file"
-        | "run_command" => SlotUse::Reads,
+        | "run_command" | "file_diagnostics" | "find_definition" | "find_references" => {
+            SlotUse::Reads
+        }
         "write_file" | "edit_file" | "apply_patch" | "run" | "start_command" | "run_checks"
         | "commit_and_push" | "open_pull_request" => SlotUse::Writes,
         "publish_scratch" | "merge_pull_request" | "rename_repository" | "delete_repository" => {

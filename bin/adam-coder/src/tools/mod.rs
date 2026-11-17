@@ -12,6 +12,7 @@
 //! | `read_output { id, offset?, limit? }`: a kept output (a command's, or a long MCP result), paged | `adam_llm_agent::ReadOutput`, kept by [`kept`](crate::kept) |
 //! | `list_files { path?, offset?, limit? }`, `find_files { pattern, path?, offset?, limit? }`, `search_files { pattern, path?, include?, literal?, offset?, limit? }`: paged, git-aware looking around | [`find`] |
 //! | `read_file { path, offset?, limit? }` (paged; `start_line` and `end_line` are aliases), `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
+//! | `file_diagnostics { path, repo?, wait?, offset?, limit? }`, `find_definition { path, line, symbol, occurrence?, repo?, wait? }`, `find_references { path, line, symbol, occurrence?, include_declaration?, repo?, wait?, offset?, limit? }`: what a language server says about a file; read only, kept between calls | [`lsp`] |
 //! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
 //! | `run_checks { command }` | [`checks`] |
 //! | `rebuild_environment { use_default? }` | [`environment`] |
@@ -123,6 +124,7 @@ pub mod files;
 pub mod find;
 pub(crate) mod gitcli;
 pub mod inspect;
+pub mod lsp;
 pub mod make;
 pub mod named;
 pub mod notes;
@@ -139,6 +141,7 @@ pub mod shell;
 pub mod skills;
 
 pub use background::{BACKGROUND_TOOLS, Commands, CommandsSweep};
+pub use lsp::{LANGUAGE_SERVER_TOOLS, Language, ServerSpec, ServerTable};
 pub use notes::{NotesStore, RunNotes};
 pub use references::{References, ReferencesError, ReferencesSource};
 
@@ -227,6 +230,12 @@ pub struct CoderSettings {
     /// `RUN_POD_READY_TIMEOUT_SECS`. The time limit of a tool that makes the environment is this and
     /// whatever else it does.
     pub environment_start: Duration,
+    /// Whether the three language server tools are offered (`LANGUAGE_SERVERS`, `on` by default).
+    pub language_servers: bool,
+    /// How long a language server that no call uses is kept (`LANGUAGE_SERVER_IDLE_SECS`).
+    pub language_server_idle: Duration,
+    /// The most language servers this worker holds at once, for every run (`LANGUAGE_SERVERS_MAX`).
+    pub language_servers_max: usize,
 }
 
 impl Default for CoderSettings {
@@ -273,6 +282,9 @@ impl CoderSettings {
             background_kill_wait: Duration::from_secs(10),
             run_kept_max: crate::kept::RUN_KEPT_MAX,
             background_output_max: adam_llm_agent::MAX_KEPT_BYTES as u64,
+            language_servers: true,
+            language_server_idle: Duration::from_secs(600),
+            language_servers_max: 4,
         }
     }
 }
@@ -323,6 +335,9 @@ pub struct ToolEnv {
     /// The commands that keep running (`start_command`): the processes this worker holds, by output
     /// id. Cloning shares them.
     pub commands: Commands,
+    /// The language servers by language ([`lsp`]): the closed table of the images. A test points a
+    /// language at the scripted server; production never changes it.
+    pub language_table: ServerTable,
     /// What a tool wants to add to its own result without being the one that builds it (a slot
     /// made while reading: which commit it holds): by call, taken by [`Gated`] when the call ends.
     notices: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
@@ -351,6 +366,7 @@ impl ToolEnv {
             credentials_hint: "GITHUB_TOKEN is valid and may push and open pull requests for the repository",
             references: References::default(),
             commands: Commands::new(),
+            language_table: ServerTable::production(),
             notices: std::sync::Mutex::default(),
         }
     }
@@ -971,7 +987,7 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
     } else {
         ToolSet::new()
     };
-    let after = tools![
+    let looking = tools![
         inspect::RunCommand,
         make::Run,
         background::StartCommand,
@@ -982,6 +998,17 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         find::FindFiles,
         find::SearchFiles,
         adam_llm_agent::ReadOutput,
+    ];
+    let servers = if env.settings.language_servers {
+        tools![
+            lsp::FileDiagnostics,
+            lsp::FindDefinition,
+            lsp::FindReferences,
+        ]
+    } else {
+        ToolSet::new()
+    };
+    let after = tools![
         files::WriteFile,
         files::ApplyPatch,
         files::EditFile,
@@ -996,6 +1023,8 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
     ];
     before
         .extend(creating)
+        .extend(looking)
+        .extend(servers)
         .extend(after)
         .extend(env.ui.tools())
         .wrap(Gated::layer(env.clone()))
@@ -1150,6 +1179,7 @@ pub const QUICK_TOOLS: [&str; 16] = [
 /// | `stop_command` | the environment is made ready (for a command this worker does not hold) and the call waits for the process 60 s |
 /// | `list_commands` | the environment is asked for its session, and the records are read |
 /// | `read_file`, `list_files`, `find_files`, `search_files`, `read_output` | their own deadline (`find::DEADLINE`, 30 s) |
+/// | `file_diagnostics`, `find_definition`, `find_references` | the environment is made ready, and the call waits for a language server at most `wait` (120 s), `initialize` (60 s) and the probe and the sync (60 s): [`lsp::BEYOND_ENVIRONMENT`] |
 /// | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | git: one network operation and the local ones around it |
 fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
     let environment = settings.environment_start;
@@ -1166,6 +1196,11 @@ fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
         "list_commands" => environment + find::DEADLINE,
         "read_file" | "list_files" | "find_files" | "search_files" | "read_output" => {
             find::DEADLINE
+        }
+        // The environment is made ready, and the call waits for a server up to `wait` (120 s),
+        // `initialize` (60 s) and the probe and the sync (60 s).
+        "file_diagnostics" | "find_definition" | "find_references" => {
+            environment + lsp::BEYOND_ENVIRONMENT
         }
         "prepare_workspace" | "commit_and_push" | "publish_scratch" | "create_repository" => {
             adam_workspace::NETWORK_TIMEOUT + adam_workspace::LOCAL_TIMEOUT
