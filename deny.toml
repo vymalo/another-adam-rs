@@ -7,7 +7,13 @@ all-features = true
 [advisories]
 # Known-vulnerable or unmaintained dependencies fail the build. To accept one
 # deliberately, add its RUSTSEC id below with a reason and a review date.
-ignore = []
+ignore = [
+    # chrono is unmaintained (informational, not a vulnerability; issued 2026-11-17, "all versions are
+    # affected", no patched version). Accepted by the owner on 2026-11-17, with a migration of adam-rs's own
+    # code to jiff to follow; the A2A types adam-rs builds on (`a2a-lf`) still depend on chrono. Review by
+    # 2027-02-17, or at once if an advisory names a vulnerability in chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; accepted 2026-11-17, migration to jiff to follow, review by 2027-02-17" },
+]
 
 [licenses]
 # Permissive licenses only. Add to this list deliberately, in a reviewed change.

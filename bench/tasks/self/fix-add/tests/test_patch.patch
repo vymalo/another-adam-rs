@@ -1,0 +1,10 @@
+diff --git a/add.test.mjs b/add.test.mjs
+new file mode 100644
+--- /dev/null
++++ b/add.test.mjs
+@@ -0,0 +1,5 @@
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++import { add } from './add.mjs';
++
++test('adds', () => assert.equal(add(2, 3), 5));

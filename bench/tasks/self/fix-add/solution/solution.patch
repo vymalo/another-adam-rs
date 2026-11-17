@@ -1,0 +1,6 @@
+diff --git a/add.mjs b/add.mjs
+--- a/add.mjs
++++ b/add.mjs
+@@ -1 +1 @@
+-export const add = (a, b) => a - b;
++export const add = (a, b) => a + b;

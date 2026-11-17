@@ -1,0 +1,11 @@
+{
+  "name": "adam-bench",
+  "private": true,
+  "description": "Benchmark harness for adam-coder and OpenCode. No dependencies: Node's standard library only.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "bench": "node bin/bench.mjs"
+  }
+}

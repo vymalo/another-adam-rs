@@ -1,0 +1,6 @@
+diff --git a/bye.txt b/bye.txt
+new file mode 100644
+--- /dev/null
++++ b/bye.txt
+@@ -0,0 +1 @@
++farewell

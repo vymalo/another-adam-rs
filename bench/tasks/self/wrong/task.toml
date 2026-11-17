@@ -1,0 +1,14 @@
+[agent]
+network_mode = "none"
+
+[verifier]
+network_mode = "none"
+
+[environment]
+cpus = 1
+memory_mb = 2048
+docker_image = "adam-bench-self/wrong:1"
+
+[metadata]
+repo = "self/wrong"
+language = "javascript"
