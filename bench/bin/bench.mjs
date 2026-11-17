@@ -3,7 +3,8 @@
 //
 //   bench config            check the configuration and print what may be shown of it
 //   bench report            build report.md from the ledger
-//   bench doctor | tasks | pilot | run | regrade   not built yet (stubs, exit 2)
+//   bench tasks <fetch|mine|lint|build|check|select>   task sources and the environment check
+//   bench doctor | pilot | run | regrade   not built yet (stubs, exit 2)
 //
 // Exit codes: 0 done, 2 not built yet, 64 usage, 78 bad configuration.
 import fs from 'node:fs';
@@ -13,14 +14,17 @@ import { parseArgs } from 'node:util';
 import { ConfigError, EXIT_CONFIG, assertOutsideRepo, benchHome, configPath, describeConfig, loadConfig } from '../lib/config.mjs';
 import { LedgerError, readLedger } from '../lib/ledger.mjs';
 import { ReportError, buildReport } from '../lib/report.mjs';
+import { runTasks } from '../lib/tasks-cli.mjs';
 
-const STUBS = { doctor: 3, tasks: 2, pilot: 4, run: 4, regrade: 4 };
+const STUBS = { doctor: 3, pilot: 4, run: 4, regrade: 4 };
 const USAGE = `usage: bench <command>
 
   config                          check the configuration; print what may be shown of it
   report [--ledger FILE] [--out FILE] [--show-model-id]
                                   build the report from the ledger (default $BENCH_HOME/report.md)
-  doctor | tasks | pilot | run | regrade
+  tasks fetch|mine|lint|build|check|select
+                                  task sources, the environment check and selection (bench tasks --help)
+  doctor | pilot | run | regrade
                                   not built yet
 
 environment: BENCH_CONFIG (default ~/.config/adam-bench/config.json), BENCH_HOME (default ~/.local/share/adam-bench)
@@ -56,7 +60,7 @@ function report(argv, env) {
   return 0;
 }
 
-export function main(argv, env = process.env) {
+export async function main(argv, env = process.env) {
   const [command, ...rest] = argv;
   try {
     if (command === undefined || command === '--help' || command === '-h') {
@@ -72,6 +76,7 @@ export function main(argv, env = process.env) {
       return 0;
     }
     if (command === 'report') return report(rest, env);
+    if (command === 'tasks') return await runTasks(rest, { env });
     process.stderr.write(`bench: unknown command ${JSON.stringify(command)}\n\n${USAGE}`);
     return 64;
   } catch (e) {
@@ -89,5 +94,5 @@ export function main(argv, env = process.env) {
 
 const entry = process.argv[1] ? fs.realpathSync(process.argv[1]) : '';
 if (entry === fileURLToPath(import.meta.url)) {
-  process.exitCode = main(process.argv.slice(2));
+  process.exitCode = await main(process.argv.slice(2));
 }

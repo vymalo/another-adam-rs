@@ -9,7 +9,7 @@ const BENCH = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin
 const run = (args, env = {}) => spawnSync(process.execPath, [BENCH, ...args], { env: { ...process.env, ...env }, encoding: 'utf8' });
 
 test('the commands of later pull requests exit 2 and say which pull request builds them', () => {
-  for (const [cmd, pr] of [['doctor', 3], ['tasks', 2], ['pilot', 4], ['run', 4], ['regrade', 4]]) {
+  for (const [cmd, pr] of [['doctor', 3], ['pilot', 4], ['run', 4], ['regrade', 4]]) {
     const r = run([cmd, 'anything']);
     assert.equal(r.status, 2, cmd);
     assert.match(r.stderr, new RegExp(`${cmd} is not built yet \\(pull request ${pr}\\)`));
@@ -33,4 +33,12 @@ test('a results directory inside the repository is refused with 78', (t) => {
   const elsewhere = fakeRepo(t);
   const inCwd = spawnSync(process.execPath, [BENCH, 'report'], { cwd: elsewhere, env: { ...process.env, HOME: home, BENCH_HOME: path.join(elsewhere, 'out') }, encoding: 'utf8' });
   assert.equal(inCwd.status, 78, 'the repository of the working directory counts too');
+});
+
+test('tasks without a known subcommand is a usage error, and with --help it prints the usage', () => {
+  assert.equal(run(['tasks']).status, 64);
+  assert.equal(run(['tasks', 'frobnicate']).status, 64);
+  const r = run(['tasks', '--help']);
+  assert.equal(r.status, 0);
+  assert.match(r.stderr, /bench tasks <command>/);
 });

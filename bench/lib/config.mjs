@@ -52,6 +52,21 @@ export const SCHEMA = {
       idleSeconds: { type: 'seconds', default: 120 },
     },
   },
+  tasks: {
+    type: 'object',
+    optional: true,
+    doc: 'Task sources and grading: the pinned upstream commit, the clones to mine, the workspace image, the Podman service',
+    fields: {
+      upstreamUrl: { type: 'string', default: 'https://github.com/scaleapi/SWE-bench_Pro-os.git' },
+      upstreamCommit: { type: 'commit' },
+      upstreamDir: { type: 'path', default: 'v2' },
+      clones: { type: 'object' },
+      workspaceImage: { type: 'imageByDigest' },
+      selfRepo: { type: 'string', default: 'another-adam-rs' },
+      seed: { type: 'string', default: '1' },
+      podman: { type: 'object', fields: { connection: { type: 'string' }, url: { type: 'string' } } },
+    },
+  },
 };
 
 /** A request field an arm may not set: they would change what is being compared or break the relay. */
@@ -160,7 +175,7 @@ function parseEndpoint(value) {
 /** Validate a parsed configuration object (no file, no environment) and return the normalised one. */
 export function normalizeConfig(raw) {
   if (!isObject(raw)) throw new ConfigError('(file)', 'must be a JSON object');
-  scanForSecrets(raw, '', new Set(['endpoint', 'keyEnv']));
+  scanForSecrets(raw, '', new Set(['endpoint', 'keyEnv', 'tasks.upstreamCommit']));
   checkUnknown(raw, SCHEMA, '');
   for (const [name, spec] of Object.entries(SCHEMA)) {
     if (spec.required && raw[name] === undefined) throw new ConfigError(name, 'is required');
@@ -233,7 +248,56 @@ export function normalizeConfig(raw) {
   };
   const timeouts = { firstByteMs: seconds('firstByteSeconds'), idleMs: seconds('idleSeconds') };
 
-  return { endpoint, modelId, modelLabel, prices, capMicro, perRunBudgetMicro, arms, keyEnv, concurrency, contextWindow, timeouts };
+  const tasks = normalizeTasks(raw.tasks);
+  return { endpoint, modelId, modelLabel, prices, capMicro, perRunBudgetMicro, arms, keyEnv, concurrency, contextWindow, timeouts, tasks };
+}
+
+/** The `tasks` block: task sources and grading. Every field optional; the commands that need one say which. */
+function normalizeTasks(raw) {
+  const f = SCHEMA.tasks.fields;
+  const out = { upstreamUrl: f.upstreamUrl.default, upstreamCommit: null, upstreamDir: f.upstreamDir.default, clones: {}, workspaceImage: null, selfRepo: f.selfRepo.default, seed: f.seed.default, podman: {} };
+  if (raw === undefined) return out;
+  if (!isObject(raw)) throw new ConfigError('tasks', 'must be an object');
+  checkUnknown(raw, f, 'tasks');
+  const str = (name) => {
+    const v = raw[name];
+    if (typeof v !== 'string' || v === '' || v.length > 500 || /[\s\0]/.test(v)) throw new ConfigError(`tasks.${name}`, 'must be a short string with no space');
+    return v;
+  };
+  if (raw.upstreamUrl !== undefined) out.upstreamUrl = str('upstreamUrl');
+  if (raw.upstreamCommit !== undefined) {
+    out.upstreamCommit = str('upstreamCommit');
+    if (!/^[0-9a-f]{40}$/.test(out.upstreamCommit)) throw new ConfigError('tasks.upstreamCommit', 'must be a full 40-digit commit id');
+  }
+  if (raw.upstreamDir !== undefined) {
+    out.upstreamDir = str('upstreamDir');
+    if (out.upstreamDir.startsWith('/') || out.upstreamDir.split('/').includes('..')) throw new ConfigError('tasks.upstreamDir', 'must be a relative path');
+  }
+  if (raw.clones !== undefined) {
+    if (!isObject(raw.clones)) throw new ConfigError('tasks.clones', 'must be an object of name to absolute path');
+    for (const [name, p] of Object.entries(raw.clones)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(name)) throw new ConfigError(`tasks.clones.${name}`, 'a clone name is plain letters, digits, . - and _');
+      if (typeof p !== 'string' || !path.isAbsolute(p)) throw new ConfigError(`tasks.clones.${name}`, 'must be an absolute path');
+      out.clones[name] = p;
+    }
+  }
+  if (raw.workspaceImage !== undefined) {
+    out.workspaceImage = str('workspaceImage');
+    if (!/^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$/i.test(out.workspaceImage)) throw new ConfigError('tasks.workspaceImage', 'must name the image by digest (name@sha256:...)');
+  }
+  if (raw.selfRepo !== undefined) out.selfRepo = str('selfRepo');
+  if (raw.seed !== undefined) out.seed = String(typeof raw.seed === 'number' ? raw.seed : str('seed'));
+  if (raw.podman !== undefined) {
+    if (!isObject(raw.podman)) throw new ConfigError('tasks.podman', 'must be an object');
+    checkUnknown(raw.podman, f.podman.fields, 'tasks.podman');
+    for (const k of ['connection', 'url']) {
+      if (raw.podman[k] === undefined) continue;
+      const v = raw.podman[k];
+      if (typeof v !== 'string' || v === '' || /[\s\0]/.test(v)) throw new ConfigError(`tasks.podman.${k}`, 'must be a short string with no space');
+      out.podman[k] = v;
+    }
+  }
+  return out;
 }
 
 /** What may be shown about a configuration: no URL path, no id, no prices. */
