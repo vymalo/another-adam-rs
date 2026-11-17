@@ -22,7 +22,7 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 32] = [
+const TOOLS: [&str; 35] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -38,6 +38,9 @@ const TOOLS: [&str; 32] = [
     "find_files",
     "search_files",
     "read_output",
+    "file_diagnostics",
+    "find_definition",
+    "find_references",
     "write_file",
     "apply_patch",
     "edit_file",
@@ -178,9 +181,9 @@ async fn every_tool_has_its_tier_and_the_new_ones_need_the_high_ones() {
 }
 
 /// The loop pages by what a tool declares (`Tool::paged`), never by an `offset` in its schema: the
-/// five tools that read in pages declare it, and no other built-in tool does.
+/// seven tools that read in pages declare it, and no other built-in tool does.
 #[tokio::test]
-async fn exactly_the_five_paged_tools_declare_that_they_page() {
+async fn exactly_the_seven_paged_tools_declare_that_they_page() {
     let fx = Fixture::new().await.offering_creation();
     for tool in coder_tools(&fx.env) {
         let spec = tool.spec();
@@ -190,6 +193,8 @@ async fn exactly_the_five_paged_tools_declare_that_they_page() {
             "find_files",
             "search_files",
             "read_output",
+            "file_diagnostics",
+            "find_references",
         ]
         .contains(&spec.name.as_str());
         assert_eq!(tool.paged(), paged, "{}", spec.name);
@@ -200,6 +205,41 @@ async fn exactly_the_five_paged_tools_declare_that_they_page() {
                 spec.name
             );
         }
+    }
+}
+
+/// `LANGUAGE_SERVERS=off` takes the three tools out of the set, as an owner list that names nobody
+/// takes `create_repository`: the model is not offered what the deployment turned off, and the
+/// others are offered in the same order.
+#[tokio::test]
+async fn the_three_language_server_tools_are_offered_unless_the_deployment_turns_them_off() {
+    let fx = Fixture::with(|settings| settings.language_servers = false)
+        .await
+        .offering_creation();
+    let names: Vec<String> = coder_tools(&fx.env)
+        .into_iter()
+        .map(|t| t.spec().name)
+        .collect();
+    let expected: Vec<&str> = TOOLS
+        .into_iter()
+        .filter(|name| !adam_coder::LANGUAGE_SERVER_TOOLS.contains(name))
+        .collect();
+    assert_eq!(names, expected);
+    assert_eq!(
+        adam_coder::LANGUAGE_SERVER_TOOLS,
+        ["file_diagnostics", "find_definition", "find_references"]
+    );
+}
+
+/// The three tools only look: the lowest tier allows them, a reference is read by them.
+#[test]
+fn the_language_server_tools_need_the_lowest_tier_and_read_a_slot() {
+    use adam_a2a::AccessTier::Plan;
+    use adam_coder::tools::references::{SlotUse, slot_use};
+    for name in adam_coder::LANGUAGE_SERVER_TOOLS {
+        assert_eq!(adam_coder::tier::known(name), Some(Plan), "{name}");
+        assert_eq!(adam_coder::tier::needs(name), Plan, "{name}");
+        assert_eq!(slot_use(name), Some(SlotUse::Reads), "{name}");
     }
 }
 

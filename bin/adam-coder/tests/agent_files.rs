@@ -108,7 +108,7 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 41] = [
+const TOOLS: [&str; 44] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -124,6 +124,9 @@ const TOOLS: [&str; 41] = [
     "find_files",
     "search_files",
     "read_output",
+    "file_diagnostics",
+    "find_definition",
+    "find_references",
     "write_file",
     "apply_patch",
     "edit_file",
@@ -213,6 +216,9 @@ async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
         ("find_files", Search),
         ("search_files", Search),
         ("read_output", Read),
+        ("file_diagnostics", Search),
+        ("find_definition", Search),
+        ("find_references", Search),
         ("write_file", Edit),
         ("edit_file", Edit),
         ("apply_patch", Edit),

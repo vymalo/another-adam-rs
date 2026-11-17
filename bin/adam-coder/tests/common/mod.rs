@@ -1021,6 +1021,9 @@ impl Fixture {
         );
         git(&seed, &["init", "--quiet", "--initial-branch=main"]);
         for (file, content) in files {
+            if let Some(parent) = std::path::Path::new(file).parent() {
+                std::fs::create_dir_all(seed.join(parent)).unwrap();
+            }
             std::fs::write(seed.join(file), content).unwrap();
         }
         git(&seed, &["add", "-A"]);
