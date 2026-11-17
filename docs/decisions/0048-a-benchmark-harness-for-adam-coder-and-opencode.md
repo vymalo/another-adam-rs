@@ -28,10 +28,15 @@ hard ceiling. The owner's endpoint, model, prices and key are private and must n
    agents' own counts are shown beside it and never used for the cap.
 5. **A hard cap, as reservations.** A run reserves its budget before it starts and is never started if the
    reservation would cross the cap; a call whose worst case would cross its run's reservation is refused with 429.
-   Money is integer micro-dollars. A call with no usable `usage` is charged its worst case and flagged.
+   Money is integer micro-dollars. A call with no usable `usage` is charged its worst case and flagged. The cap is
+   soft by one call per running slot: a call that reports more usage than its worst case takes its run, and the
+   total, past the reservation by that call's excess, and the next call is refused. Every call also has a size and
+   a time limit, one completion (`n` = 1), and the agent never sees an upstream error body; the numbers are in
+   [`bench/README.md`](../../bench/README.md).
 6. **A ledger and resume.** An append-only record of every state change of every run and every call. A finished run
-   is never repeated; an interrupted one starts again and its spend stays as waste; a run being graded is graded
-   again and never run again.
+   is never repeated; an interrupted one starts again and its spend stays as waste, but at most twice: the third
+   interruption ends the run `Failed_infra` for good; a run being graded is graded again and never run again. The
+   ledger has one writer, held by a lock file that is linked into place so it never exists without its pid.
 7. **Grading** is by patch replay in a pristine image, three times, two of three to pass (slice 2).
 8. **A pilot first** (slice 4): 20 runs set the per-run budget; the full run starts only after the owner confirms the
    projection.
@@ -66,7 +71,8 @@ Defaults, each changeable in the local configuration:
 * A comparison that holds the environment, the model and the money fixed, and says plainly what it cannot show.
 * A harness that costs nothing to test: the tests use a scripted OpenAI-compatible server and spend no tokens.
 * The meter's worst case is an estimate (one token per three bytes of input, the clamped output); an endpoint that
-  reports more than it makes the global stop, not the reservation, hold the cap.
+  reports more than it makes the global stop, not the reservation, hold the cap, so the cap is soft by that one
+  call's excess per running slot.
 
 ## Verified and unverified
 

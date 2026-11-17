@@ -463,3 +463,16 @@ async function until(fn, what, ms = 3000) {
     await new Promise((r) => setTimeout(r, 20));
   }
 }
+
+test('row 17: the cap is soft by one call: a call that reports more than its worst case passes its reservation, and the next call is refused', async (t) => {
+  // the scripted endpoint reports 100_000 output tokens: 1_500_000 micro-dollars, far above the worst case of 122_990
+  const s = await setup(t, { reserve: 200_000, behavior: { usage: { prompt: 10, completion: 100_000, cached: 0, reasoning: 0, cacheWrite: 0 } } });
+  const { baseUrl } = s.open();
+  assert.equal((await chat(baseUrl, { messages: [] })).status, 200);
+  const spent = s.book.runView('r1').spentMicro;
+  assert.ok(spent > 200_000, `the run spent ${spent} against a reservation of 200000`);
+  assert.equal((await chat(baseUrl, { messages: [] })).status, 429, 'the very next call is refused');
+  assert.equal(s.model.requests.length, 1);
+  assert.equal(s.book.runView('r1').spentMicro, spent, 'the excess is that one call, no more');
+  assert.equal(s.book.committedMicro(), spent, 'a run over its reservation is committed at what it spent');
+});
