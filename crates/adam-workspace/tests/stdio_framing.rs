@@ -10,10 +10,11 @@
 
 use std::time::Duration;
 
-use adam_workspace::LocalSession;
 use adam_workspace::testing_stdio::{
     StdioProbe, framed_stdio_until_eof, framed_stdio_until_kill, silence,
 };
+use adam_workspace::testing_stdio::{Step, processes_carrying};
+use adam_workspace::{EnvSession, ExecSpec, LocalSession};
 
 #[tokio::test]
 async fn local_stdin_stays_open_through_a_silence_and_eof_ends_the_process() {
@@ -30,5 +31,42 @@ async fn local_kill_leaves_nothing_of_the_process() {
     let probe = StdioProbe::new(dir.path()).silence(Duration::from_secs(1));
     if let Err(e) = framed_stdio_until_kill(&LocalSession, &probe).await {
         panic!("local environment: {e}");
+    }
+}
+
+#[tokio::test]
+async fn the_probe_sees_a_live_local_process_and_stops_seeing_it_after_the_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = format!("probe-test-{}", std::process::id());
+    let spec = ExecSpec::shell("exec sleep 300", dir.path()).env("ADAM_STDIO_PROBE", &marker);
+    let prepared = LocalSession.prepare(&spec).unwrap();
+    let mut child = prepared.command().kill_on_drop(true).spawn().unwrap();
+    let wait = Duration::from_secs(10);
+    let seen = processes_carrying(&LocalSession, dir.path(), &marker, wait)
+        .await
+        .unwrap();
+    assert!(!seen.is_empty(), "the live process is found");
+    child.kill().await.unwrap();
+    let after = processes_carrying(&LocalSession, dir.path(), &marker, wait)
+        .await
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "nothing is found after the kill: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_probe_that_cannot_see_the_live_process_is_the_probe_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = StdioProbe::new(dir.path()).silence(Duration::from_secs(1));
+    probe.probe_marker = Some("not-the-processs-marker".to_owned());
+    for result in [
+        framed_stdio_until_kill(&LocalSession, &probe).await,
+        framed_stdio_until_eof(&LocalSession, &probe).await,
+    ] {
+        let e = result.expect_err("a wrong marker must fail");
+        assert_eq!(e.step, Step::Probe, "{e}");
+        assert!(e.to_string().contains("would prove nothing"), "{e}");
     }
 }

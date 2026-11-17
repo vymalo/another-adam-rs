@@ -14,6 +14,9 @@
 //!    process must still be there;
 //! 3. [`Step::LargeMessage`]: a framed message of 64 KiB (more than a pipe buffer) is written and
 //!    read back;
+//!    Before the end, the probe that looks for leftovers is run against the live process and must
+//!    find it ([`Step::Probe`]): if it cannot (the marker did not reach the process, or `/proc` is
+//!    not readable there), the check after the kill would prove nothing.
 //! 4. [`Step::Eof`] ([`framed_stdio_until_eof`]): stdin is closed and the process ends by itself with
 //!    status 0; or [`Step::Kill`] ([`framed_stdio_until_kill`]): the process group is killed and so
 //!    is the exec id in the environment, and no process that carries the run's marker is left in
@@ -66,6 +69,8 @@ pub enum Step {
     Silence,
     /// The 64 KiB message after the silence.
     LargeMessage,
+    /// The probe that looks for the process by its marker did not see the live process.
+    Probe,
     /// Closing stdin: the process must end by itself, with status 0.
     Eof,
     /// Killing the process: it and its process group must be gone from the environment.
@@ -79,6 +84,7 @@ impl fmt::Display for Step {
             Self::FirstMessage => "first message",
             Self::Silence => "silence with stdin open",
             Self::LargeMessage => "large message after the silence",
+            Self::Probe => "probe of the live process",
             Self::Eof => "end of input (EOF)",
             Self::Kill => "kill",
         })
@@ -111,6 +117,8 @@ pub struct StdioProbe {
     pub silence: Duration,
     /// The longest each wait takes (a message back, the end of the process, the kill).
     pub deadline: Duration,
+    /// For testing the probe itself: look for this marker instead of the process's own.
+    pub probe_marker: Option<String>,
 }
 
 impl StdioProbe {
@@ -120,6 +128,7 @@ impl StdioProbe {
             cwd: cwd.into(),
             silence: silence(),
             deadline: Duration::from_secs(60),
+            probe_marker: None,
         }
     }
 
@@ -362,7 +371,11 @@ impl Running {
     }
 
     /// The conversation up to the point where stdin is still open and the second message was answered.
-    async fn converse(&mut self, probe: &StdioProbe) -> Result<(), StdioFailure> {
+    async fn converse(
+        &mut self,
+        session: &dyn EnvSession,
+        probe: &StdioProbe,
+    ) -> Result<(), StdioFailure> {
         self.round_trip(Step::FirstMessage, &json_body(1, 120), probe.deadline)
             .await?;
         self.stay_silent(probe.silence).await?;
@@ -371,7 +384,25 @@ impl Running {
             &json_body(2, LARGE_BODY),
             probe.deadline,
         )
-        .await
+        .await?;
+        self.assert_visible(session, probe).await
+    }
+
+    /// The probe must see the live process, or its silence after the kill means nothing.
+    async fn assert_visible(
+        &self,
+        session: &dyn EnvSession,
+        probe: &StdioProbe,
+    ) -> Result<(), StdioFailure> {
+        let marker = probe.probe_marker.as_deref().unwrap_or(&self.marker);
+        let found = processes_carrying(session, &probe.cwd, marker, probe.deadline).await?;
+        if found.is_empty() {
+            return Err(fail(
+                Step::Probe,
+                "the probe finds no process carrying the marker while the process is alive: the marker did not reach it, or /proc is not readable there, so the check after the kill would prove nothing",
+            ));
+        }
+        Ok(())
     }
 
     async fn eof(&mut self, probe: &StdioProbe) -> Result<(), StdioFailure> {
@@ -442,7 +473,8 @@ impl Running {
         // Nothing carrying the marker is left in the environment (it may take a moment to go).
         let started = Instant::now();
         loop {
-            let left = self.leftovers(session, probe).await?;
+            let left =
+                processes_carrying(session, &probe.cwd, &self.marker, probe.deadline).await?;
             if left.is_empty() {
                 return Ok(());
             }
@@ -455,35 +487,39 @@ impl Running {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+}
 
-    /// The `/proc` entries of processes of the environment whose environment holds this run's marker.
-    async fn leftovers(
-        &self,
-        session: &dyn EnvSession,
-        probe: &StdioProbe,
-    ) -> Result<Vec<String>, StdioFailure> {
-        let line = format!(
-            "grep -l -a 'ADAM_STDIO_PROBE={}' /proc/[0-9]*/environ 2>/dev/null; true",
-            self.marker
-        );
-        let prepared = session
-            .prepare(&ExecSpec::shell(line, &probe.cwd))
-            .map_err(|e| fail(Step::Kill, format!("prepare the leftover probe: {e}")))?;
-        let mut cmd = prepared.command();
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let out = tokio::time::timeout(probe.deadline, cmd.output())
-            .await
-            .map_err(|_| fail(Step::Kill, "the leftover probe did not end"))?
-            .map_err(|e| fail(Step::Kill, format!("the leftover probe: {e}")))?;
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(str::to_owned)
-            .collect())
-    }
+/// The `/proc` entries of processes in the environment whose own environment holds `marker`
+/// (`ADAM_STDIO_PROBE=<marker>`), found with a command run through the session.
+///
+/// # Errors
+///
+/// [`Step::Probe`] when the command cannot be prepared or run.
+pub async fn processes_carrying(
+    session: &dyn EnvSession,
+    cwd: &std::path::Path,
+    marker: &str,
+    deadline: Duration,
+) -> Result<Vec<String>, StdioFailure> {
+    let line =
+        format!("grep -l -a 'ADAM_STDIO_PROBE={marker}' /proc/[0-9]*/environ 2>/dev/null; true");
+    let prepared = session
+        .prepare(&ExecSpec::shell(line, cwd))
+        .map_err(|e| fail(Step::Probe, format!("prepare the probe: {e}")))?;
+    let mut cmd = prepared.command();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(deadline, cmd.output())
+        .await
+        .map_err(|_| fail(Step::Probe, "the probe did not end"))?
+        .map_err(|e| fail(Step::Probe, format!("the probe: {e}")))?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// SIGKILL the process group led by `pid` (the shell's `kill`: this crate forbids `unsafe`).
@@ -510,7 +546,7 @@ pub async fn framed_stdio_until_eof(
     probe: &StdioProbe,
 ) -> Result<(), StdioFailure> {
     let mut running = Running::start(session, probe)?;
-    let result = match running.converse(probe).await {
+    let result = match running.converse(session, probe).await {
         Ok(()) => running.eof(probe).await,
         Err(e) => Err(e),
     };
@@ -531,7 +567,7 @@ pub async fn framed_stdio_until_kill(
     probe: &StdioProbe,
 ) -> Result<(), StdioFailure> {
     let mut running = Running::start(session, probe)?;
-    let result = match running.converse(probe).await {
+    let result = match running.converse(session, probe).await {
         Ok(()) => running.killed(session, probe).await,
         Err(e) => Err(e),
     };

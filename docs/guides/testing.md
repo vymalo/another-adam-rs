@@ -65,7 +65,8 @@ A language server is a long-running process that is written to on stdin and answ
 frames. `adam_workspace::testing_stdio` asks any environment whether it can host one, with `cat` as the server: a first
 message read back, **silence with stdin held open**, a 64 KiB message read back (more than a pipe buffer), then **EOF**
 (the process ends by itself with status 0) or a **kill** (the process group and the environment's `kill` by exec id; no
-process carrying the run's marker is left). A failure names the step. `ADAM_TEST_STDIO_SILENCE_SECS` sets the silence
+process carrying the run's marker is left). Before the end, the same probe must **see** the live process by its marker (step
+`probe`), or its silence after a kill would prove nothing. A failure names the step. `ADAM_TEST_STDIO_SILENCE_SECS` sets the silence
 (20 s by default; the kill case always uses 1 s).
 
 | Environment | Test | Run it | CI |
