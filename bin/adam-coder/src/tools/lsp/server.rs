@@ -22,7 +22,7 @@
 //! ```
 //!
 //! A server is **never** trusted to be one thing: what it sends is bounded (`rpc`), what it asks is
-//! answered by [`Shared`] (`workspace/applyEdit` is refused: the client never declares the
+//! answered by `Shared` (`workspace/applyEdit` is refused: the client never declares the
 //! capability, and a server that asks anyway is answered `applied: false`), and every process of
 //! it is killed by group and by the environment's own `kill` at each stop point. The processes of
 //! a run end with the run: [`Servers::stop_run`] is called wherever
@@ -31,7 +31,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -49,7 +49,9 @@ use crate::tools::inspect::Snapshot;
 
 /// How long `initialize` may take.
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
-/// What of the server's stderr is kept: its last bytes.
+/// What of the server's stderr is shown: its last bytes. What is held in memory is that and the
+/// redactor's margin before it (see [`Want::redactor`]), so that a secret cut by the start of what is
+/// held is scrubbed whole or dropped, and the 16 KiB shown never start with a part of one.
 pub const STDERR_KEPT: usize = 16 * 1024;
 /// How long a server is quiet (no progress begins or ends) before it counts as ready.
 pub const SETTLE: Duration = Duration::from_millis(300);
@@ -124,6 +126,10 @@ pub(super) struct Shared {
     live: Mutex<Live>,
     changed: watch::Sender<u64>,
     started: Instant,
+    /// The server said at `initialize` that it tells when it is quiet (`experimental/serverStatus`,
+    /// rust-analyzer's): it is then not ready before it says `quiescent: true`, however quiet it
+    /// has been.
+    reports_status: AtomicBool,
 }
 
 impl Shared {
@@ -133,6 +139,7 @@ impl Shared {
             live: Mutex::new(Live::default()),
             changed: watch::channel(0).0,
             started: Instant::now(),
+            reports_status: AtomicBool::new(false),
         })
     }
 
@@ -144,10 +151,18 @@ impl Shared {
         self.changed.send_modify(|n| *n += 1);
     }
 
-    /// Whether the server is indexing: a progress is open, or it said it is not quiescent.
+    /// Whether the server is working through its index: a progress is open, or it said it is not
+    /// quiescent, or it says when it is quiet and has not yet.
+    fn working(&self, live: &Live) -> bool {
+        !live.progress.is_empty()
+            || live.quiescent == Some(false)
+            || (self.reports_status.load(Ordering::Acquire) && live.quiescent != Some(true))
+    }
+
+    /// Whether the server is indexing now.
     fn indexing(&self) -> bool {
         let live = self.live();
-        !live.progress.is_empty() || live.quiescent == Some(false)
+        self.working(&live)
     }
 
     /// Wait until the server is not indexing and has been quiet for [`SETTLE`], at most until
@@ -157,10 +172,7 @@ impl Shared {
         loop {
             let (busy, since) = {
                 let live = self.live();
-                (
-                    !live.progress.is_empty() || live.quiescent == Some(false),
-                    live.last_event.unwrap_or(self.started),
-                )
+                (self.working(&live), live.last_event.unwrap_or(self.started))
             };
             if !busy && since.elapsed() >= SETTLE {
                 return true;
@@ -322,6 +334,32 @@ impl Peer for Shared {
 struct Tail {
     bytes: Vec<u8>,
     total: u64,
+}
+
+/// The last [`STDERR_KEPT`] bytes of what a server said on stderr, scrubbed: what is held is
+/// scrubbed as a whole, its start (where a secret may be cut) is dropped when it is not the start of
+/// the output, and then the last bytes are taken, from a character's start.
+fn tail_text(stderr: &Mutex<Tail>, redactor: &Redactor) -> String {
+    let (bytes, cut) = {
+        let tail = lock(stderr);
+        (tail.bytes.clone(), tail.total > tail.bytes.len() as u64)
+    };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let scrubbed = if cut {
+        adam_llm_agent::scrub_open_start(
+            &text,
+            |t| redactor.scrub(t).into_owned(),
+            redactor.margin(),
+        )
+    } else {
+        redactor.scrub(&text).into_owned()
+    };
+    let scrubbed = scrubbed.trim();
+    let mut from = scrubbed.len().saturating_sub(STDERR_KEPT);
+    while !scrubbed.is_char_boundary(from) {
+        from += 1;
+    }
+    scrubbed[from..].to_owned()
 }
 
 /// What a start can fail with.
@@ -499,21 +537,7 @@ impl Server {
 
     /// The last bytes of the server's stderr, scrubbed (an empty string for none).
     pub fn stderr_tail(&self, redactor: &Redactor) -> String {
-        let (bytes, cut) = {
-            let tail = lock(&self.stderr);
-            (tail.bytes.clone(), tail.total > tail.bytes.len() as u64)
-        };
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let scrubbed = if cut {
-            adam_llm_agent::scrub_open_start(
-                &text,
-                |t| redactor.scrub(t).into_owned(),
-                redactor.margin(),
-            )
-        } else {
-            redactor.scrub(&text).into_owned()
-        };
-        scrubbed.trim().to_owned()
+        tail_text(&self.stderr, redactor)
     }
 
     /// Take the server for one call, waiting at most `within` for the call before it. The server is
@@ -1021,6 +1045,9 @@ pub struct Want<'a> {
     pub hide: Vec<String>,
     /// How long `initialize` may take ([`INITIALIZE_TIMEOUT`] for the tools).
     pub init_timeout: Duration,
+    /// What the server's stderr is scrubbed with; its [`margin`](Redactor::margin) is how much of
+    /// it is held beyond [`STDERR_KEPT`].
+    pub redactor: Redactor,
 }
 
 impl Servers {
@@ -1228,9 +1255,11 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
     let mut guard = StartGuard(pid);
 
     let stderr = Arc::new(Mutex::new(Tail::default()));
+    let mut stderr_task = None;
     if let Some(mut err) = child.stderr.take() {
         let sink = stderr.clone();
-        tokio::spawn(async move {
+        let held = STDERR_KEPT + want.redactor.margin();
+        stderr_task = Some(tokio::spawn(async move {
             let mut buf = [0_u8; 4096];
             while let Ok(n) = err.read(&mut buf).await {
                 if n == 0 {
@@ -1239,12 +1268,12 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
                 let mut tail = lock(&sink);
                 tail.total += n as u64;
                 tail.bytes.extend_from_slice(&buf[..n]);
-                let over = tail.bytes.len().saturating_sub(STDERR_KEPT);
+                let over = tail.bytes.len().saturating_sub(held);
                 if over > 0 {
                     tail.bytes.drain(..over);
                 }
             }
-        });
+        }));
     }
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(StartError::Failed("the process has no pipes".to_owned()));
@@ -1306,16 +1335,13 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
             .await;
             guard.disarm();
             client.close("it did not start");
-            let tail = {
-                let tail = lock(&stderr);
-                String::from_utf8_lossy(&tail.bytes).into_owned()
-            };
+            let tail = tail_text(&stderr, &want.redactor);
             return Err(StartError::Failed(format!(
                 "{e}{exit}{}",
-                if tail.trim().is_empty() {
+                if tail.is_empty() {
                     String::new()
                 } else {
-                    format!("\nits stderr ended with:\n{}", tail.trim())
+                    format!("\nits stderr ended with:\n{tail}")
                 }
             )));
         }
@@ -1329,6 +1355,13 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
     let pull = capabilities
         .get("diagnosticProvider")
         .is_some_and(|v| !v.is_null() && *v != json!(false));
+    shared.reports_status.store(
+        capabilities
+            .pointer("/experimental/serverStatusNotification")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        Ordering::Release,
+    );
     if let Err(e) = client.notify("initialized", json!({})).await {
         let exit = stop_unheld(
             &mut child,
@@ -1367,7 +1400,7 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
         kill_wait: want.kill_wait,
         extensions: language.extensions(),
     });
-    tokio::spawn(supervise(server.clone(), child));
+    tokio::spawn(supervise(server.clone(), child, stderr_task));
     guard.disarm();
     Ok(server)
 }
@@ -1394,7 +1427,11 @@ async fn stop_unheld(
 }
 
 /// Own the process until it ends: by itself, or stopped (idle, or asked to).
-async fn supervise(server: Arc<Server>, mut child: Child) {
+async fn supervise(
+    server: Arc<Server>,
+    mut child: Child,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+) {
     let pid = child.id();
     let ended = loop {
         // Asleep until the idle time could be over: a busy server is looked at again soon.
@@ -1442,6 +1479,11 @@ async fn supervise(server: Arc<Server>, mut child: Child) {
         .is_err()
     {
         tracing::warn!("the environment did not kill a language server in time");
+    }
+    // What it said on stderr before it ended is read to the end (a process that outlived its group
+    // and holds the pipe is not waited for).
+    if let Some(task) = stderr_task {
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
     *lock(&server.end) = Some(how.clone());
     server.client.close(how);

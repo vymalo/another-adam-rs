@@ -4,7 +4,7 @@
 //!
 //! A language server is a process that reads a whole project and keeps what it understood. The
 //! coder holds one **per run, slot, language and project root, on this worker**, started on the first
-//! call and kept until it is idle ([`CoderSettings::language_server_idle`]), the run parks, ends or
+//! call and kept until it is idle ([`CoderSettings::language_server_idle`](super::CoderSettings::language_server_idle)), the run parks, ends or
 //! remakes its environment, or the worker stops ([`Servers`] is held by
 //! [`Commands`](super::background::Commands), whose stop points are the servers' too).
 //!
@@ -167,13 +167,12 @@ fn position_of(
     ))
 }
 
-/// What a language server says is wrong in a file: the errors and warnings, as `path:line:col:
-/// error: message [source code]`, sorted by line, a page of at most 100 (the last line says `[more:
-/// ... offset=N]` or `[end: ...]`). A server for Rust, TypeScript and JavaScript, Python or Go
-/// runs in the workspace's environment and is kept between calls: the first call on a project
-/// starts it and may wait for it to index (`wait` seconds, 1 to 120, default 30; a first line says
-/// when it is still indexing, and the next call finds it warm). Nothing is changed. Where the
-/// environment has no server the answer says so: use run_checks or run_command. Example:
+/// What a language server says is wrong in a file: errors and warnings as `path:line:col: error:
+/// message [code]`, sorted, a page of at most 100 (the last line says `[more: ... offset=N]` or
+/// `[end: ...]`). The server (Rust, TypeScript and JavaScript, Python, Go) runs in the workspace's
+/// environment and is kept between calls; the first call on a project may wait for it to index
+/// (`wait` seconds, 1 to 120, default 30; a first line says when it still is). Nothing is changed.
+/// With no server in the environment the answer says so: use run_checks or run_command. Example:
 /// {"path":"src/lib.rs"}
 #[tool(label = "Diagnostics of a file", icon = "search", paged)]
 pub async fn file_diagnostics(
@@ -260,12 +259,12 @@ pub async fn find_definition(
 }
 
 /// Where the symbol on a line of a file is used, by a language server (Rust, TypeScript and
-/// JavaScript, Python, Go): each as `path:line:col: the source line`, sorted, a page of at most 100
-/// (the last line says `[more: ... offset=N]` or `[end: ...]`); at most 2000 are collected and the
-/// rest is counted. Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there
-/// more than once; `include_declaration` (default true) lists the definition too. A first call on a
-/// project starts the server and may wait for it to index (`wait` seconds, 1 to 120, default 30).
-/// Nothing is changed. Example: {"path":"src/main.rs","line":12,"symbol":"parse_config"}
+/// JavaScript, Python, Go): `path:line:col: the source line`, sorted, a page of at most 100 (the last
+/// line says `[more: ... offset=N]` or `[end: ...]`); at most 2000 are collected. Give the `line`
+/// (from 1) and the `symbol` on it, and `occurrence` when it is there more than once;
+/// `include_declaration` (default true) lists the definition too. The first call on a project may
+/// wait for the server to index (`wait` seconds, 1 to 120, default 30). Nothing is changed. Example:
+/// {"path":"src/main.rs","line":12,"symbol":"parse_config"}
 #[tool(label = "Find references", icon = "search", paged)]
 #[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn find_references(
@@ -486,6 +485,7 @@ impl Call<'_> {
             kill_wait: env.settings.background_kill_wait,
             hide: Vec::new(),
             init_timeout: INITIALIZE_TIMEOUT,
+            redactor: env.redactor.clone(),
         };
         let server = match env.commands.language_servers().get_or_start(want).await {
             Ok(server) => server,
@@ -690,7 +690,7 @@ impl Call<'_> {
         if !tail.is_empty() {
             text.push_str(&format!(
                 "\nThe end of its stderr:\n{}",
-                self.clean(&cut_chars(&tail, 4000))
+                self.clean(&last_chars(&tail, 4000))
             ));
         }
         text.push_str("\nThe next call starts it again.");
@@ -838,7 +838,7 @@ impl Call<'_> {
         if !tail.is_empty() {
             text.push_str(&format!(
                 "\nThe end of its stderr:\n{}",
-                self.clean(&cut_chars(&tail, 4000))
+                self.clean(&last_chars(&tail, 4000))
             ));
         }
         text.push_str("\nThe next call starts it again.");
@@ -984,6 +984,16 @@ fn path_strips(slot: &Slot) -> Vec<String> {
     strips.sort_by_key(|s| std::cmp::Reverse(s.len()));
     strips.dedup();
     strips
+}
+
+/// The last `max` characters of `text`, with an ellipsis before them when it was longer.
+fn last_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().skip(count - max).collect();
+    format!("…{kept}")
 }
 
 /// `text` cut at `max` characters, with an ellipsis.

@@ -15,6 +15,7 @@
 //! | `position_encoding` | `utf-8`: says so when the client offers it |
 //! | `pull` | offers `diagnosticProvider` and answers `textDocument/diagnostic` |
 //! | `progress_ms` | after `initialized`, a `$/progress` that begins and ends after that long |
+//! | `status_ms` | says it reports `experimental/serverStatus`: not quiescent after `initialized`, quiescent after that long |
 //! | `diagnostics` | `[{severity, message, line, character}]` for every opened file |
 //! | `echo` | each diagnostic message ends with ` \| held: ` and the text it holds for the file |
 //! | `silent_when_clean` | publishes nothing for a file with no diagnostics |
@@ -236,6 +237,9 @@ fn main() {
                 if script.str("position_encoding") == Some("utf-8") && offered {
                     capabilities["positionEncoding"] = json!("utf-8");
                 }
+                if script.u64("status_ms").is_some() {
+                    capabilities["experimental"] = json!({"serverStatusNotification": true});
+                }
                 if script.bool("pull") {
                     capabilities["diagnosticProvider"] =
                         json!({"interFileDependencies": false, "workspaceDiagnostics": false});
@@ -263,6 +267,18 @@ fn main() {
                             &json!({"jsonrpc": "2.0", "method": "$/progress", "params": {
                                 "token": "index", "value": {"kind": "end"}}}),
                         );
+                    });
+                }
+                if let Some(ms) = script.u64("status_ms") {
+                    let out = out.clone();
+                    let status = |quiescent: bool| {
+                        json!({"jsonrpc": "2.0", "method": "experimental/serverStatus",
+                               "params": {"health": "ok", "quiescent": quiescent}})
+                    };
+                    send(&out, &status(false));
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(ms));
+                        send(&out, &status(true));
                     });
                 }
                 if let Some(list) = script.json.get("server_requests").and_then(Value::as_array) {
