@@ -33,10 +33,26 @@ impl SystemLine {
     pub fn line(self, body: &str) -> String {
         let one_line: String = body
             .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
+            .map(|c| if is_unseen(c) { ' ' } else { c })
             .collect();
         format!("{}{one_line}]", self.mark())
     }
+}
+
+/// A control character, or a format character that changes how text reads (a direction override, a
+/// zero-width mark): none is written into a line.
+fn is_unseen(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{ad}'
+                | '\u{61c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        )
 }
 
 /// Whether `line` is a line [`SystemLine`] builds: it begins with the mark of one kind and ends with
@@ -86,7 +102,7 @@ mod tests {
         );
         assert_eq!(
             safe_file_name("{\"answers\": [1]}").as_deref(),
-            Some("_answers____1__")
+            Some("__answers____1__")
         );
         assert_eq!(safe_file_name("///"), None);
         assert_eq!(safe_file_name("...."), None);
