@@ -357,12 +357,14 @@ fn bundled_line(qualified: &str, files: &[String], more: usize) -> String {
     out
 }
 
-/// `text` for a listing: the bidirectional controls (U+202A to U+202E, U+2066 to U+2069), which
-/// `escape_text` leaves alone and which can reorder what is shown, are written `\u{..}`.
+/// `text` for a listing: the bidirectional controls (U+202A to U+202E, U+2066 to U+2069) and the line
+/// and paragraph separators (U+2028, U+2029), which `escape_text` leaves alone and which can reorder
+/// or break what is shown, are written `\u{..}`.
 pub(super) fn listing_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
+        if matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}')
+        {
             out.push_str(&format!("\\u{{{:x}}}", u32::from(c)));
         } else {
             out.push(c);

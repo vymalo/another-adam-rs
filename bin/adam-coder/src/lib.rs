@@ -116,5 +116,6 @@ pub use repos::workspaces_for;
 pub use serve::{environment_for, serve, wire_commands};
 pub use tier::TierSource;
 pub use tools::{
-    BACKGROUND_TOOLS, CoderSettings, Commands, CommandsSweep, QUICK_TOOLS, ToolEnv, coder_tools,
+    BACKGROUND_TOOLS, CoderSettings, Commands, CommandsSweep, LANGUAGE_SERVER_TOOLS, QUICK_TOOLS,
+    ToolEnv, coder_tools,
 };

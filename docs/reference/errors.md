@@ -62,6 +62,7 @@ flowchart LR
         subgraph coder_e["adam-coder"]
             ConfigError
             StoppedUnexpectedly
+            RpcError["RpcError (a language server)"]
         end
         subgraph egress_e["adam-egress"]
             EgressError
@@ -153,6 +154,8 @@ flowchart LR
 
     ConfigError --> Invalid
     StoppedUnexpectedly --> Internal
+    RpcError -->|"Timeout, Closed"| Transient
+    RpcError -->|Server| Invalid
 
     EgressError -->|Config| Invalid
     EgressError -->|Bind| Transient
@@ -265,6 +268,28 @@ A child whose parent ended is `cancelled: the parent run ended`. Two refusals of
 turn and `limit: "repeated_call"`; a closing turn with no words fails it with `the same tool call was repeated with the same
 result and the run was stopped (doom_loop)`.
 
+### A language server that cannot answer
+
+The three tools of [the coder's language servers](coder-agent.md#language-servers) answer in words, and none of these is a failure of the run:
+
+| When | Text (the first words) | Server |
+|---|---|---|
+| the program is not on `PATH` (or `--version` does not run) | `No language server for Rust in this environment (`rust-analyzer` is not on PATH in ...). Use `run_checks` or `run_command` with `cargo check` instead.` (a result, not an error) | nothing was started |
+| the file is of no language the servers know | `No language server serves `notes.txt`: they serve .rs (Rust), ...` (a result) | nothing was started |
+| the server is working through its index at the end of `wait` | a first line `[still indexing after 30 s (server up 34 s): the result may be incomplete; call again, the server is kept]` | kept |
+| the symbol is not on the line, or fewer times than `occurrence` | `` `second` is not on line 1 of `src/lib.rs`. The line reads: ... `` (an error result) | not asked |
+| the symbol is on the line only inside longer words | `` `id` is not on line 1 of `src/v.rs` as a word (it is there only inside longer words). The line reads: ... `` (an error result) | not asked |
+| the server published nothing for the file in the time given (not an empty set: that is `(no errors or warnings)`) | `No diagnostics received for `src/lib.rs` within 3 s: the server published none for it (it may not have looked at the file yet, or it publishes only when there is something to say). Call again, ...` (a result) | kept |
+| a pull for diagnostics was answered `ServerCancelled` or `ContentModified` | `No diagnostics yet for `src/lib.rs`: the server is still indexing.` (a result) | kept |
+| the server ended, or sent framing that is not framing, or a message over 16 MiB | `The language server `rust-analyzer` stopped: the server sent malformed framing: ... (the process was stopped: ...)`, the end of its stderr (scrubbed, 16 KiB at most) and `The next call starts it again.` | stopped |
+| a request got no answer inside `wait` and the server was not indexing | `The language server `x` stopped: it did not answer `textDocument/definition` within N s.` | stopped |
+| it did not answer `initialize` in 60 s, or exited | `The language server `x` did not start: the server did not answer `initialize` within 60 s` and the end of its stderr | stopped |
+| a reference was written to | `The language server changed files of `lib`, which is a reference (read, never changed). The files are as they were. ...` | stopped |
+| a writable slot was written to by a server of a run at tier `plan` | `The language server changed files of `repo`, and this run is at the `plan` tier, where nothing is changed. The files are as they were. ...` | stopped |
+| the run's servers were stopped while this one started | `The language servers of this run were stopped while this one was starting (the run parked, or its environment was made again): call again.` | stopped |
+| `LANGUAGE_SERVERS_MAX` servers are held and all are working | `This worker holds 4 language servers (LANGUAGE_SERVERS_MAX) and every one is working for a call: try again shortly.` | a call waits |
+| the call is past its budget (`wait` + 120 s) | `The language server call did not finish within N s. A server that was started is kept: call again, or use run_checks or run_command.` | kept |
+
 ### An image the model is not sent
 
 The lines name a type as a word (`png`), never as `image/png`: they stand in the person's own message, and a reader of the person's words (the coder's rule about the repositories a task named) would take `image/png` for the repository `image/png`.
@@ -303,7 +328,7 @@ the coder's own errors in `bin/adam-coder/src/exit.rs`):
 | Code | Meaning |
 |---|---|
 | 0 | clean shutdown after SIGTERM |
-| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, any other `Invalid` error, such as a `ReferencesError`: `ADAM_REFERENCES_FILE` that cannot be read, is not a file of references, repeats a name the agent declares, or names an address the workspaces' policy refuses). A bad `A2A_PUSH_*`, `A2A_CARD_SIGNING_*`, `MODEL_CONTEXT_WINDOW`, `MODEL_INPUT_MODALITIES`, `MODEL_OUTPUT_MODALITIES` (`image` is not built for any provider) or `MODEL_IMAGE_*` or `A2A_ALLOW_INSECURE_REMOTES` value is a `ConfigError`, and so is a `MODEL_IMAGE_*` variable set while `MODEL_INPUT_MODALITIES` lacks `image` (the line names the variable), and so is `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` over 32 MiB (the line names both: a request resends every admitted image), and so is a `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS` or `BACKGROUND_SWEEP_SECS` outside its range (`0` included: none of the three turns the bound off, because the sweep is what a cancel depends on), the message names the variable; so is `adam-coder` with a **GitHub App key file while the commands run in its own container** (a command could read the key and act as the App at any access tier; the message names the settings that change it) unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it, and so is a value of that variable that is no boolean; a remote subagent at plain `http` on another machine without `A2A_ALLOW_INSECURE_REMOTES`, or whose `auth` variable is unset, is an `Invalid` error of the assembly |
+| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, a `LANGUAGE_SERVERS` that is not `on` or `off`, a `LANGUAGE_SERVER_IDLE_SECS` outside 30 to 86400 or a `LANGUAGE_SERVERS_MAX` outside 1 to 32 (the line names the variable), any other `Invalid` error, such as a `ReferencesError`: `ADAM_REFERENCES_FILE` that cannot be read, is not a file of references, repeats a name the agent declares, or names an address the workspaces' policy refuses). A bad `A2A_PUSH_*`, `A2A_CARD_SIGNING_*`, `MODEL_CONTEXT_WINDOW`, `MODEL_INPUT_MODALITIES`, `MODEL_OUTPUT_MODALITIES` (`image` is not built for any provider) or `MODEL_IMAGE_*` or `A2A_ALLOW_INSECURE_REMOTES` value is a `ConfigError`, and so is a `MODEL_IMAGE_*` variable set while `MODEL_INPUT_MODALITIES` lacks `image` (the line names the variable), and so is `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` over 32 MiB (the line names both: a request resends every admitted image), and so is a `BACKGROUND_COMMANDS_MAX`, `BACKGROUND_COMMAND_MAX_SECS` or `BACKGROUND_SWEEP_SECS` outside its range (`0` included: none of the three turns the bound off, because the sweep is what a cancel depends on), the message names the variable; so is `adam-coder` with a **GitHub App key file while the commands run in its own container** (a command could read the key and act as the App at any access tier; the message names the settings that change it) unless `ALLOW_COMMANDS_NEXT_TO_SECRETS=true` accepts it, and so is a value of that variable that is no boolean; a remote subagent at plain `http` on another machine without `A2A_ALLOW_INSECURE_REMOTES`, or whose `auth` variable is unset, is an `Invalid` error of the assembly |
 | 69 | a dependency unreachable at boot (Postgres) |
 | 71 | an OS error (a port that cannot bind, a directory that cannot be created) |
 | 70 | a half of the process stopped, a panic or an internal error |

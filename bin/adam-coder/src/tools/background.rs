@@ -615,6 +615,8 @@ pub struct Commands {
     owner: Arc<str>,
     host: Arc<str>,
     entries: Arc<Registry>,
+    /// The language servers of this worker: they stop where a command that keeps running stops.
+    servers: super::lsp::Servers,
 }
 
 impl std::fmt::Debug for Commands {
@@ -673,7 +675,15 @@ impl Commands {
             host: host_name().unwrap_or_else(|| owner.clone()).into(),
             owner: owner.into(),
             entries: Arc::default(),
+            servers: super::lsp::Servers::new(),
         }
+    }
+
+    /// The language servers this worker holds ([`lsp`](super::lsp)). They are stopped where the
+    /// commands are: [`stop_run`](Self::stop_run), [`stop_all`](Self::stop_all), the
+    /// [sweep](Self::sweep) of a run that is over and [`forget_run`](Self::forget_run).
+    pub fn language_servers(&self) -> &super::lsp::Servers {
+        &self.servers
     }
 
     /// The machine this process runs on, as its records name it: the hostname the kernel gives (the
@@ -795,6 +805,7 @@ impl Commands {
     /// Forget the commands of `run` that ended (its workspace is gone).
     pub fn forget_run(&self, run: &str) {
         self.list().retain(|c| c.run != run || c.running());
+        self.servers.forget_run(run);
     }
 
     /// Stop every command of `run` this process holds, saying why, and wait until they are gone (at
@@ -807,6 +818,8 @@ impl Commands {
             .filter(|c| c.request_stop(why))
             .collect();
         wait_all_ended(&mine, Duration::from_secs(10)).await;
+        // What a language server holds for the run goes with it.
+        self.servers.stop_run(run, why).await;
     }
 
     /// Write a stop request, with `why`, into the record of every command of `run` that another
@@ -837,6 +850,7 @@ impl Commands {
             .filter(|c| c.request_stop(WORKER_STOPPED))
             .collect();
         wait_all_ended(&mine, Duration::from_secs(10)).await;
+        self.servers.stop_all().await;
     }
 
     /// One look at the runs that have commands here: a run that is over (finished, failed,
@@ -889,6 +903,20 @@ impl Commands {
                     }
                     // The beat: the record says a worker runs it, and since when it is sure.
                     None => command.write_record(),
+                }
+            }
+        }
+        // A run that is over has no use for its language servers either (a cancel never calls the
+        // agent, so this is how they are reached).
+        for run in self.servers.runs() {
+            match crate::janitor::run_is_over(store, &run).await {
+                Ok(true) => {
+                    stopped += self.servers.running(&run).len();
+                    self.servers.stop_run(&run, "the run ended").await;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(%run, error = %adam_error::report(&e), "cannot ask the store about a run with language servers; they stay");
                 }
             }
         }
@@ -1164,7 +1192,7 @@ async fn kill_pids(pids: &[u32]) {
 
 /// What a command's process group left after the leader ended: killed (they are ours: a group id
 /// is not reused while a member lives).
-async fn kill_leftovers(group: u32) {
+pub(crate) async fn kill_leftovers(group: u32) {
     kill_pids(&group_members(group)).await;
 }
 
@@ -1187,7 +1215,7 @@ fn kill_pids_blocking(pids: &[u32], group: Option<u32>) {
 }
 
 /// SIGKILL the process group `pid` leads, and what is left of it, without waiting on a runtime.
-fn kill_group_blocking(pid: u32) {
+pub(crate) fn kill_group_blocking(pid: u32) {
     kill_pids_blocking(&group_members(pid), Some(pid));
 }
 

@@ -32,7 +32,7 @@ async fn limits_with(environment_start: u64) -> BTreeMap<String, Option<Duration
 #[tokio::test]
 async fn every_tool_declares_its_own_bound_or_is_quick_by_construction() {
     let limits = limits_with(0).await;
-    assert_eq!(limits.len(), 32, "the whole list: {:?}", limits.keys());
+    assert_eq!(limits.len(), 35, "the whole list: {:?}", limits.keys());
     for (name, limit) in &limits {
         let quick = QUICK_TOOLS.contains(&name.as_str());
         match limit {
@@ -90,6 +90,11 @@ async fn the_limits_come_from_the_deployments_settings() {
     assert_eq!(secs("start_command"), 2100 + 120 + MARGIN);
     assert_eq!(secs("stop_command"), 2100 + 60 + MARGIN);
     assert_eq!(secs("list_commands"), 2100 + 30 + MARGIN);
+    // A language server: the environment is made ready, and the call waits for the server at most
+    // `wait` (120 s), `initialize` (60 s) and the probe and the sync (60 s).
+    for tool in ["file_diagnostics", "find_definition", "find_references"] {
+        assert_eq!(secs(tool), 2100 + 120 + 60 + 60 + MARGIN, "{tool}");
+    }
     // The four read tools have a deadline of 30 s of their own, whatever the environment.
     for read in [
         "read_file",

@@ -1281,6 +1281,36 @@ stateDiagram-v2
     Gone --> [*]
 ```
 
+A **language server** (`file_diagnostics`, `find_definition`, `find_references`) is the same kind of process with a pipe on
+stdin: the coder holds one per run, slot, language and project root **on this worker**, spoken to in JSON-RPC with `Content-Length`
+frames, and stops it where it stops a command that keeps running (the registry is `Commands::language_servers()`, so
+the agent's step, the sweep, the janitor and `rebuild_environment` reach it with no new wiring). There is no record on the volume
+and no beat: a run that another worker takes up starts a server there (placement `shared`; `affinity` and `isolated` keep a run where
+it is), and the first worker's server stops by itself when it is idle or its run is over. The tools, the limits and the lifecycle:
+[The coder agent](reference/coder-agent.md#language-servers).
+
+```mermaid
+sequenceDiagram
+    participant T as file_diagnostics, find_definition, find_references
+    participant C as Commands.language_servers (Servers)
+    participant P as server process<br/>own process group, stdin and stdout piped
+    participant E as EnvSession
+    participant A as CoderAgent::step
+    participant W as the sweep component
+    participant J as Janitor
+    T->>C: get_or_start (run, slot, language, root)
+    C->>E: prepare (ExecSpec::background), spawn
+    C->>P: initialize, initialized
+    T->>P: sync, then the request, within the wait
+    Note over P: idle for LANGUAGE_SERVER_IDLE_SECS: its supervisor stops it
+    A->>C: stop_run, when the root run ends, a run parks on the person, or rebuild_environment runs
+    W->>C: sweep: stop_run for a run that is over or cancelled
+    J->>C: stop_run, before the release
+    W->>C: stop_all, when the worker stops
+    C->>P: kill the process group
+    C->>E: kill the exec id, then what the group left
+```
+
 ## The two agents
 
 | | [`adam-coder`](../bin/adam-coder/README.md) | [`adam-agent`](../bin/adam-agent/README.md) |

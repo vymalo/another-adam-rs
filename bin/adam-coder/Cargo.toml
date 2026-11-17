@@ -16,6 +16,14 @@ path = "src/lib.rs"
 name = "adam-coder"
 path = "src/main.rs"
 
+# A scripted language server for the tests of the language server tools. Not shipped: the coder image
+# builds the named binaries (`--bin adam-coder`, ...) and never this one.
+[[bin]]
+name = "adam-lsp-script"
+path = "src/bin/adam-lsp-script.rs"
+test = false
+doc = false
+
 [dependencies]
 # `set_dumpable_behavior`: the process stops its same-user children from reading its environment
 # (`/proc/<pid>/environ`) with a safe call, so `forbid(unsafe_code)` holds. Already in the tree.

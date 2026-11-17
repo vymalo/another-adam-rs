@@ -40,6 +40,9 @@
 //! | `BACKGROUND_COMMANDS_MAX` | commands of one run that keep running (`start_command`) at once, 1 to 16; `0` is refused (exit 78) | `4` |
 //! | `BACKGROUND_COMMAND_MAX_SECS` | how long a command that keeps running may run before it is stopped, 60 to 86400; `0` is refused (exit 78) | `3600` |
 //! | `BACKGROUND_SWEEP_SECS` | how often the sweep looks at the runs that have such commands and stops those of a run that is over (a cancel never calls the agent, so this is how long its commands can outlive it), 1 to 3600; `0` is refused (exit 78) | `15` |
+//! | `LANGUAGE_SERVERS` | roles that run workers: `on` offers `file_diagnostics`, `find_definition` and `find_references` (a language server of the environment, kept between calls); `off` removes the three tools from the set; anything else is refused (exit 78) | `on` |
+//! | `LANGUAGE_SERVER_IDLE_SECS` | how long a language server that no call uses is kept before it is stopped, 30 to 86400; `0` is refused (exit 78) | `600` |
+//! | `LANGUAGE_SERVERS_MAX` | the most language servers this worker holds at once, for all its runs (the least recently used one that is not working is stopped for the next), 1 to 32; `0` is refused (exit 78) | `4` |
 //! | `CHECK_OUTPUT_TAIL_BYTES` | output tail `run_checks` returns | `16384` |
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 //! | `PR_DRAFT` | open pull requests as drafts (`true`/`false`) | `false` |
@@ -219,6 +222,13 @@ pub struct WorkerConfig {
     pub background_sweep: Duration,
     /// `CHECK_OUTPUT_TAIL_BYTES`.
     pub check_output_tail: usize,
+    /// `LANGUAGE_SERVERS`: whether `file_diagnostics`, `find_definition` and `find_references` are
+    /// offered (`on`, the default, or `off`).
+    pub language_servers: bool,
+    /// `LANGUAGE_SERVER_IDLE_SECS`: how long a language server that no call uses is kept.
+    pub language_server_idle: Duration,
+    /// `LANGUAGE_SERVERS_MAX`: the most language servers this worker holds at once.
+    pub language_servers_max: usize,
     /// `GIT_AUTHOR_NAME`.
     pub git_author_name: String,
     /// `GIT_AUTHOR_EMAIL`.
@@ -886,6 +896,9 @@ impl std::fmt::Debug for WorkerConfig {
             .field("background_command_max", &self.background_command_max)
             .field("background_sweep", &self.background_sweep)
             .field("check_output_tail", &self.check_output_tail)
+            .field("language_servers", &self.language_servers)
+            .field("language_server_idle", &self.language_server_idle)
+            .field("language_servers_max", &self.language_servers_max)
             .field("pr_draft", &self.pr_draft)
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
@@ -1097,6 +1110,31 @@ impl WorkerConfig {
             3600,
             problems,
         );
+        // The language server tools: `on` or `off`, and two limits that no `0` turns off.
+        let language_servers = match get("LANGUAGE_SERVERS").as_deref().map(str::trim) {
+            None | Some("on") => true,
+            Some("off") => false,
+            Some(other) => {
+                problems.push(format!(
+                    "LANGUAGE_SERVERS must be `on` or `off` (it is {other:?})"
+                ));
+                true
+            }
+        };
+        let language_server_idle = in_range(
+            parse_or(get, "LANGUAGE_SERVER_IDLE_SECS", 600u64, problems),
+            "LANGUAGE_SERVER_IDLE_SECS",
+            30,
+            86_400,
+            problems,
+        );
+        let language_servers_max = in_range(
+            parse_or(get, "LANGUAGE_SERVERS_MAX", 4u64, problems),
+            "LANGUAGE_SERVERS_MAX",
+            1,
+            32,
+            problems,
+        );
         let pr_draft = parse_flag(get, "PR_DRAFT", problems);
         let allow_local_repos = parse_flag(get, "ALLOW_LOCAL_REPOS", problems);
         let before_flag = problems.len();
@@ -1212,6 +1250,9 @@ impl WorkerConfig {
             background_command_max: Duration::from_secs(background_command_max),
             background_sweep: Duration::from_secs(background_sweep),
             check_output_tail,
+            language_servers,
+            language_server_idle: Duration::from_secs(language_server_idle),
+            language_servers_max: usize::try_from(language_servers_max).unwrap_or(4),
             git_author_name: get("GIT_AUTHOR_NAME").unwrap_or_else(|| "adam-coder".to_owned()),
             git_author_email: get("GIT_AUTHOR_EMAIL")
                 .unwrap_or_else(|| "adam-coder@users.noreply.github.com".to_owned()),
@@ -1541,6 +1582,52 @@ mod tests {
                 err.problems.iter().any(|p| p.starts_with(name)),
                 "{name}={bad}: {:?}",
                 err.problems
+            );
+        }
+    }
+
+    #[test]
+    fn the_language_servers_have_defaults_and_refuse_what_they_cannot_read() {
+        let c = parse(&full()).expect("valid").worker.expect("a worker");
+        assert_eq!(
+            (
+                c.language_servers,
+                c.language_server_idle,
+                c.language_servers_max
+            ),
+            (true, Duration::from_secs(600), 4)
+        );
+        let mut vars = full();
+        vars.insert("LANGUAGE_SERVERS", "off");
+        vars.insert("LANGUAGE_SERVER_IDLE_SECS", "30");
+        vars.insert("LANGUAGE_SERVERS_MAX", "32");
+        let c = parse(&vars).expect("valid").worker.expect("a worker");
+        assert!(!c.language_servers);
+        assert_eq!(c.language_server_idle, Duration::from_secs(30));
+        assert_eq!(c.language_servers_max, 32);
+        for (name, bad) in [
+            ("LANGUAGE_SERVERS", "maybe"),
+            ("LANGUAGE_SERVERS", "true"),
+            ("LANGUAGE_SERVER_IDLE_SECS", "0"),
+            ("LANGUAGE_SERVER_IDLE_SECS", "29"),
+            ("LANGUAGE_SERVER_IDLE_SECS", "86401"),
+            ("LANGUAGE_SERVER_IDLE_SECS", "soon"),
+            ("LANGUAGE_SERVERS_MAX", "0"),
+            ("LANGUAGE_SERVERS_MAX", "33"),
+        ] {
+            let mut vars = full();
+            vars.insert(name, bad);
+            let err = parse(&vars).unwrap_err();
+            assert!(
+                err.problems.iter().any(|p| p.starts_with(name)),
+                "{name}={bad}: {:?}",
+                err.problems
+            );
+            // A bad value is a configuration error: exit 78.
+            assert_eq!(
+                crate::exit_code(&anyhow::Error::from(err)),
+                78,
+                "{name}={bad}"
             );
         }
     }

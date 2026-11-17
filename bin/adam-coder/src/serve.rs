@@ -108,6 +108,9 @@ async fn build_agent(
     settings.background_commands_max = worker.background_commands_max;
     settings.background_command_max = worker.background_command_max;
     settings.background_sweep = worker.background_sweep;
+    settings.language_servers = worker.language_servers;
+    settings.language_server_idle = worker.language_server_idle;
+    settings.language_servers_max = worker.language_servers_max;
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 

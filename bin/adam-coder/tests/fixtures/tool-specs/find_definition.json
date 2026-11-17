@@ -1,0 +1,41 @@
+{
+  "name": "find_definition",
+  "description": "Where the symbol on a line of a file is defined, by a language server (Rust, TypeScript and JavaScript, Python, Go): at most 20 locations, each as `path:line:col: the source line`. Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once; if the symbol is not on that line the answer shows the line. A first call on a project starts the server and may wait for it to index (`wait` seconds, 1 to 120, default 30); where there is no server the answer says so. Nothing is changed. Example: {\"path\":\"src/main.rs\",\"line\":12,\"symbol\":\"parse_config\"}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "The file, relative to the worktree root"
+      },
+      "line": {
+        "type": "integer",
+        "format": "int64",
+        "description": "The line, from 1"
+      },
+      "symbol": {
+        "type": "string",
+        "description": "The text on that line the position is at (a name)"
+      },
+      "occurrence": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Which one when the symbol is on the line more than once, from 1 (default 1)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot the file is in: its name, or the repository's address. Leave out when the workspace has one."
+      },
+      "wait": {
+        "type": "integer",
+        "format": "int64",
+        "description": "Seconds to wait for a server that is still indexing, 1 to 120 (default 30)"
+      }
+    },
+    "required": [
+      "path",
+      "line",
+      "symbol"
+    ]
+  }
+}

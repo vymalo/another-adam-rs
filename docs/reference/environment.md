@@ -94,6 +94,9 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `BACKGROUND_COMMANDS_MAX` | commands of one run that keep running (`start_command`) at once, 1 to 16; `0` is refused: exit 78 naming the variable | `4` |
 | `BACKGROUND_COMMAND_MAX_SECS` | how long such a command may run before it is stopped, 60 to 86400; `0` is refused (exit 78) | `3600` |
 | `BACKGROUND_SWEEP_SECS` | how often the sweep of each worker looks at the commands it holds: it stops those of a run that is over (a cancel never calls the agent, so this is how long its commands can outlive it), carries out a stop another worker asked for (within one sweep), and writes the **beat** of the others. A record whose beat is older than the larger of three sweeps and 60 s is a dead worker's: set the same value on every worker, and keep the clocks of the workers within 60 s. 1 to 3600; `0` is refused (exit 78) | `15` |
+| `LANGUAGE_SERVERS` | `on` offers `file_diagnostics`, `find_definition` and `find_references` (a language server of the run's environment, kept between calls: [The coder agent](coder-agent.md#language-servers)); `off` removes the three tools from the set; anything else is refused: exit 78 naming the variable. No chart key: set it with `config.extraEnv` | `on` |
+| `LANGUAGE_SERVER_IDLE_SECS` | how long a language server that no call uses is kept before it is stopped, 30 to 86400; `0` is refused (exit 78) | `600` |
+| `LANGUAGE_SERVERS_MAX` | the most language servers this worker holds at once, for all its runs: the least recently used one that is not working is stopped for the next, and when every one is working the call says so. 1 to 32; `0` is refused (exit 78) | `4` |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 
@@ -188,6 +191,7 @@ Put these in a `.env` next to `compose.yaml`.
 | `ADAM_TEST_MOCK_OPENAI_URL`, `ADAM_TEST_MOCK_GITHUB_URL`, `ADAM_TEST_MOCK_GITHUB_MCP_URL` | the tests of the real clients against the compose mocks |
 | `ADAM_TEST_DEVCONTAINER=1`, `ADAM_TEST_REQUIRE_DEVCONTAINER=1` | the devcontainer suite; the second fails instead of skipping |
 | `ADAM_TEST_KUBECONFIG`, `ADAM_TEST_REQUIRE_KUBERNETES=1` | the cluster test of `adam-env-kubernetes` (more `ADAM_TEST_KUBE_*`, among them `ADAM_TEST_KUBE_ISOLATION_MIRROR` and `_ADMIN` for the isolation scenario, in `crates/adam-env-kubernetes/tests/cluster.rs`) |
+| `ADAM_TEST_LANGUAGE_SERVERS=1`, `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` | the suite of the real language servers (`bin/adam-coder/tests/real_language_servers.rs`); a language whose server is not on `PATH` is skipped, and the second fails instead of skipping (and turns the suite on). No CI job runs it yet |
 | `ADAM_TEST_STDIO_SILENCE_SECS` | seconds of silence with stdin open in the framed-stdio tests (local, devcontainer, run pod); default 20 |
 | `ADAM_TEST_REQUIRE_MOUNTS=1` | `deploy/coder/tests/git-in-run-pod.sh` (git under a run pod's mounts) fails instead of skipping when it cannot make a mount namespace (CI sets it) |
 | `ADAM_TEST_OPENAI_BASE_URL`, `ADAM_TEST_OPENAI_API_KEY`, `ADAM_TEST_OPENAI_MODEL` | a live model for `adam-model-openai/tests/live.rs` |
