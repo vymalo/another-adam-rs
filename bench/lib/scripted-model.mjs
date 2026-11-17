@@ -14,10 +14,16 @@ export function createScriptedModel(initial = {}) {
     chunkDelayMs: 0, // between the chunks of a stream
     status: 200, // a status other than 200 answers an error body
     expectKey: null, // when set, a request without `Authorization: Bearer <it>` gets 401
+    errorBody: null, // the body of a non-200 answer (a string, or a value sent as JSON); default a short error object
+    errorHeaders: {}, // extra headers of a non-200 answer
+    endless: false, // a stream that never ends: `endlessChunkBytes` of text every `endlessEveryMs`, honouring backpressure
+    endlessChunkBytes: 100,
+    endlessEveryMs: 5,
     ...initial,
   };
   const requests = [];
   const timers = new Set();
+  const stats = { sentBytes: 0, aborted: 0 }; // bytes an endless stream got into the socket; streams the client cut off
 
   const usageObject = () => ({
     prompt_tokens: behavior.usage.prompt,
@@ -48,7 +54,12 @@ export function createScriptedModel(initial = {}) {
         return json(401, { error: { message: 'bad key' } });
       }
       const respond = () => {
-        if (behavior.status !== 200) return json(behavior.status, { error: { message: 'scripted failure' } });
+        if (behavior.status !== 200) {
+          const body = behavior.errorBody ?? { error: { message: 'scripted failure' } };
+          const text = typeof body === 'string' ? body : JSON.stringify(body);
+          res.writeHead(behavior.status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text), ...behavior.errorHeaders });
+          return res.end(text);
+        }
         const base = { id: 'chatcmpl-scripted', object: 'chat.completion', created: 1, model: body?.model ?? 'unknown' };
         if (body?.stream !== true) {
           const out = { ...base, choices: [{ index: 0, message: { role: 'assistant', content: 'done' }, finish_reason: 'stop' }] };
@@ -56,6 +67,9 @@ export function createScriptedModel(initial = {}) {
           return json(200, out);
         }
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.on('close', () => {
+          if (!res.writableFinished) stats.aborted += 1;
+        });
         const frames = [
           { ...base, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: 'do' } }], usage: null },
           { ...base, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'ne' }, finish_reason: 'stop' }], usage: null },
@@ -73,8 +87,25 @@ export function createScriptedModel(initial = {}) {
             }, behavior.chunkDelayMs);
             return timers.add(t);
           }
+          if (behavior.endless) return endless();
           res.write('data: [DONE]\n\n');
           res.end();
+        };
+        const endless = () => {
+          if (res.destroyed) return;
+          const text = `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'x'.repeat(behavior.endlessChunkBytes) } }], usage: null })}\n\n`;
+          const ok = res.write(text, () => {
+            stats.sentBytes += text.length;
+          });
+          const again = () => {
+            const t = setTimeout(() => {
+              timers.delete(t);
+              endless();
+            }, behavior.endlessEveryMs);
+            timers.add(t);
+          };
+          if (ok) again();
+          else res.once('drain', again);
         };
         next();
       };
@@ -90,6 +121,7 @@ export function createScriptedModel(initial = {}) {
 
   return {
     behavior,
+    stats,
     requests,
     server,
     listen: () =>

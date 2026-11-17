@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { test } from 'node:test';
 import { CapBook } from '../lib/cap.mjs';
 import { normalizeConfig } from '../lib/config.mjs';
 import { Ledger, readLedger } from '../lib/ledger.mjs';
-import { MAX_OUTPUT_TOKENS, createMeter, deepMerge, prepareBody } from '../lib/meter.mjs';
+import { LIMITS, MAX_OUTPUT_TOKENS, createMeter, deepMerge, prepareBody } from '../lib/meter.mjs';
 import { createScriptedModel } from '../lib/scripted-model.mjs';
 import { MODEL_ID, TEST_KEY, rawConfig, tmp } from './helpers.mjs';
 
@@ -15,7 +16,7 @@ import { MODEL_ID, TEST_KEY, rawConfig, tmp } from './helpers.mjs';
 // and 4_920_000_000 / 1_000_000 = 4920 micro-dollars.
 const SCRIPTED_COST = 4920;
 
-async function setup(t, { config = {}, behavior = {}, reserve = 3_000_000, cap = 10_000_000, key = TEST_KEY } = {}) {
+async function setup(t, { config = {}, behavior = {}, reserve = 3_000_000, cap = 10_000_000, key = TEST_KEY, limits } = {}) {
   const model = createScriptedModel({ expectKey: key, ...behavior });
   const { url } = await model.listen();
   const cfg = normalizeConfig(rawConfig({ endpoint: url, ...config }));
@@ -23,7 +24,7 @@ async function setup(t, { config = {}, behavior = {}, reserve = 3_000_000, cap =
   const ledger = Ledger.open(path.join(dir, 'ledger.jsonl'));
   const book = new CapBook(cap);
   const events = [];
-  const meter = createMeter({ config: cfg, ledger, book, env: { BENCH_MODEL_API_KEY: key }, log: (e) => events.push(e) });
+  const meter = createMeter({ config: cfg, ledger, book, env: { BENCH_MODEL_API_KEY: key }, log: (e) => events.push(e), limits });
   await meter.listen();
   t.after(async () => {
     await meter.close();
@@ -227,11 +228,11 @@ test('a stream that stalls is cut by the idle timeout', async (t) => {
   assert.equal(settled[0].usageMissing, true);
 });
 
-test('an endpoint that is down is not charged; an HTTP error is relayed and not charged', async (t) => {
+test('an endpoint that is down is not charged; an HTTP error is answered with a fixed body and not charged', async (t) => {
   const s = await setup(t, { behavior: { status: 500 } });
   const { baseUrl } = s.open();
   const res = await chat(baseUrl, { messages: [] });
-  assert.equal(res.status, 500);
+  assert.equal(res.status, 502, 'an upstream 5xx is a 502 for the agent');
   const failed = callRecords(s.ledger, 'failed');
   assert.equal(failed.length, 1);
   assert.equal(failed[0].costMicro, 0);
@@ -244,11 +245,11 @@ test('an endpoint that is down is not charged; an HTTP error is relayed and not 
   assert.equal(s.book.runView('r1').spentMicro, 0, 'a refused connection cannot have been billed');
 });
 
-test('the endpoint gets a bad key: the answer is relayed, nothing is charged', async (t) => {
+test('the endpoint gets a bad key: the agent sees a 400 with a fixed body, nothing is charged', async (t) => {
   const s = await setup(t);
   s.model.behavior.expectKey = 'another-key';
   const { baseUrl } = s.open();
-  assert.equal((await chat(baseUrl, { messages: [] })).status, 401);
+  assert.equal((await chat(baseUrl, { messages: [] })).status, 400, 'an upstream 4xx other than 429 is a 400');
   assert.equal(s.book.runView('r1').spentMicro, 0);
 });
 
@@ -293,7 +294,7 @@ test('prepareBody: the clamp, the default limit, n, and include_usage only for s
   assert.equal(clamp({ max_tokens: 'lots' }).body.max_tokens, 8192);
   assert.equal(clamp({ max_tokens: -5 }).body.max_tokens, 8192);
   assert.equal(clamp({ max_tokens: 10, max_completion_tokens: 20 }).maxOutputTokens, 20, 'the worst case takes the larger');
-  assert.equal(clamp({ max_tokens: 10, n: 3 }).maxOutputTokens, 30);
+  assert.equal(clamp({ max_tokens: 10, n: 1 }).maxOutputTokens, 10);
   assert.equal('stream_options' in clamp({ stream: false }).body, false);
   assert.deepEqual(clamp({ stream: true }).body.stream_options, { include_usage: true });
   assert.equal(clamp({ stream: true }, { max_tokens: 99999 }).body.max_tokens, 8192, 'the clamp applies to the fragment too');
@@ -307,3 +308,158 @@ test('deepMerge: objects merge, anything else is replaced, the second wins, no p
   assert.equal(polluted.bad, undefined);
   assert.equal(polluted.ok, 1);
 });
+
+// ---- fix round: rows 1, 2, 3, 10, 13 of the review ----
+
+const FIXED = (status) => ({ error: { message: 'upstream error', type: 'upstream_error', status } });
+
+test('row 1: an upstream error reaches the agent as a fixed body, whatever the endpoint said', async (t) => {
+  const leak = 'Incorrect API key provided: example-key-for-tests-0001 at https://models.example.test/v1/chat/completions (tail ...0001)';
+  const s = await setup(t, { behavior: { errorBody: { error: { message: leak } }, errorHeaders: { 'x-upstream-secret': 'host-internal-7', 'www-authenticate': 'Bearer realm="example"' } } });
+  const { baseUrl } = s.open();
+  const table = [[400, 400], [401, 400], [403, 400], [404, 400], [418, 400], [429, 429], [500, 502], [502, 502], [503, 502], [302, 502]];
+  for (const [upstream, expected] of table) {
+    s.model.behavior.status = upstream;
+    const res = await chat(baseUrl, { messages: [] });
+    const text = await res.text();
+    assert.equal(res.status, expected, `upstream ${upstream}`);
+    assert.deepEqual(JSON.parse(text), FIXED(upstream), `body for ${upstream}`);
+    assert.equal(res.headers.get('x-upstream-secret'), null, 'no upstream header is relayed');
+    assert.equal(res.headers.get('www-authenticate'), null);
+    assert.match(res.headers.get('content-type'), /application\/json/);
+    assert.ok(!text.includes('example-key') && !text.includes('models.example.test'));
+  }
+  const failed = callRecords(s.ledger, 'failed');
+  assert.deepEqual(failed.map((r) => r.status), table.map(([u]) => u), 'the ledger has the upstream status and nothing else of the answer');
+  assert.ok(failed.every((r) => r.costMicro === 0));
+  assert.ok(!JSON.stringify(s.events).includes('example-key'));
+});
+
+test('row 10: a non-2xx answer with a huge body costs nothing and is not buffered', async (t) => {
+  const s = await setup(t, { behavior: { status: 500, errorBody: 'e'.repeat(3 * 1024 * 1024) } });
+  const { baseUrl } = s.open();
+  const res = await chat(baseUrl, { messages: [] });
+  assert.equal(res.status, 502);
+  assert.deepEqual(await res.json(), FIXED(500));
+  assert.equal(s.book.runView('r1').spentMicro, 0);
+});
+
+test('row 2: n absent or exactly 1 is forwarded as 1; anything else is a 400 and nothing leaves', async (t) => {
+  const s = await setup(t);
+  const { baseUrl } = s.open();
+  assert.equal((await chat(baseUrl, { messages: [] })).status, 200);
+  assert.equal((await chat(baseUrl, { messages: [], n: 1 })).status, 200);
+  assert.deepEqual(s.model.requests.map((r) => r.body.n), [1, 1]);
+  for (const n of [2, 0, -1, 1.5, '1', null, true, [1], 1e9]) {
+    const res = await chat(baseUrl, { messages: [], n });
+    assert.equal(res.status, 400, `n = ${JSON.stringify(n)}`);
+    assert.match((await res.json()).error.message, /\bn\b/);
+  }
+  assert.equal(s.model.requests.length, 2, 'nothing was forwarded for a bad n');
+  assert.equal(callRecords(s.ledger, 'pending').length, 2);
+  assert.throws(() => prepareBody({ n: 3 }, {}, 'm'), /\bn\b/);
+  assert.equal(prepareBody({}, {}, 'm').body.n, 1);
+  assert.equal(prepareBody({ max_tokens: 10, n: 1 }, {}, 'm').maxOutputTokens, 10);
+});
+
+test('row 3: a failure that throws before the request leaves frees the reservation and settles the call', async (t) => {
+  // a character above 0xFF passes the key check but cannot go in a header: http.request throws at once
+  const key = 'k€y-example-0001';
+  const s = await setup(t, { key });
+  const { baseUrl } = s.open();
+  const res = await chat(baseUrl, { messages: [] });
+  assert.equal(res.status, 500);
+  assert.equal(s.model.requests.length, 0);
+  assert.equal(callRecords(s.ledger, 'pending').length, 1);
+  const failed = callRecords(s.ledger, 'failed');
+  assert.equal(failed.length, 1, 'the pending record is settled, not left forever');
+  assert.equal(failed[0].costMicro, 0, 'nothing was sent: free');
+  assert.equal(s.book.runView('r1').pendingMicro, 0, 'the reservation is not leaked');
+  assert.equal(s.ledger.fold().get('r1').spentMicro, 0, 'the fold does not count an unsettled worst case');
+  assert.ok(!JSON.stringify(s.events).includes('€'));
+});
+
+test('row 13: a request body over the limit is answered 413 and the answer arrives', async (t) => {
+  const s = await setup(t, { limits: { maxRequestBytes: 64 * 1024 } });
+  const { baseUrl } = s.open();
+  const res = await chat(baseUrl, { messages: [{ role: 'user', content: 'x'.repeat(200 * 1024) }] });
+  assert.equal(res.status, 413);
+  assert.match((await res.json()).error.message, /too large/);
+  assert.equal(s.model.requests.length, 0);
+  const small = await chat(baseUrl, { messages: [{ role: 'user', content: 'x'.repeat(20 * 1024) }] });
+  assert.equal(small.status, 200, 'a body under the limit still goes');
+});
+
+test('row 13: the default limit is 8 MiB, the 413 is delivered even for a body several times over it, and a declared length is refused unread', async (t) => {
+  assert.equal(LIMITS.maxRequestBytes, 8 * 1024 * 1024);
+  const s = await setup(t);
+  const { baseUrl } = s.open();
+  const res = await chat(baseUrl, { messages: [{ role: 'user', content: 'x'.repeat(40 * 1024 * 1024) }] });
+  assert.equal(res.status, 413);
+  await res.text();
+  // a raw request that declares a huge length and sends nothing is refused at once
+  const status = await new Promise((resolve, reject) => {
+    const u = new URL(`${baseUrl}/chat/completions`);
+    const r = http.request({ host: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json', 'content-length': String(100 * 1024 * 1024) } }, (rs) => {
+      resolve(rs.statusCode);
+      rs.resume();
+    });
+    r.on('error', reject);
+    r.write('{');
+    setTimeout(() => r.destroy(), 3000).unref();
+  });
+  assert.equal(status, 413);
+});
+
+test('row 10: a stream that never ends is cut at the byte limit, the upstream is destroyed and the worst case is charged', async (t) => {
+  const s = await setup(t, { behavior: { endless: true, endlessChunkBytes: 1000, endlessEveryMs: 1 }, limits: { maxResponseBytes: 50_000 } });
+  const { baseUrl } = s.open();
+  const res = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', body: JSON.stringify({ messages: [], stream: true }), signal: AbortSignal.timeout(5000) });
+  const got = await res.text().catch(() => '');
+  assert.ok(got.length < 200_000, `the agent got ${got.length} bytes`);
+  await until(() => s.model.stats.aborted === 1, 'the upstream stream was cut');
+  const settled = callRecords(s.ledger, 'settled');
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0].reason, 'response_too_large');
+  assert.equal(settled[0].usageMissing, true);
+  assert.equal(settled[0].costMicro, callRecords(s.ledger, 'pending')[0].worstMicro);
+  assert.equal(s.book.runView('r1').pendingMicro, 0);
+});
+
+test('row 10: a stream that trickles forever is cut at the time limit, however lively it is', async (t) => {
+  const s = await setup(t, { behavior: { endless: true, endlessChunkBytes: 10, endlessEveryMs: 20 }, limits: { maxCallMs: 600 } });
+  const { baseUrl } = s.open();
+  const started = Date.now();
+  const res = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', body: JSON.stringify({ messages: [], stream: true }), signal: AbortSignal.timeout(5000) });
+  await res.text().catch(() => '');
+  assert.ok(Date.now() - started < 3500, `ended after ${Date.now() - started} ms`);
+  await until(() => s.model.stats.aborted === 1, 'the upstream stream was cut');
+  const settled = callRecords(s.ledger, 'settled');
+  assert.equal(settled.length, 1);
+  assert.equal(settled[0].reason, 'timeout');
+  assert.equal(settled[0].costMicro, callRecords(s.ledger, 'pending')[0].worstMicro);
+});
+
+test('row 10: a client that does not read slows the upstream down instead of filling the meter', async (t) => {
+  const s = await setup(t, {
+    behavior: { endless: true, endlessChunkBytes: 256 * 1024, endlessEveryMs: 1 },
+    limits: { maxResponseBytes: 2 ** 31, maxCallMs: 60_000 },
+  });
+  const { baseUrl } = s.open();
+  const u = new URL(`${baseUrl}/chat/completions`);
+  const req = http.request({ host: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json' } }, (rs) => rs.pause());
+  req.on('error', () => {});
+  t.after(() => req.destroy());
+  req.end(JSON.stringify({ messages: [], stream: true }));
+  await new Promise((r) => setTimeout(r, 1200));
+  const sent = s.model.stats.sentBytes;
+  assert.ok(sent < 48 * 1024 * 1024, `the upstream got ${(sent / 1e6).toFixed(1)} MB into the meter while nobody read`);
+});
+
+async function until(fn, what, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!fn()) {
+    if (Date.now() > end) assert.fail(`timed out: ${what}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
