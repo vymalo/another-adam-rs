@@ -280,14 +280,14 @@ async fn against_a_real_cluster() {
     release_and_held_runs(&cluster).await;
     a_run_pod_sees_only_its_own_run(&cluster).await;
     the_admission_policy_refuses_everything_but_the_intended_pod(&cluster).await;
+    // Before the quota scenario, which fills the namespace and leaves its pods terminating: this one
+    // needs a pod of its own, and waits until that pod is gone before the quota is counted.
+    a_server_keeps_its_conversation_on_stdin_and_stdout(&cluster).await;
     if cluster.quota_pods.is_some() {
         the_quota_refuses_a_pod_beyond_its_limit(&cluster).await;
     } else {
         eprintln!("skipped the quota scenario: ADAM_TEST_KUBE_QUOTA_PODS is not set");
     }
-    // Last: a failure here is the answer to a question of its own (can a server be talked to through
-    // `adam-kube-exec`?), and the scenarios above have already said what they had to.
-    a_server_keeps_its_conversation_on_stdin_and_stdout(&cluster).await;
 }
 
 /// A framed conversation on stdin and stdout, as a language server has: a first message, stdin held open
@@ -308,12 +308,27 @@ async fn a_server_keeps_its_conversation_on_stdin_and_stdout(c: &Cluster) {
         &StdioProbe::new(&cwd).silence(Duration::from_secs(1)),
     )
     .await;
-    // Released before the verdict, so that a failure leaves no pod to count against the quota.
-    env.release(&run_id).await.unwrap();
     let failures: Vec<String> = [("until EOF", eof), ("until kill", killed)]
         .into_iter()
         .filter_map(|(what, result)| result.err().map(|e| format!("{what}: {e}")))
         .collect();
+    for failure in &failures {
+        eprintln!("stdin and stdout: {failure}");
+    }
+    if failures.is_empty() {
+        eprintln!(
+            "stdin and stdout: both cases held, with a silence of {:?}",
+            silence()
+        );
+    }
+    // Released, and gone, before the verdict: a failure leaves no pod to count against the quota.
+    env.release(&run_id).await.unwrap();
+    c.wait_for(
+        "the pod of the stdin scenario to be gone",
+        120,
+        async || c.gone(&run_id).await,
+    )
+    .await;
     assert!(
         failures.is_empty(),
         "a framed conversation on stdin and stdout through adam-kube-exec in a run pod:\n{}",
