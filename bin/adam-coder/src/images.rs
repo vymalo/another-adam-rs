@@ -20,7 +20,9 @@
 //!   never sent.
 //! * **Bounded.** One image is at most 4 MiB (the most `MODEL_IMAGE_MAX_BYTES` allows) and a scope at
 //!   most [`SCOPE_MAX`] (64 MiB) of the files this process names; the check and the write are made one
-//!   at a time in this process.
+//!   at a time in this process, so two processes on one volume may each overshoot a scope by one image.
+//!   Keeping an image **replaces** a file under its name that would be refused at load (a hard link or
+//!   other bytes a command planted).
 //! * **Not scrubbed.** An image is bytes, not text: nothing here, and nothing in the agent, looks for a
 //!   secret in it. It reaches the volume only from the sources the deployment allows to reach the
 //!   model (`MODEL_IMAGE_SOURCES`).
