@@ -149,7 +149,9 @@ impl Lsp {
         std::fs::read_to_string(self.dir.path().join("log.jsonl"))
             .unwrap_or_default()
             .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
+            // The script writes a line at once; a reader that polls may still meet the end of the
+            // file between two writes of the OS, and a line that is not whole is not read yet.
+            .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
     }
 

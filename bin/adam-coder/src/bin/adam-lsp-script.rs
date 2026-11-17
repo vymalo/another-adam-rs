@@ -114,7 +114,8 @@ fn log(script: &Script, line: &Value) {
             .append(true)
             .open(path)
             .unwrap();
-        writeln!(file, "{line}").unwrap();
+        // One write, so that a reader polling the file never sees half a line.
+        file.write_all(format!("{line}\n").as_bytes()).unwrap();
     }
 }
 
