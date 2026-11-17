@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { test } from 'node:test';
 import { Ledger, LedgerError, foldRecords, readLedger, resumeActions, resumeRecords } from '../lib/ledger.mjs';
 import { tmp } from './helpers.mjs';
@@ -190,4 +191,130 @@ test('foldRecords ignores setup records and works on plain arrays', () => {
   const v = foldRecords([{ kind: 'setup', modelLabel: 'x' }, state('r', 'Planned')]);
   assert.equal(v.size, 1);
   assert.equal(v.get('r').state, 'Planned');
+});
+
+// ---- fix round: rows 7, 8, 9 of the review ----
+
+const LEDGER_MODULE = new URL('../lib/ledger.mjs', import.meta.url).href;
+
+test('row 7: a second open of the same ledger in one process fails, and the first keeps its lock', (t) => {
+  const { ledger, file } = open(t);
+  assert.throws(() => Ledger.open(file), (e) => e instanceof LedgerError && /in use by this process/.test(e.message));
+  assert.equal(fs.readFileSync(`${file}.lock`, 'utf8').trim(), String(process.pid), 'the failed open did not touch the lock');
+  ledger.append(plan('r1')); // the first is still the writer
+  ledger.close();
+  assert.ok(!fs.existsSync(`${file}.lock`));
+  const again = Ledger.open(file);
+  again.close();
+});
+
+test('row 7: the lock never exists without its pid, and no lock file is left behind', (t) => {
+  const { ledger, file } = open(t);
+  assert.match(fs.readFileSync(`${file}.lock`, 'utf8'), /^\d+\n$/);
+  ledger.close();
+  assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.lock')), [], 'no temp file of the lock stays');
+});
+
+test('row 7: processes racing for one ledger: exactly one wins', async (t) => {
+  const file = path.join(tmp(t), 'ledger.jsonl');
+  const startAt = Date.now() + 800;
+  const script = `
+    import { Ledger } from ${JSON.stringify(LEDGER_MODULE)};
+    const wait = ${startAt} - Date.now();
+    await new Promise((r) => setTimeout(r, Math.max(0, wait)));
+    try {
+      const l = Ledger.open(${JSON.stringify(file)});
+      process.stdout.write('WON\\n');
+      await new Promise((r) => setTimeout(r, 1500));
+      l.close();
+    } catch (e) {
+      process.stdout.write('LOST ' + e.message + '\\n');
+    }`;
+  const spawnChild = () =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'inherit'] });
+      let out = '';
+      child.stdout.on('data', (d) => (out += d));
+      child.on('close', () => resolve(out.trim()));
+    });
+  const results = await Promise.all(Array.from({ length: 6 }, spawnChild));
+  assert.equal(results.filter((r) => r === 'WON').length, 1, results.join(' | '));
+  assert.equal(results.filter((r) => r.startsWith('LOST')).length, 5, results.join(' | '));
+});
+
+test('row 8: a complete last line that does not parse stops the harness with its line number and nothing is cut', (t) => {
+  const file = path.join(tmp(t), 'ledger.jsonl');
+  const good = JSON.stringify({ v: 1, kind: 'state', run: 'r1', state: 'Planned' });
+  const content = `${good}\nthis is not json\n`;
+  fs.writeFileSync(file, content);
+  assert.throws(() => readLedger(file), (e) => e instanceof LedgerError && /line 2/.test(e.message));
+  assert.throws(() => Ledger.open(file), (e) => e instanceof LedgerError && /line 2/.test(e.message));
+  assert.equal(fs.readFileSync(file, 'utf8'), content, 'the file is as it was');
+  assert.ok(!fs.existsSync(`${file}.lock`));
+  // a complete line that is JSON but no record is corrupt too
+  fs.writeFileSync(file, `${good}\n{"no":"kind"}\n`);
+  assert.throws(() => readLedger(file), /line 2/);
+});
+
+test('row 8: only a last line without its newline is torn', (t) => {
+  const file = path.join(tmp(t), 'ledger.jsonl');
+  const good = JSON.stringify({ v: 1, kind: 'state', run: 'r1', state: 'Planned' });
+  fs.writeFileSync(file, `${good}\n{"v":1,"kind":"sta`);
+  const { records, warnings, goodBytes } = readLedger(file);
+  assert.equal(records.length, 1);
+  assert.equal(warnings.length, 1);
+  assert.equal(goodBytes, Buffer.byteLength(good) + 1);
+});
+
+const planned = (ledger, run) => walk(ledger, run, 'Planned');
+const interrupted = (ledger, run, ...more) => walk(ledger, run, 'Reserved', 'Preparing', 'Running', ...more);
+
+test('row 9: the third interruption ends the run Failed_infra for good, with its spend counted once', (t) => {
+  const { ledger } = open(t);
+  planned(ledger, 'r');
+  interrupted(ledger, 'r');
+  ledger.append(call('r', 1, 'settled', { costMicro: 777 }));
+  walk(ledger, 'r', 'Interrupted'); // 1
+  walk(ledger, 'r', 'Planned');
+  interrupted(ledger, 'r', 'Interrupted'); // 2
+  walk(ledger, 'r', 'Planned');
+  interrupted(ledger, 'r'); // running when the harness dies the third time
+  ledger.append({ kind: 'call', run: 'r', attempt: 3, call: 1, phase: 'settled', costMicro: 400 });
+  const actions = resumeActions(ledger.fold());
+  assert.equal(actions[0].action, 'give-up');
+  assert.equal(actions[0].reason, 'interrupted');
+  const records = resumeRecords(actions, ledger.fold());
+  assert.deepEqual(records.map((r) => r.state), ['Interrupted', 'Failed_infra']);
+  for (const r of records) ledger.append(r);
+  const v = ledger.fold().get('r');
+  assert.equal(v.state, 'Failed_infra');
+  assert.equal(v.interruptions, 3);
+  assert.equal(v.wastedMicro, 777 + 400, 'every attempt counted once, the last not twice');
+  // the next start finds it final and writes nothing
+  const next = resumeActions(ledger.fold());
+  assert.equal(next[0].action, 'give-up');
+  assert.deepEqual(resumeRecords(next, ledger.fold()), []);
+});
+
+test('row 9: two interruptions are still restarted; a run that was already Interrupted twice is restarted once more', (t) => {
+  const { ledger } = open(t);
+  planned(ledger, 'two');
+  interrupted(ledger, 'two', 'Interrupted');
+  walk(ledger, 'two', 'Planned');
+  interrupted(ledger, 'two'); // the second, in flight now
+  planned(ledger, 'both');
+  interrupted(ledger, 'both', 'Interrupted');
+  walk(ledger, 'both', 'Planned');
+  interrupted(ledger, 'both', 'Interrupted'); // two recorded, last state Interrupted
+  const a = Object.fromEntries(resumeActions(ledger.fold()).map((x) => [x.run, x.action]));
+  assert.deepEqual(a, { two: 'rerun', both: 'rerun' });
+  assert.equal(resumeActions(ledger.fold(), { maxInterruptions: 1 }).find((x) => x.run === 'two').action, 'give-up');
+});
+
+test('row 9: a run in Interrupted can end Failed_infra directly', (t) => {
+  const { ledger } = open(t);
+  planned(ledger, 'r');
+  interrupted(ledger, 'r', 'Interrupted');
+  ledger.append(state('r', 'Failed_infra', { final: true }));
+  assert.equal(ledger.fold().get('r').final, true);
 });

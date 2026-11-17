@@ -8,6 +8,7 @@
 //
 // `foldRecords` gives each run's current state and its spend. `resumeActions` says what to do with
 // each run when the harness starts again (a pure function of the fold).
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -21,7 +22,7 @@ export const TRANSITIONS = {
   Running: ['Collecting', 'StoppedByCap', 'Interrupted'],
   Collecting: ['Grading', 'Interrupted'],
   Grading: ['Grading', 'Done'],
-  Interrupted: ['Planned'],
+  Interrupted: ['Planned', 'Failed_infra'],
   Failed_infra: ['Planned'],
   Done: [],
   NotStarted: [],
@@ -41,7 +42,10 @@ export class LedgerError extends Error {
   }
 }
 
-/** Parse the file. A torn last line is ignored with a warning; a bad line before it is an error. */
+/**
+ * Parse the file. Only a last line without its newline can be torn (the harness died mid-write):
+ * it is ignored with a warning. A complete line that is not a record, anywhere, is an error.
+ */
 export function readLedger(file) {
   let text;
   try {
@@ -69,7 +73,7 @@ export function readLedger(file) {
         rec = JSON.parse(line);
         if (!rec || typeof rec !== 'object' || typeof rec.kind !== 'string') throw new Error('not a record');
       } catch {
-        if (i === lastNonEmpty) {
+        if (i === lastNonEmpty && !hasNewline) {
           warnings.push(`ledger line ${i + 1} is torn and was ignored`);
           break;
         }
@@ -121,28 +125,77 @@ export class Ledger {
     }
   }
 
+  /**
+   * Take the lock: write the pid to a temporary file and `link` it to the lock name, which fails
+   * if the name exists, so the lock never exists without its pid. A lock of this process is never
+   * stale (a second open fails). A lock whose pid is not running is moved away (one rename wins,
+   * and the file moved is checked to be the stale one) and then the link is tried again.
+   */
   static #lock(lockFile) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        fs.writeFileSync(lockFile, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
-        return lockFile;
-      } catch (e) {
-        if (e.code !== 'EEXIST') throw e;
-        const pid = Number.parseInt(fs.readFileSync(lockFile, 'utf8'), 10);
-        let alive = false;
-        if (Number.isSafeInteger(pid) && pid > 0) {
-          try {
-            process.kill(pid, 0);
-            alive = true;
-          } catch (err) {
-            alive = err.code === 'EPERM';
-          }
+    const mine = `${lockFile}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
+    fs.writeFileSync(mine, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
+    try {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          fs.linkSync(mine, lockFile);
+          return lockFile;
+        } catch (e) {
+          if (e.code !== 'EEXIST') throw e;
         }
-        if (alive && pid !== process.pid) throw new LedgerError(`the ledger is in use by process ${pid}`);
-        fs.rmSync(lockFile, { force: true });
+        const pid = Ledger.#lockPid(lockFile);
+        if (pid === process.pid) throw new LedgerError('the ledger is in use by this process');
+        if (pid !== null && Ledger.#running(pid)) throw new LedgerError(`the ledger is in use by process ${pid}`);
+        Ledger.#removeStale(lockFile, pid);
       }
+      throw new LedgerError('cannot lock the ledger');
+    } finally {
+      fs.rmSync(mine, { force: true });
     }
-    throw new LedgerError('cannot lock the ledger');
+  }
+
+  static #lockPid(lockFile) {
+    try {
+      const pid = Number.parseInt(fs.readFileSync(lockFile, 'utf8'), 10);
+      return Number.isSafeInteger(pid) && pid > 0 ? pid : -1;
+    } catch (e) {
+      if (e.code === 'ENOENT') return null;
+      throw e;
+    }
+  }
+
+  static #running(pid) {
+    if (pid < 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return err.code === 'EPERM';
+    }
+  }
+
+  /** Move the stale lock away; if what moved is not the stale one (another process won first), put it back. */
+  static #removeStale(lockFile, stalePid) {
+    if (stalePid === null) return; // already gone: the next link decides
+    const moved = `${lockFile}.stale.${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
+    try {
+      fs.renameSync(lockFile, moved);
+    } catch (e) {
+      if (e.code === 'ENOENT') return;
+      throw e;
+    }
+    try {
+      const was = Number.parseInt(fs.readFileSync(moved, 'utf8'), 10);
+      const wasPid = Number.isSafeInteger(was) && was > 0 ? was : -1;
+      if (wasPid !== stalePid) {
+        try {
+          fs.linkSync(moved, lockFile); // someone else's fresh lock: give it back
+        } catch {
+          // a third process has taken the name; its link failed or won, either way ours is not the owner
+        }
+      }
+    } finally {
+      fs.rmSync(moved, { force: true });
+    }
   }
 
   constructor(file, records, lock, now) {
@@ -224,6 +277,8 @@ export function foldRecords(records) {
         reservationActive: false,
         wastedMicro: 0,
         infraFailures: 0,
+        interruptions: 0,
+        final: false,
         result: null,
         firstAt: null,
         lastAt: null,
@@ -253,9 +308,17 @@ export function foldRecords(records) {
         v.reservationActive = false;
       }
       if (rec.state === 'Interrupted' || rec.state === 'Failed_infra' || rec.state === 'StoppedByCap') {
+        // An attempt's spend is wasted once, however many of these states end it (Interrupted, then Failed_infra).
         const a = v.attempts[v.attempt - 1];
-        if (a) v.wastedMicro += attemptSpend(a);
-        if (rec.state === 'Failed_infra') v.infraFailures += 1;
+        if (a && !a.wasted) {
+          a.wasted = true;
+          v.wastedMicro += attemptSpend(a);
+        }
+        if (rec.state === 'Interrupted') v.interruptions += 1;
+        if (rec.state === 'Failed_infra') {
+          if (rec.final === true) v.final = true;
+          else v.infraFailures += 1;
+        }
       }
       if (rec.state === 'Done') v.result = rec.result;
     } else if (rec.kind === 'call') {
@@ -304,12 +367,14 @@ export function foldRecords(records) {
  *            the interrupted attempt stays in the ledger as wasted
  *   regrade  Grading: grade the saved patch again; never run the agent again
  *   retry    Failed_infra with retries left (at most `maxInfraRetries`)
- *   give-up  Failed_infra with none left: final, excluded from the rates
+ *   give-up  Failed_infra with none left, or a run that would be interrupted a third time
+ *            (`maxInterruptions`, 2): final, excluded from the rates, its spend reported as wasted
  */
-export function resumeActions(folded, { maxInfraRetries = 2 } = {}) {
+export function resumeActions(folded, { maxInfraRetries = 2, maxInterruptions = 2 } = {}) {
   const out = [];
   for (const v of folded.values()) {
     let action;
+    let reason;
     switch (v.state) {
       case 'Done':
       case 'NotStarted':
@@ -323,26 +388,33 @@ export function resumeActions(folded, { maxInfraRetries = 2 } = {}) {
         action = 'regrade';
         break;
       case 'Failed_infra':
-        action = v.infraFailures <= maxInfraRetries ? 'retry' : 'give-up';
+        action = !v.final && v.infraFailures <= maxInfraRetries ? 'retry' : 'give-up';
         break;
       default:
-        action = 'rerun';
+        // A run that was in flight is interrupted now; one already Interrupted has been counted.
+        if (v.interruptions + (v.state === 'Interrupted' ? 0 : 1) > maxInterruptions) {
+          action = 'give-up';
+          reason = 'interrupted';
+        } else action = 'rerun';
     }
-    out.push({ run: v.run, from: v.state, action, spentMicro: v.spentMicro, wastedMicro: v.wastedMicro });
+    out.push({ run: v.run, from: v.state, action, ...(reason ? { reason } : {}), spentMicro: v.spentMicro, wastedMicro: v.wastedMicro });
   }
   return out;
 }
 
 /**
  * The state records that bring the ledger to where the actions assume: a run that was in flight
- * becomes Interrupted and then Planned; a Failed_infra to retry becomes Planned; a Grading run
- * re-enters Grading. Pass the result of `resumeActions`.
+ * becomes Interrupted and then Planned (or, the third time, Interrupted and then a final
+ * Failed_infra); a Failed_infra to retry becomes Planned; a Grading run re-enters Grading. Pass the result of `resumeActions`.
  */
 export function resumeRecords(actions, folded) {
   const out = [];
   for (const a of actions) {
     const v = folded.get(a.run);
-    if (a.action === 'rerun') {
+    if (a.action === 'give-up' && a.reason === 'interrupted') {
+      if (a.from !== 'Interrupted') out.push({ kind: 'state', run: a.run, state: 'Interrupted', resumed: true });
+      out.push({ kind: 'state', run: a.run, state: 'Failed_infra', final: true, reason: 'interrupted_too_often' });
+    } else if (a.action === 'rerun') {
       if (IN_FLIGHT.has(a.from)) out.push({ kind: 'state', run: a.run, state: 'Interrupted', resumed: true });
       out.push({ kind: 'state', run: a.run, state: 'Planned', retry: true, task: v.task, agent: v.agent, arm: v.arm, block: v.block, source: v.source, language: v.language });
     } else if (a.action === 'retry') {
