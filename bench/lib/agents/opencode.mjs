@@ -4,12 +4,14 @@
 //
 //   opencode run --format json --model bench/bench-model --auto --title <run> --dir <clone> < instruction.md
 //
-// Verified 2026-11-17 against the pinned binary (1.19.5) and a local OpenAI-compatible stub: the statement on stdin
-// reaches the model byte for byte (as arguments, a statement with a space is wrapped in quotes); `--title` removes
-// the extra title-generation call; `step_finish` carries `tokens` {total, input, output, reasoning, cache: {write,
-// read}} and `cost`; `opencode export <session>` prints the session as JSON ({info, messages}); the stream has only
-// the main session (a subagent's calls are in the export). The home directory is on the shared output directory so
-// that the export can run in a second container after a run that was killed at the time limit.
+// OpenCode V2 (`@opencode/cli` 2.x). Verified 2026-11-17 against the pinned 2.3.0 binary and a local OpenAI-compatible
+// stub (bench/README.md, "OpenCode V2"): `run` has no `--dir` (the directory is the working directory) and `--standalone`
+// makes it use a private server instead of a background service; the statement on stdin reaches the model byte for
+// byte; `--title` removes the extra title-generation call; `step_finish` carries `tokens` {input, output, reasoning,
+// cache: {read, write}} and `cost`; the export is `opencode session export <session>`; `run` waits for the background
+// jobs its prompt started, subagents included, with no time limit of its own: the container's time limit is the limit.
+// The home directory is on the shared output directory so that the export can run in a second container after a run
+// that was killed at the time limit.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fetchPinnedBinary } from '../npm.mjs';
@@ -39,7 +41,7 @@ export function opencodeConfig({ baseUrl, contextWindow = 131072, steps = 200, u
         models: { 'bench-model': { name: 'bench-model', tool_call: true, limit: { context: contextWindow, output: OUTPUT_TOKENS } } },
       },
     },
-    permission: { '*': 'allow', webfetch: 'deny', websearch: 'deny', external_directory: 'deny' },
+    permission: { '*': 'allow', webfetch: 'deny', websearch: 'deny', external_directory: 'deny', question: 'deny' },
     agent: { build: { steps } },
   };
 }
@@ -67,7 +69,7 @@ export function opencodeRunScript({ bin, stmt, out, dir, run }) {
     'set -u',
     ...homeLines(out),
     `cd ${dir} || exit 98`,
-    `${bin} run --format json --model ${MODEL} --auto --title '${run}' --dir ${dir} < ${stmt} > ${out}/events.jsonl 2> ${out}/stderr.txt`,
+    `${bin} run --standalone --format json --model ${MODEL} --auto --title '${run}' < ${stmt} > ${out}/events.jsonl 2> ${out}/stderr.txt`,
     `echo $? > ${out}/exit`,
   ].join('\n');
 }
@@ -76,7 +78,7 @@ export function opencodeRunScript({ bin, stmt, out, dir, run }) {
 export function opencodeExportScript({ bin, out, sessionId }) {
   plain(bin, out);
   if (!SESSION.test(sessionId)) throw new Error('the session id is not plain');
-  return ['set -u', ...homeLines(out), `${bin} export '${sessionId}' > ${out}/export.json 2> ${out}/export.err`].join('\n');
+  return ['set -u', ...homeLines(out), `${bin} session export --standalone '${sessionId}' > ${out}/export.json 2> ${out}/export.err`].join('\n');
 }
 
 /** What the JSON events say: the session, the steps, what OpenCode says it used, the errors. Pure. */
@@ -84,6 +86,8 @@ export function parseEvents(text) {
   let sessionId = null;
   let calls = 0;
   let errors = 0;
+  let retries = 0;
+  let backgroundWaits = 0;
   const tokens = { input: 0, output: 0, cached: 0 };
   for (const line of String(text).split('\n')) {
     let e;
@@ -94,6 +98,8 @@ export function parseEvents(text) {
     }
     if (typeof e?.sessionID === 'string' && SESSION.test(e.sessionID)) sessionId ??= e.sessionID;
     if (e?.type === 'error') errors += 1;
+    if (e?.type === 'retry') retries += 1;
+    if (e?.type === 'background_wait') backgroundWaits += 1;
     if (e?.type === 'step_finish') {
       calls += 1;
       const t = e.part?.tokens ?? {};
@@ -102,7 +108,7 @@ export function parseEvents(text) {
       tokens.cached += Number.isFinite(t.cache?.read) ? t.cache.read : 0;
     }
   }
-  return { sessionId, errors, selfReported: { ...tokens, calls } };
+  return { sessionId, errors, retries, backgroundWaits, selfReported: { ...tokens, calls } };
 }
 
 const readOr = (file, fallback = '') => {
@@ -116,7 +122,8 @@ const readOr = (file, fallback = '') => {
 export class OpenCodeAgent {
   name = 'opencode';
 
-  constructor({ pins, home, fetchBinary = fetchPinnedBinary, now = Date.now, contextWindow }) {
+  constructor({ pins, home, fetchBinary = fetchPinnedBinary, now = Date.now, contextWindow, pollMs = 10_000 }) {
+    this.pollMs = pollMs;
     this.pins = pins;
     this.home = home;
     this.fetchBinary = fetchBinary;
@@ -126,7 +133,7 @@ export class OpenCodeAgent {
   }
 
   #names(ctx) {
-    const parent = `/work/workspaces/oc-${ctx.run.replace(/[^A-Za-z0-9._-]/g, '-')}`;
+    const parent = `/work/workspaces/oc-${ctx.run.replace(/[^A-Za-z0-9._-]/g, '-')}-a${ctx.attempt}`;
     return { parent, dir: `${parent}/${ctx.base.slug}` };
   }
 
@@ -140,6 +147,7 @@ export class OpenCodeAgent {
     fs.chmodSync(ctx.paths.out, 0o777);
     fs.writeFileSync(path.join(ctx.paths.in, 'instruction.md'), ctx.task.instruction, { mode: 0o644 });
     const { parent, dir } = this.#names(ctx);
+    await ctx.stack.workspaceDir(ctx.slot, parent, { remove: true }); // a killed attempt may have left it
     await ctx.stack.workspaceDir(ctx.slot, parent);
     const base = path.dirname(ctx.base.dir);
     const r = await ctx.containers.run({
@@ -171,15 +179,30 @@ export class OpenCodeAgent {
     const env = opencodeEnv({ config });
     const mounts = this.#mounts(ctx, names);
     const started = this.now();
-    const r = await ctx.containers.run({
-      image: ctx.task.image.ref,
-      script: opencodeRunScript({ bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: names.dir, run: `${ctx.run}-a${ctx.attempt}`.replace(/[^A-Za-z0-9._-]/g, '-') }),
-      workdir: names.dir,
-      env,
-      mounts,
-      network: 'default', // the Podman service's own network: the meter, and nothing else
-      timeoutMs: ctx.limitMs,
-    });
+    const name = `adam-bench-oc-${ctx.run.replace(/[^A-Za-z0-9_.-]/g, '-')}-a${ctx.attempt}`.slice(0, 63);
+    // A refusal of the meter is a limit like time: OpenCode retries a refused call, so the harness ends the container.
+    let refused = false;
+    const watcher = setInterval(() => {
+      if (!refused && ctx.meter.refusal()) {
+        refused = true;
+        ctx.containers.stop(name).catch(() => {});
+      }
+    }, this.pollMs);
+    let r;
+    try {
+      r = await ctx.containers.run({
+        name,
+        image: ctx.task.image.ref,
+        script: opencodeRunScript({ bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: names.dir, run: `${ctx.run}-a${ctx.attempt}`.replace(/[^A-Za-z0-9._-]/g, '-') }),
+        workdir: names.dir,
+        env,
+        mounts,
+        network: 'default', // the Podman service's own network: the meter, and nothing else
+        timeoutMs: ctx.limitMs,
+      });
+    } finally {
+      clearInterval(watcher);
+    }
     const wallMs = this.now() - started;
     const out = ctx.paths.out;
     const exitText = readOr(path.join(out, 'exit'), '').trim();
@@ -209,11 +232,11 @@ export class OpenCodeAgent {
     const refusal = ctx.meter.refusal();
     const finished = exitText === '0' && events.errors === 0;
     let exit;
-    if (r.timedOut) exit = 'timeout';
-    else if (finished) exit = 'done';
+    if (finished) exit = 'done';
     else if (refusal) exit = refusal === 'cap' ? 'stopped_by_cap' : 'budget_hit';
+    else if (r.timedOut) exit = 'timeout';
     else exit = 'failed';
-    return { exit, wallMs, sessionId: events.sessionId, selfReported: events.selfReported, exportKept: exportText !== '', processExit: exitText === '' ? null : Number(exitText) };
+    return { exit, wallMs, sessionId: events.sessionId, selfReported: events.selfReported, retries: events.retries, backgroundWaits: events.backgroundWaits, exportKept: exportText !== '', processExit: exitText === '' ? null : Number(exitText) };
   }
 
   async collect(ctx) {

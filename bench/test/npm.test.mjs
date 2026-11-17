@@ -26,7 +26,8 @@ test('the shipped pins are well formed and name the verified coder and OpenCode'
   validatePins(PINS);
   assert.match(coderRef(PINS), /^ghcr\.io\/vymalo\/another-adam-rs\/coder:sha-[0-9a-f]{7}@sha256:[0-9a-f]{64}$/);
   assert.equal(PINS.coder.revision.slice(0, 7), PINS.coder.tag.slice(4), 'the tag is sha-<first 7 of the revision>');
-  assert.match(PINS.opencode.version, /^1\.19\.\d+$/);
+  assert.match(PINS.opencode.version, /^2\.\d+\.\d+$/);
+  assert.equal(PINS.opencode.package, '@opencode/cli-linux-x64');
   assert.match(PINS.opencode.integrity, /^sha512-[A-Za-z0-9+/]{86}==$/);
 });
 
@@ -36,13 +37,17 @@ test('validatePins refuses a pin that is loose', () => {
   bad((p) => { p.coder.tag = 'latest'; return p; });
   bad((p) => { p.coder.revision = 'abc'; return p; });
   bad((p) => { p.opencode.integrity = 'sha1-AAAA'; return p; });
-  bad((p) => { p.opencode.version = '^1.19.0'; return p; });
+  bad((p) => { p.opencode.version = '^2.3.0'; return p; });
+  bad((p) => { p.opencode.version = '1.19.5'; return p; });
   bad((p) => { p.opencode.package = '../x'; return p; });
+  bad((p) => { p.opencode.package = 'opencode-linux-x64'; return p; });
 });
 
 test('the tarball URL is on the npm registry and names the pinned package and version', () => {
-  assert.equal(tarballUrl('opencode-linux-x64', '1.19.5'), 'https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x64-1.19.5.tgz');
+  assert.equal(tarballUrl('example-platform', '1.2.3'), 'https://registry.npmjs.org/example-platform/-/example-platform-1.2.3.tgz');
+  assert.equal(tarballUrl('@opencode/cli-linux-x64', '2.3.0'), 'https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.3.0.tgz');
   assert.throws(() => tarballUrl('../evil', '1.0.0'), /package/);
+  assert.throws(() => tarballUrl('@a/b/c', '1.0.0'), /package/);
   assert.throws(() => tarballUrl('a', '1.0.0/../../x'), /version/);
 });
 

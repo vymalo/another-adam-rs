@@ -3,7 +3,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { OpenCodeAgent, opencodeConfig, opencodeEnv, opencodeRunScript, parseEvents, MODEL } from '../lib/agents/opencode.mjs';
+import { OpenCodeAgent, opencodeConfig, opencodeEnv, opencodeExportScript, opencodeRunScript, parseEvents, MODEL } from '../lib/agents/opencode.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
 import { IntegrityError, sri } from '../lib/npm.mjs';
 import { PINS } from '../lib/pins.mjs';
@@ -19,7 +19,7 @@ const URL = 'http://meter:8090/r/RUNTOKEN0123456789abcdef/v1';
 
 test('the permission denies the web and anything outside the work tree, and allows the rest', () => {
   const c = opencodeConfig({ baseUrl: URL, contextWindow: 131072 });
-  assert.deepEqual(c.permission, { '*': 'allow', webfetch: 'deny', websearch: 'deny', external_directory: 'deny' });
+  assert.deepEqual(c.permission, { '*': 'allow', webfetch: 'deny', websearch: 'deny', external_directory: 'deny', question: 'deny' });
   assert.equal(c.permission.webfetch, 'deny');
   assert.equal(c.permission.websearch, 'deny');
   assert.equal(c.permission.external_directory, 'deny');
@@ -58,11 +58,12 @@ test('the environment turns off the model list fetch and the updater and carries
 
 // ---- the command ----
 
-const paths = { bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: '/work/workspaces/oc-r1/slot', run: 'r1-a1' };
+const paths = { bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: '/work/workspaces/oc-r1-a1/slot', run: 'r1-a1' };
 
 test('the command: json events, the fixed model, auto-approve, the run as title, the directory, the statement on stdin', () => {
   const script = opencodeRunScript(paths);
-  assert.match(script, /\/opt\/bench\/opencode run --format json --model bench\/bench-model --auto --title 'r1-a1' --dir \/work\/workspaces\/oc-r1\/slot < \/bench\/in\/instruction\.md > \/bench\/out\/events\.jsonl 2> \/bench\/out\/stderr\.txt/);
+  assert.match(script, /cd \/work\/workspaces\/oc-r1-a1\/slot \|\| exit 98\n\/opt\/bench\/opencode run --standalone --format json --model bench\/bench-model --auto --title 'r1-a1' < \/bench\/in\/instruction\.md > \/bench\/out\/events\.jsonl 2> \/bench\/out\/stderr\.txt/);
+  assert.doesNotMatch(script, /--dir/);
   assert.match(script, /echo \$\? > \/bench\/out\/exit/);
   assert.doesNotMatch(script, /--variant|--session|--continue/);
 });
@@ -108,13 +109,13 @@ function setup(t, { runResult = { exitCode: 0 }, exitFile = '0\n', binary = {} }
   const containers = new FakeContainers({
     onRun: (spec) => {
       const out = spec.mounts?.find((m) => m.target === '/bench/out')?.source;
-      if (/ run --format json/.test(spec.script)) {
+      if (/ run --standalone --format json/.test(spec.script)) {
         fs.writeFileSync(path.join(out, 'events.jsonl'), jsonl(EVENTS));
         fs.writeFileSync(path.join(out, 'stderr.txt'), `warn ${URL}\n`);
         fs.writeFileSync(path.join(out, 'exit'), exitFile);
         return runResult;
       }
-      if (/ export /.test(spec.script)) fs.writeFileSync(path.join(out, 'export.json'), JSON.stringify({ info: { id: 'ses_abc123XYZ', url: URL }, messages: [] }));
+      if (/ session export /.test(spec.script)) fs.writeFileSync(path.join(out, 'export.json'), JSON.stringify({ info: { id: 'ses_abc123XYZ', url: URL }, messages: [] }));
       return { exitCode: 0 };
     },
   });
@@ -156,12 +157,12 @@ function setup(t, { runResult = { exitCode: 0 }, exitFile = '0\n', binary = {} }
 test('prepare: the verified binary, the statement and a clone of the base in a directory of the volume', async (t) => {
   const { agent, ctx, containers, stackCalls } = setup(t);
   await agent.prepare(ctx);
-  assert.deepEqual(stackCalls[0], ['workspaceDir', 2, '/work/workspaces/oc-r1', false]);
+  assert.deepEqual(stackCalls.slice(0, 2), [['workspaceDir', 2, '/work/workspaces/oc-r1-a1', true], ['workspaceDir', 2, '/work/workspaces/oc-r1-a1', false]]);
   assert.equal(fs.readFileSync(path.join(ctx.paths.in, 'instruction.md'), 'utf8'), 'Make the thing work.\n', 'the statement, byte for byte');
   const clone = containers.runs[0];
   assert.equal(clone.network, 'none');
-  assert.match(clone.script, /git clone -q --no-hardlinks \/base\/base\.git \/work\/workspaces\/oc-r1\/demo-1-aaaaaa/);
-  assert.deepEqual(clone.mounts.map((m) => [m.source, m.target, Boolean(m.readOnly)]).sort(), [['/base', '/base', true], ['/work/workspaces/oc-r1', '/work/workspaces/oc-r1', false]].sort());
+  assert.match(clone.script, /git clone -q --no-hardlinks \/base\/base\.git \/work\/workspaces\/oc-r1-a1\/demo-1-aaaaaa/);
+  assert.deepEqual(clone.mounts.map((m) => [m.source, m.target, Boolean(m.readOnly)]).sort(), [['/base', '/base', true], ['/work/workspaces/oc-r1-a1', '/work/workspaces/oc-r1-a1', false]].sort());
 });
 
 test('prepare: a binary that does not match its pinned integrity stops the run before any container starts', async (t) => {
@@ -184,11 +185,11 @@ test('run: the container of the task image, the binary read-only, the statement 
   const { agent, ctx, containers, runDir } = setup(t);
   await agent.prepare(ctx);
   const result = await agent.run(ctx);
-  const spec = containers.runs.find((s) => / run --format json/.test(s.script));
+  const spec = containers.runs.find((s) => / run --standalone --format json/.test(s.script));
   assert.equal(spec.image, ctx.task.image.ref);
   assert.equal(spec.network, 'default', 'the Podman service\'s own network: the meter and nothing else');
   assert.equal(spec.timeoutMs, 50 * 60 * 1000);
-  assert.equal(spec.workdir, '/work/workspaces/oc-r1/demo-1-aaaaaa');
+  assert.equal(spec.workdir, '/work/workspaces/oc-r1-a1/demo-1-aaaaaa');
   const mounts = Object.fromEntries(spec.mounts.map((m) => [m.target, m]));
   assert.equal(mounts['/opt/bench/opencode'].readOnly, true);
   assert.equal(mounts['/bench/in'].readOnly, true);
@@ -198,8 +199,8 @@ test('run: the container of the task image, the binary read-only, the statement 
   assert.equal(result.sessionId, 'ses_abc123XYZ');
   assert.deepEqual(result.selfReported, { input: 150, output: 20, cached: 47, calls: 2 });
   assert.ok(result.wallMs > 0);
-  const exp = containers.runs.find((s) => / export /.test(s.script));
-  assert.match(exp.script, /export 'ses_abc123XYZ'/);
+  const exp = containers.runs.find((s) => / session export /.test(s.script));
+  assert.match(exp.script, /session export --standalone 'ses_abc123XYZ'/);
   assert.equal(exp.network, 'none');
   assert.ok(fs.existsSync(path.join(runDir, 'opencode', 'export.json')), 'the export is kept as JSON');
   assert.equal(JSON.parse(fs.readFileSync(path.join(runDir, 'opencode', 'export.json'), 'utf8')).info.id, 'ses_abc123XYZ');
@@ -236,7 +237,7 @@ test('run: a container that did not start is an infrastructure error, not a fail
   await agent.prepare(ctx);
   fs.rmSync(path.join(ctx.paths.out, 'exit'), { force: true });
   const real = ctx.containers.onRun;
-  ctx.containers.onRun = (spec, i) => (/ run --format json/.test(spec.script) ? { exitCode: 125, stderr: 'Error: image not known\n' } : real(spec, i));
+  ctx.containers.onRun = (spec, i) => (/ run --standalone --format json/.test(spec.script) ? { exitCode: 125, stderr: 'Error: image not known\n' } : real(spec, i));
   await assert.rejects(agent.run(ctx), /did not start \(exit 125\)/);
 });
 
@@ -244,7 +245,7 @@ test('cleanup removes the directory the run made on the volume, and its own scra
   const { agent, ctx, stackCalls } = setup(t);
   await agent.prepare(ctx);
   await agent.cleanup(ctx);
-  assert.deepEqual(stackCalls.at(-1), ['workspaceDir', 2, '/work/workspaces/oc-r1', true]);
+  assert.deepEqual(stackCalls.at(-1), ['workspaceDir', 2, '/work/workspaces/oc-r1-a1', true]);
   assert.equal(fs.existsSync(ctx.paths.in), false);
 });
 
@@ -282,5 +283,35 @@ test('the real OpenCode, with the command and configuration this driver builds, 
   assert.ok(model.requests.every((r) => r.body.tools.some((x) => x.function.name === 'write')));
   const user = model.requests[0].body.messages.find((m) => m.role === 'user').content;
   assert.equal(user, 'Write hello.txt containing hello. [mock:hello]\n', 'the statement reaches the model unchanged');
-  git(dir, 'status', '--porcelain');
+  void git;
+  const exported = await new Promise((resolve) => execFile('sh', ['-c', opencodeExportScript({ bin: BIN, out, sessionId: events.sessionId })], { env, encoding: 'utf8', timeout: 60_000 }, (err) => resolve(err ? 1 : 0)));
+  assert.equal(exported, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(out, 'export.json'), 'utf8')).info.id, events.sessionId, 'the session is exported by a second process');
+});
+
+test('run: a refusal of the meter while OpenCode retries ends the container early, and the run is budget_hit, not a timeout', async (t) => {
+  const { agent, ctx, containers } = setup(t, { runResult: { exitCode: 137, timedOut: true }, exitFile: '' });
+  agent.pollMs = 5;
+  let release;
+  const held = new Promise((r) => (release = r));
+  const real = containers.onRun;
+  containers.onRun = async (spec, i) => {
+    if (/ run --standalone --format json/.test(spec.script)) {
+      await held; // OpenCode retrying a refused call: it does not end by itself
+      return { exitCode: 137, timedOut: true };
+    }
+    return real(spec, i);
+  };
+  await agent.prepare(ctx);
+  ctx.meter.refusal = () => 'budget';
+  const done = agent.run(ctx);
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(containers.stopped, ['adam-bench-oc-r1-a1'], 'stopped once, by name');
+  release();
+  assert.equal((await done).exit, 'budget_hit');
+});
+
+test('the events count retries and the waits for background jobs that OpenCode V2 reports', () => {
+  const r = parseEvents(`${JSON.stringify({ type: 'retry', sessionID: 'ses_abc123' })}\n${JSON.stringify({ type: 'background_wait', sessionID: 'ses_abc123' })}\n`);
+  assert.deepEqual([r.retries, r.backgroundWaits], [1, 1]);
 });

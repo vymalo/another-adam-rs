@@ -3,7 +3,7 @@
 //   run(spec)            -> { exitCode, stdout, stderr, timedOut }
 //   pull(ref)            -> void
 //   digestOf(ref)        -> 'sha256:...' (the registry digest of a pulled image)
-//   build(context, tag, dockerfile) -> void
+//   build(context, tag, dockerfile, buildArgs?) -> void   (buildArgs: { NAME: value }, plain)
 //   imageId(tag)         -> 'sha256:...' (the id of a built local image)
 //
 // RunSpec: { image, script, workdir?, env?, mounts?: [{source, target, readOnly?}], network: 'none' | 'default' | <name>,
@@ -61,6 +61,16 @@ export function buildRunArgs(spec, { connection, url, name = spec.name } = {}) {
   return args;
 }
 
+/** `--build-arg NAME=value` for each argument; a name or a value that is not plain is refused. Pure. */
+export function buildArgsFlags(buildArgs) {
+  const out = [];
+  for (const [k, v] of Object.entries(buildArgs ?? {})) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || typeof v !== 'string' || /[\s\0$"'\\]/.test(v)) throw new ContainerError('a build argument is not plain');
+    out.push('--build-arg', `${k}=${v}`);
+  }
+  return out;
+}
+
 export class PodmanRemote {
   constructor({ bin = 'podman', connection, url, exec = execFile } = {}) {
     this.bin = bin;
@@ -102,14 +112,20 @@ export class PodmanRemote {
     await this.#must(['pull', '-q', ref], `pulling ${ref}`);
   }
 
+  /** Remove a running container by name (a run the harness ends early). */
+  async stop(name) {
+    if (!SAFE_NAME.test(name)) throw new ContainerError('the container name is not safe');
+    await this.#call([...this.#base(), 'rm', '-f', name]);
+  }
+
   async digestOf(ref) {
     const out = await this.#must(['image', 'inspect', '--format', '{{.Digest}}', ref], `reading the digest of ${ref}`);
     if (!/^sha256:[0-9a-f]{64}$/.test(out)) throw new ContainerError(`the digest of ${ref} is not readable`);
     return out;
   }
 
-  async build(context, tag, dockerfile) {
-    await this.#must(['build', '-t', tag, '-f', dockerfile, context], `building ${tag}`);
+  async build(context, tag, dockerfile, buildArgs = {}) {
+    await this.#must(['build', '-t', tag, '-f', dockerfile, ...buildArgsFlags(buildArgs), context], `building ${tag}`);
   }
 
   async imageId(tag) {
@@ -128,6 +144,7 @@ export class FakeContainers {
     this.runs = [];
     this.pulled = [];
     this.built = [];
+    this.stopped = [];
   }
   async run(spec) {
     buildRunArgs(spec); // the same refusals as the real thing
@@ -139,11 +156,15 @@ export class FakeContainers {
   async pull(ref) {
     this.pulled.push(ref);
   }
+  async stop(name) {
+    this.stopped.push(name);
+  }
   async digestOf(ref) {
     return this.digests[ref] ?? `sha256:${'a'.repeat(64)}`;
   }
-  async build(context, tag, dockerfile) {
-    this.built.push({ context, tag, dockerfile });
+  async build(context, tag, dockerfile, buildArgs = {}) {
+    buildArgsFlags(buildArgs); // the same refusals as the real thing
+    this.built.push({ context, tag, dockerfile, buildArgs });
   }
   async imageId(tag) {
     return this.digests[tag] ?? `sha256:${'b'.repeat(64)}`;

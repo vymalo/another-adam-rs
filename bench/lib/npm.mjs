@@ -33,9 +33,10 @@ export function checkIntegrity(bytes, integrity) {
 }
 
 export function tarballUrl(pkg, version, registry = REGISTRY) {
-  if (!/^[a-z0-9][a-z0-9._-]*$/.test(pkg ?? '')) throw new Error('the package name is not plain');
+  const m = /^(?:(@[a-z0-9][a-z0-9._-]*)\/)?([a-z0-9][a-z0-9._-]*)$/.exec(pkg ?? '');
+  if (!m) throw new Error('the package name is not plain');
   if (!/^\d+\.\d+\.\d+$/.test(version ?? '')) throw new Error('the version is not one exact version');
-  return `${registry}/${pkg}/-/${pkg}-${version}.tgz`;
+  return `${registry}/${m[1] ? `${m[1]}/` : ''}${m[2]}/-/${m[2]}-${version}.tgz`;
 }
 
 const fileSha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');

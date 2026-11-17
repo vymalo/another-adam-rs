@@ -7,10 +7,12 @@
     "verified": "2026-11-17"
   },
   "opencode": {
-    "version": "1.19.5",
-    "package": "opencode-linux-x64",
-    "integrity": "sha512-i1qh7VooLGML9xX6ud93y0JA8j/1aPeDYRKjsmYXrJX1TjIWHgBBMkEbEJPZthpWbsJg//XfBgR6Kb7+NPaJiQ==",
-    "published": "2026-10-28",
+    "version": "2.3.0",
+    "package": "@opencode/cli-linux-x64",
+    "integrity": "sha512-8T3K8L6Nd4fSG5BSgofqhmIDQ1ZvzDZZ2J7bFVB9RK1d5Hjqh24IcxgbcwpgGKkdvItrayi4Rl+wrSmhl17FFg==",
+    "published": "2026-11-13",
+    "metaPackage": "@opencode/cli",
+    "metaIntegrity": "sha512-Q5RV8jLJ4O8bY2O8X2hkBOkgPf6+nDB9MEkz/Q/Cc4Ojd2SwUFFzEd1LzgNGKiXiS7g/9+/X4eqhrxY60fLMOQ==",
     "verified": "2026-11-17"
   }
 }

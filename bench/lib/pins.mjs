@@ -16,8 +16,8 @@ export function validatePins(pins) {
   if (!/^sha256:[0-9a-f]{64}$/.test(c.digest ?? '')) fail('coder.digest must be sha256:<64 hex digits>');
   if (!/^[0-9a-f]{40}$/.test(c.revision ?? '') || c.revision.slice(0, 7) !== c.tag.slice(4)) fail('coder.revision must be the 40-digit commit the tag names');
   const o = pins?.opencode;
-  if (!o || !/^\d+\.\d+\.\d+$/.test(o.version ?? '')) fail('opencode.version must be one exact version');
-  if (!/^opencode-[a-z0-9-]+$/.test(o.package ?? '')) fail('opencode.package must be a platform package of OpenCode');
+  if (!o || !/^2\.\d+\.\d+$/.test(o.version ?? '')) fail('opencode.version must be one exact 2.x version');
+  if (!/^@opencode\/cli-[a-z0-9-]+$/.test(o.package ?? '')) fail('opencode.package must be a platform package of @opencode/cli');
   if (!/^sha512-[A-Za-z0-9+/]{86}==$/.test(o.integrity ?? '')) fail('opencode.integrity must be a sha512 integrity');
 }
 

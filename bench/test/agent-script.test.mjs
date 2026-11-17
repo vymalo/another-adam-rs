@@ -5,7 +5,7 @@ import { createScriptedModel } from '../lib/scripted-model.mjs';
 
 const tool = (name) => ({ type: 'function', function: { name, parameters: {} } });
 const ADAM = ['prepare_workspace', 'write_file', 'run_checks', 'commit_and_push', 'open_pull_request', 'read_file'].map(tool);
-const OPENCODE = ['bash', 'edit', 'glob', 'grep', 'read', 'task', 'write'].map(tool);
+const OPENCODE = ['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'write', 'execute'].map(tool);
 
 /** Play a whole run: ask for each turn, answer each tool call, until the model answers in words. */
 function play(agentTools, first, { dir = '/work/w/slot' } = {}) {
@@ -25,7 +25,7 @@ function play(agentTools, first, { dir = '/work/w/slot' } = {}) {
 test('the callers are told apart by the tools they are offered', () => {
   assert.equal(identifyAgent(ADAM), 'adam');
   assert.equal(identifyAgent(OPENCODE), 'opencode');
-  assert.equal(identifyAgent([tool('bash')]), null);
+  assert.equal(identifyAgent([tool('shell')]), null);
   assert.equal(identifyAgent(undefined), null);
 });
 
@@ -49,8 +49,8 @@ test('adam is driven through the workspace, the file, the checks, the commit and
 
 test('OpenCode is driven through one write in its working directory and one command, in three calls', () => {
   const { calls, text } = play(OPENCODE, 'Fix add. [mock:fix-add]', { dir: '/work/workspaces/oc-r1/slot' });
-  assert.deepEqual(calls.map((c) => c.name), ['write', 'bash']);
-  assert.deepEqual(calls[0].args, { filePath: '/work/workspaces/oc-r1/slot/add.mjs', content: 'export const add = (a, b) => a + b;\n' });
+  assert.deepEqual(calls.map((c) => c.name), ['write', 'shell']);
+  assert.deepEqual(calls[0].args, { path: '/work/workspaces/oc-r1/slot/add.mjs', content: 'export const add = (a, b) => a + b;\n' });
   assert.ok(text);
   assert.equal(calls.length + 1, CALLS_PER_RUN.opencode);
 });
@@ -58,7 +58,7 @@ test('OpenCode is driven through one write in its working directory and one comm
 test('the wrong task writes the wrong answer, to the same file as hello', () => {
   const hello = play(OPENCODE, '[mock:hello]').calls[0].args;
   const wrong = play(OPENCODE, '[mock:wrong]').calls[0].args;
-  assert.equal(hello.filePath, wrong.filePath);
+  assert.equal(hello.path, wrong.path);
   assert.equal(hello.content, 'hello\n');
   assert.equal(wrong.content, 'goodbye\n');
 });

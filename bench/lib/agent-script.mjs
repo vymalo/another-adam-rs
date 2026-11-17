@@ -3,7 +3,7 @@
 // `[mock:<name>]` marker in the statement, and the step by the tool-call ids already in the history.
 //
 //   adam      prepare_workspace, write_file, run_checks, commit_and_push, open_pull_request, then an answer
-//   OpenCode  write, bash, then an answer
+//   OpenCode (2.x)  write, shell, then an answer
 //
 // The ids are `bench-call-<n>`: the next step is the highest n in the history, plus one.
 
@@ -18,11 +18,11 @@ export const CALLS_PER_RUN = Object.freeze({ adam: 6, opencode: 3 });
 
 const names = (tools) => new Set((tools ?? []).map((t) => t?.function?.name).filter(Boolean));
 
-/** 'adam' when it is offered `prepare_workspace`, 'opencode' when it is offered `bash` and `write`, else null. */
+/** 'adam' when it is offered `prepare_workspace`, 'opencode' (V2) when it is offered `shell` and `write`, else null. */
 export function identifyAgent(tools) {
   const n = names(tools);
   if (n.has('prepare_workspace')) return 'adam';
-  if (n.has('bash') && n.has('write')) return 'opencode';
+  if (n.has('shell') && n.has('write')) return 'opencode';
   return null;
 }
 
@@ -81,8 +81,8 @@ export function nextTurn(body) {
   const call = (name, args) => ({ tool: { id: `bench-call-${n}`, name, args } });
   if (agent === 'opencode') {
     const dir = workingDirectory(body.messages);
-    if (n === 1) return call('write', { filePath: `${dir ?? '.'}/${spec.file}`, content: spec.content });
-    if (n === 2) return call('bash', { command: 'true', description: 'a smoke command' });
+    if (n === 1) return call('write', { path: `${dir ?? '.'}/${spec.file}`, content: spec.content });
+    if (n === 2) return call('shell', { command: 'true' });
     return { text: 'Done: the file is written.' };
   }
   if (n === 1) return call('prepare_workspace', { repo_url: repoUrl(body.messages), base_branch: 'main' });
