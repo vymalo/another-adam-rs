@@ -131,3 +131,40 @@ therefore makes tampering hard and visible, and says so in the report:
 
 *Unverified* (added): that the stripping list covers the test machinery of every language in the task set, and everything
 the container service must still prove (see above).
+
+## Amended 2026-11-17: the owner chose OpenCode V2 (`@opencode/cli`) for the benchmark
+
+Amended 2026-11-17: the owner chose OpenCode V2 (`@opencode/cli`) for the benchmark.
+
+The benchmark compares adam-coder with OpenCode V2 (`@opencode/cli`, 2.x), not the 1.19.x line above. The pin is the
+platform package `@opencode/cli-linux-x64` 2.3.0 (published 2026-11-13), checked against its npm integrity before it is
+mounted read-only. Every fact about OpenCode in "Verified and unverified" above was about 1.19.x and is superseded by the
+table "OpenCode V2" in `bench/README.md`, which was checked against the 2.3.0 binary and source on 2026-11-17. Where 2.x
+differs the harness follows 2.x: `run` has no `--dir` and takes `--standalone`, the export is `opencode session export`,
+the tools are `shell`, `subagent` and `path`-taking `write`, and `question` is denied. V2 runs subagents in the background
+and `run` waits for them; the harness leaves them on and bounds the run by its time limit.
+
+## Amended 2026-11-17: slice 3 is built
+
+The stack, the two agent drivers, the runner, `bench doctor` and the dry run are in `bench/` (`bench/README.md`: "The
+stack", "The agents", "The runner", "`bench doctor`", "The dry run"). Decisions the slice took, none changing the above:
+
+* **One pin file.** `bench/pins.json` holds the coder image (tag, digest, revision) and OpenCode (package, version,
+  integrity); `bench/compose.yaml` names the same coder image and a test holds them equal.
+* **adam runs on settings that exist** (`ALLOW_LOCAL_REPOS`, the devcontainer settings, a WireMock mock of GitHub) and on
+  the agent folder of the image's revision **without `mcp.json`**. Polling `GetTask` decides; a first `input-required` gets one
+  fixed reply; the second, the time limit and a meter refusal cancel the task.
+* **Two internal networks, one relay.** The Podman services are on a network whose only other member is a TCP relay to the
+  harness's meter, so a task's commands reach the meter and nothing else. The harness reaches each Podman client through
+  `docker compose exec`: no socket is published.
+* **The base of a task** is its repository plus one commit that links the ignored top-level entries to the image's;
+  both agents clone it, and the links are left out of the patch.
+* **Refusals end a run.** A call the meter refuses ends the run `budget_hit` (or `stopped_by_cap`); for OpenCode, which
+  retries a refused call, the harness stops the container.
+* **The runner is sequential with one slot.** Blocks, slots at once and the pilot are the next pull request's.
+* **The dry run** drives both agents through three self-test tasks on a scripted model and asserts, from the ledger, the
+  grades 1, 1, 0, the cost, a run over budget and a kill with a resume. It is started by hand (`workflow_dispatch`).
+
+*Unverified*: everything that needs a container service, and none was available where the slice was written (the compose
+stack, nested Podman under rootless Docker, `docker compose exec` as the Podman client, the relay through the host gateway,
+the coder with no `mcp.json`, OpenCode V2 in a task image, the dry run itself). The list is in `bench/README.md`, "Unverified".

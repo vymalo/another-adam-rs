@@ -9,7 +9,7 @@ const BENCH = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin
 const run = (args, env = {}) => spawnSync(process.execPath, [BENCH, ...args], { env: { ...process.env, ...env }, encoding: 'utf8' });
 
 test('the commands of later pull requests exit 2 and say which pull request builds them', () => {
-  for (const [cmd, pr] of [['doctor', 3], ['pilot', 4], ['run', 4], ['regrade', 4]]) {
+  for (const [cmd, pr] of [['pilot', 4], ['run', 4], ['regrade', 4]]) {
     const r = run([cmd, 'anything']);
     assert.equal(r.status, 2, cmd);
     assert.match(r.stderr, new RegExp(`${cmd} is not built yet \\(pull request ${pr}\\)`));

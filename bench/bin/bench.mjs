@@ -4,19 +4,25 @@
 //   bench config            check the configuration and print what may be shown of it
 //   bench report            build report.md from the ledger
 //   bench tasks <fetch|mine|lint|build|check|select>   task sources and the environment check
-//   bench doctor | pilot | run | regrade   not built yet (stubs, exit 2)
+//   bench doctor [--start]  what the machine must have; which fallback to use when nested Podman does not work
+//   bench dry-run [--phase P] [--down]   the whole path on a scripted model, no money (needs a container service)
+//   bench pilot | run | regrade   not built yet (stubs, exit 2)
 //
-// Exit codes: 0 done, 2 not built yet, 64 usage, 78 bad configuration.
+// Exit codes: 0 done, 1 a check failed, 2 not built yet, 64 usage, 78 bad configuration.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ConfigError, EXIT_CONFIG, assertOutsideRepo, benchHome, configPath, describeConfig, loadConfig } from '../lib/config.mjs';
+import { doctor, renderDoctor } from '../lib/doctor.mjs';
+import { BENCH_DIR, REPO_DIR, runDryRun } from '../lib/dryrun.mjs';
 import { LedgerError, readLedger } from '../lib/ledger.mjs';
+import { PINS } from '../lib/pins.mjs';
 import { ReportError, buildReport } from '../lib/report.mjs';
+import { Stack } from '../lib/stack.mjs';
 import { runTasks } from '../lib/tasks-cli.mjs';
 
-const STUBS = { doctor: 3, pilot: 4, run: 4, regrade: 4 };
+const STUBS = { pilot: 4, run: 4, regrade: 4 };
 const USAGE = `usage: bench <command>
 
   config                          check the configuration; print what may be shown of it
@@ -24,8 +30,11 @@ const USAGE = `usage: bench <command>
                                   build the report from the ledger (default $BENCH_HOME/report.md)
   tasks fetch|mine|lint|build|check|select
                                   task sources, the environment check and selection (bench tasks --help)
-  doctor | pilot | run | regrade
-                                  not built yet
+  doctor [--start]                what the machine must have (Docker, user namespaces, disk, the coder image); --start
+                                  brings the stack up and runs a container in each Podman service; says which fallback to use
+  dry-run [--phase all|grades|budget|resume] [--down]
+                                  both agents on three self-test tasks and a scripted model: grades, cost, budget, kill and resume
+  pilot | run | regrade           not built yet
 
 environment: BENCH_CONFIG (default ~/.config/adam-bench/config.json), BENCH_HOME (default ~/.local/share/adam-bench)
 `;
@@ -60,6 +69,31 @@ function report(argv, env) {
   return 0;
 }
 
+async function doctorCommand(argv, env) {
+  const { values } = parseArgs({ args: argv, options: { start: { type: 'boolean' } }, allowPositionals: false });
+  const home = benchHome(env);
+  assertOutsideRepo(home, 'BENCH_HOME');
+  fs.mkdirSync(home, { recursive: true });
+  const stack = new Stack({
+    composeFile: path.join(BENCH_DIR, 'compose.yaml'),
+    home,
+    tasksDir: path.join(BENCH_DIR, 'tasks'),
+    seccomp: path.join(REPO_DIR, 'dev', 'podman', 'seccomp.json'),
+    meterPort: Number(env.BENCH_METER_PORT ?? 18090),
+    baseEnv: env,
+  });
+  const result = await doctor({ home, pins: PINS, stack, start: values.start === true });
+  process.stdout.write(`${renderDoctor(result)}\n`);
+  return result.exitCode;
+}
+
+async function dryRunCommand(argv, env) {
+  const { values } = parseArgs({ args: argv, options: { phase: { type: 'string' }, down: { type: 'boolean' } }, allowPositionals: false });
+  const phase = values.phase ?? 'all';
+  if (!['all', 'grades', 'budget', 'resume', 'resume-child'].includes(phase)) throw Object.assign(new Error('--phase is all, grades, budget or resume'), { code: 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE' });
+  return runDryRun({ phase, down: values.down === true, env, entry: fileURLToPath(import.meta.url) });
+}
+
 export async function main(argv, env = process.env) {
   const [command, ...rest] = argv;
   try {
@@ -76,6 +110,8 @@ export async function main(argv, env = process.env) {
       return 0;
     }
     if (command === 'report') return report(rest, env);
+    if (command === 'doctor') return await doctorCommand(rest, env);
+    if (command === 'dry-run') return await dryRunCommand(rest, env);
     if (command === 'tasks') return await runTasks(rest, { env });
     process.stderr.write(`bench: unknown command ${JSON.stringify(command)}\n\n${USAGE}`);
     return 64;
