@@ -1595,3 +1595,36 @@ async fn an_image_block_reaches_a_seeing_model_only_from_an_allowed_source() {
     shared.shutdown().await;
     servers.shutdown().await;
 }
+
+/// An image block over what one image may be is a line, and is not decoded: with the limit of the
+/// model far above it the line is still the cap's, and nothing is kept.
+#[tokio::test]
+async fn an_image_block_over_the_cap_is_a_line_and_is_never_decoded() {
+    use adam_model::{ImageLimits, ImageOrigin};
+
+    let server = TestHttpServer::start(None).await;
+    let servers = connect(&http_config("paint", &server.url(), "")).await;
+    let tools = servers.tools();
+    let tool = tools.get("paint__png").unwrap();
+    // Every limit of the model is above 5 MiB: only the cap of what one image may be says no.
+    let limits = ImageLimits {
+        max_bytes: 64 * 1024 * 1024,
+        max_count: 8,
+        max_side: 16_384,
+        sources: [ImageOrigin::Mcp].into(),
+    };
+    let at = adam_runtime::MAX_ARTIFACT_FILE_BYTES;
+    let ctx = || common::ctx("paint__png").with_image_limits(limits.clone());
+    let over = tool.call(&ctx(), json!({"bytes": at + 1})).await.unwrap();
+    assert!(over.images.is_empty() && over.kept_images.is_empty());
+    assert!(
+        over.content
+            .contains("image/png from `png` is over the 4 MiB one image may be"),
+        "{}",
+        over.content
+    );
+    // At the cap it is an image.
+    let fits = tool.call(&ctx(), json!({"bytes": at})).await.unwrap();
+    assert_eq!(fits.images.len(), 1, "{}", fits.content);
+    servers.shutdown().await;
+}

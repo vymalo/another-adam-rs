@@ -1696,6 +1696,56 @@ mod tests {
         }
     }
 
+    /// The bytes of one image vanish between two turns and come back a turn later: only that part of
+    /// the body changes, from the data URL to the line that says it could not be loaded and back, and
+    /// every other message of the body is the same bytes each time.
+    #[test]
+    fn a_part_flips_where_the_bytes_vanish_and_back_when_they_return() {
+        let mut req = ModelRequest::new("gw-model");
+        req.system = Some("sys".into());
+        req.messages = vec![
+            Message::user_with_images(
+                "look",
+                vec![png_ref("s1", "shot.png", adam_model::ImageOrigin::Person)],
+            ),
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![ToolCall::new("c0", "read_file", json!({}))],
+                reasoning: None,
+            },
+            Message::tool_result_with_images(
+                "c0",
+                "an image",
+                vec![png_ref("t0", "x.png", adam_model::ImageOrigin::Workspace)],
+            ),
+        ];
+        with_data(&mut req, "s1", b"bytes-of-the-first-image");
+        with_data(&mut req, "t0", b"bytes-of-the-tool-image");
+        let whole = messages(&req);
+        // The first image's bytes are gone (the file was changed).
+        let mut gone = req.clone();
+        gone.image_data = adam_model::ImageData::new();
+        with_data(&mut gone, "t0", b"bytes-of-the-tool-image");
+        let lost = messages(&gone);
+        assert_eq!(lost.len(), whole.len());
+        // The system message comes first; the person's message is the one after it.
+        let at = whole.iter().position(|m| m["role"] == "user").unwrap();
+        assert_eq!(whole[at]["content"][1]["type"], "image_url");
+        assert_eq!(lost[at]["content"][1]["type"], "text");
+        let line = lost[at]["content"][1]["text"].as_str().unwrap();
+        assert!(
+            line.contains("could not be loaded; read it again"),
+            "{line}"
+        );
+        assert_eq!(whole[at]["content"][0], lost[at]["content"][0]);
+        assert_eq!(whole[..at], lost[..at]);
+        assert_eq!(whole[at + 1..], lost[at + 1..], "nothing else changes");
+        // Two requests without the bytes say the same thing, and the bytes back are the first body.
+        assert_eq!(messages(&gone), lost);
+        with_data(&mut gone, "s1", b"bytes-of-the-first-image");
+        assert_eq!(messages(&gone), whole);
+    }
+
     #[test]
     fn a_text_only_request_never_sends_an_array() {
         let v = body(&request(), false, MaxTokensField::MaxTokens);

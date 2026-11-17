@@ -26,7 +26,7 @@
 //! | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: with `conversation` each request carries a `prompt_cache_key` that is the same for every request of one conversation (a SHA-256 of its id cut to 32 hex digits), so that a gateway with a prompt cache routes them together; anything else is a startup error ([`ModelConfig::prompt_cache_key`]) | `off` |
 //! | `MODEL_INPUT_MODALITIES` | `text` or `text,image`: what the model `MODEL` names can read. With `image`, an image the person sends or a tool returns reaches the model, within the four limits below; without it a request carries a line of text in the image's place. Never guessed from a model name ([`ModelConfig::images`]) | `text` |
 //! | `MODEL_IMAGE_MAX_BYTES` | the most bytes of one image sent to the model (1 to 4194304); needs `image` in `MODEL_INPUT_MODALITIES` | `1048576` |
-//! | `MODEL_IMAGE_MAX_COUNT` | the most images one run admits (1 to 32); needs `image` | `8` |
+//! | `MODEL_IMAGE_MAX_COUNT` | the most images one run admits (1 to 32); needs `image`. `MODEL_IMAGE_MAX_BYTES` times this may be at most 32 MiB, since a request resends every admitted image; over that is a startup error | `8` |
 //! | `MODEL_IMAGE_MAX_SIDE` | the longest side of an image sent, in pixels (64 to 16384); needs `image` | `4096` |
 //! | `MODEL_IMAGE_SOURCES` | which images may reach the model: a subset of `person`, `workspace`, `mcp` (an MCP server's result can carry expanded credentials, so it is opt-in); needs `image` | `person,workspace` |
 //! | `MODEL_OUTPUT_MODALITIES` | `text`. `image` is refused: a model that makes images inline is not built for any provider yet (an image is made by an MCP server) | `text` |
@@ -567,6 +567,10 @@ pub const IMAGE_MAX_COUNT_LIMIT: usize = 32;
 pub const IMAGE_MAX_SIDE_DEFAULT: u32 = 4096;
 /// The range of `MODEL_IMAGE_MAX_SIDE`.
 pub const IMAGE_MAX_SIDE_RANGE: std::ops::RangeInclusive<u32> = 64..=16_384;
+/// The most bytes of images one request may carry: `MODEL_IMAGE_MAX_BYTES` times
+/// `MODEL_IMAGE_MAX_COUNT` over this is a startup error, because every request resends every image
+/// the history holds.
+pub const IMAGE_REQUEST_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// `MODEL_PROMPT_CACHE_KEY`: whether the requests of a conversation carry a key that routes them to
 /// the same prompt cache. Off by default: a gateway that rejects members it does not know would
@@ -763,6 +767,12 @@ fn parse_images(
         u64::from(*IMAGE_MAX_SIDE_RANGE.start())..=u64::from(*IMAGE_MAX_SIDE_RANGE.end()),
         problems,
     );
+    if max_bytes.saturating_mul(max_count) > IMAGE_REQUEST_MAX_BYTES {
+        problems.push(format!(
+            "MODEL_IMAGE_MAX_BYTES ({max_bytes}) times MODEL_IMAGE_MAX_COUNT ({max_count}) is over {} MiB, the most a request may carry: lower one of them",
+            IMAGE_REQUEST_MAX_BYTES / (1024 * 1024)
+        ));
+    }
     let sources = match get("MODEL_IMAGE_SOURCES") {
         None => BTreeSet::from([ImageOrigin::Person, ImageOrigin::Workspace]),
         Some(raw) => {
@@ -1627,7 +1637,7 @@ mod tests {
         }
         vars.insert("MODEL_INPUT_MODALITIES", "text,image");
         vars.insert("MODEL_IMAGE_MAX_BYTES", "4194304");
-        vars.insert("MODEL_IMAGE_MAX_COUNT", "32");
+        vars.insert("MODEL_IMAGE_MAX_COUNT", "8");
         vars.insert("MODEL_IMAGE_MAX_SIDE", "64");
         vars.insert("MODEL_IMAGE_SOURCES", "mcp, person");
         let (model, problems) = model_problems(&vars);
@@ -1635,7 +1645,7 @@ mod tests {
         let limits = model.images.expect("images");
         assert_eq!(
             (limits.max_bytes, limits.max_count, limits.max_side),
-            (4_194_304, 32, 64)
+            (4_194_304, 8, 64)
         );
         assert!(limits.sources.contains(&ImageOrigin::Mcp));
         assert!(!limits.sources.contains(&ImageOrigin::Workspace));
@@ -1664,6 +1674,33 @@ mod tests {
             } else {
                 assert!(mentions(&problems, name), "{name}={bad:?}: {problems:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_request_may_carry_at_most_32_mib_of_images() {
+        let with = |bytes: &'static str, count: &'static str| {
+            let mut vars = model_vars();
+            vars.insert("MODEL_INPUT_MODALITIES", "text,image");
+            vars.insert("MODEL_IMAGE_MAX_BYTES", bytes);
+            vars.insert("MODEL_IMAGE_MAX_COUNT", count);
+            model_problems(&vars).1
+        };
+        // The defaults and the edge pass; one image more than fits is exit 78 naming both variables.
+        assert!(with("1048576", "8").is_empty());
+        assert!(with("4194304", "8").is_empty());
+        assert!(with("1048576", "32").is_empty());
+        for (bytes, count) in [("4194304", "9"), ("1048577", "32"), ("4194304", "32")] {
+            let problems = with(bytes, count);
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(
+                problems[0].contains("MODEL_IMAGE_MAX_BYTES"),
+                "{problems:?}"
+            );
+            assert!(
+                problems[0].contains("MODEL_IMAGE_MAX_COUNT"),
+                "{problems:?}"
+            );
         }
     }
 
