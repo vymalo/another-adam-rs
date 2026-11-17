@@ -154,9 +154,11 @@ stack", "The agents", "The runner", "`bench doctor`", "The dry run"). Decisions 
 * **adam runs on settings that exist** (`ALLOW_LOCAL_REPOS`, the devcontainer settings, a WireMock mock of GitHub) and on
   the agent folder of the image's revision **without `mcp.json`**. Polling `GetTask` decides; a first `input-required` gets one
   fixed reply; the second, the time limit and a meter refusal cancel the task.
-* **Two internal networks, one relay.** The Podman services are on a network whose only other member is a TCP relay to the
-  harness's meter, so a task's commands reach the meter and nothing else. The harness reaches each Podman client through
-  `docker compose exec`: no socket is published.
+* **Two internal networks for each slot, relays on the only network with the internet.** A Podman service is on a network whose
+  only other member is its slot's meter relay, so a task's commands reach the meter and nothing else; a coder is on its slot's
+  network and reaches neither a Podman service nor the other slot; only five relays, each forwarding to one fixed address, are on
+  `egress`. The harness reaches each Podman client through `docker compose exec`: no socket is published. Grading runs on a
+  `grader` service that no agent can reach. A test over the rendered compose file holds every member list.
 * **The base of a task** is its repository plus one commit that links the ignored top-level entries to the image's;
   both agents clone it, and the links are left out of the patch.
 * **Refusals end a run.** A call the meter refuses ends the run `budget_hit` (or `stopped_by_cap`); for OpenCode, which
@@ -168,3 +170,26 @@ stack", "The agents", "The runner", "`bench doctor`", "The dry run"). Decisions 
 *Unverified*: everything that needs a container service, and none was available where the slice was written (the compose
 stack, nested Podman under rootless Docker, `docker compose exec` as the Podman client, the relay through the host gateway,
 the coder with no `mcp.json`, OpenCode V2 in a task image, the dry run itself). The list is in `bench/README.md`, "Unverified".
+
+## Amended 2026-11-17: after a blind review of slice 3
+
+The host trusts no place a container could write. The review found that host git ran in a base repository a container had
+written (a planted `url.insteadOf` and `core.sshCommand` would have run on the host with the model's key in its environment), and
+several places where the harness read or deleted files a container made. The decisions:
+
+* **One principle:** the host never runs git in, reads a file from, or deletes a file in a place a container could write. What a
+  container wrote comes out as a tar stream parsed with limits (regular files and directories, links only in a work tree and never
+  followed, names refused when they leave the target, caps); what a container left is removed by a container and checked.
+  Host git runs in an allow-listed environment (no key) and `ls-remote` runs in an empty directory that is not a repository.
+* **adam's git runs in a git sandbox** (the same coder image), the coders are on no network with internet, and every run has a
+  repository of its own on the git server, so no run sees another's branches. The base is pushed by a one-shot container.
+* **Narrow mounts and a grader.** An agent's service mounts its slot's volume and one read-only directory, never `$BENCH_HOME`;
+  grading and the environment check run on a separate `grader` service.
+* **The run proves it used the task image** (a container of its digest ran, else `Failed_infra`), **the slot is reaped before and
+  after** every run, **the agent is stopped and that is confirmed before its tree is read**, and **the meter's record tells the
+  infrastructure from the agent** (`lib/classify.mjs`).
+* **Fairness:** one step limit, one context window (required) and one cancel grace in the configuration (`limits`); OpenCode's exit
+  is the container runtime's; one nudge ever; every request has a timeout; the meter binds to the loopback by default.
+
+*Unverified*, as before: everything that needs a container service. `bench/README.md`, "Unverified", lists what each fix could not
+prove here.
