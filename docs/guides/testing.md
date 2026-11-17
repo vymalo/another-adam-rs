@@ -54,6 +54,7 @@ They are gated apart, so `ADAM_TEST_REQUIRE_DB=1` does not turn them on.
 | devcontainer | `ADAM_TEST_DEVCONTAINER=1` (`ADAM_TEST_REQUIRE_DEVCONTAINER=1` to fail instead of skip) | a rootless Podman service |
 | Kubernetes run pods (`adam-env-kubernetes`) | `ADAM_TEST_KUBECONFIG` (`ADAM_TEST_REQUIRE_KUBERNETES=1`) | a cluster; CI's `run-pods` job makes a `kind` cluster (the node image `ci.yml` pins, whose network plugin enforces `NetworkPolicy`) and runs `deploy/coder/tests/kind-run-pods.sh`, which you can run with `kind`: the cluster test, then the run pods' network policy and the egress proxy ([ADR 0042](../decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md); it fails where a policy is not enforced unless `ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1`), then the git sandbox ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), open decision 6): a pod made from the chart's own StatefulSet, with canaries for the secrets of the coder container, shows that the sandbox container has no token, Secret or view of the coder's processes, that a commit through its socket works, and that a scratch project whose `.git/config` names a clean filter and an fsmonitor runs them in the sandbox, with a marker that holds no canary, where plain git in the coder container (the control) reads them all; it builds `adam-egress`, `adam-git-sandbox` and `adam-git` with cargo and needs `docker`, `kubectl`, `helm` and `python3` |
 | git under a run pod's mounts (ADR 0041) | `ADAM_TEST_REQUIRE_MOUNTS=1` to fail instead of skip | root, `unshare` and `setpriv`: `sudo sh deploy/coder/tests/git-in-run-pod.sh` builds the pod's view with bind mounts (the read-only `HEAD`, `commondir`, `gitdir` and `logs` of the worktree's directory included: it tries to write, rename over, replace and remove them; and each slot as a mount of its own: it tries to rename, remove and exchange it and expects `EBUSY`) and runs real git in it |
+| the real language servers (ADR 0044 slice 17) | `ADAM_TEST_LANGUAGE_SERVERS=1` (`ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` to fail instead of skip) | `rust-analyzer`, `typescript-language-server`, `pyright-langserver` and `gopls` on `PATH` (each language is skipped without its server): [below](#the-language-server-tools). **No CI job runs it yet** |
 | `#[tool]` compile errors worded by rustc | `ADAM_TRYBUILD=1` | the CI toolchain (the `ui` job); the errors the macro writes itself always run ([`adam` README](../../crates/adam/README.md#tests)) |
 | live model; `adam-acp` against a live OpenCode (the coder no longer uses it) | `ADAM_TEST_OPENAI_*`, `ADAM_TEST_OPENCODE=1` | secrets |
 
@@ -76,6 +77,32 @@ process carrying the run's marker is left). Before the end, the same probe must 
 | Run pod | the last scenario of `adam-env-kubernetes/tests/cluster.rs`, through `adam-kube-exec` | `sh deploy/coder/tests/kind-run-pods.sh` (`ADAM_TEST_STDIO_SILENCE_SECS` to change its 90 s) | `run-pods` job |
 
 A step that fails in the devcontainer or the pod is a finding about that environment, not a flaky test.
+
+## The language server tools
+
+`bin/adam-coder/tests/language_servers.rs` runs the three tools over a **scripted** language server, `adam-lsp-script`
+(`bin/adam-coder/src/bin/adam-lsp-script.rs`): a second binary of the crate that tests start through `CARGO_BIN_EXE_adam-lsp-script`
+and that **no image builds** (`docker/coder/Dockerfile` builds the named binaries only). It speaks the protocol and does what a JSON script
+(`ADAM_LSP_SCRIPT`) says: diagnostics pushed or pulled, an indexing that lasts so long, a `workspace/applyEdit` request, a crash on the
+n-th request with a stderr text, framing that is not framing, a `Content-Length` of 99,999,999, a request it never answers, a file it
+writes into the workspace, 100,000 references, the text it holds for a file (so a `didChange` is provable), a child and a grandchild;
+the table of keys is its module doc. It logs every message it receives, so a test reads what the client sent.
+
+The tests are real processes, and **each stop point is proved by pid** (idle, park, the end of the run, a cancelled run reached by the
+sweep, `rebuild_environment`, the worker's stop, a registry that is dropped, a server that did not answer `initialize`): nothing of the server, its
+child and its grandchild is left. Run them with the whole suite or by name:
+
+```sh
+cargo test --workspace --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp \
+  --exclude adam-store-mongodb -- no_server_on_path a_server_that diagnostics_are the_columns
+```
+
+The real servers are a gated suite (`real_language_servers.rs`, `ADAM_TEST_LANGUAGE_SERVERS=1`): four tiny projects under
+`bin/adam-coder/tests/fixtures/language-servers/` (Rust, TypeScript, Python, Go), each with one deliberate error, driven through the
+tools with the production table: the error is reported at its line, the definition of `add` is found from its call, and its references hold
+the call. A language whose server is not on `PATH` is skipped; `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` makes that a failure. **No CI job
+runs it yet**: the coder image has no language server until its workspace pin is bumped, and the images repository checks its servers
+on its own. Run on 2026-11-17 on a machine with `rust-analyzer` 1.97.0 and `pyright-langserver`, both passed; the other two were not installed.
 
 ## What the store suite covers
 
