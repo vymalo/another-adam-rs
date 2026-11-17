@@ -172,9 +172,10 @@ pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};
 pub use history::{SHORTENING_FLOOR, TRUNCATION_MARKER_PREFIX};
 pub use images::{
     Admission, IMAGES_KEY, ImageGate, ImageKeepError, ImageOutcome, ImageStore, InboundImage,
-    KeptImage, KeptImages, MAX_INBOUND_IMAGE_BYTES, MAX_INBOUND_IMAGES, MAX_SCOPE_IMAGE_BYTES,
-    MemoryImages, StateImage, StateImages, Tamper, image_scope, is_hex, keep_image,
-    kept_images_conformance, sha256_hex, user_message_with_images,
+    KeptImage, KeptImages, MAX_INBOUND_IMAGE_BYTES, MAX_INBOUND_IMAGES,
+    MAX_RUN_JOURNALED_IMAGE_BYTES, MAX_SCOPE_IMAGE_BYTES, MemoryImages, StateImage, StateImages,
+    Tamper, image_scope, is_hex, keep_image, kept_images_conformance, sha256_hex,
+    user_message_with_images,
 };
 pub use kept::{
     KeptError, KeptInfo, KeptMap, KeptOutput, KeptOutputs, KeptStore, LineFolder, MAX_KEPT_BYTES,

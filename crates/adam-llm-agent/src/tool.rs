@@ -732,8 +732,9 @@ pub struct ToolCtx {
     /// What the call reported with [`report_sandbox`](Self::report_sandbox). Shared by the clones of
     /// the context, so a tool may hand one to a task it spawns.
     sandbox: Arc<Mutex<SandboxUsage>>,
-    /// The bytes the run may still keep in its own state ([`kept_left`](Self::kept_left)).
-    kept_left: usize,
+    /// The bytes the run may still keep in its own state ([`kept_left`](Self::kept_left)). Shared by
+    /// the clones of the context and spent by whatever the call keeps there, an image included.
+    kept_left: Arc<std::sync::atomic::AtomicUsize>,
     /// The outputs the run keeps in its own state ([`kept_text`](Self::kept_text)).
     kept: Arc<BTreeMap<String, String>>,
     /// The conversation's plan as the call starts ([`plan`](Self::plan)).
@@ -794,7 +795,7 @@ impl ToolCtx {
             sandbox: Arc::default(),
             plan: None,
             scrub: None,
-            kept_left: 0,
+            kept_left: Arc::default(),
             kept: Arc::default(),
             images: None,
         }
@@ -803,12 +804,13 @@ impl ToolCtx {
     /// Say how the run admits images: the gate for the model, the conversation's scope for the
     /// keeper, and the keeper in the agent's state. The agent loop does it for every call.
     #[must_use]
-    pub(crate) fn with_images(mut self, gate: ImageGate, scope: String) -> Self {
+    pub(crate) fn with_images(mut self, gate: ImageGate, scope: String, root_run: String) -> Self {
         let store = self.state::<ImageStore>().map(|s| (*s).clone());
         self.images = Some(Arc::new(ImagePolicy {
             gate: std::sync::Mutex::new(gate),
             store,
             scope,
+            root_run,
         }));
         self
     }
@@ -819,8 +821,9 @@ impl ToolCtx {
     /// the model's own word and what the history holds.
     #[must_use]
     pub fn with_image_limits(self, limits: adam_model::ImageLimits) -> Self {
-        let scope = crate::images::image_scope(None, &self.root_run.to_string());
-        self.with_images(ImageGate::new(Some(limits), 0, None), scope)
+        let root = self.root_run.to_string();
+        let scope = crate::images::image_scope(None, &root);
+        self.with_images(ImageGate::new(Some(limits), 0, None), scope, root)
     }
 
     /// Whether the model of this run can see images at all: a tool that would read or fetch an
@@ -921,7 +924,7 @@ impl ToolCtx {
     /// every call.
     #[must_use]
     pub fn with_kept(mut self, left: usize, kept: Arc<BTreeMap<String, String>>) -> Self {
-        self.kept_left = left;
+        self.kept_left = Arc::new(std::sync::atomic::AtomicUsize::new(left));
         self.kept = kept;
         self
     }
@@ -929,7 +932,16 @@ impl ToolCtx {
     /// The bytes a tool may still hand back in [`ToolOutput::kept`]: [`MAX_RUN_KEPT_BYTES`](crate::MAX_RUN_KEPT_BYTES)
     /// less what the run keeps already (none for a detached context).
     pub fn kept_left(&self) -> usize {
-        self.kept_left
+        self.kept_left.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `bytes` of the room were used: what a call keeps takes from what it may still keep.
+    pub(crate) fn spend_kept(&self, bytes: usize) {
+        let _ = self.kept_left.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |left| Some(left.saturating_sub(bytes)),
+        );
     }
 
     /// The text the run keeps under the output id `id` in its own state.

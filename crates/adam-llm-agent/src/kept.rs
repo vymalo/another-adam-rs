@@ -685,6 +685,8 @@ pub async fn keep_long_cut(
         scrubbed_for_keeping(text, omitted, |t| ctx.scrub(t), ctx.scrub_margin());
     let (prepared, cut) = prepare(&scrubbed, omitted);
     if prepared.len() <= ctx.kept_left() {
+        // The room is the call's: an image it keeps after this text has less of it.
+        ctx.spend_kept(prepared.len());
         let info = KeptInfo {
             bytes: prepared.len() as u64,
             lines: count_lines(&prepared),

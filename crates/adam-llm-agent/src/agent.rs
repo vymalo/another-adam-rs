@@ -32,8 +32,9 @@ use crate::conversation::{
 };
 use crate::history::record_shortenings;
 use crate::images::{
-    ImageGate, ImageStore, InboundImage, Item, KeptImage, admit_inbound, answer_with, described,
-    image_data, image_scope, parse_inbound_images, parts_of, state_bytes,
+    ImageGate, ImageStore, InboundImage, Item, KeptImage, MAX_RUN_JOURNALED_IMAGE_BYTES,
+    admit_inbound, answer_with, described, for_sending, image_data, image_scope, image_step,
+    parse_inbound_images, parts_of, state_bytes,
 };
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
 use crate::paging::backstop;
@@ -246,6 +247,12 @@ struct ModelFailure {
     /// as `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     context_length: bool,
+    /// The provider refused the request itself, not for its length, nor its credentials, nor a
+    /// limit ([`ErrorClass::Invalid`]): the same request never succeeds. When the request carried
+    /// images no earlier request carried, the run replaces them with lines and asks again. Absent
+    /// from journals written before, which decode as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    refused: bool,
 }
 
 impl ModelFailure {
@@ -257,6 +264,7 @@ impl ModelFailure {
             retry_after_ms: None,
             class: None,
             context_length: false,
+            refused: false,
         }
     }
 }
@@ -280,6 +288,7 @@ impl From<ModelError> for ModelFailure {
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             class: Some(format!("{:?}", e.class())),
             context_length: e.is_context_overflow(),
+            refused: e.class() == adam_error::ErrorClass::Invalid && !e.is_context_overflow(),
         }
     }
 }
@@ -998,12 +1007,11 @@ impl LlmAgent {
     /// holds, so that a call admits the images the run has room for and no more.
     fn image_gate(&self, state: &Conversation) -> ImageGate {
         let limits = self.model.input_modalities(&self.model_alias).images;
-        let room = self
-            .extensions
-            .get::<ImageStore>()
-            .is_none()
-            .then(|| MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()));
-        ImageGate::new(limits, state.image_count(), room)
+        let keeps_in_state = self.extensions.get::<ImageStore>().is_none();
+        let room = keeps_in_state.then(|| MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()));
+        let journal_left = keeps_in_state
+            .then(|| MAX_RUN_JOURNALED_IMAGE_BYTES.saturating_sub(state.journaled_image_bytes));
+        ImageGate::new(limits, state.image_count(), room).with_journal_left(journal_left)
     }
 
     /// Admit and keep the images of the start message (`state.pending_images`) and of each message of
@@ -1025,7 +1033,8 @@ impl LlmAgent {
         if state.pending_images.is_empty() && !waiting {
             return Ok(admitted);
         }
-        let mut gate = self.image_gate(state);
+        // The images of a message are journaled as references: the journal's bound is not theirs.
+        let mut gate = self.image_gate(state).without_journal_bound();
         if !state.pending_images.is_empty() {
             let pending = std::mem::take(&mut state.pending_images);
             let items = self
@@ -1053,7 +1062,7 @@ impl LlmAgent {
             if images.is_empty() {
                 continue;
             }
-            let name = format!("image:{}", inbound.id);
+            let name = image_step(&inbound.id);
             let items = self
                 .admit_step(ctx, state, &name, &images, &mut gate)
                 .await?;
@@ -1074,10 +1083,13 @@ impl LlmAgent {
         gate: &mut ImageGate,
     ) -> Result<Vec<Item>, AgentError> {
         let store = self.extensions.get::<ImageStore>().map(|s| (*s).clone());
-        let scope = image_scope(
-            ctx.conversation_id(),
-            &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
-        );
+        let root = state.root_run.unwrap_or_else(|| ctx.run_id()).to_string();
+        let scope = image_scope(ctx.conversation_id(), &root);
+        if let Some(store) = &store
+            && let Err(error) = store.0.note_run(&scope, &root).await
+        {
+            tracing::warn!(%error, "the run could not be noted for the images it keeps");
+        }
         let (mut inside, offered, keeper, scope_in) =
             (gate.clone(), images.to_vec(), store.clone(), scope);
         let recorded: Result<Vec<Item>, String> = ctx
@@ -1222,7 +1234,10 @@ impl LlmAgent {
         let closing = state.limit.is_some();
         let mut request = ModelRequest::new(self.model_alias.clone());
         request.system = self.instructions.clone();
-        request.messages.clone_from(&state.messages);
+        // What is sent about an image is decided here, from the reference and the deployment's
+        // settings now, and recorded nowhere: the same settings give the same lines every turn.
+        let image_limits = self.model.input_modalities(&self.model_alias).images;
+        request.messages = for_sending(&state.messages, image_limits.as_ref());
         request.tools = self.specs.clone();
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         if closing {
@@ -1253,12 +1268,14 @@ impl LlmAgent {
         // The bytes of the images of the history are read here, inside the step, for this call only:
         // they are never in the journal and never in the history. A model that cannot see is given
         // none, whatever the history holds.
-        let sees = self
-            .model
-            .input_modalities(&self.model_alias)
-            .images
-            .is_some();
-        let named: Vec<adam_model::ImageRef> = state.image_refs().into_iter().cloned().collect();
+        let named: Vec<adam_model::ImageRef> = request
+            .messages
+            .iter()
+            .flat_map(Message::images)
+            .cloned()
+            .collect();
+        let carried: Vec<String> = named.iter().map(|i| i.sha256.clone()).collect();
+        let sent = carried.clone();
         let images_store = self.extensions.get::<ImageStore>().map(|s| (*s).clone());
         let images_scope = image_scope(
             ctx.conversation_id(),
@@ -1270,7 +1287,6 @@ impl LlmAgent {
                 if !named.is_empty() {
                     request.image_data = image_data(
                         named.iter().collect(),
-                        sees,
                         images_store.as_ref(),
                         &images_scope,
                         &images_state,
@@ -1348,6 +1364,8 @@ impl LlmAgent {
                 call: _,
             }) => {
                 seen_at = seen.unwrap_or(state.messages.len());
+                // The provider took every image this request carried.
+                state.note_images_sent(sent);
                 // The calls this turn asks for are the ones its listing described.
                 state.source_notes = notes;
                 // An answer recorded before a message that this transition read did not read it.
@@ -1368,6 +1386,11 @@ impl LlmAgent {
             // The provider rejected the prompt as too long: the history is compacted once, in the
             // next transition, and the turn is tried again.
             Err(f) if f.context_length => return Ok(self.rejected_as_too_long(state, &f.message)),
+            // The provider refused the request itself: if images no earlier request carried are in
+            // it, they may be why.
+            Err(f) if f.refused => {
+                return Ok(Self::refused_with_images(state, &carried, &f.message));
+            }
             Err(f) => return Ok(Flow::Fail(format!("model call failed: {}", f.message))),
         };
 
@@ -1595,6 +1618,21 @@ impl LlmAgent {
         compaction::projected(&state.messages, at, self.fixed_chars())
     }
 
+    /// What a model call that the provider refused for itself does. The images admitted since the last
+    /// call that succeeded are recorded as lines, once, and the turn is tried again; images an earlier
+    /// request carried successfully are never touched. With no such image the refusal is the failure.
+    fn refused_with_images(state: &mut Conversation, carried: &[String], message: &str) -> Flow {
+        if state.replace_unsent_images(carried, &|image: &adam_model::ImageRef| {
+            adam_runtime::SystemLine::NotShown.line(&format!(
+                "{}: the model's service refused the request that carried it",
+                image.label()
+            ))
+        }) {
+            return Flow::Next;
+        }
+        Flow::Fail(format!("model call failed: {message}"))
+    }
+
     /// What a model call whose prompt the provider rejected as too long does: ask for one compaction
     /// and a second try, the first time at this turn, and fail the run the second.
     fn rejected_as_too_long(&self, state: &mut Conversation, message: &str) -> Flow {
@@ -1661,8 +1699,9 @@ impl LlmAgent {
         // The summary request is the request before it and one more message, so a provider's cache
         // serves it: its images are the ones the last request sent. A history that a provider
         // rejected as too long is sent shorter, with each image said in a few words.
+        let image_limits = self.model.input_modalities(&self.model_alias).images;
         request.messages = match reason {
-            CompactionReason::Budget => state.messages.clone(),
+            CompactionReason::Budget => for_sending(&state.messages, image_limits.as_ref()),
             CompactionReason::Overflow => {
                 described(&shortened_for_overflow(&state.messages[..cut.index]))
             }
@@ -1685,13 +1724,12 @@ impl LlmAgent {
         let run = ctx.run_id();
         let cancel = ctx.cancel_token();
         let at = cut.index;
-        let sees = self
-            .model
-            .input_modalities(&self.model_alias)
-            .images
-            .is_some()
-            && reason == CompactionReason::Budget;
-        let named: Vec<adam_model::ImageRef> = state.image_refs().into_iter().cloned().collect();
+        let named: Vec<adam_model::ImageRef> = request
+            .messages
+            .iter()
+            .flat_map(Message::images)
+            .cloned()
+            .collect();
         let images_store = self.extensions.get::<ImageStore>().map(|s| (*s).clone());
         let images_scope = image_scope(
             ctx.conversation_id(),
@@ -1700,10 +1738,9 @@ impl LlmAgent {
         let images_state = Arc::clone(&state.images);
         let recorded: Result<Summarised, ModelFailure> = ctx
             .step(&id, move || async move {
-                if sees && !named.is_empty() {
+                if !named.is_empty() {
                     request.image_data = image_data(
                         named.iter().collect(),
-                        true,
                         images_store.as_ref(),
                         &images_scope,
                         &images_state,
@@ -2152,7 +2189,7 @@ impl LlmAgent {
                     // What the call asked the run to keep, within what the run may keep: the call was
                     // told its room (`ToolCtx::kept_left`), so a result over it was never offered.
                     state.keep_output(kept);
-                    state.keep_images(kept_images);
+                    state.keep_tool_images(kept_images);
                     if !reported.is_empty() {
                         Self::count_rounds(ctx, state, false).await?;
                     }
@@ -2344,6 +2381,7 @@ impl LlmAgent {
             return Ok((answered, SandboxUsage::new()));
         }
 
+        let root_run = root.0.unwrap_or_else(|| ctx.run_id()).to_string();
         let tool_ctx = self
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
             .with_note(note.cloned())
@@ -2351,10 +2389,8 @@ impl LlmAgent {
             .with_kept(kept_left, kept)
             .with_images(
                 images,
-                image_scope(
-                    ctx.conversation_id(),
-                    &root.0.unwrap_or_else(|| ctx.run_id()).to_string(),
-                ),
+                image_scope(ctx.conversation_id(), &root_run),
+                root_run,
             );
         let args = call.arguments.clone();
         // What a source holds back is refused here too, inside the step that records the answer:
@@ -2817,7 +2853,7 @@ impl LlmAgent {
                     .await;
                 add_artifact_refs(&mut state.artifacts, artifacts);
                 state.keep_output(kept);
-                state.keep_images(kept_images);
+                state.keep_tool_images(kept_images);
                 if let Some(answer) = answer {
                     state.announce(answer);
                 }
