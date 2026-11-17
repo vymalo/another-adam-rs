@@ -43,7 +43,7 @@ use tokio::sync::{Notify, watch};
 
 use super::position::{Encoding, file_uri};
 use super::rpc::{Client, Peer, RpcError};
-use super::table::{Language, ServerSpec, Settings};
+use super::table::{Language, Mode, ServerSpec, Settings};
 use crate::redact::Redactor;
 use crate::tools::inspect::Snapshot;
 
@@ -98,6 +98,8 @@ pub struct Key {
     pub language: Language,
     /// The project root, absolute.
     pub root: PathBuf,
+    /// Safe or full ([`Mode`]): a server is never shared between the two.
+    pub mode: Mode,
 }
 
 /// What the server is told that does not change: answers to `workspace/configuration` and the
@@ -1033,8 +1035,8 @@ pub struct Want<'a> {
     pub spec: &'a ServerSpec,
     /// The run's environment.
     pub session: Arc<dyn EnvSession>,
-    /// A reference: read only.
-    pub reference: bool,
+    /// Safe (read only, and the slot held to what it was) or full.
+    pub mode: Mode,
     /// The idle time after which it stops.
     pub idle: Duration,
     /// The most servers this worker holds.
@@ -1280,7 +1282,7 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
     };
 
     let language = key.language;
-    let settings = language.settings(want.reference);
+    let settings = language.settings(want.mode);
     let root_uri = file_uri(&key.root);
     let name = key.root.file_name().map_or_else(
         || "workspace".to_owned(),
@@ -1395,7 +1397,7 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
         end: Mutex::new(None),
         encoding,
         pull,
-        reference: want.reference,
+        reference: want.mode == Mode::Safe,
         idle: want.idle,
         kill_wait: want.kill_wait,
         extensions: language.extensions(),

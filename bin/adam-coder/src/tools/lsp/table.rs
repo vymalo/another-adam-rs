@@ -9,6 +9,21 @@
 
 use serde_json::{Value, json};
 
+/// How much a server may do in the environment: what it runs and what it may write.
+///
+/// A run at the access tier `plan`, and any run in a reference, gets a **safe** server: no build
+/// script, no procedural macro, no check on save, the image's TypeScript with no plugin and no type
+/// acquisition, and the slot is compared before and after each call and put back when it changed. A
+/// run at a higher tier in a slot it may write gets a **full** server (as `run_checks` there runs
+/// the same code) and no comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Mode {
+    /// Read only: the reference settings, and the slot held to what it was.
+    Safe,
+    /// What the project's own build does is allowed.
+    Full,
+}
+
 /// A language the tools know. Closed on purpose: a new variant must fail to compile everywhere a
 /// language is matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -80,9 +95,10 @@ impl Language {
 
     /// The sections of the server's settings that a `workspace/configuration` request asks for, and
     /// the options it is started with (`initializationOptions`), for a slot that is written or a
-    /// reference (read only: no build script, no procedural macro, no check on save, nothing that
+    /// safe server (read only: no build script, no procedural macro, no check on save, nothing that
     /// writes beside the files).
-    pub fn settings(self, reference: bool) -> Settings {
+    pub fn settings(self, mode: Mode) -> Settings {
+        let reference = mode == Mode::Safe;
         match self {
             Self::Rust => {
                 let mut options = json!({"cargo": {"targetDir": true}});
@@ -267,24 +283,24 @@ mod tests {
 
     #[test]
     fn a_section_is_found_by_its_name_or_its_path() {
-        let settings = Language::Python.settings(false);
+        let settings = Language::Python.settings(Mode::Full);
         assert_eq!(
             settings.section("python.analysis")["diagnosticMode"],
             "openFilesOnly"
         );
         assert!(settings.section("python.nothing").is_null());
-        let rust = Language::Rust.settings(false);
+        let rust = Language::Rust.settings(Mode::Full);
         assert_eq!(rust.section("rust-analyzer")["cargo"]["targetDir"], true);
     }
 
     #[test]
     fn a_reference_has_no_build_script_no_macro_and_no_check_on_save() {
-        let read = Language::Rust.settings(true).options;
+        let read = Language::Rust.settings(Mode::Safe).options;
         assert_eq!(read["cargo"]["buildScripts"]["enable"], false);
         assert_eq!(read["procMacro"]["enable"], false);
         assert_eq!(read["checkOnSave"], false);
         assert_ne!(read["cargo"]["targetDir"], true, "a path outside the slot");
-        let write = Language::Rust.settings(false).options;
+        let write = Language::Rust.settings(Mode::Full).options;
         assert!(write["cargo"].get("buildScripts").is_none());
         assert!(write.get("procMacro").is_none());
     }

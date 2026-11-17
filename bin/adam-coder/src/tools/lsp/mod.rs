@@ -73,7 +73,7 @@ use super::shell::shell_spec;
 use super::{Outcome, ToolEnv, cancelled, non_empty, run_error};
 use crate::redact::Redactor;
 pub use server::{Probe, ServerInfo, Servers};
-pub use table::{Language, ServerSpec, ServerTable, Settings};
+pub use table::{Language, Mode, ServerSpec, ServerTable, Settings};
 
 use position::{Encoding, Found, file_uri, find_symbol, path_of_uri, to_chars, to_server};
 use server::{
@@ -455,6 +455,7 @@ impl Call<'_> {
 
         // A reference is read and never changed: what it is now is what it must stay.
         let reference = !self.slot.writable();
+        let mode = if reference { Mode::Safe } else { Mode::Full };
         let before = if reference {
             let Some(state) = Snapshot::of_slot(self.slot).await else {
                 return Ok(ToolOutput::error(
@@ -476,10 +477,11 @@ impl Call<'_> {
                 slot: slot_dir,
                 language: self.language,
                 root: root.clone(),
+                mode,
             },
             spec,
             session: self.session.clone(),
-            reference,
+            mode,
             idle: env.settings.language_server_idle,
             max: env.settings.language_servers_max,
             kill_wait: env.settings.background_kill_wait,

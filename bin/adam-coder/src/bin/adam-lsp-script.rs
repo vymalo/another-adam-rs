@@ -27,6 +27,10 @@
 //! | `server_requests` | requests it makes after `initialized`: `[{method, params}]`; their answers are logged as `{"answer_to", "result"}` |
 //! | `write_on_request` | `{"n", "path", "content"}`: writes a file (relative to the root) before it answers the n-th request |
 //! | `answer_delay_ms` | every answer to a request but `initialize` waits this long |
+//! | `uri_spelling` | `lower_hex`: the `publishDiagnostics` of a file name it with every byte but letters, digits and `/` percent-encoded in lower case (a spelling of the same path) |
+//! | `garbage_after_ms` | this long after `initialized`, bytes that are not a message are written on stdout |
+//! | `error_on` | `{method: code}`: that request is answered with a JSON-RPC error of that code |
+//! | `stall_after_initialized_ms` | after `initialized` the script reads nothing for this long (a server that does not read its input) |
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // a test double
 
@@ -62,6 +66,23 @@ fn substitute(value: &mut Value, file: &str, root: &str) {
         Value::Object(map) => map.values_mut().for_each(|v| substitute(v, file, root)),
         _ => {}
     }
+}
+
+/// `uri` with every byte of its path but letters, digits and `/` written `%xx` in lower case: the
+/// same file, spelled as some servers spell it.
+fn lower_hex(uri: &str) -> String {
+    let Some(path) = uri.strip_prefix("file://") else {
+        return uri.to_owned();
+    };
+    let mut out = String::from("file://");
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'/' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02x}"));
+        }
+    }
+    out
 }
 
 fn path_of(uri: &str) -> String {
@@ -253,6 +274,13 @@ fn main() {
                 );
             }
             ("initialized", None) => {
+                if let Some(ms) = script.u64("garbage_after_ms") {
+                    let out = out.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(ms));
+                        raw(&out, b"this is not a header\r\n\r\n");
+                    });
+                }
                 if let Some(ms) = script.u64("progress_ms") {
                     let out = out.clone();
                     send(
@@ -290,6 +318,9 @@ fn main() {
                                     "method": item["method"], "params": item["params"]}),
                         );
                     }
+                }
+                if let Some(ms) = script.u64("stall_after_initialized_ms") {
+                    std::thread::sleep(Duration::from_millis(ms));
                 }
             }
             ("textDocument/didOpen", None) => {
@@ -356,6 +387,19 @@ fn main() {
                 if never.contains(&method) {
                     continue;
                 }
+                if let Some(code) = script
+                    .json
+                    .get("error_on")
+                    .and_then(|e| e.get(&method))
+                    .and_then(Value::as_i64)
+                {
+                    send(
+                        &out,
+                        &json!({"jsonrpc": "2.0", "id": id,
+                                "error": {"code": code, "message": "scripted error"}}),
+                    );
+                    continue;
+                }
                 if let Some(ms) = script.u64("answer_delay_ms") {
                     std::thread::sleep(Duration::from_millis(ms));
                 }
@@ -380,6 +424,11 @@ fn publish(script: &Script, out: &Out, uri: &str, text: &str) {
     if items.is_empty() && script.bool("silent_when_clean") {
         return;
     }
+    let uri = if script.str("uri_spelling") == Some("lower_hex") {
+        lower_hex(uri)
+    } else {
+        uri.to_owned()
+    };
     send(
         out,
         &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
