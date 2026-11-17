@@ -474,7 +474,7 @@ sequenceDiagram
     L-->>T: ready, or the deadline of wait
     T->>S: textDocument/diagnostic, definition or references
     S-->>T: the answer
-    T->>E: safe only: snapshot again; a difference is put back and the server stopped
+    T->>E: safe only: snapshot again, a difference is put back and the server is stopped
     T->>T: sort, cut, scrub, page
     T-->>M: path:line:col lines, [end] or a first line that says it is still indexing
 ```
@@ -487,7 +487,7 @@ stateDiagram-v2
     Waiting --> Refused: the bound is reached and every server is working
     Waiting --> Starting: a place under the bound
     Starting --> Initializing: spawned, piped
-    Starting --> Failed: its run's servers were stopped meanwhile
+    Starting --> Failed: its run was stopped meanwhile
     Initializing --> Indexing: initialize answered
     Initializing --> Failed: no answer in 60 s, exited, or its call was dropped
     Indexing --> Ready: no progress open, quiet for 300 ms

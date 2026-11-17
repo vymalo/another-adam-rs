@@ -10,7 +10,7 @@
 //!     Waiting --> Refused: the bound is reached and every server is working
 //!     Waiting --> Starting: a place under the bound
 //!     Starting --> Initializing: spawned, piped
-//!     Starting --> Failed: its run's servers were stopped meanwhile
+//!     Starting --> Failed: its run was stopped meanwhile
 //!     Initializing --> Indexing: initialize answered
 //!     Initializing --> Failed: no answer in 60 s, exited, or its call was dropped
 //!     Indexing --> Ready: no progress open, quiet for 300 ms

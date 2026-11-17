@@ -11,7 +11,7 @@
 //!   login shell's profile may print before the server starts.
 //! * One task writes: a message is queued whole, and written whole whatever happens to the call that
 //!   queued it, so a call that is dropped (a time limit, a cancel) never leaves half a message in the
-//!   server's input. A write that takes more than [`WRITE_TIMEOUT`] closes the client.
+//!   server's input. A write that takes more than `WRITE_TIMEOUT` (20 s) closes the client.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
