@@ -2538,6 +2538,7 @@ impl LlmAgent {
             let step = steps.next().ok_or_else(|| {
                 AgentError::permanent("a call of a segment has no reserved step".to_owned())
             })?;
+            debug_assert_eq!(step.name(), format!("tool:{}", call.id));
             debug_assert_eq!(
                 Some(step.seq()),
                 seqs[i],

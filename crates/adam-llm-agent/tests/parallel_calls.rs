@@ -244,6 +244,9 @@ impl Tool for Filer {
             vec![7; kib * 1024],
         )
         .expect("a file within the cap");
+        if args.get("error").and_then(Value::as_bool) == Some(true) {
+            return Ok(ToolOutput::error("bad").with_artifact(file));
+        }
         Ok(ToolOutput::text("shared").with_artifact(file))
     }
 }
@@ -791,12 +794,15 @@ async fn a_call_that_does_not_stop_is_dropped_after_the_grace_period() {
     let cancelled = tokio::time::Instant::now();
     rt.cancel(run, "stop").await.expect("cancel");
     let view = wait_terminal(&rt, run).await;
+    // The worker returns once the transition has ended: the loop waited out the grace period and
+    // dropped the call that does not stop.
     worker.stop().await;
     assert_eq!(view.status, RunStatus::Failed);
+    let took = cancelled.elapsed();
     assert!(
-        cancelled.elapsed() < Duration::from_secs(60),
-        "the loop did not wait for a call that ignores the cancel: {:?}",
-        cancelled.elapsed()
+        took >= adam_llm_agent::TOOL_STOP_GRACE
+            && took < adam_llm_agent::TOOL_STOP_GRACE + Duration::from_secs(1),
+        "the loop waits TOOL_STOP_GRACE for a call that ignores the cancel, not more: {took:?}"
     );
 }
 
@@ -1298,4 +1304,210 @@ async fn a_permanent_error_wins_over_a_transient_one_whichever_finished_first() 
         "{:?}",
         view.error
     );
+}
+
+// ---------------------------------------------------------------------------
+// Survivors of the mutation pass
+// ---------------------------------------------------------------------------
+
+/// A source that offers nothing and answers `Alone` for every name.
+struct Silent;
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for Silent {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_second_source_decides_when_the_first_does_not_offer_the_tool() {
+    // The rule: the first source that answers something other than `Alone` decides, so a source
+    // that does not offer the tool (and says `Alone`, the default) does not hide a later one.
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "slow_a", json!({"tag": 1})),
+        call("c2", "slow_b", json!({"tag": 2})),
+    ]);
+    h.mock.push_text("done");
+    let agent = h.agent(10, |b| {
+        b.tool_source(Silent)
+            .tool_source(Sleepers { log: log.clone() })
+    });
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(log.max_running(), 2);
+    assert_eq!(
+        tool_answers(&view),
+        [
+            ("slow_a:c1".to_owned(), false),
+            ("slow_b:c2".to_owned(), false)
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_queued_call_starts_when_any_running_call_ends() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call(
+            "c1",
+            "probe",
+            json!({"ms": 300, "use": "independent", "tag": 1}),
+        ),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 2}),
+        ),
+        call(
+            "c3",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 3}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    let started = tokio::time::Instant::now();
+    let (_, view) = h.run(2, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert!(
+        log.position("start:c3") < log.position("end:c1"),
+        "c3 took the place c2 left, it did not wait for c1"
+    );
+    let took = started.elapsed().as_millis();
+    assert!((300..400).contains(&took), "{took} ms of virtual time");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_error_result_whose_file_is_refused_has_its_end_corrected() {
+    let h = Harness::new();
+    h.mock.push_tool_calls(vec![
+        call("c1", "filer", json!({"kib": 4096, "error": true, "tag": 1})),
+        call("c2", "filer", json!({"kib": 4096, "error": true, "tag": 2})),
+    ]);
+    h.mock.push_text("done");
+    let agent = h.agent(10, |b| b.tool(Filer));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    let c2: Vec<(StepState, String)> = h
+        .sink
+        .events_for(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) if step.id == "tool:c2" => {
+                Some((step.state, step.output.map(|o| o.text).unwrap_or_default()))
+            }
+            _ => None,
+        })
+        .collect();
+    let states: Vec<StepState> = c2.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        states,
+        [StepState::Running, StepState::Failed, StepState::Failed]
+    );
+    assert_eq!(c2[1].1, "bad");
+    assert!(
+        c2[2].1.contains("Not shared"),
+        "the corrected end says why: {:?}",
+        c2[2].1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_with_bad_arguments_in_a_segment_takes_no_seq() {
+    let mut runs = Vec::new();
+    for limit in [1usize, 10] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        let mut bad = call("c2", "probe", Value::Null);
+        bad.invalid_arguments = Some("{oops".into());
+        h.mock.push_tool_calls(vec![
+            call(
+                "c1",
+                "probe",
+                json!({"ms": 10, "use": "independent", "tag": 1}),
+            ),
+            bad,
+            call(
+                "c3",
+                "probe",
+                json!({"ms": 10, "use": "independent", "tag": 3}),
+            ),
+        ]);
+        h.mock.push_text("done");
+        let (run, view) = h.run(limit, "go", &log).await;
+        assert_eq!(view.status, RunStatus::Done, "limit {limit}: {view:?}");
+        let journal = h.journal(run).await;
+        assert!(journal.iter().all(|(_, n)| n != "tool:c2"), "{journal:?}");
+        assert_eq!(
+            journal.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            (0..journal.len() as u64).collect::<Vec<_>>(),
+            "contiguous seqs"
+        );
+        runs.push((journal, tool_answers(&view)));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "the same journal and answers at both limits"
+    );
+    assert!(runs[0].1[1].1, "the bad call is answered with an error");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_tool_runs_alone_even_when_it_declares_independent() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call(
+            "c1",
+            "subagent_read",
+            json!({"ms": 50, "use": "independent", "tag": 1}),
+        ),
+        call(
+            "c2",
+            "subagent_read",
+            json!({"ms": 50, "use": "independent", "tag": 2}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    let probe = Probe {
+        name: adam_llm_agent::SUBAGENT_READ,
+        ..Probe::new(&log)
+    };
+    let agent = h.agent(10, |b| b.tool(probe));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(log.max_running(), 1, "what the tool declares is not heeded");
 }

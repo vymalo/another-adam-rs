@@ -1018,6 +1018,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reserved_step_another_worker_recorded_meanwhile_returns_the_recorded_outcome() {
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        let mut reserved = ctx.reserve_steps(&names(&["a"])).await.expect("reserve");
+        let step = reserved.remove(0);
+        assert!(!step.is_recorded());
+        // Another worker wins the race for the same seq after the reservation.
+        ctx.store
+            .journal_put(ctx.run_id(), JournalEntry::ok(0, "a", serde_json::json!(1)))
+            .await
+            .expect("the other worker records");
+        let out: Result<u8, String> = step.run(|| async { Ok(2) }).await.expect("run");
+        assert_eq!(out, Ok(1), "the first recording wins and both see it");
+        let held = ctx.store.journal_get(ctx.run_id(), 0).await.expect("get");
+        assert_eq!(held.expect("entry").payload, serde_json::json!(1));
+    }
+
+    #[tokio::test]
     async fn step_all_starts_no_step_after_a_runtime_error() {
         let sink = CollectingSink::new();
         let mut ctx = ctx(&sink).await;

@@ -78,8 +78,10 @@ at once, or "interrupted" answers (adam replays).
    first-party tool declares its class (slices P7 and P8). MCP tools are `Independent` by default, with `"parallel": false`
    per server in `mcp.json` to make them `Alone` (slice P7).
 4. **The loop forces `Alone`, whatever a tool says,** for `asks_user()` tools, the session tools (`SUBAGENT_START`, `SEND`,
-   `READ`, `CLOSE`), any tool that can park the run (`AwaitRun`, `AwaitSession`, `AwaitRemote`: the subagent tools), and every
-   call when the limit is 1. A call with the same key as the call just before it (for the first call, the committed
+   `READ`, `CLOSE`), and every call when the limit is 1. A tool that can park the run on a child or a remote task
+   (`AwaitRun`, `AwaitSession`, `AwaitRemote`: the subagent tools) is **not** detected by the loop, because no signal says
+   so before the call: it is `Alone` by declaring nothing (`SubagentTool` and `RemoteSubagentTool` do), and one that
+   declares a class and parks anyway gets decision 11's error result. A call with the same key as the call just before it (for the first call, the committed
    `repeats.key`) is a **barrier** too, because `doom_loop` needs that result applied.
 5. **Segments.** A *segment* is the run of calls between two barriers; an `Alone` call is a barrier and a segment of its own.
    A barrier starts when every earlier call has finished and its result has been **applied in call order**, and nothing after

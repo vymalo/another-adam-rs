@@ -665,7 +665,7 @@ decides it; `src/schedule.rs` is the pure schedule and `run_pending` in `src/age
 | | |
 |---|---|
 | What a call shares | `Tool::access(&args) -> ToolAccess`, `ToolSource::access(name, &args)`. A scope is a key with `/` levels; two uses overlap when equal or one is a prefix of the other at a `/`. Two calls conflict when one is `Alone`, or they overlap and one writes. **A tool that declares nothing is `Alone`** |
-| Forced `Alone` | a tool whose `asks_user()` is true, the session tools (`subagent_start`, `_send`, `_read`, `_close`), and any tool that can park the run (it says `Alone`); every call at a limit of 1 |
+| Forced `Alone` | a tool whose `asks_user()` is true, the session tools (`subagent_start`, `_send`, `_read`, `_close`), and every call at a limit of 1. A tool that can park the run on a child or a remote task is not detected: it must say `Alone` (the default), and one that declares a class and parks anyway gets the *Undeclared wait* error |
 | Barriers | an `Alone` call, and a call with the same key as the one before it (the doom-loop count needs that result applied first). A barrier starts after every earlier call finished and was applied, and nothing after it starts before it is done. The calls between two barriers are a segment |
 | In a segment | call *j* waits for each earlier call *i* it conflicts with, otherwise it starts when fewer than the limit run, ready calls in call order. More calls than the limit queue; none is refused |
 | Journal | one step `tool:<call id>` per call, at seqs reserved in call order (`Ctx::reserve_steps`): the journal is the one a sequential loop writes, so a replay works at any limit and a rollback to a sequential build replays |
