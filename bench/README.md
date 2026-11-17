@@ -204,7 +204,7 @@ told otherwise.
   however lively the stream). Beside them the configuration's first-byte and idle timeouts. A call over a response
   limit or a time limit is cut, the upstream request is destroyed and the call is charged its worst case.
 * **A client that closes at `[DONE]`** (adam does, right after the last chunk and before the upstream has ended) is charged the usage the meter had already read from the stream, not the worst case; only a client that closes before any usage was seen is charged the worst case.
-* **A proxy:** the meter uses Node's own http client, which takes `HTTPS_PROXY` from the environment only when `NODE_USE_ENV_PROXY=1` is set; `bench doctor` warns when a proxy is set without it.
+* **A proxy:** the meter uses `https.request`, which takes `HTTPS_PROXY` from the environment only when `NODE_USE_ENV_PROXY=1` is set **and** the Node release has it: *verified 2026-11-17* in Node's changelogs (`doc/changelogs/CHANGELOG_V24.md` and `CHANGELOG_V22.md`, "http,https: add built-in proxy support in http/https.request and Agent", nodejs/node#58980): first in 24.5.0 (2025-07-31) and 22.21.0 (2025-10-20); `fetch()` has had it since 24.0.0, which is not what the meter uses. `bench doctor` warns when a proxy is set without the variable, or with a Node older than those, and says what to do. Everything else in the harness needs only Node 22.
 * **Backpressure:** an SSE stream is relayed chunk by chunk and the upstream is paused while the client does not read.
 
 **The report** shows pass rates with Wilson intervals, paired differences (exact McNemar, seeded bootstrap), splits
@@ -487,6 +487,7 @@ tag `v2.3.0` (`raw.githubusercontent.com/anomalyco/opencode/v2.3.0`) and its `CH
 |---|---|---|---|
 | headless command | `opencode run [flags] [message...]`, `--format default\|json`, `--model provider/model#variant`, `--auto`, `--title`; `--standalone` runs a private server instead of the background service | `opencode run --help`, `opencode --help` | **no `--dir`**: the working directory is the directory; **`--standalone` is new** |
 | the statement | on stdin it reaches the model byte for byte; `--title` leaves two requests for a two-step task (three without it) | stub's journal | none |
+| `instructions` in the configuration, and an agent's `prompt` | both are in the configuration schema; `instructions` files are sent as "Instructions from: <path>" system text (see "The shared system prompt") | source at `v2.3.0` and the bundle's strings; **not run** | none known |
 | `OPENCODE_CONFIG_CONTENT` | read; with `OPENCODE_CONFIG`, `OPENCODE_CLI_CONFIG_CONTENT` and `OPENCODE_CONFIG_DIR` | the names are in the binary; a config with the provider, model, `small_model`, `permission`, agent `steps`, `autoupdate` and `share` ran | none |
 | provider | `@ai-sdk/openai-compatible` at the stub's address; the model's id reaches the request; `stream_options.include_usage` is set; the limit is sent as **`max_completion_tokens`** (8192) | stub's journal | 1.19 sent `max_tokens`; the meter clamps both |
 | `permission` | `external_directory: deny` refuses a write outside the directory (`Permission denied: external_directory`); `question` accepts only an action | stub's journal; `packages/core/src/v1/config/permission.ts` | none |
@@ -513,7 +514,7 @@ takes no such limit, so its CPU and memory are the service's: not equal). If the
 (adam: the first message; OpenCode: the container), and adam's `wallMs` is the time to the decision, not the cancel grace.
 OpenCode needs no network to load its provider (*verified 2026-11-17*: it ran with the proxy dead and a new home).
 
-**What cannot be made equal** (the report says so): the system prompts, the tool sets, the subagents (adam's 40 turns,
+**What cannot be made equal** (the report says so): the tool guides inside the system prompts (the task sections are shared: "The shared system prompt"), the tool sets, the subagents (adam's 40 turns,
 OpenCode's `task`), compaction, retries and prompt caching; adam's check-cycle rule and pull request flow; OpenCode's
 own process runs inside the sandbox, adam's runs outside it; the one line of preamble; the nudge against OpenCode's denied
 `question` tool; LSP; and what a step limit means.
@@ -549,6 +550,53 @@ sequenceDiagram
     D-->>R: the patch
     R->>D: cleanup(ctx)
 ```
+
+## The shared system prompt
+
+Both agents get the same guidance on **doing the task**, so the comparison is not biased by one of them having a better prompt. adam's
+`bin/adam-coder/agent/instructions.md` at the pinned coder revision is its whole system prompt, and adam keeps all of it. OpenCode keeps
+its own built-in prompt and tools and is given, in addition, the sections of adam's file that are about the work and not about adam's own
+tools and features. `lib/shared-prompt.mjs` reads the file from this checkout at the pin (as `ensureAgentFolder` reads the agent folder),
+cuts it into sections and joins the shared ones, **word for word and in their order**. Only the two numbers a shared section reads
+from the file's own front matter (`{{max_check_cycles}}` and `{{scratch_check_cycles}}`) are filled in, with the file's own defaults, 3 and 5.
+
+| Section of adam's file | Shared or left out | Why |
+|---|---|---|
+| (the opening paragraphs) | left out | adam's name, persona and file tools by name |
+| Who you are and how you talk | left out | adam's name and persona; what adam can do, with its scratch projects and repository creation |
+| Requests that are not a code change | left out | names `prepare_workspace`, `start_scratch`, `share_file` and the scratch project |
+| What the person sees | left out | adam's working notes, `turn_output`, `share_file` and the steps panel: a product feature OpenCode does not have |
+| Tools | left out | the guide to adam's own tools, by name |
+| Helpers | left out | adam's `explorer` and `reviewer` subagents |
+| Access tiers | left out | adam's access tiers, which the benchmark does not set |
+| How to work | **shared** | how to do the task: find the checks, small steps, verify, fix, commit, open the pull request |
+| Starting without a repository | left out | adam's scratch projects and `publish_scratch`; the benchmark always names a repository |
+| The work environment | left out | adam's devcontainer environment, `rebuild_environment` and the `obscura` browser; OpenCode runs in the task's own container |
+| A missing toolchain | **shared** | what to do when the environment lacks a toolchain, and when a project tool only needs its dependencies installed |
+| Asking the person | left out | `ask_user` and its forms; OpenCode has another question tool, which the benchmark denies |
+| Questions and conversation | left out | names `run_command` and refers to the left-out "Who you are" section |
+| Ending your turn | **shared** | how a turn ends: the pull request, an answer, a delivered file, a question |
+| Rules you must not break | **shared** | never a pull request on red checks, checks again after a change, stay within the task, no secrets |
+
+The four shared sections are the ones the owner named (2026-11-17). **They name adam's own tools** (`prepare_workspace`, `run_checks`,
+`ask_user`, `commit_and_push`, `open_pull_request`, `share_file`, `start_scratch`, `request_repository`, `read_file`, `write_file`,
+`edit_file`, `apply_patch`, `run`, `run_command`), which OpenCode does not have; they are kept unchanged, as decided. No other section is
+shared, and no other section that names such a tool could be (a test holds this). A section that a new pin adds or renames is an
+error until it is added to the table with a decision and a reason.
+
+How OpenCode receives it: the text is written, byte for byte, to `shared-prompt.md` in the run's read-only input directory (beside the
+statement), and the run's configuration names that file in its `instructions` list. The hash of the text is part of the ledger's
+configuration fingerprint (field `prompt`), so changing the shared prompt, or moving the pin to a revision whose sections differ, voids a
+ledger.
+
+* *Verified 2026-11-17* in the source at the tag `v2.3.0` (`packages/core/src/v1/config/agent.ts`): an agent has `prompt: string`, and
+  in the pinned binary's bundle the configuration document has an `instructions` array of paths and URLs that is read and sent as
+  "Instructions from: <path>" text. **Unverified:** that the effect is as described when the pinned binary runs (running a downloaded binary was not
+  possible where this was written). `bench/test/opencode.test.mjs` has a test that runs the real binary and asks the scripted model for its system
+  prompt (`BENCH_TEST_OPENCODE_BIN`, skipped otherwise); run it before the first real run. The alternative, if `instructions` is ignored, is the
+  agent's `prompt`, which would replace OpenCode's built-in prompt and not add to it: say so before choosing it.
+* CI checks out all history (`fetch-depth: 0`) so the pinned revision is there; the tests that read adam's file skip without it, and fail
+  under `CI`.
 
 ## The runner
 

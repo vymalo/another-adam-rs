@@ -242,3 +242,34 @@ The review found one critical and seven major faults; the smoke test found six m
 
 *Unverified*, as before: everything that needs a container service, including the archive transfer of an own image and the grader's lock
 under two real slots.
+
+## Amended 2026-11-17: the same system prompt for both agents
+
+Amended 2026-11-17: the owner chose the same system prompt for both agents; OpenCode gets the task sections of adam's instructions; the agent-specific tool guides stay apart.
+
+`bench/lib/shared-prompt.mjs` builds one shared prompt from adam's `bin/adam-coder/agent/instructions.md` at the pinned coder revision,
+word for word. adam keeps its full file. OpenCode receives the shared sections as an `instructions` file beside the statement, in addition
+to its own prompt. The decision for each section, with the reason (the same table is in `bench/README.md`, "The shared system prompt"):
+
+| Section | Decision | Reason |
+|---|---|---|
+| (the opening paragraphs) | left out | adam's name, persona and file tools by name |
+| Who you are and how you talk | left out | adam's name and persona; what adam can do, with its scratch projects and repository creation |
+| Requests that are not a code change | left out | names `prepare_workspace`, `start_scratch`, `share_file` and the scratch project |
+| What the person sees | left out | adam's working notes, `turn_output`, `share_file` and the steps panel: a product feature OpenCode does not have |
+| Tools | left out | the guide to adam's own tools, by name |
+| Helpers | left out | adam's `explorer` and `reviewer` subagents |
+| Access tiers | left out | adam's access tiers, which the benchmark does not set |
+| How to work | **shared** | how to do the task: find the checks, small steps, verify, fix, commit, open the pull request |
+| Starting without a repository | left out | adam's scratch projects and `publish_scratch`; the benchmark always names a repository |
+| The work environment | left out | adam's devcontainer environment, `rebuild_environment` and the `obscura` browser; OpenCode runs in the task's own container |
+| A missing toolchain | **shared** | what to do when the environment lacks a toolchain, and when a project tool only needs its dependencies installed |
+| Asking the person | left out | `ask_user` and its forms; OpenCode has another question tool, which the benchmark denies |
+| Questions and conversation | left out | names `run_command` and refers to the left-out "Who you are" section |
+| Ending your turn | **shared** | how a turn ends: the pull request, an answer, a delivered file, a question |
+| Rules you must not break | **shared** | never a pull request on red checks, checks again after a change, stay within the task, no secrets |
+
+The four sections the owner named name adam's tools that OpenCode lacks; they are kept unchanged. The hash of the shared text is part of
+the ledger's configuration fingerprint. *Verified 2026-11-17*: that the configuration schema of OpenCode 2.3.0 has an agent `prompt` and an
+`instructions` list. *Unverified*: the effect of `instructions` with the pinned binary, which a gated test checks (`BENCH_TEST_OPENCODE_BIN`).
+
