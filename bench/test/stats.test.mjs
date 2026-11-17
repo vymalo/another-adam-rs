@@ -118,3 +118,15 @@ test('row 16: the exact McNemar test does not underflow for many discordant pair
   // the small cases keep their exact values
   assert.equal(mcnemarExact(1, 5), 0.21875);
 });
+
+test('the bootstrap seed matters: other seeds give other bounds, and one is pinned', () => {
+  const pairs = [[1, 0], [0, 1], [1, 0], [0, 0], [1, 1], [0, 1], [1, 0]];
+  const bounds = (seed) => {
+    const r = bootstrapPairedDiff(pairs, { seed, iterations: 40 });
+    return `${r.low}|${r.high}`;
+  };
+  assert.ok(new Set([1, 2, 3, 4, 5, 6, 7, 8].map(bounds)).size > 1, 'seeds are not ignored');
+  assert.notEqual(bounds(3), bounds(1));
+  assert.notEqual(bounds(7), bounds(1));
+  assert.equal(bounds(7), '-0.5714285714285714|0.7142857142857143', 'pinned: this implementation, seed 7, 40 iterations');
+});

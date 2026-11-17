@@ -229,3 +229,11 @@ test('row 15: the command line says so and writes no report', (t) => {
   assert.match(r.stderr, /T1-a-max-again/);
   assert.ok(!fs.existsSync(path.join(home, 'report.md')));
 });
+
+test('a lone CR or a CRLF in a name leaves no CR in the report and rows stay on one line', () => {
+  for (const task of ['T\rone', 'T\r\ntwo']) {
+    const text = buildReport(twoAttempts('T1-a-max', { task, agent: 'a\rb' }));
+    assert.ok(!text.includes('\r'), JSON.stringify(task));
+    assert.match(text, /^\| T(one|two)? ?(one|two) \| pass \|$|^\| T one \| pass \|$|^\| T two \| pass \|$/m);
+  }
+});

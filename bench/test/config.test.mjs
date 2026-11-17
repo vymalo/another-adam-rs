@@ -224,3 +224,43 @@ test('row 3: a key with CR, LF, a control character or a space is refused by nam
   }
   assert.equal(readKey(c, { BENCH_MODEL_API_KEY: 'sk-abc.DEF_123' }), 'sk-abc.DEF_123');
 });
+
+// ---- mutation round ----
+
+test('a root with no .git still refuses root/..cfg/config.json', (t) => {
+  const root = tmp(t);
+  assert.throws(() => assertOutsideRepo(path.join(root, '..cfg', 'config.json'), 'BENCH_CONFIG', [root]), ConfigError);
+});
+
+test('a symlink outside that points into a work tree is refused, with no roots', (t) => {
+  const repo = fakeRepo(t);
+  fs.mkdirSync(path.join(repo, 'sub'));
+  fs.writeFileSync(path.join(repo, 'sub', 'config.json'), '{}');
+  const outside = tmp(t);
+  fs.symlinkSync(path.join(repo, 'sub'), path.join(outside, 'linkdir'));
+  assert.throws(() => assertOutsideRepo(path.join(outside, 'linkdir', 'config.json'), 'BENCH_CONFIG', []), ConfigError);
+});
+
+test('only the loopback names are loopback: localhost-prefixed hosts are not', () => {
+  for (const bad of ['http://localhost.models.example.test/v1', 'http://localhostx/v1', 'http://xlocalhost/v1']) {
+    assert.throws(() => normalizeConfig(rawConfig({ endpoint: bad })), (e) => e instanceof ConfigError && e.field === 'endpoint', bad);
+  }
+});
+
+test('the value of a refused secret field is in neither the message nor the command line\'s stderr', (t) => {
+  const value = 'hunter2-unique-value';
+  assert.throws(() => normalizeConfig(rawConfig({ arms: { a: { api_key: value } } })), (e) => e instanceof ConfigError && !e.message.includes(value));
+  const dir = tmp(t);
+  const file = path.join(dir, 'config.json');
+  fs.writeFileSync(file, JSON.stringify(rawConfig({ arms: { a: { api_key: value } } })));
+  const r = spawnSync(process.execPath, [BENCH, 'config'], { env: { ...process.env, BENCH_CONFIG: file, HOME: dir }, encoding: 'utf8' });
+  assert.equal(r.status, 78);
+  assert.ok(!r.stderr.includes(value) && !r.stdout.includes(value));
+});
+
+test('a counter name excuses a number only: a string under auth_token_max or api_key_limit is refused', () => {
+  refused(rawConfig({ arms: { a: { auth_token_max: 'abc' } } }), 'arms.a.auth_token_max');
+  refused(rawConfig({ arms: { a: { api_key_limit: 'abc' } } }), 'arms.a.api_key_limit');
+  refused(rawConfig({ arms: { a: { token_budget: true } } }), 'arms.a.token_budget');
+  assert.doesNotThrow(() => normalizeConfig(rawConfig({ arms: { a: { token_budget: 5000 } } })));
+});

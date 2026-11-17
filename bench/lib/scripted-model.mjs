@@ -16,6 +16,10 @@ export function createScriptedModel(initial = {}) {
     expectKey: null, // when set, a request without `Authorization: Bearer <it>` gets 401
     errorBody: null, // the body of a non-200 answer (a string, or a value sent as JSON); default a short error object
     errorHeaders: {}, // extra headers of a non-200 answer
+    okHeaders: {}, // extra headers of a 200 answer (plain and stream)
+    reset: false, // destroy the socket after reading the request
+    onRequest: null, // called with the recorded request when it arrives
+    padBytes: 0, // a plain answer's content is this long
     endless: false, // a stream that never ends: `endlessChunkBytes` of text every `endlessEveryMs`, honouring backpressure
     endlessChunkBytes: 100,
     endlessEveryMs: 5,
@@ -44,9 +48,11 @@ export function createScriptedModel(initial = {}) {
         // not JSON: recorded as null
       }
       requests.push({ method: req.method, url: req.url, headers: { ...req.headers }, body });
+      behavior.onRequest?.(requests.at(-1));
+      if (behavior.reset) return req.socket.destroy();
       const json = (status, value) => {
         const text = JSON.stringify(value);
-        res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
+        res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text), ...(status === 200 ? behavior.okHeaders : {}) });
         res.end(text);
       };
       if (req.method !== 'POST' || req.url !== '/v1/chat/completions') return json(404, { error: { message: 'not found' } });
@@ -62,11 +68,11 @@ export function createScriptedModel(initial = {}) {
         }
         const base = { id: 'chatcmpl-scripted', object: 'chat.completion', created: 1, model: body?.model ?? 'unknown' };
         if (body?.stream !== true) {
-          const out = { ...base, choices: [{ index: 0, message: { role: 'assistant', content: 'done' }, finish_reason: 'stop' }] };
+          const out = { ...base, choices: [{ index: 0, message: { role: 'assistant', content: 'done'.padEnd(behavior.padBytes, 'x') }, finish_reason: 'stop' }] };
           if (!behavior.omitUsage) out.usage = usageObject();
           return json(200, out);
         }
-        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', ...behavior.okHeaders });
         res.on('close', () => {
           if (!res.writableFinished) stats.aborted += 1;
         });

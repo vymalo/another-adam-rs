@@ -265,18 +265,19 @@ test('nothing the meter wrote holds the key, the endpoint, the run token or a bo
   t.after(() => {
     process.stderr.write = realWrite;
   });
+  const bodies = [];
   const secretWords = 'a-sentence-the-agent-sent-that-must-not-be-logged';
-  await (await chat(baseUrl, { messages: [{ role: 'user', content: secretWords }] })).text();
-  await (await chat(baseUrl, { messages: [{ role: 'user', content: secretWords }], stream: true })).text();
+  bodies.push(await (await chat(baseUrl, { messages: [{ role: 'user', content: secretWords }] })).text());
+  bodies.push(await (await chat(baseUrl, { messages: [{ role: 'user', content: secretWords }], stream: true })).text());
   s.model.behavior.status = 500;
-  await (await chat(baseUrl, { messages: [] })).text();
+  bodies.push(await (await chat(baseUrl, { messages: [] })).text());
   s.model.behavior.status = 200;
   await s.model.close();
-  await (await chat(baseUrl, { messages: [{ role: 'user', content: secretWords }] })).text();
+  bodies.push(await (await chat(baseUrl, { messages: [{ role: 'user', content: secretWords }] })).text());
   process.stderr.write = realWrite;
 
   const ledgerText = fs.readFileSync(s.ledger.file, 'utf8');
-  const everything = [ledgerText, JSON.stringify(s.events), stderr.join('')].join('\n');
+  const everything = [ledgerText, JSON.stringify(s.events), stderr.join(''), bodies.join('\n')].join('\n');
   const upstreamHost = new URL(s.cfg.endpoint).host;
   for (const secret of [TEST_KEY, s.cfg.endpoint, upstreamHost, token, secretWords]) {
     assert.ok(!everything.includes(secret), `found ${secret === token ? '<token>' : secret} in what the meter wrote`);
@@ -475,4 +476,103 @@ test('row 17: the cap is soft by one call: a call that reports more than its wor
   assert.equal(s.model.requests.length, 1);
   assert.equal(s.book.runView('r1').spentMicro, spent, 'the excess is that one call, no more');
   assert.equal(s.book.committedMicro(), spent, 'a run over its reservation is committed at what it spent');
+});
+
+// ---- mutation round ----
+
+test('the client headers never reach the endpoint: only the meter\'s own set does', async (t) => {
+  const s = await setup(t);
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [] }, { 'x-api-key': 'client-secret', cookie: 'session=abc', 'x-custom': 'one', authorization: 'Bearer client' })).text();
+  const names = Object.keys(s.model.requests[0].headers).sort();
+  assert.deepEqual(names, ['accept', 'accept-encoding', 'authorization', 'connection', 'content-length', 'content-type', 'host', 'user-agent']);
+  assert.equal(s.model.requests[0].headers.authorization, `Bearer ${TEST_KEY}`);
+});
+
+test('a 2xx answer relays no upstream header, plain or stream', async (t) => {
+  const s = await setup(t, { behavior: { okHeaders: { 'x-upstream-internal': 'host-7', 'set-cookie': 'a=b', 'x-request-id': 'zzz' } } });
+  const { baseUrl } = s.open();
+  for (const stream of [false, true]) {
+    const res = await chat(baseUrl, { messages: [], stream });
+    await res.text();
+    assert.equal(res.status, 200);
+    for (const h of ['x-upstream-internal', 'set-cookie', 'x-request-id']) assert.equal(res.headers.get(h), null, `${h} (stream ${stream})`);
+  }
+});
+
+test('an endpoint that is down or times out gives the agent a fixed body with no host', async (t) => {
+  const s = await setup(t, { behavior: { delayMs: 3000 }, config: { timeouts: { firstByteSeconds: 0.3 } } });
+  const { baseUrl } = s.open();
+  const slow = await chat(baseUrl, { messages: [] });
+  assert.equal(slow.status, 504);
+  assert.deepEqual(await slow.json(), { error: { message: 'upstream unavailable' } });
+  await s.model.close();
+  const down = await chat(baseUrl, { messages: [] });
+  assert.equal(down.status, 502);
+  assert.deepEqual(await down.json(), { error: { message: 'upstream unavailable' } });
+});
+
+test('an arm fragment cannot lift the output limit: it is clamped and the worst case uses the clamp', async (t) => {
+  const s = await setup(t, { config: { arms: { big: { max_completion_tokens: 99_999 }, off: { reasoning_effort: 'none' } } }, reserve: 130_000 });
+  const { baseUrl } = s.open('r1', 'big');
+  assert.equal((await chat(baseUrl, { messages: [] })).status, 200);
+  assert.equal(s.model.requests[0].body.max_completion_tokens, MAX_OUTPUT_TOKENS);
+  // the worst case is that of 8192 tokens (about 122_990), so a second call does not fit 130_000 after 4_920 spent... and the first did
+  assert.ok(callRecords(s.ledger, 'pending')[0].worstMicro < 130_000);
+});
+
+test('the pending record is on disk before the request leaves', async (t) => {
+  const seen = [];
+  const s = await setup(t);
+  s.model.behavior.onRequest = () => {
+    seen.push(fs.readFileSync(s.ledger.file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.kind === 'call'));
+  };
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [] })).text();
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0].map((r) => r.phase), ['pending'], 'at arrival: pending written, nothing settled');
+});
+
+test('a reset after the request was sent is charged the worst case and flagged', async (t) => {
+  const s = await setup(t, { behavior: { reset: true } });
+  const { baseUrl } = s.open();
+  const res = await chat(baseUrl, { messages: [] });
+  assert.equal(res.status, 502);
+  const settled = callRecords(s.ledger, 'settled');
+  assert.equal(settled.length, 1, 'settled, not failed-free');
+  assert.equal(settled[0].usageMissing, true);
+  assert.equal(settled[0].costMicro, callRecords(s.ledger, 'pending')[0].worstMicro);
+  assert.equal(callRecords(s.ledger, 'failed').length, 0);
+});
+
+test('a plain answer over the response limit is cut: 502, worst case, nothing relayed', async (t) => {
+  const s = await setup(t, { behavior: { padBytes: 300_000 }, limits: { maxResponseBytes: 5_000 } });
+  const { baseUrl } = s.open();
+  const res = await chat(baseUrl, { messages: [] });
+  assert.equal(res.status, 502);
+  assert.deepEqual(await res.json(), { error: { message: 'upstream unavailable' } });
+  const settled = callRecords(s.ledger, 'settled');
+  assert.equal(settled[0].reason, 'response_too_large');
+  assert.equal(settled[0].costMicro, callRecords(s.ledger, 'pending')[0].worstMicro);
+});
+
+test('a chunked upload with no content-length is counted in total and refused with 413', async (t) => {
+  const s = await setup(t, { limits: { maxRequestBytes: 64 * 1024 } });
+  const { baseUrl } = s.open();
+  const u = new URL(`${baseUrl}/chat/completions`);
+  const status = await new Promise((resolve, reject) => {
+    const r = http.request({ host: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json', 'transfer-encoding': 'chunked' } }, (rs) => {
+      resolve(rs.statusCode);
+      rs.resume();
+    });
+    r.on('error', reject);
+    const piece = `${'x'.repeat(40 * 1024)}`;
+    r.write('{"messages":[{"role":"user","content":"');
+    r.write(piece);
+    r.write(piece);
+    r.end(piece + '"}]}');
+    setTimeout(() => r.destroy(), 4000).unref();
+  });
+  assert.equal(status, 413);
+  assert.equal(s.model.requests.length, 0);
 });
