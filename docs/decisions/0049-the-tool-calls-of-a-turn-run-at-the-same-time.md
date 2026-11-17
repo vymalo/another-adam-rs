@@ -69,7 +69,11 @@ at once, or "interrupted" answers (adam replays).
    `FnTool::with_access` declare it for a function. `read` and `write` use `files`, or `files/<normalised path>` with `path`
    (lexical normalisation: `./` dropped, `a/./b` folded; an absolute path or one with `..` widens to `files`). A wrapper must
    forward `access`, as it forwards `asks_user`; one that does not makes the tool `Alone`, which is safe. The class is on
-   `Tool`, not in `ToolSpec`, which is the model-facing type with public fields.
+   `Tool`, not in `ToolSpec`, which is the model-facing type with public fields. `ToolAccess` and `Use` are
+   `#[non_exhaustive]` **on purpose, and unlike the closed enums of `CLAUDE.md` Rule 3** (`Role`, `Placement`,
+   `ClaimScope`): a new class or a new field of a use must not break every tool author's build, and a consumer that
+   matches `ToolAccess` has no reason to fail to compile on a new variant (it treats an unknown one as `Alone`).
+   `UseMode` is closed (`Read`, `Write`): a third mode would change what conflicts, so every consumer must see it.
 3. **A tool that declares nothing is `Alone`** (fail closed): it is code adam does not know, and one attribute opts in. Every
    first-party tool declares its class (slices P7 and P8). MCP tools are `Independent` by default, with `"parallel": false`
    per server in `mcp.json` to make them `Alone` (slice P7).
@@ -89,8 +93,9 @@ at once, or "interrupted" answers (adam replays).
 7. **Results go back in the model's order.** Messages, artifacts, the file budget, kept outputs, the plan and the doom-loop
    count are applied **in call order** after the segment, whatever order the calls finished in. Step events are said live: a
    `running` event when a call actually starts and its end when it finishes, both with the call's id; if applying the result
-   changes the outcome (a file refused by the budget), a corrected end event follows. The room for kept outputs and the image
-   gate are one budget for the segment and are enforced again when results are applied.
+   changes the outcome (a file refused by the budget), a corrected end event follows. The room for kept outputs, the room
+   for files (`ToolCtx::spend_files`) and the image gate are one budget for the segment and are enforced again when
+   results are applied.
 8. **A crash in the middle of a segment** replays the same seqs: recorded calls are not run again and unrecorded calls run
    again (at-least-once, as today). A `Read` is harmless to repeat, a `Write` must be retry-safe (the coder's write tools
    are), an `Independent` call has the contract of one MCP call today, and an `Alone` call is alone, so at most one is in
@@ -101,7 +106,8 @@ at once, or "interrupted" answers (adam replays).
    the same model turn that ran before it"; it now says every call of the turn that started in the failed try.)
 10. **A cancel** is checked before each start. Calls not yet started never start. Running calls have the run's token, as
     today, and the loop waits up to `TOOL_STOP_GRACE` (5 s) for them, then drops their futures and fails the run `cancelled`.
-11. **A call that cannot run in a segment of several** and still returns `NeedsInput` or `Await*` there (a declaration bug) is
+11. **A call that cannot run in a segment of several** and still returns `NeedsInput`, `Await*` or a result with
+    `reported` rounds there (a declaration bug; `ToolOutput::reported` is honoured only from tools that run alone) is
     answered with an error result, "this tool cannot run alongside others: call it alone". The outcome is recorded, so a replay
     agrees, and a test catches the bug.
 12. **Sync on demand** is a reserved optional boolean argument, `after_previous`, injected into every schema when the limit is
