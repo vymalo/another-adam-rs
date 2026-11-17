@@ -348,14 +348,14 @@ test('run: the exit is budget_hit or stopped_by_cap when the meter refused, fail
 });
 
 /** A container that does not end by itself, and ends when it is stopped (or, if `onKill` says so, when it is killed). */
-function hold(containers, { endsOnTerm = false } = {}) {
+function hold(containers, { endsOnTerm = false, code = null } = {}) {
   let release;
   const held = new Promise((r) => (release = r));
   const real = containers.onRun;
   containers.onRun = async (spec, i) => {
     if (spec.script.includes(' run --standalone ')) {
       await held;
-      return { exitCode: endsOnTerm ? 143 : 137, timedOut: false };
+      return { exitCode: code ?? (endsOnTerm ? 143 : 137), timedOut: false };
     }
     return real(spec, i);
   };
@@ -390,6 +390,20 @@ test('defect 4: a container that ends on SIGTERM within the grace is not force-s
   const r = await agent.run(ctx);
   assert.equal(r.exit, 'timeout');
   assert.deepEqual(containers.stopped, [], 'no forced stop: it ended within the grace');
+});
+
+test('defect 4: a run that exits 0 after the polite stop at the limit is still a timeout, and the stop came at the limit, not later', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  ctx.limits = { ...LIMITS, limitMs: 300, cancelGraceMs: 5000 };
+  hold(containers, { endsOnTerm: true, code: 0 });
+  const killedAt = [];
+  const kill = containers.kill.bind(containers);
+  containers.kill = async (n, sig) => (killedAt.push(Date.now()), kill(n, sig));
+  await agent.prepare(ctx);
+  const started = Date.now();
+  const r = await agent.run(ctx);
+  assert.equal(r.exit, 'timeout', 'the time limit fired: a clean exit after it does not make the run done');
+  assert.ok(killedAt[0] - started >= 280 && killedAt[0] - started < 500, `SIGTERM at the limit (${killedAt[0] - started} ms)`);
 });
 
 test('defect 4: a refusal of the meter ends the run in the same way: SIGTERM, the grace, a forced stop; budget_hit, not a timeout', async (t) => {
