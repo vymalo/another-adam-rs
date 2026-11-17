@@ -4,6 +4,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -279,50 +280,97 @@ impl Ctx {
         Fut: Future<Output = Result<T, E>> + Send,
     {
         let seq = self.seq;
-        let entry = match self
+        let recorded = self.recorded_at(seq, name).await?;
+        let outcome = settle(&self.store, self.run, seq, name, recorded, f).await?;
+        self.seq = seq + 1;
+        Ok(outcome)
+    }
+
+    /// Take the next `names.len()` seqs, in order, for steps that will run at the same time:
+    /// `seq` `k .. k+n-1` for `names[0] .. names[n-1]`, and the next [`step`](Self::step) takes
+    /// `k+n` whichever of them finishes first.
+    ///
+    /// The journal is read at each seq now, so a recorded name that differs from the one asked for
+    /// fails at once with [`AgentError::NonDeterminism`] and takes nothing. Each [`ReservedStep`]
+    /// then runs with the contract of [`step`](Self::step): the recorded outcome if there is one,
+    /// else `f`, recorded at the step's own seq. A step that is reserved and never run leaves a
+    /// gap in the journal; that happens only when the transition fails anyway (a cancel, an
+    /// error), and the replay fills it.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::NonDeterminism`] as above; a store failure is [`AgentError::Store`].
+    pub async fn reserve_steps(
+        &mut self,
+        names: &[String],
+    ) -> Result<Vec<ReservedStep>, AgentError> {
+        let mut reserved = Vec::with_capacity(names.len());
+        for (offset, name) in names.iter().enumerate() {
+            let seq = self.seq + offset as u64;
+            let recorded = self.recorded_at(seq, name).await?;
+            reserved.push(ReservedStep {
+                run: self.run,
+                seq,
+                name: name.clone(),
+                recorded,
+                store: self.store.clone(),
+            });
+        }
+        self.seq += names.len() as u64;
+        Ok(reserved)
+    }
+
+    /// Run `steps` (a name and the work of each) at most `at_once` at a time, at seqs reserved in
+    /// the order given ([`reserve_steps`](Self::reserve_steps)), and return their outcomes **in the
+    /// order given**, whichever finished first. Each is recorded as it finishes; a replay returns
+    /// what is recorded and runs only the rest (at-least-once, as [`step`](Self::step)). An
+    /// `at_once` of `0` is `1`.
+    ///
+    /// The first runtime error (a journal failure, a `NonDeterminism`) is returned and the steps
+    /// still running are dropped, which is the failure of the transition.
+    ///
+    /// # Errors
+    ///
+    /// As [`reserve_steps`](Self::reserve_steps) and [`step`](Self::step).
+    pub async fn step_all<T, E, F, Fut>(
+        &mut self,
+        steps: Vec<(String, F)>,
+        at_once: usize,
+    ) -> Result<Vec<Result<T, E>>, AgentError>
+    where
+        T: Serialize + DeserializeOwned,
+        E: Serialize + DeserializeOwned,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
+        let names: Vec<String> = steps.iter().map(|(name, _)| name.clone()).collect();
+        let reserved = self.reserve_steps(&names).await?;
+        let runs = reserved
+            .into_iter()
+            .zip(steps)
+            .map(|(step, (_, f))| step.run(f));
+        futures::stream::iter(runs)
+            .buffered(at_once.max(1))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// What the journal holds at `seq`, for the step `name`: `None` when nothing is recorded yet.
+    async fn recorded_at(&self, seq: u64, name: &str) -> Result<Option<JournalEntry>, AgentError> {
+        let found = self
             .store
             .journal_get(self.run, seq)
             .await
-            .map_err(store_error)?
-        {
-            Some(entry) => {
-                if entry.name != name {
-                    return Err(AgentError::non_determinism(format!(
-                        "run {} step {seq}: journal has {:?}, code asked for {name:?}",
-                        self.run, entry.name
-                    )));
-                }
-                entry
-            }
-            None => {
-                let (ok, payload) = match f().await {
-                    Ok(v) => (true, serde_json::to_value(&v)),
-                    Err(e) => (false, serde_json::to_value(&e)),
-                };
-                let payload = payload.map_err(|e| {
-                    AgentError::permanent(format!("step {name:?} result is not serializable"))
-                        .with_source(e)
-                })?;
-                let entry = if ok {
-                    JournalEntry::ok(seq, name, payload)
-                } else {
-                    JournalEntry::err(seq, name, payload)
-                };
-                self.store
-                    .journal_put(self.run, entry)
-                    .await
-                    .map_err(store_error)?
-            }
-        };
-        let decoded = decode::<T, E>(&entry).map_err(|e| {
-            AgentError::non_determinism(format!(
-                "run {} step {seq} ({name:?}): recorded result does not decode",
-                self.run
-            ))
-            .with_source(e)
-        })?;
-        self.seq = seq + 1;
-        Ok(decoded)
+            .map_err(store_error)?;
+        match found {
+            Some(entry) if entry.name != name => Err(AgentError::non_determinism(format!(
+                "run {} step {seq}: journal has {:?}, code asked for {name:?}",
+                self.run, entry.name
+            ))),
+            other => Ok(other),
+        }
     }
 
     /// Drain the inbound messages delivered before this transition started
@@ -508,6 +556,106 @@ impl Ctx {
     /// task. See [`Emitter`].
     pub fn emitter(&self) -> Emitter {
         self.emitter.clone()
+    }
+}
+
+/// The outcome of the step `name` at `seq`: `recorded` if the journal had it, else `f`'s, written
+/// first. If two workers race, the first recording wins and both see it.
+async fn settle<T, E, F, Fut>(
+    store: &DynStore,
+    run: RunId,
+    seq: u64,
+    name: &str,
+    recorded: Option<JournalEntry>,
+    f: F,
+) -> Result<Result<T, E>, AgentError>
+where
+    T: Serialize + DeserializeOwned,
+    E: Serialize + DeserializeOwned,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<T, E>> + Send,
+{
+    let entry = match recorded {
+        Some(entry) => entry,
+        None => {
+            let (ok, payload) = match f().await {
+                Ok(v) => (true, serde_json::to_value(&v)),
+                Err(e) => (false, serde_json::to_value(&e)),
+            };
+            let payload = payload.map_err(|e| {
+                AgentError::permanent(format!("step {name:?} result is not serializable"))
+                    .with_source(e)
+            })?;
+            let entry = if ok {
+                JournalEntry::ok(seq, name, payload)
+            } else {
+                JournalEntry::err(seq, name, payload)
+            };
+            store.journal_put(run, entry).await.map_err(store_error)?
+        }
+    };
+    decode::<T, E>(&entry).map_err(|e| {
+        AgentError::non_determinism(format!(
+            "run {run} step {seq} ({name:?}): recorded result does not decode"
+        ))
+        .with_source(e)
+    })
+}
+
+/// A step whose seq [`Ctx::reserve_steps`] took: owned, so several can run at the same time while
+/// the `Ctx` is free again.
+#[must_use = "a reserved step that is never run leaves a gap in the journal"]
+pub struct ReservedStep {
+    run: RunId,
+    seq: u64,
+    name: String,
+    recorded: Option<JournalEntry>,
+    store: DynStore,
+}
+
+impl std::fmt::Debug for ReservedStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReservedStep")
+            .field("run", &self.run)
+            .field("seq", &self.seq)
+            .field("name", &self.name)
+            .field("recorded", &self.recorded.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReservedStep {
+    /// The journal seq this step records at.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The name this step records under.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Whether the journal held an outcome for this step when it was reserved: [`run`](Self::run)
+    /// then returns it without running anything.
+    pub fn is_recorded(&self) -> bool {
+        self.recorded.is_some()
+    }
+
+    /// The step's outcome: the recorded one, or `f`'s, recorded at this step's seq. The contract
+    /// is [`Ctx::step`]'s, including the at-least-once effect and a recorded result that no longer
+    /// decodes being [`AgentError::NonDeterminism`].
+    ///
+    /// # Errors
+    ///
+    /// The outer `Result` is the runtime's (journal I/O); the inner one is the step's own outcome.
+    pub async fn run<T, E, F, Fut>(self, f: F) -> Result<Result<T, E>, AgentError>
+    where
+        T: Serialize + DeserializeOwned,
+        E: Serialize + DeserializeOwned,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+    {
+        settle(&self.store, self.run, self.seq, &self.name, self.recorded, f).await
     }
 }
 
@@ -700,6 +848,167 @@ mod tests {
             ctx.child_state(stranger.id).await,
             Err(AgentError::Permanent { .. })
         ));
+    }
+
+    /// A fresh `Ctx` of the run `run` on `store`, as the runtime builds one at `seq`.
+    fn ctx_on(store: &DynStore, run: RunId, seq: u64) -> Ctx {
+        Ctx::new(CtxParts {
+            run,
+            agent: "a".into(),
+            conversation_id: None,
+            attempt: 0,
+            seq,
+            inbox: Vec::new(),
+            store: store.clone(),
+            sink: Arc::new(CollectingSink::new()),
+            clock: Arc::new(SystemClock),
+            cancel: CancelToken::new(),
+            runtime: Runtime::builder(store.clone()).build(),
+        })
+    }
+
+    fn names(of: &[&str]) -> Vec<String> {
+        of.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn reserved_steps_take_consecutive_seqs_and_the_next_step_follows_them() {
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        let reserved = ctx
+            .reserve_steps(&names(&["a", "b", "c"]))
+            .await
+            .expect("reserve");
+        let seqs: Vec<(u64, &str)> = reserved.iter().map(|r| (r.seq(), r.name())).collect();
+        assert_eq!(seqs, vec![(0, "a"), (1, "b"), (2, "c")]);
+        assert!(reserved.iter().all(|r| !r.is_recorded()));
+        assert_eq!(ctx.seq, 3);
+        let next: Result<Result<u8, String>, AgentError> =
+            ctx.step("d", || async { Ok(4) }).await;
+        assert_eq!(next.expect("step").expect("inner"), 4);
+        let journal = ctx.store.journal_list(ctx.run_id()).await.expect("journal");
+        assert_eq!(
+            journal.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3],
+            "the reserved steps were never run: a gap, and `d` at k+n"
+        );
+        for r in reserved {
+            let _: Result<u8, String> = r.run(|| async { Ok(1) }).await.expect("run");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recorded_name_that_differs_fails_at_the_reservation_and_takes_nothing() {
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        ctx.store
+            .journal_put(ctx.run_id(), JournalEntry::ok(1, "other", serde_json::json!(1)))
+            .await
+            .expect("seed");
+        let refused = ctx.reserve_steps(&names(&["a", "b", "c"])).await;
+        assert!(matches!(refused, Err(AgentError::NonDeterminism { .. })));
+        assert_eq!(ctx.seq, 0, "nothing was taken");
+    }
+
+    #[tokio::test]
+    async fn after_a_crash_the_replay_runs_only_the_steps_that_were_not_recorded() {
+        let sink = CollectingSink::new();
+        let first = ctx(&sink).await;
+        let (store, run) = (first.store.clone(), first.run_id());
+        let runs = Arc::new(Mutex::new(Vec::<&str>::new()));
+        let work = |name: &'static str, runs: Arc<Mutex<Vec<&'static str>>>| {
+            move || async move {
+                runs.lock().unwrap_or_else(PoisonError::into_inner).push(name);
+                Ok::<u8, String>(1)
+            }
+        };
+        // The first try records the second step only, then dies.
+        let mut ctx = first;
+        let mut reserved = ctx
+            .reserve_steps(&names(&["a", "b", "c"]))
+            .await
+            .expect("reserve");
+        let b = reserved.remove(1);
+        b.run(work("b", runs.clone())).await.expect("b").expect("ok");
+        drop(reserved);
+
+        let mut replay = ctx_on(&store, run, 0);
+        let reserved = replay
+            .reserve_steps(&names(&["a", "b", "c"]))
+            .await
+            .expect("reserve again");
+        assert_eq!(
+            reserved.iter().map(ReservedStep::is_recorded).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+        for (r, name) in reserved.into_iter().zip(["a", "b", "c"]) {
+            r.run(work(name, runs.clone())).await.expect("run").expect("ok");
+        }
+        assert_eq!(
+            *runs.lock().unwrap_or_else(PoisonError::into_inner),
+            vec!["b", "a", "c"],
+            "`b` ran once; the replay ran the gaps"
+        );
+        let journal = store.journal_list(run).await.expect("journal");
+        assert_eq!(
+            journal.iter().map(|e| (e.seq, e.name.as_str())).collect::<Vec<_>>(),
+            vec![(0, "a"), (1, "b"), (2, "c")]
+        );
+    }
+
+    #[tokio::test]
+    async fn step_all_returns_the_outcomes_in_the_order_given_and_records_at_reserved_seqs() {
+        tokio::time::pause();
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        let delays = [30u64, 20, 10];
+        let steps: Vec<(String, _)> = delays
+            .iter()
+            .enumerate()
+            .map(|(i, ms)| {
+                let ms = *ms;
+                (format!("s{i}"), move || async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    Ok::<u64, String>(ms)
+                })
+            })
+            .collect();
+        let started = tokio::time::Instant::now();
+        let out = ctx.step_all(steps, 10).await.expect("step_all");
+        assert_eq!(out, vec![Ok(30), Ok(20), Ok(10)]);
+        assert!(
+            (30..40).contains(&started.elapsed().as_millis()),
+            "all three ran at once: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(ctx.seq, 3);
+        let journal = ctx.store.journal_list(ctx.run_id()).await.expect("journal");
+        assert_eq!(
+            journal.iter().map(|e| (e.seq, e.name.as_str())).collect::<Vec<_>>(),
+            vec![(0, "s0"), (1, "s1"), (2, "s2")]
+        );
+    }
+
+    #[tokio::test]
+    async fn step_all_runs_at_most_at_once_at_a_time() {
+        tokio::time::pause();
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        let steps: Vec<(String, _)> = (0..4)
+            .map(|i| {
+                (format!("s{i}"), || async {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    Ok::<u8, String>(1)
+                })
+            })
+            .collect();
+        let started = tokio::time::Instant::now();
+        ctx.step_all(steps, 2).await.expect("step_all");
+        assert!(
+            (20..30).contains(&started.elapsed().as_millis()),
+            "two at a time: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

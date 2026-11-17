@@ -22,7 +22,7 @@ over A2A).
 | `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is (new: a starter whose state was only `Serialize` must derive `Deserialize` too, because it reads the prior state). See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
-| `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
+| `Ctx`, `Emitter`, `ReservedStep` | `Ctx::step` journals a side effect's outcome; `Ctx::reserve_steps(&names)` takes the next seqs in order for steps that run at the same time (each `ReservedStep` has `seq()`, `name()`, `is_recorded()` and `run(f)`, with `step`'s contract), and `Ctx::step_all(steps, at_once)` runs them at most `at_once` at a time and returns the outcomes in the order given (see *Steps that run at the same time*); `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead, and `Ctx::read_already(&ids)` names the messages the run has read, whose copies are not counted (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children and `Ctx::child_state(run)` its agent's own state (both live reads of the run's own children only), and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
 | `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_child_continuing`, `list_sessions`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`). `RunView::claimed` is true while a worker holds an unexpired lease on a runnable run (read with `Store::lease_until` against the runtime's clock, before the record, so a step that commits and releases between the two reads never reads as unclaimed at version 1): the first step of a run commits nothing until it ends, and this is how a reader, in any process, tells a run being stepped from one nobody has taken |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
@@ -473,6 +473,24 @@ layer only; the run's stored failure text is a boundary, so the worker flattens
 error the worker leaves to its lease, is logged with `adam_error::report`
 (the second also with its class and `alert`).
 
+## Steps that run at the same time
+
+[`Ctx::step`] takes `&mut self`, so two steps cannot overlap. An agent that runs several side effects at once (the
+tool calls of one model turn, [ADR 0049](../../docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md))
+reserves their seqs first and runs them after:
+
+* `Ctx::reserve_steps(&names)` takes seqs `k .. k+n-1` in order and moves the `Ctx` to `k+n`, so the next `step` is
+  at `k+n` whichever reserved step finishes first. It reads the journal at each seq at once: a recorded name that
+  differs is `NonDeterminism` there and nothing is taken.
+* Each `ReservedStep` is owned (no borrow of the `Ctx`). `run(f)` is `step`'s contract: the recorded outcome, or `f`
+  recorded at the step's own seq (`journal_put` takes seqs in any order; the first writer wins).
+* `Ctx::step_all(steps, at_once)` is the convenience form: `at_once` at a time, outcomes in the order given.
+* A reserved step that is never run leaves a gap. That happens only when the transition fails (a cancel, an error),
+  and the replay fills it. After a crash the unrecorded steps run again (at-least-once, as for `step`).
+
+Because the names and seqs depend only on the order of the reservation, the journal of a batch equals the one a
+sequential run writes, so a replay works whatever concurrency each side used.
+
 ## Features and environment
 
 No Cargo features, no environment variables at runtime.
@@ -494,7 +512,9 @@ steps on one worker only) and its control
 `a_claimed_run_says_so_before_its_first_commit` (`RunView::claimed` is false before a worker takes a run, true while its first step is in the air with nothing committed, false once done, and the first claim is announced once, right after the start, not the claim of the second step) and `a_lease_that_ran_out_is_not_a_claim` (a `ManualClock` moves past the lease under a gated step: the view reads unclaimed), `a_step_that_outlives_its_lease_is_not_claimed_again_by_its_worker` (a lease lapses under a gated step and
 whole claim passes follow: `FaultyStore::claimed` says the store handed the run out once, and the step ran once), and the two
 `notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline, and the child-run cases: `a_finished_child_wakes_its_parent_once`, `a_lost_notice_is_recovered_by_the_timer`, `a_parent_that_loses_its_lease_does_not_start_or_resume_twice` and the rest, which use gates, a `ManualClock` and `FaultyStore::fail_run` and never sleep for a fixed time) run against `MemoryStore` always,
-against PostgreSQL and against MongoDB when their variables are set. Unit
+against PostgreSQL and against MongoDB when their variables are set. `tests/step_all.rs` runs steps that finish in
+reverse at the seqs of the sequential journal, and `ctx.rs` has the reservation cases (consecutive seqs, a wrong name
+takes nothing, a replay after a crash runs only the unrecorded steps, a gap is filled, `step_all` timing and limit). Unit
 tests sit in `src/cancel.rs`, `erased.rs` (an override reaches an agent and a starter, the default is `init`, a prior state that does not decode falls back to `init`), `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs` (`emit_for` reaches the other run and records no artifact, `child_state` reads the run's own children only), `events.rs`, `file.rs` (images by their first bytes, a claim that stands and every way the bytes overrule it, the extension table, the shared line and its sizes, `ReceivedFiles`: names, types, the caps, refusals), `usage.rs` (a report within its bounds, totals one entry per provider and model and at most 32), `step.rs` (the words of the kinds, states and icons are the contract's, a step is made within its bounds on a character boundary, the serde shape leaves out what a step does not say), `notify.rs` and `retry.rs`, and the
 class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 (`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
