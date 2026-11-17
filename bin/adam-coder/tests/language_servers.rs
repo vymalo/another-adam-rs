@@ -522,6 +522,30 @@ async fn indexing_past_the_wait_gives_a_partial_result_and_the_next_call_finds_t
 }
 
 #[tokio::test]
+async fn a_server_that_reports_its_status_is_not_ready_until_it_says_it_is_quiescent() {
+    // Not a `$/progress` in sight: only `experimental/serverStatus`, as rust-analyzer says it.
+    let lsp = Lsp::new(json!({"status_ms": 3000, "diagnostics": [diag(1, 0, 0, "early")]})).await;
+    rust_project(&lsp);
+    let first = lsp
+        .diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
+        .await;
+    assert!(
+        first.content.starts_with("[still indexing after 1 s"),
+        "{}",
+        first.content
+    );
+    let second = lsp
+        .diagnostics(json!({"path": "src/lib.rs", "wait": 30}))
+        .await;
+    assert!(
+        !second.content.contains("still indexing"),
+        "{}",
+        second.content
+    );
+    assert!(second.content.contains("early"), "{}", second.content);
+}
+
+#[tokio::test]
 async fn a_server_that_crashes_mid_request_is_reported_with_its_scrubbed_stderr_and_started_again()
 {
     let lsp = Lsp::new(json!({
@@ -566,6 +590,25 @@ async fn a_server_that_crashes_mid_request_is_reported_with_its_scrubbed_stderr_
     );
     assert_eq!(lsp.servers().len(), 1);
     assert_eq!(lsp.logged("initialize").len(), 2);
+}
+
+#[tokio::test]
+async fn only_the_last_16_kib_of_a_servers_stderr_are_kept_and_shown_when_it_dies() {
+    let lsp = Lsp::new(json!({
+        "crash_on_request": 1,
+        "crash_stderr": format!("{}{}", "a".repeat(40_000), "THE-END-OF-STDERR"),
+    }))
+    .await;
+    rust_project(&lsp);
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": "src/lib.rs", "line": 1, "symbol": "first"}),
+        )
+        .await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(out.content.contains("THE-END-OF-STDERR"), "{}", out.content);
+    assert!(out.content.len() < 6000, "{} bytes", out.content.len());
 }
 
 #[tokio::test]
@@ -660,6 +703,7 @@ async fn a_server_that_does_not_answer_initialize_does_not_start_and_nothing_is_
         kill_wait: Duration::from_secs(5),
         hide: Vec::new(),
         init_timeout: Duration::from_secs(1),
+        redactor: adam_coder::Redactor::default(),
     };
     let failed = env
         .commands
