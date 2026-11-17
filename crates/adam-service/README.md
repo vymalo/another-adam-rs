@@ -78,7 +78,7 @@ role. Secrets are `SecretString`s and never in `Debug` output.
 
 ## Images
 
-`MODEL_INPUT_MODALITIES` (`text` or `text,image`), `MODEL_IMAGE_MAX_BYTES` (1 to 4,194,304; default 1 MiB), `MODEL_IMAGE_MAX_COUNT` (1 to 32; 8), `MODEL_IMAGE_MAX_SIDE` (64 to 16,384; 4,096) and `MODEL_IMAGE_SOURCES` (a subset of `person`, `workspace`, `mcp`; `person,workspace`) become `ModelConfig::images` and, through `ModelConfig::client`, `OpenAiCompatible::with_input_modalities` for the alias `MODEL` only. An image variable set while the modalities lack `image` is a startup problem that names it (exit 78), and so is `MODEL_OUTPUT_MODALITIES` with `image` (not built for any provider). `ModelConfig` gains a field: a literal of it needs `images: None`. The table is [environment](../../docs/reference/environment.md).
+`MODEL_INPUT_MODALITIES` (`text` or `text,image`), `MODEL_IMAGE_MAX_BYTES` (1 to 4,194,304; default 1 MiB), `MODEL_IMAGE_MAX_COUNT` (1 to 32; 8), `MODEL_IMAGE_MAX_SIDE` (64 to 16,384; 4,096) and `MODEL_IMAGE_SOURCES` (a subset of `person`, `workspace`, `mcp`; `person,workspace`) become `ModelConfig::images` and, through `ModelConfig::client`, `OpenAiCompatible::with_input_modalities` for the alias `MODEL` only. An image variable set while the modalities lack `image` is a startup problem that names it (exit 78), and so is `MODEL_OUTPUT_MODALITIES` with `image` (not built for any provider) and `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` over 32 MiB (`IMAGE_REQUEST_MAX_BYTES`: a request resends every admitted image; the message names both). `ModelConfig` gains a field: a literal of it needs `images: None`. The table is [environment](../../docs/reference/environment.md).
 
 ## The process
 ## The process

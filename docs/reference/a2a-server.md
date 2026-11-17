@@ -388,7 +388,11 @@ A message may carry pictures as standard A2A file parts. **Off by default**: wit
 | any other `raw` part (a PDF; an SVG is text) | the line `[attached: report.pdf (pdf, 84.0 KiB); only images are read]` |
 | a `url` part | the line `[linked: <url>]`: **a link is never fetched** |
 
-A message that is only a picture is accepted. A file name and a media type are untrusted: they are cut to letters, digits and `._-() ` and to a `type/subtype` before any line quotes them.
+A message that is only a picture is accepted. **A message whose only part is a file that is not a picture** (a PDF) used to be `invalid params` (no text); it is now a message of one line, `[attached: ...; only images are read]`, so the person is told and the task goes on. This holds for every host that reads messages with `default_inbound` or `vymalo_inbound`.
+
+A file name and a media type are untrusted. A name the system prints is a file name and nothing else: letters, digits, `.`, `_` and `-`, every other character replaced by `_`, at most 64 characters (`adam_runtime::safe_file_name`), so a sentence, a path or a command a sender wrote as a "name" is not one. A type is cut to a `type/subtype` token.
+
+**These lines are the framework's words**, built by `adam_runtime::SystemLine` and recognised by `adam_runtime::is_system_line`. A reader of the person's words skips them: they name no repository, are no command and answer no form, whatever a sender put in a name or a link. The agent may still show or open a link with its own tools.
 
 ```mermaid
 sequenceDiagram
@@ -405,18 +409,28 @@ sequenceDiagram
     L->>K: keep scope sha256 bytes
     Note over L: the step records only ImageRefs and stand-in lines
     L->>L: absorb_inbox, a user message of text and image refs
-    L->>K: model_turn loads the bytes of the history images
+    L->>L: model_turn for_sending, what each image is sent as now
+    L->>K: model_turn loads the bytes of the images it sends
     L->>M: complete with request image_data
-    M-->>L: answer
+    alt the provider answers
+        M-->>L: answer
+    else the provider refuses the request itself
+        M-->>L: error of class Invalid
+        L->>L: refused_with_images records lines for the new images, next transition asks again
+    end
 ```
 
 ```mermaid
 stateDiagram-v2
     [*] --> Offered
-    Offered --> StandIn: model cannot see, source, type, size, side, count
+    Offered --> StandIn: the gate check, model cannot see, source, type, size, side, count
     Offered --> Admitted: the gate says yes
+    Admitted --> StandIn: no room, the keeper refused (admit_inbound, keep_image)
     Admitted --> Kept: keep (store or state)
     Kept --> Sent: every request names it
+    Sent --> StandIn: the settings changed (for_sending), or the provider refused the request (refused_with_images)
+    Sent --> NotLoaded: the bytes are gone or fail their hash (image_data)
+    NotLoaded --> Sent: the bytes are back
     Sent --> Removed: shortening of an old tool result
     Sent --> Summarised: compaction drops its turn
     StandIn --> [*]
@@ -424,9 +438,22 @@ stateDiagram-v2
     Summarised --> [*]
 ```
 
+The states that are lines: `StandIn` is written once into the history (the record says why); a change of the **settings** (`for_sending`) is said in every request and recorded nowhere, and `NotLoaded` is the client's line `could not be loaded; read it again`, for bytes that are gone or fail their hash and for nothing else.
+
 * **Admitted once, recorded.** The decision is a journaled step per message (`image:start` for the start message, `image:<message id>` for a later one) and lives in the history as an `ImageRef` (SHA-256, type, size, dimensions, origin), so a replay, another worker and every later turn send the same images and each request's prompt starts with the one before it. A message with no picture is read as it always was.
 * **The size is read from the header** (`adam_runtime::image_size`: PNG, JPEG, GIF, WebP; a hand-written reader with bounded loops). An image is never decoded or resized.
-* **Where the bytes are.** Never in the history or the journal. The coder keeps them on its volume per conversation ([`coder-agent.md`](coder-agent.md#images)); an agent that is only a folder keeps them in the run's state, base64, within the 4 MiB it shares with kept outputs, and its tool steps journal the bytes of a kept image as they journal a kept output.
+* **Where the bytes are, for how long, under which bound.** Never in the history. Per agent:
+
+  | Agent | The bytes are in | Until | Bound |
+  |---|---|---|---|
+  | any | the inbound message in the inbox, and `Conversation::pending_images` for the start message | the first step that reads it | 4 images and 2 MiB a message |
+  | the coder (it has an `ImageStore`) | files on its volume, per conversation | the janitor removes the scope ([the coder](coder-agent.md#images)) | 4 MiB an image, 64 MiB a scope; **nothing in the journal and nothing in the state** after the first step |
+  | a folder agent (no store) | the run's state, base64, and the journal of the tool step that kept them (as a kept output) | the state: until no message names the image; the journal: for good | the state: the 4 MiB it shares with kept outputs; the journal: `MAX_RUN_JOURNALED_IMAGE_BYTES` (6 MiB, a run's budget of file bytes) over the whole run, never freed by a shortening or a compaction, then an image is a line that says the run has kept as many image bytes as it may |
+  | a tool's image with `files: true` (MCP) | also a file artifact, journaled as every artifact is, with the same SHA-256 | as an artifact | the artifact bounds |
+
+  A request resends every image the history holds, so `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` may be at most 32 MiB (over it is exit 78).
+* **What is sent follows the settings now.** Whether an image is sent is decided each time a request is built, from the reference and the deployment's settings, and nothing about it is recorded: an image whose source is no longer in `MODEL_IMAGE_SOURCES`, that is over the byte limit now, or for a model that no longer sees, is a line that says the true reason (`this deployment no longer sends images from mcp`, `it is over the 1.0 MiB this deployment sends`, `this model cannot see images`). While the settings stay every request says the same, so the prefix holds; **a change of settings changes the prompt once**.
+* **A request the provider refuses.** When a model request fails for itself (the class `Invalid`: not its length, its credentials or a limit) and it carries images no earlier request carried, those images are recorded as lines (`the model's service refused the request that carried it`) and the request is sent again. An image an earlier request carried successfully is never touched, and with no new image the failure is what it was. The prompt changes once, and it is recorded.
 * **An answer to a question** (`ask_user`) may carry pictures: they are the images of the tool result.
 * **On the wire** an image is a `data:` URL part of a user message (`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`, no `detail`); a message with no picture is still a string. A tool's pictures follow the run of tool messages in one user message, `Images from tool results: <call id> <name>; ...`. Both shapes are *unverified* on every provider, the platform's own OpenAI-compatible gateway (the first provider the owner named, 2026-11-16) included, until tried against it ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)).
 

@@ -69,7 +69,7 @@ The persisted JSON shapes of `Message` are shown in the crate docs
 
 ## Images
 
-A message names an image by reference and never holds its bytes (ADR 0044 slice 15a).
+A message names an image by reference and never holds its bytes (ADR 0044).
 
 | Item | What |
 |---|---|
