@@ -142,3 +142,85 @@ test('the command line exits 78 on a bad configuration and names the field, neve
   assert.equal(ok.status, 0);
   assert.doesNotMatch(ok.stdout, /example-model/);
 });
+
+// ---- fix round: rows 3 (key), 4, 5, 6, 11, 12 of the review ----
+
+test('row 4: a directory that merely starts with two dots is inside the repository, not outside it', (t) => {
+  const repo = fakeRepo(t);
+  fs.mkdirSync(path.join(repo, '..cfg'));
+  const file = path.join(repo, '..cfg', 'config.json');
+  assert.throws(() => assertOutsideRepo(file, 'BENCH_CONFIG', [repo]), (e) => e instanceof ConfigError && /repository/.test(e.message));
+  // a sibling of the repository really is outside
+  assert.doesNotThrow(() => assertOutsideRepo(path.join(path.dirname(repo), 'elsewhere', 'config.json'), 'BENCH_CONFIG', [repo]));
+});
+
+test('row 5: any path under a directory with a .git entry (directory or file) is refused, with no roots given', (t) => {
+  const repo = fakeRepo(t);
+  const deep = path.join(repo, 'a', 'b', 'config.json'); // the directories do not exist yet
+  assert.throws(() => assertOutsideRepo(deep, 'BENCH_HOME'), (e) => e instanceof ConfigError && e.field === 'BENCH_HOME' && /repository/.test(e.message));
+  assert.throws(() => assertOutsideRepo(repo, 'BENCH_HOME'), ConfigError, 'the work tree itself');
+  const worktree = tmp(t);
+  fs.writeFileSync(path.join(worktree, '.git'), 'gitdir: /somewhere/else\n'); // a linked work tree has a .git file
+  assert.throws(() => assertOutsideRepo(path.join(worktree, 'out.md'), '--out'), ConfigError);
+  const loose = tmp(t);
+  assert.doesNotThrow(() => assertOutsideRepo(path.join(loose, 'x', 'ledger.jsonl'), '--ledger'));
+  // the same through loadConfig, with no `roots` argument
+  fs.mkdirSync(path.join(repo, 'sub'));
+  const inside = path.join(repo, 'sub', 'config.json');
+  fs.writeFileSync(inside, JSON.stringify(rawConfig()));
+  assert.throws(() => loadConfig({ env: { BENCH_CONFIG: inside } }), (e) => e instanceof ConfigError && e.field === 'BENCH_CONFIG');
+});
+
+test('row 12: the report refuses --ledger and --out inside a work tree, and BENCH_HOME', (t) => {
+  const repo = fakeRepo(t);
+  const home = tmp(t);
+  const env = { ...process.env, HOME: home, BENCH_HOME: home, BENCH_CONFIG: '' };
+  const out = spawnSync(process.execPath, [BENCH, 'report', '--out', path.join(repo, 'report.md')], { env, encoding: 'utf8' });
+  assert.equal(out.status, 78, out.stderr);
+  assert.match(out.stderr, /--out/);
+  assert.ok(!fs.existsSync(path.join(repo, 'report.md')));
+  const ledger = spawnSync(process.execPath, [BENCH, 'report', '--ledger', path.join(repo, 'ledger.jsonl')], { env, encoding: 'utf8' });
+  assert.equal(ledger.status, 78, ledger.stderr);
+  assert.match(ledger.stderr, /--ledger/);
+});
+
+test('row 6: a real-looking model id and an arm option named like a counter are accepted', () => {
+  const id = 'Qwen3-Coder-480B-A35B-Instruct-FP8';
+  const c = normalizeConfig(rawConfig({ modelId: id, modelLabel: id, arms: { a: { token_budget: 5000, note: id, thinking: { budget_tokens: 2048 } } } }));
+  assert.equal(c.modelId, id);
+  assert.equal(looksLikeKey(id), true, 'the entropy rule is still a rule of looksLikeKey; it is just not applied to ids, labels and arms');
+});
+
+test('row 6: a secret-named field holding any non-empty value of any type is refused; known prefixes and long hex still are, in ids and arms', () => {
+  refused(rawConfig({ apiKey: 12345678 }), 'apiKey');
+  refused(rawConfig({ arms: { a: { password: 42 } } }), 'arms.a.password');
+  refused(rawConfig({ arms: { a: { secret: true } } }), 'arms.a.secret');
+  refused(rawConfig({ arms: { a: { auth: { nested: 'x' } } } }), 'arms.a.auth');
+  refused(rawConfig({ arms: { a: { token: 'abc' } } }), 'arms.a.token');
+  assert.doesNotThrow(() => normalizeConfig(rawConfig({ arms: { a: { token: '' } } })), 'an empty value holds no secret');
+  refused(rawConfig({ modelId: fakeKey('ghp_') }), 'modelId');
+  refused(rawConfig({ arms: { a: { note: '0123456789abcdef0123456789abcdef' } } }), 'arms.a.note');
+});
+
+test('row 11: http is for a loopback host only; anything else must be https', () => {
+  const bad = (endpoint) =>
+    assert.throws(() => normalizeConfig(rawConfig({ endpoint })), (e) => e instanceof ConfigError && e.field === 'endpoint', endpoint);
+  bad('http://models.example.test/v1');
+  bad('http://10.0.0.5/v1');
+  bad('http://127.0.0.1.example.test/v1');
+  for (const ok of ['http://127.0.0.1:8080/v1', 'http://localhost:9/v1', 'http://[::1]:9/v1', 'http://127.1.2.3/v1', 'https://models.example.test/v1']) {
+    assert.doesNotThrow(() => normalizeConfig(rawConfig({ endpoint: ok })), ok);
+  }
+});
+
+test('row 3: a key with CR, LF, a control character or a space is refused by name, never by value', () => {
+  const c = normalizeConfig(rawConfig());
+  for (const bad of ['abc\ndef', 'abc\r\ndef', 'abc def', 'abc\tdef', 'abc\u0000def', 'abc\u007fdef', ' leading', 'trailing\n']) {
+    assert.throws(
+      () => readKey(c, { BENCH_MODEL_API_KEY: bad }),
+      (e) => e instanceof ConfigError && e.exitCode === 78 && e.message.includes('BENCH_MODEL_API_KEY') && !e.message.includes('def') && !e.message.includes('leading') && !e.message.includes('trailing'),
+      JSON.stringify(bad),
+    );
+  }
+  assert.equal(readKey(c, { BENCH_MODEL_API_KEY: 'sk-abc.DEF_123' }), 'sk-abc.DEF_123');
+});

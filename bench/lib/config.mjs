@@ -57,6 +57,8 @@ export const SCHEMA = {
 /** A request field an arm may not set: they would change what is being compared or break the relay. */
 const FORBIDDEN_FRAGMENT_KEYS = new Set(['model', 'messages', 'tools', 'tool_choice', 'stream', 'stream_options', 'n']);
 const SECRET_WORDS = new Set(['key', 'apikey', 'secret', 'token', 'password', 'passwd', 'pwd', 'credential', 'credentials', 'authorization', 'bearer', 'auth', 'cookie']);
+// A secret-named field that holds a number is still a counter when the name also says what it counts.
+const COUNTER_WORDS = new Set(['budget', 'limit', 'count', 'max', 'min', 'size', 'length', 'usage', 'ttl', 'timeout', 'seconds', 'ms']);
 const KEY_PREFIXES = /^(sk-|sk_|pk-|ghp_|gho_|ghu_|ghs_|github_pat_|glpat-|xox[abprs]-|AKIA[0-9A-Z]{8}|AIza|eyJ[A-Za-z0-9_-]{10,}\.)/;
 
 function nameWords(name) {
@@ -77,20 +79,28 @@ function entropy(s) {
   return h;
 }
 
-/** Does a string look like a key? A heuristic: a known prefix, long hex, or long dense base64-like text. */
-export function looksLikeKey(s) {
+/**
+ * Does a string look like a key? A heuristic: a known prefix, long hex, or (with `dense`) long
+ * dense base64-like text. Real model ids look like the last, so `dense` is off for them.
+ */
+export function looksLikeKey(s, { dense = true } = {}) {
   if (typeof s !== 'string') return false;
   const t = s.trim();
   if (KEY_PREFIXES.test(t)) return true;
   if (/^[0-9a-fA-F]{32,}$/.test(t)) return true;
-  if (/^[A-Za-z0-9_+=-]{32,}$/.test(t) && /[0-9]/.test(t) && /[A-Za-z]/.test(t) && entropy(t) >= 4.0) return true;
+  if (dense && /^[A-Za-z0-9_+=-]{32,}$/.test(t) && /[0-9]/.test(t) && /[A-Za-z]/.test(t) && entropy(t) >= 4.0) return true;
   return false;
 }
 
-/** Walk every value but the endpoint and keyEnv; refuse a secret-named field that holds a string and any key-like string. */
+const isEmptyValue = (v) => v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0) || (isObject(v) && Object.keys(v).length === 0);
+
+/** The density rule applies everywhere but to the model id, its label and anything inside an arm. */
+const densityApplies = (where) => !(where === 'modelId' || where === 'modelLabel' || where === 'arms' || where.startsWith('arms.') || where.startsWith('arms['));
+
+/** Walk every value but the endpoint and keyEnv; refuse a secret-named field that holds anything and any key-like string. */
 function scanForSecrets(value, where, skip) {
   if (typeof value === 'string') {
-    if (looksLikeKey(value)) throw new ConfigError(where, 'holds a value that looks like a key; the key belongs only in the environment variable named by keyEnv');
+    if (looksLikeKey(value, { dense: densityApplies(where) })) throw new ConfigError(where, 'holds a value that looks like a key; the key belongs only in the environment variable named by keyEnv');
     return;
   }
   if (Array.isArray(value)) {
@@ -101,7 +111,8 @@ function scanForSecrets(value, where, skip) {
     for (const [name, v] of Object.entries(value)) {
       const here = where ? `${where}.${name}` : name;
       if (skip.has(here)) continue;
-      if (isSecretName(name) && typeof v === 'string' && v !== '') {
+      const counter = typeof v === 'number' && nameWords(name).some((w) => COUNTER_WORDS.has(w));
+      if (isSecretName(name) && !isEmptyValue(v) && !counter) {
         throw new ConfigError(here, 'a field named like a secret holds a value; the key belongs only in the environment variable named by keyEnv');
       }
       scanForSecrets(v, here, skip);
@@ -126,6 +137,11 @@ function checkFragment(value, where) {
   }
 }
 
+function isLoopbackHost(hostname) {
+  const h = hostname.toLowerCase();
+  return h === 'localhost' || h === '[::1]' || /^127(\.\d{1,3}){1,3}$/.test(h);
+}
+
 function parseEndpoint(value) {
   let url;
   try {
@@ -134,6 +150,7 @@ function parseEndpoint(value) {
     throw new ConfigError('endpoint', 'not a valid URL');
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new ConfigError('endpoint', 'must be http or https');
+  if (url.protocol === 'http:' && !isLoopbackHost(url.hostname)) throw new ConfigError('endpoint', 'must be https unless the host is on the loopback (127.x, localhost, ::1): the key would cross the network in clear');
   if (url.username || url.password) throw new ConfigError('endpoint', 'must not hold credentials; the key is read from the environment');
   if (url.search || url.hash) throw new ConfigError('endpoint', 'must not hold a query or a fragment');
   if (!url.hostname) throw new ConfigError('endpoint', 'has no host');
@@ -258,15 +275,43 @@ export function repoRoots(cwd = process.cwd()) {
   return [...roots];
 }
 
-/** Refuse a path (resolved through symlinks) inside any of the roots. */
-export function assertOutsideRepo(file, field, roots = repoRoots()) {
-  const real = realpathOrSelf(file);
-  for (const root of roots) {
-    const rel = path.relative(realpathOrSelf(root), real);
-    if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
-      throw new ConfigError(field, 'is inside the repository; keep it outside, where it cannot be committed');
-    }
+/** Inside `root`, or `root` itself: a relative path that is neither `..`, nor starts with `../`, nor is absolute. */
+function isInside(root, real) {
+  const rel = path.relative(root, real);
+  return !(rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel));
+}
+
+/** The nearest directory at or above `file` (symlinks resolved, missing parts skipped) that has a `.git`, file or directory. */
+export function enclosingWorkTree(file) {
+  let p = path.resolve(file);
+  while (!fs.existsSync(p)) {
+    const up = path.dirname(p);
+    if (up === p) return null;
+    p = up;
   }
+  let dir = realpathOrSelf(p);
+  try {
+    if (!fs.statSync(dir).isDirectory()) dir = path.dirname(dir);
+  } catch {
+    dir = path.dirname(dir);
+  }
+  for (;;) {
+    if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Refuse a path inside a work tree: any directory above it (symlinks resolved) with a `.git`, and
+ * any of `roots` (the harness's own checkout and the working directory by default).
+ */
+export function assertOutsideRepo(file, field, roots = repoRoots()) {
+  const inside = () => new ConfigError(field, 'is inside the repository; keep it outside, where it cannot be committed');
+  if (enclosingWorkTree(file)) throw inside();
+  const real = realpathOrSelf(file);
+  for (const root of roots) if (isInside(realpathOrSelf(root), real)) throw inside();
 }
 
 export function configPath(env = process.env) {
@@ -307,5 +352,8 @@ export function loadConfig({ env = process.env, roots } = {}) {
 export function readKey(config, env = process.env) {
   const key = env[config.keyEnv];
   if (typeof key !== 'string' || key === '') throw new ConfigError('keyEnv', `the environment variable ${config.keyEnv} is not set`);
+  if (/[\u0000-\u0020\u007f]/.test(key)) {
+    throw new ConfigError('keyEnv', `the environment variable ${config.keyEnv} holds a space or a control character (a line break, a tab); a key has none`);
+  }
   return key;
 }

@@ -31,6 +31,9 @@ function report(argv, env) {
   const home = benchHome(env);
   assertOutsideRepo(home, 'BENCH_HOME');
   const ledgerFile = values.ledger ?? path.join(home, 'ledger.jsonl');
+  const outFile = values.out ?? path.join(home, 'report.md');
+  if (values.ledger) assertOutsideRepo(ledgerFile, '--ledger');
+  if (values.out) assertOutsideRepo(outFile, '--out');
   const { records, warnings } = readLedger(ledgerFile);
   for (const w of warnings) process.stderr.write(`bench: warning: ${w}\n`);
   if (records.length === 0) {
@@ -47,7 +50,6 @@ function report(argv, env) {
   } else if (opts.showModelId) {
     throw new ConfigError('--show-model-id', 'needs the configuration, which holds the model id');
   }
-  const outFile = values.out ?? path.join(home, 'report.md');
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
   fs.writeFileSync(outFile, buildReport(records, opts));
   process.stdout.write(`${outFile}\n`);
