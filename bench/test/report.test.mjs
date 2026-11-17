@@ -4,8 +4,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { Ledger } from '../lib/ledger.mjs';
-import { NOT_CLAIMED, buildReport } from '../lib/report.mjs';
+import { Ledger, foldRecords } from '../lib/ledger.mjs';
+import { NOT_CLAIMED, ReportError, buildReport } from '../lib/report.mjs';
 import { rawConfig, tmp } from './helpers.mjs';
 
 const BENCH = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'bench.mjs');
@@ -153,4 +153,79 @@ test('an empty ledger is reported as such, not as an empty report', (t) => {
   const r = spawnSync(process.execPath, [BENCH, 'report'], { env: { ...process.env, BENCH_HOME: home, HOME: home, BENCH_CONFIG: '' }, encoding: 'utf8' });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /no records/);
+});
+
+// ---- fix round: rows 14 and 15 of the review ----
+
+const usage = { input: 1000, cached: 400, cacheWrite: 0, output: 200, reasoning: 50 };
+
+/** One run with two attempts: the first interrupted after a call, the second done. */
+function twoAttempts(run = 'T1-a-max', extra = {}) {
+  const planned = { kind: 'state', run, state: 'Planned', task: 'T1', agent: 'a', arm: 'max', source: 'public', language: 'go', ...extra };
+  const up = (attempt, call) => [
+    { kind: 'state', run, state: 'Reserved', reservedMicro: 3_000_000 },
+    { kind: 'state', run, state: 'Preparing' },
+    { kind: 'state', run, state: 'Running' },
+    { kind: 'call', run, attempt, call, phase: 'pending', worstMicro: 100_000 },
+    { kind: 'call', run, attempt, call, phase: 'settled', costMicro: 5_000, usage, usageMissing: false },
+  ];
+  return [
+    planned,
+    ...up(1, 1),
+    { kind: 'state', run, state: 'Interrupted' },
+    { ...planned, retry: true },
+    ...up(2, 1),
+    { kind: 'state', run, state: 'Collecting' },
+    { kind: 'state', run, state: 'Grading' },
+    { kind: 'state', run, state: 'Done', result: { pass: true, grades: [1, 1, 1], exit: 'done', wallMs: 1000 } },
+  ];
+}
+
+test('row 14: tokens and calls sum all attempts of a run, as the cost does, and the report says so', () => {
+  const folded = foldRecords(twoAttempts());
+  const v = folded.get('T1-a-max');
+  assert.equal(v.spentMicro, 10_000);
+  assert.deepEqual(v.tokens, { input: 2000, cached: 800, cacheWrite: 0, output: 400, reasoning: 100 });
+  assert.equal(v.calls.settled, 2);
+  const text = buildReport(twoAttempts());
+  assert.match(text, /\| a \| max \| \$0\.0100 \| \$0\.0100 \| 2000 \| 800 \| 0 \| 400 \| 100 \|/);
+  assert.match(text, /sums all attempts of a run/);
+});
+
+test('row 14: the report names the states that are left out of every rate, and lists those runs', () => {
+  const text = buildReport(fixture());
+  assert.match(text, /StoppedByCap, Failed_infra, NotStarted/);
+  assert.match(text, /left out of every rate/i);
+  assert.match(text, /\| T7-a-max \| StoppedByCap \| T7 \| a \/ max \|[^\n]*\$0\.0080/, 'the list says what each one wasted');
+});
+
+test('row 15: a cell with a pipe or a line break cannot break the table', () => {
+  const text = buildReport(twoAttempts('T1-a-max', { task: 'T|1\nsecond line', agent: 'a|b' }));
+  assert.ok(!/T\|1/.test(text), 'no unescaped pipe from a cell');
+  assert.match(text, /^\| T\\\|1 second line \| pass \|$/m, 'the per-task row is one line with the pipe escaped');
+  assert.match(text, /^\| a\\\|b \| max \| 1 \| 1 \|/m);
+});
+
+test('row 15: two Done runs for one task, agent and arm are an error that names them', () => {
+  const records = [...twoAttempts('T1-a-max'), ...twoAttempts('T1-a-max-again')];
+  assert.throws(
+    () => buildReport(records),
+    (e) => e instanceof ReportError && /T1-a-max/.test(e.message) && /T1-a-max-again/.test(e.message) && /T1/.test(e.message),
+  );
+  assert.doesNotThrow(() => buildReport(twoAttempts('T1-a-max')));
+});
+
+test('row 15: the command line says so and writes no report', (t) => {
+  const home = tmp(t);
+  const ledger = Ledger.open(path.join(home, 'ledger.jsonl'));
+  for (const r of [...twoAttempts('T1-a-max'), ...twoAttempts('T1-a-max-again')]) {
+    const { v, t: _t, ...rest } = r;
+    ledger.append(rest);
+  }
+  ledger.close();
+  const env = { ...process.env, BENCH_HOME: home, HOME: home, BENCH_CONFIG: '' };
+  const r = spawnSync(process.execPath, [BENCH, 'report'], { env, encoding: 'utf8' });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /T1-a-max-again/);
+  assert.ok(!fs.existsSync(path.join(home, 'report.md')));
 });

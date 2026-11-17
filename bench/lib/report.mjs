@@ -12,6 +12,13 @@ import { foldRecords } from './ledger.mjs';
 
 const MIN_TASKS_PER_LANGUAGE = 15;
 
+export class ReportError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ReportError';
+  }
+}
+
 export const NOT_CLAIMED = [
   'One agent is better in general, or with another model or another endpoint: this compares two agents on one model in two arms.',
   'Comparability with any public leaderboard: the environment is adapted, each task has one attempt, and the limits are ours.',
@@ -25,9 +32,12 @@ const interval = (w) => (w ? `${pct(w.low)} to ${pct(w.high)}` : 'n/a');
 const num = (n) => (n === null || n === undefined ? 'n/a' : Number.isInteger(n) ? String(n) : n.toFixed(1));
 const sum = (xs) => xs.reduce((s, x) => s + x, 0);
 
+/** A table cell on one line, its pipes escaped: nothing a run carries can break a table. */
+const cell = (c) => String(c).replace(/\r\n|\r|\n/g, ' ').replace(/\|/g, '\\|');
+
 function table(header, rows) {
   if (rows.length === 0) return '_none_\n';
-  const line = (cells) => `| ${cells.join(' | ')} |`;
+  const line = (cells) => `| ${cells.map(cell).join(' | ')} |`;
   return `${[line(header), line(header.map(() => '---')), ...rows.map(line)].join('\n')}\n`;
 }
 
@@ -103,6 +113,14 @@ export function buildReport(foldedOrRecords, opts = {}) {
   const setup = opts.setup ?? (records ? [...records].reverse().find((r) => r.kind === 'setup') : null) ?? {};
   const all = [...folded.values()].sort((a, b) => a.run.localeCompare(b.run));
   const counted = all.filter((v) => v.state === 'Done');
+  const seen = new Map();
+  for (const v of counted) {
+    const key = JSON.stringify([v.task, v.agent, v.arm]);
+    if (seen.has(key)) {
+      throw new ReportError(`two Done runs for task ${v.task}, agent ${v.agent}, arm ${v.arm}: ${seen.get(key)} and ${v.run}; a task has one attempt per cell`);
+    }
+    seen.set(key, v.run);
+  }
   const excluded = all.filter((v) => v.state !== 'Done');
   const label = setup.modelLabel ?? opts.modelLabel ?? 'unlabelled';
   const seed = setup.seed ?? 1;
@@ -136,10 +154,12 @@ export function buildReport(foldedOrRecords, opts = {}) {
   out.push(table(['State', 'Runs'], [...group(all, (v) => v.state ?? 'unknown')].map(([s, rs]) => [s, rs.length])));
   out.push('\nExit reasons of the counted runs (state Done):\n');
   out.push(table(['Exit', 'Runs'], [...group(counted, (v) => v.result?.exit ?? 'not recorded')].map(([e, rs]) => [e, rs.length])));
+  out.push(
+    '\nA run counts in the rates only when it is Done. Runs in StoppedByCap, Failed_infra, NotStarted (and any other state but Done) are left out of every rate, so the selection is visible here and not in the numbers:\n',
+  );
   if (excluded.length > 0) {
-    out.push('\nExcluded from every rate below (not Done):\n');
-    out.push(table(['Run', 'State', 'Task', 'Agent / arm'], excluded.map((v) => [v.run, v.state ?? 'unknown', v.task ?? '-', v.agent ? cellKey(v) : '-'])));
-  }
+    out.push(table(['Run', 'State', 'Task', 'Agent / arm', 'Wasted'], excluded.map((v) => [v.run, v.state ?? 'unknown', v.task ?? '-', v.agent ? cellKey(v) : '-', formatUSD(v.wastedMicro)])));
+  } else out.push('None: every run is Done.\n');
 
   h('Pass rate by agent and arm');
   out.push(table(['Agent', 'Arm', 'Runs', 'Solved', 'Rate', '95% interval (Wilson)'], [...group(counted, cellKey)].map(([, rs]) => rateRow([rs[0].agent, rs[0].arm], rs))));
@@ -165,6 +185,7 @@ export function buildReport(foldedOrRecords, opts = {}) {
   if (langNotes.length > 0) out.push(`\n${langNotes.map((n) => `* ${n}`).join('\n')}\n`);
 
   h('Cost, tokens, time and calls');
+  out.push('Every figure of this section sums all attempts of a run (an interrupted attempt that was run again is in it), and counts only Done runs.\n\n');
   const costRows = [];
   const timeRows = [];
   for (const [, rs] of group(counted, cellKey)) {

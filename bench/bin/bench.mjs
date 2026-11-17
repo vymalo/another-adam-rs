@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ConfigError, EXIT_CONFIG, assertOutsideRepo, benchHome, configPath, describeConfig, loadConfig } from '../lib/config.mjs';
 import { LedgerError, readLedger } from '../lib/ledger.mjs';
-import { buildReport } from '../lib/report.mjs';
+import { ReportError, buildReport } from '../lib/report.mjs';
 
 const STUBS = { doctor: 3, tasks: 2, pilot: 4, run: 4, regrade: 4 };
 const USAGE = `usage: bench <command>
@@ -79,9 +79,9 @@ export function main(argv, env = process.env) {
       process.stderr.write(`bench: configuration error: ${e.message}\n`);
       return EXIT_CONFIG;
     }
-    if (e instanceof LedgerError || e?.code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION' || e?.code === 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE') {
+    if (e instanceof LedgerError || e instanceof ReportError || e?.code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION' || e?.code === 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE') {
       process.stderr.write(`bench: ${e.message}\n`);
-      return e instanceof LedgerError ? 1 : 64;
+      return e instanceof LedgerError || e instanceof ReportError ? 1 : 64;
     }
     throw e;
   }

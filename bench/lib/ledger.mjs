@@ -254,7 +254,8 @@ const attemptSpend = (a) => {
 /**
  * Fold the records into one view per run. Spend is the meter's: a settled or failed call counts its
  * cost, a call that was written pending and never settled counts its worst case (the harness may
- * have died with it in flight, and it may have been billed). `wastedMicro` is the spend of attempts
+ * have died with it in flight, and it may have been billed). `tokens` and `calls` sum all attempts
+ * of a run, as `spentMicro` does. `wastedMicro` is the spend of attempts
  * that were interrupted, failed in the infrastructure or stopped by the cap.
  */
 export function foldRecords(records) {
@@ -351,10 +352,14 @@ export function foldRecords(records) {
     v.attemptSpentMicro = current ? attemptSpend(current) : 0;
     v.spentMicro = v.attempts.reduce((s, a) => s + (a ? attemptSpend(a) : 0), 0);
     v.priorSpentMicro = v.spentMicro - v.attemptSpentMicro;
-    v.tokens = current ? current.tokens : emptyTokens();
-    v.calls = current
-      ? { settled: current.settled, failed: current.failed, refused: current.refused, usageMissing: current.usageMissing }
-      : { settled: 0, failed: 0, refused: 0, usageMissing: 0 };
+    // Tokens and calls, like the spend, are of all attempts of the run.
+    v.tokens = emptyTokens();
+    v.calls = { settled: 0, failed: 0, refused: 0, usageMissing: 0 };
+    for (const a of v.attempts) {
+      if (!a) continue;
+      for (const k of Object.keys(v.tokens)) v.tokens[k] += a.tokens[k];
+      for (const k of Object.keys(v.calls)) v.calls[k] += a[k];
+    }
   }
   return runs;
 }
