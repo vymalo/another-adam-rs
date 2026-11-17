@@ -12,6 +12,7 @@ Start with the [root README](../README.md), then the guide for what you are doin
 | [Deploy the coder](guides/deploy-the-coder.md) | you are installing the image and the Helm chart on Kubernetes |
 | [Embed adam](guides/embed-adam.md) | you host adam agents inside your own Rust program |
 | [Testing](guides/testing.md) | you want to run or add tests, the end-to-end scripts, or check the chart |
+| [The benchmark harness](../bench/README.md) | you want to compare adam-coder and OpenCode on real tasks, with a hard cap on spend |
 
 ## Architecture: understand it
 
@@ -84,6 +85,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) | a subagent can run in the background as a session: `subagent_start` returns at once, the parent keeps working and reads reports, `subagent_send` continues it with its context, and "close when done" is chosen at creation; a kept-open session lives for the thread and is announced to clients by `child-sessions/v1` |
 | [0046](decisions/0046-the-operator-lives-in-the-platform-repository.md) | the operator lives only in the platform repository: adam-rs's copy, its charts, CRDs, image and skill are removed; `deploy/coder` stays the contract |
 | [0047](decisions/0047-adam-rs-can-be-embedded-in-an-application.md) | adam-rs can be embedded in an application: a library with no protocol (`adam-engine`), the embedded set as Cargo features, a SQLite store on cratestack in its own workspace, the host's model client, and ports for secrets, approvals and the tools' workspace (accepted 2026-11-16; nothing is built) |
+| [0048](decisions/0048-a-benchmark-harness-for-adam-coder-and-opencode.md) | a benchmark harness in `bench/` for adam-coder against OpenCode: one meter that is the truth for cost and the cap, reservations, a ledger with resume, grading by patch replay (accepted 2026-11-17; the meter, cost, cap, ledger and report are built) |
 
 ## Keeping these docs short and true
 

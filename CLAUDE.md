@@ -22,6 +22,7 @@ that integrate adam-rs.
 | `deploy/coder/`, `docker/coder/` | the Helm chart (`bump-tag.sh`, `tests/`: renders, goldens, schemas) and the image with its smoke tests. **`deploy/coder` is read by another repository**: vymalo/another-agentic-platform renders its parity goldens from this chart at a pinned revision (its `tools/adam-parity/regen.sh`), so what the chart renders for a given value is a contract; say so in the pull request when it changes |
 | `dev/`, `compose.yaml` | local stack: databases, WireMock mocks, a git server, example agent folders `dev/agents/*/agent`, e2e scripts `dev/*-e2e.sh` |
 | `tools/docs-check/` | diagram, link, anchor, crate-README and skill checker (also in CI) |
+| `bench/` | the benchmark harness for adam-coder and OpenCode (ADR 0048): Node ESM, no dependencies, outside the Rust workspace; its configuration (endpoint, model, prices, key) is the owner's and **never in the repository**; `bench/README.md`; CI `bench.yml` (`node --test "bench/test/*.test.mjs"`) |
 | `.agents/skills/` | first-party (`adam-*`, `update-vendored-skills`) and vendored skills (`skills-lock.json`); `.claude/skills`, `.goose/skills`, `.kiro/skills` are symlinks |
 | `.github/workflows/` | `ci.yml` (Rust, docs, compose), `coder.yml` (image, chart, e2e, tag bump), `nightly.yml` (live services) |
 
