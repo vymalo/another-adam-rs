@@ -6,7 +6,7 @@ import http from 'node:http';
 export const USAGE = 'https://agents.vymalo.com/a2a/extensions/usage/v1';
 export const TASK_ID = 'task-1';
 
-export async function fakeCoder({ script, bearer = 'test-bearer-0001', holdStream = false, getTaskStatus = null, cancelTo = 'canceled', failSend = false }) {
+export async function fakeCoder({ script, bearer = 'test-bearer-0001', holdStream = false, getTaskStatus = null, cancelTo = 'canceled', failSend = false, hangGetTask = false, followUpHang = false }) {
   const calls = [];
   const sockets = new Set();
   let polls = 0;
@@ -31,6 +31,7 @@ export async function fakeCoder({ script, bearer = 'test-bearer-0001', holdStrea
       if (auth !== `Bearer ${bearer}`) return json(401, { error: 'unauthenticated' });
       const ok = (result) => json(200, { jsonrpc: '2.0', id: rpc.id, result });
       if (rpc.method === 'GetTask') {
+        if (hangGetTask) return; // accepts the connection and never answers
         if (getTaskStatus) {
           const s = getTaskStatus(polls++);
           if (s !== 200) return json(s, { error: 'boom' });
@@ -49,6 +50,7 @@ export async function fakeCoder({ script, bearer = 'test-bearer-0001', holdStrea
         return ok({ id: TASK_ID, status: { state: 'TASK_STATE_CANCELED' } });
       }
       if (rpc.method === 'SendStreamingMessage') {
+        if (followUpHang && rpc.params.message.taskId) return; // the nudge is delivered, its answer is slow
         if (failSend && rpc.params.message.taskId) return json(200, { jsonrpc: '2.0', id: rpc.id, error: { code: -32602, message: 'nope' } });
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         const frame = (result) => res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result })}\n\n`);

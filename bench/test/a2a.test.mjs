@@ -74,11 +74,49 @@ test('a nudge that is never answered ends at the grace, cancelled', async (t) =>
   assert.ok(clock.elapsed() < 10 * MIN);
 });
 
-test('a nudge the server refuses is tried again at the next poll, three times at most, then cancelled', async (t) => {
-  const { server, result } = await drive(t, [{ state: 'input-required', ts: 'T1' }], {}, { failSend: true });
+test('a nudge the server refuses is not sent again: one nudge ever, and the park ends at the grace, cancelled', async (t) => {
+  const { server, result } = await drive(t, [{ state: 'input-required', ts: 'T1' }], { nudgeGraceMs: 60_000 }, { failSend: true });
   assert.equal(result.exit, 'input_required');
-  assert.equal(server.of('SendStreamingMessage').length, 1 + 3);
+  assert.equal(server.of('SendStreamingMessage').length, 2, 'the task, and one nudge');
   assert.equal(server.of('CancelTask').length, 1);
+});
+
+test('a nudge that is delivered but answered slowly is not sent a second time (finding 18)', async (t) => {
+  const { server, result } = await drive(t, [{ state: 'input-required', ts: 'T1' }, { state: 'working' }, { state: 'completed' }], {}, { followUpHang: true });
+  assert.equal(result.exit, 'done');
+  assert.equal(result.nudges, 1);
+  assert.equal(server.of('SendStreamingMessage').length, 2, 'the task, and exactly one nudge');
+});
+
+test('every request has a timeout: a coder that never answers is an error, not a hang (finding 17)', async (t) => {
+  const server = await fakeCoder({ script: [{ state: 'working' }], hangGetTask: true });
+  t.after(() => server.close());
+  const client = new A2AClient({ url: server.url, bearer: server.bearer, requestTimeoutMs: 80 });
+  const started = Date.now();
+  await assert.rejects(client.getTask('x'), (e) => e instanceof A2AError && !e.message.includes(server.bearer));
+  assert.ok(Date.now() - started < 2000);
+});
+
+test('six polls that time out in a row end the run as infrastructure, quickly', async (t) => {
+  const server = await fakeCoder({ script: [{ state: 'working' }], hangGetTask: true });
+  t.after(() => server.close());
+  const client = new A2AClient({ url: server.url, bearer: server.bearer, requestTimeoutMs: 40 });
+  const clock = fakeClock();
+  const result = await driveTask({ client, text: 'x', messageId: 'm', limitMs: 50 * MIN, now: clock.now, sleep: clock.sleep });
+  assert.equal(result.exit, 'infra');
+});
+
+test('auth-required is a terminal state: the task is cancelled and the run is infrastructure (finding 26)', async (t) => {
+  const { server, result } = await drive(t, [{ state: 'working' }, { state: 'auth-required' }]);
+  assert.equal(result.exit, 'infra');
+  assert.equal(server.of('CancelTask').length, 1);
+});
+
+test('the elapsed time is the time to the decision, without the grace of a cancel (finding 19)', async (t) => {
+  const { result, clock } = await drive(t, [{ state: 'working' }], { limitMs: 3 * MIN, graceMs: 60_000 });
+  assert.equal(result.exit, 'timeout');
+  assert.ok(result.elapsedMs >= 3 * MIN && result.elapsedMs < 3 * MIN + 15_000, `elapsed ${result.elapsedMs}`);
+  assert.ok(clock.elapsed() >= result.elapsedMs);
 });
 
 test('at the time limit the task is cancelled, and the exit is timeout', async (t) => {

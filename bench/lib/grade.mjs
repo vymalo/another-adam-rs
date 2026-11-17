@@ -33,21 +33,55 @@ export class PatchTooLarge extends Error {
 }
 
 /** What git runs with on the harness's side: no system or global configuration, no hooks, attributes, fsmonitor or textconv. */
-const SAFE_C = ['-c', 'core.quotepath=off', '-c', 'core.autocrlf=false', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null', '-c', 'protocol.ext.allow=never'];
+export const SAFE_C = ['-c', 'core.quotepath=off', '-c', 'core.autocrlf=false', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null', '-c', 'protocol.ext.allow=never'];
 const emptyHome = () => {
   emptyHome.dir ??= fs.mkdtempSync(path.join(os.tmpdir(), 'bench-git-home-'));
   return emptyHome.dir;
 };
 
+const ENV_ALLOW = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'SYSTEMROOT'];
+
 /**
- * The environment git runs in on the harness's side: no system or global configuration, no configuration that
- * arrives through the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and its KEY/VALUE pairs), and an
+ * The environment a host git runs in: an allow-list, nothing else. Git needs no key, no proxy and no credential, so
+ * none of them is here (the model's key is in the harness's own environment); no system or global configuration, none
+ * that arrives through the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and its KEY/VALUE pairs), and an
  * empty HOME and XDG_CONFIG_HOME so no user file is found.
  */
 export function safeEnv(home = emptyHome()) {
-  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', HOME: home, XDG_CONFIG_HOME: home };
-  for (const k of Object.keys(env)) if (/^GIT_CONFIG_(PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$/.test(k) || k === 'GIT_DIR' || k === 'GIT_WORK_TREE' || k === 'GIT_INDEX_FILE') delete env[k];
+  const env = {};
+  for (const k of ENV_ALLOW) if (process.env[k] !== undefined) env[k] = process.env[k];
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', HOME: home, XDG_CONFIG_HOME: home });
   return env;
+}
+
+/**
+ * Git with no repository around it: run in a new empty directory that is not a repository, with discovery stopped
+ * above it, only the plain http protocol allowed and nothing a repository could say read. For what the host asks of a
+ * server (`ls-remote`), never for a directory a container wrote. Returns stdout as a Buffer.
+ */
+export async function isolatedGit(args, { maxBytes = 1024 * 1024, timeoutMs = 60_000 } = {}) {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'bench-isolated-'));
+  try {
+    return await new Promise((resolve, reject) => {
+      const env = { ...safeEnv(cwd), GIT_CEILING_DIRECTORIES: path.dirname(cwd) };
+      const child = spawn('git', [...SAFE_C, '-c', 'protocol.allow=never', '-c', 'protocol.http.allow=always', ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL' });
+      const chunks = [];
+      let size = 0;
+      let err = '';
+      child.stdout.on('data', (c) => {
+        size += c.length;
+        if (size > maxBytes) child.kill('SIGKILL');
+        else chunks.push(c);
+      });
+      child.stderr.on('data', (c) => {
+        if (err.length < 2000) err += c;
+      });
+      child.on('error', reject);
+      child.on('close', (code) => (code === 0 && size <= maxBytes ? resolve(Buffer.concat(chunks)) : reject(new Error(`git ${args[0]} failed (${code}): ${err.trim().split('\n')[0]}`))));
+    });
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 }
 
 /** A `git(args, { maxBytes })` that runs git in `dir`, safely, and returns stdout as a Buffer. */
@@ -327,10 +361,20 @@ export async function gradeOnce({ containers, task, patchFile = null, cloneTo = 
     let stale = false;
     try {
       const file = path.join(logs, 'reward.txt');
-      stale = fs.statSync(file).mtimeMs < startedMs - STALE_SLACK_MS;
-      // exactly 1 or 0, with at most one newline after it: nothing else is a reward
-      const raw = fs.readFileSync(file, 'utf8');
-      reward = /^[01]\n?$/.test(raw) ? raw.slice(0, 1) : 'invalid';
+      // A container wrote this file: it is read without following a link, and only if it is a small regular file.
+      const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const st = fs.fstatSync(fd);
+        stale = st.mtimeMs < startedMs - STALE_SLACK_MS;
+        // exactly 1 or 0, with at most one newline after it: nothing else is a reward
+        if (!st.isFile() || st.size > 16) reward = 'invalid';
+        else {
+          const raw = fs.readFileSync(fd, 'utf8');
+          reward = /^[01]\n?$/.test(raw) ? raw.slice(0, 1) : 'invalid';
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
     } catch {
       reward = null;
     }

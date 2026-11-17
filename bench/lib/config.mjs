@@ -42,7 +42,17 @@ export const SCHEMA = {
   arms: { type: 'arms', required: true, doc: 'Named JSON fragments merged into every request of the arm' },
   keyEnv: { type: 'envName', default: 'BENCH_MODEL_API_KEY', doc: 'The environment variable that holds the key' },
   concurrency: { type: 'int', min: 1, max: 8, default: 2, doc: 'Runs at once' },
-  contextWindow: { type: 'int', min: 1024, max: 100_000_000, optional: true, doc: 'The model context window in tokens' },
+  contextWindow: { type: 'int', min: 1024, max: 100_000_000, required: true, doc: 'The model context window in tokens; both agents are given this one value' },
+  limits: {
+    type: 'object',
+    optional: true,
+    doc: 'The limits of one run, the same for both agents',
+    fields: {
+      minutes: { type: 'int', min: 1, max: 600, default: 50 },
+      steps: { type: 'int', min: 1, max: 1000, default: 200 },
+      cancelGraceSeconds: { type: 'int', min: 1, max: 600, default: 60 },
+    },
+  },
   timeouts: {
     type: 'object',
     optional: true,
@@ -237,7 +247,20 @@ export function normalizeConfig(raw) {
     return v;
   };
   const concurrency = int('concurrency', SCHEMA.concurrency);
+  if (raw.contextWindow === undefined || raw.contextWindow === null) throw new ConfigError('contextWindow', 'is required: both agents are given the same context window');
   const contextWindow = int('contextWindow', SCHEMA.contextWindow);
+  const lim = raw.limits ?? {};
+  if (!isObject(lim)) throw new ConfigError('limits', 'must be an object');
+  checkUnknown(lim, SCHEMA.limits.fields, 'limits');
+  const limit = (name) => {
+    const spec = SCHEMA.limits.fields[name];
+    const v = lim[name] ?? spec.default;
+    if (!Number.isSafeInteger(v) || v < spec.min || v > spec.max) throw new ConfigError(`limits.${name}`, `must be a whole number from ${spec.min} to ${spec.max}`);
+    return v;
+  };
+  const limits = { minutes: limit('minutes'), steps: limit('steps'), cancelGraceSeconds: limit('cancelGraceSeconds') };
+  limits.limitMs = limits.minutes * 60_000;
+  limits.cancelGraceMs = limits.cancelGraceSeconds * 1000;
 
   const t = raw.timeouts ?? {};
   if (!isObject(t)) throw new ConfigError('timeouts', 'must be an object');
@@ -250,7 +273,7 @@ export function normalizeConfig(raw) {
   const timeouts = { firstByteMs: seconds('firstByteSeconds'), idleMs: seconds('idleSeconds') };
 
   const tasks = normalizeTasks(raw.tasks);
-  return { endpoint, modelId, modelLabel, prices, capMicro, perRunBudgetMicro, arms, keyEnv, concurrency, contextWindow, timeouts, tasks };
+  return { endpoint, modelId, modelLabel, prices, capMicro, perRunBudgetMicro, arms, keyEnv, concurrency, contextWindow, limits, timeouts, tasks };
 }
 
 /** The `tasks` block: task sources and grading. Every field optional; the commands that need one say which. */

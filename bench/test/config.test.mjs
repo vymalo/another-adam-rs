@@ -264,3 +264,21 @@ test('a counter name excuses a number only: a string under auth_token_max or api
   refused(rawConfig({ arms: { a: { token_budget: true } } }), 'arms.a.token_budget');
   assert.doesNotThrow(() => normalizeConfig(rawConfig({ arms: { a: { token_budget: 5000 } } })));
 });
+
+test('the context window is required, because both agents are given the same value (finding 19)', () => {
+  const raw = rawConfig();
+  delete raw.contextWindow;
+  refused(raw, 'contextWindow');
+  refused(rawConfig({ contextWindow: null }), 'contextWindow');
+  assert.equal(normalizeConfig(rawConfig({ contextWindow: 65536 })).contextWindow, 65536);
+});
+
+test('the limits of a run are one set of values in the configuration: minutes, steps and the cancel grace', () => {
+  const d = normalizeConfig(rawConfig());
+  assert.deepEqual(d.limits, { minutes: 50, steps: 200, cancelGraceSeconds: 60, limitMs: 50 * 60 * 1000, cancelGraceMs: 60_000 });
+  const c = normalizeConfig(rawConfig({ limits: { minutes: 10, steps: 80, cancelGraceSeconds: 5 } }));
+  assert.deepEqual([c.limits.limitMs, c.limits.steps, c.limits.cancelGraceMs], [600_000, 80, 5000]);
+  refused(rawConfig({ limits: { minutes: 0 } }), 'limits.minutes');
+  refused(rawConfig({ limits: { steps: 1.5 } }), 'limits.steps');
+  refused(rawConfig({ limits: { hours: 1 } }), 'limits.hours');
+});

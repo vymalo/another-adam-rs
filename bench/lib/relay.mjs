@@ -7,9 +7,10 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 /** Listen on `listenPort` and relay every connection to `target` ({ host, port }). Resolves to the server. */
-export function startRelay({ listenPort, target, listenHost = '0.0.0.0', onError = () => {} }) {
+export function startRelay({ listenPort, target, listenHost = '0.0.0.0', onError = () => {}, idleMs = 10 * 60 * 1000, maxConnections = 256 }) {
   return new Promise((resolve, reject) => {
     const server = net.createServer((client) => {
+      client.setTimeout(idleMs, () => client.destroy());
       const upstream = net.connect({ host: target.host, port: target.port });
       const end = () => {
         client.destroy();
@@ -22,9 +23,11 @@ export function startRelay({ listenPort, target, listenHost = '0.0.0.0', onError
       });
       client.on('close', end);
       upstream.on('close', end);
+      upstream.setTimeout(idleMs, () => upstream.destroy());
       client.pipe(upstream);
       upstream.pipe(client);
     });
+    server.maxConnections = maxConnections;
     server.once('error', reject);
     server.listen(listenPort, listenHost, () => resolve(server));
   });
@@ -39,7 +42,8 @@ export function parseTarget(text) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const target = parseTarget(process.env.RELAY_TARGET);
   const port = Number(process.env.RELAY_PORT ?? 8090);
-  const server = await startRelay({ listenPort: port, target, onError: (code) => process.stderr.write(`relay: upstream ${code}\n`) });
+  const idleMs = Number(process.env.RELAY_IDLE_SECS ?? 600) * 1000;
+  const server = await startRelay({ listenPort: port, target, idleMs, onError: (code) => process.stderr.write(`relay: upstream ${code}\n`) });
   process.stdout.write(`relay: ${port} -> ${target.host}:${target.port}\n`);
   for (const s of ['SIGTERM', 'SIGINT']) process.on(s, () => server.close(() => process.exit(0)));
 }

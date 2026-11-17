@@ -20,6 +20,7 @@ export function rawConfig(overrides = {}) {
     modelId: MODEL_ID,
     modelLabel: 'Example Model',
     prices: { inputPerMTok: 3, cachedInputPerMTok: 0.3, cacheWritePerMTok: 3.75, outputPerMTok: 15 },
+    contextWindow: 131072,
     capUSD: 10,
     perRunBudgetUSD: 3,
     arms: { max: { reasoning_effort: 'high' }, off: { reasoning_effort: 'none' } },

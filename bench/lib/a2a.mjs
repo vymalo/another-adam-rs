@@ -23,13 +23,16 @@ const isLoopback = (h) => h === 'localhost' || h === '[::1]' || /^127(\.\d{1,3})
 /** `TASK_STATE_INPUT_REQUIRED` -> `input-required`. */
 export const normState = (s) => String(s ?? '').replace(/^TASK_STATE_/, '').toLowerCase().replace(/_/g, '-');
 const TERMINAL = new Set(['completed', 'failed', 'canceled', 'rejected']);
+export const REQUEST_TIMEOUT_MS = 15_000;
 const EXIT_OF = { completed: 'done', failed: 'failed', canceled: 'canceled', rejected: 'rejected' };
 
 export class A2AClient {
   #bearer;
   #fetch;
+  #timeoutMs;
 
-  constructor({ url, bearer, fetch = globalThis.fetch }) {
+  constructor({ url, bearer, fetch = globalThis.fetch, requestTimeoutMs = REQUEST_TIMEOUT_MS }) {
+    this.#timeoutMs = requestTimeoutMs;
     let u;
     try {
       u = new URL(url);
@@ -48,10 +51,10 @@ export class A2AClient {
     return { authorization: `Bearer ${this.#bearer}`, 'content-type': 'application/json', 'a2a-extensions': USAGE_URI };
   }
 
-  async #post(method, params, id) {
+  async #post(method, params, id, signal = AbortSignal.timeout(this.#timeoutMs)) {
     const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
     try {
-      return await this.#fetch(this.url, { method: 'POST', headers: this.#headers(), body, redirect: 'error' });
+      return await this.#fetch(this.url, { method: 'POST', headers: this.#headers(), body, redirect: 'error', signal });
     } catch {
       throw new A2AError(`${method}: the request failed`); // no cause: a transport error may carry the headers
     }
@@ -85,6 +88,7 @@ export class A2AClient {
    */
   sendStreaming({ text, messageId, taskId = null, onEvent = () => {} }) {
     const message = { messageId, role: 'ROLE_USER', parts: [{ text }], ...(taskId ? { taskId } : {}) };
+    const controller = new AbortController();
     const seen = { events: 0, usageCalls: new Set() };
     let resolveTask;
     let resolveAccepted;
@@ -103,7 +107,7 @@ export class A2AClient {
     };
     const done = (async () => {
       try {
-        const res = await this.#post('SendStreamingMessage', { message }, '1');
+        const res = await this.#post('SendStreamingMessage', { message }, '1', controller.signal);
         if (!res.ok || !res.body) return;
         if (!/text\/event-stream/i.test(res.headers?.get?.('content-type') ?? 'text/event-stream')) {
           handle(await res.json().catch(() => null));
@@ -133,7 +137,7 @@ export class A2AClient {
       }
       return seen;
     })();
-    return { taskId: task, accepted, done, seen };
+    return { taskId: task, accepted, done, seen, abort: () => controller.abort() };
   }
 }
 
@@ -175,7 +179,6 @@ export async function driveTask({
   graceMs = 60_000,
   nudgeGraceMs = 120_000,
   maxPollFailures = 6,
-  maxNudgeTries = 3,
   refusal = () => null,
   now = Date.now,
   sleep = realSleep,
@@ -186,13 +189,16 @@ export async function driveTask({
   let taskId = null;
   let polls = 0;
   let nudges = 0;
-  let nudgeTries = 0;
   let nudgedTs = null;
   let nudgedAt = 0;
   let failures = 0;
   let cancelFailed = false;
   let lastTask = null;
+  let decided = null; // the time to the decision, before any grace
+  const mark = () => (decided ??= now() - started);
+  let nudgeStream = null;
   const out = (exit, finalState = null) => ({
+    elapsedMs: mark(),
     exit,
     taskId,
     finalState,
@@ -202,6 +208,7 @@ export async function driveTask({
     selfReported: selfReportedFrom(lastTask, stream.seen.usageCalls.size),
     streamEvents: stream.seen.events,
     lastTask,
+    ...(stream.abort(), nudgeStream?.abort(), {}),
   });
 
   // The task id comes from the stream's first event. No id before the limit: the run never started.
@@ -214,6 +221,7 @@ export async function driveTask({
   log({ event: 'started' });
 
   const cancel = async (exit) => {
+    mark();
     try {
       await client.cancelTask(taskId);
     } catch {
@@ -256,6 +264,7 @@ export async function driveTask({
       continue;
     }
     const state = normState(task?.status?.state);
+    if (state === 'auth-required') return cancel('infra'); // nobody can sign in: the harness's, not the agent's, trouble
     const refused = refusal();
     const why = refused === 'cap' ? 'stopped_by_cap' : refused ? 'budget_hit' : null;
 
@@ -268,18 +277,13 @@ export async function driveTask({
 
     if (state === 'input-required') {
       const ts = task?.status?.timestamp ?? null;
-      if (nudges === 0 && nudgeTries < maxNudgeTries) {
-        nudgeTries += 1;
-        const send = client.sendStreaming({ text: NUDGE, messageId: `${messageId}-nudge-${nudgeTries}`, taskId });
-        const accepted = await withTimeout(send.accepted, 20_000, false);
-        if (accepted) {
-          nudges = 1;
-          nudgedTs = ts;
-          nudgedAt = now();
-          log({ event: 'nudged' });
-        } else log({ event: 'nudge_failed', n: nudgeTries });
-      } else if (nudges === 0) {
-        return cancel('input_required');
+      if (nudges === 0) {
+        // One nudge, ever: sent once by the state, never again because an answer was slow or lost.
+        nudges = 1;
+        nudgedTs = ts;
+        nudgedAt = now();
+        nudgeStream = client.sendStreaming({ text: NUDGE, messageId: `${messageId}-nudge`, taskId });
+        log({ event: 'nudged' });
       } else if (ts !== nudgedTs) {
         log({ event: 'parked_again' });
         return cancel('input_required');
