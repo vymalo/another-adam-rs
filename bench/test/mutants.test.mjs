@@ -156,9 +156,9 @@ function trap(bin, marks, name) {
 
 const FILTER = (cmd) => `[filter "x"]\n\tclean = ${cmd}\n`;
 
-async function runs(t, name, setup) {
+async function runs(t, name, setup, { agentAttributes = true } = {}) {
   const { dir, bare, base } = agentTree(t);
-  fs.writeFileSync(path.join(dir, '.gitattributes'), '* filter=x\n');
+  if (agentAttributes) fs.writeFileSync(path.join(dir, '.gitattributes'), '* filter=x\n');
   fs.writeFileSync(path.join(dir, 'a.txt'), 'one\ntwo\n');
   const marks = tmp(t);
   const bin = tmp(t);
@@ -193,8 +193,6 @@ test('row 2: host-side git configuration runs nothing: system, global, HOME, XDG
 });
 
 test('row 2: a configuration that arrives through a repository template (fsmonitor, hooks, attributes) runs nothing', async (t) => {
-  const template = (setup) => async () => {};
-  void template;
   await runs(t, 'template fsmonitor', ({ bin, trap: tr }) => {
     const tpl = path.join(bin, 'tpl');
     fs.mkdirSync(tpl);
@@ -225,7 +223,7 @@ test('row 2: a configuration that arrives through a repository template (fsmonit
     fs.mkdirSync(tpl);
     fs.writeFileSync(path.join(tpl, 'config'), `[core]\n\tattributesFile = ${attrs}\n[filter "y"]\n\tclean = ${tr('ATTRIBUTES')}\n`);
     return { GIT_TEMPLATE_DIR: tpl };
-  });
+  }, { agentAttributes: false });
 });
 
 // ---- upstream ----
