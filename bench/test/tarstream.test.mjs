@@ -64,18 +64,27 @@ test('a long path (pax) and a long file are read whole', (t) => {
   assert.equal(e.data.length, 100_000);
 });
 
-test('symlinks are refused unless the caller allows them; hard links, devices and FIFOs never', (t) => {
+test('a symbolic link without permission, a hard link, a device and a FIFO are refused and skipped: recorded with their path and reason, and the rest is read (defects 2 and 3)', (t) => {
   const d = tmp(t);
   fs.writeFileSync(path.join(d, 'a'), 'a');
   fs.symlinkSync('a', path.join(d, 'l'));
-  assert.throws(() => parseTar(tarOf(d)), TarError);
-  fs.rmSync(path.join(d, 'l'));
   execFileSync('mkfifo', [path.join(d, 'pipe')]);
-  assert.throws(() => parseTar(tarOf(d), { allowSymlinks: true }), /not a plain file/);
-  fs.rmSync(path.join(d, 'pipe'));
   fs.linkSync(path.join(d, 'a'), path.join(d, 'hard'));
-  assert.throws(() => parseTar(tarOf(d), { allowSymlinks: true }), /not a plain file/);
-  assert.throws(() => parseTar(Buffer.concat([entry({ name: 'dev', type: '3' }), end]), { allowSymlinks: true }), /not a plain file/);
+  fs.writeFileSync(path.join(d, 'z.txt'), 'after');
+  const entries = parseTar(tarOf(d));
+  const names = entries.filter((e) => e.type === 'file').map((e) => e.name).sort();
+  assert.ok(names.includes('z.txt') && (names.includes('a') || names.includes('hard')), 'the plain files are read');
+  assert.ok(!names.includes('pipe') && !names.includes('l'));
+  const by = Object.fromEntries(entries.refused.map((r) => [r.name, r.reason]));
+  assert.match(by.l, /symbolic link/);
+  assert.match(by.pipe, /not a plain file/);
+  assert.match(by.hard ?? by.a, /not a plain file/, 'the second name of a hard link is refused');
+  const withLinks = parseTar(tarOf(d), { allowSymlinks: true });
+  assert.equal(withLinks.find((e) => e.name === 'l').type, 'symlink');
+  assert.ok(withLinks.refused.some((r) => r.name === 'pipe'));
+  const dev = parseTar(Buffer.concat([entry({ name: 'dev', type: '3' }), entry({ name: 'ok' }, 'fine'), end]));
+  assert.deepEqual(dev.refused.map((r) => r.name), ['dev']);
+  assert.equal(dev.find((e) => e.name === 'ok').data.toString(), 'fine');
 });
 
 test('a name that leaves the target is refused: absolute, .., and a file under a symlink', (t) => {
@@ -90,11 +99,15 @@ test('a name that leaves the target is refused: absolute, .., and a file under a
   assert.equal(fs.existsSync('/etc/passwd.bench-test'), false);
 });
 
-test('caps: total bytes, entries and one file', (t) => {
+test('caps: the total bytes and the entries are a broken stream (they throw); one file over its cap is refused and skipped (defect 3)', (t) => {
   const d = tmp(t);
   fs.writeFileSync(path.join(d, 'big'), 'x'.repeat(10_000));
+  fs.writeFileSync(path.join(d, 'small'), 'ok');
   assert.throws(() => parseTar(tarOf(d), { maxBytes: 4096 }), /larger than/);
-  assert.throws(() => parseTar(tarOf(d), { maxFileBytes: 100 }), /file is larger/);
+  const e = parseTar(tarOf(d), { maxFileBytes: 100 });
+  assert.deepEqual(e.refused.map((r) => [r.name, /larger than 100/.test(r.reason)]), [['big', true]]);
+  assert.equal(e.find((x) => x.name === 'small').data.toString(), 'ok');
+  assert.ok(!e.some((x) => x.name === 'big'));
   for (let i = 0; i < 20; i++) fs.writeFileSync(path.join(d, `f${i}`), 'x');
   assert.throws(() => parseTar(tarOf(d), { maxEntries: 5 }), /more than 5 entries/);
 });
@@ -107,10 +120,24 @@ test('a header with a wrong checksum, or a size that runs past the end, is refus
   assert.throws(() => parseTar(short), /ends inside/);
 });
 
-test('pickFiles keeps the named regular files, and says what it refused', () => {
+test('pickFiles keeps the named regular files, and says what it refused (what the parser refused too)', () => {
   const tar = Buffer.concat([entry({ name: 'events.jsonl' }, '{}\n'), entry({ name: 'export.json', type: '2', link: '/home/x/.ssh/id' }), entry({ name: 'other.txt' }, 'o'), end]);
   const { files, refused } = pickFiles(parseTar(tar, { allowSymlinks: true }), ['events.jsonl', 'export.json', 'stderr.txt']);
   assert.deepEqual([...files.keys()], ['events.jsonl']);
   assert.equal(files.get('events.jsonl').toString(), '{}\n');
   assert.deepEqual(refused, ['export.json']);
+  const fifo = Buffer.concat([entry({ name: 'events.jsonl', type: '6' }), entry({ name: 'stderr.txt' }, 'e'), end]);
+  const got = pickFiles(parseTar(fifo), ['events.jsonl', 'stderr.txt']);
+  assert.deepEqual([[...got.files.keys()], got.refused], [['stderr.txt'], ['events.jsonl']], 'a FIFO where a log should be is refused, the other log is read');
+});
+
+test('an entry that repeats a link\'s name replaces the link and never writes through it', (t) => {
+  const outside = path.join(tmp(t), 'victim.txt');
+  fs.writeFileSync(outside, 'original');
+  const tar = Buffer.concat([entry({ name: 'a', type: '2', link: outside }), entry({ name: 'a' }, 'pwned'), end]);
+  const dest = path.join(tmp(t), 'o');
+  extractEntries(parseTar(tar, { allowSymlinks: true }), dest);
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'original');
+  assert.ok(fs.lstatSync(path.join(dest, 'a')).isFile());
+  assert.equal(fs.readFileSync(path.join(dest, 'a'), 'utf8'), 'pwned');
 });

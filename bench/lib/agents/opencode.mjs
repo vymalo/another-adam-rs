@@ -14,8 +14,10 @@
 // What the host trusts (the review of slice 3): the exit status is the container runtime's, never a file the agent could
 // write; the JSON stream, the stderr and the export come out through a tar stream with a size cap and are refused if
 // they are not regular files; the config, which holds the run token, goes in on stdin and is on no command line.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { probeLimits } from '../limits.mjs';
 import { fetchPinnedBinary } from '../npm.mjs';
 import { InfraError, patchOfTree, saveRaw } from './common.mjs';
 
@@ -72,11 +74,31 @@ const prelude = (out) => [
   'export OPENCODE_CONFIG_CONTENT',
 ];
 
-/** The shell of the run; its last command is OpenCode, so the container's exit status is OpenCode's. Pure. */
+const STDERR_CAP = 1048576;
+
+/**
+ * The shell of the run. OpenCode runs in the background under a TERM trap (the polite stop of the time limit reaches it
+ * and exits 143), its stderr goes through a pipe that keeps the first megabyte and drops the rest, and the script's
+ * exit status is OpenCode's. Pure.
+ */
 export function opencodeRunScript({ bin, stmt, out, dir, run }) {
   plain(bin, stmt, out, dir);
   if (!SAFE_RUN.test(run)) throw new Error('the run id is not plain');
-  return [...prelude(out), `cd ${dir} || exit 98`, `${bin} run --standalone --format json --model ${MODEL} --auto --title '${run}' < ${stmt} > ${out}/events.jsonl 2> ${out}/stderr.txt`].join('\n');
+  return [
+    ...prelude(out),
+    `E=${out}/.stderr.fifo`,
+    'rm -f "$E"; mkfifo "$E" || exit 97',
+    `( head -c ${STDERR_CAP} > ${out}/stderr.txt; cat > /dev/null ) < "$E" &`,
+    'DRAIN=$!',
+    `cd ${dir} || exit 98`,
+    `${bin} run --standalone --format json --model ${MODEL} --auto --title '${run}' < ${stmt} > ${out}/events.jsonl 2> "$E" &`,
+    'OC=$!',
+    `trap 'kill -TERM "$OC" 2>/dev/null' TERM INT`,
+    'wait "$OC"; S=$?',
+    'if kill -0 "$OC" 2>/dev/null; then wait "$OC"; S=$?; fi',
+    'wait "$DRAIN" 2>/dev/null',
+    'exit $S',
+  ].join('\n');
 }
 
 /** The shell of the export, in a container of its own (the run's may have been killed). Pure. */
@@ -116,6 +138,7 @@ export function parseEvents(text) {
   return { sessionId, errors, retries, backgroundWaits, selfReported: { ...tokens, calls } };
 }
 
+const sha512 = (file) => crypto.createHash('sha512').update(fs.readFileSync(file)).digest('hex');
 const text = (files, name) => (files.has(name) ? files.get(name).toString('utf8') : '');
 
 export class OpenCodeAgent {
@@ -124,6 +147,8 @@ export class OpenCodeAgent {
   constructor({ pins, home, fetchBinary = fetchPinnedBinary, now = Date.now, contextWindow, pollMs = 10_000 }) {
     Object.assign(this, { pins, home, fetchBinary, now, contextWindow, pollMs });
     this.binary = null;
+    this.binarySha = null;
+    this.limitsBySlot = new Map(); // slot -> { accepted }
   }
 
   #names(ctx) {
@@ -143,7 +168,9 @@ export class OpenCodeAgent {
     const bin = path.join(this.slotDir(ctx), 'bin');
     fs.mkdirSync(bin, { recursive: true, mode: 0o755 });
     const target = path.join(bin, 'opencode');
-    if (!fs.existsSync(target) || fs.statSync(target).size !== fs.statSync(this.binary.path).size) {
+    // What is in the slot is the verified binary or it is replaced: compared by hash, never by size.
+    this.binarySha ??= sha512(this.binary.path);
+    if (!fs.existsSync(target) || sha512(target) !== this.binarySha) {
       fs.rmSync(target, { force: true });
       fs.copyFileSync(this.binary.path, target);
       fs.chmodSync(target, 0o555);
@@ -168,6 +195,12 @@ export class OpenCodeAgent {
       labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) },
     });
     if (r.exitCode !== 0) throw new Error(`the clone for OpenCode failed (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+    // Does the service accept the task's CPU and memory? Asked once for a slot; the answer decides what the run is given.
+    if (!this.limitsBySlot.has(ctx.slot)) {
+      const probe = await probeLimits({ containers: ctx.containers, image: ctx.task.image.ref, cpus: ctx.task.cpus, memoryMb: ctx.task.memoryMb });
+      if (probe.runtimeFailed) throw new InfraError('runtime', `the Podman service cannot run a container: ${probe.detail}`);
+      this.limitsBySlot.set(ctx.slot, { accepted: probe.accepted });
+    }
   }
 
   async run(ctx) {
@@ -180,29 +213,38 @@ export class OpenCodeAgent {
       { source: names.out, target: '/bench/out' },
       { source: names.parent, target: names.parent },
     ];
-    const base = { image: ctx.task.image.ref, workdir: '/', env: opencodeEnv(), mounts, input, cpus: ctx.task.cpus, memoryMb: ctx.task.memoryMb, labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) } };
+    const limitsAccepted = this.limitsBySlot.get(ctx.slot)?.accepted ?? false;
+    const base = { image: ctx.task.image.ref, workdir: '/', env: opencodeEnv(), mounts, input, ...(limitsAccepted ? { cpus: ctx.task.cpus, memoryMb: ctx.task.memoryMb } : {}), labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) } };
     // The image the container runs is the task's, by digest: asserted here, before the container starts.
     if (!/@sha256:[0-9a-f]{64}$/.test(base.image)) throw new InfraError('no-task-container', 'the task image is not named by digest');
-    // A refusal of the meter is a limit like time: OpenCode retries a refused call, so the harness ends the container.
-    let refused = false;
+    // The end of a run, for the time limit and for a refusal of the meter (OpenCode retries a refused call, so it would
+    // not end by itself): a polite stop (SIGTERM), then the configured grace, then a forced stop. The same grace adam gets.
+    let ended = null;
+    let graceTimer = null;
+    const end = (why) => {
+      if (ended) return;
+      ended = why;
+      ctx.containers.kill(names.container, 'TERM').catch(() => {});
+      graceTimer = setTimeout(() => ctx.containers.stop(names.container).catch(() => {}), ctx.limits.cancelGraceMs);
+    };
+    const limitTimer = setTimeout(() => end('timeout'), ctx.limits.limitMs);
     const watcher = setInterval(() => {
-      if (!refused && ctx.meter.refusal()) {
-        refused = true;
-        ctx.containers.stop(names.container).catch(() => {});
-      }
+      if (ctx.meter.refusal()) end('refusal');
     }, this.pollMs);
     const started = this.now();
     let r;
     try {
-      r = await ctx.containers.run({ ...base, name: names.container, script: opencodeRunScript({ bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: names.dir, run: `${ctx.run}-a${ctx.attempt}`.replace(/[^A-Za-z0-9._-]/g, '-') }), network: 'default', timeoutMs: ctx.limits.limitMs });
+      r = await ctx.containers.run({ ...base, name: names.container, script: opencodeRunScript({ bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: names.dir, run: `${ctx.run}-a${ctx.attempt}`.replace(/[^A-Za-z0-9._-]/g, '-') }), network: 'default' });
     } finally {
+      clearTimeout(limitTimer);
+      clearTimeout(graceTimer);
       clearInterval(watcher);
     }
     const wallMs = this.now() - started;
     let got = await ctx.stack.readFiles(ctx.slot, names.out, OUT_FILES);
     const eventsText = text(got.files, 'events.jsonl');
     const events = parseEvents(eventsText);
-    if (!r.timedOut && !refused && eventsText === '' && [125, 126, 127].includes(r.exitCode)) throw new InfraError('runtime', `the OpenCode container did not start (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+    if (ended === null && eventsText === '' && [125, 126, 127].includes(r.exitCode)) throw new InfraError('runtime', `the OpenCode container did not start (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
 
     if (events.sessionId) {
       const e = await ctx.containers.run({ ...base, name: `${names.container}-x`.slice(0, 63), script: opencodeExportScript({ bin: '/opt/bench/opencode', out: '/bench/out', sessionId: events.sessionId }), network: 'none', timeoutMs: 5 * 60 * 1000 });
@@ -218,12 +260,12 @@ export class OpenCodeAgent {
 
     const refusal = ctx.meter.refusal();
     let exit;
-    if (refused) exit = refusal === 'cap' ? 'stopped_by_cap' : 'budget_hit';
-    else if (r.timedOut) exit = 'timeout'; // the runtime's word, before any status
+    if (ended === 'refusal') exit = refusal === 'cap' ? 'stopped_by_cap' : 'budget_hit';
+    else if (ended === 'timeout') exit = 'timeout'; // the harness's own clock, before any status
     else if (r.exitCode === 0 && events.errors === 0) exit = 'done';
     else if (refusal) exit = refusal === 'cap' ? 'stopped_by_cap' : 'budget_hit';
     else exit = 'failed';
-    return { exit, wallMs, sessionId: events.sessionId, selfReported: events.selfReported, retries: events.retries, backgroundWaits: events.backgroundWaits, exportKept: got.files.has('export.json'), processExit: r.exitCode, refusedOutput: got.refused };
+    return { exit, wallMs, sessionId: events.sessionId, selfReported: events.selfReported, retries: events.retries, backgroundWaits: events.backgroundWaits, exportKept: got.files.has('export.json'), processExit: r.exitCode, record: { limits: limitsAccepted ? 'task' : 'service', outputRefused: got.refused } };
   }
 
   /** The container ran with --rm and has ended; nothing of the run may be left in the service. */
@@ -238,10 +280,10 @@ export class OpenCodeAgent {
   async collect(ctx) {
     const names = this.#names(ctx);
     const treeDir = path.join(ctx.paths.scratch, 'tree');
-    await ctx.stack.extractTree(ctx.slot, names.dir, treeDir);
+    const ex = await ctx.stack.extractTree(ctx.slot, names.dir, treeDir);
     const patch = await patchOfTree({ treeDir, base: ctx.base, workRoot: ctx.paths.scratch });
     fs.rmSync(treeDir, { recursive: true, force: true });
-    return { patch, notes: {} };
+    return { patch, notes: { refused: ex?.refused ?? [] } };
   }
 
   async cleanup(ctx) {

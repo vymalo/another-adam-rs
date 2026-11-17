@@ -330,6 +330,53 @@ export function gradeScript({ workdir = '/app', cloneTo = null } = {}) {
 }
 
 const STALE_SLACK_MS = 1000;
+export const MAX_REWARD_BYTES = 16;
+
+/** The reward text of what a container left, or 'invalid' for anything that is not a small regular file. */
+export const rewardOf = (raw) => (/^[01]\n?$/.test(raw) ? raw.slice(0, 1) : 'invalid');
+
+/**
+ * Where a grading's files live. The default is the host's own: a directory of the harness's, made empty for each
+ * attempt, handed to the container and read after it ends. The reward file is one a container wrote, so it is opened
+ * without following a link and without blocking (a FIFO would hang the harness) and is read only if it is a regular
+ * file of at most 16 bytes; anything else is 'invalid'. The service-backed one (`Stack.graderIO`) keeps the files
+ * inside the grader and moves them as tar streams.
+ *   stage({ task, patchFile }) -> { mounts, readReward(startedMs) -> { reward, stale }, remove() }
+ */
+export function hostGradeIO(workRoot = os.tmpdir()) {
+  return {
+    async stage({ task, patchFile }) {
+      const logs = fs.mkdtempSync(path.join(workRoot, 'grade-logs-'));
+      fs.chmodSync(logs, 0o777);
+      const mounts = [
+        { source: path.join(task.dir, 'tests'), target: '/tests', readOnly: true },
+        { source: logs, target: '/logs/verifier' },
+      ];
+      if (patchFile) mounts.push({ source: path.resolve(patchFile), target: '/patch/model.patch', readOnly: true });
+      return {
+        mounts,
+        async readReward(startedMs) {
+          let fd;
+          try {
+            fd = fs.openSync(path.join(logs, 'reward.txt'), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+          } catch (e) {
+            return { reward: e.code === 'ENOENT' ? null : 'invalid', stale: false };
+          }
+          try {
+            const st = fs.fstatSync(fd);
+            if (!st.isFile() || st.size > MAX_REWARD_BYTES) return { reward: 'invalid', stale: false };
+            return { reward: rewardOf(fs.readFileSync(fd, 'utf8')), stale: st.mtimeMs < startedMs - STALE_SLACK_MS };
+          } finally {
+            fs.closeSync(fd);
+          }
+        },
+        async remove() {
+          fs.rmSync(logs, { recursive: true, force: true });
+        },
+      };
+    },
+  };
+}
 
 /**
  * One grading run, in a directory of its own that is empty when the container starts and is read only after
@@ -337,47 +384,21 @@ const STALE_SLACK_MS = 1000;
  * attempt, and no error. A reward of 1 with another exit status is a fail and `suspect`.
  * Returns { pass, reward, error, exitCode, suspect }.
  */
-export async function gradeOnce({ containers, task, patchFile = null, cloneTo = null, workRoot = os.tmpdir(), timeoutMs = 30 * 60 * 1000 }) {
-  const logs = fs.mkdtempSync(path.join(workRoot, 'grade-logs-'));
-  fs.chmodSync(logs, 0o777);
+export async function gradeOnce({ containers, task, patchFile = null, cloneTo = null, workRoot = os.tmpdir(), timeoutMs = 30 * 60 * 1000, io = hostGradeIO(workRoot) }) {
+  const staged = await io.stage({ task, patchFile });
   try {
-    const mounts = [
-      { source: path.join(task.dir, 'tests'), target: '/tests', readOnly: true },
-      { source: logs, target: '/logs/verifier' },
-    ];
-    if (patchFile) mounts.push({ source: path.resolve(patchFile), target: '/patch/model.patch', readOnly: true });
     const startedMs = Date.now();
     const r = await containers.run({
       image: task.image.ref,
       script: gradeScript({ workdir: task.workdir, cloneTo }),
       workdir: '/',
-      mounts,
+      mounts: staged.mounts,
       network: verifierNetwork(task),
       cpus: task.cpus,
       memoryMb: task.memoryMb,
       timeoutMs,
     });
-    let reward = null;
-    let stale = false;
-    try {
-      const file = path.join(logs, 'reward.txt');
-      // A container wrote this file: it is read without following a link, and only if it is a small regular file.
-      const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-      try {
-        const st = fs.fstatSync(fd);
-        stale = st.mtimeMs < startedMs - STALE_SLACK_MS;
-        // exactly 1 or 0, with at most one newline after it: nothing else is a reward
-        if (!st.isFile() || st.size > 16) reward = 'invalid';
-        else {
-          const raw = fs.readFileSync(fd, 'utf8');
-          reward = /^[01]\n?$/.test(raw) ? raw.slice(0, 1) : 'invalid';
-        }
-      } finally {
-        fs.closeSync(fd);
-      }
-    } catch {
-      reward = null;
-    }
+    const { reward, stale } = await staged.readReward(startedMs);
     const suspect = [];
     let error = null;
     if (r.timedOut) error = 'timeout';
@@ -392,7 +413,7 @@ export async function gradeOnce({ containers, task, patchFile = null, cloneTo = 
     }
     return { pass: error === null && reward === '1', reward, error, exitCode: r.exitCode, suspect };
   } finally {
-    fs.rmSync(logs, { recursive: true, force: true });
+    await staged.remove();
   }
 }
 
@@ -411,7 +432,7 @@ export async function gradeAttempt(opts) {
  * never a fail) when an attempt stays an infrastructure error. The patch is stripped first (`sanitizePatch`);
  * `removed` and `suspect` say what was taken out and what a person should read.
  */
-export async function gradePatch({ containers, task, patchFile = null, workRoot = os.tmpdir(), hiddenTests, timeoutMs }) {
+export async function gradePatch({ containers, task, patchFile = null, workRoot = os.tmpdir(), hiddenTests, timeoutMs, io }) {
   let mounted = patchFile;
   let removed = [];
   let suspect = [];
@@ -425,7 +446,7 @@ export async function gradePatch({ containers, task, patchFile = null, workRoot 
       if (mounted) fs.writeFileSync(mounted, s.patch);
     }
     const attempts = [];
-    for (let i = 0; i < GRADE_ATTEMPTS; i++) attempts.push(await gradeAttempt({ containers, task, patchFile: mounted, workRoot, timeoutMs }));
+    for (let i = 0; i < GRADE_ATTEMPTS; i++) attempts.push(await gradeAttempt({ containers, task, patchFile: mounted, workRoot, timeoutMs, io }));
     for (const a of attempts) for (const s of a.suspect) if (!suspect.includes(s)) suspect.push(s);
     const invalid = attempts.some((a) => a.invalid);
     const passes = attempts.filter((a) => a.pass).length;

@@ -4,7 +4,12 @@
 // file in a place a container could write. A tree or a log comes out of a Podman service as `tar -cf -`; this parser
 // reads it with limits: regular files and directories only (symbolic links only when the caller asks, for a work
 // tree, and they are never followed), no hard link, device or FIFO, every name normalised and refused if it is
-// absolute, holds `..` or a NUL byte, a cap on the bytes, the entries and one file. What it extracts the host owns.
+// absolute, holds `..` or a NUL byte, a cap on the bytes, the entries and one file.
+//
+// An entry that is not acceptable (a FIFO, a device, a hard link, a link nobody asked for, a file over its cap) is
+// **refused and skipped**: it is recorded in `entries.refused` with its path and reason, and the rest is read, so one
+// bad entry does not end a run. Only a broken stream (a wrong checksum, a name that leaves the target, an archive that
+// ends inside an entry) or one over the TOTAL cap throws: that is infrastructure. What it extracts the host owns.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -68,6 +73,7 @@ export function cleanName(raw) {
 export function parseTar(buf, { maxBytes = DEFAULT_LIMITS.maxBytes, maxEntries = DEFAULT_LIMITS.maxEntries, maxFileBytes = DEFAULT_LIMITS.maxFileBytes, allowSymlinks = false } = {}) {
   if (buf.length > maxBytes) throw new TarError(`the archive is larger than ${maxBytes} bytes`);
   const entries = [];
+  entries.refused = [];
   let pos = 0;
   let pax = {};
   let longName = null;
@@ -108,18 +114,18 @@ export function parseTar(buf, { maxBytes = DEFAULT_LIMITS.maxBytes, maxEntries =
     if (entries.length >= maxEntries) throw new TarError(`the archive has more than ${maxEntries} entries`);
     const mode = octal(h.subarray(100, 108)) & 0o777;
     if (type === '0' || type === '7') {
-      if (realSize > maxFileBytes) throw new TarError(`a file is larger than ${maxFileBytes} bytes`);
       if (clean === '') throw new TarError('a file has no name');
-      entries.push({ name: clean, type: 'file', mode, data: Buffer.from(data) });
+      if (realSize > maxFileBytes) entries.refused.push({ name: clean, reason: `a file is larger than ${maxFileBytes} bytes` });
+      else entries.push({ name: clean, type: 'file', mode, data: Buffer.from(data) });
     } else if (type === '5') {
       if (clean !== '') entries.push({ name: clean, type: 'dir', mode });
     } else if (type === '2' && allowSymlinks) {
       if (clean === '' || link.includes('\0')) throw new TarError('a link is malformed');
       entries.push({ name: clean, type: 'symlink', mode, linkpath: link });
     } else if (type === '2') {
-      throw new TarError(`a symbolic link is refused: ${JSON.stringify(clean)}`);
+      entries.refused.push({ name: clean, reason: 'a symbolic link is not allowed here' });
     } else {
-      throw new TarError(`an entry is not a plain file: ${JSON.stringify(clean)} (type ${JSON.stringify(type)})`);
+      entries.refused.push({ name: clean, reason: `not a plain file (type ${JSON.stringify(type)})` });
     }
   }
   return entries;
@@ -129,7 +135,7 @@ export function parseTar(buf, { maxBytes = DEFAULT_LIMITS.maxBytes, maxEntries =
 export function pickFiles(entries, names) {
   const wanted = new Set(names);
   const files = new Map();
-  const refused = [];
+  const refused = (entries.refused ?? []).filter((r) => wanted.has(r.name)).map((r) => r.name);
   for (const e of entries) {
     if (!wanted.has(e.name)) continue;
     if (e.type === 'file') files.set(e.name, e.data);

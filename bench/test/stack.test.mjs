@@ -196,11 +196,38 @@ test('finding 5 and 6: files come out of a service as a tar stream, by name, and
   assert.deepEqual(refused, ['export.json']);
 });
 
-test('finding 5: a file larger than the cap, or an archive that is too big, is an error and not memory', async (t) => {
+test('a log over its cap is refused and the others are read; an archive over the total cap is the only error (defect 3)', async (t) => {
+  const huge = makeStack(t, { execBuf: async () => ({ exitCode: 0, stdout: tarOf({ 'events.jsonl': 'x'.repeat(5000), 'stderr.txt': 'ok' }), stderr: '', over: false }) });
+  const got = await huge.stack.readFiles(1, '/work/bench-out/x', ['events.jsonl', 'stderr.txt'], { maxFileBytes: 1000 });
+  assert.deepEqual([[...got.files.keys()], got.refused], [['stderr.txt'], ['events.jsonl']]);
   const big = makeStack(t, { execBuf: async () => ({ exitCode: 0, stdout: Buffer.alloc(0), stderr: '', over: true }) });
   await assert.rejects(big.stack.readFiles(1, '/work/bench-out/x', ['events.jsonl']), /larger than the limit/);
-  const huge = makeStack(t, { execBuf: async () => ({ exitCode: 0, stdout: tarOf({ 'events.jsonl': 'x'.repeat(5000) }), stderr: '', over: false }) });
-  await assert.rejects(huge.stack.readFiles(1, '/work/bench-out/x', ['events.jsonl'], { maxFileBytes: 1000 }), /file is larger/);
+});
+
+test('defect 2, through the real parser: a FIFO where a log should be does not end the run: it is refused, and the other logs are read', async (t) => {
+  const d = tmp(t);
+  fs.writeFileSync(path.join(d, 'stderr.txt'), 'warn');
+  fs.writeFileSync(path.join(d, 'export.json'), '{}');
+  execFileSync('mkfifo', [path.join(d, 'events.jsonl')]);
+  const tar = execFileSync('tar', ['--format=posix', '-cf', '-', '-C', d, 'events.jsonl', 'stderr.txt', 'export.json'], { maxBuffer: 1 << 26 });
+  const { stack } = makeStack(t, { execBuf: async () => ({ exitCode: 0, stdout: tar, stderr: '', over: false }) });
+  const got = await stack.readFiles(1, '/work/bench-out/x', ['events.jsonl', 'stderr.txt', 'export.json']);
+  assert.deepEqual([[...got.files.keys()].sort(), got.refused], [['export.json', 'stderr.txt'], ['events.jsonl']]);
+});
+
+test('defect 3, through the real parser: a FIFO, a device or a big file in the work tree is skipped and recorded, and the rest of the tree is extracted', async (t) => {
+  const d = tmp(t);
+  fs.mkdirSync(path.join(d, 'src'));
+  fs.writeFileSync(path.join(d, 'src', 'a.txt'), 'a');
+  fs.writeFileSync(path.join(d, 'huge.bin'), 'x'.repeat(5000));
+  execFileSync('mkfifo', [path.join(d, 'src', 'pipe')]);
+  const tar = execFileSync('tar', ['--format=posix', '-cf', '-', '-C', d, '.'], { maxBuffer: 1 << 26 });
+  const { stack } = makeStack(t, { execBuf: async () => ({ exitCode: 0, stdout: tar, stderr: '', over: false }) });
+  const dest = path.join(tmp(t), 'tree');
+  const { refused } = await stack.extractTree(1, '/work/workspaces/r/s', dest, { maxFileBytes: 1000 });
+  assert.deepEqual(refused.map((r) => r.name).sort(), ['huge.bin', 'src/pipe']);
+  assert.equal(fs.readFileSync(path.join(dest, 'src', 'a.txt'), 'utf8'), 'a');
+  assert.equal(fs.existsSync(path.join(dest, 'src', 'pipe')), false);
 });
 
 test('a tree comes out as a tar stream into a directory the harness makes, without its top-level .git, links kept as links and never followed', async (t) => {
@@ -354,13 +381,14 @@ test('finding 2: the git sandbox has no secret, no network, a read-only root and
   }
 });
 
-test('finding 7: an agent\'s Podman service mounts its own work volume and one read-only directory, never $BENCH_HOME or the tasks', compose, () => {
+test('defect 8 and finding 7: an agent\'s Podman service mounts its own work volume and one read-only directory, never $BENCH_HOME or the tasks', compose, () => {
   for (const slot of [1, 2]) {
     const mounts = config.services[`podman-${slot}`].volumes.map((v) => `${v.source}:${v.target}${v.read_only ? ':ro' : ''}`).sort();
     assert.deepEqual(mounts, [`/tmp/bh/slots/${slot}:/tmp/bh/slots/${slot}:ro`, `podman-socket-${slot}:/run/podman`, `podman-storage-${slot}:/home/agent/.local/share/containers`, `work-${slot}:/work`].sort());
   }
-  const grader = config.services.grader.volumes.map((v) => v.target).sort();
-  assert.deepEqual(grader, ['/home/agent/.local/share/containers', '/run/podman', '/tmp/bh', '/tmp/bt']);
+  const grader = config.services.grader.volumes.map((v) => `${v.source}:${v.target}`).sort();
+  assert.deepEqual(grader, ['grader-socket:/run/podman', 'grader-storage:/home/agent/.local/share/containers'].sort(), 'the grader mounts nothing of the host\'s (defect 8)');
+  assert.ok(config.services.grader.tmpfs.some((t) => t.startsWith('/grade:')), 'a grading\'s files are in memory of the grader');
   assert.ok(!config.services['podman-1'].volumes.some((v) => v.target === '/tmp/bt' || v.target === '/tmp/bh'));
 });
 
@@ -416,4 +444,10 @@ test('compose: slots do not share a database, a volume, a socket, a network or a
 
 test('compose: the stack has a service of each kind for each slot', compose, () => {
   for (const kind of ['podman', 'coder', 'gitbox', 'meter', 'pub-coder', 'pusher']) for (const slot of [1, 2]) assert.ok(config.services[`${kind}-${slot}`], `${kind}-${slot}`);
+});
+
+test('C: only the three relays publish ports, and only on the loopback', compose, () => {
+  const published = Object.entries(config.services).filter(([, svc]) => svc.ports).map(([n]) => n).sort();
+  assert.deepEqual(published, ['pub-coder-1', 'pub-coder-2', 'pub-git']);
+  for (const n of published) for (const port of config.services[n].ports) assert.equal(port.host_ip, '127.0.0.1', n);
 });

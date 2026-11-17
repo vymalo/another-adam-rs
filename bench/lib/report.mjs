@@ -267,6 +267,12 @@ export function buildReport(foldedOrRecords, opts = {}) {
     out.push(table(['Run', 'Task', 'Agent / arm', 'Why', 'Stripped', 'Patch'], suspects.map((v) => [v.run, v.task ?? '-', v.agent ? cellKey(v) : '-', v.result.suspect.join(', '), (v.result.removed ?? []).join(', ') || '-', v.result.patch ?? '-'])));
   } else out.push('None.\n');
 
+  h('Refused entries and limits');
+  out.push('What an agent left in its tree or its output that the harness would not read (a FIFO, a device, a link, a file over its cap) is skipped, the run goes on, and the entry is listed here. A run whose container refused the task\'s CPU and memory limits ran on the service\'s own, which are the same for both agents.\n\n');
+  const refusedRuns = all.filter((v) => (v.result?.notes?.refused?.length ?? 0) > 0 || v.result?.notes?.limits === 'service');
+  if (refusedRuns.length > 0) out.push(table(['Run', 'Agent / arm', 'Refused', 'Limits'], refusedRuns.map((v) => [v.run, v.agent ? cellKey(v) : '-', (v.result.notes.refused ?? []).map((r) => `${r.name}: ${r.reason}`).join('; ') || '-', v.result.notes.limits ?? '-'])));
+  else out.push('None.\n');
+
   h('What this report does not claim');
   out.push(NOT_CLAIMED.map((s) => `* ${s}`).join('\n'));
   out.push('');

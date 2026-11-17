@@ -139,6 +139,13 @@ export class PodmanRemote {
     return (Array.isArray(rows) ? rows : []).map((r) => ({ image: String(r.Image ?? ''), imageId: String(r.ImageID ?? ''), labels: r.Labels ?? {}, names: r.Names ?? [] }));
   }
 
+  /** Send a signal to a running container by name: the polite end of a run, before the forced one (`stop`). */
+  async kill(name, signal) {
+    if (!SAFE_NAME.test(name)) throw new ContainerError('the container name is not safe');
+    if (!['TERM', 'INT', 'KILL'].includes(signal)) throw new ContainerError('the signal is not one the harness sends');
+    await this.#call([...this.#base(), 'kill', '--signal', signal, name], { timeoutMs: 60_000 });
+  }
+
   /** Remove a running container by name (a run the harness ends early). */
   async stop(name) {
     if (!SAFE_NAME.test(name)) throw new ContainerError('the container name is not safe');
@@ -172,6 +179,7 @@ export class FakeContainers {
     this.pulled = [];
     this.built = [];
     this.stopped = [];
+    this.killed = [];
     this.reaped = 0;
     this.listing = [];
   }
@@ -187,6 +195,9 @@ export class FakeContainers {
   }
   async stop(name) {
     this.stopped.push(name);
+  }
+  async kill(name, signal) {
+    this.killed.push([name, signal]);
   }
   async reapAll() {
     this.reaped += 1;

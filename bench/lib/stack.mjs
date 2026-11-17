@@ -9,10 +9,12 @@
 // mode 0600 that exists only while the coder is being created and is removed at the next start if a kill left it;
 // they are in no command line, no log event and no error message (`redact`). The Podman client runs inside the
 // service, so a mount source is a path as the service sees it.
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { PodmanRemote } from './containers.mjs';
+import { MAX_REWARD_BYTES, rewardOf } from './grade.mjs';
 import { extractEntries, parseTar, pickFiles } from './tarstream.mjs';
 
 export class StackError extends Error {
@@ -243,7 +245,9 @@ export class Stack {
     fs.rmSync(dest, { recursive: true, force: true });
     const r = await this.streamFrom(this.slotService('podman', slot), ['tar', '--format=posix', '-cf', '-', '--exclude=./.git', '-C', dir, '.'], { maxBytes: limits.maxBytes ?? 512 * 1024 * 1024 });
     if (r.exitCode !== 0) throw new StackError(`the tree could not be read (exit ${r.exitCode})`);
-    extractEntries(parseTar(r.stdout, { allowSymlinks: true, ...limits }), dest);
+    const entries = parseTar(r.stdout, { allowSymlinks: true, ...limits });
+    extractEntries(entries, dest);
+    return { refused: entries.refused }; // a FIFO, a device or a file over its cap: skipped, and recorded
   }
 
   /** A base repository of the slot's volume on the git server, pushed by a one-shot container with no secret. */
@@ -302,6 +306,51 @@ export class Stack {
   /** The Podman client of the service that grades: no agent runs there. */
   graderContainers() {
     return this.containersIn('grader');
+  }
+
+  /** Put files into a directory of a service: a tar of the host's own files, given on stdin. */
+  async putTar(service, dir, srcDir, names) {
+    const tar = execFileSync('tar', ['-cf', '-', '-C', srcDir, ...names], { maxBuffer: 1024 * 1024 * 1024 });
+    await this.compose(['exec', '-T', service, 'tar', '-xf', '-', '-C', dir], { input: tar, timeoutMs: 5 * 60 * 1000 });
+  }
+
+  /**
+   * Where a grading's files live, for `gradeOnce`: a directory of the grader's own, `/grade/<id>`, made for one grading. The tests
+   * and the patch go in as tar streams and are mounted read-only into the grading container; its logs directory comes
+   * out as a tar stream (the reward, a regular file of at most 16 bytes, or nothing); the directory is removed inside
+   * the service. The grader mounts no directory of the host.
+   */
+  graderIO() {
+    const stack = this;
+    return {
+      async stage({ task, patchFile }) {
+        const base = `/grade/${crypto.randomBytes(8).toString('hex')}`;
+        await stack.execIn('grader', `mkdir -p ${base}/logs ${base}/tests ${base}/patch && chmod 777 ${base}/logs`);
+        const mounts = [
+          { source: `${base}/tests`, target: '/tests', readOnly: true },
+          { source: `${base}/logs`, target: '/logs/verifier' },
+        ];
+        await stack.putTar('grader', `${base}/tests`, path.join(task.dir, 'tests'), ['.']);
+        if (patchFile) {
+          const name = path.basename(patchFile);
+          if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new StackError('the patch file name is not plain');
+          await stack.putTar('grader', `${base}/patch`, path.dirname(path.resolve(patchFile)), [name]);
+          mounts.push({ source: `${base}/patch/${name}`, target: '/patch/model.patch', readOnly: true });
+        }
+        return {
+          mounts,
+          async readReward() {
+            const r = await stack.streamFrom('grader', ['tar', '--format=posix', '-cf', '-', '--ignore-failed-read', '-C', `${base}/logs`, 'reward.txt'], { maxBytes: 1024 * 1024 });
+            const { files, refused } = pickFiles(parseTar(r.stdout, { allowSymlinks: true, maxFileBytes: MAX_REWARD_BYTES }), ['reward.txt']);
+            if (refused.length > 0) return { reward: 'invalid', stale: false };
+            return { reward: files.has('reward.txt') ? rewardOf(files.get('reward.txt').toString('utf8')) : null, stale: false };
+          },
+          async remove() {
+            await stack.execIn('grader', `chmod -R u+rwX ${base} 2>/dev/null; rm -rf ${base}; test ! -e ${base}`);
+          },
+        };
+      },
+    };
   }
 
   /** Give a Podman service the internet while `fn` runs (a task image is pulled, a verifier needs the network), and take it away after. */

@@ -30,7 +30,7 @@ const broken = (series) => series.some((a) => a.invalid);
  * no-gold-patch, infra, gold-does-not-apply, gold-fails, gold-flaky, gold-fails-at-app, empty-passes, empty-flaky.
  * The gold also runs once through the real grading path (the working directory /app, the original test.sh).
  */
-export async function checkTask({ containers, task: given, workRoot = os.tmpdir(), timeoutMs }) {
+export async function checkTask({ containers, task: given, workRoot = os.tmpdir(), timeoutMs, io }) {
   const result = (extra) => ({ id: given.id, ok: false, reason: null, devcontainer: null, imageDigest: null, pin: null, ...extra });
   let pinned;
   try {
@@ -52,7 +52,7 @@ export async function checkTask({ containers, task: given, workRoot = os.tmpdir(
   if (probe.exitCode !== 0 || !/devcontainer=(yes|no)/.test(probe.stdout)) return result({ ...base, reason: 'infra', detail: 'the probe did not run' });
   const devcontainer = probe.stdout.includes('devcontainer=yes');
 
-  const opts = { containers, task, workRoot, timeoutMs };
+  const opts = { containers, task, workRoot, timeoutMs, io };
   const gold = await runSeries(opts, task.goldPatch);
   if (broken(gold)) return result({ ...base, devcontainer, reason: 'infra' });
   const goldPasses = count(gold, (a) => a.pass);

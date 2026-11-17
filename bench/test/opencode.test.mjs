@@ -58,10 +58,15 @@ test('finding 13: the config, which holds the run token, goes in on stdin; the e
 
 const paths = { bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: '/work/workspaces/oc-r1-a1/slot', run: 'r1-a1' };
 
-test('the command: the config from stdin, then OpenCode as the last command, so the container\'s exit status is its own; no exit file, no --dir', () => {
+test('the command: the config from stdin, OpenCode in the background under a TERM trap so the container\'s exit status is its own, stderr capped inside the service; no exit file, no --dir', () => {
   const script = opencodeRunScript(paths);
-  assert.match(script, /OPENCODE_CONFIG_CONTENT=\$\(cat\)\nexport OPENCODE_CONFIG_CONTENT\ncd \/work\/workspaces\/oc-r1-a1\/slot \|\| exit 98\n\/opt\/bench\/opencode run --standalone --format json --model bench\/bench-model --auto --title 'r1-a1' < \/bench\/in\/instruction\.md > \/bench\/out\/events\.jsonl 2> \/bench\/out\/stderr\.txt$/);
-  assert.doesNotMatch(script, /--dir|echo \$\?|\/exit/);
+  assert.match(script, /OPENCODE_CONFIG_CONTENT=\$\(cat\)\nexport OPENCODE_CONFIG_CONTENT\n/);
+  assert.match(script, /cd \/work\/workspaces\/oc-r1-a1\/slot \|\| exit 98\n\/opt\/bench\/opencode run --standalone --format json --model bench\/bench-model --auto --title 'r1-a1' < \/bench\/in\/instruction\.md > \/bench\/out\/events\.jsonl 2> "\$E" &\nOC=\$!/);
+  assert.match(script, /trap 'kill -TERM "\$OC" 2>\/dev\/null' TERM INT/);
+  assert.match(script, /mkfifo "\$E"/);
+  assert.match(script, /head -c 1048576 > \/bench\/out\/stderr\.txt; cat > \/dev\/null/, 'a chatty run cannot reach any cap: the rest is read and dropped');
+  assert.match(script, /wait "\$OC"; S=\$\?\nif kill -0 "\$OC" 2>\/dev\/null; then wait "\$OC"; S=\$\?; fi\nwait "\$DRAIN" 2>\/dev\/null\nexit \$S$/);
+  assert.doesNotMatch(script, /--dir|echo \$\? >|\/exit\b/);
 });
 
 test('the command takes only plain paths and a plain run id', () => {
@@ -166,6 +171,29 @@ test('prepare: the verified binary and the statement in the slot\'s directory, a
   assert.equal(clone.labels['bench.slot'], '2');
 });
 
+test('defect 6: whatever is in the slot directory is replaced by the verified binary: another size, and the same size with other bytes', async (t) => {
+  for (const other of [Buffer.from('x'), null]) {
+    const { agent, ctx, slotDir } = setup(t);
+    const verified = fs.readFileSync((await agent.fetchBinary({ pin: PINS.opencode, dir: tmp(t) })).path);
+    fs.mkdirSync(path.join(slotDir, 'bin'), { recursive: true });
+    const planted = path.join(slotDir, 'bin', 'opencode');
+    fs.writeFileSync(planted, other ?? Buffer.from(verified).fill(0x41));
+    assert.equal(fs.statSync(planted).size === verified.length, other === null, 'the second case has the size of the verified binary');
+    await agent.prepare(ctx);
+    assert.deepEqual(fs.readFileSync(planted), verified);
+    assert.equal(fs.statSync(planted).mode & 0o777, 0o555);
+  }
+});
+
+test('defect 6: a binary already in the slot that is the verified one is left as it is', async (t) => {
+  const { agent, ctx, slotDir } = setup(t);
+  await agent.prepare(ctx);
+  const target = path.join(slotDir, 'bin', 'opencode');
+  const before = fs.statSync(target).ino;
+  await agent.prepare(ctx);
+  assert.equal(fs.statSync(target).ino, before);
+});
+
 test('prepare: a binary that does not match its pinned integrity stops the run before any container starts', async (t) => {
   const { agent, ctx, containers } = setup(t, { binary: { integrity: `sha512-${'A'.repeat(86)}==` } });
   await assert.rejects(agent.prepare(ctx), IntegrityError);
@@ -188,7 +216,7 @@ test('run: the container of the task image by digest, the binary read-only, the 
   const spec = containers.runs.find((s) => s.script.includes(' run --standalone '));
   assert.equal(spec.image, task.image.ref);
   assert.equal(spec.network, 'default', 'the Podman service\'s own network: the meter relay and nothing else');
-  assert.equal(spec.timeoutMs, LIMITS.limitMs);
+  assert.equal(spec.timeoutMs, undefined, 'the time limit is the driver\'s own: a polite stop, the grace, then a forced stop');
   assert.deepEqual([spec.cpus, spec.memoryMb], [task.cpus, task.memoryMb]);
   assert.equal(spec.name, 'adam-bench-oc-r1-a1');
   assert.equal(spec.labels['bench.slot'], '2');
@@ -219,16 +247,12 @@ test('run: the output is read through the stream reader with named files only, a
   assert.equal(JSON.parse(fs.readFileSync(path.join(ctx.paths.run, 'opencode', 'export.json'), 'utf8')).info.id, 'ses_abc123XYZ');
 });
 
-test('finding 6: the exit is the runtime\'s: a file the agent wrote called exit is never read, and a time-out wins over any status', async (t) => {
+test('finding 6: the exit is the runtime\'s: a file the agent wrote called exit is never read', async (t) => {
   const forged = [...setup(t).out.files, ['exit', Buffer.from('0\n')]];
   const failed = setup(t, { runResult: { exitCode: 1 }, outFiles: forged });
   await failed.agent.prepare(failed.ctx);
   assert.equal((await failed.agent.run(failed.ctx)).exit, 'failed', 'the agent wrote 0 to exit; the container said 1');
   assert.ok(!failed.stackCalls.some((c) => c[0] === 'readFiles' && c[3].includes('exit')));
-
-  const slow = setup(t, { runResult: { exitCode: 0, timedOut: true } });
-  await slow.agent.prepare(slow.ctx);
-  assert.equal((await slow.agent.run(slow.ctx)).exit, 'timeout', 'timed out, whatever the status says');
 });
 
 test('finding 6: a symbolic link, FIFO or device where a log should be is refused, logged and kept out of the results', async (t) => {
@@ -240,10 +264,71 @@ test('finding 6: a symbolic link, FIFO or device where a log should be is refuse
   })();
   await agent.prepare(ctx);
   const r = await agent.run(ctx);
-  assert.deepEqual(r.refusedOutput, ['events.jsonl', 'export.json']);
+  assert.deepEqual(r.record.outputRefused, ['events.jsonl', 'export.json']);
   assert.deepEqual(logs.find((l) => l.event === 'refused_output').names, ['events.jsonl', 'export.json']);
   assert.equal(fs.readFileSync(path.join(runDir, 'opencode', 'refused.json'), 'utf8').trim(), '["events.jsonl","export.json"]');
   assert.equal(fs.readFileSync(path.join(runDir, 'opencode', 'events.jsonl'), 'utf8'), '');
+});
+
+test('defect 7: the task\'s limits are passed when the service accepts them, and the run record says so', async (t) => {
+  const { agent, ctx, containers, task } = setup(t);
+  await agent.prepare(ctx);
+  const r = await agent.run(ctx);
+  const probes = containers.runs.filter((s) => s.script === 'true');
+  assert.equal(probes.length, 2, 'a container without the limits, then one with them');
+  assert.deepEqual([probes[1].cpus, probes[1].memoryMb], [task.cpus, task.memoryMb]);
+  const spec = containers.runs.find((x) => x.script.includes(' run --standalone '));
+  assert.deepEqual([spec.cpus, spec.memoryMb], [task.cpus, task.memoryMb]);
+  assert.equal(r.record.limits, 'task');
+});
+
+test('defect 7: limits a cgroup-less service refuses are not passed, the run goes on, and the record says the limits are the service\'s own', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  const real = containers.onRun;
+  containers.onRun = (spec, i) => (spec.cpus !== undefined || spec.memoryMb !== undefined ? { exitCode: 125, stderr: 'Error: cpu limit is not supported with cgroups disabled' } : real(spec, i));
+  await agent.prepare(ctx);
+  const r = await agent.run(ctx);
+  const spec = containers.runs.find((x) => x.script.includes(' run --standalone '));
+  assert.deepEqual([spec.cpus, spec.memoryMb], [undefined, undefined]);
+  assert.equal(r.exit, 'done', 'not every run fails');
+  assert.equal(r.record.limits, 'service');
+  await agent.prepare({ ...ctx, run: 'r2' });
+  assert.equal(containers.runs.filter((x) => x.script === 'true').length, 2, 'the probe is made once for a slot');
+});
+
+test('defect 7: a service that cannot even run a container without limits is infrastructure, not a refusal of limits', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  containers.onRun = (spec) => (spec.script === 'true' ? { exitCode: 125, stderr: 'Error: the service is down' } : { exitCode: 0 });
+  await assert.rejects(agent.prepare(ctx), (e) => e instanceof InfraError && e.reason === 'runtime');
+});
+
+test('M-oc-task-digest: a task image not named by digest is infrastructure and no agent container starts', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  await agent.prepare(ctx);
+  ctx.task = { ...ctx.task, image: { ...ctx.task.image, ref: 'example.test/task:1' } };
+  await assert.rejects(agent.run(ctx), (e) => e instanceof InfraError && e.reason === 'no-task-container');
+  assert.ok(!containers.runs.some((x) => x.script.includes(' run --standalone ')));
+});
+
+test('F: both drivers give the model the one configured context window and step limit', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  const a = new OpenCodeAgent({ pins: agent.pins, home: tmp(t), contextWindow: 65536, fetchBinary: agent.fetchBinary, pollMs: 5 });
+  ctx.limits = { ...LIMITS, steps: 77 };
+  await a.prepare(ctx);
+  await a.run(ctx);
+  const spec = containers.runs.find((x) => x.script.includes(' run --standalone '));
+  const cfg = JSON.parse(spec.input);
+  assert.equal(cfg.provider.bench.models['bench-model'].limit.context, 65536);
+  assert.equal(cfg.agent.build.steps, 77);
+  const { adamSettings } = await import('../lib/agents/adam.mjs');
+  assert.equal(adamSettings({ meterBaseUrl: 'http://meter-1:8090/r/abcdefabcdefabcdef/v1', bearer: 'b'.repeat(16), taskImage: ctx.task.image.ref, contextWindow: 65536 }).MODEL_CONTEXT_WINDOW, '65536');
+});
+
+test('defect 2: a log the agent replaced with something that is not a file is refused and recorded in the result, and the run goes on', async (t) => {
+  const { agent, ctx } = setup(t, { outFiles: [['stderr.txt', Buffer.from('x')]], refused: ['events.jsonl'] });
+  await agent.prepare(ctx);
+  const r = await agent.run(ctx);
+  assert.deepEqual(r.record.outputRefused, ['events.jsonl']);
 });
 
 test('run: the exit is budget_hit or stopped_by_cap when the meter refused, failed otherwise, and a container that did not start is infrastructure', async (t) => {
@@ -262,25 +347,76 @@ test('run: the exit is budget_hit or stopped_by_cap when the meter refused, fail
   await assert.rejects(dead.agent.run(dead.ctx), (e) => e instanceof InfraError && e.reason === 'runtime');
 });
 
-test('run: a refusal of the meter while OpenCode retries ends the container early, and the run is budget_hit, not a timeout', async (t) => {
-  const { agent, ctx, containers } = setup(t);
+/** A container that does not end by itself, and ends when it is stopped (or, if `onKill` says so, when it is killed). */
+function hold(containers, { endsOnTerm = false } = {}) {
   let release;
   const held = new Promise((r) => (release = r));
   const real = containers.onRun;
   containers.onRun = async (spec, i) => {
     if (spec.script.includes(' run --standalone ')) {
-      await held; // OpenCode retrying a refused call: it does not end by itself
-      return { exitCode: 137, timedOut: true };
+      await held;
+      return { exitCode: endsOnTerm ? 143 : 137, timedOut: false };
     }
     return real(spec, i);
   };
+  const stop = containers.stop.bind(containers);
+  const kill = containers.kill.bind(containers);
+  containers.stop = async (n) => (await stop(n), release());
+  containers.kill = async (n, sig) => {
+    await kill(n, sig);
+    if (endsOnTerm) release();
+  };
+  return release;
+}
+
+test('defect 4: at the time limit OpenCode gets SIGTERM, then the configured grace, then a forced stop; the exit is timeout', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  ctx.limits = { ...LIMITS, limitMs: 40, cancelGraceMs: 60 };
+  hold(containers);
+  await agent.prepare(ctx);
+  const started = Date.now();
+  const r = await agent.run(ctx);
+  assert.equal(r.exit, 'timeout');
+  assert.deepEqual(containers.killed, [['adam-bench-oc-r1-a1', 'TERM']]);
+  assert.deepEqual(containers.stopped, ['adam-bench-oc-r1-a1']);
+  assert.ok(Date.now() - started >= 40 + 60 - 5, 'the forced stop came after the limit and the whole grace');
+});
+
+test('defect 4: a container that ends on SIGTERM within the grace is not force-stopped', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  ctx.limits = { ...LIMITS, limitMs: 30, cancelGraceMs: 500 };
+  hold(containers, { endsOnTerm: true });
+  await agent.prepare(ctx);
+  const r = await agent.run(ctx);
+  assert.equal(r.exit, 'timeout');
+  assert.deepEqual(containers.stopped, [], 'no forced stop: it ended within the grace');
+});
+
+test('defect 4: a refusal of the meter ends the run in the same way: SIGTERM, the grace, a forced stop; budget_hit, not a timeout', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  ctx.limits = { ...LIMITS, cancelGraceMs: 40 };
+  hold(containers);
   await agent.prepare(ctx);
   ctx.meter.refusal = () => 'budget';
-  const done = agent.run(ctx);
-  await new Promise((r) => setTimeout(r, 60));
-  assert.deepEqual(containers.stopped, ['adam-bench-oc-r1-a1'], 'stopped once, by name');
-  release();
-  assert.equal((await done).exit, 'budget_hit');
+  const r = await agent.run(ctx);
+  assert.equal(r.exit, 'budget_hit');
+  assert.deepEqual(containers.killed, [['adam-bench-oc-r1-a1', 'TERM']]);
+  assert.deepEqual(containers.stopped, ['adam-bench-oc-r1-a1']);
+});
+
+test('defect 4: both drivers are given the one configured grace and the one limit, and use them', async (t) => {
+  const { agent, ctx } = setup(t);
+  assert.ok(ctx.limits.cancelGraceMs > 0);
+  const { AdamAgent } = await import('../lib/agents/adam.mjs');
+  const seen = [];
+  const adam = new AdamAgent({ pins: PINS, home: tmp(t), repoDir: '/r', contextWindow: 131072, ensureFolder: async (o) => o.dest, drive: async (o) => (seen.push(o), { exit: 'done', elapsedMs: 1, polls: 1, nudges: 0 }) });
+  adam.runs.set('r1', { client: {}, repo: 'x', bearer: 'bearer-value-1234' });
+  ctx.containers.listing = [{ image: ctx.task.image.ref, imageId: 'f'.repeat(64), labels: {}, names: [] }];
+  ctx.paths.run = tmp(t);
+  await adam.run(ctx);
+  assert.equal(seen[0].graceMs, ctx.limits.cancelGraceMs);
+  assert.equal(seen[0].limitMs, ctx.limits.limitMs);
+  assert.ok(agent);
 });
 
 test('finding 11 and 9: stop reaps the service and confirms it, and a failure is infrastructure', async (t) => {

@@ -7,7 +7,7 @@
 # Every container here runs the one coder image of bench/pins.json (the relays, the git sandbox, the pusher) or a
 # service of the dev stack; no other image is added.
 #
-# Variables the harness sets (a person never needs to): BENCH_HOME, BENCH_TASKS_DIR, BENCH_STACK_DIR,
+# Variables the harness sets (a person never needs to): BENCH_STACK_DIR,
 # BENCH_AGENT_DIR, BENCH_SLOT_1_DIR and BENCH_SLOT_2_DIR (what the harness hands a slot's agent service: a statement,
 # the OpenCode binary), BENCH_METER_PORT, PODMAN_SECCOMP, and the optional BENCH_GIT_PORT, BENCH_CODER_1_PORT,
 # BENCH_CODER_2_PORT.
@@ -231,15 +231,18 @@ services:
       - ${BENCH_SLOT_2_DIR}:${BENCH_SLOT_2_DIR}:ro
     networks: [agentnet-2]
 
-  # What grades: tests are mounted read-only, in the container of a grading, from $BENCH_HOME. No agent can reach this
-  # service: it is on a network of its own with nothing else on it.
+  # What grades: a grading's tests and patch are staged in a volume of its own and mounted read-only into the grading
+  # container only. No agent can reach this service: it is on a network of its own with nothing else on it, and it
+  # mounts no directory of the host.
   grader:
     <<: *podman
     volumes:
       - grader-socket:/run/podman
       - grader-storage:/home/agent/.local/share/containers
-      - ${BENCH_HOME:?the harness sets BENCH_HOME}:${BENCH_HOME}
-      - ${BENCH_TASKS_DIR:?the harness sets BENCH_TASKS_DIR}:${BENCH_TASKS_DIR}:ro
+      # Nothing of the host's: the harness copies a grading's tests and patch in, as tar streams, into /grade/<id>, and reads the
+      # reward out the same way (lib/stack.mjs, graderIO).
+    # A volume of memory, writable by the service's user and gone with the service:
+    tmpfs: ["/grade:mode=1777,size=1g"]
     networks: [grader-net]
 
   gitbox-1:

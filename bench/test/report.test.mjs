@@ -237,3 +237,20 @@ test('a lone CR or a CRLF in a name leaves no CR in the report and rows stay on 
     assert.match(text, /^\| T(one|two)? ?(one|two) \| pass \|$|^\| T one \| pass \|$|^\| T two \| pass \|$/m);
   }
 });
+
+test('entries a container left that the harness refused (a FIFO, a device, a file over its cap) are listed with their path and reason', () => {
+  const records = [
+    { kind: 'state', run: 'r1', state: 'Planned', task: 'T1', agent: 'a', arm: 'max' },
+    { kind: 'state', run: 'r1', state: 'Reserved', reservedMicro: 100 },
+    { kind: 'state', run: 'r1', state: 'Preparing' },
+    { kind: 'state', run: 'r1', state: 'Running' },
+    { kind: 'state', run: 'r1', state: 'Collecting' },
+    { kind: 'state', run: 'r1', state: 'Grading' },
+    { kind: 'state', run: 'r1', state: 'Done', result: { pass: true, grades: [1, 1, 1], exit: 'done', wallMs: 1, notes: { refused: [{ name: 'src/pipe', reason: 'not a plain file (type "6")' }], limits: 'service' } } },
+  ];
+  const text = buildReport(records);
+  assert.match(text, /Refused entries/);
+  assert.match(text, /\| r1 \|[^\n]*src\/pipe[^\n]*not a plain file/);
+  assert.match(text, /\| r1 \|[^\n]*service/);
+  assert.match(buildReport(records.slice(0, 6).concat({ kind: 'state', run: 'r1', state: 'Done', result: { pass: true, grades: [1, 1, 1], exit: 'done', wallMs: 1 } })), /Refused entries[\s\S]*None\./);
+});
