@@ -1659,8 +1659,13 @@ stateDiagram-v2
   group of its own; killed by group, by the environment's `kill` of the exec id and by what the group left, at every stop point of a command that keeps
   running (`Commands::stop_run`, `sweep`, `stop_all`; a dropped registry), and when it is idle, for room, or when its environment is not the one it
   started in.
-* **It never writes.** `workspace/applyEdit` is answered `applied: false`; in a reference the slot's state is taken when the server starts and
-  compared before and after each call.
+* **It never writes, at the boundaries of a call.** `workspace/applyEdit` is answered `applied: false`. A server has a **mode** (`Mode`, part of its
+  key): **safe** in a reference and at tier `plan` (the reference settings, and the slot's state compared after each call: a reference against its
+  state when the server started, a writable slot against its state before the call; a difference is put back and the server stopped), **full** in a
+  writable slot at a tier that may write (as `run_checks` there). What that covers and what it does not is
+  [in the reference](../../docs/reference/coder-agent.md#language-servers): git-visible state of the call's slot, at call boundaries; project code still runs.
+* **One writer, whole frames.** `rpc.rs` has a task that writes, fed by a queue: a message is written whole whatever happens to the call that queued it.
+  A server that is starting counts toward `LANGUAGE_SERVERS_MAX`, and the bound is one decision at a time.
 * **The scripted server** `src/bin/adam-lsp-script.rs` (`tests/language_servers.rs`) is a second binary of the crate, not built into any image; the
   gated `tests/real_language_servers.rs` runs the real servers (`ADAM_TEST_LANGUAGE_SERVERS=1`; no CI job yet).
 * **Settings:** `LANGUAGE_SERVERS`, `LANGUAGE_SERVER_IDLE_SECS`, `LANGUAGE_SERVERS_MAX` ([Configuration](#configuration)).
@@ -2576,7 +2581,9 @@ database of its own, so the role needs `CREATEDB`):
   a secret in a diagnostic and in stderr, indexing past `wait` (a partial result, then the same pid answers), a crash (the scrubbed stderr tail, then a new
   server), a request nobody answers, framing that is not framing, a message over 16 MiB, a location outside the slot and in another slot, 100,000
   references (cut at 2,000, paged), `edit_file` then diagnostics (the server holds the new text), watched files, `workspace/applyEdit` refused, a reference
-  (settings that write nothing; a server that writes is put back and stopped), the bound of servers, and each stop point (idle, park, the end of the run,
+  and a run at tier `plan` (settings that write nothing; a server that writes is put back and stopped; tier `edits` gets a full server), the bound of
+  servers (also under two concurrent starts), a call dropped mid-write of a 3.6 MiB file, a server whose output stops being messages, a start that is dropped
+  or ends after its run stopped, diagnostics under another spelling of the file's address and a server that publishes nothing, and each stop point (idle, park, the end of the run,
   a cancelled run reached by the sweep, `rebuild_environment`, the worker's stop, a dropped registry) with a server that has a child and a grandchild,
   asserted by pid; `tests/tool_specs.rs` (three specs, seven paged tools), `time_limits.rs`, `tiers.rs`, `config.rs` (three settings, exit 78),
 * **Commands that keep running** (`tests/background.rs`, real processes with short lifetimes and sweeps through the settings;

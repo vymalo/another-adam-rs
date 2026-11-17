@@ -278,10 +278,15 @@ The three tools of [the coder's language servers](coder-agent.md#language-server
 | the file is of no language the servers know | `No language server serves `notes.txt`: they serve .rs (Rust), ...` (a result) | nothing was started |
 | the server is working through its index at the end of `wait` | a first line `[still indexing after 30 s (server up 34 s): the result may be incomplete; call again, the server is kept]` | kept |
 | the symbol is not on the line, or fewer times than `occurrence` | `` `second` is not on line 1 of `src/lib.rs`. The line reads: ... `` (an error result) | not asked |
+| the symbol is on the line only inside longer words | `` `id` is not on line 1 of `src/v.rs` as a word (it is there only inside longer words). The line reads: ... `` (an error result) | not asked |
+| the server published nothing for the file in the time given (not an empty set: that is `(no errors or warnings)`) | `No diagnostics received for `src/lib.rs` within 3 s: the server published none for it (it may not have looked at the file yet, or it publishes only when there is something to say). Call again, ...` (a result) | kept |
+| a pull for diagnostics was answered `ServerCancelled` or `ContentModified` | `No diagnostics yet for `src/lib.rs`: the server is still indexing.` (a result) | kept |
 | the server ended, or sent framing that is not framing, or a message over 16 MiB | `The language server `rust-analyzer` stopped: the server sent malformed framing: ... (the process was stopped: ...)`, the end of its stderr (scrubbed, 16 KiB at most) and `The next call starts it again.` | stopped |
 | a request got no answer inside `wait` and the server was not indexing | `The language server `x` stopped: it did not answer `textDocument/definition` within N s.` | stopped |
 | it did not answer `initialize` in 60 s, or exited | `The language server `x` did not start: the server did not answer `initialize` within 60 s` and the end of its stderr | stopped |
 | a reference was written to | `The language server changed files of `lib`, which is a reference (read, never changed). The files are as they were. ...` | stopped |
+| a writable slot was written to by a server of a run at tier `plan` | `The language server changed files of `repo`, and this run is at the `plan` tier, where nothing is changed. The files are as they were. ...` | stopped |
+| the run's servers were stopped while this one started | `The language servers of this run were stopped while this one was starting (the run parked, or its environment was made again): call again.` | stopped |
 | `LANGUAGE_SERVERS_MAX` servers are held and all are working | `This worker holds 4 language servers (LANGUAGE_SERVERS_MAX) and every one is working for a call: try again shortly.` | a call waits |
 | the call is past its budget (`wait` + 120 s) | `The language server call did not finish within N s. A server that was started is kept: call again, or use run_checks or run_command.` | kept |
 

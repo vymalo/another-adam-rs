@@ -85,12 +85,15 @@ A step that fails in the devcontainer or the pod is a finding about that environ
 and that **no image builds** (`docker/coder/Dockerfile` builds the named binaries only). It speaks the protocol and does what a JSON script
 (`ADAM_LSP_SCRIPT`) says: diagnostics pushed or pulled, an indexing that lasts so long, a `workspace/applyEdit` request, a crash on the
 n-th request with a stderr text, framing that is not framing, a `Content-Length` of 99,999,999, a request it never answers, a file it
-writes into the workspace, 100,000 references, the text it holds for a file (so a `didChange` is provable), a child and a grandchild;
-the table of keys is its module doc. It logs every message it receives, so a test reads what the client sent.
+writes into the workspace, 100,000 references, the text it holds for a file (so a `didChange` is provable), a child and a grandchild,
+another spelling of a file's address, garbage on stdout after the start, an error code for a method, a stall before it reads again (a server
+whose input pipe fills); the table of keys is its module doc. It logs every message it receives, so a test reads what the client sent.
 
 The tests are real processes, and **each stop point is proved by pid** (idle, park, the end of the run, a cancelled run reached by the
-sweep, `rebuild_environment`, the worker's stop, a registry that is dropped, a server that did not answer `initialize`): nothing of the server, its
-child and its grandchild is left. Run them with the whole suite or by name:
+sweep, `rebuild_environment`, the worker's stop, a registry that is dropped, a server that did not answer `initialize`, a start whose call is
+dropped, a start that ends after its run was stopped, a server whose output stopped being messages): nothing of the server, its
+child and its grandchild is left. The registry is also driven directly (`Servers::get_or_start` with a recording `EnvSession`) for what a
+call cannot show: the bound under two concurrent starts, a server that is being stopped still counting, a call dropped while it waits for a server. Run them with the whole suite or by name:
 
 ```sh
 cargo test --workspace --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp \

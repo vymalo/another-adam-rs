@@ -424,12 +424,18 @@ They work in a reference (`SlotUse::Reads`) and are not offered with `LANGUAGE_S
 
 **The model gives a line and a symbol, never a column.** `line` counts from 1 and `symbol` is text on that line;
 `occurrence` (from 1) picks one when it is there more than once. A whole word is preferred to the same letters inside a
-longer word. The tool finds the column and counts it in the encoding the server agreed to: the client offers
-`general.positionEncodings: ["utf-8", "utf-16"]`, a server that says nothing counts UTF-16 (`position.rs`). A symbol that
-is not on the line is answered with the line as it is. Every position shown is `path:line:col`, from 1, the column in
+longer word: **only whole words count**, so `occurrence` means the same whatever else the line holds, and a symbol that is on
+the line only inside longer words (`id` in `valid`) is answered `not on line N of path as a word` with the line, never a
+guess. A line ends at `\r\n`, `\n` or a lone `\r`, as the protocol counts. The tool finds the column and counts it in the
+encoding the server agreed to: the client offers `general.positionEncodings: ["utf-8", "utf-16"]`, a server that says nothing
+counts UTF-16 (`position.rs`). A symbol that is not on the line is answered with the line as it is. Every position shown is `path:line:col`, from 1, the column in
 characters, the path relative to the slot. A location in another slot of the workspace is `<slot>/<path>`; any other
-is `(outside the workspace) <last three components>:line`: **no path of this machine is shown**, and the slot's own path
-is taken out of every message a server writes.
+is `(outside the workspace) <last three components>:line`: **no path of this machine is shown in a location**, and the
+slot's own path is taken out of every message a server writes. In a message, any other path (a run of characters that
+starts with `/` and has two names in it, as in `/usr/local/go/src/fmt/print.go:12:3`) is written the same way,
+**best effort**: a path with a space in it, or written some other way, is not found. Bidirectional controls (U+202A to
+U+202E, U+2066 to U+2069) and the line and paragraph separators (U+2028, U+2029) in anything a server says, or in a
+file's name, are written `\u{202e}`, so that nothing can reorder or break what the model reads.
 
 The servers are a **closed table in code** (`table.rs`, never a setting, so a deployment cannot name a program to run):
 
@@ -458,14 +464,17 @@ sequenceDiagram
     participant S as server (stdio)
     M->>T: {path, wait}
     T->>E: probe: command -v, --version (once per run, slot, language)
-    T->>L: get_or_start (run, slot, language, root)
+    T->>T: mode: safe at tier plan or in a reference, else full
+    T->>E: safe only: snapshot of the slot
+    T->>L: get_or_start (run, slot, language, root, mode)
     L->>E: prepare (background), spawn with stdin and stdout piped
-    L->>S: initialize, initialized
+    L->>S: initialize (processId null), initialized
     T->>S: didOpen or didChange, didSave, didChangeWatchedFiles
     S-->>L: $/progress, experimental/serverStatus, publishDiagnostics
     L-->>T: ready, or the deadline of wait
     T->>S: textDocument/diagnostic, definition or references
     S-->>T: the answer
+    T->>E: safe only: snapshot again; a difference is put back and the server stopped
     T->>T: sort, cut, scrub, page
     T-->>M: path:line:col lines, [end] or a first line that says it is still indexing
 ```
@@ -474,20 +483,28 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> Probing
     Probing --> Missing: not on PATH
-    Probing --> Starting: found
+    Probing --> Waiting: found
+    Waiting --> Refused: the bound is reached and every server is working
+    Waiting --> Starting: a place under the bound
     Starting --> Initializing: spawned, piped
+    Starting --> Failed: its run's servers were stopped meanwhile
     Initializing --> Indexing: initialize answered
-    Initializing --> Dead: no answer in 60 s
+    Initializing --> Failed: no answer in 60 s, exited, or its call was dropped
     Indexing --> Ready: no progress open, quiet for 300 ms
     Ready --> Indexing: progress begins
-    Ready --> Stopped: idle, park, run over, rebuild, release, the bound, the worker stops
-    Indexing --> Stopped: idle, park, run over, rebuild, release, the bound, the worker stops
-    Indexing --> Dead: crash, bad framing, no answer, wrote to a reference
-    Ready --> Dead: crash, bad framing, no answer, wrote to a reference
-    Dead --> Starting: the next call
+    Ready --> Stopped: idle, park, run over, rebuild, release, worker stops, room for another
+    Indexing --> Stopped: idle, park, run over, rebuild, release, worker stops, room for another
+    Ready --> Stopped: crash, output that is not messages, no answer, wrote to a slot that must not change
+    Indexing --> Stopped: crash, output that is not messages, no answer, wrote to a slot that must not change
     Missing --> [*]
+    Refused --> [*]
+    Failed --> [*]
     Stopped --> [*]
 ```
+
+A stopped server is replaced by the next call, which starts a new one. A server counts toward the bound from the moment its
+start is decided until its process is gone, one that is being started or stopped included, and the bound is decided one call
+at a time.
 
 **A server is kept**, per run, slot, language and project root, **on the worker that started it** (`server.rs`,
 `Servers`, held by `Commands`). A cold start of `rust-analyzer` takes minutes and is not paid on every call. There is
@@ -504,8 +521,12 @@ reports it: rust-analyzer's), or less than 300 ms of quiet since the last. Past 
 a first line, `[still indexing after 30 s (server up 34 s): the result may be incomplete; call again, the server is kept]`,
 and the server stays: the next call finds it warm. That is never an error. Diagnostics are pulled
 (`textDocument/diagnostic`) when the server offers it, else the last `publishDiagnostics` of the file, waited for after a change
-(a first one within 3 s from a server that is not indexing, then 300 ms without another). A request that gets no answer
-inside the wait stops a server that is **not** indexing and says so; one that is indexing is left to work.
+(a first one within 3 s from a server that is not indexing, then 300 ms without another). A file is found under whatever
+spelling of its address the server uses (`%2d` for `-`, a lower-case escape). **A server that published nothing for the
+file in that time is not a clean file**: the answer is `No diagnostics received for path within N s ...`, and
+`(no errors or warnings)` is for a server that published an empty set. A request that gets no answer inside the wait stops a
+server that is **not** indexing and says so; one that is indexing is left to work. A pull answered `ServerCancelled`
+(-32802) or `ContentModified` (-32801) is "still indexing", as a location is.
 
 | Limit | Value |
 |---|---|
@@ -513,11 +534,12 @@ inside the wait stops a server that is **not** indexing and says so; one that is
 | a call's own budget | `wait` + 60 s + 60 s (the probe, the sync, the check of a reference, the formatting) |
 | the tool's time limit | making the environment ready + 120 s + 60 s + 60 s + 30 s |
 | a request | what is left of `wait`, at least 2 s |
-| one message of a server | 16 MiB (`Content-Length`), 32 header lines of 1 KiB |
+| one message of a server | 16 MiB (`Content-Length`, one only), 32 header lines of 1 KiB; before its first message, 64 KiB of what is not a message (a login profile's banner) is skipped |
 | a file sent to a server | 4 MiB; at most 200 files open at once (the oldest is closed) |
-| files looked at for changes | 20,000 under the project root (not `.git`, `node_modules`, `target`, virtual environments, `dist`, `build`) |
+| files looked at for changes | the first 20,000 under the project root in the order of their paths (not `.git`, `node_modules`, `target`, virtual environments, `dist`, `build`); a file that a new one pushes past the 20,000th is out of sight, not deleted |
 | a diagnostic's message, a source line | 1,000 and 200 characters |
-| what is kept of the server's stderr | the last 16 KiB, scrubbed, shown only when the server dies |
+| what is kept of the server's stderr | the last 16 KiB, scrubbed, shown only when the server dies; it is read to its end, and a server whose stderr cannot be read is stopped |
+| what is kept of what a server published | one entry per file, at most 200 (the oldest is dropped), and progress tokens at most 64 |
 | servers on a worker | `LANGUAGE_SERVERS_MAX` (4): the least recently used one that is not working is stopped for the next; when every one is working the call says so |
 | an idle server | `LANGUAGE_SERVER_IDLE_SECS` (600 s) |
 
@@ -526,22 +548,47 @@ text (the next version) when its hash changed, a `didChange` for every other fil
 `workspace/didChangeWatchedFiles` for the files under the root that were created, changed (size or time) or deleted since the last
 call. No hook is in the write tools: `edit_file`, `run`, a build and the shell reach the server the same way.
 
-**What a server may do.** Nothing that writes. The client never declares `workspace.applyEdit`, and a server that asks anyway is
-answered `applied: false`; `workspace/configuration` is answered from the table's settings, other requests with a method-not-found error.
-A server runs where `run_command` runs, as the same user, with the same variables hidden (`GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`,
-`DATABASE_URL`, `A2A_BEARER_TOKENS`, `MODEL_API_KEY`, the deployment's MCP secrets), so it is no wider than `run_checks`, which runs the
-same build scripts. In a **reference** the slot is snapshotted when the server starts (the snapshot of `run_command`), and compared before
-and after each call: a difference is put back, the server is stopped, and the tool says so. Its build scripts, procedural macros and
-check on save are off there (`rust-analyzer`; the settings' names are *unverified*, below), so its Rust diagnostics are weaker. **Everything
-a server says is scrubbed** before it is cut or shown, and a message that is not framing stops the server.
+**What a server may do: two modes, and what the guarantee covers.** The tools are tier `plan`, so they run at every tier, and the mode of
+the server depends on where it runs and on the tier of the run (the tier of the notes of the root run):
+
+| The run | The slot | The server | Held to what the slot was |
+|---|---|---|---|
+| tier `plan` | any | **safe** | yes |
+| any tier | a reference | **safe** | yes |
+| `edits`, `auto`, `bypass` | a slot it may write | **full** | no |
+
+A **safe** server has the reference settings: for rust-analyzer no build script, no procedural macro, no check on save and a build directory of its own (below);
+for TypeScript the image's own TypeScript (never the project's), no plugin and no automatic type acquisition; for Go `-mod=readonly`. A **full**
+server runs what the project's own build runs, as `run_checks` there does (a build script, a procedural macro): at a tier that may write, a
+slot may be written by the checks, so it is no wider. A server is never shared between the two modes; a run whose tier changes starts one of the
+other mode (the old one stops when it is idle). Where a server runs, it runs as the same user with the same variables hidden as `run_command`
+(`GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `MODEL_API_KEY`, the deployment's MCP secrets).
+
+**The guarantee, and its limits.** The client never declares `workspace.applyEdit`, and a server that asks anyway is answered `applied: false`.
+For a **safe** server the slot is also snapshotted (the snapshot of `run_command`: `HEAD`, the branch, the tree of the files as `commit_and_push` would commit
+them, the refs and the local git configuration) and compared after each call: a reference against its state when the server started (a server may
+write between calls), a writable slot at tier `plan` against its state before the call. A difference is put back, the server is stopped, and the tool says so.
+This covers **what git sees in the call's own slot, at the boundaries of a call**. It does not cover: a write after the last comparison
+of a call (it is seen at the next call of a reference, and not at all in a writable slot at `plan`); a file git ignores; a path outside the slot; and
+**project code that runs while the server looks**, which a safe server reduces and cannot remove (a `build.rs` is off, but `cargo metadata` and a
+`.cargo/config` runner or wrapper are not; tsserver plugins are off, but `tsconfig.json` and `package.json` are read; gopls runs `go list`). A full
+server has none of the snapshot and runs more. The comparison costs the git calls of `run_command` on each call.
+
+A safe rust-analyzer builds in `/tmp/adam-rust-analyzer/<id>` of the **environment**, one directory for each run, slot and project root, and the
+coder removes it when the server stops (through the environment, where a pod or a devcontainer keeps it). Its Rust diagnostics are weaker than
+`cargo check`'s: it sees no code a build script or a macro makes. **Everything a server says is scrubbed** before it is cut or shown, and output that is
+not messages stops the server at once, with no call needed.
 
 **Nothing outlives its run.** A server stops where a command that keeps running stops: `Commands::stop_run`
 (the root run ends, any run of the tree parks on the person, `rebuild_environment`, the janitor releases the run), the sweep of a run that is over or
 cancelled (`Commands::sweep`, every `BACKGROUND_SWEEP_SECS`), `Commands::stop_all` when the worker stops, and a registry that is dropped kills
 the groups it holds. Besides: its idle time, the bound of servers, an environment that is not the one it started in (described differently:
-a devcontainer or pod made again), a crash, framing that is not framing, a request that no one answers. Each is a kill of the process group,
+a devcontainer or pod made again), a crash, output that is not messages (stopped when it is seen, not at the next call), a request that no one
+answers. A server that is **starting** when its run is stopped is stopped too and never held (each run has a mark that `stop_run` moves), and a start
+whose call is dropped kills the process group and asks the environment to kill the exec id. Each is a kill of the process group,
 the environment's own `kill` of the exec id and what is left of the group, and is proved by pid in `tests/language_servers.rs` with a server
-that has a child and a grandchild.
+that has a child and a grandchild. `initialize` names no process (`processId: null`): the worker's pid means nothing in another PID namespace, and
+some servers exit when the pid they were given is gone.
 
 **Settings** ([environment](environment.md)): `LANGUAGE_SERVERS` (`on` or `off`), `LANGUAGE_SERVER_IDLE_SECS`, `LANGUAGE_SERVERS_MAX`; no chart key
 (set them with `config.extraEnv`). A bad value is exit 78 ([errors](errors.md)).
@@ -617,7 +664,7 @@ With `MODEL_INPUT_MODALITIES=text,image` (off by default, [environment](environm
 | GitHub reads | through the official GitHub MCP server, read-only, as a **sidecar** that holds no credential; the coder gives each call the token of the repository it is about (`GitHubReadBearer`). Writes stay the coder's own, behind the gate |
 | The model key | in no run environment: a devcontainer gets no key file and a run pod no `MODEL_API_KEY` ([ADR 0038](../decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)); a command never sees it. A variable an `mcp.json` names, `MODEL_API_KEY` included, is hidden from every command and redacted |
 | Commands | `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the environment of a command |
-| Language servers | run where commands run, with the same variables hidden; what they say is scrubbed before it is cut or shown, and the end of their stderr, 16 KiB, only when they die; they write nothing (`applyEdit` is refused, a reference is put back) |
+| Language servers | run where commands run, with the same variables hidden; what they say is scrubbed before it is cut or shown, and the end of their stderr, 16 KiB, only when they die; they write nothing (`applyEdit` is refused; at tier `plan` and in a reference the server is safe and the slot is held to what it was, at call boundaries: [what that covers](#language-servers)) |
 | Everything | a `Redactor` scrubs the process's own secrets from every tool result, event and failure text |
 | Images | **an image is not scrubbed**: the `Redactor` reads text, and what is in a picture it cannot read. An image reaches the model only from a source the deployment allows (`MODEL_IMAGE_SOURCES`, `person,workspace` by default). A command cannot see the coder's secrets (the table above), so a picture in a repository holds one only if a command could already have read it, and such a command could already have got it past the scrubber in an encoded text. An MCP server's picture is off by default because a server's call can carry credentials that were expanded into it. The person's pictures are the person's own. The coder's `read_file` never scrubs the bytes it offers |
 
