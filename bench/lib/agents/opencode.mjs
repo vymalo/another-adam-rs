@@ -1,32 +1,36 @@
-// The OpenCode driver. OpenCode (a pinned binary from npm, checked against its integrity hash and mounted read-only)
-// runs in a container of the task's own image on the same Podman service as adam's commands, in a clone of the same
-// base at the same kind of path, with the statement on stdin and the meter as its only way to the model.
+// The OpenCode driver. OpenCode V2 (`@opencode/cli` 2.x: a pinned binary from npm, checked against its integrity hash
+// and mounted read-only) runs in a container of the task's own image on the slot's Podman service, in a clone of the
+// same base at the same kind of path, with the statement on stdin and the meter as its only way to the model.
 //
-//   opencode run --format json --model bench/bench-model --auto --title <run> --dir <clone> < instruction.md
+//   cd <clone> && opencode run --standalone --format json --model bench/bench-model --auto --title <run> < instruction.md
 //
-// OpenCode V2 (`@opencode/cli` 2.x). Verified 2026-11-17 against the pinned 2.3.0 binary and a local OpenAI-compatible
-// stub (bench/README.md, "OpenCode V2"): `run` has no `--dir` (the directory is the working directory) and `--standalone`
-// makes it use a private server instead of a background service; the statement on stdin reaches the model byte for
-// byte; `--title` removes the extra title-generation call; `step_finish` carries `tokens` {input, output, reasoning,
-// cache: {read, write}} and `cost`; the export is `opencode session export <session>`; `run` waits for the background
-// jobs its prompt started, subagents included, with no time limit of its own: the container's time limit is the limit.
-// The home directory is on the shared output directory so that the export can run in a second container after a run
-// that was killed at the time limit.
+// Verified 2026-11-17 against the pinned 2.3.0 binary and a local OpenAI-compatible stub (bench/README.md, "OpenCode
+// V2"): `run` has no `--dir` and `--standalone` makes it use a private server; the statement on stdin reaches the model
+// byte for byte; `--title` removes the extra title-generation call; `step_finish` carries `tokens` {input, output,
+// reasoning, cache: {read, write}} and `cost`; the export is `opencode session export <session>`; `run` waits for the
+// background jobs its prompt started, subagents included, with no time limit of its own: the time limit is the harness's.
+// It needs no network to load its provider.
+//
+// What the host trusts (the review of slice 3): the exit status is the container runtime's, never a file the agent could
+// write; the JSON stream, the stderr and the export come out through a tar stream with a size cap and are refused if
+// they are not regular files; the config, which holds the run token, goes in on stdin and is on no command line.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fetchPinnedBinary } from '../npm.mjs';
-import { copyTreeOut, patchOfTree, saveRaw } from './common.mjs';
+import { InfraError, patchOfTree, saveRaw } from './common.mjs';
 
 export const MODEL = 'bench/bench-model';
-const METER_URL = /^http:\/\/meter:8090\/r\/[A-Za-z0-9_-]{16,128}\/v1$/;
+const METER_URL = /^http:\/\/meter-\d:8090\/r\/[A-Za-z0-9_-]{16,128}\/v1$/;
 const SAFE_PATH = /^\/[A-Za-z0-9._/@+=-]*$/;
 const SAFE_RUN = /^[A-Za-z0-9._-]{1,64}$/;
 const SESSION = /^ses_[A-Za-z0-9]{6,64}$/;
 const OUTPUT_TOKENS = 8192;
+const OUT_FILES = ['events.jsonl', 'stderr.txt', 'export.json'];
 
 /** The OpenCode configuration of a run (`OPENCODE_CONFIG_CONTENT`). Pure. */
-export function opencodeConfig({ baseUrl, contextWindow = 131072, steps = 200, urlPattern = METER_URL }) {
-  if (!urlPattern.test(baseUrl ?? '')) throw new Error('the model address must be the meter\'s: http://meter:8090/r/<run token>/v1');
+export function opencodeConfig({ baseUrl, contextWindow, steps = 200, urlPattern = METER_URL }) {
+  if (!urlPattern.test(baseUrl ?? '')) throw new Error('the model address must be the meter\'s: http://meter-<slot>:8090/r/<run token>/v1');
+  if (!Number.isSafeInteger(contextWindow) || contextWindow < 1) throw new Error('the context window is required: both agents are given the same one');
   return {
     $schema: 'https://opencode.ai/config.json',
     autoupdate: false,
@@ -46,39 +50,40 @@ export function opencodeConfig({ baseUrl, contextWindow = 131072, steps = 200, u
   };
 }
 
-/** The environment of the container, besides the home directory the script sets. */
-export function opencodeEnv({ config }) {
-  return {
-    OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-    OPENCODE_DISABLE_MODELS_FETCH: 'true',
-    OPENCODE_DISABLE_AUTOUPDATE: '1',
-  };
+/** The environment of the container: two switches, nothing secret. */
+export function opencodeEnv() {
+  return { OPENCODE_DISABLE_MODELS_FETCH: 'true', OPENCODE_DISABLE_AUTOUPDATE: '1' };
+}
+
+/** What goes in on stdin: the configuration, which holds the run's token. */
+export function opencodeInput({ config }) {
+  return `${JSON.stringify(config)}\n`;
 }
 
 const plain = (...ps) => {
   for (const p of ps) if (!SAFE_PATH.test(p)) throw new Error('a path in the OpenCode script is not a plain absolute path');
 };
 
-const homeLines = (out) => [`export HOME=${out}/home XDG_DATA_HOME=${out}/home/data XDG_CONFIG_HOME=${out}/home/config XDG_CACHE_HOME=${out}/home/cache`, 'mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"'];
+const prelude = (out) => [
+  'set -u',
+  `export HOME=${out}/home XDG_DATA_HOME=${out}/home/data XDG_CONFIG_HOME=${out}/home/config XDG_CACHE_HOME=${out}/home/cache`,
+  'mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"',
+  'OPENCODE_CONFIG_CONTENT=$(cat)',
+  'export OPENCODE_CONFIG_CONTENT',
+];
 
-/** The shell of the run. Pure. */
+/** The shell of the run; its last command is OpenCode, so the container's exit status is OpenCode's. Pure. */
 export function opencodeRunScript({ bin, stmt, out, dir, run }) {
   plain(bin, stmt, out, dir);
   if (!SAFE_RUN.test(run)) throw new Error('the run id is not plain');
-  return [
-    'set -u',
-    ...homeLines(out),
-    `cd ${dir} || exit 98`,
-    `${bin} run --standalone --format json --model ${MODEL} --auto --title '${run}' < ${stmt} > ${out}/events.jsonl 2> ${out}/stderr.txt`,
-    `echo $? > ${out}/exit`,
-  ].join('\n');
+  return [...prelude(out), `cd ${dir} || exit 98`, `${bin} run --standalone --format json --model ${MODEL} --auto --title '${run}' < ${stmt} > ${out}/events.jsonl 2> ${out}/stderr.txt`].join('\n');
 }
 
 /** The shell of the export, in a container of its own (the run's may have been killed). Pure. */
 export function opencodeExportScript({ bin, out, sessionId }) {
   plain(bin, out);
   if (!SESSION.test(sessionId)) throw new Error('the session id is not plain');
-  return ['set -u', ...homeLines(out), `${bin} session export --standalone '${sessionId}' > ${out}/export.json 2> ${out}/export.err`].join('\n');
+  return [...prelude(out), `${bin} session export --standalone '${sessionId}' > ${out}/export.json 2> ${out}/export.err`].join('\n');
 }
 
 /** What the JSON events say: the session, the steps, what OpenCode says it used, the errors. Pure. */
@@ -111,149 +116,151 @@ export function parseEvents(text) {
   return { sessionId, errors, retries, backgroundWaits, selfReported: { ...tokens, calls } };
 }
 
-const readOr = (file, fallback = '') => {
-  try {
-    return fs.readFileSync(file, 'utf8');
-  } catch {
-    return fallback;
-  }
-};
+const text = (files, name) => (files.has(name) ? files.get(name).toString('utf8') : '');
 
 export class OpenCodeAgent {
   name = 'opencode';
 
   constructor({ pins, home, fetchBinary = fetchPinnedBinary, now = Date.now, contextWindow, pollMs = 10_000 }) {
-    this.pollMs = pollMs;
-    this.pins = pins;
-    this.home = home;
-    this.fetchBinary = fetchBinary;
-    this.now = now;
-    this.contextWindow = contextWindow;
+    Object.assign(this, { pins, home, fetchBinary, now, contextWindow, pollMs });
     this.binary = null;
   }
 
   #names(ctx) {
-    const parent = `/work/workspaces/oc-${ctx.run.replace(/[^A-Za-z0-9._-]/g, '-')}-a${ctx.attempt}`;
-    return { parent, dir: `${parent}/${ctx.base.slug}` };
+    const safe = ctx.run.replace(/[^A-Za-z0-9._-]/g, '-');
+    const parent = `/work/workspaces/oc-${safe}-a${ctx.attempt}`;
+    return { parent, dir: `${parent}/${ctx.base.slug}`, out: `/work/bench-out/oc-${safe}-a${ctx.attempt}`, inDir: path.join(this.slotDir(ctx), `in-${safe}-a${ctx.attempt}`), container: `adam-bench-oc-${safe}-a${ctx.attempt}`.slice(0, 63) };
+  }
+
+  slotDir(ctx) {
+    return ctx.stack.slotDir(ctx.slot);
   }
 
   async prepare(ctx) {
     this.binary ??= await this.fetchBinary({ pin: this.pins.opencode, dir: path.join(this.home, 'opencode', this.pins.opencode.version) });
-    for (const d of [ctx.paths.in, ctx.paths.out]) {
-      fs.rmSync(d, { recursive: true, force: true });
-      fs.mkdirSync(d, { recursive: true });
+    const names = this.#names(ctx);
+    // What the service gets from the harness: the binary and the statement, in the slot's directory, which it mounts read-only.
+    const bin = path.join(this.slotDir(ctx), 'bin');
+    fs.mkdirSync(bin, { recursive: true, mode: 0o755 });
+    const target = path.join(bin, 'opencode');
+    if (!fs.existsSync(target) || fs.statSync(target).size !== fs.statSync(this.binary.path).size) {
+      fs.rmSync(target, { force: true });
+      fs.copyFileSync(this.binary.path, target);
+      fs.chmodSync(target, 0o555);
     }
-    fs.chmodSync(ctx.paths.in, 0o755);
-    fs.chmodSync(ctx.paths.out, 0o777);
-    fs.writeFileSync(path.join(ctx.paths.in, 'instruction.md'), ctx.task.instruction, { mode: 0o644 });
-    const { parent, dir } = this.#names(ctx);
-    await ctx.stack.workspaceDir(ctx.slot, parent, { remove: true }); // a killed attempt may have left it
-    await ctx.stack.workspaceDir(ctx.slot, parent);
-    const base = path.dirname(ctx.base.dir);
+    fs.rmSync(names.inDir, { recursive: true, force: true });
+    fs.mkdirSync(names.inDir, { recursive: true, mode: 0o755 });
+    fs.writeFileSync(path.join(names.inDir, 'instruction.md'), ctx.task.instruction, { mode: 0o644 });
+    for (const d of [names.parent, names.out]) {
+      await ctx.stack.workDir(ctx.slot, d, { remove: true }); // a killed attempt may have left it
+      await ctx.stack.workDir(ctx.slot, d);
+    }
     const r = await ctx.containers.run({
       image: ctx.task.image.ref,
-      script: ['set -eu', "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'", `git clone -q --no-hardlinks ${ctx.base.dir} ${dir}`, `git -C ${dir} checkout -q main`, `chmod -R a+rwX ${parent}`].join('\n'),
+      script: ['set -eu', "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'", `git clone -q --no-hardlinks ${ctx.base.containerRepo} ${names.dir}`, `git -C ${names.dir} checkout -q main`, `chmod -R a+rwX ${names.parent}`].join('\n'),
       workdir: '/',
       mounts: [
-        { source: base, target: base, readOnly: true },
-        { source: parent, target: parent },
+        { source: path.dirname(ctx.base.containerRepo), target: path.dirname(ctx.base.containerRepo), readOnly: true },
+        { source: names.parent, target: names.parent },
       ],
       network: 'none',
       timeoutMs: 10 * 60 * 1000,
+      labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) },
     });
     if (r.exitCode !== 0) throw new Error(`the clone for OpenCode failed (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
   }
 
-  #mounts(ctx, { dir, parent }) {
-    return [
-      { source: this.binary.path, target: '/opt/bench/opencode', readOnly: true },
-      { source: ctx.paths.in, target: '/bench/in', readOnly: true },
-      { source: ctx.paths.out, target: '/bench/out' },
-      { source: parent, target: parent },
-    ].filter(Boolean);
-  }
-
   async run(ctx) {
     const names = this.#names(ctx);
-    const config = opencodeConfig({ baseUrl: ctx.meter.baseUrl, contextWindow: this.contextWindow });
-    const env = opencodeEnv({ config });
-    const mounts = this.#mounts(ctx, names);
-    const started = this.now();
-    const name = `adam-bench-oc-${ctx.run.replace(/[^A-Za-z0-9_.-]/g, '-')}-a${ctx.attempt}`.slice(0, 63);
+    const config = opencodeConfig({ baseUrl: ctx.meter.baseUrl, contextWindow: this.contextWindow, steps: ctx.limits.steps });
+    const input = opencodeInput({ config });
+    const mounts = [
+      { source: path.join(this.slotDir(ctx), 'bin', 'opencode'), target: '/opt/bench/opencode', readOnly: true },
+      { source: names.inDir, target: '/bench/in', readOnly: true },
+      { source: names.out, target: '/bench/out' },
+      { source: names.parent, target: names.parent },
+    ];
+    const base = { image: ctx.task.image.ref, workdir: '/', env: opencodeEnv(), mounts, input, cpus: ctx.task.cpus, memoryMb: ctx.task.memoryMb, labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) } };
+    // The image the container runs is the task's, by digest: asserted here, before the container starts.
+    if (!/@sha256:[0-9a-f]{64}$/.test(base.image)) throw new InfraError('no-task-container', 'the task image is not named by digest');
     // A refusal of the meter is a limit like time: OpenCode retries a refused call, so the harness ends the container.
     let refused = false;
     const watcher = setInterval(() => {
       if (!refused && ctx.meter.refusal()) {
         refused = true;
-        ctx.containers.stop(name).catch(() => {});
+        ctx.containers.stop(names.container).catch(() => {});
       }
     }, this.pollMs);
+    const started = this.now();
     let r;
     try {
-      r = await ctx.containers.run({
-        name,
-        image: ctx.task.image.ref,
-        script: opencodeRunScript({ bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: names.dir, run: `${ctx.run}-a${ctx.attempt}`.replace(/[^A-Za-z0-9._-]/g, '-') }),
-        workdir: names.dir,
-        env,
-        mounts,
-        network: 'default', // the Podman service's own network: the meter, and nothing else
-        timeoutMs: ctx.limitMs,
-      });
+      r = await ctx.containers.run({ ...base, name: names.container, script: opencodeRunScript({ bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: names.dir, run: `${ctx.run}-a${ctx.attempt}`.replace(/[^A-Za-z0-9._-]/g, '-') }), network: 'default', timeoutMs: ctx.limits.limitMs });
     } finally {
       clearInterval(watcher);
     }
     const wallMs = this.now() - started;
-    const out = ctx.paths.out;
-    const exitText = readOr(path.join(out, 'exit'), '').trim();
-    if (exitText === '' && !r.timedOut && [125, 126, 127].includes(r.exitCode)) throw new Error(`the OpenCode container did not start (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
-    const eventsText = readOr(path.join(out, 'events.jsonl'));
+    let got = await ctx.stack.readFiles(ctx.slot, names.out, OUT_FILES);
+    const eventsText = text(got.files, 'events.jsonl');
     const events = parseEvents(eventsText);
+    if (!r.timedOut && !refused && eventsText === '' && [125, 126, 127].includes(r.exitCode)) throw new InfraError('runtime', `the OpenCode container did not start (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
 
-    let exportText = '';
     if (events.sessionId) {
-      const e = await ctx.containers.run({
-        image: ctx.task.image.ref,
-        script: opencodeExportScript({ bin: '/opt/bench/opencode', out: '/bench/out', sessionId: events.sessionId }),
-        workdir: '/',
-        env: opencodeEnv({ config }),
-        mounts,
-        network: 'none',
-        timeoutMs: 5 * 60 * 1000,
-      });
-      exportText = e.exitCode === 0 ? readOr(path.join(out, 'export.json')) : '';
+      const e = await ctx.containers.run({ ...base, name: `${names.container}-x`.slice(0, 63), script: opencodeExportScript({ bin: '/opt/bench/opencode', out: '/bench/out', sessionId: events.sessionId }), network: 'none', timeoutMs: 5 * 60 * 1000 });
+      if (e.exitCode === 0) got = await ctx.stack.readFiles(ctx.slot, names.out, OUT_FILES);
     }
     const secrets = [ctx.meter.token];
     const keep = path.join(ctx.paths.run, 'opencode');
-    saveRaw(keep, 'events.jsonl', eventsText, secrets);
-    saveRaw(keep, 'stderr.txt', readOr(path.join(out, 'stderr.txt')).slice(-20_000), secrets);
-    saveRaw(keep, 'export.json', exportText, secrets);
+    for (const name of OUT_FILES) saveRaw(keep, name, text(got.files, name).slice(name === 'stderr.txt' ? -20_000 : 0), secrets);
+    if (got.refused.length > 0) {
+      ctx.log({ event: 'refused_output', names: got.refused });
+      saveRaw(keep, 'refused.json', `${JSON.stringify(got.refused)}\n`);
+    }
 
     const refusal = ctx.meter.refusal();
-    const finished = exitText === '0' && events.errors === 0;
     let exit;
-    if (finished) exit = 'done';
+    if (refused) exit = refusal === 'cap' ? 'stopped_by_cap' : 'budget_hit';
+    else if (r.timedOut) exit = 'timeout'; // the runtime's word, before any status
+    else if (r.exitCode === 0 && events.errors === 0) exit = 'done';
     else if (refusal) exit = refusal === 'cap' ? 'stopped_by_cap' : 'budget_hit';
-    else if (r.timedOut) exit = 'timeout';
     else exit = 'failed';
-    return { exit, wallMs, sessionId: events.sessionId, selfReported: events.selfReported, retries: events.retries, backgroundWaits: events.backgroundWaits, exportKept: exportText !== '', processExit: exitText === '' ? null : Number(exitText) };
+    return { exit, wallMs, sessionId: events.sessionId, selfReported: events.selfReported, retries: events.retries, backgroundWaits: events.backgroundWaits, exportKept: got.files.has('export.json'), processExit: r.exitCode, refusedOutput: got.refused };
+  }
+
+  /** The container ran with --rm and has ended; nothing of the run may be left in the service. */
+  async stop(ctx) {
+    try {
+      await ctx.containers.reapAll();
+    } catch (e) {
+      throw new InfraError('not-stopped', e.message);
+    }
   }
 
   async collect(ctx) {
-    const { dir } = this.#names(ctx);
-    const treeDir = path.join(ctx.paths.out, 'tree');
-    await copyTreeOut({ containers: ctx.containers, image: ctx.task.image.ref, treePath: dir, outDir: treeDir });
-    const patch = await patchOfTree({ treeDir, base: ctx.base, workRoot: path.dirname(ctx.paths.out) });
+    const names = this.#names(ctx);
+    const treeDir = path.join(ctx.paths.scratch, 'tree');
+    await ctx.stack.extractTree(ctx.slot, names.dir, treeDir);
+    const patch = await patchOfTree({ treeDir, base: ctx.base, workRoot: ctx.paths.scratch });
     fs.rmSync(treeDir, { recursive: true, force: true });
     return { patch, notes: {} };
   }
 
   async cleanup(ctx) {
-    const { parent } = this.#names(ctx);
-    try {
-      await ctx.stack.workspaceDir(ctx.slot, parent, { remove: true });
-    } finally {
-      for (const d of [ctx.paths.in, ctx.paths.out]) fs.rmSync(d, { recursive: true, force: true });
+    const names = this.#names(ctx);
+    const errors = [];
+    for (const d of [names.parent, names.out]) {
+      try {
+        await ctx.stack.workDir(ctx.slot, d, { remove: true });
+      } catch (e) {
+        errors.push(e);
+      }
     }
+    try {
+      await ctx.containers.reapAll();
+    } catch (e) {
+      errors.push(e);
+    }
+    fs.rmSync(names.inDir, { recursive: true, force: true });
+    fs.rmSync(ctx.paths.scratch, { recursive: true, force: true });
+    if (errors.length > 0) throw errors[0];
   }
 }

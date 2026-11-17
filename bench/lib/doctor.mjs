@@ -38,7 +38,7 @@ const readSysctl = (file, readFile) => {
  * @param {boolean} [o.start]
  * @returns {Promise<{checks: object[], exitCode: number, fallback: string|null}>}
  */
-export async function doctor({ home, pins, exec = runCommand, readFile = fs.readFileSync, statfs = fs.statfsSync, nodeVersion = process.versions.node, stack = null, start = false, slots = 2 }) {
+export async function doctor({ home, pins, exec = runCommand, readFile = fs.readFileSync, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2 }) {
   const checks = [];
   const run = async (file, args) => {
     try {
@@ -51,8 +51,14 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
   const major = Number(nodeVersion.split('.')[0]);
   checks.push(major >= 22 ? ok('node', `Node ${nodeVersion} (CI runs 24)`) : fail('node', `Node ${nodeVersion} is too old`, 'install Node 22 or newer (24 is what CI uses)'));
 
+  // The binary of OpenCode that is mounted is a native linux-x64 executable linked to glibc.
+  checks.push(arch === 'x64' ? ok('machine', 'x64: the OpenCode binary of the pins runs here') : fail('machine', `${arch}: the OpenCode binary of the pins is linux-x64`, 'run the benchmark on an x64 Linux machine; a task image with musl (Alpine) cannot run it either, and the environment check says so'));
+
   const compose = await run('docker', ['compose', 'version', '--short']);
-  checks.push(compose.exitCode === 0 ? ok('docker compose', compose.stdout.trim()) : fail('docker compose', 'docker or its compose plugin is not available', 'install Docker Engine with the compose plugin'));
+  const composeVersion = /^v?(\d+)\.(\d+)/.exec(compose.stdout.trim());
+  if (compose.exitCode !== 0) checks.push(fail('docker compose', 'docker or its compose plugin is not available', 'install Docker Engine with the compose plugin'));
+  else if (!composeVersion || Number(composeVersion[1]) < 2 || (Number(composeVersion[1]) === 2 && Number(composeVersion[2]) < 24)) checks.push(fail('docker compose', `${compose.stdout.trim()} is older than 2.24: compose.yaml's \`env_file: required: false\` needs 2.24`, 'upgrade the compose plugin to 2.24 or newer'));
+  else checks.push(ok('docker compose', compose.stdout.trim()));
 
   let info = null;
   const daemon = await run('docker', ['info', '--format', '{{json .}}']);
@@ -111,19 +117,25 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
     checks.push(digests.some((d) => d.endsWith(`@${pins.coder.digest}`)) ? ok('coder image', `present by digest ${pins.coder.digest.slice(0, 19)}...`) : fail('coder image', `a different image has the tag ${pins.coder.tag}`, `docker pull ${ref}`));
   }
 
+  // What a killed harness leaves: an env file holds a bearer and a run token.
+  if (stack?.removeStaleEnvFiles) {
+    const gone = stack.removeStaleEnvFiles();
+    checks.push(gone.length > 0 ? warn('stale env files', `removed ${gone.join(', ')} (a killed harness left them)`) : ok('stale env files', 'none'));
+  }
+
   // The nested part, which needs the stack.
   if (stack && start && checks.every((c) => c.status !== 'fail')) {
     try {
       await stack.up();
       checks.push(ok('stack', 'the shared services and the Podman services are up'));
-      for (let slot = 1; slot <= Math.min(slots, stack.slots); slot++) {
-        const containers = stack.containers(slot);
+      const targets = [...Array.from({ length: Math.min(slots, stack.slots) }, (_, i) => ({ label: `slot ${i + 1}`, containers: stack.containers(i + 1), window: (fn) => stack.pullWindow(i + 1, fn) })), ...(stack.graderContainers ? [{ label: 'grader', containers: stack.graderContainers(), window: (fn) => stack.graderWindow(fn) }] : [])];
+      for (const { label, containers, window } of targets) {
         try {
-          await stack.pullWindow(slot, () => containers.pull(ref));
+          await window(() => containers.pull(ref));
           const r = await containers.run({ image: ref, script: 'true', network: 'none', timeoutMs: 120_000 });
-          checks.push(r.exitCode === 0 ? ok(`nested Podman, slot ${slot}`, 'a container ran inside the service') : fail(`nested Podman, slot ${slot}`, `a container did not run (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
+          checks.push(r.exitCode === 0 ? ok(`nested Podman, ${label}`, 'a container ran inside the service') : fail(`nested Podman, ${label}`, `a container did not run (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
         } catch (e) {
-          checks.push(fail(`Podman service, slot ${slot}`, e.message, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
+          checks.push(fail(`Podman service, ${label}`, e.message, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
         }
       }
     } catch (e) {

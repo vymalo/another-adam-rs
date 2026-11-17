@@ -47,6 +47,7 @@ export function dryRunConfig({ endpoint, prices = PRICES, capUSD = 100, perRunBu
     arms: { max: { reasoning_effort: 'high' }, off: { reasoning_effort: 'none' } },
     keyEnv: KEY_ENV,
     contextWindow: 131072,
+    limits: { minutes: 10, steps: 200, cancelGraceSeconds: 20 },
     tasks: { workspaceImage: `${PINS.coder.image}@${PINS.coder.digest}` },
   };
 }
@@ -102,7 +103,7 @@ async function startHarness({ env, home, name, raw, killSpec = null }) {
     },
   });
   const meterPort = Number(env.BENCH_METER_PORT ?? 18090);
-  await meter.listen(meterPort, env.BENCH_METER_BIND ?? '0.0.0.0');
+  await meter.listen(meterPort, env.BENCH_METER_BIND ?? '127.0.0.1');
   const stack = new Stack({
     composeFile: path.join(BENCH_DIR, 'compose.yaml'),
     home,
@@ -114,13 +115,17 @@ async function startHarness({ env, home, name, raw, killSpec = null }) {
   });
   await stack.up();
   const containers = stack.containers(1);
+  const grader = stack.graderContainers();
   await stack.pullWindow(1, () => containers.pull(coderRef(PINS)));
+  await stack.graderWindow(() => grader.pull(coderRef(PINS)));
   const base = config.tasks.workspaceImage;
   const pins = {};
   const tasks = {};
   for (const id of SELF_IDS) {
     const m = await materializeSelf({ srcDir: path.join(BENCH_DIR, 'tasks', 'self', id), home });
+    // The same image in both places: the agents' service runs the agent, the grader grades.
     await containers.build(m.context, m.tag, m.dockerfile, { BASE_IMAGE: base });
+    await grader.build(m.context, m.tag, m.dockerfile, { BASE_IMAGE: base });
     try {
       pins[m.tag] = await containers.digestOf(m.tag);
     } catch {
@@ -135,7 +140,6 @@ async function startHarness({ env, home, name, raw, killSpec = null }) {
     stack,
     config,
     home: dir, // results of this phase; the shared home above is what the Podman services see
-    limitMs: 10 * 60 * 1000,
     agents: {
       adam: new AdamAgent({ pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow }),
       opencode: new OpenCodeAgent({ pins: PINS, home, contextWindow: config.contextWindow }),
@@ -146,7 +150,7 @@ async function startHarness({ env, home, name, raw, killSpec = null }) {
     ledger.close();
     await model.close();
   };
-  return { deps, close, model, config, tasks, stack, containers, ledger };
+  return { deps, close, model, config, tasks, stack, containers: grader, ledger };
 }
 
 const specs = (tasks, agents, arm = 'max') => SELF_IDS.flatMap((id) => agents.map((agent) => ({ run: `${id}-${agent}-${arm}`, task: tasks[id], agent, arm, slot: 1, source: 'self', language: 'javascript' })));
@@ -154,7 +158,7 @@ const specs = (tasks, agents, arm = 'max') => SELF_IDS.flatMap((id) => agents.ma
 async function phaseEnvCheck(h) {
   lines('phase 0: the environment check of each self-test task (gold passes three times, the empty patch fails three times)');
   const results = [];
-  fs.mkdirSync(path.join(h.deps.home, "work"), { recursive: true });
+  fs.mkdirSync(path.join(h.deps.home, 'work'), { recursive: true });
   for (const id of SELF_IDS) {
     const r = await checkTask({ containers: h.containers, task: h.tasks[id], workRoot: path.join(h.deps.home, 'work') });
     results.push({ ok: r.ok, what: `the environment check of ${id} passes`, detail: r.reason ?? '' });

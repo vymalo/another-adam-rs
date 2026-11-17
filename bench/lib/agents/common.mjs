@@ -1,47 +1,32 @@
-// What the two drivers share: the agent interface, finding the run's tree, copying it out of the Podman
-// service, keeping raw output, and a patch from the final tree.
+// What the two drivers share: the agent interface, finding the run's tree, keeping raw output, and a patch from the
+// final tree.
 //
 // An agent driver is an object with
 //   name                      'adam' | 'opencode'
 //   prepare(ctx)              the base is in place, the agent can be started; throws on infrastructure trouble
 //   run(ctx)                  runs the agent to its end; returns { exit, wallMs, selfReported, ... }
-//   collect(ctx)              the final tree as a patch: { patch: Buffer, ... }
+//   stop(ctx)                 the agent and everything it started are stopped and that is confirmed, or it throws
+//   collect(ctx)              the final tree as a patch: { patch: Buffer, ... }; only after stop()
 //   cleanup(ctx)              always called; removes what the run left in the stack
-// ctx: { run, attempt, slot, task, base, stack, containers, meter: { token, baseUrl, refusal() }, paths: { run, in, out },
-//        limitMs, log }
+// ctx: { run, attempt, slot, task, base, stack, containers, meter: { token, baseUrl, refusal() }, paths: { run, in, scratch },
+//        limits: { limitMs, steps, cancelGraceMs }, contextWindow, log }
+// The host never reads a file a container wrote and never deletes one: trees and logs come out as tar streams
+// (lib/tarstream.mjs through lib/stack.mjs) and what is left in a service is removed by the service.
 import fs from 'node:fs';
 import path from 'node:path';
-import { redact } from '../stack.mjs';
 import { collectPatch } from '../grade.mjs';
+import { redact } from '../stack.mjs';
 
-const SAFE_PATH = /^\/[A-Za-z0-9._/@+=-]*$/;
-
-/** The shell that copies a tree (never its top-level `.git`) from `tree` to `out`, readable by everyone. Pure. */
-export function copyScript({ tree = '/tree', out = '/out' } = {}) {
-  for (const p of [tree, out]) if (!SAFE_PATH.test(p)) throw new Error('a path in the copy script is not a plain absolute path');
-  return `set -eu\ncd ${tree}\ntar --exclude=./.git -cf - . | tar -xf - -C ${out}\nchmod -R a+rX ${out}`;
+/** The harness's infrastructure, not the agent, is what went wrong: the run is `Failed_infra` with this reason. */
+export class InfraError extends Error {
+  constructor(reason, message = reason) {
+    super(message);
+    this.name = 'InfraError';
+    this.reason = reason;
+  }
 }
 
-/** Copy a tree out of the Podman service's volume into `outDir` (a directory the harness shares with the service). */
-export async function copyTreeOut({ containers, image, treePath, outDir, timeoutMs = 10 * 60 * 1000 }) {
-  fs.rmSync(outDir, { recursive: true, force: true });
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.chmodSync(outDir, 0o777);
-  const r = await containers.run({
-    image,
-    script: copyScript(),
-    workdir: '/',
-    mounts: [
-      { source: treePath, target: '/tree', readOnly: true },
-      { source: outDir, target: '/out' },
-    ],
-    network: 'none',
-    timeoutMs,
-  });
-  if (r.exitCode !== 0) throw new Error(`the final tree could not be copied out (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
-}
-
-/** The patch of the tree in `treeDir` against the base. The agent's `.git` was never copied and nothing in the tree is run. */
+/** The patch of the tree in `treeDir` (a directory the harness made) against the base. Nothing in the tree is run. */
 export async function patchOfTree({ treeDir, base, workRoot }) {
   return collectPatch({ tree: treeDir, baseRepo: base.dir, base: base.sha, linkPrefix: base.workdir, workRoot });
 }
@@ -75,7 +60,8 @@ export function locateWorktree({ runs, slotsOf, slug, root = '/work/workspaces' 
 /**
  * Is a pushed `agent/*` branch the one this run made? The coder names its branch `agent/<the first characters of
  * the run id>`, so the branch's tail must be a prefix of the run directory's name. Returns
- * { branch, sha, consistent } or null when nothing was pushed.
+ * { branch, sha, consistent } or null when nothing was pushed. The run has a repository of its own, so every
+ * branch in it is this run's.
  */
 export function crossCheckBranch({ heads, runDir }) {
   const mine = heads.filter((h) => h.ref.startsWith('agent/'));

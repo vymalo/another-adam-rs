@@ -21,11 +21,17 @@ test('the README names the pins that bench/pins.json holds', () => {
   assert.ok(!/opencode-ai|1\.19\.5/.test(README), 'no word of the old line is left as a pin');
 });
 
-test('the README and the ADR say what the agents do: the fixed reply, the limit, the deny rules, the choice about subagents', () => {
+test('the README and the ADR say what the agents do: the fixed reply, the limit, the deny rules, the choice about subagents', async () => {
   assert.ok(README.includes(NUDGE));
   assert.ok(README.includes(MODEL));
   assert.match(README, /every 10 s/);
-  assert.match(README, /time limit \(50 minutes\)/);
+  const { normalizeConfig } = await import("../lib/config.mjs");
+  const { rawConfig } = await import("./helpers.mjs");
+  const { dryRunConfig } = await import("../lib/dryrun.mjs");
+  const limits = normalizeConfig(rawConfig()).limits;
+  assert.ok(README.includes("`minutes` (the time limit of a run, " + limits.minutes + ")"), "the README names the configured default");
+  assert.equal(limits.minutes, 50);
+  assert.ok(normalizeConfig({ ...rawConfig(), ...dryRunConfig({ endpoint: "http://127.0.0.1:1/v1" }) }).limits.minutes < 50, "the dry run sets the same key a real run reads");
   assert.match(README, /\| allow \| deny \| deny \| deny \|/);
   assert.match(README, /`question: deny`/);
   assert.match(README, /leave them on and let `run` wait for them/);
@@ -45,4 +51,11 @@ test('the README says what did not run, and no word of the market or a private v
   assert.match(README, /The dry run itself has not been run/);
   const texts = [README, ADR, read('../compose.yaml'), read('../dry-run.sh')].join('\n');
   assert.doesNotMatch(texts, /\b(revenue|pricing strategy|customers?|competitors?|market share)\b/i);
+});
+
+test('the meter binds to the loopback unless told otherwise, in the code and in the README (finding 16)', () => {
+  const code = read('../lib/dryrun.mjs');
+  assert.match(code, /BENCH_METER_BIND \?\? '127\.0\.0\.1'/);
+  assert.doesNotMatch(code + read('../dry-run.sh'), /BENCH_METER_BIND(:-|\?\? )'0\.0\.0\.0'|:-0\.0\.0\.0/);
+  assert.match(README, /\*\*`127\.0\.0\.1` by default\*\*/);
 });

@@ -24,7 +24,7 @@ function machine({ info = INFO(), compose = '2.40.0', digests = [`${PINS.coder.i
   return { exec, readFile, statfs };
 }
 
-const run = (m, extra = {}) => doctor({ home: '/home/x/bench', pins: PINS, nodeVersion: '24.1.0', ...m, ...extra });
+const run = (m, extra = {}) => doctor({ home: '/home/x/bench', pins: PINS, nodeVersion: '24.1.0', arch: 'x64', ...m, ...extra });
 const by = (r, name) => r.checks.find((c) => c.name.startsWith(name));
 
 test('a machine that has everything is ok, and exits 0', async () => {
@@ -83,8 +83,12 @@ test('the coder image: absent is a warning with the pull command, another image 
   assert.equal(by(other, 'coder image').status, 'fail');
 });
 
-function fakeStack({ nested = true, up = true } = {}) {
+function fakeStack({ nested = true, up = true, stale = [] } = {}) {
   const calls = [];
+  const nestedContainers = () => ({
+    pull: async () => calls.push('pull grader'),
+    run: async () => (nested ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 125, stdout: '', stderr: 'Error: cannot clone: Operation not permitted\nexit' }),
+  });
   return {
     calls,
     slots: 2,
@@ -93,6 +97,9 @@ function fakeStack({ nested = true, up = true } = {}) {
       if (!up) throw new Error('docker compose up failed (exit 1): podman-1 is unhealthy');
     },
     pullWindow: async (slot, fn) => fn(),
+    removeStaleEnvFiles: () => stale,
+    graderContainers: () => nestedContainers(),
+    graderWindow: async (fn) => fn(),
     containers: (slot) => ({
       pull: async () => calls.push(`pull ${slot}`),
       run: async () => (nested ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 125, stdout: '', stderr: 'Error: cannot clone: Operation not permitted\nexit' }),
@@ -111,8 +118,9 @@ test('without --start the stack is not touched and the nested check is a warning
 test('with --start a container is run inside each Podman service', async () => {
   const stack = fakeStack();
   const r = await run(machine(), { stack, start: true });
-  assert.deepEqual(stack.calls, ['up', 'pull 1', 'pull 2']);
-  assert.deepEqual(r.checks.filter((c) => c.name.startsWith('nested Podman')).map((c) => c.status), ['ok', 'ok']);
+  assert.deepEqual(stack.calls, ['up', 'pull 1', 'pull 2', 'pull grader']);
+  assert.deepEqual(r.checks.filter((c) => c.name.startsWith('nested Podman')).map((c) => c.status), ['ok', 'ok', 'ok']);
+  assert.ok(r.checks.some((c) => c.name === 'nested Podman, grader'), 'the grader is checked too');
 });
 
 test('nested Podman that does not work fails with the reason, exits 1 and names the fallback', async () => {
@@ -136,4 +144,26 @@ test('the stack is not started while a check has already failed', async () => {
   const stack = fakeStack();
   await run(machine({ info: null }), { stack, start: true });
   assert.deepEqual(stack.calls, []);
+});
+
+test('finding 20: a compose plugin older than 2.24 is a failure, because env_file needs required: false', async () => {
+  const old = await run(machine({ compose: '2.20.3' }));
+  assert.equal(by(old, 'docker compose').status, 'fail');
+  assert.match(by(old, 'docker compose').fix, /2\.24/);
+  assert.equal(by(await run(machine({ compose: 'v2.24.0' })), 'docker compose').status, 'ok');
+  assert.equal(by(await run(machine({ compose: '2.40.0' })), 'docker compose').status, 'ok');
+  assert.equal(by(await run(machine({ compose: '1.29.2' })), 'docker compose').status, 'fail');
+});
+
+test('finding 20: the OpenCode binary is linux-x64, so another machine is a failure that says so', async () => {
+  const r = await run(machine(), { arch: 'arm64' });
+  assert.equal(by(r, 'machine').status, 'fail');
+  assert.match(by(r, 'machine').detail, /linux-x64/);
+  assert.equal(by(await run(machine()), 'machine').status, 'ok');
+});
+
+test('finding 15: doctor removes the env files a killed harness left and says so', async () => {
+  const r = await run(machine(), { stack: fakeStack({ stale: ['slot-1.env'] }) });
+  assert.match(by(r, 'stale env files').detail, /removed slot-1\.env/);
+  assert.equal(by(await run(machine(), { stack: fakeStack() }), 'stale env files').status, 'ok');
 });

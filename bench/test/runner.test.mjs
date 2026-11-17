@@ -149,7 +149,7 @@ test('a verifier that needs the network gets it for its grading only', async (t)
   assert.deepEqual(none.windows, []);
   const open = await fixture(t, { verifier: 'public' });
   await runPlan({ deps: open.deps(), plan: [spec(open, 'hello-1', 'opencode')] });
-  assert.deepEqual(open.windows, [1]);
+  assert.deepEqual(open.windows, ['grader']);
 });
 
 test('executeRun refuses an agent it has no driver for', async (t) => {
@@ -164,4 +164,56 @@ test('the key the model was given is in nothing the runner kept', async (t) => {
   const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]));
   for (const file of walk(f.home)) assert.ok(!fs.readFileSync(file, 'utf8').includes(TEST_KEY), file);
   assert.ok(!fs.readFileSync(path.join(f.home, 'ledger.jsonl'), 'utf8').includes(MODEL_ID));
+});
+
+test('finding 11: the agent is stopped, and that is confirmed, before its tree is read: run, stop, collect, in that order', async (t) => {
+  const f = await fixture(t);
+  await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'opencode')] });
+  const order = f.agents.opencode.log.map((l) => l[0]).filter((n) => ['run', 'stop', 'collect', 'cleanup'].includes(n));
+  assert.deepEqual(order, ['run', 'stop', 'collect', 'cleanup']);
+});
+
+test('finding 11: a coder that cannot be confirmed stopped makes the run infrastructure, and its tree is never read', async (t) => {
+  const f = await fixture(t, { agentOver: { stopFails: () => true } });
+  const out = await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'adam')] });
+  assert.equal(out[0].state, 'Failed_infra');
+  assert.equal(out[0].reason, 'not-stopped');
+  assert.ok(!f.agents.adam.log.some((l) => l[0] === 'collect'));
+  assert.deepEqual(history(f, 'hello-1-adam-max').slice(-3), ['Running', 'Interrupted', 'Failed_infra']);
+});
+
+test('finding 9: the slot\'s service is reaped and its volume emptied before every run, and again at the start of a plan', async (t) => {
+  const f = await fixture(t);
+  f.slotContainers.listing = [{ image: 'leftover', imageId: 'x', labels: {}, names: ['old'] }];
+  await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'opencode'), spec(f, 'fix-add-1', 'opencode')] });
+  assert.ok(f.slotContainers.reaped >= 3, `reaped ${f.slotContainers.reaped} times: at the plan, and before each of the two runs`);
+  assert.deepEqual(f.resets, [1, 1]);
+  const log = f.agents.opencode.log.map((l) => `${l[0]}:${l[1]}`);
+  assert.ok(log.indexOf('prepare:hello-1-opencode-max') >= 0);
+});
+
+test('finding 7: grading runs on the grader service and never on the agents\' service', async (t) => {
+  const f = await fixture(t);
+  await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'opencode')] });
+  assert.equal(f.slotContainers.runs.length, 0, 'no grading container on the agents\' service');
+  assert.ok(f.grading.runs.length >= 3, 'three grading attempts on the grader');
+});
+
+test('finding 10: a run in which the agent made no model call is infrastructure, not a fail, and is not graded', async (t) => {
+  const f = await fixture(t, { calls: { adam: 0, opencode: 0 } });
+  const out = await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'opencode')] });
+  assert.equal(out[0].state, 'Failed_infra');
+  assert.equal(out[0].reason, 'infra:no-model-calls');
+  assert.equal(f.grading.runs.length, 0);
+  const v = f.ledger.fold().get('hello-1-opencode-max');
+  assert.equal(v.state, 'Failed_infra');
+  assert.equal(v.result, null);
+});
+
+test('finding 10: more than two upstream errors make a run infrastructure, whichever agent it is', async (t) => {
+  const f = await fixture(t, { calls: { adam: 6, opencode: 6 } });
+  f.model.behavior.status = 502; // the endpoint is down for every call
+  const out = await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'adam')] });
+  assert.equal(out[0].state, 'Failed_infra');
+  assert.match(out[0].reason, /^infra:(upstream-errors|last-call-failed)$/);
 });

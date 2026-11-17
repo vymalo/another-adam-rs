@@ -4,9 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { baseScript, prepareBase } from '../lib/base.mjs';
+import { repoSlug } from '../lib/gitops.mjs';
+import { extractEntries, parseTar } from '../lib/tarstream.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
 import { adapterSymlinks, collectPatch, localGit } from '../lib/grade.mjs';
-import { WorktreeError, copyScript, crossCheckBranch, locateWorktree, saveRaw } from '../lib/agents/common.mjs';
+import { WorktreeError, crossCheckBranch, locateWorktree, saveRaw } from '../lib/agents/common.mjs';
 import { commitFiles, git, initRepo } from './gitfix.mjs';
 import { tmp } from './helpers.mjs';
 import { DIGEST, IMAGE, makeTask } from './taskfix.mjs';
@@ -29,43 +31,21 @@ function runBase(t, app) {
   const out = tmp(t);
   const scratch = path.join(tmp(t), 'w');
   sh(baseScript({ workdir: app, out, scratch }), { GIT_CONFIG_NOSYSTEM: '1' });
-  return { out, bare: path.join(out, 'base.git'), sha: fs.readFileSync(path.join(out, 'base.sha'), 'utf8').trim() };
+  return { out, bare: path.join(out, 'base.git'), tree: path.join(out, 'tree'), sha: git(path.join(out, 'base.git'), 'rev-parse', 'refs/heads/main').trim() };
 }
 
-test('the base script makes a bare repository, on main, with one commit that links the ignored top-level entries to the image\'s', (t) => {
+test('the base script makes a bare repository on main, with one commit that links the ignored top-level entries, and a tree without .git', (t) => {
   const app = appRepo(t);
   const original = git(app, 'rev-parse', 'HEAD').trim();
-  const { bare, sha } = runBase(t, app);
+  const { bare, tree, sha } = runBase(t, app);
   assert.match(sha, /^[0-9a-f]{40}$/);
-  assert.equal(git(bare, 'rev-parse', 'refs/heads/main').trim(), sha);
   assert.equal(git(bare, 'rev-parse', `${sha}^`).trim(), original, 'the history up to the base is kept, one commit on top');
-  const tree = git(bare, 'ls-tree', '-r', sha).split('\n').filter(Boolean);
-  const links = tree.filter((l) => l.startsWith('120000'));
-  assert.equal(links.length, 2);
-  assert.ok(links.some((l) => l.endsWith('\tnode_modules')) && links.some((l) => l.endsWith('\tdist')));
+  const links = git(bare, 'ls-tree', '-r', sha).split('\n').filter((l) => l.startsWith('120000'));
+  assert.deepEqual(links.map((l) => l.split('\t')[1]).sort(), ['dist', 'node_modules']);
   assert.equal(git(bare, 'cat-file', 'blob', `${sha}:node_modules`), path.join(app, 'node_modules'));
-  assert.ok(!tree.some((l) => l.includes('dep/index.js')), 'the dependencies themselves are not copied into the repository');
-});
-
-test('the links are the base: the patch of an untouched clone is empty, and a change to a link is left out of it', async (t) => {
-  const app = appRepo(t);
-  const { bare, sha } = runBase(t, app);
-  const clone = path.join(tmp(t), 'c');
-  execFileSync('git', ['clone', '-q', bare, clone]);
-  assert.equal((await collectPatch({ tree: clone, baseRepo: bare, base: sha, linkPrefix: app })).length, 0);
-  fs.writeFileSync(path.join(clone, 'new.txt'), 'x\n');
-  fs.rmSync(path.join(clone, 'dist'));
-  fs.symlinkSync('/elsewhere', path.join(clone, 'dist'));
-  const patch = (await collectPatch({ tree: clone, baseRepo: bare, base: sha, linkPrefix: app })).toString();
-  assert.match(patch, /\+\+\+ b\/new\.txt/);
-  assert.doesNotMatch(patch, /dist|node_modules/);
-  assert.deepEqual((await adapterSymlinks(localGit(bare), sha, app)).sort(), ['dist', 'node_modules']);
-});
-
-test('a repository with nothing ignored has no extra commit, and the base is its own head', (t) => {
-  const app = initRepo(t);
-  const head = commitFiles(app, { 'a.txt': 'a\n' }, 'only commit');
-  assert.equal(runBase(t, app).sha, head);
+  assert.equal(fs.readFileSync(path.join(tree, 'src', 'index.js'), 'utf8'), 'export {};\n');
+  assert.equal(fs.existsSync(path.join(tree, '.git')), false);
+  assert.equal(fs.readlinkSync(path.join(tree, 'node_modules')), path.join(app, 'node_modules'));
 });
 
 test('the base script refuses a path that is not plain', () => {
@@ -73,51 +53,47 @@ test('the base script refuses a path that is not plain', () => {
   assert.throws(() => baseScript({ workdir: '/app', out: '/out $(x)' }), /plain/);
 });
 
-test('prepareBase runs the script in the task image, with no network and the output mounted, and keeps the result by digest', async (t) => {
-  const home = tmp(t);
-  const tasks = tmp(t);
-  const task = loadTask(makeTask(tasks, 'demo-1'));
+/** What the real stack does for the base: the container's tree comes out as a tar stream into a directory the host owns. */
+function fakeStack(produced, calls) {
+  return {
+    workDir: async (slot, dir, o) => calls.push(['workDir', slot, dir, Boolean(o?.remove)]),
+    extractTree: async (slot, dir, dest) => {
+      calls.push(['extractTree', slot, dir]);
+      const tar = execFileSync('tar', ['--format=posix', '-cf', '-', '-C', produced.tree, '.'], { maxBuffer: 1 << 28 });
+      extractEntries(parseTar(tar, { allowSymlinks: true }), dest);
+    },
+  };
+}
+
+test('prepareBase: made in the slot\'s volume in the task image with no network, then rebuilt on the host from a tar stream by a repository the harness owns', async (t) => {
+  const hostRoot = tmp(t);
+  const task = loadTask(makeTask(tmp(t), 'demo-1'));
   const app = appRepo(t);
   const produced = runBase(t, app);
-  const containers = new FakeContainers({
-    onRun: (spec) => {
-      const out = spec.mounts.find((m) => m.target === '/out').source;
-      fs.cpSync(produced.out, out, { recursive: true });
-      return { exitCode: 0 };
-    },
-  });
-  const base = await prepareBase({ containers, task, root: home });
-  assert.equal(containers.runs.length, 1);
+  const calls = [];
+  const containers = new FakeContainers();
+  const base = await prepareBase({ containers, stack: fakeStack(produced, calls), slot: 2, task, hostRoot });
   const spec = containers.runs[0];
   assert.deepEqual([spec.image, spec.network, spec.workdir], [`${IMAGE}@${DIGEST}`, 'none', '/']);
+  assert.deepEqual(spec.mounts, [{ source: '/work/bench-base', target: '/out' }]);
   assert.match(spec.script, /git clone -q --no-hardlinks \/app /);
-  assert.equal(base.sha, produced.sha);
-  assert.ok(fs.existsSync(base.dir));
-  const again = await prepareBase({ containers, task, root: home });
-  assert.equal(containers.runs.length, 1, 'kept: the image is the same');
-  assert.deepEqual(again, base);
+  assert.deepEqual(calls.map((c) => c.slice(0, 4).join(' ')), ['workDir 2 /work/bench-base true', 'workDir 2 /work/bench-base false', 'extractTree 2 /work/bench-base/tree']);
+  assert.equal(base.containerRepo, '/work/bench-base/base.git');
+  assert.notEqual(base.dir, base.containerRepo);
+  assert.equal(git(base.dir, 'rev-parse', 'HEAD').trim(), base.sha);
+  assert.equal(base.slug, repoSlug('demo-1'));
+  // the host's repository is the base for patch collection: untouched is empty, a new file is the patch, the links are left out
+  fs.cpSync(base.dir, path.join(hostRoot, 'work'), { recursive: true });
+  assert.equal((await collectPatch({ tree: path.join(hostRoot, 'work'), baseRepo: base.dir, base: base.sha, linkPrefix: app })).length, 0);
+  fs.writeFileSync(path.join(hostRoot, 'work', 'new.txt'), 'x\n');
+  assert.match((await collectPatch({ tree: path.join(hostRoot, 'work'), baseRepo: base.dir, base: base.sha, linkPrefix: app })).toString(), /\+\+\+ b\/new\.txt/);
+  assert.deepEqual((await adapterSymlinks(localGit(base.dir), base.sha, app)).sort(), ['dist', 'node_modules']);
 });
 
-test('prepareBase says why it failed, and keeps nothing', async (t) => {
+test('prepareBase says why it failed', async (t) => {
   const task = loadTask(makeTask(tmp(t), 'demo-2'));
   const containers = new FakeContainers({ onRun: () => ({ exitCode: 3, stderr: 'fatal: not a git repository\n' }) });
-  await assert.rejects(prepareBase({ containers, task, root: tmp(t) }), /could not be made \(exit 3\).*not a git repository/);
-});
-
-test('the copy script copies a tree without its top-level .git, keeps links as links and makes it readable', (t) => {
-  const tree = tmp(t);
-  fs.mkdirSync(path.join(tree, '.git'));
-  fs.writeFileSync(path.join(tree, '.git', 'config'), '[core]\n\tfsmonitor = x\n');
-  fs.mkdirSync(path.join(tree, 'src', 'deep'), { recursive: true });
-  fs.writeFileSync(path.join(tree, 'src', 'deep', 'a.txt'), 'a\n', { mode: 0o600 });
-  fs.symlinkSync('/app/node_modules', path.join(tree, 'node_modules'));
-  const out = tmp(t);
-  sh(copyScript({ tree, out }));
-  assert.equal(fs.existsSync(path.join(out, '.git')), false);
-  assert.equal(fs.readFileSync(path.join(out, 'src', 'deep', 'a.txt'), 'utf8'), 'a\n');
-  assert.equal(fs.readlinkSync(path.join(out, 'node_modules')), '/app/node_modules');
-  assert.ok((fs.statSync(path.join(out, 'src', 'deep', 'a.txt')).mode & 0o044) === 0o044);
-  assert.throws(() => copyScript({ tree: '/tree; x' }), /plain/);
+  await assert.rejects(prepareBase({ containers, stack: fakeStack({}, []), slot: 1, task, hostRoot: tmp(t) }), /could not be made \(exit 3\).*not a git repository/);
 });
 
 test('the run\'s worktree is the one slot of the one run directory, or the one named after the repository', () => {

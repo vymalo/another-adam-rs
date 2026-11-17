@@ -11,9 +11,10 @@
 # takes it down with its volumes. It needs Docker with the compose plugin, Node 22 or newer, and what
 # `node bench/bin/bench.mjs doctor` checks. Nothing here has run where it was written: no container service was there.
 #
-# Environment: BENCH_HOME (default: a new temporary directory, removed at the end), BENCH_METER_BIND (default
-# 0.0.0.0: the stack's relay reaches the harness's meter through the host gateway), BENCH_METER_PORT (18090),
-# BENCH_GIT_PORT (18083), BENCH_CODER_1_PORT (18081), BENCH_CODER_2_PORT (18082).
+# Environment: BENCH_HOME (default: a new temporary directory, removed at the end), BENCH_METER_BIND (default: the
+# address of Docker's default bridge, which the stack's relay reaches through the host gateway; 127.0.0.1 when that
+# cannot be read, and under rootless Docker, where the host gateway is another address, set it yourself),
+# BENCH_METER_PORT (18090), BENCH_GIT_PORT (18083), BENCH_CODER_1_PORT (18081), BENCH_CODER_2_PORT (18082).
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -44,7 +45,10 @@ if [ -z "${BENCH_HOME:-}" ]; then
 fi
 chmod 755 "$BENCH_HOME"
 export BENCH_HOME
-BENCH_METER_BIND=${BENCH_METER_BIND:-0.0.0.0}
+if [ -z "${BENCH_METER_BIND:-}" ]; then
+  BENCH_METER_BIND=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
+  BENCH_METER_BIND=${BENCH_METER_BIND:-127.0.0.1}
+fi
 export BENCH_METER_BIND
 
 # Ubuntu 24.04 hosts stop a rootless Podman from making a user namespace (dev/podman/README.md).
@@ -54,9 +58,12 @@ fi
 
 cleanup() {
   status=$?
+  # What follows must not change the status of the run: no -e here.
+  set +e
   node bench/bin/bench.mjs dry-run --down >/dev/null 2>&1 || echo "bench dry run: the stack may still be up: docker compose -p adam-bench down --volumes" >&2
   if [ -n "$made_home" ]; then
-    rm -rf "$made_home"
+    # a container may have made what is in it: the service removes it, then the host does
+    rm -rf "$made_home" 2>/dev/null || echo "bench dry run: $made_home was not removed; remove it by hand" >&2
   fi
   exit "$status"
 }

@@ -3,14 +3,19 @@
 //
 //   Planned -> Reserved -> Preparing -> Running -> Collecting -> Grading -> Done
 //
-// Every transition is a ledger record (ledger.mjs refuses any other). The patch is saved before grading, so a
-// grading that is stopped is graded again from it and the agent is never run again. A harness that is killed leaves
-// the run in the state it was in; the next start reads the ledger (`resumeActions`): a Done run is not repeated,
-// an interrupted one starts again from scratch (its spend stays in the ledger as waste), a Grading one is graded again.
+// Every transition is a ledger record (ledger.mjs refuses any other). Before a run the slot's service is reaped and
+// its volume emptied; after the agent ends it is stopped, and that is confirmed, before anything is read from its tree
+// (an agent that cannot be stopped is infrastructure). The meter's record decides whether the run is the agent's or the
+// infrastructure's (classify.mjs). The patch is saved before grading, so a grading that is stopped is graded again from
+// it and the agent is never run again. Grading runs on the grader service, which no agent can reach. A harness that is
+// killed leaves the run in the state it was in; the next start reads the ledger (`resumeActions`): a Done run is not
+// repeated, an interrupted one starts again from scratch (its spend stays in the ledger as waste), a Grading one is
+// graded again.
 import fs from 'node:fs';
 import path from 'node:path';
 import { prepareBase } from './base.mjs';
 import { CapBook } from './cap.mjs';
+import { callStats, classifyRun } from './classify.mjs';
 import { gradePatch } from './grade.mjs';
 import { resumeActions, resumeRecords } from './ledger.mjs';
 
@@ -30,11 +35,10 @@ export const runDirName = (run, attempt) => `${run.replace(SAFE_ID, '-')}-a${att
  * @property {object} ledger   an open Ledger
  * @property {object} book     a CapBook
  * @property {object} meter    createMeter's
- * @property {object} stack    the Stack (or a stand-in): containers(slot), ports, agentDir
+ * @property {object} stack    the Stack (or a stand-in)
  * @property {object} agents   { adam, opencode } drivers
- * @property {object} config   the normalised configuration
- * @property {string} home     $BENCH_HOME
- * @property {number} limitMs  the time limit of a run
+ * @property {object} config   the normalised configuration (its `limits` are the limits of a run)
+ * @property {string} home     where this phase keeps its results
  * @property {(spec) => number} [reserveMicro]  what a run reserves; default the configuration's per-run budget
  * @property {(run: string, state: string) => void} [afterState]  called after each state record is written
  */
@@ -44,17 +48,18 @@ function stateRecord(deps, run, state, extra = {}) {
   deps.afterState?.(run, state);
 }
 
-async function gradeSaved({ deps, spec, task, patchPath, containers }) {
+async function gradeSaved({ deps, task, patchPath }) {
+  const containers = deps.stack.graderContainers();
   const hasPatch = fs.existsSync(patchPath) && fs.statSync(patchPath).size > 0;
   const work = path.join(deps.home, 'work');
   fs.mkdirSync(work, { recursive: true });
   const grade = () => gradePatch({ containers, task, patchFile: hasPatch ? patchPath : null, workRoot: work });
   const net = task.verifierNetwork;
-  // The service has no route out; a verifier that needs the network gets one for the window of its grading.
-  return net === 'public' || net === 'default' ? deps.stack.pullWindow(spec.slot, grade) : grade();
+  // The grader has no route out; a verifier that needs the network gets it for the window of its grading.
+  return net === 'public' || net === 'default' ? deps.stack.graderWindow(grade) : grade();
 }
 
-function resultOf({ grade, exit, wallMs, selfReported, patchPath, notes }) {
+function resultOf({ grade, exit, wallMs, selfReported, patchPath, notes, meter }) {
   return {
     pass: grade.pass,
     grades: grade.attempts.map((a) => (a.pass ? 1 : 0)),
@@ -63,6 +68,7 @@ function resultOf({ grade, exit, wallMs, selfReported, patchPath, notes }) {
     exit,
     wallMs,
     ...(selfReported ? { selfReported } : {}),
+    ...(meter ? { meter } : {}),
     suspect: grade.suspect,
     removed: grade.removed,
     patch: patchPath,
@@ -87,19 +93,27 @@ export async function executeRun({ deps, spec, attempt }) {
   stateRecord(deps, run, 'Reserved', { reservedMicro });
 
   const dirName = runDirName(run, attempt);
-  const paths = { run: path.join(deps.home, 'runs', dirName), in: path.join(deps.home, 'scratch', dirName, 'in'), out: path.join(deps.home, 'scratch', dirName, 'out') };
+  const paths = { run: path.join(deps.home, 'runs', dirName), scratch: path.join(deps.home, 'scratch', dirName) };
   fs.mkdirSync(paths.run, { recursive: true });
+  fs.mkdirSync(paths.scratch, { recursive: true });
   const containers = stack.containers(spec.slot);
   const opened = { meter: false };
   let ctx = null;
-  const fail = (state, reason) => {
+  const infra = async (reason, message, { interrupted }) => {
+    await agent.cleanup(ctx ?? { run, attempt, slot: spec.slot, stack, containers, paths }).catch(() => {});
     if (opened.meter) meter.closeRun(run);
     else book.close(run);
-    stateRecord(deps, run, state, { reason });
+    if (interrupted) stateRecord(deps, run, 'Interrupted', { reason });
+    stateRecord(deps, run, 'Failed_infra', { reason });
+    return { state: 'Failed_infra', reason, error: message };
   };
+
   try {
     stateRecord(deps, run, 'Preparing');
-    const base = await (deps.prepareBase ?? prepareBase)({ containers, task, root: path.join(deps.home, 'bases') });
+    // What an earlier run or a killed harness left in the slot's service is removed first, and checked.
+    await containers.reapAll();
+    await stack.resetWork(spec.slot);
+    const base = await (deps.prepareBase ?? prepareBase)({ containers, stack, slot: spec.slot, task, hostRoot: path.join(paths.scratch, 'base') });
     const { token } = meter.openRun({ run, attempt, arm: spec.arm });
     opened.meter = true;
     ctx = {
@@ -110,21 +124,16 @@ export async function executeRun({ deps, spec, attempt }) {
       base,
       stack,
       containers,
-      meter: {
-        token,
-        baseUrl: `http://meter:8090/r/${token}/v1`,
-        refusal: () => meter.status(run)?.refusal ?? null,
-      },
+      meter: { token, baseUrl: `http://${stack.meterHost(spec.slot)}:8090/r/${token}/v1`, refusal: () => meter.status(run)?.refusal ?? null },
       paths,
-      limitMs: deps.limitMs,
+      limits: config.limits,
+      contextWindow: config.contextWindow,
       log: deps.log ?? (() => {}),
     };
     await agent.prepare(ctx);
   } catch (e) {
-    if (e instanceof HarnessCrash) throw e;
-    await agent.cleanup(ctx ?? { run, slot: spec.slot, stack, paths }).catch(() => {});
-    fail('Failed_infra', 'prepare');
-    return { state: 'Failed_infra', error: e.message };
+    if (e.name === 'HarnessCrash') throw e;
+    return infra(e.reason ?? 'prepare', e.message, { interrupted: false });
   }
 
   let ran;
@@ -132,20 +141,18 @@ export async function executeRun({ deps, spec, attempt }) {
     stateRecord(deps, run, 'Running');
     ran = await agent.run(ctx);
   } catch (e) {
-    if (e instanceof HarnessCrash) throw e;
-    await agent.cleanup(ctx).catch(() => {});
-    meter.closeRun(run);
-    stateRecord(deps, run, 'Interrupted', { reason: 'agent_error' });
-    stateRecord(deps, run, 'Failed_infra', { reason: 'agent_error' });
-    return { state: 'Failed_infra', error: e.message };
+    if (e.name === 'HarnessCrash') throw e;
+    return infra(e.reason ?? 'agent_error', e.message, { interrupted: true });
   }
+  if (ran.exit === 'infra') return infra('infra', 'the agent could not be driven', { interrupted: true });
 
-  if (ran.exit === 'infra') {
-    await agent.cleanup(ctx).catch(() => {});
-    meter.closeRun(run);
-    stateRecord(deps, run, 'Interrupted', { reason: 'infra' });
-    stateRecord(deps, run, 'Failed_infra', { reason: 'infra' });
-    return { state: 'Failed_infra', error: 'infra' };
+  // The agent has ended or been cancelled. It and everything it started are stopped, and that is confirmed, before
+  // any file of its tree is read: a tree that is still changing is not a result.
+  try {
+    await agent.stop?.(ctx);
+  } catch (e) {
+    if (e.name === 'HarnessCrash') throw e;
+    return infra(e.reason ?? 'not-stopped', e.message, { interrupted: true });
   }
   if (ran.exit === 'stopped_by_cap') {
     await agent.cleanup(ctx).catch(() => {});
@@ -153,15 +160,18 @@ export async function executeRun({ deps, spec, attempt }) {
     stateRecord(deps, run, 'StoppedByCap');
     return { state: 'StoppedByCap' };
   }
+  // Infrastructure is told apart from the agent by the meter's own record.
+  const stats = callStats(ledger.records, run, attempt);
+  const verdict = classifyRun({ exit: ran.exit, stats, externalFailure: ran.externalFailure });
+  if (verdict) return infra(`infra:${verdict.reason}`, `classified as infrastructure: ${verdict.reason}`, { interrupted: true });
 
-  // The agent has ended. Its reservation is not needed to collect or to grade.
   meter.closeRun(run);
   stateRecord(deps, run, 'Collecting');
   let collected;
   try {
     collected = await agent.collect(ctx);
   } catch (e) {
-    if (e instanceof HarnessCrash) throw e;
+    if (e.name === 'HarnessCrash') throw e;
     await agent.cleanup(ctx).catch(() => {});
     stateRecord(deps, run, 'Interrupted', { reason: 'collect' });
     stateRecord(deps, run, 'Failed_infra', { reason: 'collect' });
@@ -169,12 +179,13 @@ export async function executeRun({ deps, spec, attempt }) {
   }
   const patchPath = path.join(paths.run, 'model.patch');
   fs.writeFileSync(patchPath, collected.patch);
-  fs.writeFileSync(path.join(paths.run, 'meta.json'), `${JSON.stringify({ exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported ?? null, notes: collected.notes ?? null }, null, 2)}\n`);
+  const meterNote = { settled: stats.settled, upstreamErrors: stats.upstreamErrors, refused: stats.refused };
+  fs.writeFileSync(path.join(paths.run, 'meta.json'), `${JSON.stringify({ exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported ?? null, notes: collected.notes ?? null, meter: meterNote }, null, 2)}\n`);
   await agent.cleanup(ctx).catch(() => {});
 
   stateRecord(deps, run, 'Grading');
-  const grade = await gradeSaved({ deps, spec, task, patchPath, containers });
-  stateRecord(deps, run, 'Done', { result: resultOf({ grade, exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported, patchPath, notes: collected.notes }) });
+  const grade = await gradeSaved({ deps, task, patchPath });
+  stateRecord(deps, run, 'Done', { result: resultOf({ grade, exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported, patchPath, notes: collected.notes, meter: meterNote }) });
   return { state: 'Done', pass: grade.pass };
 }
 
@@ -188,8 +199,8 @@ export async function regradeRun({ deps, spec, attempt }) {
   } catch {
     // no meta: graded as an unknown exit
   }
-  const grade = await gradeSaved({ deps, spec, task: spec.task, patchPath, containers: deps.stack.containers(spec.slot) });
-  stateRecord(deps, spec.run, 'Done', { result: resultOf({ grade, exit: meta.exit ?? 'unknown', wallMs: meta.wallMs, selfReported: meta.selfReported, patchPath, notes: meta.notes }) });
+  const grade = await gradeSaved({ deps, task: spec.task, patchPath });
+  stateRecord(deps, spec.run, 'Done', { result: resultOf({ grade, exit: meta.exit ?? 'unknown', wallMs: meta.wallMs, selfReported: meta.selfReported, patchPath, notes: meta.notes, meter: meta.meter }) });
   return { state: 'Done', pass: grade.pass };
 }
 
@@ -204,6 +215,10 @@ export async function runPlan({ deps, plan }) {
   for (const rec of resumeRecords(actions, folded)) {
     stateRecord(deps, rec.run, rec.state, Object.fromEntries(Object.entries(rec).filter(([k]) => !['kind', 'run', 'state'].includes(k))));
     if (rec.state === 'Interrupted') deps.book.close(rec.run); // the killed attempt's reservation is free; its spend stays
+  }
+  // A killed harness may have left a coder and the containers of a run in a service: reaped first (and again before each run).
+  for (const slot of new Set(plan.map((s) => s.slot))) {
+    await deps.stack.containers(slot).reapAll();
   }
   const outcomes = [];
   for (const spec of plan) {

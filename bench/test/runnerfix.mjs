@@ -18,8 +18,8 @@ export const PER_CALL = priceCall({ input: 3_000_000, cachedInput: 300_000, cach
 
 /** An agent that makes `calls` model calls through the meter, as the real ones would, and ends as they end. */
 export class FakeAgent {
-  constructor(name, { origin, calls, crashAfter = {}, fail = {}, exit = null }) {
-    Object.assign(this, { name, origin, calls, crashAfter, fail, forcedExit: exit });
+  constructor(name, { origin, calls, crashAfter = {}, fail = {}, exit = null, stopFails = null }) {
+    Object.assign(this, { name, origin, calls, crashAfter, fail, forcedExit: exit, stopFails });
     this.log = [];
   }
 
@@ -31,7 +31,7 @@ export class FakeAgent {
   async run(ctx) {
     this.log.push(['run', ctx.run, ctx.attempt]);
     for (let i = 1; i <= this.calls; i++) {
-      const res = await fetch(ctx.meter.baseUrl.replace('http://meter:8090', this.origin) + '/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }] }) });
+      const res = await fetch(ctx.meter.baseUrl.replace(/^http:\/\/meter-\d:8090/, this.origin) + '/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }] }) });
       await res.arrayBuffer();
       if (this.crashAfter[ctx.run] === i && ctx.attempt === 1) throw new HarnessCrash(`${ctx.run} after call ${i}`);
       if (res.status === 429) break;
@@ -44,6 +44,11 @@ export class FakeAgent {
     this.log.push(['collect', ctx.run]);
     const text = ctx.task.id.startsWith('wrong') ? 'goodbye' : 'hello';
     return { patch: Buffer.from(`diff --git a/hello.txt b/hello.txt\nnew file mode 100644\n--- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+${text}\n`), notes: { by: this.name } };
+  }
+
+  async stop(ctx) {
+    this.log.push(['stop', ctx.run]);
+    if (this.stopFails?.(ctx.run)) throw Object.assign(new Error('the coder did not stop'), { reason: 'not-stopped' });
   }
 
   async cleanup(ctx) {
@@ -60,6 +65,7 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
   const config = normalizeConfig(rawConfig({ endpoint: url, capUSD, perRunBudgetUSD, ...(prices ? { prices } : {}) }));
   const taskRoot = tmp(t);
   const tasks = Object.fromEntries(taskNames.map((n) => [n, loadTask(makeTask(taskRoot, n, { 'task.toml': `[agent]\nnetwork_mode = "none"\n\n[verifier]\nnetwork_mode = "${verifier}"\n` }))]));
+  const slotContainers = new FakeContainers();
   const grading = new FakeContainers({
     onRun: (spec) => {
       const logs = spec.mounts.find((m) => m.target === '/logs/verifier').source;
@@ -70,7 +76,16 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     },
   });
   const windows = [];
-  const stack = { containers: () => grading, ports: { git: 1 }, pullWindow: async (slot, fn) => (windows.push(slot), fn()) };
+  const resets = [];
+  const stack = {
+    containers: () => slotContainers,
+    graderContainers: () => grading,
+    ports: { git: 1 },
+    meterHost: (slot) => `meter-${slot}`,
+    resetWork: async (slot) => resets.push(slot),
+    pullWindow: async (slot, fn) => fn(),
+    graderWindow: async (fn) => (windows.push('grader'), fn()),
+  };
   const ledgerFile = path.join(home, 'ledger.jsonl');
   let ledger;
   let meter;
@@ -92,7 +107,6 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     agents,
     config,
     home,
-    limitMs: 50 * 60 * 1000,
     prepareBase: async () => ({ dir: '/base/base.git', sha: 'a'.repeat(40), slug: 'demo', workdir: '/app' }),
     ...fixtureHooks,
   });
@@ -108,6 +122,9 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     tasks,
     agents,
     windows,
+    resets,
+    slotContainers,
+    grading,
     home,
     get ledger() {
       return ledger;
