@@ -74,6 +74,8 @@ pub mod safe_fs;
 pub mod testing;
 #[cfg(feature = "test-util")]
 pub mod testing_sandbox;
+#[cfg(feature = "test-util")]
+pub mod testing_stdio;
 mod workspace;
 mod worktree;
 

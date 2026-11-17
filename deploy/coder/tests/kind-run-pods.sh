@@ -18,6 +18,8 @@
 #
 #   * the objects the chart renders for runPods apply, the quota and the admission policy take effect, and a run pod
 #     made from the chart's own template runs commands, is killed, swept when idle and released (the cluster test);
+#   * a command in a run pod can be spoken to on stdin for minutes (the cluster test's last scenario: framed messages through
+#     adam-kube-exec, a silence of ADAM_TEST_STDIO_SILENCE_SECS, 90 s here, a 64 KiB message, then EOF or a kill);
 #   * a run pod sees only its own run (ADR 0041): the volume is seeded with two runs, a mirror and another mirror, and
 #     the cluster test makes the pod of one run and looks at what it can see, read and write;
 #   * the network policy of run pods is deny by default and the egress proxy is the one way out (ADR 0042), asked of a run
@@ -266,6 +268,7 @@ ADAM_TEST_KUBE_WORKER=ci-0 \
 ADAM_TEST_KUBE_QUOTA_PODS=4 \
 ADAM_TEST_KUBE_ISOLATION_MIRROR=/work/git/example.test/o/r.git \
 ADAM_TEST_KUBE_ISOLATION_ADMIN="$isolation_admin" \
+ADAM_TEST_STDIO_SILENCE_SECS="${ADAM_TEST_STDIO_SILENCE_SECS:-90}" \
 ADAM_TEST_REQUIRE_KUBERNETES=1 \
   cargo test --locked -p adam-env-kubernetes --test cluster -- --nocapture || status=$?
 

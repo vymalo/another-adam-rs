@@ -172,7 +172,9 @@ so pulled images and layers are reused across runs.
   every refusal, the state across a restart, single-flight, release and the sweep; `tests/adam_exec.rs` runs the embedded script.
 * `tests/podman.rs` runs against a real Podman service and the real CLI. It is gated on `ADAM_TEST_DEVCONTAINER=1`,
   `CONTAINER_HOST` and `ADAM_TEST_DEVCONTAINER_ROOT` (`ADAM_TEST_REQUIRE_DEVCONTAINER=1` makes a skip fail); the CI job
-  `devcontainer` runs it ([`dev/podman/README.md`](../../dev/podman/README.md)).
+  `devcontainer` runs it ([`dev/podman/README.md`](../../dev/podman/README.md)). It also holds a framed conversation on stdin and stdout
+  with `cat` in the container (a first message, a silence with stdin open, a 64 KiB message, then EOF or a kill:
+  `adam_workspace::testing_stdio`; the CI job asks for 90 s of silence), so it answers whether `devcontainer exec` forwards a piped stdin.
 * The `podman inspect`, `ps` and `images` JSON of the unit tests is written by hand in the shapes of Podman v5.8.7's own structs
   (`libpod/define/container_inspect.go`, `pkg/domain/entities/types`, *verified* against the source on 2026-10-01), not recorded from
   a live Podman: the gated test is what shows they match.

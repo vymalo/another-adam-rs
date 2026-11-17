@@ -457,6 +457,7 @@ jobs:
             ADAM_TEST_DEVCONTAINER_ROOT="$PODMAN_WORK" \
             ADAM_TEST_DEVCONTAINER_DNS_NAME=podman \
             ADAM_TEST_DEVCONTAINER_UP_SECS=600 \
+            ADAM_TEST_STDIO_SILENCE_SECS=90 \
             HOME="$PODMAN_WORK" "$PODMAN_WORK/podman-test" --nocapture
       - name: Logs
         if: failure()

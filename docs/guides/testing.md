@@ -59,6 +59,23 @@ They are gated apart, so `ADAM_TEST_REQUIRE_DB=1` does not turn them on.
 
 All test variables: [Environment](../reference/environment.md#tests).
 
+## A process that is spoken to on stdin
+
+A language server is a long-running process that is written to on stdin and answers on stdout with `Content-Length`
+frames. `adam_workspace::testing_stdio` asks any environment whether it can host one, with `cat` as the server: a first
+message read back, **silence with stdin held open**, a 64 KiB message read back (more than a pipe buffer), then **EOF**
+(the process ends by itself with status 0) or a **kill** (the process group and the environment's `kill` by exec id; no
+process carrying the run's marker is left). A failure names the step. `ADAM_TEST_STDIO_SILENCE_SECS` sets the silence
+(20 s by default; the kill case always uses 1 s).
+
+| Environment | Test | Run it | CI |
+|---|---|---|---|
+| Local | `adam-workspace/tests/stdio_framing.rs` | `cargo test -p adam-workspace --test stdio_framing` (always runs, about 20 s) | the normal test job |
+| Devcontainer | the end of `adam-devcontainer/tests/podman.rs` (after the `kill` check; its verdict comes after the teardown) | gated like that test: `ADAM_TEST_DEVCONTAINER=1`, see [`dev/podman/README.md`](../../dev/podman/README.md) | `devcontainer` job, 90 s of silence |
+| Run pod | the last scenario of `adam-env-kubernetes/tests/cluster.rs`, through `adam-kube-exec` | `sh deploy/coder/tests/kind-run-pods.sh` (`ADAM_TEST_STDIO_SILENCE_SECS` to change its 90 s) | `run-pods` job |
+
+A step that fails in the devcontainer or the pod is a finding about that environment, not a flaky test.
+
 ## What the store suite covers
 
 27 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent

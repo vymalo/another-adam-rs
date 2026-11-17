@@ -14,6 +14,10 @@
 //!   `mcr.microsoft.com/devcontainers/base`) and `ADAM_TEST_DEVCONTAINER_DNS_NAME` (a name that the
 //!   service's network resolves, such as a compose service, to check from inside).
 //!
+//! The test also holds a framed conversation on stdin and stdout with `cat` in the container (first
+//! message, a silence with stdin open, a 64 KiB message, then EOF or a kill: `adam_workspace::testing_stdio`);
+//! `ADAM_TEST_STDIO_SILENCE_SECS` sets the silence (20 s by default).
+//!
 //! `ADAM_TEST_REQUIRE_DEVCONTAINER=1` makes a run that would skip fail instead (CI sets it). The
 //! stack and the command are in `dev/podman/README.md`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -25,6 +29,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_devcontainer::{DevContainer, Network, Runtime, Settings};
+use adam_workspace::testing_stdio::{
+    StdioProbe, framed_stdio_until_eof, framed_stdio_until_kill, silence,
+};
 use adam_workspace::{
     EnvKind, EnvProgress, EnvSession, EnvStep, Environment, ExecSpec, GitCredentials, RepoRef,
     StaticToken, Workspaces,
@@ -388,6 +395,20 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
         panic!("kill did not stop the command; inside the container:\n{seen}");
     }
 
+    // A server's conversation (a language server's): framed messages on stdin and stdout, stdin held open
+    // through a silence, a large message, then EOF or a kill. Whether `devcontainer exec` forwards a piped
+    // stdin is what this asks. The answers are kept until the teardown below has run, so that a failure
+    // leaves no container behind.
+    let mut stdio_failures = Vec::new();
+    let eof = StdioProbe::new(&slot_path).silence(silence());
+    if let Err(e) = framed_stdio_until_eof(session.as_ref(), &eof).await {
+        stdio_failures.push(format!("until EOF: {e}"));
+    }
+    let killed = StdioProbe::new(&slot_path).silence(Duration::from_secs(1));
+    if let Err(e) = framed_stdio_until_kill(session.as_ref(), &killed).await {
+        stdio_failures.push(format!("until kill: {e}"));
+    }
+
     // Reused: the next command does not build again.
     let again = Steps::default();
     environment.ensure(&ws, &again).await.unwrap();
@@ -435,4 +456,9 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
         );
     }
     assert!(!slot_path.exists());
+    assert!(
+        stdio_failures.is_empty(),
+        "a framed conversation on stdin and stdout in the devcontainer:\n{}",
+        stdio_failures.join("\n")
+    );
 }

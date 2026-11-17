@@ -233,7 +233,7 @@ one line); none carries a secret, and the API server never echoes one in a refus
   cannot read the other run's file or `meta/`, runs `git status` and `git log` in its worktree, cannot write the mirror's
   configuration, hooks, refs or objects, or commit, and cannot rename, move or remove its slot (`EBUSY`) while a directory of the
   run that is not a slot renames; and (with `ADAM_TEST_KUBE_QUOTA_PODS`) that the quota refuses one pod
-  beyond its limit with `EnvError::Unavailable`. The kubeconfig must be **the coder's ServiceAccount's**, or the policy tests nothing. Without the
+  beyond its limit with `EnvError::Unavailable`; and, last, a framed conversation on stdin and stdout through `adam-kube-exec` with `cat` (a first message, a silence with stdin open, 20 s by default and 90 s in the kind script (`ADAM_TEST_STDIO_SILENCE_SECS`), a 64 KiB message, then EOF or a kill: `adam_workspace::testing_stdio`), which says whether a stdin held open for minutes over the WebSocket works and whether EOF reaches the command. The kubeconfig must be **the coder's ServiceAccount's**, or the policy tests nothing. Without the
   variable the test says it skipped; **with `ADAM_TEST_REQUIRE_KUBERNETES=1` it fails instead** (the `run-pods` job of CI sets
   it). The other variables (`ADAM_TEST_KUBE_TEMPLATE`, `ADAM_TEST_KUBE_NAMESPACE`, `ADAM_TEST_KUBE_INSTANCE`,
   `ADAM_TEST_KUBE_WORKER`, `ADAM_TEST_KUBE_ISOLATION_MIRROR`, `ADAM_TEST_KUBE_ISOLATION_ADMIN`) are in
