@@ -109,3 +109,25 @@ The task sources, the statement lint, selection, the environment check and gradi
 mounts of harness paths, digests of pulled and locally built images, running a locally built image by digest, the
 clone-path check on real images), where `SHA256SUMS` and the task directories sit under `v2/`, the form of `solution/`
 in upstream tasks, and the image sizes. The Docker-gated test (`bench/test/docker.test.mjs`) has not been run.
+
+### Amended 2026-11-17: after a blind review of slice 2
+
+Grading runs the agent's code, so no grader can be made tamper-proof against code that runs inside it. The harness
+therefore makes tampering hard and visible, and says so in the report:
+
+* **Nothing but files from the agent's tree.** The patch is made in a clone the harness owns; the agent's `.git`
+  (configuration, filters, hooks, attributes) is never read. The base's `.gitignore` decides what is left out.
+* **Stripping and the suspect list.** Changes to the tests and to the machinery that runs them are removed from the patch
+  and recorded; changes that configure tests, a reward that came with a failed exit status, and a patch that mentions the
+  grading's files are graded as they are and listed in the report as **suspect**, with the patch path, for a person to read.
+* **Every signal must agree.** A pass is exit status 0, a reward of exactly `1` written during the attempt, in a
+  directory of that attempt, and no error.
+* **An invalid grade is not a fail.** An attempt with an infrastructure error is tried twice more; still one, the grade is
+  `invalid`, left out of the rates and listed.
+* **The verifier's network is an allow-list** (`none`, `default`, `public` or a name the owner lists; never `host`).
+* The upstream tree is verified whole (every file listed, no symlink, normal paths), a check result is tied to the task's
+  checksum and image digest, the environment check also runs the gold through the real `/app` path, and the miner reads
+  `cfg` predicates, more test paths, exact lockfile names and binary source files.
+
+*Unverified* (added): that the stripping list covers the test machinery of every language in the task set, and everything
+the container service must still prove (see above).

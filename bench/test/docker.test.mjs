@@ -34,8 +34,10 @@ test('docker: a self-made task, the oracle grades 1 and the empty patch 0', { sk
 
   const out = path.join(tmp(t), 'm', 'tiny-2');
   const { tag } = materializeOwn({ spec, cloneDir: clone, outDir: out, workspaceImage });
-  prepareOwnContext({ cloneDir: clone, base, outDir: path.join(out, 'environment', 'repo') });
-  await containers.build(path.join(out, 'environment'), tag, path.join(out, 'environment', 'Dockerfile'));
+  const context = path.join(tmp(t), 'context');
+  prepareOwnContext({ cloneDir: clone, base, outDir: path.join(context, 'repo') });
+  fs.copyFileSync(path.join(out, 'environment', 'Dockerfile'), path.join(context, 'Dockerfile'));
+  await containers.build(context, tag, path.join(context, 'Dockerfile'));
   const digest = await containers.digestOf(tag);
   const task = loadTask(out, { pins: { [tag]: digest }, source: 'own' });
 

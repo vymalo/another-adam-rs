@@ -227,21 +227,29 @@ digest and keeps it in `$BENCH_HOME/tasks/pins.json`, and the pin is what a task
 }
 ```
 
-`upstreamUrl` (default the public repository), `upstreamDir` (default `v2`), `selfRepo` (the agent's own repository,
-default `another-adam-rs`), `seed` (default `1`) and `podman` (`connection` or `url` of the Podman service, as
-`podman --remote` takes them) are the other fields. The task commands read the same file as the rest, so it must be a
+`upstreamUrl` (default the public repository; `https:`, `file:`, `ssh:` or an absolute path, never beginning with `-`),
+`upstreamDir` (default `v2`), `selfRepo` (the agent's own repository, default `another-adam-rs`, `null` for no cap of
+its own), `seed` (default `1`), `verifierNetworks` (names of networks a verifier may use, see Grading) and `podman`
+(`connection`, a plain name, or `url`, `unix://` or `ssh://`, of the Podman service, as `podman --remote` takes them)
+are the other fields. The task commands read the same file as the rest, so it must be a
 whole configuration.
 
 **Fetch.** `bench tasks fetch` clones the upstream repository, checks out the pinned commit, checks every file against
-`v2/SHA256SUMS` and lists the tasks. A task's checksum in the lock is the hash of its `SHA256SUMS` lines.
+`v2/SHA256SUMS` and lists the tasks. The check is of the whole tree: every file of a task must be listed, there must be no
+symlink anywhere, and a listed path must be in its normal form (`a//b` and `a/../b` are refused). A reused clone is cleaned
+(`git clean -ffdx`) and its origin must be the configured URL. A task's checksum in the lock is the hash of its
+`SHA256SUMS` lines. A task directory may hold no symlink either.
 
 **Mine.** `bench tasks mine` walks the first-parent history of `main` in each clone and keeps a commit that
 
-* has one parent and a subject ending `(#N)` (a squashed pull request) and is not `docs`, `chore` or a revert;
-* touches a test file and a source file, by path (`tests/`, `*.test.ts`, `*_test.go`, ...);
-* changes at most 400 non-test lines (added plus deleted, documentation and lockfiles not counted);
-* changes no lockfile (a new dependency would need the network);
-* has no hunk inside a `#[cfg(test)]` item of a Rust file (inline tests cannot be hidden).
+* has one parent and a subject ending `(#N)` (a squashed pull request) and is not `docs`, `chore`, `ci`, `style`,
+  `build`, `test`, `refactor` or a revert;
+* touches a test file and a source file, by path (`tests/`, `testing/`, `*.test.ts`, `*_test.go`, `*_tests.rs`, `tests.rs`, ...);
+* changes at most 400 non-test lines (added plus deleted, documentation and lockfiles not counted); a binary source file
+  counts as over the limit;
+* changes no lockfile (by exact name, a full list, and any `*.lock`: a new dependency would need the network);
+* has no hunk inside code that `#[cfg(...)]` makes test-only: `test` as a token of the predicate (`all`, `any`, and not
+  under `not`), and a whole file under `#![cfg(test)]` (inline tests cannot be hidden).
 
 It writes `$BENCH_HOME/tasks/own-candidates.json` (commit, base, the hidden test files, a hint of the test command) and
 **never a statement**. You write it: [`bench/tasks/own/README.md`](tasks/own/README.md).
@@ -260,19 +268,49 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
   passes all three and the empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`,
   `gold-flaky`, `gold-does-not-apply`, `empty-passes`, `empty-flaky`, `no-gold-patch`, `infra`). It also records whether
   the base has a `.devcontainer`.
-* `bench tasks select` keeps the checked tasks without a `.devcontainer`, draws them stratified by repository with the
+* After the clone-path runs the check runs the gold **once more through the real grading path** (working directory `/app`,
+  the original `test.sh`) and keeps the task only if that passes too (`gold-fails-at-app`).
+* `bench tasks select` keeps the checked tasks without a `.devcontainer`, whose check still fits the task (a result carries
+  the task's checksum and image digest and is ignored when either has changed), draws them stratified by repository with the
   seeded generator of `lib/stats.mjs` (public: 80, at most 9 per repository; own: 20, at most 6 per repository and at
   most 6 from `selfRepo`) and writes the lock files. The same seed gives the same list.
 
 ## Grading
 
-`bench/lib/grade.mjs` collects the patch from a run's final tree (`git add -A`, `git diff --cached --binary <base>`;
-untracked files and binaries included; ignored files not; the symlinks the adapter committed to `/app/...` left out;
-more than 5 MB stops with an error) and grades it in a **new container of the task
-image, by digest**: the patch is applied in `/app`, `/tests` is mounted **read-only in that container only**, `bash
-/tests/test.sh` runs and the reward is read from `/logs/verifier`. The agent phase has no network; the grading
-container has the verifier's network (`public` by default). Three runs, two of three pass; a split is `flaky`. A patch
-that does not apply is a fail. The runtime is the `Containers` interface of `lib/containers.mjs`: `PodmanRemote` runs
+**A principle.** Grading runs the agent's code: its patched sources run inside the test process. So no grader can be
+made tamper-proof against code that runs inside it. The harness makes tampering hard and visible. It takes nothing
+from the agent's tree but its files, strips what may not change, demands that every signal agree, and lists every
+patch that touches the grading's own machinery as **suspect**, for a person to read. The report says so.
+
+`bench/lib/grade.mjs`:
+
+* **Collecting.** The agent's `.git` is never read or run (its `config`, filters, hooks and attributes can execute
+  commands). `collectPatch` clones the base from a repository the harness owns, copies the files of the agent's tree
+  over it (symlinks are copied as links and never followed, nested repositories are not entered), then runs
+  `git add -A` and `git diff --cached --binary <base>` with no system or global configuration, no hooks, no attributes
+  file, no fsmonitor and no textconv. Untracked files and binaries are included; the symlinks the adapter committed to
+  `/app/...` are left out; more than 5 MB stops with an error. The patch follows the **base's** `.gitignore`: the
+  agent's change to a `.gitignore` is dropped, and so are changes inside ignored paths or nested repositories.
+* **Stripping.** Before the patch is applied, every change to the hidden test files, to any path the miner calls a test
+  path (`tests/`, `*_test.*`, `tests.rs`, `testing/`, ...), to `conftest.py`, `pytest.ini`, `tox.ini`, `noxfile.py`,
+  jest, vitest, mocha and karma configuration and to `.gitattributes` is removed, and the removed paths are recorded with
+  the run. Changes to `pyproject.toml`, `setup.cfg`, `Cargo.toml`, `package.json` and `go.mod` that configure tests (a
+  `[tool.pytest*]` table, `[[test]]`, `harness`, a `test` script) are kept and flagged **suspect**.
+* **Grading.** The stripped patch is applied in a **new container of the task image, by digest**, `/tests` is mounted
+  **read-only in that container only**, `bash /tests/test.sh` runs, and the reward is read from a directory made empty
+  for that attempt, after the container has ended. A pass needs **all** of: exit status 0, a reward of exactly `1` written
+  during the attempt, and no error. A reward of `1` with another exit status is a fail and **suspect**. A patch whose added
+  lines mention `reward.txt`, `/logs/verifier`, `/tests/` or `test.sh` is graded as it is and **suspect** too. The agent
+  phase has no network; the grading container has the verifier's network.
+* **The verifier's network is an allow-list:** `none`, `default`, `public`, or a name in `tasks.verifierNetworks` of the
+  local configuration. `host` and anything else is refused, when the task is read and again when the container starts.
+* **Three attempts, two of three pass; a split is `flaky`.** An attempt that ends in an infrastructure error (exit 125,
+  126, 127, 98, or a timeout of the container) is tried again, at most twice; if it is still one the grade is **`invalid`**:
+  left out of the rates and listed in the report, never a fail. A patch that does not apply is a fail.
+* **Suspect list.** The report has a section with every suspect run: the reasons, what was stripped and the path of the
+  patch, for a person to read. A suspect run is graded as it is and counted as it is.
+
+The runtime is the `Containers` interface of `lib/containers.mjs`: `PodmanRemote` runs
 `podman --remote [--connection C | --url U] run --rm --pull=never --entrypoint sh ...` (the arguments are the pure
 function `buildRunArgs`) and `FakeContainers` is for tests. A mount source is a path as the Podman service sees it:
 the service and the harness must share the harness's work directory.

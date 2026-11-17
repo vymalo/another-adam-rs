@@ -11,17 +11,18 @@
 import { execFileSync } from 'node:child_process';
 
 export const MAX_NON_TEST_LINES = 400;
-const LOCKFILES = new Set(['Cargo.lock', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'npm-shrinkwrap.json', 'bun.lockb', 'bun.lock', 'go.sum', 'poetry.lock', 'uv.lock', 'Pipfile.lock', 'Gemfile.lock', 'composer.lock', 'flake.lock']);
-const TEST_DIRS = new Set(['tests', 'test', '__tests__', 'spec', 'specs', 'e2e']);
+const LOCKFILES = new Set(['Cargo.lock', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'pnpm-lock.yml', 'bun.lockb', 'bun.lock', 'deno.lock', 'go.sum', 'poetry.lock', 'Pipfile.lock', 'uv.lock', 'Gemfile.lock', 'composer.lock', 'mix.lock', 'Package.resolved', 'flake.lock']);
+const TEST_DIRS = new Set(['tests', 'test', '__tests__', 'spec', 'specs', 'e2e', 'testing']);
 const DOC_EXT = /\.(md|mdx|txt|rst|adoc|png|jpe?g|gif|svg|ico|webp|pdf)$/i;
 
 /** 'test' | 'lock' | 'doc' | 'source' for a repository path. */
 export function classifyPath(p) {
   const parts = p.split('/');
   const name = parts[parts.length - 1];
-  if (LOCKFILES.has(name)) return 'lock';
+  if (LOCKFILES.has(name) || /\.(lock|lockb)$/.test(name)) return 'lock';
   if (parts.slice(0, -1).some((d) => TEST_DIRS.has(d))) return 'test';
-  if (/\.(test|spec)\.[A-Za-z0-9]+$/.test(name) || /_test\.[A-Za-z0-9]+$/.test(name) || /^test_.*\.py$/.test(name)) return 'test';
+  if (/\.(test|spec)\.[A-Za-z0-9]+$/.test(name) || /_tests?\.[A-Za-z0-9]+$/.test(name) || /^test_.*\.py$/.test(name)) return 'test';
+  if (/^tests\.[A-Za-z0-9]+$/.test(name) || /^(testutil|test_utils)/.test(name)) return 'test';
   if (DOC_EXT.test(name) || parts[0] === 'docs') return 'doc';
   return 'source';
 }
@@ -30,7 +31,55 @@ export function gitIn(dir) {
   return (args) => execFileSync('git', ['-c', 'core.quotepath=off', '-C', dir, ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-/** Line ranges (1-based, inclusive) of the items that follow a `#[cfg(test)]` attribute. */
+/** Does a `cfg(...)` predicate hold the token `test` outside every `not(...)`? */
+export function predicateIsTest(pred) {
+  const tokens = pred.match(/[A-Za-z_][A-Za-z0-9_]*|[()]|"(?:[^"\\]|\\.)*"/g) ?? [];
+  const stack = [];
+  let prev = null;
+  for (const t of tokens) {
+    if (t === '(') stack.push(prev === 'not');
+    else if (t === ')') stack.pop();
+    else if (t.startsWith('"')) {
+      prev = t;
+      continue;
+    } else if (t === 'test' && !stack.includes(true)) return true;
+    prev = t;
+  }
+  return false;
+}
+
+/** Skip a string, raw string, char literal or comment at `i`; returns the index after it, or `i` when there is none. */
+function skipLiteral(text, i) {
+  const c = text[i];
+  if (c === '/' && text[i + 1] === '/') {
+    while (i < text.length && text[i] !== '\n') i++;
+    return i;
+  }
+  if (c === '/' && text[i + 1] === '*') {
+    const e = text.indexOf('*/', i + 2);
+    return e < 0 ? text.length : e + 2;
+  }
+  if ((c === 'r' || (c === 'b' && text[i + 1] === 'r')) && !/[A-Za-z0-9_]/.test(text[i - 1] ?? ' ')) {
+    const m = /^b?r(#*)"/.exec(text.slice(i, i + 40));
+    if (m) {
+      const close = `"${m[1]}`;
+      const e = text.indexOf(close, i + m[0].length);
+      return e < 0 ? text.length : e + close.length;
+    }
+  }
+  if (c === '"') {
+    i++;
+    while (i < text.length && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
+    return i + 1;
+  }
+  if (c === "'") {
+    const lit = /^'(?:[^'\\\n]|\\.[^'\n]*)'/.exec(text.slice(i, i + 12));
+    if (lit) return i + lit[0].length;
+  }
+  return i;
+}
+
+/** Line ranges (1-based, inclusive) of the code that `#[cfg(...test...)]` makes test-only, and of a whole file under `#![cfg(test)]`. */
 export function cfgTestRanges(text) {
   const ranges = [];
   const lines = text.split('\n');
@@ -50,43 +99,43 @@ export function cfgTestRanges(text) {
     }
     return lo + 1;
   };
-  const re = /^[ \t]*#\[cfg\(test\)\]/gm;
+  const re = /^[ \t]*#(!?)\[cfg\(/gm;
   let m;
   while ((m = re.exec(text)) !== null) {
     let i = m.index + m[0].length;
-    let depth = 0;
+    let depth = 1;
+    const start = i;
+    while (i < text.length && depth > 0) {
+      const j = skipLiteral(text, i);
+      if (j !== i) {
+        i = j;
+        continue;
+      }
+      if (text[i] === '(') depth++;
+      else if (text[i] === ')') depth--;
+      i++;
+    }
+    if (!predicateIsTest(text.slice(start, i - 1))) continue;
+    if (m[1] === '!') {
+      ranges.push([1, lines.length]);
+      continue;
+    }
+    let braces = 0;
     let opened = false;
     let end = -1;
     while (i < text.length) {
+      const j = skipLiteral(text, i);
+      if (j !== i) {
+        i = j;
+        continue;
+      }
       const c = text[i];
-      if (c === '/' && text[i + 1] === '/') {
-        while (i < text.length && text[i] !== '\n') i++;
-        continue;
-      }
-      if (c === '/' && text[i + 1] === '*') {
-        const e = text.indexOf('*/', i + 2);
-        i = e < 0 ? text.length : e + 2;
-        continue;
-      }
-      if (c === '"') {
-        i++;
-        while (i < text.length && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
-        i++;
-        continue;
-      }
-      if (c === "'") {
-        const lit = /^'(?:[^'\\\n]|\\.[^'\n]*)'/.exec(text.slice(i, i + 12));
-        if (lit) {
-          i += lit[0].length;
-          continue;
-        }
-      }
       if (c === '{') {
-        depth++;
+        braces++;
         opened = true;
       } else if (c === '}') {
-        depth--;
-        if (opened && depth === 0) {
+        braces--;
+        if (opened && braces === 0) {
           end = i;
           break;
         }
@@ -123,10 +172,13 @@ export function touchesInlineTests({ hunks, oldText, newText }) {
   return false;
 }
 
+const EXCLUDED_TYPES = new Set(['docs', 'chore', 'revert', 'ci', 'style', 'build', 'test', 'refactor']);
+
 function subjectKind(subject) {
   const m = /^([A-Za-z]+)(\([^)]*\))?!?:/.exec(subject);
   const type = m ? m[1].toLowerCase() : null;
-  if (type === 'docs' || type === 'chore' || type === 'revert' || /^revert\b/i.test(subject)) return type === 'docs' || type === 'chore' ? type : 'revert';
+  if (EXCLUDED_TYPES.has(type)) return type;
+  if (/^revert\b/i.test(subject)) return 'revert';
   return null;
 }
 
@@ -190,7 +242,8 @@ export function evaluateCommit(git, commit, { repoName = 'repo', maxNonTestLines
   const numstat = git(['diff', '--numstat', '-z', '--no-renames', parent, hash]).split('\0').filter(Boolean);
   const files = numstat.map((l) => {
     const m = /^(-|\d+)\t(-|\d+)\t(.*)$/s.exec(l);
-    return { path: m[3], added: m[1] === '-' ? 0 : +m[1], deleted: m[2] === '-' ? 0 : +m[2] };
+    const binary = m[1] === '-';
+    return { path: m[3], added: binary ? 0 : +m[1], deleted: m[2] === '-' ? 0 : +m[2], binary };
   });
   const by = { test: [], lock: [], doc: [], source: [] };
   for (const f of files) by[classifyPath(f.path)].push(f);
@@ -198,7 +251,7 @@ export function evaluateCommit(git, commit, { repoName = 'repo', maxNonTestLines
   if (by.source.length === 0) reasons.push('no-source');
   if (by.lock.length > 0) reasons.push('lockfile');
   const nonTestLines = by.source.reduce((s, f) => s + f.added + f.deleted, 0);
-  if (nonTestLines > maxNonTestLines) reasons.push('too-large');
+  if (nonTestLines > maxNonTestLines || by.source.some((f) => f.binary)) reasons.push('too-large');
   if (by.source.some((f) => f.path.endsWith('.rs'))) {
     for (const f of by.source.filter((x) => x.path.endsWith('.rs'))) {
       const hunks = parseHunks(git(['diff', '-U0', '--no-renames', parent, hash, '--', f.path]));

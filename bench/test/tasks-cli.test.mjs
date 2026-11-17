@@ -53,7 +53,7 @@ test('SHA256SUMS is parsed strictly and checked against the files', (t) => {
   const good = `${sha('hello')}  a/x\n`;
   const sums = parseSums(good);
   verifySums(dir, sums);
-  assert.equal(parseSums(`${sha('hello')} *./a/x\n`).get('a/x'), sha('hello'));
+  assert.equal(parseSums(`${sha('hello')} *a/x\n`).get('a/x'), sha('hello'));
   fs.writeFileSync(path.join(dir, 'a', 'x'), 'tampered');
   assert.throws(() => verifySums(dir, sums), /differs/);
   fs.rmSync(path.join(dir, 'a', 'x'));
@@ -91,7 +91,7 @@ test('fetch refuses without a pinned commit, and with a checksum that does not m
   execFileSync('git', ['-C', up.bare, 'fetch', '-q', up.work, 'HEAD:refs/heads/tampered']);
   const s2 = setup(t, { tasks: { upstreamUrl: up.bare, upstreamCommit: bad } });
   assert.equal(await s2.run(['fetch']), 1);
-  assert.match(s2.errLines.join('\n'), /do not match SHA256SUMS/);
+  assert.match(s2.errLines.join('\n'), /fault\(s\) against SHA256SUMS/);
   assert.throws(() => fetchUpstream({ url: up.bare, commit: 'abc', dir: path.join(s2.dir, 'x') }), /full commit id/);
 });
 
@@ -175,8 +175,8 @@ test('own tasks: mine, lint, build, check and select, end to end on fixtures', a
   assert.equal(await s.run(['build'], () => runtime), 0);
   assert.equal(runtime.built.length, 1);
   assert.match(runtime.built[0].tag, /^adam-bench-own\/demo-2:/);
-  assert.equal(fs.existsSync(path.join(s.home, 'tasks', 'materialized', 'demo-2', 'environment', 'repo', 'src', 'app.ts')), true);
-  assert.equal(fs.existsSync(path.join(s.home, 'tasks', 'materialized', 'demo-2', 'environment', 'repo', 'src', 'app.test.ts')), false, 'the hidden test is not in the image');
+  assert.equal(fs.existsSync(path.join(s.home, 'tasks', 'contexts', 'demo-2', 'repo', 'src', 'app.ts')), true);
+  assert.equal(fs.existsSync(path.join(s.home, 'tasks', 'contexts', 'demo-2', 'repo', 'src', 'app.test.ts')), false, 'the hidden test is not in the image');
 
   assert.equal(await s.run(['check', '--source', 'own'], () => runtime), 0);
   assert.match(s.outLines.join('\n'), /demo-2: kept/);

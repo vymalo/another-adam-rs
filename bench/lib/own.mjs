@@ -111,7 +111,7 @@ export function ownTestScript({ workdir = '/app', testFiles, testCommand }) {
     'mkdir -p /logs/verifier',
     'fail() { echo 0 > /logs/verifier/reward.txt; exit 0; }',
     `cd ${workdir} || fail`,
-    `for f in ${list}; do git checkout -q HEAD -- "$f" 2>/dev/null || rm -f "$f"; done`,
+    `for f in ${list}; do git checkout -q HEAD -- "$f" 2>/dev/null || rm -f -- "$f"; done`,
     'git apply --whitespace=nowarn /tests/test_patch.patch || fail',
     `if ( ${testCommand} ); then echo 1 > /logs/verifier/reward.txt; else echo 0 > /logs/verifier/reward.txt; fi`,
     '',

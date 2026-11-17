@@ -38,6 +38,7 @@ export function buildRunArgs(spec, { connection, url, name = spec.name } = {}) {
   }
   if (spec.network === 'none') args.push('--network=none');
   else if (spec.network !== 'default') {
+    if (spec.network === 'host') throw new ContainerError('the host network is never given to a container');
     if (!SAFE_NAME.test(spec.network)) throw new ContainerError('the network name is not safe');
     args.push(`--network=${spec.network}`);
   }

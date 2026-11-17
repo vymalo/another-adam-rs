@@ -5,7 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { ContainerError, FakeContainers, PodmanRemote, buildRunArgs } from '../lib/containers.mjs';
 import { CLONE_PATH, checkTask, pinTask } from '../lib/envcheck.mjs';
-import { MAX_PATCH_BYTES, PatchTooLarge, collectPatch, gradeOnce, gradePatch, gradeScript, localGit, verifierNetwork } from '../lib/grade.mjs';
+import { MAX_PATCH_BYTES, PatchTooLarge, collectPatch, gradeOnce, gradePatch, gradeScript, verifierNetwork } from '../lib/grade.mjs';
 import { loadTask } from '../lib/task.mjs';
 import { commitFiles, git, initRepo } from './gitfix.mjs';
 import { tmp } from './helpers.mjs';
@@ -20,11 +20,13 @@ function finalTree(t) {
   fs.symlinkSync('/etc/hosts', path.join(dir, 'hosts-link'));
   git(dir, 'add', '-A');
   git(dir, 'commit', '-q', '-m', 'adapter links');
-  return { dir, base: git(dir, 'rev-parse', 'HEAD').trim(), first: base };
+  const bare = path.join(tmp(t), 'base.git');
+  execFileSync('git', ['clone', '-q', '--bare', dir, bare]);
+  return { dir, bare, base: git(dir, 'rev-parse', 'HEAD').trim(), first: base };
 }
 
 test('the patch has edits, untracked files and binaries, and leaves out ignored files and the adapter symlinks', async (t) => {
-  const { dir, base } = finalTree(t);
+  const { dir, bare, base } = finalTree(t);
   fs.writeFileSync(path.join(dir, 'a.txt'), 'one\nTWO\n');
   fs.writeFileSync(path.join(dir, 'untracked.txt'), 'new file\n');
   fs.writeFileSync(path.join(dir, 'blob.bin'), Buffer.from([0, 1, 2, 255, 254, 0, 0, 7]));
@@ -36,7 +38,7 @@ test('the patch has edits, untracked files and binaries, and leaves out ignored 
   fs.rmSync(path.join(dir, 'hosts-link'));
   fs.symlinkSync('/etc/passwd', path.join(dir, 'hosts-link'));
 
-  const patch = (await collectPatch({ git: localGit(dir), base })).toString('utf8');
+  const patch = (await collectPatch({ tree: dir, baseRepo: bare, base })).toString('utf8');
   assert.match(patch, /\+\+\+ b\/untracked\.txt/);
   assert.match(patch, /\+TWO/);
   assert.match(patch, /GIT binary patch/);
@@ -61,23 +63,23 @@ test('the patch has edits, untracked files and binaries, and leaves out ignored 
 });
 
 test('an untouched tree gives an empty patch', async (t) => {
-  const { dir, base } = finalTree(t);
-  assert.equal((await collectPatch({ git: localGit(dir), base })).length, 0);
+  const { dir, bare, base } = finalTree(t);
+  assert.equal((await collectPatch({ tree: dir, baseRepo: bare, base })).length, 0);
 });
 
 test('a patch above 5 MB stops with PatchTooLarge, and the limit is a parameter', async (t) => {
-  const { dir, base } = finalTree(t);
+  const { dir, bare, base } = finalTree(t);
   fs.writeFileSync(path.join(dir, 'big.txt'), 'x'.repeat(MAX_PATCH_BYTES + 1000));
-  await assert.rejects(collectPatch({ git: localGit(dir), base }), PatchTooLarge);
+  await assert.rejects(collectPatch({ tree: dir, baseRepo: bare, base }), PatchTooLarge);
   fs.rmSync(path.join(dir, 'big.txt'));
   fs.writeFileSync(path.join(dir, 'small.txt'), 'y'.repeat(2000));
-  await assert.rejects(collectPatch({ git: localGit(dir), base, maxBytes: 1000 }), PatchTooLarge);
-  assert.ok((await collectPatch({ git: localGit(dir), base })).length > 2000);
+  await assert.rejects(collectPatch({ tree: dir, baseRepo: bare, base, maxBytes: 1000 }), PatchTooLarge);
+  assert.ok((await collectPatch({ tree: dir, baseRepo: bare, base })).length > 2000);
 });
 
 test('the base must be a full commit id', async (t) => {
-  const { dir } = finalTree(t);
-  await assert.rejects(collectPatch({ git: localGit(dir), base: 'HEAD' }), /full commit id/);
+  const { dir, bare } = finalTree(t);
+  await assert.rejects(collectPatch({ tree: dir, baseRepo: bare, base: 'HEAD' }), /full commit id/);
 });
 
 // ---- the podman --remote arguments ----
@@ -159,7 +161,9 @@ function loaded(t, over) {
 
 test('three grades, two of three pass; one of three fails; unanimous is not flaky, a split is', async (t) => {
   const task = loaded(t);
-  const run = async (seq) => gradePatch({ containers: new FakeContainers({ onRun: rewards(seq) }), task, patchFile: '/tmp/p.patch', workRoot: tmp(t) });
+  const patchFile = path.join(tmp(t), 'p.patch');
+  fs.writeFileSync(patchFile, 'diff --git a/src/x.rs b/src/x.rs\n--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1 +1,2 @@\n a\n+b\n');
+  const run = async (seq) => gradePatch({ containers: new FakeContainers({ onRun: rewards(seq) }), task, patchFile, workRoot: tmp(t) });
   const a = await run(['1', '1', '1']);
   assert.deepEqual([a.pass, a.passes, a.flaky], [true, 3, false]);
   const b = await run(['1', '0', '1']);
@@ -253,8 +257,9 @@ test('the check keeps a task whose gold passes three times and empty fails three
   const c = oracle({ devcontainer: true });
   const r = await checkTask({ containers: c, task, workRoot: tmp(t) });
   assert.deepEqual([r.ok, r.reason, r.devcontainer, r.imageDigest], [true, null, true, DIGEST]);
-  assert.equal(c.runs.length, 1 + 3 + 3);
-  assert.ok(c.runs.slice(1).every((s) => /git clone/.test(s.script)), 'always from the agents\' clone path');
+  assert.equal(c.runs.length, 1 + 3 + 1 + 3);
+  assert.equal(c.runs.slice(1).filter((s) => /git clone/.test(s.script)).length, 6, 'six runs from the agents\' clone path');
+  assert.equal(c.runs.filter((s) => !/git clone/.test(s.script) && s.mounts?.some((m) => m.target === '/patch/model.patch')).length, 1, 'and the gold once through the real path');
   assert.equal(c.runs[0].network, 'none');
 });
 

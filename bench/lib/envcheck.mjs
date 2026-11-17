@@ -3,7 +3,7 @@
 // are never at the image's /app, so a task whose tests only work at /app would favour neither fairly).
 // No model is involved and nothing is spent.
 import os from 'node:os';
-import { GRADE_ATTEMPTS, gradeOnce } from './grade.mjs';
+import { GRADE_ATTEMPTS, gradeAttempt } from './grade.mjs';
 
 export const CLONE_PATH = '/work/workspaces/bench/slot';
 
@@ -18,16 +18,17 @@ export async function pinTask(containers, task) {
 
 async function runSeries(opts, patchFile) {
   const out = [];
-  for (let i = 0; i < GRADE_ATTEMPTS; i++) out.push(await gradeOnce({ ...opts, patchFile, cloneTo: CLONE_PATH }));
+  for (let i = 0; i < GRADE_ATTEMPTS; i++) out.push(await gradeAttempt({ ...opts, patchFile, cloneTo: CLONE_PATH }));
   return out;
 }
 
 const count = (series, f) => series.filter(f).length;
-const broken = (series) => series.some((a) => a.error === 'infra' || a.error === 'timeout');
+const broken = (series) => series.some((a) => a.invalid);
 
 /**
  * Check one task. Returns { id, ok, reason, devcontainer, imageDigest, pin }. `reason` is one of
- * no-gold-patch, infra, gold-does-not-apply, gold-fails, gold-flaky, empty-passes, empty-flaky.
+ * no-gold-patch, infra, gold-does-not-apply, gold-fails, gold-flaky, gold-fails-at-app, empty-passes, empty-flaky.
+ * The gold also runs once through the real grading path (the working directory /app, the original test.sh).
  */
 export async function checkTask({ containers, task: given, workRoot = os.tmpdir(), timeoutMs }) {
   const result = (extra) => ({ id: given.id, ok: false, reason: null, devcontainer: null, imageDigest: null, pin: null, ...extra });
@@ -59,6 +60,9 @@ export async function checkTask({ containers, task: given, workRoot = os.tmpdir(
     const reason = goldPasses > 0 ? 'gold-flaky' : count(gold, (a) => a.error === 'apply') > 0 ? 'gold-does-not-apply' : 'gold-fails';
     return result({ ...base, devcontainer, reason });
   }
+  const real = await gradeAttempt({ ...opts, patchFile: task.goldPatch });
+  if (real.invalid) return result({ ...base, devcontainer, reason: 'infra' });
+  if (!real.pass) return result({ ...base, devcontainer, reason: 'gold-fails-at-app' });
   const empty = await runSeries(opts, null);
   if (broken(empty)) return result({ ...base, devcontainer, reason: 'infra' });
   const emptyPasses = count(empty, (a) => a.pass);

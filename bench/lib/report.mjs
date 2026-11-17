@@ -25,6 +25,7 @@ export const NOT_CLAIMED = [
   'A difference where the intervals overlap or the interval of a difference includes zero: with about a hundred runs, gaps under about ten points are noise.',
   'Real billing: every cost here is the meter\'s count times the price table in the local configuration.',
   `A conclusion for a language with fewer than ${MIN_TASKS_PER_LANGUAGE} tasks.`,
+  'That a grade is free of influence by the agent: grading runs the agent\'s code, so it cannot be made tamper-proof. The harness strips what may not change and lists the patches that touch the grading\'s machinery as suspect, for a person to read.',
 ];
 
 const pct = (x) => `${(x * 100).toFixed(1)}%`;
@@ -112,7 +113,8 @@ export function buildReport(foldedOrRecords, opts = {}) {
   const folded = records ? foldRecords(records) : foldedOrRecords;
   const setup = opts.setup ?? (records ? [...records].reverse().find((r) => r.kind === 'setup') : null) ?? {};
   const all = [...folded.values()].sort((a, b) => a.run.localeCompare(b.run));
-  const counted = all.filter((v) => v.state === 'Done');
+  // A Done run whose grade is invalid (an infrastructure error that did not go away) is not a fail and not a pass: it is left out.
+  const counted = all.filter((v) => v.state === 'Done' && v.result?.invalid !== true);
   const seen = new Map();
   for (const v of counted) {
     const key = JSON.stringify([v.task, v.agent, v.arm]);
@@ -121,7 +123,7 @@ export function buildReport(foldedOrRecords, opts = {}) {
     }
     seen.set(key, v.run);
   }
-  const excluded = all.filter((v) => v.state !== 'Done');
+  const excluded = all.filter((v) => !counted.includes(v));
   const label = setup.modelLabel ?? opts.modelLabel ?? 'unlabelled';
   const seed = setup.seed ?? 1;
   const out = [];
@@ -158,7 +160,7 @@ export function buildReport(foldedOrRecords, opts = {}) {
     '\nA run counts in the rates only when it is Done. Runs in StoppedByCap, Failed_infra, NotStarted (and any other state but Done) are left out of every rate, so the selection is visible here and not in the numbers:\n',
   );
   if (excluded.length > 0) {
-    out.push(table(['Run', 'State', 'Task', 'Agent / arm', 'Wasted'], excluded.map((v) => [v.run, v.state ?? 'unknown', v.task ?? '-', v.agent ? cellKey(v) : '-', formatUSD(v.wastedMicro)])));
+    out.push(table(['Run', 'State', 'Task', 'Agent / arm', 'Wasted'], excluded.map((v) => [v.run, v.state === 'Done' ? 'Done (invalid grade)' : v.state ?? 'unknown', v.task ?? '-', v.agent ? cellKey(v) : '-', formatUSD(v.wastedMicro)])));
   } else out.push('None: every run is Done.\n');
 
   h('Pass rate by agent and arm');
@@ -257,6 +259,13 @@ export function buildReport(foldedOrRecords, opts = {}) {
   } else {
     out.push('\nNo run recorded its own token count.\n');
   }
+
+  h('Suspect patches');
+  const suspects = all.filter((v) => Array.isArray(v.result?.suspect) && v.result.suspect.length > 0);
+  out.push('Grading runs the agent\'s code, so it cannot be made tamper-proof; a patch that touches the grading\'s own machinery is graded as it is and listed here for a person to read. What was stripped from a patch is listed with it.\n\n');
+  if (suspects.length > 0) {
+    out.push(table(['Run', 'Task', 'Agent / arm', 'Why', 'Stripped', 'Patch'], suspects.map((v) => [v.run, v.task ?? '-', v.agent ? cellKey(v) : '-', v.result.suspect.join(', '), (v.result.removed ?? []).join(', ') || '-', v.result.patch ?? '-'])));
+  } else out.push('None.\n');
 
   h('What this report does not claim');
   out.push(NOT_CLAIMED.map((s) => `* ${s}`).join('\n'));

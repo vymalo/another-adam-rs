@@ -63,6 +63,7 @@ export const SCHEMA = {
       clones: { type: 'object' },
       workspaceImage: { type: 'imageByDigest' },
       selfRepo: { type: 'string', default: 'another-adam-rs' },
+      verifierNetworks: { type: 'array' },
       seed: { type: 'string', default: '1' },
       podman: { type: 'object', fields: { connection: { type: 'string' }, url: { type: 'string' } } },
     },
@@ -255,7 +256,7 @@ export function normalizeConfig(raw) {
 /** The `tasks` block: task sources and grading. Every field optional; the commands that need one say which. */
 function normalizeTasks(raw) {
   const f = SCHEMA.tasks.fields;
-  const out = { upstreamUrl: f.upstreamUrl.default, upstreamCommit: null, upstreamDir: f.upstreamDir.default, clones: {}, workspaceImage: null, selfRepo: f.selfRepo.default, seed: f.seed.default, podman: {} };
+  const out = { upstreamUrl: f.upstreamUrl.default, upstreamCommit: null, upstreamDir: f.upstreamDir.default, clones: {}, workspaceImage: null, selfRepo: f.selfRepo.default, seed: f.seed.default, podman: {}, verifierNetworks: [] };
   if (raw === undefined) return out;
   if (!isObject(raw)) throw new ConfigError('tasks', 'must be an object');
   checkUnknown(raw, f, 'tasks');
@@ -264,7 +265,10 @@ function normalizeTasks(raw) {
     if (typeof v !== 'string' || v === '' || v.length > 500 || /[\s\0]/.test(v)) throw new ConfigError(`tasks.${name}`, 'must be a short string with no space');
     return v;
   };
-  if (raw.upstreamUrl !== undefined) out.upstreamUrl = str('upstreamUrl');
+  if (raw.upstreamUrl !== undefined) {
+    out.upstreamUrl = str('upstreamUrl');
+    if (!/^(https:\/\/|file:\/\/|ssh:\/\/|\/)/.test(out.upstreamUrl)) throw new ConfigError('tasks.upstreamUrl', 'must be an https:, file: or ssh: URL or an absolute path (and never begin with -)');
+  }
   if (raw.upstreamCommit !== undefined) {
     out.upstreamCommit = str('upstreamCommit');
     if (!/^[0-9a-f]{40}$/.test(out.upstreamCommit)) throw new ConfigError('tasks.upstreamCommit', 'must be a full 40-digit commit id');
@@ -285,7 +289,12 @@ function normalizeTasks(raw) {
     out.workspaceImage = str('workspaceImage');
     if (!/^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$/i.test(out.workspaceImage)) throw new ConfigError('tasks.workspaceImage', 'must name the image by digest (name@sha256:...)');
   }
-  if (raw.selfRepo !== undefined) out.selfRepo = str('selfRepo');
+  if (raw.selfRepo === null) out.selfRepo = null;
+  else if (raw.selfRepo !== undefined) out.selfRepo = str('selfRepo');
+  if (raw.verifierNetworks !== undefined) {
+    if (!Array.isArray(raw.verifierNetworks) || raw.verifierNetworks.some((n) => typeof n !== 'string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(n) || n === 'host')) throw new ConfigError('tasks.verifierNetworks', 'must be a list of network names (never host)');
+    out.verifierNetworks = raw.verifierNetworks;
+  }
   if (raw.seed !== undefined) out.seed = String(typeof raw.seed === 'number' ? raw.seed : str('seed'));
   if (raw.podman !== undefined) {
     if (!isObject(raw.podman)) throw new ConfigError('tasks.podman', 'must be an object');
@@ -294,6 +303,8 @@ function normalizeTasks(raw) {
       if (raw.podman[k] === undefined) continue;
       const v = raw.podman[k];
       if (typeof v !== 'string' || v === '' || /[\s\0]/.test(v)) throw new ConfigError(`tasks.podman.${k}`, 'must be a short string with no space');
+      if (k === 'connection' && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(v)) throw new ConfigError('tasks.podman.connection', 'must be a plain name (never begin with -)');
+      if (k === 'url' && !/^(unix:\/\/|ssh:\/\/)/.test(v)) throw new ConfigError('tasks.podman.url', 'must be a unix:// or ssh:// URL (and never begin with -)');
       out.podman[k] = v;
     }
   }

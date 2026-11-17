@@ -19,6 +19,14 @@ import { listTasks } from './task.mjs';
 import { UpstreamError, fetchUpstream, taskChecksum } from './upstream.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+class UsageError extends Error {}
+
+/** A positive whole number from a command-line option, or a usage error. */
+function positiveInt(value, name) {
+  if (!/^[1-9][0-9]{0,8}$/.test(String(value))) throw new UsageError(`${name} must be a positive whole number`);
+  return Number(value);
+}
+
 export const PUBLIC_TOTAL = 80;
 export const PUBLIC_PER_REPO = 9;
 export const OWN_TOTAL = 20;
@@ -60,6 +68,7 @@ export function paths(env = process.env) {
     check: path.join(state, 'check.json'),
     candidates: path.join(state, 'own-candidates.json'),
     materialized: path.join(state, 'materialized'),
+    contexts: path.join(state, 'contexts'),
     work: path.join(state, 'work'),
     upstream: path.join(home, 'upstream', 'swe-bench-pro-os'),
     repoTasks: env.BENCH_TASKS_DIR || path.join(HERE, '..', 'tasks'),
@@ -90,12 +99,13 @@ async function cmdFetch(config, p, out) {
 
 async function cmdMine(config, p, argv, out) {
   const { values } = parseArgs({ args: argv, options: { repo: { type: 'string' }, branch: { type: 'string' }, limit: { type: 'string' } } });
+  const limit = values.limit ? positiveInt(values.limit, '--limit') : Infinity;
   const clones = need(config, 'clones');
   const names = values.repo ? [values.repo] : Object.keys(clones).sort();
   const all = [];
   for (const name of names) {
     if (!clones[name]) throw new ConfigError(`tasks.clones.${name}`, 'is not in the local configuration');
-    const { candidates, refused } = mine({ dir: clones[name], repoName: name, branch: values.branch ?? 'main', limit: values.limit ? Number(values.limit) : Infinity });
+    const { candidates, refused } = mine({ dir: clones[name], repoName: name, branch: values.branch ?? 'main', limit });
     out(`${name}: ${candidates.length} candidate(s); refused: ${Object.entries(refused).map(([k, n]) => `${k} ${n}`).join(', ') || 'none'}`);
     all.push(...candidates);
   }
@@ -141,8 +151,10 @@ async function cmdBuild(config, p, argv, out, make) {
     if (!clone) throw new ConfigError(`tasks.clones.${spec.clone}`, 'is not in the local configuration');
     const dir = path.join(p.materialized, spec.id);
     const { tag } = materializeOwn({ spec, cloneDir: clone, outDir: dir, workspaceImage });
-    prepareOwnContext({ cloneDir: clone, base: spec.base, outDir: path.join(dir, 'environment', 'repo') });
-    await containers.build(path.join(dir, 'environment'), tag, path.join(dir, 'environment', 'Dockerfile'));
+    const context = path.join(p.contexts, spec.id);
+    prepareOwnContext({ cloneDir: clone, base: spec.base, outDir: path.join(context, 'repo') });
+    fs.copyFileSync(path.join(dir, 'environment', 'Dockerfile'), path.join(context, 'Dockerfile'));
+    await containers.build(context, tag, path.join(context, 'Dockerfile'));
     pins[tag] = await containers.digestOf(tag);
     writeJson(p.pins, pins);
     out(`${spec.id}: built ${tag} ${pins[tag]}`);
@@ -157,12 +169,18 @@ async function cmdCheck(config, p, argv, out, make) {
   const pins = readJson(p.pins, {});
   const results = readJson(p.check, {});
   let tasks;
-  if (values.source === 'public') ({ tasks } = listTasks(fetchPublic(config, p).tasksRoot, { pins, requireDigest: false }));
-  else {
+  let checksumOf;
+  if (values.source === 'public') {
+    const up = fetchPublic(config, p);
+    ({ tasks } = listTasks(up.tasksRoot, { pins, requireDigest: false, allowedNetworks: config.tasks.verifierNetworks }));
+    checksumOf = (t) => taskChecksum(path.relative(up.tasksRoot, t.dir), up.sums);
+  } else {
     const { specs } = loadOwnSpecs(path.join(p.repoTasks, 'own'));
-    ({ tasks } = listTasks(p.materialized, { pins, source: 'own' }));
+    ({ tasks } = listTasks(p.materialized, { pins, source: 'own', allowedNetworks: config.tasks.verifierNetworks }));
     const built = new Set(tasks.map((t) => t.id));
     for (const s of specs) if (!built.has(s.id)) out(`${s.id}: not built, or its image is not pinned: run bench tasks build ${s.id}`);
+    const byId = new Map(specs.map((s) => [s.id, s]));
+    checksumOf = (t) => (byId.has(t.id) ? ownChecksum(byId.get(t.id)) : null);
   }
   const only = values.only ? new Set(values.only.split(',')) : null;
   fs.mkdirSync(p.work, { recursive: true });
@@ -171,7 +189,7 @@ async function cmdCheck(config, p, argv, out, make) {
   for (const task of tasks.filter((t) => !only || only.has(t.id))) {
     const r = await checkTask({ containers, task, workRoot: p.work });
     if (r.pin) pins[r.pin.ref] = r.pin.digest;
-    results[`${values.source}/${task.id}`] = { ok: r.ok, reason: r.reason, devcontainer: r.devcontainer, imageDigest: r.imageDigest };
+    results[`${values.source}/${task.id}`] = { ok: r.ok, reason: r.reason, devcontainer: r.devcontainer, imageDigest: r.imageDigest, checksum: checksumOf(task) };
     writeJson(p.pins, pins);
     writeJson(p.check, results);
     if (r.ok) kept++;
@@ -185,22 +203,25 @@ async function cmdCheck(config, p, argv, out, make) {
 async function cmdSelect(config, p, argv, out) {
   const { values } = parseArgs({ args: argv, options: { seed: { type: 'string' }, total: { type: 'string' }, source: { type: 'string', default: 'both' } } });
   const seed = values.seed ?? config.tasks.seed;
+  const totalOption = values.total ? positiveInt(values.total, '--total') : null;
   const results = readJson(p.check, {});
   const pins = readJson(p.pins, {});
-  const usable = (source, id) => {
+  // A result belongs to the task it was made for: the same checksum and the same image digest.
+  const usable = (source, id, checksum, digest) => {
     const r = results[`${source}/${id}`];
-    return r?.ok === true && r.devcontainer === false;
+    return r?.ok === true && r.devcontainer === false && typeof checksum === 'string' && r.checksum === checksum && typeof digest === 'string' && r.imageDigest === digest;
   };
-  const explain = (source, ids) => {
-    const dropped = ids.filter((id) => !usable(source, id));
-    if (dropped.length) out(`${source}: ${dropped.length} task(s) not selectable (not checked, dropped by the check, or a .devcontainer at the base)`);
+  const explain = (source, items) => {
+    const dropped = items.filter(([id, checksum, digest]) => !usable(source, id, checksum, digest));
+    if (dropped.length) out(`${source}: ${dropped.length} task(s) not selectable (not checked, changed since its check, dropped by the check, or a .devcontainer at the base)`);
   };
   if (values.source === 'public' || values.source === 'both') {
     const up = fetchPublic(config, p);
-    const { tasks } = listTasks(up.tasksRoot, { pins, requireDigest: true });
-    explain('public', tasks.map((t) => t.id));
-    const cands = tasks.filter((t) => usable('public', t.id)).map((t) => ({ id: t.id, repo: t.repo, checksum: taskChecksum(path.relative(up.tasksRoot, t.dir), up.sums), imageDigest: t.image.digest })).filter((t) => t.checksum);
-    const total = values.total ? Number(values.total) : PUBLIC_TOTAL;
+    const { tasks } = listTasks(up.tasksRoot, { pins, requireDigest: true, allowedNetworks: config.tasks.verifierNetworks });
+    const sumOf = (t) => taskChecksum(path.relative(up.tasksRoot, t.dir), up.sums);
+    explain('public', tasks.map((t) => [t.id, sumOf(t), t.image.digest]));
+    const cands = tasks.filter((t) => usable('public', t.id, sumOf(t), t.image.digest)).map((t) => ({ id: t.id, repo: t.repo, checksum: sumOf(t), imageDigest: t.image.digest }));
+    const total = totalOption ?? PUBLIC_TOTAL;
     const chosen = selectTasks(cands, { seed, scope: 'public', total, perRepoCap: PUBLIC_PER_REPO });
     fs.mkdirSync(p.repoTasks, { recursive: true });
     fs.writeFileSync(path.join(p.repoTasks, 'public.lock.json'), lockText(buildLock({ source: 'public', seed, upstreamCommit: up.head, tasks: chosen })));
@@ -209,10 +230,11 @@ async function cmdSelect(config, p, argv, out) {
   if (values.source === 'own' || values.source === 'both') {
     const { specs, errors } = loadOwnSpecs(path.join(p.repoTasks, 'own'));
     for (const e of errors) out(`${e.id}: ${e.problems.join('; ')}`);
-    explain('own', specs.map((s) => s.id));
-    const cands = specs.filter((s) => usable('own', s.id) && pins[ownImageTag(s)]).map((s) => ({ id: s.id, repo: s.repo, checksum: ownChecksum(s), imageDigest: pins[ownImageTag(s)] }));
-    const total = values.total ? Number(values.total) : OWN_TOTAL;
-    const chosen = selectTasks(cands, { seed, scope: 'own', total, perRepoCap: OWN_PER_REPO, repoCaps: { [config.tasks.selfRepo]: OWN_PER_REPO } });
+    explain('own', specs.map((s) => [s.id, ownChecksum(s), pins[ownImageTag(s)]]));
+    const cands = specs.filter((s) => usable('own', s.id, ownChecksum(s), pins[ownImageTag(s)])).map((s) => ({ id: s.id, repo: s.repo, checksum: ownChecksum(s), imageDigest: pins[ownImageTag(s)] }));
+    const total = totalOption ?? OWN_TOTAL;
+    const repoCaps = config.tasks.selfRepo ? { [config.tasks.selfRepo]: OWN_PER_REPO } : {};
+    const chosen = selectTasks(cands, { seed, scope: 'own', total, perRepoCap: OWN_PER_REPO, repoCaps });
     fs.mkdirSync(p.repoTasks, { recursive: true });
     fs.writeFileSync(path.join(p.repoTasks, 'own.lock.json'), lockText(buildLock({ source: 'own', seed, tasks: chosen })));
     out(`own: ${chosen.length} of ${cands.length} selected`);
@@ -238,7 +260,11 @@ export async function runTasks(argv, { env = process.env, out = (l) => process.s
     return await cmdSelect(config, p, rest, out);
   } catch (e) {
     if (e instanceof ConfigError) throw e;
-    if (e instanceof UpstreamError || e instanceof OwnTaskError || e instanceof ContainerError || e?.code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION') {
+    if (e instanceof UsageError) {
+      err(`bench: ${e.message}`);
+      return 64;
+    }
+    if (e instanceof UpstreamError || e instanceof OwnTaskError || e instanceof ContainerError || e?.code === 'ERR_PARSE_ARGS_UNKNOWN_OPTION' || e?.code === 'ERR_PARSE_ARGS_INVALID_OPTION_VALUE') {
       err(`bench: ${e.message}`);
       return e instanceof UpstreamError || e instanceof OwnTaskError || e instanceof ContainerError ? 1 : 64;
     }

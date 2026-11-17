@@ -50,3 +50,13 @@ test('the README says what is never in the repository and what stays unverified 
   assert.match(own, /never from its body/);
   assert.match(own, /## Interface/);
 });
+
+test('the README and the ADR state the grading principle, the suspect list, the invalid grade and the network allow-list', () => {
+  for (const [name, text] of [['README', README], ['ADR', ADR]]) {
+    assert.match(text, /tamper-proof/, name);
+    assert.match(text, /suspect/i, name);
+    assert.match(text, /`invalid`/, name);
+    assert.match(text, /allow-list/, name);
+  }
+  assert.match(README, /`tasks\.verifierNetworks`/);
+});

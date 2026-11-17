@@ -74,7 +74,7 @@ test('the report shows the model by its label and never by its id, unless asked'
 test('the report says what it does not claim', () => {
   const text = buildReport(fixture());
   assert.match(text, /## What this report does not claim/);
-  assert.equal(NOT_CLAIMED.length, 5);
+  assert.equal(NOT_CLAIMED.length, 6);
   for (const sentence of NOT_CLAIMED) assert.ok(text.includes(sentence), sentence);
 });
 

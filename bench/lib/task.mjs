@@ -52,6 +52,28 @@ export function dockerfileFrom(text) {
   return null;
 }
 
+const BUILTIN_NETWORKS = new Set(['none', 'no-network', 'default', 'public']);
+
+/** The first symlink under `dir` (relative path), or null. Nothing is followed. */
+function findSymlink(dir) {
+  const walk = (d, rel) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isSymbolicLink()) return r;
+      if (e.isDirectory()) {
+        const found = walk(path.join(d, e.name), r);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  try {
+    return walk(dir, '');
+  } catch {
+    return null;
+  }
+}
+
 const isTable = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 /** Language by the repository name's conventions is not guessed: it comes from [metadata], or is "unknown". */
@@ -70,11 +92,15 @@ function goldPatchFile(dir) {
 /**
  * Read and validate a task directory. Every problem is collected; one TaskError names them all.
  * `pins` maps an image reference without digest to its digest. `requireDigest: false` is for listing only.
+ * The verifier's network is `none`, `default`, `public` or a name in `allowedNetworks` (the owner's configuration): never `host`.
+ * A symlink anywhere in the directory is refused.
  */
-export function loadTask(dir, { pins = {}, source = 'public', requireDigest = true } = {}) {
+export function loadTask(dir, { pins = {}, source = 'public', requireDigest = true, allowedNetworks = [] } = {}) {
   const id = path.basename(path.resolve(dir));
   if (!TASK_ID.test(id) || id.includes('..')) throw new TaskError(id, 'the directory name is not a safe task id');
   const problems = [];
+  const link = findSymlink(dir);
+  if (link !== null) throw new TaskError(id, `a symlink is not allowed in a task directory: ${link}`);
   const file = (rel) => {
     const p = path.join(dir, rel);
     try {
@@ -152,8 +178,9 @@ export function loadTask(dir, { pins = {}, source = 'public', requireDigest = tr
     else agentNetwork = 'none';
     const verifier = isTable(toml.verifier) ? toml.verifier : {};
     if (verifier.network_mode !== undefined) {
-      if (typeof verifier.network_mode !== 'string' || !/^[a-z][a-z0-9_-]{0,31}$/i.test(verifier.network_mode)) problems.push('[verifier] network_mode is not a name');
-      else verifierNetwork = verifier.network_mode;
+      const n = verifier.network_mode;
+      if (typeof n !== 'string' || !(BUILTIN_NETWORKS.has(n) || allowedNetworks.includes(n))) problems.push(`[verifier] network_mode must be one of ${[...BUILTIN_NETWORKS, ...allowedNetworks].join(', ')}`);
+      else verifierNetwork = n;
     }
     const env = isTable(toml.environment) ? toml.environment : {};
     for (const [key, set] of [['cpus', (v) => (cpus = v)], ['memory_mb', (v) => (memoryMb = v)]]) {
