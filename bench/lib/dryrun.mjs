@@ -21,6 +21,7 @@ import { Ledger } from './ledger.mjs';
 import { createMeter } from './meter.mjs';
 import { PINS, coderRef } from './pins.mjs';
 import { runPlan } from './runner.mjs';
+import { readSharedPrompt } from './shared-prompt.mjs';
 import { createScriptedModel } from './scripted-model.mjs';
 import { Stack } from './stack.mjs';
 import { loadTask } from './task.mjs';
@@ -142,7 +143,7 @@ async function startHarness({ env, home, name, raw, killSpec = null }) {
     home: dir, // results of this phase; the shared home above is what the Podman services see
     agents: {
       adam: new AdamAgent({ pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow }),
-      opencode: new OpenCodeAgent({ pins: PINS, home, contextWindow: config.contextWindow }),
+      opencode: new OpenCodeAgent({ pins: PINS, home, contextWindow: config.contextWindow, sharedPrompt: await readSharedPrompt({ repoDir: REPO_DIR, revision: PINS.coder.revision }) }),
     },
   };
   const close = async () => {

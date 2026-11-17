@@ -253,3 +253,20 @@ test('the ledger lets a Done run be graded again only by a regrade of an invalid
   assert.throws(() => f.ledger.append({ kind: 'state', run, state: 'Grading', regrade: true }), /invalid/, 'a valid grade is final');
   assert.throws(() => f.ledger.append({ kind: 'state', run, state: 'Planned' }), LedgerError);
 });
+
+test('M-fits-strict: a block that needs exactly what is left under the cap starts (exactly at the cap is allowed)', async (t) => {
+  const f = await fixture(t, { capUSD: 12, perRunBudgetUSD: 3, taskNames: NAMES });
+  const specs = plan(f, 1);
+  const res = await runSchedule({ deps: f.deps(), specs, slots: 2 });
+  assert.equal(res.capHit, false);
+  assert.ok(specs.every((s) => f.ledger.fold().get(s.run)?.state === 'Done'));
+});
+
+test('H-run-never-pulls: every run makes its task image present on its own slot, once, before its base is prepared', async (t) => {
+  const f = await fixture(t, { capUSD: 100, taskNames: NAMES });
+  const order = [];
+  const deps = { ...f.deps(), pullImage: async (slot, task) => void order.push(`pull ${slot} ${task.id}`), prepareBase: async () => (order.push('base'), { dir: '/base/base.git', sha: 'a'.repeat(40), slug: 'demo', workdir: '/app' }) };
+  const specs = specsOf(buildBlocks({ tasks: Object.values(f.tasks).slice(0, 1), agents: ['adam'], arms: ['max'], seed: '1' }));
+  await runSchedule({ deps, specs, slots: 1 });
+  assert.deepEqual(order, [`pull 1 ${specs[0].task.id}`, 'base']);
+});

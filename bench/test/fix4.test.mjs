@@ -15,7 +15,7 @@ import { doctor } from '../lib/doctor.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
 import { Ledger } from '../lib/ledger.mjs';
-import { realHarness } from '../lib/run-cli.mjs';
+import { realHarness, regradeStranded } from '../lib/run-cli.mjs';
 import { normalizeConfig } from '../lib/config.mjs';
 import { rawConfig } from './helpers.mjs';
 import { fixture, spec } from './runnerfix.mjs';
@@ -161,19 +161,32 @@ test('S4: a repository with a test script, a manifest, a target or a configurati
 
 test('S5: doctor warns when HTTPS_PROXY is set and the process does not use it', async () => {
   const exec = async () => ({ exitCode: 127, stdout: '', stderr: '' });
-  const run = (env) => doctor({ home: '/h', pins: PINS, nodeVersion: '24.1.0', arch: 'x64', exec, readFile: () => { throw new Error('x'); }, statfs: () => ({ bavail: 1e9, bsize: 4096 }), env });
+  const run = (env, nodeVersion = '24.5.0') => doctor({ home: '/h', pins: PINS, nodeVersion, arch: 'x64', exec, readFile: () => { throw new Error('x'); }, statfs: () => ({ bavail: 1e9, bsize: 4096 }), env });
   const warn = (await run({ HTTPS_PROXY: 'http://proxy.example.test:3128' })).checks.find((c) => c.name === 'proxy');
   assert.equal(warn.status, 'warn');
   assert.match(warn.fix, /NODE_USE_ENV_PROXY=1/);
   assert.equal((await run({ https_proxy: 'http://proxy.example.test:3128' })).checks.find((c) => c.name === 'proxy').status, 'warn');
   assert.equal((await run({ HTTPS_PROXY: 'http://proxy.example.test:3128', NODE_USE_ENV_PROXY: '1' })).checks.find((c) => c.name === 'proxy').status, 'ok');
   assert.equal((await run({})).checks.find((c) => c.name === 'proxy'), undefined, 'no proxy, nothing to say');
+  assert.equal((await run({ HTTPS_PROXY: 'http://proxy.example.test:3128', NODE_USE_ENV_PROXY: '0' })).checks.find((c) => c.name === 'proxy').status, 'warn', 'K-doctor-any-proxy-flag: 0 is not using the proxy');
+});
+
+test('S5: the proxy advice depends on the Node release: https.request takes NODE_USE_ENV_PROXY from 22.21.0 and 24.5.0', async () => {
+  const exec = async () => ({ exitCode: 127, stdout: '', stderr: '' });
+  const status = async (nodeVersion) => (await doctor({ home: '/h', pins: PINS, nodeVersion, arch: 'x64', exec, readFile: () => { throw new Error('x'); }, statfs: () => ({ bavail: 1e9, bsize: 4096 }), env: { HTTPS_PROXY: 'http://proxy.example.test:3128', NODE_USE_ENV_PROXY: '1' } })).checks.find((c) => c.name === 'proxy');
+  for (const old of ['22.12.0', '22.20.9', '24.4.1', '24.0.0']) {
+    const c = await status(old);
+    assert.equal(c.status, 'warn', old);
+    assert.match(c.fix, /22\.21\.0.*24\.5\.0/);
+  }
+  for (const good of ['22.21.0', '22.23.4', '24.5.0', '24.11.0', '25.0.0']) assert.equal((await status(good)).status, 'ok', good);
 });
 
 test('S6: CI runs the tests on Node 22 and 24, and nothing needs more than 22', () => {
   const here = path.dirname(new URL(import.meta.url).pathname);
   const yml = fs.readFileSync(path.join(here, '..', '..', '.github', 'workflows', 'bench.yml'), 'utf8');
   assert.match(yml, /node-version: \[22, 24\]/);
+  assert.match(yml, /fetch-depth: 0/, 'the shared prompt is read from the adam file at the pinned revision, which needs history');
   assert.match(yml, /\$\{\{ matrix\.node-version \}\}/);
   const pkg = JSON.parse(fs.readFileSync(path.join(here, '..', 'package.json'), 'utf8'));
   assert.equal(pkg.engines.node, '>=22');
@@ -199,9 +212,9 @@ test('R19: a pilot killed after it removed the old proposal and before it wrote 
   const make = async () => ({ deps: f.deps(), tasks: Object.values(f.tasks), slots: 1, close: async () => {} });
   const lockTexts = ['{"public":1}', ''];
   const errs = [];
-  await assert.rejects(runCli('pilot', ['--blocks', '2'], { env, make, lockTexts, out: () => {}, err: (l) => errs.push(l) }));
+  await assert.rejects(runCli('pilot', ['--blocks', '2'], { env, make, lockTexts, sharedPrompt: 'x', out: () => {}, err: (l) => errs.push(l) }));
   assert.equal(fs.existsSync(path.join(f.home, 'pilot-budget.json')), false, 'the old yes is gone');
-  const second = await runCli('run', [], { env, make: async () => assert.fail('opened'), lockTexts, out: () => {}, err: (l) => errs.push(l) });
+  const second = await runCli('run', [], { env, make: async () => assert.fail('opened'), lockTexts, sharedPrompt: 'x', out: () => {}, err: (l) => errs.push(l) });
   assert.equal(second, 1);
   assert.match(errs.join('\n'), /another configuration|no pilot budget/);
   assert.ok(rawConfig);
@@ -233,7 +246,7 @@ function realParts(t, { tasks, upFails = false, origin = new FakeContainers() } 
 
 test('R14: a failure after the meter listens closes the meter, brings the stack down and releases the ledger', async (t) => {
   const p = realParts(t, { tasks: [], upFails: true });
-  await assert.rejects(realHarness({ env: p.env, config: p.config, log: () => {}, inject: p.inject }), /compose up failed/);
+  await assert.rejects(realHarness({ env: p.env, config: p.config, log: () => {}, sharedPrompt: 'shared', inject: p.inject }), /compose up failed/);
   assert.deepEqual(p.log, ['meter closed', 'stack down']);
   Ledger.open(path.join(p.home, 'ledger.jsonl')).close(); // the lock was released
 });
@@ -243,11 +256,36 @@ test('R14: every own image is put on every slot and on the grader before anythin
   const origin = new FakeContainers();
   origin.images = new Set([own.image.ref]);
   const p = realParts(t, { tasks: [own], origin });
-  const h = await realHarness({ env: p.env, config: p.config, log: () => {}, inject: p.inject });
+  const h = await realHarness({ env: p.env, config: p.config, log: () => {}, sharedPrompt: 'shared', inject: p.inject });
   assert.deepEqual(p.log.filter((l) => l.startsWith('load')).sort(), ['load grader', 'load podman-1', 'load podman-2']);
   assert.equal(origin.saved.length, 1, 'saved once, however many services load it');
+  assert.equal(h.deps.agents.opencode.sharedPrompt, 'shared', 'OpenCode is given the shared prompt');
   await h.close();
   const q = realParts(t, { tasks: [own], origin: new FakeContainers() });
-  await assert.rejects(realHarness({ env: q.env, config: q.config, log: () => {}, inject: q.inject }), /on no service/);
+  await assert.rejects(realHarness({ env: q.env, config: q.config, log: () => {}, sharedPrompt: 'shared', inject: q.inject }), /on no service/);
   assert.ok(q.log.includes('meter closed') && q.log.includes('stack down'));
+});
+
+test('defect 2: a run stranded in Grading whose saved patch is gone or changed is recorded invalid and is not graded', async (t) => {
+  for (const damage of ['gone', 'changed']) {
+    const f = await fixture(t, { capUSD: 100, taskNames: ['hello-1'] });
+    const specs = specsOf(buildBlocks({ tasks: Object.values(f.tasks), agents: ['adam'], arms: ['max'], seed: '1' }));
+    f.hooks.afterState = (run, state) => {
+      if (state === 'Grading') throw new HarnessCrash('Grading');
+    };
+    await assert.rejects(runSchedule({ deps: f.deps(), specs, slots: 1 }), HarnessCrash);
+    const deps = await f.reopen();
+    delete f.hooks.afterState;
+    delete deps.afterState;
+    const patch = path.join(f.home, 'runs', fs.readdirSync(path.join(f.home, 'runs'))[0], 'model.patch');
+    if (damage === 'gone') fs.rmSync(patch);
+    else fs.appendFileSync(patch, '\n# tampered');
+    const gradingRuns = f.grading.runs.length;
+    await regradeStranded({ deps, specs });
+    const v = f.ledger.fold().get(specs[0].run);
+    assert.equal(v.state, 'Done', damage);
+    assert.equal(v.result.invalid, true, `${damage}: never a valid fail`);
+    assert.equal(v.result.pass, false);
+    assert.equal(f.grading.runs.length, gradingRuns, `${damage}: nothing was graded`);
+  }
 });

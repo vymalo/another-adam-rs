@@ -202,6 +202,20 @@ test('S4: lint refuses an own task whose repository has no test command a coder 
   assert.match(s.outLines.join('\n'), /1 refused/);
 });
 
+test('K-lint-reads-head: the lint looks at the base, not at the task\'s commit: a test script added by the commit does not count', async (t) => {
+  const clone = initRepo(t);
+  commitFiles(clone, { 'src/app.ts': lines(5), 'package.json': '{}\n' }, 'chore: start (#1)');
+  const base = git(clone, 'rev-parse', 'HEAD').trim();
+  const commit = commitFiles(clone, { 'src/app.ts': `${lines(5)}export const x = 1;\n`, 'package.json': '{"scripts":{"test":"vitest"}}\n' }, 'feat: x (#2)');
+  const s = setup(t, { tasks: { clones: { demo: clone }, selfRepo: 'demo' } });
+  const dir = path.join(s.repoTasks, 'own', 'demo-2');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'own.json'), JSON.stringify({ id: 'demo-2', repo: 'demo', clone: 'demo', commit, base, testCommand: 'npx vitest run' }));
+  fs.writeFileSync(path.join(dir, 'instruction.md'), 'Add a constant.\n');
+  assert.equal(await s.run(['lint']), 1);
+  assert.match(s.outLines.join('\n'), /demo-2: refused/);
+});
+
 test('the local configuration refuses a bad tasks block, and an unknown subcommand is a usage error', async (t) => {
   for (const tasks of [{ upstreamCommit: 'abc' }, { workspaceImage: 'x/y:latest' }, { clones: { a: 'relative/path' } }, { nope: 1 }, { upstreamDir: '../x' }]) {
     const s = setup(t, { tasks });

@@ -6,10 +6,12 @@ import { CALLS_PER_RUN } from '../lib/agent-script.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { runCli } from '../lib/run-cli.mjs';
 import { rawConfig, tmp } from './helpers.mjs';
+import { HarnessCrash } from '../lib/runner.mjs';
 import { PER_CALL, fixture } from './runnerfix.mjs';
 
 const NAMES = ['hello-1', 'hello-2', 'hello-3', 'hello-4', 'fix-add-1', 'fix-add-2'];
 const LOCKS = ['{"public":"lock"}', ''];
+const SHARED = '# How to work\nA shared prompt for the tests.\n';
 const ADAM = CALLS_PER_RUN.adam * PER_CALL; // 29_520 micro-dollars a run
 const OPENCODE = CALLS_PER_RUN.opencode * PER_CALL; // 14_760
 
@@ -28,7 +30,7 @@ async function setup(t, opts = {}) {
   };
   const lines = [];
   const errs = [];
-  const call = (command, argv = [], over = {}) => runCli(command, argv, { env, make, pins: PINS, lockTexts: LOCKS, out: (l) => lines.push(l), err: (l) => errs.push(l), ...over });
+  const call = (command, argv = [], over = {}) => runCli(command, argv, { env, make, pins: PINS, lockTexts: LOCKS, sharedPrompt: SHARED, out: (l) => lines.push(l), err: (l) => errs.push(l), ...over });
   const records = () => f.ledger.records;
   return { f, env, home, configFile, opened, lines, errs, call, records, proposal: () => JSON.parse(fs.readFileSync(path.join(home, 'pilot-budget.json'), 'utf8')) };
 }
@@ -208,4 +210,39 @@ test('regrade grades again the runs whose grading failed in the infrastructure, 
 test('options that do not exist are usage errors', async (t) => {
   const s = await setup(t);
   assert.equal(await s.call('run', ['--nope']), 64);
+});
+
+test('M-run-checks-confirmed-cap: a cap lowered after confirm, under the planned spend, refuses bench run before anything opens', async (t) => {
+  const s = await setup(t);
+  assert.equal(await s.call('pilot'), 0, s.errs.join('\n'));
+  assert.equal(await s.call('confirm'), 0, s.errs.join('\n'));
+  const opened = s.opened.length;
+  fs.writeFileSync(s.configFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(s.configFile, 'utf8')), capUSD: 1, perRunBudgetUSD: 1 }));
+  assert.equal(await s.call('run'), 1);
+  assert.match(s.errs.join('\n'), /cap is below what the confirmed projection plans/);
+  assert.equal(s.opened.length, opened);
+});
+
+test('T-regrade-cli-skips-stranded: bench regrade grades a run an earlier regrade left in Grading, and says so', async (t) => {
+  const s = await setup(t);
+  s.f.grader.broken = true;
+  assert.equal(await s.call('pilot', ['--blocks', '2']), 1);
+  s.f.grader.broken = false;
+  let first = true;
+  s.f.hooks.afterState = (run, state) => {
+    if (state === 'Grading' && first) {
+      first = false;
+      throw new HarnessCrash('Grading');
+    }
+  };
+  await assert.rejects(s.call('regrade'), HarnessCrash);
+  delete s.f.hooks.afterState;
+  const stranded = [...s.f.ledger.fold().values()].filter((v) => v.state === 'Grading').map((v) => v.run);
+  assert.equal(stranded.length, 1);
+  s.lines.length = 0;
+  assert.equal(await s.call('regrade'), 0, s.errs.join('\n'));
+  assert.match(s.lines.join('\n'), /regrade: 1 run\(s\) left in Grading, 7 run\(s\)/);
+  const v = s.f.ledger.fold().get(stranded[0]);
+  assert.equal(v.state, 'Done');
+  assert.equal(v.result.invalid, false);
 });

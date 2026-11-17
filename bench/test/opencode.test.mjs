@@ -500,3 +500,25 @@ test('the real OpenCode, with the command, the configuration and the stdin of th
   assert.equal(exported.status, 0);
   assert.equal(JSON.parse(fs.readFileSync(path.join(out, 'export.json'), 'utf8')).info.id, events.sessionId);
 });
+
+test('the real OpenCode puts the shared prompt file in the system prompt it sends (run with BENCH_TEST_OPENCODE_BIN)', { skip: live }, async (t) => {
+  const model = createScriptedModel({ script: 'agents' });
+  const { port } = await model.listen();
+  t.after(() => model.close());
+  const base = tmp(t);
+  const repo = initRepo(t);
+  commitFiles(repo, { 'README.md': 'demo\n' }, 'base');
+  const dir = path.join(tmp(t), 'clone');
+  execFileSync('git', ['clone', '-q', repo, dir]);
+  const out = tmp(t);
+  const stmt = path.join(base, 'instruction.md');
+  const shared = path.join(base, 'shared-prompt.md');
+  const marker = 'SHARED-PROMPT-MARKER-7f3a';
+  fs.writeFileSync(stmt, 'Write hello.txt containing hello. [mock:hello]\n');
+  fs.writeFileSync(shared, `# How to work\n${marker}\n`);
+  const config = opencodeConfig({ baseUrl: `http://127.0.0.1:${port}/v1`, contextWindow: 131072, urlPattern: /^http:\/\/127\.0\.0\.1:\d+\/v1$/, instructions: [shared] });
+  const ran = await sh(opencodeRunScript({ bin: BIN, stmt, out, dir, run: 'live-2' }), { env: { PATH: process.env.PATH, ...opencodeEnv() }, input: opencodeInput({ config }) });
+  assert.equal(ran.status, 0, fs.readFileSync(path.join(out, 'stderr.txt'), 'utf8').slice(-600));
+  const system = model.requests[0].body.messages.filter((m) => m.role === 'system').map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');
+  assert.ok(system.includes(marker), 'the file named in `instructions` is in the system prompt');
+});

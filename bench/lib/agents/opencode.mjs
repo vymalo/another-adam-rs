@@ -27,16 +27,19 @@ const SAFE_PATH = /^\/[A-Za-z0-9._/@+=-]*$/;
 const SAFE_RUN = /^[A-Za-z0-9._-]{1,64}$/;
 const SESSION = /^ses_[A-Za-z0-9]{6,64}$/;
 const OUTPUT_TOKENS = 8192;
+export const SHARED_PROMPT_FILE = 'shared-prompt.md';
 const OUT_FILES = ['events.jsonl', 'stderr.txt', 'export.json'];
 
 /** The OpenCode configuration of a run (`OPENCODE_CONFIG_CONTENT`). Pure. */
-export function opencodeConfig({ baseUrl, contextWindow, steps = 200, urlPattern = METER_URL }) {
+export function opencodeConfig({ baseUrl, contextWindow, steps = 200, urlPattern = METER_URL, instructions = [] }) {
   if (!urlPattern.test(baseUrl ?? '')) throw new Error('the model address must be the meter\'s: http://meter-<slot>:8090/r/<run token>/v1');
   if (!Number.isSafeInteger(contextWindow) || contextWindow < 1) throw new Error('the context window is required: both agents are given the same one');
   return {
     $schema: 'https://opencode.ai/config.json',
     autoupdate: false,
     share: 'disabled',
+    // The shared prompt (lib/shared-prompt.mjs): a file in the run's read-only input directory, added to OpenCode's own system prompt.
+    ...(instructions.length > 0 ? { instructions } : {}),
     model: MODEL,
     small_model: MODEL,
     provider: {
@@ -144,8 +147,8 @@ const text = (files, name) => (files.has(name) ? files.get(name).toString('utf8'
 export class OpenCodeAgent {
   name = 'opencode';
 
-  constructor({ pins, home, fetchBinary = fetchPinnedBinary, now = Date.now, contextWindow, pollMs = 10_000 }) {
-    Object.assign(this, { pins, home, fetchBinary, now, contextWindow, pollMs });
+  constructor({ pins, home, fetchBinary = fetchPinnedBinary, now = Date.now, contextWindow, pollMs = 10_000, sharedPrompt = null }) {
+    Object.assign(this, { pins, home, fetchBinary, now, contextWindow, pollMs, sharedPrompt });
     this.binary = null;
     this.binarySha = null;
     this.limitsBySlot = new Map(); // slot -> { accepted }
@@ -178,6 +181,7 @@ export class OpenCodeAgent {
     fs.rmSync(names.inDir, { recursive: true, force: true });
     fs.mkdirSync(names.inDir, { recursive: true, mode: 0o755 });
     fs.writeFileSync(path.join(names.inDir, 'instruction.md'), ctx.task.instruction, { mode: 0o644 });
+    if (this.sharedPrompt) fs.writeFileSync(path.join(names.inDir, SHARED_PROMPT_FILE), this.sharedPrompt, { mode: 0o644 });
     for (const d of [names.parent, names.out]) {
       await ctx.stack.workDir(ctx.slot, d, { remove: true }); // a killed attempt may have left it
       await ctx.stack.workDir(ctx.slot, d);
@@ -205,7 +209,7 @@ export class OpenCodeAgent {
 
   async run(ctx) {
     const names = this.#names(ctx);
-    const config = opencodeConfig({ baseUrl: ctx.meter.baseUrl, contextWindow: this.contextWindow, steps: ctx.limits.steps });
+    const config = opencodeConfig({ baseUrl: ctx.meter.baseUrl, contextWindow: this.contextWindow, steps: ctx.limits.steps, instructions: this.sharedPrompt ? [`/bench/in/${SHARED_PROMPT_FILE}`] : [] });
     const input = opencodeInput({ config });
     const mounts = [
       { source: path.join(this.slotDir(ctx), 'bin', 'opencode'), target: '/opt/bench/opencode', readOnly: true },

@@ -607,3 +607,24 @@ test('S1: a client that closes before any usage was seen is still charged the wo
   await until(() => callRecords(s.ledger, 'settled').length === 1, 'settled');
   assert.equal(callRecords(s.ledger, 'settled')[0].costMicro, callRecords(s.ledger, 'pending')[0].worstMicro);
 });
+
+test('defect 1: a client that aborts after the usage chunk but before [DONE] is charged the worst case, reason client_abort', async (t) => {
+  const s = await setup(t, { behavior: { holdBeforeDoneMs: 600 } });
+  const { baseUrl } = s.open();
+  const res = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true, stream_options: { include_usage: true } }) });
+  const reader = res.body.getReader();
+  let text = '';
+  const decoder = new TextDecoder();
+  while (!text.includes('"usage":{')) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value);
+  }
+  assert.ok(!text.includes('[DONE]'), 'the usage chunk came and [DONE] has not');
+  await reader.cancel();
+  await until(() => callRecords(s.ledger, 'settled').length === 1, 'settled');
+  const settled = callRecords(s.ledger, 'settled')[0];
+  assert.equal(settled.reason, 'client_abort');
+  assert.equal(settled.usageMissing, true);
+  assert.equal(settled.costMicro, callRecords(s.ledger, 'pending')[0].worstMicro);
+});

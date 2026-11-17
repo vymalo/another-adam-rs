@@ -203,7 +203,7 @@ export async function executeRun({ deps, spec, attempt }) {
   else delete notes.refused;
   if (ran.record?.limits) notes.limits = ran.record.limits;
   const meterNote = { settled: stats.settled, upstreamErrors: stats.upstreamErrors, refused: stats.refused };
-  fs.writeFileSync(path.join(paths.run, 'meta.json'), `${JSON.stringify({ exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported ?? null, notes, meter: meterNote }, null, 2)}\n`);
+  fs.writeFileSync(path.join(paths.run, 'meta.json'), `${JSON.stringify({ exit: ran.exit, wallMs: ran.wallMs, selfReported: ran.selfReported ?? null, notes, meter: meterNote, patchBytes: patchBytes(patchPath) }, null, 2)}\n`);
   await agent.cleanup(ctx).catch(() => {});
 
   stateRecord(deps, run, 'Grading');
@@ -222,7 +222,11 @@ export async function regradeRun({ deps, spec, attempt }) {
   } catch {
     // no meta: graded as an unknown exit
   }
-  const grade = await gradeSaved({ deps, task: spec.task, patchPath });
+  // A patch that is gone or is not the one that was saved would be graded as "no patch" and become a valid fail: the run is
+  // recorded invalid instead, and nothing is graded.
+  const bytes = patchBytes(patchPath);
+  const damaged = bytes === null || (Number.isSafeInteger(meta.patchBytes) && bytes !== meta.patchBytes);
+  const grade = damaged ? { pass: false, attempts: [], flaky: false, invalid: true, suspect: [], removed: [] } : await gradeSaved({ deps, task: spec.task, patchPath });
   stateRecord(deps, spec.run, 'Done', { result: resultOf({ grade, exit: meta.exit ?? 'unknown', wallMs: meta.wallMs, selfReported: meta.selfReported, patchPath, notes: meta.notes, meter: meta.meter }) });
   return { state: 'Done', pass: grade.pass };
 }

@@ -24,6 +24,7 @@ import { Ledger, readLedger } from './ledger.mjs';
 import { createMeter } from './meter.mjs';
 import { buildBlocks, specsOf } from './plan.mjs';
 import { PINS, coderRef } from './pins.mjs';
+import { readSharedPrompt } from './shared-prompt.mjs';
 import { buildReport } from './report.mjs';
 import { advance, regradeInvalid } from './runner.mjs';
 import { runSchedule } from './schedule.mjs';
@@ -98,7 +99,8 @@ export function loadSelected(config, p) {
  * The real harness: the stack, the meter, the ledger and the two drivers. Needs the container services; unverified here.
  * Whatever fails after the meter listens, or after the stack starts, closes the meter and brings the stack down.
  */
-export async function realHarness({ env, config, log, inject = {} }) {
+export async function realHarness({ env, config, log, sharedPrompt, inject = {} }) {
+  if (typeof sharedPrompt !== 'string' || sharedPrompt === '') throw new Error('the shared system prompt is required: both agents are given the same one');
   const { load = loadSelected, makeStack = (o) => new Stack(o), makeMeter = createMeter, makeOrigin = () => new PodmanRemote(config.tasks.podman) } = inject;
   const home = benchHome(env);
   assertOutsideRepo(home, 'BENCH_HOME');
@@ -171,7 +173,7 @@ export async function realHarness({ env, config, log, inject = {} }) {
       log,
       agents: {
         adam: new AdamAgent({ pins: PINS, home, repoDir: REPO_DIR, contextWindow: config.contextWindow }),
-        opencode: new OpenCodeAgent({ pins: PINS, home, contextWindow: config.contextWindow }),
+        opencode: new OpenCodeAgent({ pins: PINS, home, contextWindow: config.contextWindow, sharedPrompt }),
       },
     };
     return {
@@ -224,7 +226,7 @@ async function cmdPilot(argv, ctx) {
   if (blockMicro > ctx.config.capMicro) throw new BudgetError(`the cap (${formatUSD(ctx.config.capMicro)}) cannot hold one block of ${cells} runs at ${formatUSD(ctx.config.perRunBudgetMicro)} each: raise the cap or lower perRunBudgetUSD`);
   const file = proposalFile(ctx.home);
   fs.rmSync(file, { force: true }); // a new pilot invalidates any earlier confirmation
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {} });
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, sharedPrompt: ctx.sharedPrompt });
   try {
     const plan = plans(harness, ctx.config);
     if (count > plan.blocks.length) throw new SelectionError(`--blocks ${count} is more than the ${plan.blocks.length} selected tasks`);
@@ -268,7 +270,7 @@ async function cmdRun(argv, ctx) {
   parseArgs({ args: argv, options: {}, allowPositionals: false });
   // Nothing is started, not even the stack, before the owner's confirmation is checked.
   const perArm = requireConfirmed(readJson(proposalFile(ctx.home), null), { config: ctx.config, fingerprint: ctx.fingerprint });
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {} });
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, sharedPrompt: ctx.sharedPrompt });
   try {
     const { blocks, specs } = plans(harness, ctx.config);
     const { ledger } = harness.deps;
@@ -303,7 +305,7 @@ export async function regradeStranded({ deps, specs }) {
 
 async function cmdRegrade(argv, ctx) {
   parseArgs({ args: argv, options: {}, allowPositionals: false });
-  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {} });
+  const harness = await ctx.make({ env: ctx.env, config: ctx.config, log: () => {}, sharedPrompt: ctx.sharedPrompt });
   try {
     const plan = plans(harness, ctx.config);
     const specs = [...plan.allPilotSpecs, ...plan.specs];
@@ -325,14 +327,15 @@ async function cmdRegrade(argv, ctx) {
 }
 
 /** Run one of the four commands. Returns an exit code. `make` opens the harness (tests pass a fake). */
-export async function runCli(command, argv, { env = process.env, out = (l) => process.stdout.write(`${l}\n`), err = (l) => process.stderr.write(`${l}\n`), make = realHarness, pins = PINS, lockTexts = null } = {}) {
+export async function runCli(command, argv, { env = process.env, out = (l) => process.stdout.write(`${l}\n`), err = (l) => process.stderr.write(`${l}\n`), make = realHarness, pins = PINS, lockTexts = null, sharedPrompt = null } = {}) {
   try {
     const home = benchHome(env);
     assertOutsideRepo(home, 'BENCH_HOME');
     fs.mkdirSync(home, { recursive: true, mode: 0o755 });
     const ctx = { env, home, out, make, pins, config: loadConfig({ env }) };
     ctx.lockTexts = lockTexts ?? readLocks(paths(env));
-    ctx.fingerprint = configFingerprint({ config: ctx.config, pins, lockTexts: ctx.lockTexts, key: digestKey(home) });
+    ctx.sharedPrompt = sharedPrompt ?? (await readSharedPrompt({ repoDir: REPO_DIR, revision: pins.coder.revision }));
+    ctx.fingerprint = configFingerprint({ config: ctx.config, pins, lockTexts: ctx.lockTexts, key: digestKey(home), sharedPrompt: ctx.sharedPrompt });
     // The ledger holds runs of one configuration only; nothing here pools two.
     assertLedgerBound(readLedger(ledgerFile(home)).records, ctx.fingerprint);
     if (command === 'pilot') return await cmdPilot(argv, ctx);

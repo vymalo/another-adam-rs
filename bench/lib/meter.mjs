@@ -124,6 +124,7 @@ class UsageSniffer {
     this.decoder = new StringDecoder('utf8');
     this.partial = '';
     this.usage = null;
+    this.done = false; // the stream said `[DONE]`: it is over, and the usage it carried is the whole of it
     this.gaveUp = false;
   }
 
@@ -151,6 +152,7 @@ class UsageSniffer {
     const line = text.replace(/\r$/, '');
     if (!line.startsWith('data:')) return;
     const data = line.slice(5).trim();
+    if (data === '[DONE]') this.done = true;
     if (data === '' || data === '[DONE]') return;
     try {
       const chunk = JSON.parse(data);
@@ -312,7 +314,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
         clientGone = true;
         upstreamReq?.destroy();
         sniffer?.end();
-        if (sniffer?.usage) settle({ rawUsage: sniffer.usage, status: 200 });
+        if (sniffer?.done && sniffer.usage) settle({ rawUsage: sniffer.usage, status: 200 });
         else settle({ rawUsage: null, reason: 'client_abort' });
         resolve();
       });

@@ -26,12 +26,12 @@ export class BudgetError extends Error {
 
 /**
  * What the ledger and a pilot are bound to: everything that changes a treatment or the task set. The model id, prices, arms,
- * limits, context window, pins, the two lock files, `tasks.seed` and `tasks.selfRepo`. Not `concurrency` (it changes the wall
+ * limits, context window, pins, the shared system prompt, the two lock files, `tasks.seed` and `tasks.selfRepo`. Not `concurrency` (it changes the wall
  * time of a run, not what it is given), not the endpoint (the same model elsewhere), not the cap (a bound on spend, checked
  * live). Each field is an HMAC under a key kept in `$BENCH_HOME` (`digestKey`), so no file that holds a fingerprint holds a hash
  * of the model id that a guess could be tested against.
  */
-export function configFingerprint({ config, pins, lockTexts, key }) {
+export function configFingerprint({ config, pins, lockTexts, key, sharedPrompt = null }) {
   const mac = (v) => crypto.createHmac('sha256', key).update(JSON.stringify(v ?? null)).digest('hex').slice(0, 16);
   const fields = {
     model: mac(config.modelId),
@@ -41,6 +41,7 @@ export function configFingerprint({ config, pins, lockTexts, key }) {
     contextWindow: mac(config.contextWindow),
     pins: mac(pins),
     locks: mac(lockTexts),
+    prompt: mac(sharedPrompt),
     seed: mac(config.tasks?.seed),
     selfRepo: mac(config.tasks?.selfRepo),
   };
