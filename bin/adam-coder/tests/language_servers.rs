@@ -1570,7 +1570,7 @@ async fn with_the_servers_off_the_three_tools_are_not_in_the_set() {
 
 use adam_a2a::AccessTier;
 use adam_coder::tools::lsp::Mode;
-use adam_coder::tools::lsp::server::{Key, StartError, Want};
+use adam_coder::tools::lsp::server::{Key, Probe, StartError, Want};
 use adam_workspace::{EnvDescription, EnvError, EnvSession, ExecId, ExecSpec, PreparedCommand};
 
 impl Lsp {
@@ -1591,6 +1591,7 @@ impl Lsp {
 struct Recording {
     inner: Arc<dyn EnvSession>,
     kill_delay: Duration,
+    summary: Option<&'static str>,
     events: std::sync::Mutex<Vec<&'static str>>,
     kills: std::sync::Mutex<Vec<ExecId>>,
 }
@@ -1600,6 +1601,18 @@ impl Recording {
         Arc::new(Self {
             inner: adam_workspace::LocalSession::shared(),
             kill_delay,
+            summary: None,
+            events: std::sync::Mutex::default(),
+            kills: std::sync::Mutex::default(),
+        })
+    }
+
+    /// A session that says it is `summary`: another environment than the plain one.
+    fn described_as(summary: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            inner: adam_workspace::LocalSession::shared(),
+            kill_delay: Duration::ZERO,
+            summary: Some(summary),
             events: std::sync::Mutex::default(),
             kills: std::sync::Mutex::default(),
         })
@@ -1617,7 +1630,11 @@ impl Recording {
 #[async_trait::async_trait]
 impl EnvSession for Recording {
     fn describe(&self) -> EnvDescription {
-        self.inner.describe()
+        let mut described = self.inner.describe();
+        if let Some(summary) = self.summary {
+            summary.clone_into(&mut described.summary);
+        }
+        described
     }
 
     fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {
@@ -1993,12 +2010,13 @@ async fn the_safe_rust_analyzer_target_directory_is_private_and_removed_when_the
 
 #[tokio::test]
 async fn what_a_server_says_loses_its_direction_controls_and_the_paths_of_other_places() {
-    let message = "reordered \u{202e}txet\u{2066}x\u{2028}y, from \
-                   /usr/local/go/src/fmt/print.go:12:3 and (/home/ana/.cargo/registry/src/x/y.rs)";
+    let message = "reordered \u{202e}txet\u{2066}x\u{2028}y\u{2029}z, from \
+                   /usr/local/go/src/fmt/print.go:12:3 and (/home/ana/.cargo/registry/src/x/y.rs) \
+                   and /etc/passwd";
     let lsp = Lsp::new(json!({"diagnostics": [diag(1, 0, 0, message)]})).await;
     rust_project(&lsp);
     let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
-    for bad in ['\u{202e}', '\u{2066}', '\u{2028}'] {
+    for bad in ['\u{202e}', '\u{2066}', '\u{2028}', '\u{2029}'] {
         assert!(
             !out.content.contains(bad),
             "U+{:04X}: {}",
@@ -2015,7 +2033,8 @@ async fn what_a_server_says_loses_its_direction_controls_and_the_paths_of_other_
     assert!(
         out.content
             .contains("(outside the workspace) src/fmt/print.go:12:3")
-            && out.content.contains("(outside the workspace) src/x/y.rs"),
+            && out.content.contains("(outside the workspace) src/x/y.rs")
+            && out.content.contains("(outside the workspace) etc/passwd"),
         "{}",
         out.content
     );
@@ -2029,7 +2048,10 @@ async fn the_name_of_a_file_and_the_source_line_of_a_location_lose_their_directi
     .await;
     rust_project(&lsp);
     let name = "src/evil\u{202e}gnp.rs";
-    lsp.put(name, "// \u{202e}hidden \u{2028}text\npub fn x() {}\n");
+    lsp.put(
+        name,
+        "// \u{202e}hidden \u{2028}text\u{2029}more\npub fn x() {}\n",
+    );
     let out = lsp
         .call(
             "find_definition",
@@ -2037,7 +2059,7 @@ async fn the_name_of_a_file_and_the_source_line_of_a_location_lose_their_directi
         )
         .await;
     assert!(!out.is_error, "{}", out.content);
-    for bad in ['\u{202e}', '\u{2028}'] {
+    for bad in ['\u{202e}', '\u{2028}', '\u{2029}'] {
         assert!(
             !out.content.contains(bad),
             "U+{:04X}: {}",
@@ -2098,4 +2120,365 @@ async fn a_pull_that_is_cancelled_while_the_server_works_is_still_indexing_not_a
     let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
     assert!(!out.is_error, "{}", out.content);
     assert!(out.content.contains("still indexing"), "{}", out.content);
+}
+
+// ------------------------------------------------------------------------- the mutation pass
+
+#[tokio::test]
+async fn a_start_that_finishes_after_the_worker_stopped_leaves_no_server() {
+    let lsp = Lsp::new(json!({"initialize_delay_ms": 1500})).await;
+    rust_project(&lsp);
+    let servers = lsp.fx.env.commands.language_servers();
+    let session = adam_workspace::LocalSession::shared();
+    let (started, ()) = tokio::join!(
+        servers.get_or_start(want(
+            &lsp,
+            session,
+            lsp.worktree(),
+            4,
+            Duration::from_secs(30)
+        )),
+        async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            servers.stop_all().await;
+        }
+    );
+    assert!(
+        matches!(&started, Err(StartError::Stopped)),
+        "{:?}",
+        started.as_ref().err()
+    );
+    assert_eq!(servers.count(), 0);
+    let pid: u32 = std::fs::read_to_string(lsp.dir.path().join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    until("the late server's process to be gone", || !alive(pid)).await;
+}
+
+#[tokio::test]
+async fn a_server_in_a_call_longer_than_its_idle_time_is_not_stopped() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    let servers = lsp.fx.env.commands.language_servers();
+    let mut asked = want(
+        &lsp,
+        adam_workspace::LocalSession::shared(),
+        lsp.worktree(),
+        4,
+        Duration::from_secs(30),
+    );
+    asked.idle = Duration::from_secs(1);
+    let server = servers.get_or_start(asked).await.unwrap();
+    let held = server.lock(Duration::from_secs(5)).await.expect("the gate");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(server.is_alive(), "it was working the whole time");
+    assert_eq!(servers.count(), 1);
+    drop(held);
+    until("the server to be stopped once it is idle", || {
+        !server.is_alive()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_start_that_fails_initialize_asks_the_environment_to_kill_its_exec() {
+    let lsp = Lsp::new(json!({"initialize_never": true})).await;
+    rust_project(&lsp);
+    let servers = lsp.fx.env.commands.language_servers();
+    let session = Recording::new(Duration::ZERO);
+    let started = servers
+        .get_or_start(want(
+            &lsp,
+            session.clone(),
+            lsp.worktree(),
+            4,
+            Duration::from_secs(1),
+        ))
+        .await;
+    assert!(
+        matches!(&started, Err(StartError::Failed(_))),
+        "{:?}",
+        started.as_ref().err()
+    );
+    assert!(
+        !session.kills().is_empty(),
+        "the environment was asked to kill what it started"
+    );
+    assert_eq!(servers.count(), 0);
+}
+
+#[tokio::test]
+async fn a_server_of_an_environment_described_differently_is_replaced() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    let servers = lsp.fx.env.commands.language_servers();
+    let first = servers
+        .get_or_start(want(
+            &lsp,
+            Recording::described_as("a container"),
+            lsp.worktree(),
+            4,
+            Duration::from_secs(30),
+        ))
+        .await
+        .unwrap();
+    let again = servers
+        .get_or_start(want(
+            &lsp,
+            Recording::described_as("a container"),
+            lsp.worktree(),
+            4,
+            Duration::from_secs(30),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(again.pid(), first.pid(), "the same environment keeps it");
+    let (old, replaced) = (first.pid().unwrap(), {
+        servers
+            .get_or_start(want(
+                &lsp,
+                Recording::described_as("another container"),
+                lsp.worktree(),
+                4,
+                Duration::from_secs(30),
+            ))
+            .await
+            .unwrap()
+    });
+    assert_ne!(replaced.pid().unwrap(), old);
+    until("the old server's process to be gone", || !alive(old)).await;
+    assert_eq!(servers.count(), 1);
+}
+
+#[tokio::test]
+async fn a_write_into_a_reference_between_calls_is_caught_at_the_next() {
+    let lsp = references::with_reference(json!({"diagnostics": [diag(1, 0, 0, "x")]})).await;
+    let out = lsp
+        .diagnostics(json!({"path": "src/lib.rs", "repo": "lib"}))
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    let written = lsp
+        .fx
+        .root
+        .join("workspaces")
+        .join(lsp.run())
+        .join("lib")
+        .join("src/generated.rs");
+    std::fs::write(&written, "// between the calls\n").unwrap();
+    let out = lsp
+        .diagnostics(json!({"path": "src/lib.rs", "repo": "lib"}))
+        .await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("is a reference") && out.content.contains("as they were"),
+        "{}",
+        out.content
+    );
+    assert!(!written.exists(), "the file is removed");
+    assert!(lsp.servers().is_empty(), "the server is stopped");
+}
+
+#[tokio::test]
+async fn a_run_without_notes_gets_a_safe_server() {
+    let lsp = Lsp::new(json!({"diagnostics": [diag(1, 0, 0, "x")]})).await;
+    rust_project(&lsp);
+    let notes = lsp
+        .fx
+        .root
+        .join("coder")
+        .join(format!("{}.json", lsp.run()));
+    std::fs::remove_file(&notes).unwrap();
+    let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    let options = lsp.init_options(0);
+    assert_eq!(
+        options["cargo"]["buildScripts"]["enable"], false,
+        "{options}"
+    );
+}
+
+#[tokio::test]
+async fn at_a_bound_of_two_the_least_recently_used_is_stopped() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    for dir in ["b", "c"] {
+        lsp.put(&format!("{dir}/Cargo.toml"), "[package]\nname = \"p\"\n");
+    }
+    let servers = lsp.fx.env.commands.language_servers();
+    let session = adam_workspace::LocalSession::shared();
+    let start = |root: PathBuf| {
+        let asked = want(&lsp, session.clone(), root, 2, Duration::from_secs(30));
+        async { servers.get_or_start(asked).await.unwrap() }
+    };
+    let a = start(lsp.worktree()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let b = start(lsp.worktree().join("b")).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // A is used again, so B is the one least recently used.
+    let again = start(lsp.worktree()).await;
+    assert_eq!(again.pid(), a.pid());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _c = start(lsp.worktree().join("c")).await;
+    let (a, b) = (a.pid().unwrap(), b.pid().unwrap());
+    until("the least recently used to be gone", || !alive(b)).await;
+    assert!(alive(a), "the one used last is kept");
+    assert_eq!(servers.count(), 2);
+}
+
+#[tokio::test]
+async fn a_probe_is_asked_again_when_the_environment_is_described_differently() {
+    let lsp = Lsp::new(json!({})).await;
+    let servers = lsp.fx.env.commands.language_servers();
+    let run = lsp.run();
+    servers.remember_probe(&run, "w", Language::Rust, "a container", Probe::Found);
+    assert_eq!(
+        servers.probed(&run, "w", Language::Rust, "a container"),
+        Some(Probe::Found)
+    );
+    assert_eq!(
+        servers.probed(&run, "w", Language::Rust, "another container"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_second_call_on_a_file_never_published_is_still_not_clean() {
+    let lsp = Lsp::new(json!({"silent_when_clean": true})).await;
+    rust_project(&lsp);
+    for call in 1..=2 {
+        let out = lsp
+            .diagnostics(json!({"path": "src/lib.rs", "wait": 5}))
+            .await;
+        assert!(
+            out.content.contains("No diagnostics received")
+                && !out.content.contains("(no errors or warnings)"),
+            "call {call}: {}",
+            out.content
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_pull_answered_content_modified_is_still_indexing_not_a_failure() {
+    let lsp =
+        Lsp::new(json!({"pull": true, "error_on": {"textDocument/diagnostic": -32801}})).await;
+    rust_project(&lsp);
+    let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("still indexing"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn a_secret_across_the_1000_character_cut_is_not_shown_in_part() {
+    // The token starts 15 characters before the cut: cut first, its start would not be known.
+    let message = format!("{}{GITHUB_TOKEN} and more", "x".repeat(985));
+    let lsp = Lsp::new(json!({"diagnostics": [diag(1, 0, 0, &message)]})).await;
+    rust_project(&lsp);
+    let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert!(!out.content.contains("ghp_FAKE"), "{}", out.content);
+    assert!(out.content.contains("[redacted]"), "{}", out.content);
+}
+
+/// A rig whose server says `symbol` of `src/{name}.rs` (`text`, one line) is defined at `character`
+/// of that line, and what `find_definition` of it says.
+async fn definition_in(name: &str, text: &str, symbol: &str, character: u64) -> (Lsp, String) {
+    let lsp = Lsp::new(json!({"results": {"textDocument/definition": [
+        {"uri": "$FILE", "range": {"start": {"line": 0, "character": character},
+                                   "end": {"line": 0, "character": character + 1}}}
+    ]}}))
+    .await;
+    rust_project(&lsp);
+    let rel = format!("src/{name}.rs");
+    lsp.put(&rel, text);
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": rel, "line": 1, "symbol": symbol}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    (lsp, out.content)
+}
+
+#[tokio::test]
+async fn a_secret_on_a_location_source_line_is_scrubbed() {
+    let (_lsp, said) = definition_in("s", &format!("let t = \"{GITHUB_TOKEN}\";\n"), "t", 4).await;
+    assert!(!said.contains(GITHUB_TOKEN), "{said}");
+    assert!(said.contains("[redacted]"), "{said}");
+}
+
+#[tokio::test]
+async fn a_location_climbing_out_with_dotdot_is_outside_the_workspace() {
+    let lsp = Lsp::new(json!({"results": {"textDocument/definition": [
+        {"uri": "$ROOT/../../etc/passwd",
+         "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}}
+    ]}}))
+    .await;
+    rust_project(&lsp);
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": "src/lib.rs", "line": 1, "symbol": "first"}),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("(outside the workspace) ") && !out.content.contains(".."),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn long_source_lines_and_messages_are_cut() {
+    let (_lsp, said) =
+        definition_in("long", &format!("let y = {};\n", "y".repeat(5000)), "y", 4).await;
+    let line = said
+        .lines()
+        .find(|l| l.starts_with("src/long.rs:1:5"))
+        .unwrap();
+    assert!(line.ends_with('…'), "{line}");
+    assert!(
+        line.chars().count() <= "src/long.rs:1:5: ".len() + 201,
+        "{}",
+        line.chars().count()
+    );
+
+    let lsp = Lsp::new(json!({"diagnostics": [diag(1, 0, 0, &"m".repeat(5000))]})).await;
+    rust_project(&lsp);
+    let out = lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    let line = out.content.lines().find(|l| l.contains("error: ")).unwrap();
+    assert!(line.ends_with('…'), "{} chars", line.chars().count());
+    assert!(
+        line.chars().count() <= "src/lib.rs:1:1: error: ".len() + 1001,
+        "{}",
+        line.chars().count()
+    );
+}
+
+#[tokio::test]
+async fn the_column_of_a_location_is_characters() {
+    // The server counts UTF-16: `bad` is at unit 4 of `é😀 bad`, the fourth character.
+    let (_lsp, said) = definition_in("u", "é😀 bad\n", "bad", 4).await;
+    assert!(said.contains("src/u.rs:1:4: é😀 bad"), "{said}");
+}
+
+#[tokio::test]
+async fn a_definition_asked_while_indexing_keeps_the_server() {
+    let lsp = Lsp::new(json!({
+        "progress_ms": 60000, "never_answer": ["textDocument/definition"],
+    }))
+    .await;
+    rust_project(&lsp);
+    let out = lsp
+        .call(
+            "find_definition",
+            json!({"path": "src/lib.rs", "line": 1, "symbol": "first", "wait": 1}),
+        )
+        .await;
+    assert!(out.content.contains("still indexing"), "{}", out.content);
+    assert_eq!(lsp.servers().len(), 1, "the server is kept");
+    assert!(alive(lsp.pid()));
 }

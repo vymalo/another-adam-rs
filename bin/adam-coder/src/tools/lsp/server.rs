@@ -1993,6 +1993,25 @@ mod tests {
         assert_eq!(lock(&sink).bytes, b"said after the failure");
     }
 
+    #[test]
+    fn a_secret_cut_by_the_start_of_the_held_stderr_is_never_shown() {
+        let secret = "SECRETVALUE-0123456789-abcdefghijklmnop";
+        let redactor = Redactor::new([secret]);
+        // What is held starts inside the secret (the output went on after it was cut), so the
+        // redactor cannot know the part is one.
+        let held = format!("{} and then more output", &secret[20..]);
+        let kept = Mutex::new(Tail {
+            total: held.len() as u64 + 100,
+            bytes: held.into_bytes(),
+        });
+        let shown = tail_text(&kept, &redactor);
+        assert!(!shown.contains(&secret[20..]), "{shown}");
+        // From the start of the output, the same text is shown whole.
+        let whole = lock(&kept).bytes.len() as u64;
+        lock(&kept).total = whole;
+        assert!(tail_text(&kept, &redactor).contains("and then more output"));
+    }
+
     #[tokio::test]
     async fn no_start_gate_is_kept_once_a_start_is_over() {
         let servers = Servers::new();

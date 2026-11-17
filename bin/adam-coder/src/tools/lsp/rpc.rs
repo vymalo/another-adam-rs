@@ -801,6 +801,75 @@ mod tests {
         assert!(client.closed().is_none());
     }
 
+    /// A writer that takes nothing.
+    struct Refusing;
+
+    impl AsyncWrite for Refusing {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("the pipe is broken")))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_closes_the_client() {
+        let (ours, theirs) = duplex(1024);
+        let (our_read, _our_write) = tokio::io::split(ours);
+        let client = Client::start(our_read, Refusing, Arc::new(Echo));
+        let err = client.notify("x", json!({})).await.unwrap_err();
+        assert!(
+            matches!(&err, RpcError::Closed(why) if why.contains("does not take its input")),
+            "{err}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), client.wait_closed())
+            .await
+            .expect("what is half written is never followed by another message");
+        assert!(client.closed().unwrap().contains("does not take its input"));
+        drop(theirs);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_asks_more_than_it_reads_is_closed() {
+        // Nobody reads what the client writes, and the pipe holds less than one answer: the first
+        // answer is stuck in the writer and the rest wait in the queue.
+        let (ours, theirs) = duplex(64);
+        let (_their_read, mut their_write) = tokio::io::split(theirs);
+        let (our_read, our_write) = tokio::io::split(ours);
+        let client = Client::start(our_read, our_write, Arc::new(Echo));
+        for id in 0..300 {
+            let ask = json!({"jsonrpc": "2.0", "id": id, "method": "ok"}).to_string();
+            tokio::time::timeout(Duration::from_secs(5), their_write.write_all(&frame(&ask)))
+                .await
+                .expect("the client keeps reading")
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), client.wait_closed())
+            .await
+            .expect("the client is closed");
+        assert!(
+            client.closed().unwrap().contains("asks more than it reads"),
+            "{:?}",
+            client.closed()
+        );
+    }
+
     #[tokio::test]
     async fn a_request_that_is_dropped_forgets_its_wait_and_cancels_it() {
         let (ours, theirs) = duplex(64 * 1024);
