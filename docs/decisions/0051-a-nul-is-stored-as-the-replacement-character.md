@@ -23,17 +23,24 @@ class as permanent, so the run failed.
 
 ## Decision
 
-1. **Every adapter replaces a NUL with U+FFFD before it writes**, in a string and in an object key, at any depth, for
+1. **The loop sanitizes a tool's output before it is journaled.** `ToolOutput::sanitized` replaces a NUL with U+FFFD in
+   every text a tool can write — the content, the announced answer, the repeat key, a kept output, the plan's title and
+   items, an artifact's name, media type and JSON data — and one call in `agent.rs`, inside the closure `Ctx::step`
+   journals, applies it. So the journaled step and the model's message are the same bytes whatever store is behind the
+   run, and a replay shows exactly what the live run showed.
+2. **Every adapter replaces a NUL with U+FFFD before it writes**, in a string and in an object key, at any depth, for
    every JSON value it stores: a run's state, a journal payload, a push configuration and its cursor. The one function
-   is `adam_core::storable`; it borrows the value when there is nothing to replace, so the common path copies nothing.
-   U+FFFD is the replacement character, and it is what the coder's kept outputs already write for a NUL.
-2. **A store returns what it stored.** `create_run`, `commit_run` and `journal_put` return the value as it was written
+   is `adam_core::storable` (and `storable_text` for one string); it borrows the value when there is nothing to
+   replace, so the common path copies nothing. U+FFFD is the replacement character, and it is what the coder's kept
+   outputs already write for a NUL. This is the backend contract, and it covers the text the loop did not write: the
+   model's own answer, a compaction summary, a person's message.
+3. **A store returns what it stored.** `create_run`, `commit_run` and `journal_put` return the value as it was written
    (they already read it back), so the loop applies the same bytes it journaled and a replay decodes the same value.
    The live transition and the replay therefore agree, and the model's next request is built from the stored value.
-3. **The testkit requires it.** `nul_characters_are_stored_as_the_replacement_character` replaces the old
+4. **The testkit requires it.** `nul_characters_are_stored_as_the_replacement_character` replaces the old
    `nul_characters_roundtrip_or_reject_cleanly`, which accepted either behaviour: every adapter must now round-trip a
    NUL as U+FFFD, in the state and in a journal payload, for values and for keys.
-4. **A rejection is a bug, not a contract.** `InvalidInput` keeps its other cases (a number beyond the column, a bad
+5. **A rejection is a bug, not a contract.** `InvalidInput` keeps its other cases (a number beyond the column, a bad
    table prefix). PostgreSQL's `22P05` mapping stays as a defensive net, and its message says a NUL reached the store
    unsanitized, which is a bug in the caller of `storable`.
 
@@ -47,6 +54,7 @@ class as permanent, so the run failed.
 * **This covers JSON values only.** A NUL in a text column (a push configuration's `id`, a delivery
   `last_error`, a journal step name) is the caller's, not a tool's output: it is still refused, now as
   `InvalidInput` for SQLSTATE `22021` as for `22P05`, instead of an opaque backend error.
-* `adam_core::storable` is new public API, re-exported from `adam-core`; `MemoryStore` applies it too, so the
-  reference adapter passes the same testkit as the databases.
+* `adam_core::storable` and `storable_text` are new public API, re-exported from `adam-core`; `MemoryStore` applies
+  the rule too, so the reference adapter passes the same testkit as the databases. `ToolOutput::sanitized` is
+  `pub(crate)`: the loop applies it, a tool author does not.
 * No trait method changed. The store READMEs, the store-adapters reference and the `InvalidInput` doc say the rule.

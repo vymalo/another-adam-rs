@@ -624,6 +624,15 @@ pub fn storable(value: &Value) -> Cow<'_, Value> {
     Cow::Owned(owned)
 }
 
+/// [`storable`]'s rule for a single string: a NUL becomes U+FFFD, borrowed when there is none.
+pub fn storable_text(text: &str) -> Cow<'_, str> {
+    if text.contains('\u{0}') {
+        Cow::Owned(text.replace('\u{0}', "\u{FFFD}"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 /// [`storable`] for a value the caller already owns: the same rule, with no clone on either path
 /// (a clean value is returned as it is; a dirty one is changed in place).
 pub fn storable_owned(mut value: Value) -> Value {
@@ -649,8 +658,8 @@ fn holds_a_nul(value: &Value) -> bool {
 fn replace_nul(value: &mut Value) {
     match value {
         Value::String(text) => {
-            if text.contains('\u{0}') {
-                *text = text.replace('\u{0}', "\u{FFFD}");
+            if let Cow::Owned(clean) = storable_text(text) {
+                *text = clean;
             }
         }
         Value::Array(items) => items.iter_mut().for_each(replace_nul),
