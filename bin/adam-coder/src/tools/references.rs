@@ -888,7 +888,7 @@ pub(super) async fn check_out(
             // Of two calls that make the reference at the same time, the first one recorded tells
             // the commit; the other says nothing, and the commit that stands is the first's.
             Ok(commit) => match record_commit(env, &run, &def.name, &commit).await {
-                Recorded::Mine | Recorded::NotRecorded => Some(commit),
+                Recorded::Mine | Recorded::Failed => Some(commit),
                 Recorded::Another => None,
             },
             Err(e) => {
@@ -923,7 +923,7 @@ enum Recorded {
     /// Another call's, recorded first: that call tells it.
     Another,
     /// The notes could not be written: the reference is read anyway.
-    NotRecorded,
+    Failed,
 }
 
 /// Keep the commit the reference `name` was first read at in the run's notes: **the first one
@@ -948,7 +948,7 @@ async fn record_commit(env: &ToolEnv, run: &str, name: &str, commit: &str) -> Re
         Ok(false) => Recorded::Another,
         Err(e) => {
             tracing::warn!(run, reference = name, error = %e, "cannot record the commit a reference was read at");
-            Recorded::NotRecorded
+            Recorded::Failed
         }
     }
 }
