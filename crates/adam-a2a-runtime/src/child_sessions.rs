@@ -1295,6 +1295,13 @@ mod tests {
             closed,
             closing,
             started_by: None,
+            report: adam_runtime::ReportRound {
+                run: RunId::new(),
+                ended: state != SessionState::Working,
+                cancelled: false,
+                started_by: None,
+                updated_at: chrono::Utc::now(),
+            },
         }
     }
 

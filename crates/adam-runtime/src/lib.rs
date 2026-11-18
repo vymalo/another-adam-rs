@@ -120,9 +120,9 @@ pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
 pub use session::{
-    MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_PAGE, MAX_SESSION_ROUNDS_SCANNED, RoundOutcome,
-    SESSION_CLOSE_KIND, SESSION_CLOSE_ROUND_KEY, SESSION_STATE_KEY, SessionHeader, SessionList,
-    SessionState, SessionSummary, SessionView, closing_round_payload,
+    MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_PAGE, MAX_SESSION_ROUNDS_SCANNED, ReportRound,
+    RoundOutcome, SESSION_CLOSE_KIND, SESSION_CLOSE_ROUND_KEY, SESSION_STATE_KEY, SessionHeader,
+    SessionList, SessionState, SessionSummary, SessionView, closing_round_payload,
     parse_session_conversation_id, session_conversation_id, session_conversation_prefix,
 };
 pub use step::{

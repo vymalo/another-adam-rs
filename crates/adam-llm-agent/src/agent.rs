@@ -47,7 +47,9 @@ use crate::order;
 use crate::paging::backstop;
 use crate::plan::Plan;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
-use crate::sessions::{SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, is_due};
+use crate::sessions::{
+    DueFacts, SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, is_due, report_call_id,
+};
 
 /// Whether the history holds a call that started a session or sent to one.
 fn has_started_session(state: &Conversation) -> bool {
@@ -424,12 +426,6 @@ struct RoundReport {
     output: ToolOutput,
 }
 
-/// The id of the call the loop makes for the report of `round`: `report_` and its id's 32 hex
-/// digits, which every provider accepts and which no model call of ours ever has.
-fn report_call_id(round: RunId) -> String {
-    format!("report_{}", round.0.simple())
-}
-
 /// What a request is given for `reports`: one assistant message that calls `subagent_read` once
 /// for each, then the results, in the same order. Pure: the request and the history are given the
 /// same bytes. `paged` is the tool's ([`Tool::paged`]).
@@ -473,6 +469,10 @@ struct ReportPlan {
     agents: Arc<[String]>,
     /// The rounds already reported ([`Conversation::reported_rounds`]).
     reported: Vec<RunId>,
+    /// The ids of the report calls the history holds.
+    in_history: HashSet<String>,
+    /// When the chain of tasks began ([`Conversation::chain_started`]).
+    since: Option<DateTime<Utc>>,
 }
 
 impl ReportPlan {
@@ -489,16 +489,18 @@ impl ReportPlan {
                 return (Vec::new(), None);
             }
         };
-        let open = list
+        let mut open = list
             .sessions
             .iter()
             .any(|s| s.state != SessionState::Closed);
+        let facts = DueFacts {
+            me: self.me,
+            reported: &self.reported,
+            in_history: &self.in_history,
+            since: self.since,
+        };
         let mut reports = Vec::new();
-        for session in list
-            .sessions
-            .iter()
-            .filter(|s| is_due(s, self.me, &self.reported))
-        {
+        for session in list.sessions.iter().filter(|s| is_due(s, &facts)) {
             match self
                 .tool
                 .poll_remote(&self.tool_ctx, &session.id.to_string())
@@ -511,13 +513,21 @@ impl ReportPlan {
                             round,
                             output,
                         });
+                        continue;
                     }
                 }
-                Ok(_) => {}
+                Ok(RemotePoll::Ready(_)) => {
+                    tracing::warn!(session = %session.id, "the read of a report answered an error; the next call looks again");
+                }
+                // The round the report is of has not ended as far as the read can tell (a closing
+                // round still works): it is due, and looked at again.
+                Ok(RemotePoll::Working) => {}
                 Err(e) => {
                     tracing::warn!(session = %session.id, error = %e, "reading a report failed; the next call looks again");
                 }
             }
+            // A due report that was not appended keeps the listing on.
+            open = true;
         }
         request
             .messages
@@ -1567,6 +1577,9 @@ impl LlmAgent {
         let images_state = Arc::clone(&state.images);
         // A report is told to the model before its first call of a run, and before every call
         // while a session of the conversation may still end.
+        if turn == 0 && state.chain_started.is_none() {
+            state.chain_started = Some(ctx.now());
+        }
         let report_plan = (self.session_reports && !closing && (turn == 0 || state.sessions_open))
             .then(|| self.report_plan(ctx, state))
             .flatten();
@@ -1682,9 +1695,10 @@ impl LlmAgent {
                 // What the model was told goes into the history in front of its answer. An answer
                 // that did not read a message that arrived is not the last word, and nor is its
                 // listing: the reports are left for the next call, which finds them again.
-                if !answered_stale {
-                    seen_at += self.told(ctx, state, &reports).await?;
-                }
+                // The steps taken do not depend on it (a replay that finds the answer stale must take
+                // the ones the first try took): the rounds are counted either way, and only the
+                // history waits.
+                seen_at += self.told(ctx, state, &reports, !answered_stale).await?;
                 (response, stream)
             }
             // A recorded error is replayed forever on crash-replay, but a
@@ -2241,6 +2255,13 @@ impl LlmAgent {
             "report",
             SUBAGENT_READ,
         );
+        let in_history = state
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls())
+            .filter(|c| c.name == SUBAGENT_READ && c.id.starts_with("report_"))
+            .map(|c| c.id.clone())
+            .collect();
         Some(ReportPlan {
             paged: tool.paged(),
             tool,
@@ -2249,6 +2270,8 @@ impl LlmAgent {
             me: ctx.run_id(),
             agents: Arc::clone(&self.session_agents),
             reported: state.reported_rounds.clone(),
+            in_history,
+            since: state.chain_started,
         })
     }
 
@@ -2261,8 +2284,17 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         reports: &[RoundReport],
+        append: bool,
     ) -> Result<usize, AgentError> {
         if reports.is_empty() {
+            return Ok(0);
+        }
+        // The tokens of the rounds are counted whether or not the history takes the reports, so
+        // that the steps of a replay are the steps of the first try.
+        Self::count_rounds(ctx, state, false).await?;
+        if !append {
+            // Left for the next call, which finds them again: its listing stays on.
+            state.sessions_open = true;
             return Ok(0);
         }
         let messages = report_messages(reports, self.pages(SUBAGENT_READ));
@@ -2288,7 +2320,6 @@ impl LlmAgent {
         state.messages.extend(messages);
         let rounds: Vec<RunId> = reports.iter().map(|r| r.round).collect();
         state.note_reported(&rounds);
-        Self::count_rounds(ctx, state, false).await?;
         Ok(added)
     }
 
@@ -2320,6 +2351,14 @@ impl LlmAgent {
         let agents = self.session_agents.clone();
         let reports = self.session_reports;
         let reported = state.reported_rounds.clone();
+        let since = state.chain_started;
+        let in_history: HashSet<String> = state
+            .messages
+            .iter()
+            .flat_map(|m| m.tool_calls())
+            .filter(|c| c.name == SUBAGENT_READ && c.id.starts_with("report_"))
+            .map(|c| c.id.clone())
+            .collect();
         let found: Result<Option<RunId>, (bool, String)> = ctx
             .step(&format!("sessions:{turn}"), move || async move {
                 let names: Vec<&str> = agents.iter().map(String::as_str).collect();
@@ -2332,7 +2371,16 @@ impl LlmAgent {
                     .into_iter()
                     .find(|s| {
                         (does_work(s) && s.started_by == Some(me))
-                            || (reports && is_due(s, me, &reported))
+                            || (reports
+                                && is_due(
+                                    s,
+                                    &DueFacts {
+                                        me,
+                                        reported: &reported,
+                                        in_history: &in_history,
+                                        since,
+                                    },
+                                ))
                     })
                     .map(|s| s.id))
             })

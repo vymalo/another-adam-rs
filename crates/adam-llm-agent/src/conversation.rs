@@ -609,10 +609,18 @@ pub struct Conversation {
     /// existed, and not written while `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sessions_open: bool,
+    /// When the chain of tasks this run belongs to began, by the runtime's clock, set at the run's
+    /// first model call and **carried** by [`continued`](Self::continued): a person's round that
+    /// ended before it is not told to a run that does not continue the task that was told of it
+    /// (nothing records that it was). Absent from state written before it existed, and not written
+    /// while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_started: Option<DateTime<Utc>>,
 }
 
 /// How many rounds a run remembers having reported ([`Conversation::reported_rounds`]): the oldest
-/// is given up, so a round a hundred and twenty-nine reports ago may be reported once more.
+/// is given up. A round given up that is still due is not told again if its report is still in the
+/// history (its call id is there); one whose report was compacted away may be told once more.
 pub const MAX_REPORTED_ROUNDS: usize = 128;
 
 /// How many message ids a run remembers having read ([`Conversation::read_ids`]). A person does not
@@ -1210,6 +1218,7 @@ impl Conversation {
                 .collect(),
             pinned_calls: self.pinned_calls.clone(),
             reported_rounds: self.reported_rounds.clone(),
+            chain_started: self.chain_started,
             images: Arc::clone(&self.images),
             sent_images: self.sent_images.clone(),
             ..Self::default()
@@ -1238,6 +1247,31 @@ fn is_empty_images(map: &Arc<BTreeMap<String, StateImage>>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_rounds_keep_the_last_128_each_once_and_are_carried() {
+        let mut state = Conversation::default();
+        let rounds: Vec<RunId> = (0..MAX_REPORTED_ROUNDS + 5).map(|_| RunId::new()).collect();
+        state.note_reported(&rounds);
+        state.note_reported(&rounds[MAX_REPORTED_ROUNDS..]);
+        assert_eq!(state.reported_rounds.len(), MAX_REPORTED_ROUNDS);
+        assert_eq!(state.reported_rounds[..], rounds[5..]);
+        let next = state.continued("next", RunId::new());
+        assert_eq!(next.reported_rounds, state.reported_rounds);
+        assert!(!next.sessions_open);
+    }
+
+    #[test]
+    fn the_start_of_the_chain_is_carried_and_a_fresh_run_has_none() {
+        let mut state = Conversation::new("go");
+        assert_eq!(state.chain_started, None);
+        let at = Utc::now();
+        state.chain_started = Some(at);
+        assert_eq!(
+            state.continued("next", RunId::new()).chain_started,
+            Some(at)
+        );
+    }
 
     fn shot(sha: &str) -> adam_model::ImageRef {
         adam_model::ImageRef {

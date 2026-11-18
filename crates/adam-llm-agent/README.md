@@ -491,16 +491,24 @@ parks the run and returns.
   `max_tool_calls`.
 * **Reports during a turn (slice 3).** A round that ended while the model worked is told to it by its next call, with no read of
   its own. Inside the journaled step `model:<turn>` (no new step) the loop lists the sessions (`ChildStarter::sessions`) and reads
-  each **due** round through the read tool's `poll_remote`: the round has ended, is not a closing round, is not in
-  `Conversation::reported_rounds` (the last `MAX_REPORTED_ROUNDS` = 128, carried by `Conversation::continued`) and was started by
-  this run or by a person (a person's report says "started by the person" in its header and holds none of the person's words). The
-  request ends with one assistant message of `subagent_read` calls (ids `report_<32 hex of the round id>`) and their results; the
+  each **due** round through the read tool's `poll_remote`. A session's report is of **the latest round that worked** (`SessionSummary::report`:
+  a closing round that follows does not hide it, and a round a later round replaced before the parent looked is not reported on its own, and a round cancelled by the close that follows it is not reported: whoever closed the session knows). It is
+  due when that round has ended, is not in `Conversation::reported_rounds` (the last `MAX_REPORTED_ROUNDS` = 128, carried by
+  `Conversation::continued`) and its call id `report_<32 hex>` is not already in the history (a round the cap gave up is not told twice), and
+  either this run started it or a person did **after the chain of tasks began** (`Conversation::chain_started`, set at the run's first model call and
+  carried: a task that does not continue another does not re-tell a person's old round). A person's report says "started by the person" in
+  its header and holds none of the person's words. The request ends with one assistant message of `subagent_read` calls and their results; the
   record of the call holds them (`Recorded::reports`, with `sessions_open`, both absent when empty), so a replay gives the model the
   same words and every request starts with the one before it. The loop lists at the first model call of a run and, while
-  `Conversation::sessions_open` is set, before every call; a failed listing or read is skipped with a warning. The appended reads are
+  `Conversation::sessions_open` is set, before every call; it stays set while a due report was not appended (a failed or erroring read, a
+  stale answer). The tokens of the rounds are counted (`usage:<call>`) whenever a record holds reports, **whether or not the history takes them**
+  (an answer that predates a message is dropped with its reports, which the next call finds again), so the steps of a replay do not depend on it. The appended reads are
   not calls of the model: they do not count toward `max_tool_calls` or `doom_loop` and are added only when no result is owed, never
   inside a segment. A notice stays a wake-up (a lost one costs at most one turn, a copy matches nothing). `LlmAgentBuilder::without_session_reports`
-  (hidden) builds the agent as one from before, for the test that replays such a journal.
+  (hidden) builds the agent as one from before, for the tests that replay such a journal and count a round nobody read. **Unverified risks:**
+  the appended assistant message carries no reasoning (a model with `echo_reasoning` may expect it); a history can hold two assistant messages in a
+  row (the turn-end read is attached to the answer, but a report appended after an unsent answer is not); the listing runs inside `model:<turn>` before
+  the call with no time limit of its own; the step events of the appended reads are emitted after the answer has streamed.
 * **Tokens.** Every round a run started or sent to is counted **once** in its `usage_totals`, whether its report is read once,
   twice or never. `Conversation::rounds_started` lists the call ids (`subagent_start`, `subagent_send`) whose round is not yet
   counted; the round of a call is `child_run_id(run, call id)`. The read of a round's state is the journaled step
@@ -529,9 +537,12 @@ parks the run and returns.
 * **Retention.** A session lives as its rounds: `purge_finished` must outlast a session's idle life, and a purged first round makes the
   session vanish ("no session").
 
-**Breaking (slice 3):** `Conversation` has `reported_rounds` and `sessions_open`: a struct literal of it without `..Default::default()` stops
-compiling. No `Store` or trait method is added, no step changes name, and the journal and the state are **safe both ways**: a build from
-before slice 3 ignores the new members of `model:<turn>` and of the state and replays without the reports.
+**Breaking (slice 3):** `Conversation` has `reported_rounds`, `sessions_open` and `chain_started`: a struct literal of it without
+`..Default::default()` stops compiling; `adam_runtime::SessionSummary` has a `report` field (type `ReportRound`), so a literal of it does too. No
+`Store` or trait method is added and no step changes name. A journal that is **committed** from before slice 3 replays as it was. **No mixed
+versions**, as for slice 2: a transition in flight when a worker of the other revision takes the run can replay differently (the steps taken
+follow the build that replays), so stop every worker of the old revision before a run uses sessions; an old build ignores the new members of
+`model:<turn>` and of the state and replays without the reports.
 
 **Breaking:** `PendingWait` has a new variant (`Session`; a `match` with no wildcard stops compiling), `ToolOutput` has a field
 (`reported`: build it with its constructors), `Conversation` has `rounds_started` and the journal has the steps `sessions:<turn>` and `sessions_end:<turn>` for a run that
