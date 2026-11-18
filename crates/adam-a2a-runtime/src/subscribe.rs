@@ -61,9 +61,10 @@ pub(crate) fn subscribe(
 }
 
 /// What a poll compares to know the run has not changed since the last one: the store version
-/// (bumped by every commit), whether a worker holds the run (a lease changes without a commit) and
-/// when it was last committed.
-type RunStamp = (u64, bool, chrono::DateTime<chrono::Utc>);
+/// (bumped by every commit) and whether a worker holds the run (a lease changes without a commit).
+/// The version alone detects every state change; `claimed` is the lease, which the record's version
+/// does not carry. `updated_at` is deliberately not here: it cannot move without a commit.
+type RunStamp = (u64, bool);
 
 /// What the subscriber has been told so far.
 struct Tracker {
@@ -141,7 +142,7 @@ impl Tracker {
             context_id,
             seen_artifacts,
             ids,
-            seen: Some((view.version, view.claimed, view.updated_at)),
+            seen: Some((view.version, view.claimed)),
             last: status_key(&task.status),
             steps: caller.has_extension(STEPS_EXTENSION),
             reported: HashMap::new(),
@@ -157,7 +158,7 @@ impl Tracker {
     fn sync(&mut self, view: &RunView, backend: &RuntimeTaskBackend) -> Vec<TaskEvent> {
         // A poll that reads the run it already read has nothing to say, and says it without
         // hashing or serialising an artifact and without building a status.
-        let stamp = (view.version, view.claimed, view.updated_at);
+        let stamp = (view.version, view.claimed);
         if self.seen == Some(stamp) {
             return Vec::new();
         }
@@ -779,6 +780,19 @@ mod tests {
         );
         assert_eq!(after.1 - before.1, 1, "one serialisation for it");
         assert_eq!(said(&events), vec!["plan-x".to_owned()]);
+
+        // A replaceable artifact renamed in place is said again: the cache compares the name, not
+        // only the data, so a rename is not swallowed.
+        let mut renamed = replaced.clone();
+        renamed.version = 5;
+        renamed.artifacts[1] =
+            RunArtifact::new("plan-renamed", None, json!({"v": 2})).with_id("plan-x");
+        let events = tracker.sync(&renamed, &backend);
+        assert_eq!(
+            said(&events),
+            vec!["plan-x".to_owned()],
+            "a rename is said again"
+        );
     }
 
     /// An artifact the run changed is derived again: one without an id gets a new content-derived

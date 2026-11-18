@@ -376,6 +376,10 @@ impl Mapped {
 /// (a plan, a surface: JSON, never the bytes of a file), and the name and length of a file. A run
 /// never replaces a file ([ADR 0012](../../../docs/decisions/0012-files-as-a2a-artifacts.md)), and
 /// its bytes are what its id hashes.
+///
+/// The cache holds one copy of every non-file artifact's data per subscription; file bytes are
+/// never copied, only the filename and the length. A run with large JSON artifacts costs that much
+/// resident memory per open stream, not per run.
 #[derive(Default)]
 pub(crate) struct ArtifactIds {
     /// By position in the run's list. The list only grows, and an artifact with an id is replaced
@@ -436,6 +440,8 @@ impl ArtifactIds {
         if let Some(Some(entry)) = self.entries.get(at)
             && entry.held.is(artifact)
         {
+            // A file is never replaced (ADR 0012), so a hit on a file entry is the same file; the
+            // filename and length compared above are enough only because of that.
             return entry.mapped.clone();
         }
         let mapped = Mapped::of(artifact);
