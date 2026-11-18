@@ -235,7 +235,6 @@ impl RemoteEndpoint {
 
     /// Fetch the card again and rebuild the client from it, so a card that changed is read. Says
     /// whether the card lists `steer/v1`.
-    #[allow(dead_code)] // used by remote sessions in the next change
     pub(crate) async fn refresh(&self) -> Result<(Arc<Client>, bool), ToolError> {
         let mut slot = self.client.write().await;
         let (client, steers) = self.dial().await?;
@@ -391,6 +390,16 @@ impl RemoteEndpoint {
 
     /// Where a task stands, as the result of the call, or "still going".
     pub(crate) fn outcome(&self, task: &Task, files_left: u64) -> Outcome {
+        let name = self.name();
+        self.outcome_with(
+            task,
+            self.files.then(|| ReceivedFiles::new(name, files_left)),
+        )
+    }
+
+    /// [`outcome`](Self::outcome) with `files` given: `Some` shares the file parts of the answer,
+    /// `None` describes each in a line.
+    pub(crate) fn outcome_with(&self, task: &Task, mut files: Option<ReceivedFiles>) -> Outcome {
         let said = task
             .status
             .message
@@ -408,7 +417,6 @@ impl RemoteEndpoint {
         match task.status.state {
             TaskState::Unspecified | TaskState::Submitted | TaskState::Working => Outcome::Working,
             TaskState::Completed => {
-                let mut files = self.files.then(|| ReceivedFiles::new(name, files_left));
                 // An adam agent answers in its status message and shares its files as artifacts:
                 // artifacts with no words do not replace the words.
                 let artifacts_have_words = task.artifacts.iter().flatten().any(|a| {
@@ -478,9 +486,14 @@ impl RemoteEndpoint {
     /// A plain message that answered the call at once, as its result: its text, and with
     /// `files: true` its `raw` parts shared within `files_left` bytes.
     pub(crate) fn reply(&self, reply: &Message, files_left: u64) -> ToolOutput {
-        let mut files = self
+        let files = self
             .files
             .then(|| ReceivedFiles::new(self.name(), files_left));
+        Self::reply_with(reply, files)
+    }
+
+    /// [`reply`](Self::reply) with `files` given: `None` describes the file parts in lines.
+    pub(crate) fn reply_with(reply: &Message, mut files: Option<ReceivedFiles>) -> ToolOutput {
         let text = match cap_text(
             parts_text_sharing(&reply.parts, files.as_mut(), None),
             MAX_RESULT_BYTES,
@@ -556,7 +569,6 @@ impl RemoteSubagentTool {
     }
 
     /// The connection, shared with the remote session of the same subagent.
-    #[allow(dead_code)] // used by remote sessions in the next change
     pub(crate) fn endpoint(&self) -> &Arc<RemoteEndpoint> {
         &self.endpoint
     }
@@ -628,7 +640,7 @@ fn parts_text_sharing(
         .join("\n")
 }
 
-fn message_text(message: &Message) -> String {
+pub(crate) fn message_text(message: &Message) -> String {
     parts_text(&message.parts)
 }
 
@@ -1362,5 +1374,28 @@ mod tests {
                 .failure("send the message to", &A2AError::new(code, "no"));
             assert!(matches!(error, ToolError::Permanent(_)), "{code}");
         }
+    }
+
+    #[test]
+    fn the_card_says_whether_a_working_task_takes_messages() {
+        let mut card: AgentCard = serde_json::from_value(serde_json::json!({
+            "name": "billing", "description": "d", "version": "1",
+            "supportedInterfaces": [],
+            "capabilities": {}, "defaultInputModes": [], "defaultOutputModes": [], "skills": []
+        }))
+        .unwrap();
+        assert!(!lists_steer(&card));
+        card.capabilities.extensions = Some(vec![a2a::AgentExtension {
+            uri: STEER_EXTENSION_URI.to_owned(),
+            description: None,
+            required: None,
+            params: None,
+        }]);
+        assert!(lists_steer(&card));
+    }
+
+    #[test]
+    fn the_steer_uri_is_the_one_the_agents_declare() {
+        assert_eq!(STEER_EXTENSION_URI, adam_a2a::STEER_EXTENSION);
     }
 }

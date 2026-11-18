@@ -17,6 +17,7 @@ use crate::assembly::BoundDef;
 use crate::error::{Error, Origin, ToolClash};
 use crate::mcp::{self, McpBinding};
 use crate::remote::{RemoteSettings, RemoteSubagentTool};
+use crate::remote_session::RemoteRoundAgent;
 use crate::skills::{self, RunSkills, RunSkillsHandle, SkillFiles, SkillSet};
 use crate::subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 use crate::suggest::closest;
@@ -526,6 +527,9 @@ pub(crate) struct Node {
     /// The registration names of the subagents a session can be started on, when the agent has the
     /// session tools; empty otherwise.
     pub(crate) session_agents: Vec<String>,
+    /// The agents that work the rounds of a session on a remote subagent, one per remote subagent
+    /// of the root; empty for any other agent.
+    pub(crate) round_agents: Vec<RemoteRoundAgent>,
 }
 
 /// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
@@ -635,7 +639,7 @@ impl Walk<'_> {
         let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
         let mcp_names: Vec<String> = own_mcp.iter().map(|(n, _)| n.clone()).collect();
         // The session tools (ADR 0045) go to the root only: sessions are one level deep.
-        let session_agents = add_subagent_tools(
+        let (session_agents, round_agents) = add_subagent_tools(
             &origin,
             manifest,
             &Taken {
@@ -669,6 +673,7 @@ impl Walk<'_> {
             skills,
             preloaded,
             session_agents,
+            round_agents,
         });
         for sub in &manifest.subagents {
             match sub {
@@ -819,9 +824,10 @@ fn add_subagent_tools(
     remote: &RemoteSettings,
     tools: &mut Vec<(String, DynTool)>,
     sessions: bool,
-) -> Result<Vec<String>, Error> {
+) -> Result<(Vec<String>, Vec<RemoteRoundAgent>), Error> {
     // The subagent tools added so far, by name, with the file of the subagent that owns each.
     let mut subagents: Vec<(&str, &std::path::Path)> = Vec::new();
+    let mut rounds: Vec<RemoteRoundAgent> = Vec::new();
     for sub in &manifest.subagents {
         let (name, file) = match sub {
             Subagent::Local(child) => (child.name.as_str(), child.path.as_path()),
@@ -865,19 +871,22 @@ fn add_subagent_tools(
                 .with_run_limit(run_limit(child.frontmatter.limits.as_ref())),
             ),
             Subagent::Remote(agent) => {
-                Arc::new(RemoteSubagentTool::bind(&sub_origin, agent, remote)?)
+                let tool = RemoteSubagentTool::bind(&sub_origin, agent, remote)?;
+                // The rounds of a session on it are runs of an agent of its own, for the root.
+                if sessions {
+                    rounds.push(RemoteRoundAgent::new(
+                        format!("{}/{}", origin.agent, agent.name),
+                        Arc::clone(tool.endpoint()),
+                    ));
+                }
+                Arc::new(tool)
             }
         };
         subagents.push((name, file));
         tools.push((name.to_owned(), tool));
     }
-    if !sessions
-        || !manifest
-            .subagents
-            .iter()
-            .any(|s| matches!(s, Subagent::Local(_)))
-    {
-        return Ok(Vec::new());
+    if !sessions || manifest.subagents.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
     }
     // The tools that run a subagent in the background: after the one tool per subagent, and named
     // so that a clash with a tool or a subagent is found now.
@@ -894,9 +903,9 @@ fn add_subagent_tools(
             },
             Subagent::Remote(agent) => SessionAgent {
                 name: agent.name.clone(),
-                agent: agent.name.clone(),
+                agent: format!("{}/{}", origin.agent, agent.name),
                 description: agent.description.clone(),
-                within: None,
+                within: Some(remote.max_wait),
                 remote: true,
             },
         })
@@ -924,7 +933,7 @@ fn add_subagent_tools(
     for tool in session_tools.tools() {
         tools.push((tool.spec().name, tool));
     }
-    Ok(session_tools.session_agents())
+    Ok((session_tools.session_agents(), rounds))
 }
 
 /// The time limit of a subagent's run: `limits.max_minutes` of its file, 30 minutes when it says

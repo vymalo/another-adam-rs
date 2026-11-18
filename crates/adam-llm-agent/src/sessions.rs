@@ -92,8 +92,11 @@ pub struct SessionAgent {
     pub description: String,
     /// The time limit of each of its rounds (`None`: none).
     pub within: Option<Duration>,
-    /// Whether it runs on another system (an A2A agent). A session cannot be started on one yet:
-    /// the call is refused in words that point to the subagent's own tool.
+    /// Whether it runs on another system (an A2A agent). A session on it is started like any
+    /// other: its rounds are runs of the agent registered as [`agent`](Self::agent), which talks
+    /// to the remote. What differs is the answer to a message sent while a round works: such an
+    /// agent says in its round state (`queues_messages`) whether the remote takes the message at
+    /// once (`steered`) or only after its current task (`queued`).
     pub remote: bool,
 }
 
@@ -115,11 +118,7 @@ impl Roster {
     }
 
     fn registered(&self) -> Vec<&str> {
-        self.agents
-            .iter()
-            .filter(|a| !a.remote)
-            .map(|a| a.agent.as_str())
-            .collect()
+        self.agents.iter().map(|a| a.agent.as_str()).collect()
     }
 
     fn by_registered(&self, agent: &str) -> Option<&SessionAgent> {
@@ -165,7 +164,7 @@ impl SessionTools {
         ]
     }
 
-    /// The registration names of the subagents a session can be started on (the local ones):
+    /// The registration names of the subagents a session can be started on:
     /// what [`LlmAgentBuilder::session_agents`](crate::LlmAgentBuilder::session_agents) takes.
     pub fn session_agents(&self) -> Vec<String> {
         self.roster
@@ -437,13 +436,6 @@ impl Tool for Start {
                 self.roster.names().join(", ")
             ));
         };
-        if agent.remote {
-            return refuse(format!(
-                "`{}` runs on another system, and a session cannot be started on it yet: call the \
-                 `{}` tool for a synchronous ask",
-                agent.name, agent.name
-            ));
-        }
         let description = match text_arg(&args, "description") {
             Some(text) => one_line(text),
             None => {
@@ -634,7 +626,7 @@ impl Tool for Send {
                     .and_then(Value::as_array)
                     .is_some_and(|ids| ids.iter().any(|id| id == ctx.call_id()))
             {
-                return Ok(sent(session, view.round, "steered"));
+                return Ok(sent(session, view.round, delivery_of(&state)));
             }
             if view.closed {
                 return refuse(closed_words(session));
@@ -642,7 +634,14 @@ impl Tool for Send {
             let steered = || user_inbound(message, ctx.call_id());
             if view.state == SessionState::Working {
                 match starter.steer(&view, steered()).await {
-                    Ok(()) => return Ok(sent(session, view.round, "steered")),
+                    Ok(()) => {
+                        let state = starter.round_state(view.latest_run).await;
+                        let how = state
+                            .ok()
+                            .flatten()
+                            .map_or("steered", |state| delivery_of(&state));
+                        return Ok(sent(session, view.round, how));
+                    }
                     Err(e) if is_busy_or_finished(&e) => continue,
                     Err(e) => return Err(runtime_error(&e)),
                 }
@@ -687,6 +686,15 @@ impl Tool for Send {
         Err(ToolError::Transient(format!(
             "session `{session}` kept changing while the message was sent"
         )))
+    }
+}
+
+/// How a message that reached a working round was taken: `queued` when the round's agent says it
+/// keeps messages until its remote can take them (`queues_messages` in its state), else `steered`.
+fn delivery_of(round_state: &Value) -> &'static str {
+    match round_state.get("queues_messages") {
+        Some(Value::Bool(true)) => "queued",
+        _ => "steered",
     }
 }
 

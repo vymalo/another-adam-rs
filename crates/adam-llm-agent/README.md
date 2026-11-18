@@ -459,7 +459,7 @@ parks the run and returns.
 | Tool | Arguments | Result |
 |---|---|---|
 | `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working |
-| `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered"}`; an error result when the session is closed |
+| `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered" \| "queued"}` (`queued`: the round's agent says in its state, `queues_messages: true`, that it keeps the message until its remote can take it); an error result when the session is closed |
 | `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line, `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works |
 | `subagent_close` | `session`, `cancel` (default `false`) | `{"session", "state": "closed"}` |
 | `subagent_list` | `offset`, `limit` | one line per session, working then idle then closed, paged |
@@ -472,7 +472,9 @@ parks the run and returns.
   `subagent_send`, whose round **continues the session's conversation** (round 2 sees round 1). Closing an idle session starts a
   round that calls no model and ends with the last answer again; closing a working one leaves the round to finish (the
   session takes no more messages) unless `cancel: true`, which stops it. A closed session is never reopened. A remote
-  (`a2a:`) subagent is refused in words (use its own tool).
+  (`a2a:`) subagent works like any other: `SessionAgent::remote` only says it is one, and its rounds are runs of the agent
+  registered under `SessionAgent::agent`, which `adam-assembly` makes (`RemoteRoundAgent`). `subagent_send` reads
+  `queues_messages` from such a round's state to say `queued` instead of `steered`.
 * **Waiting.** `subagent_read` with `wait: true` and a working round returns `ToolError::AwaitSession`: the loop parks with a
   `PendingWait::Session` and the `wait_poll` timer. The round's end wakes the run (a notice), and what it does on waking is
   ask the tool how the session stands (`Tool::poll_remote`, the session id as the `task`) in a journaled step `poll:<call id>`,
@@ -497,7 +499,7 @@ parks the run and returns.
   conversation and `MAX_SESSION_ROUNDS` (20) rounds per session, a close included: the smallest hard bounds that keep a model
   from starting rounds without end.
 * **Not here yet** (slices 3 to 8): a report that reaches the model in the middle of a turn without a read, the session limits as
-  settings, remote sessions, the A2A extension, the coder's kept-open helpers, a child that asks the person.
+  settings, the A2A extension, the coder's kept-open helpers, a child that asks the person.
 
 * **Effects are committed first.** A turn that calls `subagent_start`, `_send` or `_close` is committed before the call runs, and
   each such call is its own transition, so a failed try never asks the model again (new call ids would start a second session)

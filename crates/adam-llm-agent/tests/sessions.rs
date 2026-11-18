@@ -387,6 +387,54 @@ impl Rig {
     }
 }
 
+/// An agent that keeps messages for later, as a round that talks to a remote does: its state says
+/// `queues_messages`, and it finishes when a message says `finish`.
+struct Queues(String);
+
+#[async_trait]
+impl adam_runtime::Agent for Queues {
+    type State = Value;
+
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn init(&self, input: Inbound) -> Result<Value, adam_runtime::AgentError> {
+        Ok(json!({
+            "session": input.payload["session"],
+            "queues_messages": true,
+            "read_ids": [],
+        }))
+    }
+
+    async fn step(
+        &self,
+        ctx: &mut adam_runtime::Ctx,
+        mut state: Value,
+    ) -> Result<adam_runtime::Transition<Value>, adam_runtime::AgentError> {
+        let mut finish = false;
+        for message in ctx.take_inbox() {
+            if message.kind != adam_llm_agent::MESSAGE_KIND {
+                continue;
+            }
+            finish |= message.payload["text"] == "finish";
+            if let Some(ids) = state["read_ids"].as_array_mut() {
+                ids.push(json!(message.id));
+            }
+        }
+        if finish {
+            return Ok(adam_runtime::Transition::Done {
+                state,
+                output: json!({"text": "queue done"}),
+            });
+        }
+        Ok(adam_runtime::Transition::Park {
+            state,
+            wake_at: None,
+        })
+    }
+}
+
 fn start_call(id: &str, keep_open: bool) -> ToolCall {
     call(
         id,
@@ -1213,28 +1261,72 @@ mod cases {
         assert_eq!(rig.child_mock.requests().len(), 1, "only alice's round ran");
     }
 
-    /// A subagent that runs on another system is refused in words that name the tool to use.
-    pub async fn a_remote_subagent_is_refused_in_words(store: DynStore) {
+    /// A subagent that runs on another system starts a round like any other: the round is a run of
+    /// the agent registered under its name, which is the one that talks to the remote.
+    pub async fn a_remote_subagent_starts_a_round_of_its_registered_agent(store: DynStore) {
         let rig = Rig::new();
+        let far_mock = Arc::new(MockModel::new());
+        far_mock.push_text("the far answer");
+        let far_model: DynModel = far_mock.clone();
+        let far = LlmAgent::builder("far", far_model, "m").build();
         let (parent_agent, child_agent) = (rig.parent(), rig.child());
-        let rt = rig.together(&store, &parent_agent, &child_agent);
-        let parent = rig.start(&rt, &conv_id()).await;
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent.clone())
+            .agent(child_agent)
+            .agent(far)
+            .build();
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
         rig.parent_mock
             .push_tool_calls(vec![call(
                 "c1",
                 "subagent_start",
                 json!({"agent": "far", "description": "d", "prompt": "p"}),
             )])
-            .push_text("refused");
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_text("read");
         let worker = spawn_worker(&rt);
         wait_done(&rt, parent).await;
         worker.stop().await;
         let results = tool_results(&state_of(&rt, parent).await);
-        let (_, text, is_error) = result_of(&results, "c1");
-        assert!(*is_error);
-        assert!(text.contains("runs on another system"), "{text}");
-        assert!(text.contains("`far` tool"), "{text}");
-        assert_eq!(rig.child_mock.requests().len(), 0);
+        let started = as_json(&result_of(&results, "c1").1);
+        assert_eq!(started["agent"], "far");
+        assert!(!result_of(&results, "c1").2, "{results:#?}");
+        assert!(result_of(&results, "c2").1.contains("the far answer"));
+        let listed = rt.list_sessions(&conv, &["far"], 0, 10).await.unwrap();
+        assert_eq!(listed.sessions.len(), 1);
+        assert_eq!(listed.sessions[0].agent, "far");
+        assert_eq!(far_mock.requests().len(), 1);
+    }
+
+    /// A round whose agent keeps messages until its remote can take them says so: the send answers
+    /// `queued`, not `steered`.
+    pub async fn a_send_to_a_round_that_queues_says_queued(store: DynStore) {
+        let rig = Rig::new();
+        let (parent_agent, queues) = (rig.parent(), Queues(rig.child_name.clone()));
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent)
+            .agent(queues)
+            .build();
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![send_call("c2", session, "hold on")])
+            .push_tool_calls(vec![send_call("c3", session, "finish")])
+            .push_tool_calls(vec![read_call("c4", session, true)])
+            .push_text("queued twice");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        for id in ["c2", "c3"] {
+            assert_eq!(as_json(&result_of(&results, id).1)["delivered"], "queued");
+        }
+        assert!(result_of(&results, "c4").1.contains("queue done"));
     }
 
     /// A later call of the same turn fails the try, and the model is asked again with other call
@@ -2799,7 +2891,8 @@ macro_rules! session_suite {
                 closing_with_cancel_stops_the_round,
                 the_list_orders_open_sessions_first_and_pages,
                 a_session_that_is_not_ours_is_refused_in_words,
-                a_remote_subagent_is_refused_in_words,
+                a_remote_subagent_starts_a_round_of_its_registered_agent,
+                a_send_to_a_round_that_queues_says_queued,
                 a_retried_try_starts_nothing_twice,
                 a_closed_session_reports_the_round_that_worked,
                 a_run_that_cannot_wait_cancels_its_rounds,

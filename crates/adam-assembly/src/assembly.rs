@@ -14,6 +14,7 @@ use adam_runtime::RuntimeBuilder;
 
 use crate::def::{Node, Remote};
 use crate::error::{AliasProblem, Error, Origin};
+use crate::remote_session::RemoteRoundAgent;
 use crate::scrub::{Scrub, Scrubbed};
 use crate::suggest::closest;
 
@@ -243,6 +244,15 @@ impl BoundDef {
             });
             resolved.push(alias);
         }
+        let rounds = self
+            .nodes
+            .iter()
+            .flat_map(|node| node.round_agents.iter().cloned())
+            .map(|round| match self.wait_poll {
+                Some(every) => round.with_wait_poll(every),
+                None => round,
+            })
+            .collect();
         let remotes = self
             .remotes
             .into_iter()
@@ -254,6 +264,7 @@ impl BoundDef {
         Ok(Assembly {
             manifest: self.manifest,
             agents,
+            rounds,
             info,
             remotes,
             #[cfg(feature = "mcp")]
@@ -398,6 +409,7 @@ pub struct RemoteInfo {
 pub struct Assembly {
     manifest: AgentManifest,
     agents: Vec<LlmAgent>,
+    rounds: Vec<RemoteRoundAgent>,
     info: Vec<AgentInfo>,
     remotes: Vec<RemoteInfo>,
     #[cfg(feature = "mcp")]
@@ -426,9 +438,21 @@ impl Assembly {
     /// sees an error result naming the missing agent. In a split deployment, register the
     /// subagents as starters on the process that steps the parent.
     pub fn register(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
-        self.agents
+        let builder = self
+            .agents
             .iter()
-            .fold(builder, |builder, agent| builder.agent(agent.clone()))
+            .fold(builder, |builder, agent| builder.agent(agent.clone()));
+        self.rounds
+            .iter()
+            .fold(builder, |builder, round| builder.agent(round.clone()))
+    }
+
+    /// The agents that work the rounds of a session on a remote subagent of the root, registered
+    /// as `<root>/<subagent>`: [`register`](Self::register) registers them with the rest. A
+    /// composition root that registers [`agents`](Self::agents) one by one registers these too, or
+    /// `subagent_start` on a remote subagent is refused in a process that does not know the name.
+    pub fn remote_round_agents(&self) -> &[RemoteRoundAgent] {
+        &self.rounds
     }
 
     /// What each agent in [`agents`](Self::agents) was made from, in the same order.

@@ -411,8 +411,20 @@ async fn a_remote_subagent_is_called_polled_and_its_answer_comes_back() {
         let model = Arc::new(MockModel::new());
         script(&model, "invoice 7", "the invoice is settled");
         let assembly = assemble(&files, &model);
-        // The tool is the parent's, after its own (none), like a local subagent.
-        assert_eq!(assembly.info()[0].tools, ["billing"], "{backend}");
+        // The tool is the parent's, after its own (none), like a local subagent. A root with a
+        // remote subagent has the session tools too.
+        assert_eq!(
+            assembly.info()[0].tools,
+            [
+                "billing",
+                "subagent_start",
+                "subagent_send",
+                "subagent_read",
+                "subagent_close",
+                "subagent_list"
+            ],
+            "{backend}"
+        );
         assert_eq!(assembly.remotes().len(), 1, "{backend}");
 
         let sink = CollectingSink::new();
@@ -434,7 +446,11 @@ async fn a_remote_subagent_is_called_polled_and_its_answer_comes_back() {
         let requests = model.requests();
         assert_eq!(requests.len(), 2, "{backend}");
         // Same shape as a local subagent: `{message}` and the same suffix.
-        assert_eq!(requests[0].tools.len(), 1);
+        assert_eq!(
+            requests[0].tools.len(),
+            6,
+            "the tool and the five of a session"
+        );
         assert_eq!(
             requests[0].tools[0].description,
             format!("Handles billing questions for a customer account. {NOTE}"),
@@ -957,7 +973,18 @@ fn a_remote_named_like_a_tool_of_its_parent_or_a_skill_tool_or_a_subagent_is_ref
         .unwrap()
         .model(Arc::new(MockModel::new()), "default")
         .unwrap();
-    assert_eq!(assembly.info()[0].tools, ["other", "billing"]);
+    assert_eq!(
+        assembly.info()[0].tools,
+        [
+            "other",
+            "billing",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
 
     // A remote named `load_skill`, on a parent with skills.
     let mut skill = remote_files("coder", "https://billing.example.com/card", None);
@@ -1253,4 +1280,71 @@ async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run(
         )
         .await;
     }
+}
+
+// --- sessions ------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_root_with_only_remote_subagents_gets_the_session_tools_and_a_round_agent() {
+    let root = uniq("root");
+    let files = remote_files(&root, "https://billing.example.com/card", None);
+    let assembly = def_of(&files)
+        .bind(ToolSet::new())
+        .unwrap()
+        .model(Arc::new(MockModel::new()), "default")
+        .unwrap();
+    assert_eq!(
+        assembly.info()[0].tools,
+        [
+            "billing",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_close",
+            "subagent_list"
+        ]
+    );
+    assert_eq!(assembly.remote_round_agents().len(), 1);
+    // The agent of its rounds is registered beside the root, under `<root>/<subagent>`.
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = assembly.register(Runtime::builder(store)).build();
+    assert_eq!(rt.agent_names(), [root.clone(), format!("{root}/billing")]);
+    // Registered one by one, as a composition root may: the same.
+    let by_hand = assembly
+        .remote_round_agents()
+        .iter()
+        .fold(
+            Runtime::builder(Arc::new(MemoryStore::new()) as DynStore)
+                .agent(assembly.root().clone()),
+            |builder, round| builder.agent(round.clone()),
+        )
+        .build();
+    assert_eq!(by_hand.agent_names(), rt.agent_names());
+}
+
+#[tokio::test]
+async fn the_remote_subagent_of_a_subagent_has_no_session_and_no_round_agent() {
+    let root = uniq("root");
+    let files: Files = vec![
+        (
+            "agent/instructions.md".into(),
+            instructions(&format!("name: {root}\ntools: []"), "You are the root."),
+        ),
+        (
+            "agent/subagents/researcher/instructions.md".into(),
+            instructions("description: Researches.\ntools: []", "You research."),
+        ),
+        (
+            "agent/subagents/researcher/subagents/browser.md".into(),
+            "---\ndescription: Reads pages.\na2a: https://browser.example.com/card\n---\n".into(),
+        ),
+    ];
+    let assembly = def_of(&files)
+        .bind(ToolSet::new())
+        .unwrap()
+        .model(Arc::new(MockModel::new()), "default")
+        .unwrap();
+    assert!(assembly.remote_round_agents().is_empty());
+    let researcher = &assembly.info()[1];
+    assert_eq!(researcher.tools, ["browser"], "sessions are one level deep");
 }
