@@ -415,3 +415,50 @@ async fn a_gate_runs_alone() {
     .await;
     assert_eq!(t.max_running.load(SeqCst), 1, "{:?}", t.events.lock());
 }
+
+/// A tool that runs beside the other calls of its turn changes the run notes through
+/// `NotesStore::update`, one step under the run's lock: a `load` and a `save` of its own could drop
+/// the change of a call that ran between them. Only what never runs beside a call of its turn saves
+/// the notes itself: the agent before the turn, and the gates that run alone (`run_checks` and its run
+/// on the base, `commit_and_push`, `open_pull_request`). A new direct save is a decision: pin it here.
+#[test]
+fn only_what_runs_alone_saves_the_notes_itself() {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, found: &mut BTreeMap<String, usize>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, root, found);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text: String = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .split_whitespace()
+                    .collect();
+                let saves = text.matches(".notes.save(").count();
+                if saves > 0 {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    found.insert(rel, saves);
+                }
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = BTreeMap::new();
+    walk(&root, &root, &mut found);
+    let expected: BTreeMap<String, usize> = [
+        ("agent.rs", 1),
+        ("tools/checks.rs", 1),
+        ("tools/preexisting.rs", 1),
+        ("tools/publish.rs", 4),
+    ]
+    .into_iter()
+    .map(|(f, n)| (f.to_owned(), n))
+    .collect();
+    assert_eq!(
+        found, expected,
+        "a save of the notes outside `NotesStore::update`"
+    );
+}

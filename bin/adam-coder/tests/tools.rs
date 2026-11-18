@@ -5129,6 +5129,41 @@ fn shared(out: &ToolOutput) -> (String, String, String, Vec<u8>) {
     )
 }
 
+/// `share_file` runs beside the other calls of its turn (ADR 0049): files shared by calls at the
+/// same time are all in the notes, each recorded in one step (`NotesStore::update`).
+#[tokio::test]
+async fn files_shared_at_the_same_time_are_all_noted() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let names: Vec<String> = (0..6).map(|n| format!("out/f{n}.svg")).collect();
+    for name in &names {
+        WriteFile
+            .call(
+                &rig.ctx,
+                json!({"path": name, "content": String::from_utf8_lossy(SVG)}),
+            )
+            .await
+            .unwrap();
+    }
+    let shares = names
+        .iter()
+        .map(|name| ShareFile.call(&rig.ctx, json!({"path": name})));
+    for out in futures::future::join_all(shares).await {
+        assert!(!out.unwrap().is_error);
+    }
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    let mut shared = notes.shared.clone();
+    shared.sort();
+    let expected: Vec<String> = names.iter().map(|n| format!("remote/{n}")).collect();
+    assert_eq!(shared, expected);
+}
+
 #[tokio::test]
 async fn share_file_needs_a_workspace_like_the_others() {
     let rig = Rig::new().await;
