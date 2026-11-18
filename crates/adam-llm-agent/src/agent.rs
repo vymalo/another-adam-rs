@@ -501,7 +501,8 @@ pub enum BuildError {
         /// The repeated name.
         name: String,
     },
-    /// A tool's own schema has a property called `after_previous`, which the loop reserves for the
+    /// A tool's own schema (a compiled tool's: not one whose [`Tool::schema_is_foreign`], such as an
+    /// MCP server's) has a property called `after_previous`, which the loop reserves for the
     /// order of the calls of a turn ([`AFTER_PREVIOUS`](crate::AFTER_PREVIOUS)) whenever more than
     /// one call may run at once. Rename the property, or build the agent with `max_parallel(1)`.
     #[error(
@@ -692,7 +693,7 @@ impl LlmAgentBuilder {
                     });
                 }
             }
-            if self.max_parallel > 1 && order::has_own(&tool.spec()) {
+            if self.max_parallel > 1 && !tool.schema_is_foreign() && order::has_own(&tool.spec()) {
                 return Err(BuildError::ReservedArgument {
                     tool: name,
                     argument: order::AFTER_PREVIOUS.to_owned(),
@@ -1715,7 +1716,14 @@ impl LlmAgent {
         self.instructions
             .as_deref()
             .map_or(0, |s| s.chars().count())
-            + serde_json::to_string(&self.specs).map_or(0, |s| s.chars().count())
+            + serde_json::to_string(&self.shown_specs()).map_or(0, |s| s.chars().count())
+    }
+
+    /// The agent's own specs as a request shows them: with `after_previous` above a limit of one.
+    fn shown_specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self.specs.clone();
+        order::prepare(&mut specs, self.max_parallel > 1);
+        specs
     }
 
     /// The estimate of the next request, in tokens.
@@ -2906,6 +2914,9 @@ impl LlmAgent {
     /// nobody has the tool and the agent has no source to ask. `None` for a call that runs a tool.
     fn shortcut(&self, call: &ToolCall, output_cut: bool) -> Option<String> {
         if let Some(raw) = &call.invalid_arguments {
+            if call.arguments.as_str() == Some(order::BAD_ORDER_MARKER) {
+                return Some(order::bad_value(&call.name, raw));
+            }
             return Some(invalid_arguments(&call.name, raw, output_cut));
         }
         // A name that is none of the agent's own: an agent with no source says so at once, one with
@@ -3569,13 +3580,9 @@ async fn output_message(
     });
     if !refused.is_empty() {
         output.is_error = true;
-        output.content.push_str(&format!(
-            "\nNot shared: {}. A run may share at most {} MiB of files in all, and it has shared \
-             {} KiB so far.",
-            refused.join(", "),
-            MAX_RUN_FILE_BYTES / (1024 * 1024),
-            files_used / 1024
-        ));
+        output
+            .content
+            .push_str(&crate::tool::files_not_shared(&refused, files_used));
     }
     let outcome = if output.is_error {
         StepState::Failed
@@ -4041,8 +4048,8 @@ const INVALID_ARGUMENTS_QUOTE: usize = 2048;
 
 /// The calls of a turn as the loop runs them: `after_previous` taken out of each (the tool, its access, the
 /// doom-loop key, the hooks and the step's input never see it), and the ids of the calls that said `true`.
-/// A call whose value is not a boolean does not run: it becomes a call with invalid arguments, which
-/// [`invalid_arguments`] answers. A tool in `own` has its own `after_previous`: its calls are left as they
+/// A call whose value is not a boolean does not run: it becomes a call whose arguments are
+/// [`order::BAD_ORDER_MARKER`] and whose `invalid_arguments` hold the value, which `shortcut` answers. A tool in `own` has its own `after_previous`: its calls are left as they
 /// are. The history keeps what the model said.
 fn ordered_by_the_model(calls: Vec<ToolCall>, own: &[String]) -> (Vec<ToolCall>, Vec<String>) {
     let mut barriers = Vec::new();
@@ -4052,13 +4059,12 @@ fn ordered_by_the_model(calls: Vec<ToolCall>, own: &[String]) -> (Vec<ToolCall>,
             if call.invalid_arguments.is_some() || own.contains(&call.name) {
                 return call;
             }
-            let original = call.arguments.clone();
             match order::take(&mut call.arguments) {
                 order::Order::Plain => {}
                 order::Order::After => barriers.push(call.id.clone()),
-                order::Order::Bad(_) => {
-                    call.invalid_arguments = Some(original.to_string());
-                    call.arguments = Value::String(adam_model::INVALID_ARGUMENTS_MARKER.into());
+                order::Order::Bad(value) => {
+                    call.invalid_arguments = Some(value);
+                    call.arguments = Value::String(order::BAD_ORDER_MARKER.into());
                 }
             }
             call
@@ -4067,22 +4073,8 @@ fn ordered_by_the_model(calls: Vec<ToolCall>, own: &[String]) -> (Vec<ToolCall>,
     (calls, barriers)
 }
 
-/// What the model is told when the arguments of its call were not JSON, or when its `after_previous`
-/// was not a boolean (the arguments are then valid JSON, and the call is kept as invalid by
-/// [`ordered_by_the_model`]).
+/// What the model is told when the arguments of its call were not JSON.
 fn invalid_arguments(name: &str, raw: &str, output_cut: bool) -> String {
-    if let Ok(Value::Object(mut arguments)) = serde_json::from_str::<Value>(raw)
-        && let Some(value) = arguments.remove(order::AFTER_PREVIOUS)
-    {
-        let mut shown = Value::Object(serde_json::Map::from_iter([(
-            order::AFTER_PREVIOUS.to_owned(),
-            value,
-        )]));
-        let order::Order::Bad(text) = order::take(&mut shown) else {
-            return order::bad_value(name, "something else");
-        };
-        return order::bad_value(name, &text);
-    }
     let why = serde_json::from_str::<Value>(raw)
         .err()
         .map_or_else(String::new, |e| format!(": {e}"));
@@ -4363,6 +4355,10 @@ impl Agent for LlmAgent {
         }
         if matches!(flow, Flow::Next) {
             flow = self.run_pending(ctx, &mut state, &notices).await?;
+        }
+        // The order the model asked for is the turn's: once its calls are answered it says nothing.
+        if state.pending_calls.is_empty() {
+            state.ordered_calls.clear();
         }
         Ok(match flow {
             Flow::Next => {
@@ -4645,6 +4641,40 @@ mod compaction_gate_tests {
                 ..Limits::default()
             })
             .build()
+    }
+
+    /// The budget of a request counts what the loop adds above a limit of one: the property in each
+    /// schema and the sentence of the instructions.
+    #[test]
+    fn the_fixed_part_of_a_request_counts_the_injected_order() {
+        let built = |limit: usize| {
+            let model: DynModel = Arc::new(MockModel::new());
+            LlmAgent::builder("t", model, "m")
+                .instructions("be brief")
+                .max_parallel(limit)
+                .tool(crate::FnTool::raw(
+                    "a",
+                    "a",
+                    json!({"type": "object", "properties": {}}),
+                    |_ctx, _args| async { Ok::<_, crate::ToolError>(crate::ToolOutput::text("a")) },
+                ))
+                .build()
+        };
+        let one = built(1).fixed_chars();
+        let ten = built(10).fixed_chars();
+        let mut specs = built(10).specs.clone();
+        order::prepare(&mut specs, true);
+        let injected = serde_json::to_string(&specs).unwrap().chars().count()
+            - serde_json::to_string(&built(10).specs)
+                .unwrap()
+                .chars()
+                .count();
+        assert!(injected > 0);
+        assert_eq!(
+            ten - one,
+            injected + order::INSTRUCTION.chars().count() + 2,
+            "the property and the sentence (after a blank line) are counted"
+        );
     }
 
     /// A history of `turns` turns whose results are `size` letters, and `turns` model turns made.

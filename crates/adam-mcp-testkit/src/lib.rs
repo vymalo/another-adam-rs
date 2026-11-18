@@ -18,8 +18,9 @@
 //! | `slow` | none | nothing, ever |
 //! | `a.b` | none | `dotted`; a tool whose name no model provider accepts |
 //!
-//! A [`Script`] adds what a server says about itself (`instructions`) and the prompts it serves
-//! ([`TestPrompt`]); [`TestHttpServer::start_scripted`] serves one.
+//! A [`Script`] adds what a server says about itself (`instructions`), the prompts it serves
+//! ([`TestPrompt`]) and, with `ordered_tool`, a tool `ordered` whose own schema has a property
+//! `after_previous` (it answers with the JSON of its arguments); [`TestHttpServer::start_scripted`] serves one.
 //!
 //! Test code, not a product: it panics and exits on purpose.
 
@@ -154,6 +155,9 @@ pub struct Script {
     pub hang_prompt_list: bool,
     /// How long `tools/list` waits before it answers, in milliseconds.
     pub list_tools_delay_ms: u64,
+    /// Also list `ordered`, a tool whose own schema has a property `after_previous` (the name an
+    /// agent reserves for the order of parallel calls): it answers with the JSON of its arguments.
+    pub ordered_tool: bool,
 }
 
 /// The MCP server behind the tools of the table in the [crate docs](crate).
@@ -360,7 +364,21 @@ impl ServerHandler for TestServer {
             ))
             .await;
         }
-        Ok(ListToolsResult::with_all_items(Self::tools()))
+        let mut tools = Self::tools();
+        if self.script.ordered_tool {
+            let schema = json!({
+                "type": "object",
+                "properties": {"after_previous": {"type": "string"}}
+            });
+            if let Value::Object(map) = schema {
+                tools.push(Tool::new(
+                    "ordered",
+                    "Answers with the JSON of its arguments.",
+                    Arc::new(map),
+                ));
+            }
+        }
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
@@ -448,6 +466,9 @@ impl ServerHandler for TestServer {
                 Ok(text("unreachable"))
             }
             "a.b" => Ok(text("dotted")),
+            "ordered" if self.script.ordered_tool => {
+                Ok(text(Value::Object(args.clone()).to_string()))
+            }
             other => Err(McpError::invalid_params(format!("no tool `{other}`"), None)),
         }
     }

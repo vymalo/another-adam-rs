@@ -141,6 +141,15 @@ pub trait Tool: Send + Sync + 'static {
         ToolAccess::Alone
     }
 
+    /// Whether the tool's schema is another system's (an MCP server's) and not this program's own.
+    /// A property called `after_previous` in such a schema is that system's: the agent keeps it and
+    /// never strips it, where a schema of its own with that name is a build error
+    /// ([`BuildError::ReservedArgument`](crate::BuildError::ReservedArgument)). The default is
+    /// `false`. A tool that wraps another must forward it.
+    fn schema_is_foreign(&self) -> bool {
+        false
+    }
+
     /// Whether the answer to this tool's own question may be acted on: the loop asks before it
     /// hands the answer to the model.
     ///
@@ -325,6 +334,18 @@ impl StepStyle {
             None => step,
         }
     }
+}
+
+/// The line that says the files `names` were not shared because the run has shared `used` bytes of
+/// its [`MAX_RUN_FILE_BYTES`] already: the same words whether a tool or the loop refused them.
+pub(crate) fn files_not_shared(names: &[String], used: u64) -> String {
+    format!(
+        "\nNot shared: {}. A run may share at most {} MiB of files in all, and it has shared \
+         {} KiB so far.",
+        names.join(", "),
+        MAX_RUN_FILE_BYTES / (1024 * 1024),
+        used / 1024
+    )
 }
 
 /// The id of the step of the call `call_id`: `tool:<call id>`.
@@ -1028,16 +1049,51 @@ impl ToolCtx {
         }
     }
 
-    /// [`spend_files`](Self::spend_files) for the files among `artifacts`: what a tool that returns
-    /// files it did not choose (an MCP server's, a remote agent's) calls with its result.
-    pub fn spend_files_of(&self, artifacts: &[adam_runtime::Artifact]) {
-        let bytes: usize = artifacts
-            .iter()
-            .filter_map(|a| a.file.as_ref())
-            .map(|f| f.bytes.len())
-            .sum();
-        if bytes > 0 {
-            self.spend_files(u64::try_from(bytes).unwrap_or(u64::MAX));
+    /// Take `bytes` of the room for files if they fit, at once: `false` (and nothing taken) when
+    /// fewer are left. The calls of one segment share the room, so of two calls that both read
+    /// enough room before either took it, only one gets it.
+    pub fn try_spend_files(&self, bytes: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut left = self.files_left.load(SeqCst);
+        loop {
+            let Some(after) = left.checked_sub(bytes) else {
+                return false;
+            };
+            match self
+                .files_left
+                .compare_exchange_weak(left, after, SeqCst, SeqCst)
+            {
+                Ok(_) => return true,
+                Err(now) => left = now,
+            }
+        }
+    }
+
+    /// Take the room for the files of `output` the moment the tool has them, file by file
+    /// ([`try_spend_files`](Self::try_spend_files)): a file that does not fit is dropped from the
+    /// output, which becomes an error result that says so, in the words the loop uses when it
+    /// refuses a file. What a tool that returns files it did not choose (an MCP server's, a remote
+    /// agent's) calls with its result, so that two calls that run together never journal more than
+    /// the run may share.
+    pub fn spend_files_of(&self, output: &mut ToolOutput) {
+        let before = self.files_left();
+        let mut refused: Vec<String> = Vec::new();
+        output.artifacts.retain(|a| {
+            let Some(file) = &a.file else {
+                return true;
+            };
+            let len = u64::try_from(file.bytes.len()).unwrap_or(u64::MAX);
+            if self.try_spend_files(len) {
+                true
+            } else {
+                refused.push(a.name.clone());
+                false
+            }
+        });
+        if !refused.is_empty() {
+            output.is_error = true;
+            let used = (MAX_RUN_FILE_BYTES as u64).saturating_sub(before);
+            output.content.push_str(&files_not_shared(&refused, used));
         }
     }
 

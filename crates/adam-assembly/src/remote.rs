@@ -633,13 +633,13 @@ impl Tool for RemoteSubagentTool {
             .map_err(|e| self.failure("send the message to", &e))?;
         match response {
             SendMessageResponse::Message(reply) => {
-                let output = self.reply(&reply, ctx.files_left());
-                ctx.spend_files_of(&output.artifacts);
+                let mut output = self.reply(&reply, ctx.files_left());
+                ctx.spend_files_of(&mut output);
                 Ok(output)
             }
             SendMessageResponse::Task(task) => match self.outcome(&task, ctx.files_left()) {
-                Outcome::Done(output) => {
-                    ctx.spend_files_of(&output.artifacts);
+                Outcome::Done(mut output) => {
+                    ctx.spend_files_of(&mut output);
                     Ok(output)
                 }
                 Outcome::Working => {

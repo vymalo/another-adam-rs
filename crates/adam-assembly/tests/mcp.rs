@@ -1077,3 +1077,62 @@ async fn a_subagents_instructions_and_prompts_stay_with_it() {
         .collect();
     assert_eq!(commands, ["srv__p"], "the root's prompts only");
 }
+
+/// An MCP tool whose own schema has a property `after_previous` is the server's: the agent still
+/// builds above a limit of one, the property is not replaced, and the value reaches the server.
+#[tokio::test]
+async fn an_mcp_tool_with_its_own_after_previous_keeps_it_and_the_agent_builds() {
+    let script = adam_mcp_testkit::Script {
+        ordered_tool: true,
+        ..Default::default()
+    };
+    let server = TestHttpServer::start_scripted(Some(TOKEN), script).await;
+    let root = uniq("root");
+    let files = root_files(
+        &root,
+        "tools: ['linear__ordered']",
+        &mcp_json(&server.url(), "LINEAR_TOKEN", ""),
+    );
+    let def = def_of(&files)
+        .env("LINEAR_TOKEN", TOKEN)
+        .connect_mcp(&policy())
+        .await
+        .unwrap();
+    let model = Arc::new(MockModel::new());
+    model
+        .push_tool_calls(vec![call(
+            "c1",
+            "linear__ordered",
+            json!({"after_previous": "the server's own"}),
+        )])
+        .push_text("all done");
+    let assembly = def
+        .bind(ToolSet::new())
+        .unwrap()
+        .max_parallel(10)
+        .model(model.clone(), "default")
+        .expect("an MCP tool's own property is no build error");
+    let rt = assembly
+        .register(Runtime::builder(Arc::new(adam_core::MemoryStore::new())))
+        .poll_interval(std::time::Duration::from_millis(20))
+        .build();
+    let worker = spawn_worker(&rt);
+    let run = rt.start(&root, user_message("go"), None).await.unwrap();
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    let requests = model.requests();
+    let shown = &requests[0].tools[0];
+    assert_eq!(shown.name, "linear__ordered");
+    assert_eq!(
+        shown.parameters["properties"]["after_previous"],
+        json!({"type": "string"}),
+        "the server's property is not replaced"
+    );
+    let (text, is_error) = last_tool_result(&requests[1], "c1");
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({"after_previous": "the server's own"}),
+        "the argument reached the server"
+    );
+}

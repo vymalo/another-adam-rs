@@ -227,7 +227,7 @@ impl McpTool {
         outcome: Result<CallToolResponse, ServiceError>,
     ) -> (ToolOutput, bool) {
         let scrub = |text: &str| cap_text(redactor.scrub(text), MAX_MESSAGE_BYTES);
-        let output = match outcome {
+        let mut output = match outcome {
             Ok(CallToolResponse::Complete(result)) => map_result(
                 &result,
                 redactor,
@@ -274,7 +274,7 @@ impl McpTool {
             }
         };
         // The files it shares count against the room the turn's other calls read (ADR 0049).
-        ctx.spend_files_of(&output.artifacts);
+        ctx.spend_files_of(&mut output);
         (output, false)
     }
 
@@ -407,6 +407,12 @@ impl Tool for McpTool {
         } else {
             ToolAccess::Alone
         }
+    }
+
+    /// The schema is the server's: a property it calls `after_previous` is the server's own, kept
+    /// as it is and never taken out of a call (ADR 0049).
+    fn schema_is_foreign(&self) -> bool {
+        true
     }
 
     /// The call's own timeout, the time a connection may take (a call dials again, or dials for

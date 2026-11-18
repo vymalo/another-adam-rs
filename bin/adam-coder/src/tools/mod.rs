@@ -1090,6 +1090,10 @@ impl Tool for Gated {
         self.inner.access(args)
     }
 
+    fn schema_is_foreign(&self) -> bool {
+        self.inner.schema_is_foreign()
+    }
+
     fn read_answer(
         &self,
         call_id: &str,
@@ -1261,6 +1265,10 @@ impl Tool for Redacting {
 
     fn access(&self, args: &Value) -> ToolAccess {
         self.inner.access(args)
+    }
+
+    fn schema_is_foreign(&self) -> bool {
+        self.inner.schema_is_foreign()
     }
 
     fn time_limit(&self) -> Option<Duration> {

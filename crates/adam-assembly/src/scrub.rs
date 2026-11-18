@@ -110,6 +110,10 @@ impl Tool for Scrubbed {
         self.inner.access(args)
     }
 
+    fn schema_is_foreign(&self) -> bool {
+        self.inner.schema_is_foreign()
+    }
+
     fn time_limit(&self) -> Option<Duration> {
         self.inner.time_limit()
     }

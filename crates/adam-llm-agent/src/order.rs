@@ -20,7 +20,7 @@ pub const AFTER_PREVIOUS: &str = "after_previous";
 /// What the instructions say about [`AFTER_PREVIOUS`]: the sentence appended to them (after a blank
 /// line) when the limit is above 1. Exported as `AFTER_PREVIOUS_INSTRUCTION`, so a test can tell it from
 /// the agent's own words.
-pub const INSTRUCTION: &str = "The tool calls of one reply run at the same time; give a call \
+pub const INSTRUCTION: &str = "The tool calls of one reply may run at the same time; give a call \
     `\"after_previous\": true` when it must start only after every call before it in the reply has \
     finished.";
 
@@ -101,6 +101,11 @@ pub(crate) fn take(arguments: &mut Value) -> Order {
         }
     }
 }
+
+/// The `arguments` of a call that does not run because its [`AFTER_PREVIOUS`] is not a boolean: the
+/// call's `invalid_arguments` then holds the value, as text, and this marker says why, apart from
+/// [`adam_model::INVALID_ARGUMENTS_MARKER`] (arguments that were not JSON).
+pub(crate) const BAD_ORDER_MARKER: &str = "after_previous was not a boolean";
 
 /// What the model is told when a call's [`AFTER_PREVIOUS`] is not a boolean.
 pub(crate) fn bad_value(tool: &str, value: &str) -> String {

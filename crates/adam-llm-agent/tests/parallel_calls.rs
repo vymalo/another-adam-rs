@@ -1843,6 +1843,12 @@ async fn after_previous_is_in_every_schema_above_a_limit_of_one_and_in_none_at_o
             injected,
             "the instruction says it above a limit of one only: {system:?}"
         );
+        if injected {
+            assert!(
+                system.contains("The tool calls of one reply may run at the same time"),
+                "a tool that runs alone still does, so the calls only may: {system:?}"
+            );
+        }
     }
 }
 
@@ -2044,4 +2050,339 @@ fn read_output_is_independent_and_the_session_list_runs_alone() {
             tool.spec().name
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The fixes of the review of PR B
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_call_flagged_invalid_by_the_client_is_told_why_even_when_its_text_holds_after_previous()
+{
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    let mut bad = call(
+        "c1",
+        "probe",
+        Value::String(adam_model::INVALID_ARGUMENTS_MARKER.into()),
+    );
+    bad.invalid_arguments = Some(r#"{"after_previous": true}"#.into());
+    h.mock.push_tool_calls(vec![bad]);
+    h.mock.push_text("done");
+    let (_, view) = h.run(10, "go", &log).await;
+    let answers = tool_answers(&view);
+    assert!(answers[0].1, "{answers:?}");
+    assert!(
+        answers[0].0.contains("not valid JSON"),
+        "the client's reason, not the order's: {}",
+        answers[0].0
+    );
+    assert!(
+        !answers[0].0.contains("must be true or false"),
+        "{}",
+        answers[0].0
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_order_of_a_turn_is_not_kept_once_its_calls_are_answered() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"use": "independent", "tag": 1})),
+        call(
+            "c2",
+            "probe",
+            json!({"use": "independent", "tag": 2, "after_previous": true}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    let (_, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    let state = conversation(&view);
+    assert!(state.pending_calls.is_empty());
+    assert!(
+        state.ordered_calls.is_empty(),
+        "the snapshot keeps no order of calls that are answered: {:?}",
+        state.ordered_calls
+    );
+}
+
+/// A source whose tool `mine` has a property `after_previous` of its own, or not: what a server that
+/// changed between two processes would list.
+struct Mine {
+    log: Arc<Log>,
+    own: bool,
+}
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for Mine {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        let parameters = if self.own {
+            json!({"type": "object", "properties": {"after_previous": {"type": "string"}}})
+        } else {
+            json!({"type": "object"})
+        };
+        vec![ToolSpec {
+            name: "mine".into(),
+            description: "mine".into(),
+            parameters,
+        }]
+    }
+
+    fn access(&self, _name: &str, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
+    async fn call(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        let id = ctx.call_id().to_owned();
+        self.log.args.lock().unwrap().insert(id.clone(), args);
+        self.log.events.lock().unwrap().push(format!("start:{id}"));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.log.events.lock().unwrap().push(format!("end:{id}"));
+        *self.log.ends.lock().unwrap().entry(id.clone()).or_default() += 1;
+        Some(Ok(ToolOutput::text(format!("{name}:{id}"))))
+    }
+}
+
+/// The turn of the restart tests: a call that hangs in the first process, a call to the source's tool
+/// with its own `after_previous`, and a call that asks to follow both.
+fn ordered_turn(hang: bool) -> Vec<ToolCall> {
+    vec![
+        call(
+            "c1",
+            "probe",
+            json!({"ms": 30, "use": "independent", "tag": 1, "hang": hang}),
+        ),
+        call("c2", "mine", json!({"after_previous": "later", "k": 2})),
+        call(
+            "c3",
+            "probe",
+            json!({"ms": 5, "use": "independent", "tag": 3, "after_previous": true}),
+        ),
+    ]
+}
+
+/// The start events of the tool steps of `run`, by call id: what each call was given.
+fn step_inputs(h: &Harness, run: RunId) -> HashMap<String, Value> {
+    h.sink
+        .events_for(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) if step.state == StepState::Running => {
+                Some((step.id, Value::Object(step.input.unwrap_or_default())))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_restart_with_another_limit_and_other_sources_keeps_the_recorded_order() {
+    // An uninterrupted run, for the journal it writes.
+    let reference = {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(ordered_turn(false));
+        h.mock.push_text("done");
+        let agent = h.agent(10, |b| {
+            b.tool(Probe::new(&log)).tool_source(Mine {
+                log: log.clone(),
+                own: true,
+            })
+        });
+        let rt = h.runtime(agent, Duration::from_secs(10));
+        let run = rt.start("llm", user_message("go"), None).await.unwrap();
+        let worker = Worker::spawn(&rt);
+        wait_terminal(&rt, run).await;
+        worker.stop().await;
+        (h.journal(run).await, step_inputs(&h, run))
+    };
+    for (first, second) in [(10usize, 1usize), (1, 10)] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(ordered_turn(true));
+        h.mock.push_text("done");
+        let probe = Probe::new(&log);
+        probe.armed.store(true, SeqCst);
+        let armed = probe.armed.clone();
+        let agent = h.agent(first, |b| {
+            b.tool(probe).tool_source(Mine {
+                log: log.clone(),
+                own: true,
+            })
+        });
+        let rt = h.runtime(agent, Duration::from_millis(300));
+        let run = rt.start("llm", user_message("go"), None).await.unwrap();
+        let worker = Worker::spawn(&rt);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while log.starts("c1") == 0 {
+            assert!(Instant::now() < deadline, "the turn did not start");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // The process dies in the middle of the turn, after its model step was journaled.
+        worker.kill().await;
+        armed.store(false, SeqCst);
+        let before: Vec<String> = h.journal(run).await.into_iter().map(|(_, n)| n).collect();
+        assert!(before[0].starts_with("model:"), "{before:?}");
+        assert!(!before.contains(&"tool:c3".to_owned()), "{before:?}");
+
+        // Another process: another limit, and a source whose `mine` has no `after_previous` now.
+        let probe = Probe {
+            armed: armed.clone(),
+            ..Probe::new(&log)
+        };
+        let agent = h.agent(second, |b| {
+            b.tool(probe).tool_source(Mine {
+                log: log.clone(),
+                own: false,
+            })
+        });
+        let rt = h.runtime(agent, Duration::from_secs(10));
+        let worker = Worker::spawn(&rt);
+        let view = wait_terminal(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(
+            view.status,
+            RunStatus::Done,
+            "{first} then {second}: {view:?}"
+        );
+        assert_eq!(h.journal(run).await, reference.0, "{first} then {second}");
+        let args = log.args.lock().unwrap().clone();
+        assert_eq!(
+            args["c2"],
+            json!({"after_previous": "later", "k": 2}),
+            "{first} then {second}: the recorded turn says the property is the tool's"
+        );
+        assert_eq!(
+            args["c3"],
+            json!({"ms": 5, "use": "independent", "tag": 3}),
+            "{first} then {second}"
+        );
+        let last_c1_end = log
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rposition(|e| e == "end:c1")
+            .unwrap();
+        let c3_start = start_position(&log, "c3");
+        assert!(
+            end_position(&log, "c2") < c3_start && last_c1_end < c3_start,
+            "{first} then {second}: the barrier held: {:?}",
+            log.events.lock().unwrap()
+        );
+        let inputs = step_inputs(&h, run);
+        for id in ["tool:c2", "tool:c3"] {
+            assert_eq!(inputs[id], reference.1[id], "{first} then {second}: {id}");
+        }
+        assert!(
+            !inputs["tool:c3"].to_string().contains("after_previous"),
+            "{:?}",
+            inputs["tool:c3"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_parked_turn_keeps_its_order_in_the_snapshot_and_a_new_process_honours_it() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "ask", json!({})),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 200, "use": "independent", "tag": 2, "after_previous": true}),
+        ),
+        call(
+            "c3",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 3}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    // Parked by a process that runs one call at a time.
+    let agent = h.agent(1, |b| b.tool(Probe::new(&log)).tool(Asker));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    let worker = Worker::spawn(&rt);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let parked = loop {
+        let view = rt.view(run).await.unwrap().unwrap();
+        if view.waiting {
+            break view;
+        }
+        assert!(Instant::now() < deadline, "the run did not park");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    worker.stop().await;
+    assert_eq!(
+        parked.state["ordered_calls"],
+        json!(["c2"]),
+        "in the snapshot"
+    );
+    let state = conversation(&parked);
+    assert_eq!(
+        state.pending_calls[1].arguments,
+        json!({"ms": 200, "use": "independent", "tag": 2})
+    );
+
+    // Answered in a process that runs ten at once: the snapshot still says c2 follows the ones before
+    // it, and c3 waits for c2.
+    let agent = h.agent(10, |b| b.tool(Probe::new(&log)).tool(Asker));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let worker = Worker::spawn(&rt);
+    rt.deliver(run, user_message("prod"))
+        .await
+        .expect("deliver");
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert!(
+        end_position(&log, "c2") < start_position(&log, "c3"),
+        "the barrier came back from the snapshot: {:?}",
+        log.events.lock().unwrap()
+    );
+}
+
+#[test]
+fn of_two_calls_that_read_the_same_room_only_one_keeps_a_file_that_fits_once() {
+    let file = || {
+        ToolOutput::text("made").with_artifact(
+            Artifact::file("f", "application/octet-stream", "f.bin", vec![7; 4 << 20])
+                .expect("a file within the cap"),
+        )
+    };
+    let ctx = ToolCtx::detached("t", "c1", Arc::new(adam_runtime::NoopSink));
+    let (a_ctx, b_ctx) = (ctx.clone(), ctx.clone());
+    // Both read 6 MiB of room before either takes any, as two calls of a segment can.
+    assert_eq!((a_ctx.files_left(), b_ctx.files_left()), (6 << 20, 6 << 20));
+    let (mut a, mut b) = (file(), file());
+    a_ctx.spend_files_of(&mut a);
+    b_ctx.spend_files_of(&mut b);
+    assert_eq!(a.artifacts.len(), 1, "the first keeps its file");
+    assert!(!a.is_error);
+    assert!(
+        b.artifacts.is_empty(),
+        "the second drops it instead of journaling it"
+    );
+    assert!(b.is_error);
+    assert!(
+        b.content
+            .starts_with("made\nNot shared: f. A run may share at most 6 MiB"),
+        "{}",
+        b.content
+    );
+    assert_eq!(ctx.files_left(), 2 << 20);
+    assert!(
+        !ctx.try_spend_files(3 << 20),
+        "nothing taken when it does not fit"
+    );
+    assert_eq!(ctx.files_left(), 2 << 20);
 }

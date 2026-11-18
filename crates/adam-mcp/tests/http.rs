@@ -1628,3 +1628,47 @@ async fn an_image_block_over_the_cap_is_a_line_and_is_never_decoded() {
     assert_eq!(fits.images.len(), 1, "{}", fits.content);
     servers.shutdown().await;
 }
+
+/// Two calls of one turn share the room for files: with 6 MiB left and 4 MiB a call, one keeps its
+/// file and the other is told it was not shared, whichever finishes first (ADR 0049).
+#[tokio::test]
+async fn two_calls_that_run_together_cannot_both_take_the_room_for_files() {
+    const FOUR_MIB: u64 = 4 * 1024 * 1024;
+    let server = TestHttpServer::start(None).await;
+    let servers = connect(&http_config("paint", &server.url(), r#""files": true"#)).await;
+    let tools = servers.tools();
+    let tool = tools.get("paint__png").unwrap();
+    let kept = |out: &adam_llm_agent::ToolOutput| out.artifacts.iter().any(|a| a.file.is_some());
+    let refused = |out: &adam_llm_agent::ToolOutput| {
+        out.is_error && out.content.contains("Not shared") && !kept(out)
+    };
+    // At once, and one after the other in both orders: the room is one, as in a segment.
+    for order in ["together", "a then b", "b then a"] {
+        let ctx = common::ctx("paint__png");
+        assert_eq!(ctx.files_left(), 6 * 1024 * 1024);
+        let (a_ctx, b_ctx) = (ctx.clone(), ctx.clone());
+        let args = json!({"bytes": FOUR_MIB});
+        let (a, b) = match order {
+            "together" => tokio::join!(
+                tool.call(&a_ctx, args.clone()),
+                tool.call(&b_ctx, args.clone())
+            ),
+            "a then b" => {
+                let a = tool.call(&a_ctx, args.clone()).await;
+                (a, tool.call(&b_ctx, args.clone()).await)
+            }
+            _ => {
+                let b = tool.call(&b_ctx, args.clone()).await;
+                (tool.call(&a_ctx, args.clone()).await, b)
+            }
+        };
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(
+            (kept(&a) && refused(&b)) || (kept(&b) && refused(&a)),
+            "{order}: exactly one keeps its file: {} / {}",
+            a.content,
+            b.content
+        );
+        assert_eq!(ctx.files_left(), 2 * 1024 * 1024, "{order}");
+    }
+}
