@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { CapBook } from '../lib/cap.mjs';
 import { normalizeConfig } from '../lib/config.mjs';
 import { Ledger, readLedger } from '../lib/ledger.mjs';
-import { LIMITS, MAX_OUTPUT_TOKENS, createMeter, deepMerge, prepareBody } from '../lib/meter.mjs';
+import { LIMITS, MAX_OUTPUT_TOKENS, createMeter, deepMerge, prepareBody, toolName } from '../lib/meter.mjs';
 import { createScriptedModel } from '../lib/scripted-model.mjs';
 import { MODEL_ID, TEST_KEY, rawConfig, tmp } from './helpers.mjs';
 
@@ -597,7 +597,10 @@ test('a failed call has no tool call count', async (t) => {
   await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
   const done = s.ledger.records.filter((r) => r.kind === 'call' && r.phase !== 'pending');
   assert.ok(done.length >= 1);
-  for (const r of done) assert.equal(r.toolCalls, undefined);
+  for (const r of done) {
+    assert.equal(r.toolCalls, undefined);
+    assert.equal(r.toolNames, undefined);
+  }
 });
 
 test('a stream that sends its tool calls one by one, each in fragments, is counted by call and not by chunk', async (t) => {
@@ -626,6 +629,52 @@ test('a stream whose tool calls carry no id is counted by their indices', async 
     assert.ok(!/"id":"call/.test(text), 'no call carries an id');
     assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.toolCalls), [3], `split: ${splitToolCalls}`);
   }
+});
+
+test('the settled record keeps the name of each tool call, plain and stream', async (t) => {
+  const s = await setup(t, { behavior: { toolCalls: 3, toolNames: ['read_file', 'search_files', 'run_checks'] } });
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+  const want = ['read_file', 'search_files', 'run_checks'];
+  assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.toolNames), [want, want]);
+});
+
+test('the names survive the fragments, a shared index and a missing id', async (t) => {
+  const variants = [
+    { splitToolCalls: true },
+    { sameIndexToolCalls: true },
+    { noToolCallIds: true },
+    { splitToolCalls: true, sameIndexToolCalls: true },
+    { splitToolCalls: true, noToolCallIds: true },
+  ];
+  for (const [i, variant] of variants.entries()) {
+    const s = await setup(t, { behavior: { toolCalls: 2, toolNames: ['read_file', 'run_checks'], ...variant } });
+    const { baseUrl } = s.open(`r-${i}`);
+    await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+    assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.toolNames), [['read_file', 'run_checks']], JSON.stringify(variant));
+  }
+});
+
+test('an answer with no tool call carries no names', async (t) => {
+  const s = await setup(t, { behavior: { toolCalls: 0 } });
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+  for (const r of callRecords(s.ledger, 'settled')) assert.equal(r.toolNames, undefined);
+});
+
+test('a tool name is text: control characters dropped, cut to 64, a non-string not kept', async (t) => {
+  assert.equal(toolName(null), null);
+  assert.equal(toolName(7), null);
+  assert.equal(toolName('   '), null);
+  assert.equal(toolName('read\u0000_file\n'), 'read_file');
+  assert.equal(toolName('x'.repeat(200)), 'x'.repeat(64));
+  const s = await setup(t, { behavior: { toolCalls: 2, toolNames: ['x'.repeat(200), 'read_file'] } });
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
+  const [record] = callRecords(s.ledger, 'settled');
+  assert.deepEqual(record.toolNames, ['x'.repeat(64), 'read_file']);
 });
 
 test('a client that closes the stream right after [DONE] keeps the tool call count of its answer', async (t) => {

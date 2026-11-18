@@ -118,6 +118,20 @@ function drainThenCut(req) {
   req.once('close', () => clearTimeout(t));
 }
 
+/** Longest tool name kept, in characters: a name is the upstream's text, and the ledger is not a place for it whole. */
+const MAX_TOOL_NAME = 64;
+
+/** Most tool names kept for one answer: the count is the whole of it, and a name is only for the calls seen first. */
+const MAX_TOOL_NAMES = 64;
+
+/** The tool name of a streamed or plain call, as the ledger keeps it: control and format characters dropped, cut to [`MAX_TOOL_NAME`]. */
+export function toolName(name) {
+  if (typeof name !== 'string') return null;
+  const clean = name.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '').trim();
+  if (clean === '') return null;
+  return clean.length > MAX_TOOL_NAME ? clean.slice(0, MAX_TOOL_NAME) : clean;
+}
+
 /** Reads `data:` lines of an SSE stream and keeps the last non-null `usage`, never the stream. */
 class UsageSniffer {
   constructor() {
@@ -125,6 +139,7 @@ class UsageSniffer {
     this.partial = '';
     this.usage = null;
     this.callIds = new Map(); // the ids each tool call `index` of the stream has carried: a call is an index, or an id when a gateway gives every call the same index
+    this.callNames = new Map(); // `index:id` (or `index:` when the call carried no id) -> its tool name, when the stream gave one
     this.done = false; // the stream said `[DONE]`: it is over, and the usage it carried is the whole of it
     this.gaveUp = false;
   }
@@ -134,6 +149,20 @@ class UsageSniffer {
     let n = 0;
     for (const ids of this.callIds.values()) n += Math.max(1, ids.size);
     return n;
+  }
+
+  /** The names of those calls, in the stream's order, when the stream gave them: one per call, up to [`MAX_TOOL_NAMES`]. */
+  get toolNames() {
+    const names = [];
+    for (const [index, ids] of this.callIds) {
+      const keys = ids.size === 0 ? [`${index}:`] : [...ids].map((id) => `${index}:${id}`);
+      for (const key of keys) {
+        const name = this.callNames.get(key);
+        if (name) names.push(name);
+        if (names.length >= MAX_TOOL_NAMES) return names;
+      }
+    }
+    return names;
   }
 
   push(chunk) {
@@ -171,8 +200,15 @@ class UsageSniffer {
         for (const c of calls) {
           if (!Number.isInteger(c?.index) || c.index < 0) continue;
           const ids = this.callIds.get(c.index) ?? new Set();
-          if (typeof c.id === 'string' && c.id !== '') ids.add(c.id);
+          const id = typeof c.id === 'string' && c.id !== '' ? c.id : null;
+          if (id) ids.add(id);
           this.callIds.set(c.index, ids);
+          const name = toolName(c?.function?.name);
+          if (name) {
+            // A later fragment carries no id: its name (when it repeats one) belongs to the last id of that index.
+            const known = id ?? [...ids].at(-1) ?? '';
+            this.callNames.set(`${c.index}:${known}`, name);
+          }
         }
       }
     } catch {
@@ -271,7 +307,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
   /** One settlement per call: write the actual cost, free the worst case. `sent` says the request left. */
   function makeSettler({ run, base, worstMicro }) {
     const call = { done: false, sent: false, worstMicro, base, run };
-    call.settle = ({ rawUsage, status, reason, free = false, toolCalls }) => {
+    call.settle = ({ rawUsage, status, reason, free = false, toolCalls, toolNames }) => {
       if (call.done) return false;
       call.done = true;
       let outcome;
@@ -288,6 +324,8 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
           ...(reason ? { reason } : {}),
           // How many tool calls the answer asked for (calls per model turn): only when the answer was read.
           ...(!free && Number.isInteger(toolCalls) ? { toolCalls } : {}),
+          // And their names, for the calls by tool: only the ones the answer named.
+          ...(!free && Array.isArray(toolNames) && toolNames.length > 0 ? { toolNames: toolNames.slice(0, MAX_TOOL_NAMES) } : {}),
         });
       } catch {
         // The truth cannot be written: stop serving rather than spend unrecorded.
@@ -334,7 +372,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
         clientGone = true;
         upstreamReq?.destroy();
         sniffer?.end();
-        if (sniffer?.done && sniffer.usage) settle({ rawUsage: sniffer.usage, status: 200, toolCalls: sniffer.toolCalls });
+        if (sniffer?.done && sniffer.usage) settle({ rawUsage: sniffer.usage, status: 200, toolCalls: sniffer.toolCalls, toolNames: sniffer.toolNames });
         else settle({ rawUsage: null, reason: 'client_abort' });
         resolve();
       });
@@ -409,7 +447,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
             ur.on('end', () => {
               sniffer.end();
               if (clientGone) return resolve();
-              settle({ rawUsage: sniffer.usage, status, toolCalls: sniffer.toolCalls });
+              settle({ rawUsage: sniffer.usage, status, toolCalls: sniffer.toolCalls, toolNames: sniffer.toolNames });
               res.end();
               resolve();
             });
@@ -425,15 +463,21 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
             const body = Buffer.concat(chunks);
             let usage = null;
             let toolCalls;
+            let toolNames;
             try {
               const parsedBody = JSON.parse(body.toString('utf8'));
               if (isObject(parsedBody) && isObject(parsedBody.usage)) usage = parsedBody.usage;
               const choice = Array.isArray(parsedBody?.choices) ? parsedBody.choices[0] : null;
-              if (isObject(choice?.message)) toolCalls = Array.isArray(choice.message.tool_calls) ? choice.message.tool_calls.length : 0;
+              if (isObject(choice?.message) && Array.isArray(choice.message.tool_calls)) {
+                toolCalls = choice.message.tool_calls.length;
+                toolNames = choice.message.tool_calls.map((c) => toolName(c?.function?.name)).filter((n) => n !== null).slice(0, MAX_TOOL_NAMES);
+              } else if (isObject(choice?.message)) {
+                toolCalls = 0;
+              }
             } catch {
               // not JSON: usage stays missing
             }
-            settle({ rawUsage: usage, status, toolCalls });
+            settle({ rawUsage: usage, status, toolCalls, toolNames });
             res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
             res.end(body);
             resolve();

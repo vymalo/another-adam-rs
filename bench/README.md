@@ -183,6 +183,14 @@ text of it. The report shows, for each agent and arm, the turns counted, the cal
 turns that asked for several and the most in one turn: whether the model asks for calls together, and so what a
 limit on parallel tool calls (ADR 0049) can save. Every answer the meter relays is a turn, the agent's own requests for a title or a summary too: such an answer counts as a turn with 0 calls. A ledger from before the count has none, and the report says `n/a`.
 
+**Calls by tool.** The meter also keeps the name of each of those calls (`toolNames` on the same settled record: one
+name per call, in the answer's order, a name cut to 64 characters and control characters dropped; at most 64 names
+per answer). The fold counts them per tool, per run, and the report prints one table of the calls of each tool per
+agent and arm, so the reader sees where the calls go and not only how many there are: on the tasks both agents
+finish, the tool whose count differs most is the next slice. A call the answer did not name is counted in the calls
+and shown in a `(no name)` row, never guessed from the arguments; a ledger from before the names says `n/a`. The
+names are the model's own text: they are shown in a report and never used for a decision of the harness.
+
 **The cap.** A run reserves its budget before it starts, and starts only if what is spent plus what is reserved plus
 this reservation fits the cap (exactly at the cap fits; one micro-dollar over does not). Each call's worst case (the
 input at one token per three bytes, the clamped output) must fit what is left of the run's reservation, else the
