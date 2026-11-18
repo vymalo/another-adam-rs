@@ -12,6 +12,8 @@ same behaviour). Builds on [ADR 0007](0007-progress-as-steps-and-streamed-text.m
 
 *Amended 2026-11-17 ([ADR 0049](0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)):* slice 2 ("ADR 0037 slices 1-2") is ADR 0049's slices P1 to P4; plugins' deciding hooks run inside each call's step and so may run concurrently for the calls of one turn.
 
+*Amended 2026-11-18 ([ADR 0050](0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md)), the owner's decision:* *"Both, and for all events around the loop, and with the possibility of custom events too. Compiled first."* `Plugin` (decisions 7 to 9) is built first as Rust and extended by ADR 0050: hooks reach every event of the loop, not only a tool call; tools, agents and plugins declare and emit events of their own; `message.received` and `run.ending` are deciding points; hooks may ask the loop for actions (a compaction, and actions a plugin declares), never write a summary. Then programs: one adapter runs programs the deployment names, over JSON lines on stdio, each call with a deadline, failing closed. This reverses the owner's answer 4. Slice 3 no longer waits for ADR 0037 slices 1 and 2; its slices are ADR 0050's H1 to H3, slice 6 is H6, the `compacting` hook of slice 8 is H9, slice 9 is H11 and slice 10 is H10.
+
 ## Context
 
 OpenCode leaves the coder (ADR 0038), but its loop is well shaped, and the owner wants that shape and a plugin system in
@@ -307,6 +309,7 @@ slice 3 after its slices 1-2.
    format, the extension in `adam-a2a` and `adam-a2a-runtime`, and the coder's `build` (the default) and `plan` modes.
 4. **No out-of-process plugins now.** Plugins are Rust, composed at build time with the testkit; one over MCP or an exec
    comes when a concrete plugin needs it.
+   *Reversed 2026-11-18 by the owner, see the amendment at the top and [ADR 0050](0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md).*
 
 ## Verified and unverified (2026-10-11)
 
