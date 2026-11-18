@@ -1125,7 +1125,9 @@ impl NotesStore {
     /// read-change-write goes through here instead: a lock per run in this process makes the three
     /// steps one, and the save stays atomic ([`save`](Self::save)). A tool that must do slow work
     /// between reading and writing does the work first and puts only the change in `change`.
-    /// Across processes, the workers and sessions of one run, ADR 0037 decision 16 holds.
+    /// The agent's own `load` and `save` at the turn boundary (`CoderAgent::record_grants`) run with
+    /// no call in flight, so they need no lock. Across processes, the workers and sessions of one
+    /// run, ADR 0037 decision 16 holds.
     ///
     /// The gates that run alone (`run_checks`, `commit_and_push`, `open_pull_request`) still hold the
     /// notes across their work and save them once: no other call of their turn runs beside them.

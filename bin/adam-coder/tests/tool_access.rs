@@ -101,7 +101,7 @@ fn table() -> BTreeMap<&'static str, Cases> {
         "stop_command",
         vec![(json!({"id": "o-0123456789abcdef"}), writes("commands"))],
     );
-    t.insert("list_commands", vec![(json!({}), reads("commands"))]);
+    t.insert("list_commands", vec![(json!({}), writes("commands"))]);
 
     // The language servers read the slot (they sync what changed) and serialise on their own scope.
     for name in ["file_diagnostics", "find_definition", "find_references"] {
@@ -109,7 +109,11 @@ fn table() -> BTreeMap<&'static str, Cases> {
             name,
             vec![(
                 json!({"path": "src/a.rs"}),
-                uses(vec![Use::read("files"), Use::write("lsp")]),
+                uses(vec![
+                    Use::read("files"),
+                    Use::write("lsp"),
+                    Use::write("commands"),
+                ]),
             )],
         );
     }
@@ -460,5 +464,348 @@ fn only_what_runs_alone_saves_the_notes_itself() {
     assert_eq!(
         found, expected,
         "a save of the notes outside `NotesStore::update`"
+    );
+}
+
+#[tokio::test]
+async fn a_language_server_call_waits_for_a_command_and_for_another_one_and_runs_beside_a_read() {
+    let lsp = |id: &str, tool: &str| call(id, tool, json!({"path": "src/a.rs"}));
+    let t = run_turn(
+        vec![
+            lsp("c1", "file_diagnostics"),
+            call("c2", "run_command", json!({"command": "ls"})),
+            call("c3", "read_file", json!({"path": "src/b.rs"})),
+            lsp("c4", "find_references"),
+        ],
+        10,
+    )
+    .await;
+    let events = || format!("{:?}", t.events.lock());
+    assert!(
+        !t.overlapped("c1", "c2"),
+        "a command and a server call: {}",
+        events()
+    );
+    assert!(
+        t.overlapped("c1", "c3"),
+        "a read beside a server call: {}",
+        events()
+    );
+    assert!(!t.overlapped("c1", "c4"), "two server calls: {}", events());
+    assert!(!t.overlapped("c2", "c4"), "{}", events());
+}
+
+#[tokio::test]
+async fn list_commands_keeps_its_place_among_the_commands() {
+    let t = run_turn(
+        vec![
+            call("c1", "run_command", json!({"command": "ls"})),
+            call("c2", "list_commands", json!({})),
+            call("c3", "read_file", json!({"path": "a"})),
+        ],
+        10,
+    )
+    .await;
+    assert!(!t.overlapped("c1", "c2"), "{:?}", t.events.lock());
+    assert!(t.overlapped("c1", "c3"), "{:?}", t.events.lock());
+}
+
+/// A listing of a directory waits for a write below it and a write of one file waits for a read of
+/// it; a glob, which names no directory, widens to every file; another directory is beside it.
+#[tokio::test]
+async fn a_directory_a_file_and_a_glob_conflict_as_the_paths_say() {
+    let write = |id: &str| {
+        call(
+            id,
+            "write_file",
+            json!({"path": "src/new.rs", "content": "x"}),
+        )
+    };
+    for (reader, waits) in [
+        (call("c1", "list_files", json!({"path": "src"})), true),
+        (call("c1", "list_files", json!({"path": "./src/"})), true),
+        (call("c1", "list_files", json!({"path": " src "})), true),
+        (
+            call("c1", "find_files", json!({"pattern": "src/**/*.rs"})),
+            true,
+        ),
+        (
+            call(
+                "c1",
+                "find_files",
+                json!({"pattern": "*.rs", "path": "src"}),
+            ),
+            true,
+        ),
+        (
+            call(
+                "c1",
+                "search_files",
+                json!({"pattern": "x", "include": "*.rs"}),
+            ),
+            true,
+        ),
+        (
+            call(
+                "c1",
+                "search_files",
+                json!({"pattern": "x", "path": "src/new.rs"}),
+            ),
+            true,
+        ),
+        (call("c1", "list_files", json!({"path": "docs"})), false),
+        (
+            call(
+                "c1",
+                "search_files",
+                json!({"pattern": "x", "path": "srcs"}),
+            ),
+            false,
+        ),
+    ] {
+        let label = format!("{} {}", reader.name, reader.arguments);
+        let t = run_turn(vec![reader, write("c2")], 10).await;
+        assert_eq!(
+            !t.overlapped("c1", "c2"),
+            waits,
+            "{label}: {:?}",
+            t.events.lock()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The real tools, on a real workspace, through the real loop
+// ---------------------------------------------------------------------------
+
+/// One of the coder's own tools, run for real, after a pause: what the trace shows is the time
+/// the real call is in flight, so two real calls that the loop starts together overlap and two that
+/// it orders do not.
+struct Real {
+    real: DynTool,
+    trace: Arc<Trace>,
+}
+
+#[async_trait]
+impl Tool for Real {
+    fn spec(&self) -> ToolSpec {
+        self.real.spec()
+    }
+
+    fn required_state(&self) -> Vec<adam_llm_agent::StateKey> {
+        self.real.required_state()
+    }
+
+    fn paged(&self) -> bool {
+        self.real.paged()
+    }
+
+    fn step_style(&self) -> adam_llm_agent::StepStyle {
+        self.real.step_style()
+    }
+
+    fn access(&self, args: &Value) -> ToolAccess {
+        self.real.access(args)
+    }
+
+    fn time_limit(&self) -> Option<Duration> {
+        self.real.time_limit()
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let id = ctx.call_id().to_owned();
+        self.trace
+            .events
+            .lock()
+            .unwrap()
+            .push(format!("start:{id}"));
+        self.trace.running.fetch_add(1, SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let out = self.real.call(ctx, args).await;
+        self.trace.running.fetch_sub(1, SeqCst);
+        self.trace.events.lock().unwrap().push(format!("end:{id}"));
+        out
+    }
+}
+
+/// The turns of `turns` through an agent whose tools are the coder's own, wrapped to take their time:
+/// a scratch project is the workspace. Returns the trace and what each call answered, by call id.
+async fn run_real(turns: Vec<Vec<ToolCall>>) -> (Arc<Trace>, BTreeMap<String, String>) {
+    let fx = Fixture::new().await;
+    let trace = Arc::new(Trace::default());
+    let mock = Arc::new(MockModel::new());
+    for calls in turns {
+        mock.push_tool_calls(calls);
+    }
+    mock.push_text("done");
+    let mut builder = LlmAgent::builder("llm", mock, "test-model")
+        .max_parallel(10)
+        .state(fx.env.clone());
+    for real in coder_tools(&fx.env) {
+        builder = builder.tool(Real {
+            real,
+            trace: trace.clone(),
+        });
+    }
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = Runtime::builder(store)
+        .agent(builder.build())
+        .worker_id(format!("w-{}", RunId::new()))
+        .poll_interval(Duration::from_millis(20))
+        .retry(RetryPolicy::default())
+        .build();
+    let run = rt.start("llm", user_message("go"), None).await.unwrap();
+    // The tier of the run: the gated tools check it.
+    fx.env
+        .notes
+        .update(&run.to_string(), |notes| {
+            notes.tier = Some(adam_a2a::AccessTier::Bypass);
+        })
+        .await
+        .unwrap();
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let worker = {
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            rt.run_worker(async {
+                let _ = rx.await;
+            })
+            .await
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let view = loop {
+        let view = rt.view(run).await.unwrap().unwrap();
+        if matches!(view.status, RunStatus::Done | RunStatus::Failed) {
+            break view;
+        }
+        assert!(Instant::now() < deadline, "timed out: {view:#?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    let conversation: adam_llm_agent::Conversation = serde_json::from_value(view.state).unwrap();
+    let mut answers = BTreeMap::new();
+    for message in &conversation.messages {
+        if let adam_model::Message::Tool {
+            call_id, content, ..
+        } = message
+        {
+            answers.insert(call_id.clone(), content.clone());
+        }
+    }
+    (trace, answers)
+}
+
+fn scratch() -> Vec<ToolCall> {
+    vec![call("s1", "start_scratch", json!({"name": "work"}))]
+}
+
+fn seed(files: &[(&str, &str)]) -> Vec<ToolCall> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, (path, content))| {
+            call(
+                &format!("w{i}"),
+                "write_file",
+                json!({"path": path, "content": content}),
+            )
+        })
+        .collect()
+}
+
+/// Four real reads of one reply are in flight together, and each answers its own page.
+#[tokio::test]
+async fn real_reads_of_one_reply_overlap_and_answer_their_own_pages() {
+    let (t, answers) = run_real(vec![
+        scratch(),
+        seed(&[("a.txt", "alpha\n"), ("b.txt", "bravo\n")]),
+        vec![
+            call("r1", "read_file", json!({"path": "a.txt"})),
+            call("r2", "read_file", json!({"path": "b.txt"})),
+            call("r3", "list_files", json!({})),
+            call(
+                "r4",
+                "search_files",
+                json!({"pattern": "bravo", "literal": true}),
+            ),
+        ],
+    ])
+    .await;
+    assert!(t.overlapped("r1", "r2"), "{:?}", t.events.lock());
+    assert!(t.overlapped("r1", "r4"), "{:?}", t.events.lock());
+    assert!(answers["r1"].contains("alpha"), "{}", answers["r1"]);
+    assert!(answers["r2"].contains("bravo"), "{}", answers["r2"]);
+    assert!(answers["r3"].contains("a.txt"), "{}", answers["r3"]);
+    assert!(answers["r4"].contains("b.txt"), "{}", answers["r4"]);
+}
+
+/// A real read, a real edit and a real read of one file, in one reply: the first read sees the old
+/// file, the second the new one, and none of them is in flight beside the edit.
+#[tokio::test]
+async fn a_real_read_then_edit_then_read_of_one_file_keep_the_models_order() {
+    let (t, answers) = run_real(vec![
+        scratch(),
+        seed(&[("a.txt", "old text\n"), ("other.txt", "other\n")]),
+        vec![
+            call("r1", "read_file", json!({"path": "a.txt"})),
+            call(
+                "e1",
+                "edit_file",
+                json!({"path": "a.txt", "old": "old", "new": "new"}),
+            ),
+            call("r2", "read_file", json!({"path": "a.txt"})),
+            call("r3", "read_file", json!({"path": "other.txt"})),
+        ],
+    ])
+    .await;
+    assert!(answers["r1"].contains("old text"), "{}", answers["r1"]);
+    assert!(answers["r2"].contains("new text"), "{}", answers["r2"]);
+    assert!(!t.overlapped("r1", "e1") && !t.overlapped("e1", "r2"));
+    assert!(t.at("end:r1") < t.at("start:e1"));
+    assert!(t.at("end:e1") < t.at("start:r2"));
+    assert!(
+        t.overlapped("r1", "r3"),
+        "an unrelated read runs beside: {:?}",
+        t.events.lock()
+    );
+}
+
+/// Real commands never overlap each other, and each says when it ran.
+#[tokio::test]
+async fn real_commands_run_one_at_a_time_beside_a_read() {
+    // Two calls with the same arguments are a barrier (the repeat check), so the commands differ.
+    let stamp = |n: u8| format!("date +%s%N; sleep 0.3; date +%s%N; echo done{n}");
+    let (t, answers) = run_real(vec![
+        scratch(),
+        seed(&[("a.txt", "alpha\n")]),
+        vec![
+            call("k1", "run_command", json!({"command": stamp(1)})),
+            call("k2", "run_command", json!({"command": stamp(2)})),
+            call("r1", "read_file", json!({"path": "a.txt"})),
+        ],
+    ])
+    .await;
+    assert!(!t.overlapped("k1", "k2"), "{:?}", t.events.lock());
+    assert!(t.overlapped("k1", "r1"), "{:?}", t.events.lock());
+    let times = |id: &str| -> Vec<u128> {
+        answers[id]
+            .lines()
+            .filter_map(|l| l.trim().parse::<u128>().ok())
+            .collect()
+    };
+    let (a, b) = (times("k1"), times("k2"));
+    assert_eq!(
+        (a.len(), b.len()),
+        (2, 2),
+        "{} / {}",
+        answers["k1"],
+        answers["k2"]
+    );
+    assert!(
+        a[1] <= b[0],
+        "the second command started after the first ended"
     );
 }

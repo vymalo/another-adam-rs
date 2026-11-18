@@ -1889,9 +1889,52 @@ mod tests {
         confine(root, rel, access).expect_err(rel)
     }
 
-    /// A read that runs while `write_file` and `edit_file` of the same path write (the calls of one
-    /// turn run at the same time) sees the old file or the new one whole, never half of one: each
-    /// write is a new file renamed over the old.
+    /// A file that is open while `write_file` or `edit_file` replaces it keeps the old content whole
+    /// and the path names a new file with the new content whole: the tools write a file of their own and
+    /// rename it over the old, never into the old one. That is what lets a read run beside a write
+    /// (ADR 0049). The check is made on an open handle, so it does not depend on timing; the control
+    /// shows that it fails for a write made in place.
+    #[test]
+    fn a_write_or_an_edit_replaces_the_file_and_never_changes_the_one_a_read_holds() {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = root();
+        let path = dir.path().join("src/shared.txt");
+        let (old, new) = ("alpha\n".repeat(2_000), "bravo\n".repeat(2_000));
+        let open_old = |text: &str| {
+            fs::write(&path, text).unwrap();
+            (
+                fs::File::open(&path).unwrap(),
+                fs::metadata(&path).unwrap().ino(),
+            )
+        };
+        let seen = |mut held: fs::File| {
+            let mut text = String::new();
+            held.read_to_string(&mut text).unwrap();
+            text
+        };
+
+        // The control: a write in place changes what the open handle sees.
+        let (held, _) = open_old(&old);
+        fs::write(&path, &new).unwrap();
+        assert_eq!(seen(held), new, "an in-place write reaches the open handle");
+
+        // `write_file`.
+        let (held, ino) = open_old(&old);
+        write_in(dir.path(), "src/shared.txt", &new).unwrap();
+        assert_eq!(seen(held), old, "the open file is untouched");
+        assert_eq!(fs::read_to_string(&path).unwrap(), new);
+        assert_ne!(fs::metadata(&path).unwrap().ino(), ino, "a new file");
+
+        // `edit_file`.
+        let (held, ino) = open_old(&old);
+        edit_in(dir.path(), "src/shared.txt", "alpha", "bravo", true).unwrap();
+        assert_eq!(seen(held), old, "the open file is untouched");
+        assert_eq!(fs::read_to_string(&path).unwrap(), new);
+        assert_ne!(fs::metadata(&path).unwrap().ino(), ino, "a new file");
+    }
+
+    /// The same, as readers and a writer that run at the same time: no read is half of each.
     #[test]
     fn a_read_beside_a_write_or_an_edit_sees_a_whole_file() {
         let dir = root();

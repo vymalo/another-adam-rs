@@ -1885,7 +1885,9 @@ middle of a run) for a `{{placeholder}}` the frontmatter does not declare, a var
 uses, or a `tools:` name the coder does not register. Then update `tests/fixtures/agent/prompt.txt` (the
 **instruction snapshot**: the body of `instructions.md`, placeholders as written) and `card.json` in the same commit:
 a change of what the model is told is a reviewed diff of those files, a change of behaviour to decide on and not
-a refactor (see [Tests](#tests)). The limit in the prompt follows
+a refactor (see [Tests](#tests)). The rendered body is under the loader's 30,000 characters by about 250 (the count
+varies a few characters with the check limits): a sentence added needs an equal length cut, and
+`the_prompt_names_no_opencode_and_stays_under_30000_chars` says when it does not. The limit in the prompt follows
 `MAX_CHECK_CYCLES` and `SCRATCH_CHECK_CYCLES`: the process passes `CoderSettings::max_check_cycles` and
 `scratch_check_cycles` as the vars, so the file's defaults only apply to a caller that does not.
 

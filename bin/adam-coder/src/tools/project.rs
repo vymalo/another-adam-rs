@@ -270,8 +270,8 @@ pub(super) async fn at_prepare(
 ) -> Result<Option<String>, ToolError> {
     let run = ctx.run_id().to_string();
     let key = slot.dir().to_owned();
-    // Read here, written below through `update`: `read_file` shows instructions beside the other
-    // calls of its turn.
+    // `prepare_workspace` runs alone, so nothing changes the notes while this reads them; the write
+    // below still goes through `update`, as every write of the notes that a tool makes does.
     let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     if !notes.may_show_instructions(&key, ctx.call_id()) {
         return Ok(None);

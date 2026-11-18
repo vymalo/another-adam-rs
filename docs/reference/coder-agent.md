@@ -700,8 +700,8 @@ nothing else), `commands` (one command at a time in a workspace), `screen` and `
 | `run_command` | reads `files`, writes `commands` | reads, `ui_catalog`, GitHub | a write of a file, another command |
 | `run`, `start_command` | writes `files` and `commands` | `read_output`, `ui_catalog`, GitHub | any other use of files, another command |
 | `stop_command` | writes `commands` | calls that do not use commands | a command that starts or lists |
-| `list_commands` | reads `commands` | everything but a command | `run_command`, `run`, `start_command`, `stop_command` |
-| `file_diagnostics`, `find_definition`, `find_references` | reads `files`, writes `lsp` | reads | a write of a file, another language server call |
+| `list_commands` | writes `commands` (it settles the records of commands that ended unseen) | everything but a command | every command call |
+| `file_diagnostics`, `find_definition`, `find_references` | reads `files`, writes `lsp` and `commands` | reads | a write of a file, a command, another language server call |
 | `show` | writes `screen` | everything but another `show` | another `show` |
 | `read_output`, `ui_catalog` | independent | everything but a call that must run alone | |
 | the GitHub tools (`github__*`, an MCP server) | independent unless `"parallel": false` in `mcp.json` | everything but a call that must run alone | |
@@ -714,8 +714,11 @@ starts before it ends: the gates change state the loop must apply first (the not
 question parks the run. A model that wants the order of its calls to hold sets `after_previous: true` on a call.
 
 **What makes it safe.** `write_file` and `edit_file` write a new file and rename it over the old, so a read of the
-same path beside a write sees the old file or the new one whole (`a_read_beside_a_write_or_an_edit_sees_a_whole_file`
-in `src/tools/files.rs`). A write through a symlink is refused, so an alias cannot name a path the scope does not. The
+same path beside a write sees the old file or the new one whole (`a_write_or_an_edit_replaces_the_file_and_never_changes_the_one_a_read_holds`
+in `src/tools/files.rs`). **What it does not do:** a scope is a path as written, so a read through a symlink inside the
+slot (`link/a.rs` for `real/a.rs`) is not ordered with a write of the target, and the model's read-then-edit order is not
+kept across an alias. The read still sees one whole file, the old or the new, and a write through a symlink is refused;
+a model that needs the order sets `after_previous: true`. The
 run's notes are changed through `NotesStore::update`, a lock per run around load, change and save, so two calls that
 note something at the same time keep both (`concurrent_updates_of_one_run_keep_every_change`). The gates that run
 alone hold the notes across their work and save them once. `tests/tool_access.rs` pins the class of every tool in

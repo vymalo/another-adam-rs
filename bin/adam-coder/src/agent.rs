@@ -411,6 +411,9 @@ impl CoderAgent {
     /// another inherits the notes of that run (`Conversation::continued_from`). Only when those
     /// notes are not there (the other run was on another worker's volume) are the results of
     /// `commit_and_push` in the carried history read, as [`pushed_branches`] says.
+    ///
+    /// It runs at the turn boundary, with no call of the run in flight, so the plain `load` and `save`
+    /// of the notes here cannot lose the change of a call that runs beside it (ADR 0049).
     async fn record_grants(
         &self,
         ctx: &Ctx,
