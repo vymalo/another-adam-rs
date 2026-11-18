@@ -1640,6 +1640,39 @@ async fn a_reference_made_again_is_at_the_commit_it_was_first_read_at() {
     );
 }
 
+/// Two reads of one reply that both make the reference at the same time (the calls of a turn run at
+/// the same time): the commit is recorded once, the first one recorded stands, and only the call that
+/// recorded it says so.
+#[tokio::test]
+async fn two_first_reads_at_once_tell_the_commit_once() {
+    let (fx, _url) = with_design().await;
+    let remote = fx.tmp.path().join("other").join("design.git");
+    let rig = Rig::new(fx, AccessTier::Plan).await;
+    let commit = git(&remote, &["rev-parse", "main"]);
+    let second = ToolCtx::detached("tool", "call-2", Arc::new(CollectingSink::new()))
+        .with_root_run(rig.ctx.root_run_id())
+        .with_state(rig.fx.env.clone());
+    let tools = coder_tools(&rig.fx.env);
+    let read = tools.get("read_file").expect("read_file").clone();
+    let args = json!({"path": "tokens.css", "repo": "design"});
+    let (a, b) = tokio::join!(
+        read.call(&rig.ctx, args.clone()),
+        read.call(&second, args.clone())
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(!a.is_error && !b.is_error, "{} / {}", a.content, b.content);
+    let said = format!("Reference `design` is at commit {}", &commit[..12]);
+    let told = [&a, &b]
+        .iter()
+        .filter(|out| out.content.contains(&said))
+        .count();
+    assert_eq!(told, 1, "told once: {} / {}", a.content, b.content);
+    assert_eq!(
+        rig.notes().await.reference_commits.get("design"),
+        Some(&commit)
+    );
+}
+
 /// A pod that already runs cannot be told of the new slot: the model is told, as `prepare_workspace`
 /// tells it, in the result of the read that made the reference.
 #[tokio::test]

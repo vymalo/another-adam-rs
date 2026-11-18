@@ -885,10 +885,12 @@ pub(super) async fn check_out(
     let commit = match (&pinned, slot.reference()) {
         (Some(pinned), _) => Some(pinned.clone()),
         (None, Some(wt)) => match wt.head_commit().await {
-            Ok(commit) => {
-                record_commit(env, &run, &def.name, &commit).await;
-                Some(commit)
-            }
+            // Of two calls that make the reference at the same time, the first one recorded tells
+            // the commit; the other says nothing, and the commit that stands is the first's.
+            Ok(commit) => match record_commit(env, &run, &def.name, &commit).await {
+                Recorded::Mine | Recorded::NotRecorded => Some(commit),
+                Recorded::Another => None,
+            },
             Err(e) => {
                 tracing::warn!(run, reference = %def.name, error = %e, "cannot read the commit a reference was checked out at");
                 None
@@ -914,19 +916,40 @@ pub(super) async fn check_out(
     Ok(Some(slot))
 }
 
-/// Keep the commit the reference `name` was first read at in the run's notes. A failure is logged and
-/// the reference is read anyway: it is made again at the branch's tip then.
-async fn record_commit(env: &ToolEnv, run: &str, name: &str, commit: &str) {
+/// Whose commit the notes hold for a reference after [`record_commit`].
+enum Recorded {
+    /// This call's: it is the first read of the reference.
+    Mine,
+    /// Another call's, recorded first: that call tells it.
+    Another,
+    /// The notes could not be written: the reference is read anyway.
+    NotRecorded,
+}
+
+/// Keep the commit the reference `name` was first read at in the run's notes: **the first one
+/// recorded stands**. A failure is logged and the reference is read anyway: it is made again at the
+/// branch's tip then.
+async fn record_commit(env: &ToolEnv, run: &str, name: &str, commit: &str) -> Recorded {
     let recorded = env
         .notes
         .update(run, |notes| {
-            notes
-                .reference_commits
-                .insert(name.to_owned(), commit.to_owned());
+            if notes.reference_commits.contains_key(name) {
+                false
+            } else {
+                notes
+                    .reference_commits
+                    .insert(name.to_owned(), commit.to_owned());
+                true
+            }
         })
         .await;
-    if let Err(e) = recorded {
-        tracing::warn!(run, reference = name, error = %e, "cannot record the commit a reference was read at");
+    match recorded {
+        Ok(true) => Recorded::Mine,
+        Ok(false) => Recorded::Another,
+        Err(e) => {
+            tracing::warn!(run, reference = name, error = %e, "cannot record the commit a reference was read at");
+            Recorded::NotRecorded
+        }
     }
 }
 
