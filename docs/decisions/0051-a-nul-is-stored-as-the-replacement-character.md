@@ -35,10 +35,10 @@ class as permanent, so the run failed.
    outputs already write for a NUL. This is the backend contract, and it covers the text the loop did not write: the
    model's own answer, a compaction summary, a person's message.
 3. **A store returns what it stored.** `create_run`, `commit_run` and `journal_put` return the value as it was written
-   (they already read it back), so the loop applies the same bytes it journaled and a replay decodes the same value.
+   (the adapter produces it from what it wrote), so the loop applies the same bytes it journaled and a replay decodes the same value.
    The live transition and the replay therefore agree, and the model's next request is built from the stored value.
-   *Amended 2026-11-18:* MongoDB builds the returned record and entry from the values it wrote instead of converting
-   the stored document back to JSON; the requirement is unchanged.
+   *Amended 2026-11-18:* For these three methods, MongoDB builds the returned record and entry from the values it
+   wrote instead of converting the stored document back to JSON; the requirement is unchanged.
 4. **The testkit requires it.** `nul_characters_are_stored_as_the_replacement_character` replaces the old
    `nul_characters_roundtrip_or_reject_cleanly`, which accepted either behaviour: every adapter must now round-trip a
    NUL as U+FFFD, in the state and in a journal payload, for values and for keys.

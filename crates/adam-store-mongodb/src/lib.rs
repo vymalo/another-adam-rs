@@ -589,12 +589,15 @@ impl Store for MongoStore {
             "open_key": open_key(id, &current.agent, current.conversation_id.as_deref(), status),
             "updated_at": date(t),
         };
+        // Hoisted so the bound is visible at `expected + 1` below: a version that does not fit
+        // the filter cannot reach the arithmetic.
+        let expected_i = to_i64(expected, "version")?;
         let result = self
             .runs
             .find_one_and_update(
                 doc! {
                     "_id": uuid(id),
-                    "version": to_i64(expected, "version")?,
+                    "version": expected_i,
                     // A tombstoned run is being purged; it must not come back to life.
                     "purging": { "$ne": true },
                 },
@@ -1336,7 +1339,8 @@ mod returned_value_tests {
             .await
             .unwrap();
         // The one conversion is the current document `commit_run` reads for `agent` and
-        // `conversation_id` before the CAS; the record it returns adds none.
+        // `conversation_id` before the CAS; the record it returns adds none. A pre-read that
+        // projects `state` away makes this 0: lower the number then, it is not a regression.
         assert_eq!(
             conversion_counter::calls() - before,
             1,
