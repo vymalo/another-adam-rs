@@ -38,3 +38,25 @@ fn asking_and_the_plan_run_alone() {
         assert_eq!(access(name), ToolAccess::Alone, "{name}");
     }
 }
+
+/// The orchestration layer's tools (`ask_agent` and the rest the endpoint lists) may ask other agents
+/// and wait: the source says every call of them runs alone.
+#[test]
+fn the_thread_tools_run_alone() {
+    use adam_llm_agent::ToolSource;
+    let ui = Ui::new(McpPolicy::default());
+    for source in [
+        ui.source(),
+        adam_ui::ThreadTools::new(std::sync::Arc::new(adam_ui::ThreadToolsClient::new(
+            McpPolicy::default(),
+        ))),
+    ] {
+        for name in ["ask_agent", "turn_output", "show"] {
+            assert_eq!(
+                source.access(name, &json!({"agent": "researcher"})),
+                ToolAccess::Alone,
+                "{name}"
+            );
+        }
+    }
+}

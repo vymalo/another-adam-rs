@@ -1192,6 +1192,18 @@ mod tests {
         );
     }
 
+    /// A remote subagent can park the run on its task, so it never runs beside another call
+    /// (ADR 0049 decision 14).
+    #[test]
+    fn a_remote_subagent_runs_alone() {
+        use adam_llm_agent::Tool;
+        assert_eq!(tool().access(&serde_json::json!({})), ToolAccess::Alone);
+        assert_eq!(
+            tool().access(&serde_json::json!({"message": "invoice 7"})),
+            ToolAccess::Alone
+        );
+    }
+
     #[test]
     fn errors_from_the_remote_are_transient_only_when_trying_again_can_help() {
         let tool = tool();
