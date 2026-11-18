@@ -488,6 +488,14 @@ enum Plan {
 /// Returns whether the lease should be released.
 async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> bool {
     let run = rec.id;
+    // A claim may hand back a snapshot read after the lease was taken (the MongoDB store sets the
+    // lease, then reads the run), and a cancel does not touch the lease: the run can be terminal
+    // already. Its version is the cancel's, so stepping it would commit over the cancel and reopen
+    // the run.
+    if rec.status.is_terminal() {
+        tracing::debug!("the claimed run is finished already; not stepping it");
+        return true;
+    }
     // A run that works for a parent that has ended does not step: it is cancelled here, before it
     // can do anything (one read of the parent per transition of a child).
     if let Some(parent) = rec.parent_id
@@ -1047,5 +1055,71 @@ mod artifact_tests {
         add_artifact(&mut held, &made("plan", Some("p"), 2));
         assert_eq!(held.len(), 2);
         assert_eq!(held[0].data, json!(2));
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+
+    use adam_core::{DynStore, MemoryStore};
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::*;
+    use crate::agent::{Agent, Inbound};
+
+    /// Parks at every step, and counts them.
+    struct Counting(Arc<AtomicU32>);
+
+    #[async_trait]
+    impl Agent for Counting {
+        type State = Value;
+
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn init(&self, input: Inbound) -> Result<Value, AgentError> {
+            Ok(input.payload)
+        }
+
+        async fn step(
+            &self,
+            _ctx: &mut Ctx,
+            state: Value,
+        ) -> Result<Transition<Value>, AgentError> {
+            self.0.fetch_add(1, SeqCst);
+            Ok(Transition::Park {
+                state,
+                wake_at: None,
+            })
+        }
+    }
+
+    /// The interleaving of a claim that reads the run after taking the lease: the cancel commits
+    /// between the two, and the worker gets the cancelled run with the cancel's version. It must
+    /// not step it, or its commit would reopen the run (and a child would never see its parent end).
+    #[tokio::test]
+    async fn a_claimed_run_that_is_cancelled_already_is_not_stepped() {
+        let steps = Arc::new(AtomicU32::new(0));
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let rt = Runtime::builder(store.clone())
+            .agent(Counting(steps.clone()))
+            .build();
+        let run = rt
+            .start("counting", Inbound::new("start", json!({})), None)
+            .await
+            .expect("start");
+        rt.cancel(run, "stop").await.expect("cancel");
+        let cancelled = store.load_run(run).await.expect("load").expect("run");
+        assert_eq!(cancelled.status, RunStatus::Failed);
+
+        assert!(transition(&rt.inner, cancelled.clone(), CancelToken::new()).await);
+
+        assert_eq!(steps.load(SeqCst), 0, "the agent was not stepped");
+        let after = store.load_run(run).await.expect("load").expect("run");
+        assert_eq!(after.status, RunStatus::Failed);
+        assert_eq!(after.version, cancelled.version, "nothing was committed");
     }
 }

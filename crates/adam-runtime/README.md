@@ -447,6 +447,12 @@ the claim, and one that landed after a newer claim would clear that claim's leas
 may take a run over once its lease expired; the version CAS rejects whichever commit comes second,
 as before.
 
+A claim may hand back the run as it reads after the lease was taken (the MongoDB store sets the
+lease, then reads the run), and a cancel does not touch the lease: a cancel that commits between the
+two hands the worker a `Failed` run at the cancel's version. The worker steps no run that is not
+open and only releases its lease, so no step commits over a cancel and reopens the run
+(`worker::claim_tests` in `src/worker.rs`).
+
 ## Errors
 
 `AgentError` and `RuntimeError` implement `adam_error::Classify`; the worker
