@@ -279,7 +279,7 @@ that share one conversation. A client that **activates** `https://agents.vymalo.
 contract is the orchestration layer's `docs/api/child-sessions-v1.md`) sees the sessions of a parent context on the parent task,
 follows each round as an ordinary task of a **child context**, and starts, talks to, stops and closes a session.
 `RuntimeTaskBackend::with_child_sessions` is the backend side (`crates/adam-a2a-runtime/src/child_sessions.rs`); the card entry is
-`ExtensionConfig::child_sessions`. No shipped agent lists it yet (slice 6 part c).
+`ExtensionConfig::child_sessions`. The parent stream's events are `crates/adam-a2a-runtime/src/session_events.rs`. No shipped agent lists it yet (slice 6 part c).
 
 ```mermaid
 sequenceDiagram
@@ -302,6 +302,14 @@ sequenceDiagram
   B-->>C: the round, its session says closed or closing
   C->>B: CancelTask {round}
   B->>R: cancel
+  C->>B: SubscribeToTask {parent task}
+  B->>R: list_sessions (the snapshot, no event)
+  loop the parent's record changed or a second passed
+    B->>R: list_sessions
+    B-->>C: status update, metadata event (opened, round, reported or closed)
+  end
+  B->>R: list_sessions (once more before the final event)
+  B-->>C: the final status of the parent
 ```
 
 ```mermaid
@@ -330,9 +338,13 @@ stateDiagram-v2
 * **A person's round is its own parent**, so no run's end cancels it and no run waits for it; its tasks say `by: person`.
 * **What a task says.** The parent's tasks: `metadata[URI].sessions`, open first then the 16 most recently closed. A round:
   `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}`. Today only the snapshot of a stream,
-  `GetTask`, `ListTasks` and the answers carry them. Part b (not built) adds the parent stream's events (`opened`, `round`,
-  `reported`, `closed`, with `opened` and `by: person` on a running parent) and the round stream's status updates when a round
-  ends and when `closing` turns true. A task whose sessions cannot be listed carries no sessions object.
+  `GetTask`, `ListTasks` and the answers carry them. **Events.** On the stream of a parent task, an activated subscriber is sent
+  one status update per change of a session, in the order `opened`, `round`, `reported` (`done`, `failed`, `canceled`, `blocked`),
+  `closed`, with `session`, `contextId`, `agent`, `description`, `keepOpen`, `by` and, except for `closed`, `round {number, taskId,
+  state}` (the A2A JSON state, `TASK_STATE_COMPLETED`). Sessions that existed at the snapshot say nothing; the listing is read when
+  the parent's record changes, at least every second, and once more before the final event. A person's start on a running parent is
+  `opened` with `by: person`. The stream of a round carries the session object on the update that ends the round and on one where
+  `closing` turns true. A task whose sessions cannot be listed carries no sessions object.
 * **Limits.** `maxOpen` (the card's), checked before the start: two concurrent starts may exceed it by the number racing, as the model's start tool may. 20 rounds a session (a close is always allowed, even at the limit), a description of at most 80 characters on one line. A round a person
   starts runs under the tier its message names, else the agent's default; commands are not expanded in a child context.
 
