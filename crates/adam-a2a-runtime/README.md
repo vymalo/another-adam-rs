@@ -136,19 +136,28 @@ extension, each change of one of its sessions is a `TaskStatusUpdateEvent` of th
 plus `round {number, taskId, state}` (`opened`, `round`, `reported`) and `report` (`reported`: `done`, `failed`, `canceled`,
 `blocked` for a round that waits for the person). `closed` carries nothing more. `by` is `person` for a round that is its own
 parent. **`round.state` is the A2A JSON spelling** (`TASK_STATE_WORKING`, `TASK_STATE_COMPLETED`, `TASK_STATE_INPUT_REQUIRED`, ...), as
-in the sessions object, not the contract's lower-case examples. The tracker is seeded from the snapshot's listing (a session that
-existed before says nothing), lists again when the parent's record changes and at least every second (`SESSIONS_POLL`), and lists
-once more before the final event. Per session the diff is a pure function (`diff`) in the contract's order: new -> `opened` (with
-the latest round); the latest round's number grew and it is not a round that only closes -> `round`; the latest round left
-`working`, or waits for the person -> `reported`; the session turned closed -> `closed`. A step missed between two listings is
-filled in that order (a round that began and ended unseen says `round` then `reported`; the report of the round it replaced is
-read from its run). A round that only closes the session reports nothing. A subscriber that did not activate the extension is
-sent none, though the sessions happen. Events are a latency optimisation: the sessions object is the truth.
+in the sessions object, not the contract's lower-case examples. The tracker lists the sessions once before the snapshot is built (so it is a separate listing from the one
+the snapshot's sessions object makes: a session that starts between the two may be told twice, once in the object and once as
+`opened`, never missed), and a session that existed then says nothing. It lists again after at least 200 ms when the parent's
+record changed and at least every second (`SESSIONS_MIN_INTERVAL`, `SESSIONS_POLL`); a listing that fails is warned about and
+retried after the full second; and it lists once more before the final event. A session whose latest round the listing cannot
+read is left out until it can. Per session the diff is a pure function (`diff`) in the contract's order: new -> `opened`; the
+latest round's number grew and it is not a round that only closes -> `round`; the latest round left `working`, or waits for the
+person -> `reported`; the session turned closed -> `closed`. **`opened` carries the latest round**, which is not round 1 for a
+session first seen later (a session that began and went through rounds between two listings, or that a shifting page hid from
+one). Missed steps are filled in only so far as the listings allow: a session first seen with its round over says `opened`,
+`reported`, and `closed` if it closed; a round that began and ended unseen says `round` then `reported`; and the round **immediately
+before** the new one is settled (its report is read from its run) if it was still working. A round skipped entirely between two
+listings is not reported, and what happens after the last listing before the final event is not told: the sessions object, read
+again, is the truth. A round that only closes the session reports nothing. An event's status carries the task's state and no
+message. A subscriber that did not activate the extension is sent none, though the sessions happen.
 
 **The stream of a round** (activated) carries the session object (`{session, parentContextId, agent, description, keepOpen, round,
-by, state, closing}`, as on the round's tasks) on the status update that ends the round, read after it ended (so `state` is `idle`
-or `closed`), and on a status update of its own when `closing` turns true, read when the round's record changes and at least every
-second.
+by, state, closing}`, as on the round's tasks) on the status update that ends the round or pauses it (`input-required`), read after
+it (so `state` is `idle` or `closed` for an ended round), and on a status update of its own when `closing` turns true, read under the
+same rate limit as the parent's listing. A stream that ends with an error, or a round whose session cannot be read (a warning), sends
+no object: the round's tasks still carry it. A round the store could not be read for when the stream starts degrades to a stream with
+no session object, not to a failed subscription.
 
 **A person's round is its own parent.** A round a person starts has no run of an agent behind it, so the runtime is told it is
 its own parent (`start_child_continuing_within(S, S, ..)`): no run's end cancels it and no run waits for it, and

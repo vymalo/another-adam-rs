@@ -337,14 +337,16 @@ stateDiagram-v2
   `ListTasks {contextId: K}` lists the rounds, an unknown or foreign `K` is an empty page.
 * **A person's round is its own parent**, so no run's end cancels it and no run waits for it; its tasks say `by: person`.
 * **What a task says.** The parent's tasks: `metadata[URI].sessions`, open first then the 16 most recently closed. A round:
-  `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}`. Today only the snapshot of a stream,
-  `GetTask`, `ListTasks` and the answers carry them. **Events.** On the stream of a parent task, an activated subscriber is sent
-  one status update per change of a session, in the order `opened`, `round`, `reported` (`done`, `failed`, `canceled`, `blocked`),
-  `closed`, with `session`, `contextId`, `agent`, `description`, `keepOpen`, `by` and, except for `closed`, `round {number, taskId,
-  state}` (the A2A JSON state, `TASK_STATE_COMPLETED`). Sessions that existed at the snapshot say nothing; the listing is read when
-  the parent's record changes, at least every second, and once more before the final event. A person's start on a running parent is
-  `opened` with `by: person`. The stream of a round carries the session object on the update that ends the round and on one where
-  `closing` turns true. A task whose sessions cannot be listed carries no sessions object.
+  `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}`. The snapshot of a stream, `GetTask`, `ListTasks` and the answers carry them. **Events.** On the stream of a parent task, an
+  activated subscriber is sent one status update per change of a session (the task's state, no message), in the order `opened`,
+  `round`, `reported` (`done`, `failed`, `canceled`, `blocked`), `closed`, with `session`, `contextId`, `agent`, `description`,
+  `keepOpen`, `by` and, except for `closed`, `round {number, taskId, state}` (the A2A JSON state, `TASK_STATE_COMPLETED`).
+  Sessions that existed at the start say nothing (one that starts in between may be told twice); the listing is read at most every
+  200 ms when the parent's record changes, at least every second, and once more before the final event. `opened` carries the latest
+  round, which is not round 1 for a session first seen late, and a session a shifting page hid may be told `opened` late. Only the
+  round immediately before a new one is settled, so a round skipped between two listings is not reported: the sessions object is
+  the truth. A person's start on a running parent is `opened` with `by: person`. The stream of a round carries the session object
+  on the update that ends or pauses the round (not when it ends in an error) and on one where `closing` turns true. A task whose sessions cannot be listed carries no sessions object.
 * **Limits.** `maxOpen` (the card's), checked before the start: two concurrent starts may exceed it by the number racing, as the model's start tool may. 20 rounds a session (a close is always allowed, even at the limit), a description of at most 80 characters on one line. A round a person
   starts runs under the tier its message names, else the agent's default; commands are not expanded in a child context.
 
