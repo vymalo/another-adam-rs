@@ -1,6 +1,6 @@
 {
   "name": "find_definition",
-  "description": "Where the symbol on a line of a file is defined, by a language server (Rust, TypeScript and JavaScript, Python, Go): at most 20 locations, each as `path:line:col: the source line`. Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once; if the symbol is not on that line the answer shows the line. A first call on a project starts the server and may wait for it to index (`wait` seconds, 1 to 120, default 30); where there is no server the answer says so. Nothing is changed. Example: {\"path\":\"src/main.rs\",\"line\":12,\"symbol\":\"parse_config\"}",
+  "description": "Where the symbol on a line of a file is defined, by a language server (Rust, TypeScript and JavaScript, Python, Go, Dart): at most 20 locations, each as `path:line:col: the source line`. Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once; if the symbol is not on that line the answer shows the line. A first call on a project starts the server and may wait for it to index (`wait` seconds, 1 to 120, default 30); where there is no server the answer says so. Nothing is changed. Example: {\"path\":\"src/main.rs\",\"line\":12,\"symbol\":\"parse_config\"}",
   "parameters": {
     "type": "object",
     "properties": {

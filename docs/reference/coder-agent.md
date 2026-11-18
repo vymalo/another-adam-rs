@@ -448,6 +448,7 @@ The servers are a **closed table in code** (`table.rs`, never a setting, so a de
 | `.ts .tsx .mts .cts .js .jsx .mjs .cjs` | `typescript-language-server --stdio` (the image's TypeScript, no automatic type acquisition) | `tsconfig.json`, `jsconfig.json`, `package.json` |
 | `.py .pyi` | `pyright-langserver --stdio` (on Node: it sees no interpreter and no installed package) | `pyrightconfig.json`, `pyproject.toml`, `setup.cfg`, `setup.py` |
 | `.go` | `gopls serve` (`GOFLAGS=-mod=readonly`, `GOTOOLCHAIN=local`) | `go.work`, `go.mod` |
+| `.dart` | `dart language-server --protocol=lsp` | `pubspec.yaml` |
 
 The root is the nearest directory, from the file's own up to the slot's root, that holds one of the markers; the slot's root
 when none does. **Today's coder image has no language server**: it is built on a workspace image from before the
@@ -561,7 +562,7 @@ the server depends on where it runs and on the tier of the run (the tier of the 
 | `edits`, `auto`, `bypass` | a slot it may write | **full** | no |
 
 A **safe** server has the reference settings: for rust-analyzer no build script, no procedural macro, no check on save and a build directory of its own (below);
-for TypeScript the image's own TypeScript (never the project's), no plugin and no automatic type acquisition; for Go `-mod=readonly`. A **full**
+for TypeScript the image's own TypeScript (never the project's), no plugin and no automatic type acquisition; for Go `-mod=readonly`; for Dart nothing (it is told no setting). A **full**
 server runs what the project's own build runs, as `run_checks` there does (a build script, a procedural macro): at a tier that may write, a
 slot may be written by the checks, so it is no wider. A server is never shared between the two modes; a run whose tier changes starts one of the
 other mode (the old one stops when it is idle). Where a server runs, it runs as the same user with the same variables hidden as `run_command`
@@ -574,7 +575,8 @@ write between calls), a writable slot at tier `plan` against its state before th
 This covers **what git sees in the call's own slot, at the boundaries of a call**. It does not cover: a write after the last comparison
 of a call (it is seen at the next call of a reference, and not at all in a writable slot at `plan`); a file git ignores; a path outside the slot; and
 **project code that runs while the server looks**, which a safe server reduces and cannot remove (a `build.rs` is off, but `cargo metadata` and a
-`.cargo/config` runner or wrapper are not; tsserver plugins are off, but `tsconfig.json` and `package.json` are read; gopls runs `go list`). A full
+`.cargo/config` runner or wrapper are not; tsserver plugins are off, but `tsconfig.json` and `package.json` are read; gopls runs `go list`; the Dart
+analysis server reads `analysis_options.yaml`, whose analyzer plugins it may run, *unverified*). A full
 server has none of the snapshot and runs more. The comparison costs the git calls of `run_command` on each call.
 
 A safe rust-analyzer builds in `/tmp/adam-rust-analyzer/<id>` of the **environment**, one directory for each run, slot and project root, and the
@@ -600,8 +602,10 @@ some servers exit when the pid they were given is gone.
 `cargo.targetDir` of rust-analyzer; `disableAutomaticTypingAcquisition` and `--tsserver-path` of typescript-language-server; `python.analysis` of
 pyright; `buildFlags` of gopls): a name a server does not know is ignored, so a wrong one costs a weaker result. What was run on a real server:
 `rust-analyzer` 1.97.0 and `pyright-langserver` (Node) answered the gated suite of `tests/real_language_servers.rs` here (an error at its line, a
-definition, references); `typescript-language-server` and `gopls` were not installed here and have not been run. No CI job runs the gated
-suite yet.
+definition, references); `typescript-language-server` and `gopls` were not installed here and have not been run. `dart language-server`
+takes `--protocol=lsp` (*verified* 2026-11-18 in dart-lang/sdk at tag 3.12.2, `pkg/dartdev/lib/src/commands/language_server.dart`); the
+author of the pull request that added it reports the gated suite passing on Dart SDK 3.12.2 in the workspace image (*unverified* here: no Dart
+SDK where it was merged). No CI job runs the gated suite yet.
 
 ## Rules in code
 
