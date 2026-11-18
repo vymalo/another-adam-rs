@@ -32,9 +32,13 @@ const HIDDEN_FROM_CHECKS: &[&str] = &[
 /// grandchild that outlives its parent may hold them open forever.
 const PIPE_GRACE: Duration = Duration::from_secs(2);
 
-/// The most bytes of a command's output that are captured for keeping: the first 16 MiB. The tail
-/// beyond them is still tracked for the view.
-pub const KEPT_OUTPUT_MAX: usize = 16 * 1024 * 1024;
+/// The most bytes of a command's output that are captured for keeping: the first 4 MiB, the bytes
+/// a run may keep in its own state ([`MAX_RUN_KEPT_BYTES`](adam_llm_agent::MAX_RUN_KEPT_BYTES))
+/// rather than the 16 MiB one kept output may hold. The capture is a buffer that every call
+/// running at once holds (ten by default, so 40 MiB rather than 160), and an output beyond it is
+/// kept cut: the view and the last page say `only the first N of M bytes are kept`. The tail
+/// beyond the capture is still tracked for the view.
+pub const KEPT_OUTPUT_MAX: usize = adam_llm_agent::MAX_RUN_KEPT_BYTES;
 
 /// What is captured beyond [`KEPT_OUTPUT_MAX`], and kept before the tail the model is shown: the
 /// margin that `adam_llm_agent::scrub_open_end` and `scrub_open_start` cut back at the edge of a
@@ -88,7 +92,7 @@ pub struct ShellOutcome {
 }
 
 impl std::fmt::Debug for ShellOutcome {
-    /// Lengths, never the captured bytes (up to 16 MiB of them).
+    /// Lengths, never the captured bytes (up to [`KEPT_OUTPUT_MAX`] of them).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShellOutcome")
             .field("exit_code", &self.exit_code)
@@ -730,6 +734,30 @@ mod tests {
         assert!(long.tail.ends_with("20000\n"));
         let short = run_shell(dir.path(), "seq 1 5", LONG, 1024).await.unwrap();
         assert!(!short.truncated && short.captured.is_empty() && short.total == 10);
+    }
+
+    /// A command that prints more than the capture holds: the capture stops at
+    /// [`KEPT_OUTPUT_MAX`] and the margin, the output is still counted whole, and the tail is the
+    /// real tail (what the model is shown is unchanged).
+    #[tokio::test]
+    async fn a_command_captures_at_most_the_kept_output_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_captured(
+            &LocalSession,
+            shell_spec(dir.path(), "head -c 20971520 /dev/zero | tr '\\0' a"),
+            LONG,
+            1024,
+            SCRUB_OVERLAP,
+            &CancelToken::new(),
+        )
+        .await
+        .0
+        .unwrap();
+        assert!(out.truncated);
+        assert_eq!(out.total, 20 * 1024 * 1024);
+        assert_eq!(out.captured.len(), KEPT_OUTPUT_MAX + SCRUB_OVERLAP);
+        assert_eq!(out.tail.len(), 1024);
+        assert!(out.tail.bytes().all(|b| b == b'a'));
     }
 
     #[tokio::test]
