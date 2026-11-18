@@ -289,7 +289,9 @@ impl Store for MemoryStore {
 
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
         let inner = self.inner.lock().await;
-        let mut found: Vec<RunRecord> = inner
+        // Sort references and clone the page only: a listing of a thousand runs must not copy a
+        // thousand states to return ten of them.
+        let mut found: Vec<&RunRecord> = inner
             .runs
             .values()
             .map(|s| &s.run)
@@ -299,11 +301,10 @@ impl Store for MemoryStore {
                     .after
                     .is_none_or(|(at, id)| (r.updated_at, r.id) < (at, id))
             })
-            .cloned()
             .collect();
-        found.sort_by_key(|a| std::cmp::Reverse((a.updated_at, a.id)));
+        found.sort_by_key(|r| std::cmp::Reverse((r.updated_at, r.id)));
         found.truncate(query.limit);
-        Ok(found)
+        Ok(found.into_iter().cloned().collect())
     }
 
     async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
@@ -454,5 +455,83 @@ impl Store for MemoryStore {
             }
         }
         Ok(doomed.len() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::RunStatus;
+    use crate::store::ConversationScope;
+
+    /// A thousand runs, paged by the `(updated_at, id)` keyset: every page is the next slice of the
+    /// order the store promises, and the last one is short. The listing sorts references and clones
+    /// only the page (see `list_runs`), which this checks by its result: the same order and the same
+    /// records a full sort would give.
+    #[tokio::test]
+    async fn a_listing_of_a_thousand_runs_pages_by_updated_at_and_id() {
+        let store = MemoryStore::new();
+        let mut made = Vec::with_capacity(1000);
+        for n in 0..1000 {
+            let mut run = NewRun::new("a", json!({"n": n})).conversation(format!("owner:ctx{n}"));
+            if n % 2 == 0 {
+                run = run.status(RunStatus::Parked);
+            }
+            made.push(store.create_run(run).await.expect("create a run"));
+        }
+        // What the store's contract says the order is, computed from the records themselves.
+        made.sort_by_key(|r| std::cmp::Reverse((r.updated_at, r.id)));
+        let expected: Vec<RunId> = made.iter().map(|r| r.id).collect();
+
+        let mut page = RunQuery::new("a", ConversationScope::Prefix("owner:".into()), 10);
+        let mut seen = Vec::new();
+        loop {
+            let runs = store.list_runs(&page).await.expect("list");
+            assert!(runs.len() <= 10);
+            let last = runs.last().map(|r| (r.updated_at, r.id));
+            seen.extend(runs.iter().map(|r| r.id));
+            match last {
+                Some(after) if runs.len() == 10 => page.after = Some(after),
+                _ => break,
+            }
+        }
+        assert_eq!(seen, expected, "every run once, in the documented order");
+
+        // A page in the middle is the slice after its cursor, and the filters still apply.
+        let mut middle = RunQuery::new("a", ConversationScope::Prefix("owner:".into()), 3);
+        middle.after = Some((made[499].updated_at, made[499].id));
+        assert_eq!(
+            store
+                .list_runs(&middle)
+                .await
+                .expect("list")
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            expected[500..503]
+        );
+        middle.statuses = Some(vec![RunStatus::Parked]);
+        assert!(
+            store
+                .list_runs(&middle)
+                .await
+                .expect("list")
+                .iter()
+                .all(|r| r.status == RunStatus::Parked)
+        );
+        assert!(
+            store
+                .list_runs(&RunQuery::new(
+                    "a",
+                    ConversationScope::Prefix("other:".into()),
+                    10
+                ))
+                .await
+                .expect("list")
+                .is_empty(),
+            "another owner's namespace is not listed"
+        );
     }
 }
