@@ -160,7 +160,7 @@ the agents with `try_build`, so a tool whose `required_state` nobody gave is
 reaches `max_turns` or `max_tool_calls` gets one closing model call in which it may call no tool and ends `Done`
 with that answer marked `limited` (see `adam-llm-agent`). `limits.max_minutes` is the time limit of a subagent's run
 (`SubagentTool::with_run_limit`; 30 by default, `0` none, at most 1,440; a warning on a root agent): past it the runtime
-fails the child and the parent reads "the run failed: cancelled: time limit: ...". `DEFAULT_SUBAGENT_MINUTES` is 30. `limits.max_parallel` is not in the loop's `Limits` (ADR 0049): it is the number of tool calls of one
+fails the child and the parent reads "the run failed: cancelled: time limit: ...". `DEFAULT_SUBAGENT_MINUTES` is 30. The classes of the tools the assembly makes (ADR 0049): `load_skill` and `read_skill_file` are `Independent`; a one-shot subagent tool and a remote subagent tool are `Alone` (they park the run on a child or a task), and so are the session tools. A remote agent's files are taken from the room the turn's calls share (`ToolCtx::spend_files_of`). `limits.max_parallel` is not in the loop's `Limits` (ADR 0049): it is the number of tool calls of one
 model turn that run at once for that agent, 1 to 32, and it can only lower `BoundDef::max_parallel` (the deployment's setting).
 
 **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an

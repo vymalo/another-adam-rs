@@ -87,3 +87,10 @@ fn a_file_value_equal_to_the_setting_is_that_value() {
     let got = assemble(family("max_parallel: 4", ""), Some(4));
     assert_eq!(parallel_of(&got), (4, 4));
 }
+
+#[test]
+fn a_subagent_tool_runs_alone() {
+    use adam_llm_agent::{Tool, ToolAccess};
+    let tool = adam_assembly::SubagentTool::new("helper", "coder/helper", "Does a piece of work.");
+    assert_eq!(tool.access(&serde_json::json!({})), ToolAccess::Alone);
+}

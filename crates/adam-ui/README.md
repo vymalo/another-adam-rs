@@ -56,6 +56,8 @@ inbound function reads a screen's action as JSON text.
 
 ## The tools
 
+**What each shares with the other calls of a turn** ([ADR 0049](../../docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md); `tests/access.rs`): `ui_catalog` is `Independent`, `show` writes the scope `screen` (two `show` calls keep the model's order), `ask_user` and the three plan tools are `Alone`, and so is the thread-tools source (its tools may ask other agents and wait).
+
 * **`ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`** is the question every agent has.
   Without `choices` the run parks as `input-required` with the question as text, as before (a `title` or a
   `description` with no `choices` is ignored). Whenever the answer is one of a few options the model is told to pass

@@ -801,7 +801,7 @@ stateDiagram-v2
 
 ### Timeouts, instructions and prompts
 
-Four optional keys of a server entry, in `mcp.json` and in the deployment's extra file
+Five optional keys of a server entry, in `mcp.json` and in the deployment's extra file
 (`ADAM_EXTRA_MCP_FILE`).
 
 | Key | Meaning | Default |
@@ -810,6 +810,7 @@ Four optional keys of a server entry, in `mcp.json` and in the deployment's extr
 | `connectTimeoutSecs` | how long the server may take to start, initialize and list its tools and its prompts: one deadline for all of it | 30 |
 | `instructions` | `false` leaves out the text the server returns when it initializes | on |
 | `prompts` | `false` stops the server's prompts from becoming commands | on |
+| `parallel` | `false` makes the calls of this server's tools run one at a time, alone in their turn; by default they run at the same time as the turn's other calls, up to `MAX_PARALLEL_TOOL_CALLS` ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)). **Folder agents change behaviour here:** with the default of 10, the MCP calls of one model reply now overlap; set `"parallel": false` on a server whose calls must not | on |
 
 * **Seconds.** A whole number, at least 1. Zero, a negative or a fractional number, or text refuses that server
   when the file is loaded (`path: error: ...`).

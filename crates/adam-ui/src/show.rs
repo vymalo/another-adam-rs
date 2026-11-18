@@ -9,6 +9,7 @@
 //! emitted as a run artifact `ui` of media type `application/a2ui+json` (the A2UI messages), which
 //! the A2A server sends as a data part; the result the model reads is "Shown to the person.".
 
+use adam_llm_agent::ToolAccess;
 use std::sync::Arc;
 
 use adam_a2a::A2UI_MEDIA_TYPE;
@@ -247,6 +248,11 @@ impl Show {
 
 #[async_trait]
 impl Tool for Show {
+    /// Draws on the person's screen: two `show` calls keep the model's order (ADR 0049).
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::writes("screen")
+    }
+
     /// The step of a call is called "Show on your screen".
     fn step_style(&self) -> StepStyle {
         StepStyle::default().with_label("Show on your screen")
@@ -323,6 +329,11 @@ impl UiCatalogTool {
 
 #[async_trait]
 impl Tool for UiCatalogTool {
+    /// Reads the screen's catalog and changes nothing.
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
     /// The step of a call is called "List what the screen can draw".
     fn step_style(&self) -> StepStyle {
         StepStyle::default().with_label("List what the screen can draw")

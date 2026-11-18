@@ -30,6 +30,7 @@
 //! way round: a secret cut in half is not recognised by the scrubber that runs on the finished
 //! result, and its first half would stay in a durable artifact.
 
+use adam_llm_agent::ToolAccess;
 use std::sync::Arc;
 
 use adam_a2a::A2UI_MEDIA_TYPE;
@@ -512,6 +513,11 @@ plan_tool!(PlanAdd);
 
 #[async_trait]
 impl Tool for PlanWork {
+    /// The plan is the run's state, which the loop applies call by call: it runs alone (ADR 0049).
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Alone
+    }
+
     fn step_style(&self) -> StepStyle {
         step("Write the plan")
     }
@@ -600,6 +606,11 @@ impl Tool for PlanWork {
 
 #[async_trait]
 impl Tool for PlanCheck {
+    /// The plan is the run's state, which the loop applies call by call: it runs alone (ADR 0049).
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Alone
+    }
+
     fn step_style(&self) -> StepStyle {
         step("Update the plan")
     }
@@ -698,6 +709,11 @@ impl Tool for PlanCheck {
 
 #[async_trait]
 impl Tool for PlanAdd {
+    /// The plan is the run's state, which the loop applies call by call: it runs alone (ADR 0049).
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Alone
+    }
+
     fn step_style(&self) -> StepStyle {
         step("Add to the plan")
     }

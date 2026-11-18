@@ -1028,6 +1028,19 @@ impl ToolCtx {
         }
     }
 
+    /// [`spend_files`](Self::spend_files) for the files among `artifacts`: what a tool that returns
+    /// files it did not choose (an MCP server's, a remote agent's) calls with its result.
+    pub fn spend_files_of(&self, artifacts: &[adam_runtime::Artifact]) {
+        let bytes: usize = artifacts
+            .iter()
+            .filter_map(|a| a.file.as_ref())
+            .map(|f| f.bytes.len())
+            .sum();
+        if bytes > 0 {
+            self.spend_files(u64::try_from(bytes).unwrap_or(u64::MAX));
+        }
+    }
+
     /// Give the call the note its source made about the tool when it listed it
     /// ([`ToolNote`]): what [`note`](Self::note) answers. The agent does it for the calls of a
     /// source's tools; a test of a source does it to say what a listing said.

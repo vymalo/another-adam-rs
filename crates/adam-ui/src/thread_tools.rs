@@ -463,6 +463,12 @@ impl ToolSource for ThreadTools {
         is_relayed(name)
     }
 
+    /// The orchestration layer's tools may ask other agents and wait: they run alone until the
+    /// owner decides otherwise (ADR 0049).
+    fn access(&self, _name: &str, _args: &Value) -> adam_llm_agent::ToolAccess {
+        adam_llm_agent::ToolAccess::Alone
+    }
+
     async fn listing(&self, ctx: &SourceCtx) -> Listing {
         let grant = match self.client.grant(ctx.context_map()) {
             Ok(grant) => grant,

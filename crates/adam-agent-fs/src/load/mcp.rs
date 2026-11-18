@@ -157,6 +157,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
         connect_timeout_secs: asked("connectTimeoutSecs", raw.connect_timeout_secs.as_ref()),
         instructions: raw.instructions.unwrap_or(true),
         prompts: raw.prompts.unwrap_or(true),
+        parallel: raw.parallel.unwrap_or(true),
     };
     let command = raw.command.as_deref().map(str::trim);
     let url = raw.url.as_deref().map(str::trim);

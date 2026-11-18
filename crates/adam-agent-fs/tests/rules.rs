@@ -1400,3 +1400,20 @@ fn max_parallel_from_1_to_32_is_read_and_is_no_diagnostic() {
         assert_eq!(limits.max_parallel, Some(n));
     }
 }
+
+#[test]
+fn parallel_false_is_read_per_server_and_is_on_by_default() {
+    let (config, diagnostics) = parse_servers(
+        r#"{"mcpServers":{
+            "serial":{"command":"x","parallel":false},
+            "plain":{"command":"y"},
+            "explicit":{"command":"z","parallel":true}}}"#,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let config = config.unwrap();
+    assert!(!config.servers["serial"].settings().parallel);
+    assert!(!config.servers["serial"].settings().is_default());
+    assert!(config.servers["plain"].settings().parallel);
+    assert!(config.servers["plain"].settings().is_default());
+    assert!(config.servers["explicit"].settings().is_default());
+}

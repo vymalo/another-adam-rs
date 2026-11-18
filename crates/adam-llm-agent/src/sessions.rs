@@ -13,6 +13,7 @@
 //!
 //! [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
 
+use crate::access::ToolAccess;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -982,6 +983,11 @@ struct List {
 
 #[async_trait]
 impl Tool for List {
+    /// Declared like the other session tools, which the loop runs alone.
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Alone
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: SUBAGENT_LIST.to_owned(),

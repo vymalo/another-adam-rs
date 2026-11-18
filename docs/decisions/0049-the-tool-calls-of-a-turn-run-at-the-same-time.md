@@ -192,7 +192,8 @@ stateDiagram-v2
 * **Additive:** `Tool::access`, `ToolSource::access`, `ToolAccess`, `Use`, `UseMode`, the `#[tool]` options,
   `FnTool::with_access`, `Ctx::reserve_steps`, `ReservedStep`, `Ctx::step_all`, `LlmAgentBuilder::max_parallel`
   (slice P4), and later `NotesStore::update`.
-* **Not additive, in later slices:** `adam_agent_fs::Limits` gains `max_parallel` (a struct literal breaks); the `adam-service`
+* **Not additive, built in P5 to P7:** `adam_agent_fs::Limits` gained `max_parallel` and `McpSettings` gained `parallel`; `adam_service::WorkerSettings`, `adam_agent::WorkerParts` (and `assemble_with` now delegates to `assemble_limited`) and adam-coder's `WorkerConfig` and `CoderSettings` gained a field; `BuildError` gained the variant `ReservedArgument`; `Conversation` gained `ordered_calls`; the chart renders `MAX_PARALLEL_TOOL_CALLS` only when `config.maxParallelToolCalls` is set; the prompt prefix changed once (the schemas and one sentence of the instructions). **Folder agents:** the MCP calls of one model reply now overlap (`"parallel": false` per server opts out).
+* **Not additive, still to come:** `adam_agent_fs::Limits` gains `max_parallel` (a struct literal breaks); the `adam-service`
   `Config` and the MCP server config gain a field; the MCP tool calls of every folder agent now run concurrently; the prompt
   prefix changes once; the chart renders a new key. Say each in the pull request and in `adam-upgrade`.
 * **Slices P1 to P4 change no behaviour in production:** every first-party tool is `Alone` until its class is declared, so
@@ -210,7 +211,7 @@ stateDiagram-v2
 | P4 | `run_pending` by segments, `LlmAgentBuilder::max_parallel` | built |
 | P5 | `MAX_PARALLEL_TOOL_CALLS`, `limits.max_parallel`, the chart key | built |
 | P6 | `after_previous` | built |
-| P7 | classes of the library tools: MCP, UI, assembly, `read_output` | not built |
+| P7 | classes of the library tools: MCP, UI, assembly, `read_output` | built (`"parallel": false` per server in `mcp.json`; the thread-tools source stays `Alone`; folder agents' MCP calls now overlap) |
 | P8 | the coder: `NotesStore::update`, the class table, atomic writes | not built |
 | P9 | the batching sentence, the bench pin, calls per turn in the bench | not built |
 | P10 | ADR 0037 decision 4 (`waits`, `held`) so subagent and remote calls join segments | later |

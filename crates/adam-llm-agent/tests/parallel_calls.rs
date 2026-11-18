@@ -2022,3 +2022,26 @@ async fn a_source_tool_with_its_own_after_previous_keeps_it_and_the_others_still
         ]
     );
 }
+
+#[test]
+fn read_output_is_independent_and_the_session_list_runs_alone() {
+    assert_eq!(
+        adam_llm_agent::ReadOutput.access(&json!({})),
+        ToolAccess::Independent
+    );
+    let roster = adam_llm_agent::SessionTools::new([adam_llm_agent::SessionAgent {
+        name: "helper".into(),
+        agent: "x/helper".into(),
+        description: "Does a piece of work.".into(),
+        within: None,
+        remote: false,
+    }]);
+    for tool in roster.tools() {
+        assert_eq!(
+            tool.access(&json!({})),
+            ToolAccess::Alone,
+            "{}",
+            tool.spec().name
+        );
+    }
+}

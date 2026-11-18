@@ -158,6 +158,7 @@ impl McpServers {
             files,
             instructions: want_instructions,
             prompts: want_prompts,
+            parallel,
         } = plan;
         let name = recipe.server.clone();
         let connect_timeout = recipe.connect_timeout;
@@ -212,6 +213,7 @@ impl McpServers {
                     call_timeout,
                     connect_timeout,
                     files,
+                    parallel,
                 ))
             })
             .collect();
@@ -380,6 +382,8 @@ struct Plan {
     instructions: bool,
     /// `prompts` of the entry (on unless the file says `false`).
     prompts: bool,
+    /// `parallel` of the entry (on unless the file says `false`): its tools may run beside other calls.
+    parallel: bool,
 }
 
 impl Plan {
@@ -547,6 +551,7 @@ impl Plan {
             files: server.shares_files(),
             instructions: server.settings().instructions,
             prompts: server.settings().prompts,
+            parallel: server.settings().parallel,
         })
     }
 }

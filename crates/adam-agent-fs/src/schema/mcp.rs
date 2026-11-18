@@ -97,6 +97,9 @@ pub struct McpSettings {
     pub instructions: bool,
     /// `prompts: false` stops the server's prompts from becoming commands. On by default.
     pub prompts: bool,
+    /// `parallel: false` makes the calls of this server's tools run one at a time, alone in their
+    /// turn (ADR 0049); by default they may run at the same time as the turn's other calls.
+    pub parallel: bool,
 }
 
 impl Default for McpSettings {
@@ -106,6 +109,7 @@ impl Default for McpSettings {
             connect_timeout_secs: None,
             instructions: true,
             prompts: true,
+            parallel: true,
         }
     }
 }
@@ -339,6 +343,7 @@ pub(crate) struct RawServer {
     pub(crate) connect_timeout_secs: Option<Value>,
     pub(crate) instructions: Option<bool>,
     pub(crate) prompts: Option<bool>,
+    pub(crate) parallel: Option<bool>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
 }

@@ -26,6 +26,7 @@
 //! is **folded** onto several lines and a NUL becomes U+FFFD, so that a page never cuts a line and no
 //! byte of the text is out of reach.
 
+use crate::access::ToolAccess;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -738,6 +739,11 @@ pub struct ReadOutput;
 
 #[async_trait]
 impl Tool for ReadOutput {
+    /// Reads output the run kept and changes nothing.
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: READ_OUTPUT.into(),

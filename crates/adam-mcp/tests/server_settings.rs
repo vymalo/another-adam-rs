@@ -6,6 +6,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use adam_llm_agent::ToolAccess;
 use adam_mcp::{
     Env, MAX_INSTRUCTIONS_BYTES, MAX_SERVER_INSTRUCTIONS_BYTES, McpPolicy, McpServers, PromptError,
 };
@@ -812,4 +813,20 @@ async fn a_prompt_with_one_argument_takes_all_the_words() {
         .await
         .unwrap();
     assert!(text.ends_with("Paint a red dot."), "{text}");
+}
+
+/// An MCP tool shares nothing with the turn's other calls, so by default it may run beside them;
+/// `"parallel": false` on its server makes it run alone (ADR 0049).
+#[tokio::test]
+async fn mcp_tools_are_independent_unless_the_server_says_parallel_false() {
+    let first = TestHttpServer::start(None).await;
+    let second = TestHttpServer::start(None).await;
+    let config = two_servers(&first.url(), &second.url(), r#", "parallel": false"#);
+    let servers = McpServers::connect(&config, &Env::new(), &McpPolicy::default())
+        .await
+        .unwrap();
+    let tools = servers.tools();
+    let access = |name: &str| tools.get(name).unwrap().access(&json!({}));
+    assert_eq!(access("a__echo"), ToolAccess::Alone);
+    assert_eq!(access("b__echo"), ToolAccess::Independent);
 }

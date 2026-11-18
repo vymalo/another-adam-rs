@@ -7,6 +7,7 @@
 //! token, the limits) is decided at [`RemoteSubagentTool::bind`]; the network is touched only when a
 //! call needs it.
 
+use adam_llm_agent::ToolAccess;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -583,6 +584,11 @@ fn cap_text(mut text: String, max: usize) -> String {
 
 #[async_trait]
 impl Tool for RemoteSubagentTool {
+    /// A remote subagent can park the run on its task: it runs alone (ADR 0049 decision 14).
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Alone
+    }
+
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }
@@ -626,9 +632,16 @@ impl Tool for RemoteSubagentTool {
             .await
             .map_err(|e| self.failure("send the message to", &e))?;
         match response {
-            SendMessageResponse::Message(reply) => Ok(self.reply(&reply, ctx.files_left())),
+            SendMessageResponse::Message(reply) => {
+                let output = self.reply(&reply, ctx.files_left());
+                ctx.spend_files_of(&output.artifacts);
+                Ok(output)
+            }
             SendMessageResponse::Task(task) => match self.outcome(&task, ctx.files_left()) {
-                Outcome::Done(output) => Ok(output),
+                Outcome::Done(output) => {
+                    ctx.spend_files_of(&output.artifacts);
+                    Ok(output)
+                }
                 Outcome::Working => {
                     tracing::debug!(tool = %self.name(), task = %task.id, "remote task started");
                     Err(ToolError::AwaitRemote {

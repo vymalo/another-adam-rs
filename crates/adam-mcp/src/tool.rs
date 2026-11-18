@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_llm_agent::{StepStyle, Tool, ToolCtx, ToolError, ToolOutput, keep_image};
+use adam_llm_agent::{StepStyle, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput, keep_image};
 use adam_model::{ImageOrigin, ToolSpec};
 use adam_runtime::{
     MAX_ARTIFACT_FILE_BYTES, ReceivedFiles, SystemLine, checked_media_type, extension_of,
@@ -66,6 +66,9 @@ pub(crate) struct McpTool {
     connect_timeout: Duration,
     /// `files: true` on its server: the files of a result are shared, not described.
     files: bool,
+    /// Its calls may run beside the turn's other calls (`parallel` of the server's entry, on by
+    /// default); off, they run alone.
+    parallel: bool,
 }
 
 /// How a tool reaches its server.
@@ -106,6 +109,7 @@ impl McpTool {
         call_timeout: Duration,
         connect_timeout: Duration,
         files: bool,
+        parallel: bool,
     ) -> Self {
         Self {
             spec,
@@ -116,6 +120,7 @@ impl McpTool {
             call_timeout,
             connect_timeout,
             files,
+            parallel,
         }
     }
 
@@ -268,6 +273,8 @@ impl McpTool {
                 );
             }
         };
+        // The files it shares count against the room the turn's other calls read (ADR 0049).
+        ctx.spend_files_of(&output.artifacts);
         (output, false)
     }
 
@@ -389,6 +396,17 @@ impl McpTool {
 impl Tool for McpTool {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
+    }
+
+    /// An MCP tool shares nothing with the run's other calls (an MCP call has no idempotency key
+    /// and its server is its own), so by default it runs beside them; `"parallel": false` on its
+    /// server in `mcp.json` makes it run alone (ADR 0049).
+    fn access(&self, _args: &Value) -> ToolAccess {
+        if self.parallel {
+            ToolAccess::Independent
+        } else {
+            ToolAccess::Alone
+        }
     }
 
     /// The call's own timeout, the time a connection may take (a call dials again, or dials for

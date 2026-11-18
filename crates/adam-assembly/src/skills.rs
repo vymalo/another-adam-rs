@@ -14,6 +14,7 @@
 //! same text whether the files were embedded by `build.rs` or read from a directory, and both
 //! tools are ordinary [`Tool`]s: their results are journaled with the step that ran them.
 
+use adam_llm_agent::ToolAccess;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -891,6 +892,11 @@ struct LoadSkill {
 
 #[async_trait]
 impl Tool for LoadSkill {
+    /// Reads a skill's files and changes nothing.
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
     /// The step of a call is called "Load a skill".
     fn step_style(&self) -> StepStyle {
         StepStyle::default().with_label("Load a skill")
@@ -930,6 +936,11 @@ struct ReadSkillFile {
 
 #[async_trait]
 impl Tool for ReadSkillFile {
+    /// Reads a skill's file and changes nothing.
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
     /// The step of a call is called "Read a skill file".
     fn step_style(&self) -> StepStyle {
         StepStyle::default().with_label("Read a skill file")
@@ -982,6 +993,22 @@ mod tests {
 
     fn set(entries: Vec<Entry>) -> Arc<SkillSet> {
         Arc::new(SkillSet { entries })
+    }
+
+    /// The skills tools only read: two of them in one turn may run at the same time (ADR 0049).
+    #[test]
+    fn the_skills_tools_are_independent() {
+        let set = set(vec![entry("pdf", false, &[])]);
+        let load = LoadSkill {
+            set: set.clone(),
+            run: None,
+        };
+        assert_eq!(
+            load.access(&serde_json::json!({"name": "pdf"})),
+            ToolAccess::Independent
+        );
+        let read = ReadSkillFile { set, run: None };
+        assert_eq!(read.access(&serde_json::json!({})), ToolAccess::Independent);
     }
 
     #[test]

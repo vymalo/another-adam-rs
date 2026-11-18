@@ -1,5 +1,6 @@
 //! [`SubagentTool`]: the tool a parent calls to run a subagent as a durable child run.
 
+use adam_llm_agent::ToolAccess;
 use std::time::Duration;
 
 use adam_llm_agent::{StepIcon, StepKind, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
@@ -120,6 +121,11 @@ impl SubagentTool {
 
 #[async_trait]
 impl Tool for SubagentTool {
+    /// A one-shot subagent parks the run on its child: it runs alone (ADR 0049 decision 14).
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Alone
+    }
+
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }

@@ -26,6 +26,7 @@ mod shown;
 #[cfg(test)]
 mod vectors;
 
+use adam_llm_agent::ToolAccess;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -1082,6 +1083,11 @@ fn parameters() -> Value {
 
 #[async_trait]
 impl Tool for AskUser {
+    /// Asks the person: the loop runs it alone whatever it says (ADR 0049).
+    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
+        ToolAccess::Alone
+    }
+
     /// The step of a call is called "Ask you", and drawn as thinking.
     fn step_style(&self) -> StepStyle {
         StepStyle::default()
