@@ -3024,7 +3024,7 @@ impl LlmAgent {
                     .into_iter()
                     .next()
             {
-                return Ok(ToolOutput::error(held.reason));
+                return Ok(ToolOutput::error(held.reason).sanitized());
             }
             let called = match own {
                 Some(tool) => {
@@ -3048,7 +3048,9 @@ impl LlmAgent {
                     .await
                 }
             };
-            with_reported_sandbox(&tool_ctx, &unjournaled, called)
+            // The one place a call's output becomes its journaled step and its model message: a NUL
+            // a tool printed is stored and shown as U+FFFD, before either (ADR 0051).
+            with_reported_sandbox(&tool_ctx, &unjournaled, called).map(ToolOutput::sanitized)
         }
         .boxed()
     }

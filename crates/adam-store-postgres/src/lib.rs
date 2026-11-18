@@ -36,7 +36,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_core::store::{add_ttl, now, sched_at, truncate_ms};
+use adam_core::store::{add_ttl, now, sched_at, storable, truncate_ms};
 use adam_core::{
     ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
     PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
@@ -140,9 +140,11 @@ impl PgStore {
             if db.code().as_deref() == Some("23503") {
                 return StoreError::NotFound(run);
             }
-            if db.code().as_deref() == Some("22P05") {
+            if matches!(db.code().as_deref(), Some("22P05" | "22021")) {
                 return StoreError::InvalidInput(
-                    "PostgreSQL JSONB cannot store the NUL character (\\u0000) in strings or keys"
+                    "PostgreSQL cannot store a character of this value (a NUL in JSONB, or a \
+                     character the database encoding cannot hold): a NUL is a bug, since \
+                     adam_core::storable replaces it before every write"
                         .into(),
                 );
             }
@@ -648,13 +650,14 @@ impl Store for PgStore {
     async fn create_run(&self, new: NewRun) -> StoreResult<RunRecord> {
         let t = now();
         let wake_at = new.wake_at.map(truncate_ms);
+        let state = storable(&new.state);
         let row = sqlx::query(safe(&self.sql.insert_run))
             .bind(new.id.0)
             .bind(&new.agent)
             .bind(&new.conversation_id)
             .bind(new.parent_id.map(|p| p.0))
             .bind(new.status.as_str())
-            .bind(Json(&new.state))
+            .bind(Json(state.as_ref()))
             .bind(wake_at)
             .bind(sched_at(new.status, wake_at, t))
             .bind(t)
@@ -683,11 +686,12 @@ impl Store for PgStore {
     ) -> StoreResult<RunRecord> {
         let t = now();
         let wake_at = update.wake_at.map(truncate_ms);
+        let state = storable(&update.state);
         let result = sqlx::query(safe(&self.sql.commit_run))
             .bind(id.0)
             .bind(to_i64(expected, "version")?)
             .bind(update.status.as_str())
-            .bind(Json(&update.state))
+            .bind(Json(state.as_ref()))
             .bind(wake_at)
             .bind(sched_at(update.status, wake_at, t))
             .bind(t)
@@ -757,12 +761,13 @@ impl Store for PgStore {
 
     async fn journal_put(&self, run: RunId, entry: JournalEntry) -> StoreResult<JournalEntry> {
         let seq = to_i64(entry.seq, "journal seq")?;
+        let payload = storable(&entry.payload);
         let inserted = sqlx::query(safe(&self.sql.journal_insert))
             .bind(run.0)
             .bind(seq)
             .bind(&entry.name)
             .bind(entry.ok)
-            .bind(Json(&entry.payload))
+            .bind(Json(payload.as_ref()))
             .bind(truncate_ms(entry.recorded_at))
             .fetch_optional(&self.pool)
             .await
@@ -933,13 +938,15 @@ impl Store for PgStore {
     }
 
     async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
+        let config = storable(&new.config);
+        let cursor = storable(&new.cursor);
         let row = sqlx::query(safe(&self.sql.push_put))
             .bind(new.run.0)
             .bind(&new.id)
             .bind(&new.agent)
             .bind(&new.owner)
-            .bind(Json(&new.config))
-            .bind(Json(&new.cursor))
+            .bind(Json(config.as_ref()))
+            .bind(Json(cursor.as_ref()))
             .bind(now())
             .fetch_one(&self.pool)
             .await
@@ -1008,12 +1015,13 @@ impl Store for PgStore {
         let attempts = i32::try_from(progress.attempts).map_err(|_| {
             StoreError::InvalidInput(format!("attempts {} exceeds i32::MAX", progress.attempts))
         })?;
+        let cursor = storable(&progress.cursor);
         let row = sqlx::query(safe(&self.sql.push_commit))
             .bind(run.0)
             .bind(id)
             .bind(to_i64(expected, "version")?)
             .bind(progress.state.as_str())
-            .bind(Json(&progress.cursor))
+            .bind(Json(cursor.as_ref()))
             .bind(attempts)
             .bind(&progress.last_error)
             .bind(truncate_ms(progress.next_attempt_at))
