@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use super::consent::{Asked, ask, quoted_reason, yes_no};
 use super::named::key_of_argument;
-use super::notes::{CreatedRepo, RunNotes};
+use super::notes::CreatedRepo;
 use super::{Outcome, ToolEnv, non_empty, notes_error, workspace_error};
 
 /// The tool's name.
