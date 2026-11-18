@@ -29,7 +29,7 @@ use adam_runtime::ReceivedFiles;
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
-use tokio::sync::OnceCell;
+use tokio::sync::RwLock;
 use url::{Host, Url};
 
 use crate::error::{Error, Origin, RemoteAuthProblem, RemoteUrlProblem};
@@ -46,6 +46,10 @@ const MAX_RESULT_BYTES: usize = 64 * 1024;
 
 /// The biggest agent card that is read.
 const MAX_CARD_BYTES: usize = 1024 * 1024;
+
+/// `adam_a2a::STEER_EXTENSION`, which this crate does not depend on without its `a2a` feature (a
+/// test holds the two equal).
+pub(crate) const STEER_EXTENSION_URI: &str = "https://agents.vymalo.com/a2a/extensions/steer/v1";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -129,51 +133,42 @@ fn shown(url: &Url) -> String {
     url.to_string()
 }
 
-/// The tool that runs a subagent on another A2A agent, one per remote subagent, named after it.
-///
-/// `AgentDef::bind` adds one to the parent of every remote subagent (`a2a:` in the frontmatter) with
-/// the same shape as [`SubagentTool`](crate::SubagentTool): input `{ "message": string }`, the
-/// same description suffix, and no questions to the user. What differs is what a call does:
-///
-/// 1. one journaled `SendMessage` to the agent, with `returnImmediately`, whose message id is
-///    derived from the parent's run and the tool call (`adam_runtime::child_run_id`), so a retry or
-///    a replay sends the same id and a server that recognises a repeated message id (as
-///    `adam-a2a-runtime` does) hands back the task it already made;
-/// 2. an answer that is already final (a task in a final state, or a plain message) is the result;
-///    otherwise the parent parks on the remote task id ([`ToolError::AwaitRemote`]) and looks at it
-///    with `GetTask` each time its wait timer fires ([`Tool::poll_remote`]), each look a journaled
-///    step, until the task is over or the wait passes the limit.
+/// The A2A client of the agent: the connection and the rules about where it may go. A remote
+/// subagent tool and a remote session share one per `a2a:` subagent.
 ///
 /// The client is built on the first call that needs it and kept: it fetches the agent card, picks
 /// an interface, and adds `Authorization: Bearer <token>` to each request. Nothing here logs or
 /// journals the token.
-pub(crate) struct RemoteSubagentTool {
-    spec: ToolSpec,
+pub(crate) struct RemoteEndpoint {
+    name: String,
     /// The agent-card URL, as it can be shown.
     card_url: Url,
     /// The token, when the agent has `auth: bearer:VAR`.
     token: Option<SecretString>,
     allow_insecure: bool,
-    max_wait: Duration,
     /// `files: true` in the file: the file parts of the answer are shared, not described.
     files: bool,
-    client: OnceCell<A2AClient<Box<dyn Transport>>>,
+    client: RwLock<Option<Arc<Client>>>,
 }
 
-impl std::fmt::Debug for RemoteSubagentTool {
+pub(crate) type Client = A2AClient<Box<dyn Transport>>;
+
+impl std::fmt::Debug for RemoteEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteSubagentTool")
-            .field("name", &self.spec.name)
+        f.debug_struct("RemoteEndpoint")
+            .field("name", &self.name)
             .field("card_url", &shown(&self.card_url))
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
-            .field("connected", &self.client.initialized())
+            .field(
+                "connected",
+                &self.client.try_read().is_ok_and(|client| client.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
 
-impl RemoteSubagentTool {
-    /// Check a remote subagent against the deployment's rules and build its tool. `origin` is the
-    /// subagent (`coder/billing`) and its file.
+impl RemoteEndpoint {
+    /// Check a remote subagent's URL and token against the deployment's rules.
     ///
     /// # Errors
     ///
@@ -210,33 +205,45 @@ impl RemoteSubagentTool {
             Some(RemoteAuth::Bearer { env }) => Some(settings.token(origin, env)?),
             None => None,
         };
-        let description = [agent.description.trim(), agent.note.trim()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
         Ok(Self {
-            spec: subagent_spec(&agent.name, &description),
+            name: agent.name.clone(),
             card_url,
             token,
             allow_insecure: settings.allow_insecure,
-            max_wait: settings.max_wait,
             files: agent.files,
-            client: OnceCell::new(),
+            client: RwLock::new(None),
         })
     }
 
-    fn name(&self) -> &str {
-        &self.spec.name
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
-    /// The client, made on first use: the card is fetched, an interface that is safe to talk to is
-    /// chosen, and the token is attached. A failure is not kept, so the next call tries again.
-    async fn client(&self) -> Result<&A2AClient<Box<dyn Transport>>, ToolError> {
-        self.client.get_or_try_init(|| self.dial()).await
+    /// The client, made on first use. A failure is not kept, so the next call tries again.
+    pub(crate) async fn client(&self) -> Result<Arc<Client>, ToolError> {
+        if let Some(client) = self.client.read().await.as_ref() {
+            return Ok(client.clone());
+        }
+        let mut slot = self.client.write().await;
+        if let Some(client) = slot.as_ref() {
+            return Ok(client.clone());
+        }
+        let (client, _) = self.dial().await?;
+        *slot = Some(client.clone());
+        Ok(client)
     }
 
-    async fn dial(&self) -> Result<A2AClient<Box<dyn Transport>>, ToolError> {
+    /// Fetch the card again and rebuild the client from it, so a card that changed is read. Says
+    /// whether the card lists `steer/v1`.
+    #[allow(dead_code)] // used by remote sessions in the next change
+    pub(crate) async fn refresh(&self) -> Result<(Arc<Client>, bool), ToolError> {
+        let mut slot = self.client.write().await;
+        let (client, steers) = self.dial().await?;
+        *slot = Some(client.clone());
+        Ok((client, steers))
+    }
+
+    async fn dial(&self) -> Result<(Arc<Client>, bool), ToolError> {
         let http = reqwest::Client::builder()
             // A redirect could carry the request, and the token, somewhere nobody named.
             .redirect(reqwest::redirect::Policy::none())
@@ -248,6 +255,7 @@ impl RemoteSubagentTool {
                 ToolError::Permanent(format!("cannot build an HTTP client: {}", e.without_url()))
             })?;
         let mut card = self.fetch_card(&http).await?;
+        let steers = lists_steer(&card);
         let offered = card.supported_interfaces.len();
         card.supported_interfaces
             .retain(|interface| self.interface_is_safe(&interface.url));
@@ -280,7 +288,7 @@ impl RemoteSubagentTool {
             .await
             .map_err(|e| self.failure("connect to", &e))?;
         tracing::debug!(tool = %self.name(), card = %shown(&self.card_url), "connected to a remote subagent");
-        Ok(client)
+        Ok((Arc::new(client), steers))
     }
 
     /// Whether the client may talk to the interface at `url`: no credentials in it; this machine only
@@ -368,7 +376,7 @@ impl RemoteSubagentTool {
     /// An A2A error as a tool error. A transport failure or a fault on the remote's side
     /// (JSON-RPC `internal error`) is worth trying again; anything the remote answered on purpose
     /// (unauthorized, task not found, invalid params) is not.
-    fn failure(&self, action: &str, error: &A2AError) -> ToolError {
+    pub(crate) fn failure(&self, action: &str, error: &A2AError) -> ToolError {
         let text = format!(
             "cannot {action} the remote agent `{}`: {}",
             self.name(),
@@ -382,7 +390,7 @@ impl RemoteSubagentTool {
     }
 
     /// Where a task stands, as the result of the call, or "still going".
-    fn outcome(&self, task: &Task, files_left: u64) -> Outcome {
+    pub(crate) fn outcome(&self, task: &Task, files_left: u64) -> Outcome {
         let said = task
             .status
             .message
@@ -466,12 +474,10 @@ impl RemoteSubagentTool {
             ))),
         }
     }
-}
 
-impl RemoteSubagentTool {
     /// A plain message that answered the call at once, as its result: its text, and with
     /// `files: true` its `raw` parts shared within `files_left` bytes.
-    fn reply(&self, reply: &Message, files_left: u64) -> ToolOutput {
+    pub(crate) fn reply(&self, reply: &Message, files_left: u64) -> ToolOutput {
         let mut files = self
             .files
             .then(|| ReceivedFiles::new(self.name(), files_left));
@@ -486,8 +492,82 @@ impl RemoteSubagentTool {
     }
 }
 
+/// Whether the card lists `steer/v1`.
+fn lists_steer(card: &AgentCard) -> bool {
+    card.capabilities
+        .extensions
+        .iter()
+        .flatten()
+        .any(|extension| extension.uri == STEER_EXTENSION_URI)
+}
+
+/// The tool that runs a subagent on another A2A agent, one per remote subagent, named after it.
+///
+/// `AgentDef::bind` adds one to the parent of every remote subagent (`a2a:` in the frontmatter) with
+/// the same shape as [`SubagentTool`](crate::SubagentTool): input `{ "message": string }`, the
+/// same description suffix, and no questions to the user. What differs is what a call does:
+///
+/// 1. one journaled `SendMessage` to the agent, with `returnImmediately`, whose message id is
+///    derived from the parent's run and the tool call (`adam_runtime::child_run_id`), so a retry or
+///    a replay sends the same id and a server that recognises a repeated message id (as
+///    `adam-a2a-runtime` does) hands back the task it already made;
+/// 2. an answer that is already final (a task in a final state, or a plain message) is the result;
+///    otherwise the parent parks on the remote task id ([`ToolError::AwaitRemote`]) and looks at it
+///    with `GetTask` each time its wait timer fires ([`Tool::poll_remote`]), each look a journaled
+///    step, until the task is over or the wait passes the limit.
+pub(crate) struct RemoteSubagentTool {
+    spec: ToolSpec,
+    endpoint: Arc<RemoteEndpoint>,
+    max_wait: Duration,
+}
+
+impl std::fmt::Debug for RemoteSubagentTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSubagentTool")
+            .field("name", &self.spec.name)
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteSubagentTool {
+    /// Check a remote subagent against the deployment's rules and build its tool. `origin` is the
+    /// subagent (`coder/billing`) and its file.
+    ///
+    /// # Errors
+    ///
+    /// See [`RemoteEndpoint::bind`].
+    pub(crate) fn bind(
+        origin: &Origin,
+        agent: &RemoteAgent,
+        settings: &RemoteSettings,
+    ) -> Result<Self, Error> {
+        let endpoint = Arc::new(RemoteEndpoint::bind(origin, agent, settings)?);
+        let description = [agent.description.trim(), agent.note.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Ok(Self {
+            spec: subagent_spec(&agent.name, &description),
+            endpoint,
+            max_wait: settings.max_wait,
+        })
+    }
+
+    /// The connection, shared with the remote session of the same subagent.
+    #[allow(dead_code)] // used by remote sessions in the next change
+    pub(crate) fn endpoint(&self) -> &Arc<RemoteEndpoint> {
+        &self.endpoint
+    }
+
+    fn name(&self) -> &str {
+        &self.spec.name
+    }
+}
+
 /// A task's state, from the tool's side.
-enum Outcome {
+pub(crate) enum Outcome {
     Working,
     Done(ToolOutput),
 }
@@ -611,7 +691,7 @@ impl Tool for RemoteSubagentTool {
                 )));
             }
         };
-        let client = self.client().await?;
+        let client = self.endpoint.client().await?;
         let mut message = Message::new(Role::User, vec![Part::text(text.as_str())]);
         // The same id for the same call of the same run, on every retry and replay: what lets a
         // server that recognises repeated messages hand back the task it already made.
@@ -630,14 +710,15 @@ impl Tool for RemoteSubagentTool {
         let response = client
             .send_message(&request)
             .await
-            .map_err(|e| self.failure("send the message to", &e))?;
+            .map_err(|e| self.endpoint.failure("send the message to", &e))?;
         match response {
             SendMessageResponse::Message(reply) => {
-                let mut output = self.reply(&reply, ctx.files_left());
+                let mut output = self.endpoint.reply(&reply, ctx.files_left());
                 ctx.spend_files_of(&mut output);
                 Ok(output)
             }
-            SendMessageResponse::Task(task) => match self.outcome(&task, ctx.files_left()) {
+            SendMessageResponse::Task(task) => match self.endpoint.outcome(&task, ctx.files_left())
+            {
                 Outcome::Done(mut output) => {
                     ctx.spend_files_of(&mut output);
                     Ok(output)
@@ -656,7 +737,7 @@ impl Tool for RemoteSubagentTool {
     }
 
     async fn poll_remote(&self, ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
-        let client = self.client().await?;
+        let client = self.endpoint.client().await?;
         let task = client
             .get_task(&GetTaskRequest {
                 id: task.to_owned(),
@@ -664,8 +745,8 @@ impl Tool for RemoteSubagentTool {
                 tenant: None,
             })
             .await
-            .map_err(|e| self.failure("look at the task on", &e))?;
-        Ok(match self.outcome(&task, ctx.files_left()) {
+            .map_err(|e| self.endpoint.failure("look at the task on", &e))?;
+        Ok(match self.endpoint.outcome(&task, ctx.files_left()) {
             Outcome::Working => RemotePoll::Working,
             Outcome::Done(output) => RemotePoll::Ready(output),
         })
@@ -775,7 +856,7 @@ mod tests {
         let good = settings(&[("BILLING_TOKEN", "  s3cret-token \n")]);
         let tool = RemoteSubagentTool::bind(&origin(), &a, &good).unwrap();
         assert_eq!(
-            tool.token.as_ref().unwrap().expose_secret(),
+            tool.endpoint.token.as_ref().unwrap().expose_secret(),
             "s3cret-token",
             "surrounding whitespace is trimmed"
         );
@@ -837,12 +918,31 @@ mod tests {
     fn a_token_goes_only_to_the_origin_it_was_configured_for() {
         let a = agent("https://billing.example.com/card", Some("T"));
         let with = RemoteSubagentTool::bind(&origin(), &a, &settings(&[("T", "x")])).unwrap();
-        assert!(with.interface_is_safe("https://billing.example.com/rpc"));
-        assert!(!with.interface_is_safe("https://evil.example.net/rpc"));
-        assert!(!with.interface_is_safe("https://billing.example.com:8443/rpc"));
-        assert!(!with.interface_is_safe("http://billing.example.com/rpc"));
-        assert!(!with.interface_is_safe("https://u:p@billing.example.com/rpc"));
-        assert!(!with.interface_is_safe("not a url"));
+        assert!(
+            with.endpoint
+                .interface_is_safe("https://billing.example.com/rpc")
+        );
+        assert!(
+            !with
+                .endpoint
+                .interface_is_safe("https://evil.example.net/rpc")
+        );
+        assert!(
+            !with
+                .endpoint
+                .interface_is_safe("https://billing.example.com:8443/rpc")
+        );
+        assert!(
+            !with
+                .endpoint
+                .interface_is_safe("http://billing.example.com/rpc")
+        );
+        assert!(
+            !with
+                .endpoint
+                .interface_is_safe("https://u:p@billing.example.com/rpc")
+        );
+        assert!(!with.endpoint.interface_is_safe("not a url"));
         // Without a token the origin may differ, but not the transport rules.
         let without = RemoteSubagentTool::bind(
             &origin(),
@@ -850,20 +950,36 @@ mod tests {
             &settings(&[]),
         )
         .unwrap();
-        assert!(without.interface_is_safe("https://api.example.net/rpc"));
-        assert!(!without.interface_is_safe("http://api.example.net/rpc"));
+        assert!(
+            without
+                .endpoint
+                .interface_is_safe("https://api.example.net/rpc")
+        );
+        assert!(
+            !without
+                .endpoint
+                .interface_is_safe("http://api.example.net/rpc")
+        );
         // A remote card never points at this machine; a card on this machine may.
-        assert!(!without.interface_is_safe("http://127.0.0.1:1/rpc"));
-        assert!(!without.interface_is_safe("https://localhost/rpc"));
-        assert!(!without.interface_is_safe("http://[::1]:1/rpc"));
+        assert!(!without.endpoint.interface_is_safe("http://127.0.0.1:1/rpc"));
+        assert!(!without.endpoint.interface_is_safe("https://localhost/rpc"));
+        assert!(!without.endpoint.interface_is_safe("http://[::1]:1/rpc"));
         let local = RemoteSubagentTool::bind(
             &origin(),
             &agent("http://127.0.0.1:8080/card", None),
             &settings(&[]),
         )
         .unwrap();
-        assert!(local.interface_is_safe("http://127.0.0.1:9090/rpc"));
-        assert!(local.interface_is_safe("http://localhost:9090/rpc"));
+        assert!(
+            local
+                .endpoint
+                .interface_is_safe("http://127.0.0.1:9090/rpc")
+        );
+        assert!(
+            local
+                .endpoint
+                .interface_is_safe("http://localhost:9090/rpc")
+        );
     }
 
     /// Plain http that the deployment allowed (`A2A_ALLOW_INSECURE_REMOTES`) is for the card's own
@@ -881,19 +997,44 @@ mod tests {
             &lax,
         )
         .unwrap();
-        assert!(!https.interface_is_safe("http://browser.example.com/rpc"));
-        assert!(!https.interface_is_safe("http://evil.example.net/rpc"));
-        assert!(https.interface_is_safe("https://api.example.net/rpc"));
+        assert!(
+            !https
+                .endpoint
+                .interface_is_safe("http://browser.example.com/rpc")
+        );
+        assert!(
+            !https
+                .endpoint
+                .interface_is_safe("http://evil.example.net/rpc")
+        );
+        assert!(
+            https
+                .endpoint
+                .interface_is_safe("https://api.example.net/rpc")
+        );
         let http = RemoteSubagentTool::bind(
             &origin(),
             &agent("http://browser.agents.svc:8080/card", None),
             &lax,
         )
         .unwrap();
-        assert!(http.interface_is_safe("http://browser.agents.svc:8080/"));
-        assert!(http.interface_is_safe("http://browser.agents.svc:9090/rpc"));
-        assert!(!http.interface_is_safe("http://evil.example.net/rpc"));
-        assert!(http.interface_is_safe("https://api.example.net/rpc"));
+        assert!(
+            http.endpoint
+                .interface_is_safe("http://browser.agents.svc:8080/")
+        );
+        assert!(
+            http.endpoint
+                .interface_is_safe("http://browser.agents.svc:9090/rpc")
+        );
+        assert!(
+            !http
+                .endpoint
+                .interface_is_safe("http://evil.example.net/rpc")
+        );
+        assert!(
+            http.endpoint
+                .interface_is_safe("https://api.example.net/rpc")
+        );
     }
 
     fn task(state: TaskState, status: Option<&str>, artifacts: &[&str]) -> Task {
@@ -948,11 +1089,11 @@ mod tests {
             TaskState::Working,
         ] {
             assert!(matches!(
-                tool.outcome(&task(state, None, &[]), RUN),
+                tool.endpoint.outcome(&task(state, None, &[]), RUN),
                 Outcome::Working
             ));
         }
-        let done = |t: Task| match tool.outcome(&t, RUN) {
+        let done = |t: Task| match tool.endpoint.outcome(&t, RUN) {
             Outcome::Done(output) => output,
             Outcome::Working => panic!("still working"),
         };
@@ -1056,7 +1197,7 @@ mod tests {
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
         let sharing = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
-        let Outcome::Done(out) = sharing.outcome(&done, RUN) else {
+        let Outcome::Done(out) = sharing.endpoint.outcome(&done, RUN) else {
             panic!("the task is over");
         };
         assert!(!out.is_error, "{}", out.content);
@@ -1091,7 +1232,7 @@ mod tests {
         assert_eq!(out.artifacts[0].file.as_ref().unwrap().bytes, PNG);
 
         // The same task to a subagent without the key: described, nothing kept.
-        let Outcome::Done(plain) = tool().outcome(&done, RUN) else {
+        let Outcome::Done(plain) = tool().endpoint.outcome(&done, RUN) else {
             panic!("the task is over");
         };
         assert!(plain.artifacts.is_empty());
@@ -1108,7 +1249,7 @@ mod tests {
         png.filename = Some("shot.png".into());
         png.media_type = Some("image/png".into());
         adam.artifacts = Some(vec![artifact(None, vec![png])]);
-        let Outcome::Done(out) = sharing.outcome(&adam, RUN) else {
+        let Outcome::Done(out) = sharing.endpoint.outcome(&adam, RUN) else {
             panic!("the task is over");
         };
         let shot = &out.artifacts[0].file.as_ref().unwrap().filename;
@@ -1131,7 +1272,7 @@ mod tests {
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
         let sharing = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
-        let out = sharing.reply(&reply, RUN);
+        let out = sharing.endpoint.reply(&reply, RUN);
         assert!(!out.is_error, "{}", out.content);
         let name = &out.artifacts[0].file.as_ref().unwrap().filename;
         // A real PNG keeps its base name and gets the extension of what it is.
@@ -1145,7 +1286,7 @@ mod tests {
             out.content
         );
         // With no room left, the file is refused before it is copied.
-        let full = sharing.reply(&reply, 3);
+        let full = sharing.endpoint.reply(&reply, 3);
         assert!(full.is_error && full.artifacts.is_empty());
         assert!(
             full.content
@@ -1154,7 +1295,7 @@ mod tests {
             full.content
         );
         // Without the key, described.
-        let plain = tool().reply(&reply, RUN);
+        let plain = tool().endpoint.reply(&reply, RUN);
         assert!(plain.artifacts.is_empty());
         assert!(
             plain.content.contains("[file `evil.html` not included"),
@@ -1179,7 +1320,7 @@ mod tests {
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
         let tool = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
-        let Outcome::Done(out) = tool.outcome(&done, RUN) else {
+        let Outcome::Done(out) = tool.endpoint.outcome(&done, RUN) else {
             panic!("the task is over");
         };
         assert!(out.is_error);
@@ -1207,14 +1348,18 @@ mod tests {
     #[test]
     fn errors_from_the_remote_are_transient_only_when_trying_again_can_help() {
         let tool = tool();
-        let internal = tool.failure("connect to", &A2AError::internal("HTTP request failed"));
+        let internal = tool
+            .endpoint
+            .failure("connect to", &A2AError::internal("HTTP request failed"));
         assert!(matches!(internal, ToolError::Transient(_)), "{internal:?}");
         for code in [
             error_code::TASK_NOT_FOUND,
             error_code::INVALID_PARAMS,
             -32000, // unauthorized
         ] {
-            let error = tool.failure("send the message to", &A2AError::new(code, "no"));
+            let error = tool
+                .endpoint
+                .failure("send the message to", &A2AError::new(code, "no"));
             assert!(matches!(error, ToolError::Permanent(_)), "{code}");
         }
     }
