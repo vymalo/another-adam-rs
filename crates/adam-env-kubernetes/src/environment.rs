@@ -25,10 +25,11 @@ use adam_workspace::{
     EnvError, EnvProgress, EnvSession, EnvStep, EnvStepState, Environment, RunWorkspace,
 };
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use kube::Client;
-use kube::api::{DeleteParams, ListParams, PostParams};
+use kube::api::{DeleteParams, ListParams, PostParams, WatchEvent, WatchParams};
 use tokio::sync::Mutex;
 
 use crate::cluster::{clip, env_error, is_already_exists, is_not_found};
@@ -56,6 +57,16 @@ const BLOCKED: &[&str] = &[
     "CreateContainerError",
     "ErrImageNeverPull",
 ];
+
+/// Why [`KubeEnvironment::wait_for_change`] returned.
+enum Woke {
+    /// The pod changed (or was deleted): read it again.
+    Changed,
+    /// The pod's deadline passed.
+    Deadline,
+    /// There is no watch to wait on: fall back to the poll.
+    Closed,
+}
 
 /// What the process holds: the settings, the API, and the per-run locks.
 pub(crate) struct Inner {
@@ -375,7 +386,60 @@ impl KubeEnvironment {
                     secs: settings.ready_timeout.as_secs(),
                 });
             }
-            tokio::time::sleep(settings.ready_poll).await;
+            match self.wait_for_change(name, deadline).await {
+                Woke::Changed | Woke::Deadline => {}
+                // The API refused the watch, or closed it: the poll is the fallback it always was.
+                Woke::Closed => tokio::time::sleep(settings.ready_poll).await,
+            }
+        }
+    }
+
+    /// Wait until the pod `name` changes, the deadline passes, or the watch cannot be kept: one
+    /// watch on the pod (`metadata.name`), not a read per [`Settings::ready_poll`].
+    ///
+    /// The caller reads the pod again after any change: a watch event says that something moved
+    /// (a status, the deletion), and the read decides what to do with it, as it does today.
+    async fn wait_for_change(&self, name: &str, deadline: Instant) -> Woke {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Woke::Deadline;
+        }
+        // The API refuses a watch of 295 s or more; the deadline still bounds the wait.
+        let secs = u32::try_from(left.as_secs())
+            .unwrap_or(u32::MAX)
+            .clamp(1, 294);
+        let params = WatchParams::default()
+            .fields(&format!("metadata.name={name}"))
+            .timeout(secs);
+        // `0` asks for the pod as it is now, then the changes: no listing, no resource version to
+        // resume from, so an expired or dropped watch costs one more watch and never a stale read.
+        let stream = match self.inner.pods.watch(&params, "0").await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::debug!(pod = %name, error = %adam_error::report(&e), "cannot watch the run pod; polling it instead");
+                return Woke::Closed;
+            }
+        };
+        tokio::pin!(stream);
+        let until = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(until);
+        loop {
+            tokio::select! {
+                () = &mut until => return Woke::Deadline,
+                item = stream.try_next() => match item {
+                    Ok(Some(
+                        WatchEvent::Added(_) | WatchEvent::Modified(_) | WatchEvent::Deleted(_),
+                    )) => return Woke::Changed,
+                    // A bookmark only says the watch is alive, and an error object is the API's
+                    // own: the next event, or the end of the stream, decides.
+                    Ok(Some(WatchEvent::Bookmark(_) | WatchEvent::Error(_))) => continue,
+                    Ok(None) => return Woke::Closed,
+                    Err(e) => {
+                        tracing::debug!(pod = %name, error = %adam_error::report(&e), "the watch of the run pod ended; polling it instead");
+                        return Woke::Closed;
+                    }
+                },
+            }
         }
     }
 

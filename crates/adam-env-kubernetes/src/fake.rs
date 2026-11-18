@@ -22,9 +22,11 @@ use k8s_openapi::api::core::v1::{
     ContainerState, ContainerStateWaiting, ContainerStatus, Pod, PodCondition, PodStatus,
 };
 use kube::Client;
+use kube::api::WatchEvent;
 use kube::client::Body;
 use tower_test::mock;
 
+use crate::environment::is_ready;
 use crate::exec::{Captured, ExecError, ExitStatus, PodExec};
 use crate::template::tests::template_at;
 use crate::{KubeEnvironment, Settings};
@@ -48,6 +50,10 @@ pub(crate) struct State {
     pub(crate) blind_gets: u32,
     /// Answer every request with 503.
     pub(crate) down: bool,
+    /// Answer watch requests with 503, as an API that does not serve them.
+    pub(crate) watch_down: bool,
+    /// How long a watch answer waits before it is sent: a pod that takes time to come up.
+    pub(crate) watch_delay: Duration,
     /// Pods that were read, by name.
     reads: BTreeMap<String, u32>,
 }
@@ -167,6 +173,35 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Read a pod the way the API would: the fake's clock is a count of observations (`reads`), and a
+/// pod with no status yet is given one. Both `GET` and a watch event observe.
+fn observe(st: &mut State, name: &str) -> Option<Pod> {
+    let reads = {
+        let n = st.reads.entry(name.to_owned()).or_insert(0);
+        *n += 1;
+        *n
+    };
+    let (ready_after, stuck) = (st.ready_after, st.stuck.clone());
+    let pod = st.pods.get_mut(name)?;
+    // A pod that is already ended or going away keeps the status it was given.
+    if pod.status.is_none() {
+        pod.status = Some(match stuck {
+            Some(stuck) => stuck,
+            None if reads > ready_after => ready_status(),
+            None => PodStatus {
+                phase: Some("Pending".to_owned()),
+                ..PodStatus::default()
+            },
+        });
+    } else if let (None, Some(status)) = (&stuck, &mut pod.status)
+        && status.phase.as_deref() == Some("Pending")
+        && reads > ready_after
+    {
+        *status = ready_status();
+    }
+    Some(pod.clone())
+}
+
 async fn answer(state: &Shared, request: Request<Body>) -> Response<Body> {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -188,11 +223,61 @@ async fn answer(state: &Shared, request: Request<Body>) -> Response<Body> {
         return failure(404, "NotFound", &format!("no such path {path}"));
     };
     let name = rest.strip_prefix('/');
+    // A watch answer may be made to wait, for a pod that takes its time to come up. The delay is
+    // read before the lock is taken for the answer: a guard must not be held across an await.
+    if method.as_str() == "GET" && query_of(&query, "watch").as_deref() == Some("true") {
+        let delay = lock(state).watch_delay;
+        tokio::time::sleep(delay).await;
+    }
     let mut st = lock(state);
     if st.down {
         return failure(503, "ServiceUnavailable", "the API server is down");
     }
     match (method.as_str(), name) {
+        // A watch of the collection, narrowed by `metadata.name` (which is how `Api::watch` asks
+        // for one object). The pod is the only one a field selector can name here.
+        ("GET", None) if query_of(&query, "watch").as_deref() == Some("true") => {
+            if st.watch_down {
+                return failure(503, "ServiceUnavailable", "watching pods is not allowed");
+            }
+            let Some(name) = query_of(&query, "fieldSelector")
+                .and_then(|selector| selector.strip_prefix("metadata.name=").map(str::to_owned))
+            else {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap();
+            };
+            // One event per observation the pod can still take before it is ready (or over): a
+            // real watch sends the changes it sees, and the fake's changes are its observations.
+            let mut events: Vec<WatchEvent<Pod>> = Vec::new();
+            let mut budget = st
+                .ready_after
+                .saturating_add(1)
+                .saturating_sub(*st.reads.get(&name).unwrap_or(&0));
+            while budget > 0 {
+                budget -= 1;
+                let Some(pod) = observe(&mut st, &name) else {
+                    break;
+                };
+                let done = is_ready(&pod) || pod.metadata.deletion_timestamp.is_some();
+                events.push(WatchEvent::Modified(pod));
+                if done {
+                    break;
+                }
+            }
+            let lines: Vec<String> = events
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect();
+            let body = format!("{}\n", lines.join("\n"));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(body.into_bytes()))
+                .unwrap()
+        }
         ("GET", None) => {
             let selector = query_of(&query, "labelSelector").unwrap_or_default();
             let items: Vec<&Pod> = st
@@ -211,36 +296,10 @@ async fn answer(state: &Shared, request: Request<Body>) -> Response<Body> {
             st.blind_gets -= 1;
             failure(404, "NotFound", &format!("pods \"{name}\" not found"))
         }
-        ("GET", Some(name)) => {
-            let reads = {
-                let n = st.reads.entry(name.to_owned()).or_insert(0);
-                *n += 1;
-                *n
-            };
-            let (ready_after, stuck) = (st.ready_after, st.stuck.clone());
-            match st.pods.get_mut(name) {
-                None => failure(404, "NotFound", &format!("pods \"{name}\" not found")),
-                Some(pod) => {
-                    // A pod that is already ended or going away keeps the status it was given.
-                    if pod.status.is_none() {
-                        pod.status = Some(match stuck {
-                            Some(stuck) => stuck,
-                            None if reads > ready_after => ready_status(),
-                            None => PodStatus {
-                                phase: Some("Pending".to_owned()),
-                                ..PodStatus::default()
-                            },
-                        });
-                    } else if let (None, Some(status)) = (&stuck, &mut pod.status)
-                        && status.phase.as_deref() == Some("Pending")
-                        && reads > ready_after
-                    {
-                        *status = ready_status();
-                    }
-                    json(StatusCode::OK, &serde_json::to_value(&*pod).unwrap())
-                }
-            }
-        }
+        ("GET", Some(name)) => match observe(&mut st, name) {
+            None => failure(404, "NotFound", &format!("pods \"{name}\" not found")),
+            Some(pod) => json(StatusCode::OK, &serde_json::to_value(&pod).unwrap()),
+        },
         ("POST", None) => {
             if st.quota {
                 return failure(
@@ -502,6 +561,37 @@ impl Fixture {
         lock(&self.api).pods.keys().cloned().collect()
     }
 
+    /// How many plain reads of `pod` the fake answered. A watch is not one: it carries its events.
+    pub(crate) fn gets(&self, pod: &str) -> usize {
+        let path = format!("GET /api/v1/namespaces/coder/pods/{pod}");
+        lock(&self.api)
+            .requests
+            .iter()
+            .filter(|r| **r == path)
+            .count()
+    }
+
+    /// The list requests the fake answered (a watch of the collection is not one).
+    pub(crate) fn lists(&self) -> usize {
+        lock(&self.api)
+            .requests
+            .iter()
+            .filter(|r| {
+                r.starts_with("GET /api/v1/namespaces/coder/pods?") && !r.contains("watch=true")
+            })
+            .count()
+    }
+
+    /// The watch requests the fake answered.
+    pub(crate) fn watches(&self) -> Vec<String> {
+        lock(&self.api)
+            .requests
+            .iter()
+            .filter(|r| r.contains("watch=true"))
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn requests(&self, prefix: &str) -> usize {
         lock(&self.api)
             .requests
@@ -591,6 +681,55 @@ mod tests {
             "a pod that is ready is reused with no step"
         );
         assert_eq!(first.describe(), second.describe());
+    }
+
+    /// A pod that takes a while to come up is waited on with one watch of that pod, not a read per
+    /// `ready_poll`: the fake's pod becomes ready after 10 observations, which polling would spend
+    /// ten sleeps on and the watch delivers at once.
+    #[tokio::test]
+    async fn a_pod_that_takes_its_time_is_watched_not_read_over_and_over() {
+        let fx = fixture(settings());
+        lock(&fx.api).ready_after = 10;
+        lock(&fx.api).watch_delay = Duration::from_millis(60);
+        let started = std::time::Instant::now();
+        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(60),
+            "the wait was real: {:?}",
+            started.elapsed()
+        );
+        let name = pod_name(RUN);
+        assert_eq!(
+            fx.gets(&name),
+            2,
+            "not found, then the pod the watch said is ready: {:?}",
+            lock(&fx.api).requests
+        );
+        let watches = fx.watches();
+        assert_eq!(watches.len(), 1, "{watches:?}");
+        assert!(
+            watches[0].contains("fieldSelector=metadata.name"),
+            "one pod, by name: {}",
+            watches[0]
+        );
+        assert_eq!(fx.pod_names(), [name]);
+    }
+
+    /// An API that refuses the watch is the poll's, as it always was: the pod still comes up.
+    #[tokio::test]
+    async fn a_pod_comes_up_when_the_watch_is_refused() {
+        let fx = fixture(settings());
+        lock(&fx.api).ready_after = 2;
+        lock(&fx.api).watch_down = true;
+        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
+        assert!(!fx.watches().is_empty(), "it tried the watch");
+        let name = pod_name(RUN);
+        assert_eq!(
+            fx.gets(&name),
+            3,
+            "the reads the poll made: {:?}",
+            lock(&fx.api).requests
+        );
     }
 
     #[tokio::test]
@@ -863,7 +1002,9 @@ mod tests {
         let list = lock(&fx.api)
             .requests
             .iter()
-            .find(|r| r.starts_with("GET /api/v1/namespaces/coder/pods?"))
+            .find(|r| {
+                r.starts_with("GET /api/v1/namespaces/coder/pods?") && !r.contains("watch=true")
+            })
             .cloned()
             .unwrap();
         assert!(list.contains("labelSelector="), "{list}");
@@ -964,7 +1105,7 @@ mod tests {
         let fx = fixture(never);
         fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
         assert!(fx.env.reap_idle().await.unwrap().is_empty());
-        assert_eq!(fx.requests("GET /api/v1/namespaces/coder/pods?"), 0);
+        assert_eq!(fx.lists(), 0, "no listing: a watch is not one");
     }
 
     // ----- the workspace mounts -------------------------------------------------------------------
