@@ -636,11 +636,12 @@ sees the parent's history. The sequence and the states of the wait are in
 
 ### The session tools
 
-A root with a local subagent also gets five tools that run a subagent **in the background** as a session
+A root with a subagent, local or remote, also gets five tools that run a subagent **in the background** as a session
 (`subagent_start`, `subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`; [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md),
 [child runs](child-runs.md#sessions-adr-0045-slices-1-and-2)). No file declares them: they follow the folder's subagents,
-whose names are the enum of `agent`, and they are not given to a subagent. A subagent file needs nothing for them; a remote
-(`a2a:`) subagent is refused by `subagent_start` in words. A tool or a subagent named like one of the five is refused at bind.
+whose names are the enum of `agent`, and they are not given to a subagent. A subagent file needs nothing for them, and a remote
+(`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the five is refused at
+bind. A root whose subagents are all remote gets the five tools as well.
 
 ### The subagent tool
 
@@ -679,7 +680,8 @@ whose names are the enum of `agent`, and they are not given to a subagent. A sub
   tools include one (`Error::SubagentAsksUser`), also through `*` or a pattern.
 * **Limits of the design.** The calls of one model turn run one after another. Only the child's text travels
   back (artifacts stay on the child's run). The child starts empty and cannot be continued. Cancelling the
-  parent cancels the child (a remote A2A subagent's task is not cancelled).
+  parent cancels the child (the task of a remote A2A subagent called through its tool is not cancelled; a round of a
+  [remote session](#remote-sessions) cancels it).
 
 ### Remote subagents (`a2a:`)
 
@@ -709,8 +711,9 @@ Same shape, name checks and placement as a local subagent's tool; `limits`, `too
   that network (a NetworkPolicy that admits only the caller, or mesh mTLS). A card cannot widen the switch: an `https`
   card's plain-`http` interface is refused, and plain `http` goes only to the card's own host. A card on another
   machine never points at this one (`localhost`, a loopback address). A URL with credentials is always refused.
-* **What does not travel.** Only text, no `contextId` (every call is a fresh conversation), and no file: a `raw` part
-  is described in a line and dropped, a `url` part stays a line (it is never fetched).
+* **What does not travel.** Only text, no `contextId` (every call of the tool is a fresh conversation; a
+  [session](#remote-sessions) keeps it), and no file: a `raw` part is described in a line and dropped, a `url` part stays a
+  line (it is never fetched).
 * **`files: true`** (an adam extension, remote subagents only; on any other file it warns and does nothing): each
   `raw` part of the answer is shared as a file of the calling run, by the rule of a `files: true` MCP server
   ([below](#files-from-a-server-files-true)): a name made here from the sender's (`page.png` is `page-<hash>.png`, and
@@ -727,6 +730,28 @@ Same shape, name checks and placement as a local subagent's tool; `limits`, `too
   with its own `auth` (two may name the same variable); a flat `subagents/<name>.md` has no directory, so give it one
   (`subagents/<name>/instructions.md`) to nest a remote under it. A subagent never gets a tool it does not declare or
   list, so the root's `browser` is not the researcher's.
+
+#### Remote sessions
+
+A remote subagent can also run as a session (`subagent_start`, `subagent_send`, ...). Each round is a run of an agent
+the assembly registers as `<root>/<subagent>`: it has no model, it talks to the remote. Only the **root's** remote
+subagents have one; a remote under a local subagent has no session. The sequence and the states are in
+[child runs](child-runs.md#remote-sessions).
+
+* **Context.** Round 1 names no `contextId`. The round adopts the remote's from its first answer and the next round
+  sends it, with `referenceTaskIds` naming the task before. An adam remote honours `referenceTaskIds` only for a caller
+  that is authenticated (`auth: bearer:VAR`); without it the remote starts a new context each round.
+* **A message to a working round.** If the card lists `steer/v1` the message is sent to the working task and
+  `subagent_send` says `steered`. Otherwise it waits and is sent as the next task of the same round, joined with the
+  others that waited, and `subagent_send` says `queued`. A steer the remote refuses is queued.
+* **The report** is the remote's answer in text. A file is described in a line, not shared (`files: true` is for the
+  tool), and the remote's tokens are not counted in the parent's. A question (`input-required`) is the report, and the
+  next round's message answers that task. `failed`, `canceled`, `rejected` and `auth-required` fail the round; the
+  session stays usable.
+* **Time and cancel.** `AgentDef::remote_timeout` (one hour by default) is the one-shot tool's wait cap and a round's time limit. A round that is
+  cancelled (`subagent_close` with `cancel`, a cancelled parent, the limit) sends the remote `CancelTask`, best effort.
+  Each cancel is one try, logged and not repeated. A process that registered only the starter of the round agent sends none.
+* **Closing** a session is local: the closing round calls nothing and repeats the last report.
 
 More in the [`adam-assembly` README](../../crates/adam-assembly/README.md#subagents).
 

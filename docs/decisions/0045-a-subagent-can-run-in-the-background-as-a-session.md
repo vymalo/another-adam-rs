@@ -11,7 +11,7 @@ resume" of [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-g
 [ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) decisions 1 and 2 for its
 tools. The orchestration layer's side is its own ADR in `vymalo/another-agentic-system`.
 
-*Built 2026-11-14 ([ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 10):* the runtime half of decision 6: a cancelled or failed parent fails the open round (`cancelled: the parent run ended`) and the session stays usable; `start_child_continuing_within` gives a round the same time limit. Remote sessions are not cancelled (slice 5).
+*Built 2026-11-14 ([ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 10):* the runtime half of decision 6: a cancelled or failed parent fails the open round (`cancelled: the parent run ended`) and the session stays usable; `start_child_continuing_within` gives a round the same time limit. Remote sessions are not cancelled (slice 5: *amended 2026-11-18*, built: a round sends `CancelTask`, see below).
 
 *Built 2026-11-14:* slice 1 (the runtime): `Runtime::start_child_continuing`, the kind `adam.child.reported`
 (`CHILD_REPORTED_KIND`, chosen by whether the child has a conversation) and `Runtime::list_sessions`, in
@@ -45,7 +45,7 @@ decisions above, each for a reason found while building:
 * **Two bounds of slice 4 are constants here** because a missing one is unsafe: 16 open sessions per conversation and 20 rounds
   per session (a close counts as a round). `idle_ttl`, `max_working` and the settings are slice 4.
 * **`subagent_start` lists remote subagents in the enum** and refuses them in words (slice 5 builds them); a session tool is given
-  only to a root with at least one local subagent.
+  only to a root with at least one local subagent. (*Amended 2026-11-18:* slice 5 built them: no refusal, and a root with any subagent has the five.)
 * **The coder's tier**: the five are `plan` tier, like the helpers they run.
 * **Also departures:** results are text, not rows (`subagent_list`, `subagent_close` too); `BoundDef::scrub` exists so the coder's
   redactor reaches the tools the assembly makes; every round a run started or sent to is counted once in its totals (`Conversation::rounds_started`, a journaled step `usage:<call id>`),
@@ -69,6 +69,47 @@ the final event; the diff per session is a pure function in the contract's order
 of a round carries the session object on the update that ends the round and on the one where `closing` turns true. `round.state` is the
 A2A JSON spelling (`TASK_STATE_COMPLETED`), as in the sessions object. A round that only closes the session reports nothing. Not built: the
 wiring into `adam-assembly`, `adam-service` and `adam-coder` (part c).
+
+*Built 2026-11-18:* slice 5 (remote sessions, `crates/adam-assembly/src/remote_session.rs`, `RemoteEndpoint` in `remote.rs`, `Agent::on_cancelled`
+in `crates/adam-runtime`, the roster in `crates/adam-llm-agent/src/sessions.rs`): a session on an `a2a:` subagent of the root is a chain of
+rounds, each a run of `RemoteRoundAgent` registered as `<root>/<subagent>` (no model: card, send, look, report). The session tools,
+the listing, the notices, the closing round, the turn-end wait and the A2A front work on it unchanged. The context is carried
+(`contextId`, `referenceTaskIds`), a message to a working round is steered or queued, a cancelled round sends `CancelTask`. Proof:
+`crates/adam-assembly/tests/remote_sessions.rs` (twelve cases against an in-process A2A server, memory and PostgreSQL), four hook cases in
+`crates/adam-runtime/tests/runtime.rs`, two in `crates/adam-llm-agent/tests/sessions.rs`. Not built: slice 6 part c must register the
+round agents' starters on the A2A front; a reload of `LiveAssembly` keeps the round agents of the first load.
+
+*Amended 2026-11-18* (slice 5; decision 10 as built, each a departure found while planning or building):
+
+1. **A message to a working remote is queued inside the round.** It is sent as the next remote task of the same round, joined with the
+   others that waited, not left for the next round. The report of the round has every answer.
+2. **`subagent_send` says `queued`** when the round's agent keeps the message until its remote can take it (`queues_messages` in the round's
+   state), else `steered`.
+3. **`CancelTask` comes from a hook**, `Agent::on_cancelled(run, state)` (provided, does nothing), which the runtime spawns after a cancel
+   commit succeeds, once per commit, best effort. It exists only where the full agent is registered: a process that registered only
+   the starter sends nothing. The next round cancels the task the round before left (`cancel-prior`).
+4. **The time limit of a remote round** is `AgentDef::remote_timeout` (one hour). At the limit the runtime cancels the round and the
+   remote task is cancelled. The one-shot tool of a remote subagent still leaves its task running.
+5. **Context continuity needs an authenticated caller on an adam remote**: `adam-a2a-runtime` ignores `referenceTaskIds` from an
+   anonymous caller (*verified 2026-11-18*, `crates/adam-a2a-runtime/src/backend.rs`).
+6. **A round shows no steps, counts no tokens and shares no files** of the remote's work: files are described in a line, the remote's
+   tokens are not added to the parent's.
+7. **The five tools go to a root with any subagent**, a root with only remote subagents included (it had none before).
+8. **`input-required` is a report**, not an error: the question is the report and the next round answers the task by `taskId`.
+   `failed`, `canceled`, `rejected` and `auth-required` fail the round and the session stays usable.
+9. **The card is read once per round**, on a client rebuilt from it, so a card that changed between rounds is read again.
+10. **The one-shot tool is unchanged.** A subagent called through its tool behaves as before.
+
+*Amended 2026-11-18* (slice 5, after review):
+
+* **A cancel while the send is answered is recoverable.** The round commits the send's request before the call (`sending`). If a
+  cancel lands before the task id is committed, `on_cancelled`, or the next round (`cancel-prior`), repeats that send under its
+  message id and cancels the task found. This needs a remote that deduplicates message ids to avoid a second task; one that does
+  not makes a task and cancels it. Every cancel is one try, logged, not repeated.
+* **A closing round cancels what the round before left first.**
+* **Messages a failed or cancelled round never sent** go first in the next round.
+* **A round limits itself**: it records its first step and fails after `remote_timeout`, because the A2A front starts a person's round with no runtime limit. `remote_timeout` is both the one-shot tool's wait cap and a round's limit.
+* **`read_ids` keeps 64 ids**: a copy delivered after 64 newer messages is sent again.
 
 *Amended 2026-11-18* (slice 6 part a; each is a departure found while building, and the contract is
 `docs/api/child-sessions-v1.md` of `vymalo/another-agentic-system`):

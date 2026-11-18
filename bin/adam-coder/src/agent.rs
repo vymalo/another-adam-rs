@@ -377,6 +377,11 @@ impl CoderAgent {
             .subagents()
             .iter()
             .fold(builder, |builder, sub| builder.agent(sub.clone()));
+        let builder = self
+            .assembly
+            .remote_round_agents()
+            .iter()
+            .fold(builder, |builder, round| builder.agent(round.clone()));
         builder.agent(self)
     }
 

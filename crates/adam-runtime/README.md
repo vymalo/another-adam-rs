@@ -18,7 +18,7 @@ over A2A).
 
 | Item | What |
 |---|---|
-| `Agent` (trait) | `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`; see *Continuing another run*), `async step(&mut Ctx, State) -> Transition<State>` |
+| `Agent` (trait) | `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`; see *Continuing another run*), `async step(&mut Ctx, State) -> Transition<State>`, `async on_cancelled(RunId, Value)` (provided, does nothing; see *Cancelling a run*) |
 | `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is (new: a starter whose state was only `Serialize` must derive `Deserialize` too, because it reads the prior state). See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
@@ -178,7 +178,12 @@ a wake no later than a minute away; at it the runtime reads the parent first and
 wake of the agent's own), parks the run again **without stepping the agent**, journaling nothing and calling no model, so
 a child waiting for a person is reached too, and its own children after it. A `Done` parent changes nothing. A parent that
 cannot be loaded (retention purged it, the store is down) is **unknown and cancels nothing**: keep retention longer than a
-minute (`Store::purge_finished`). No `Store` method is involved. Remote A2A tasks are not cancelled.
+minute (`Store::purge_finished`). No `Store` method is involved. The runtime cancels no remote A2A task, but it calls
+`Agent::on_cancelled(run, state)` so the agent can: after a cancel commit succeeds (`Runtime::cancel`, a parent that ended,
+a time limit, the A2A front's cancel) it spawns the call with the agent state that commit holds, **once per commit,
+best effort** (not retried, not durable, and the process may end first), and only in a process that registered the full
+agent: a start-only registration has nothing to call, so a front that cancels sends nothing. A run that is already
+terminal gets no call. The provided method is new and does nothing, so no implementer breaks.
 `Runtime::start_child_within` starts a child with a time limit: the deadline is stored once, from the runtime's `Clock`,
 `wake_at` is clamped to it, and a child past it fails with `cancelled: time limit: the run did not finish within N min`.
 **The time a child spends waiting for a person is not counted** (it parked with no timer: the deadline is cleared and what is

@@ -119,12 +119,21 @@ where
 struct FnAgent {
     name: String,
     step: Arc<StepFn>,
+    /// What `Agent::on_cancelled` was called with, in order.
+    cancelled: Arc<Mutex<Vec<(RunId, Value)>>>,
 }
 
 fn fn_agent(name: &str, step: Arc<StepFn>) -> FnAgent {
     FnAgent {
         name: name.to_owned(),
         step,
+        cancelled: Arc::default(),
+    }
+}
+
+impl FnAgent {
+    fn hook_calls(&self) -> Vec<(RunId, Value)> {
+        self.cancelled.lock().expect("lock").clone()
     }
 }
 
@@ -142,6 +151,10 @@ impl Agent for FnAgent {
 
     async fn step(&self, ctx: &mut Ctx, state: Value) -> StepResult {
         (self.step)(ctx, state).await
+    }
+
+    async fn on_cancelled(&self, run: RunId, state: Value) {
+        self.cancelled.lock().expect("lock").push((run, state));
     }
 }
 
@@ -4406,6 +4419,134 @@ mod cases {
         assert_eq!(count(&watch.resumes), 2);
     }
 
+    // -----------------------------------------------------------------------
+    // The hook a cancel runs (`Agent::on_cancelled`)
+    // -----------------------------------------------------------------------
+
+    /// An agent that parks with a state worth telling the hook about.
+    fn parks_with_a_task(name: &str) -> FnAgent {
+        fn_agent(
+            name,
+            step_fn(|_ctx, _state| {
+                async move {
+                    Ok(Transition::Park {
+                        state: json!({"task": "t-1"}),
+                        wake_at: None,
+                    })
+                }
+                .boxed()
+            }),
+        )
+    }
+
+    /// A cancel runs the hook once, with the state the run last committed, and asking again, or
+    /// for a run that has failed, runs nothing more.
+    pub async fn a_cancel_runs_the_agents_hook_once_with_its_last_state(store: DynStore) {
+        let name = uniq("hook");
+        let agent = parks_with_a_task(&name);
+        let rt = builder(&store, &uniq("w"), &agent).build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, run).await;
+        rt.cancel(run, "stop").await.expect("cancel");
+        wait_until("the hook", || agent.hook_calls().len() == 1).await;
+        assert_eq!(agent.hook_calls(), vec![(run, json!({"task": "t-1"}))]);
+        rt.cancel(run, "again").await.expect("cancel twice");
+        // A negative check: the hook is spawned, so "never called again" can only be shown by
+        // waiting a while; the first call was awaited above.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        worker.stop().await;
+        assert_eq!(agent.hook_calls().len(), 1, "once per cancel commit");
+    }
+
+    /// A run that finished is not cancelled, so the hook does not run.
+    pub async fn a_finished_run_runs_no_hook(store: DynStore) {
+        let name = uniq("hook-done");
+        let agent = child_done(&name, json!("ok"));
+        let rt = builder(&store, &uniq("w"), &agent).build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, run).await;
+        rt.cancel(run, "too late").await.expect("cancel");
+        // A negative check, as above: nothing to wait for, so a short wait.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        worker.stop().await;
+        assert!(agent.hook_calls().is_empty());
+    }
+
+    /// A process that registered only the starter has no agent to call: it cancels, and the
+    /// hook runs where the full agent is registered.
+    pub async fn a_process_with_only_a_starter_runs_no_hook(store: DynStore) {
+        let name = uniq("hook-front");
+        let agent = parks_with_a_task(&name);
+        let front = Runtime::builder(store.clone())
+            .starter(JsonStarter(name.clone()))
+            .worker_id(uniq("front"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let full = builder(&store, &uniq("w"), &agent).build();
+        let (first, second) = (
+            front.start(&name, inbound(), None).await.expect("start"),
+            front.start(&name, inbound(), None).await.expect("start"),
+        );
+        let worker = spawn_worker(&full);
+        wait_waiting(&full, first).await;
+        wait_waiting(&full, second).await;
+        front.cancel(first, "from the front").await.expect("cancel");
+        // A negative check, as above; the second cancel below proves the hook path works.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(agent.hook_calls().is_empty(), "the front has no agent");
+        full.cancel(second, "from the worker")
+            .await
+            .expect("cancel");
+        wait_until("the hook", || agent.hook_calls().len() == 1).await;
+        worker.stop().await;
+        assert_eq!(agent.hook_calls()[0].0, second);
+    }
+
+    /// A child that follows a parent that was cancelled, or a time limit, is cancelled by the
+    /// runtime and the hook runs for it too.
+    pub async fn a_parent_cascade_and_a_deadline_run_the_hook(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let (started, saw) = (Arc::new(Notify::new()), Arc::new(AtomicBool::new(false)));
+        let parent_agent = parent_of(&name, &child_name, &cell, &watch);
+        let child_agent = child_listening(&child_name, &started, &saw);
+        let clock = ManualClock::new();
+        let rt = family(&store, &parent_agent, &child_agent, &cell, &clock);
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&started, "the child").await;
+        wait_for(&rt, parent, "the parent parked", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+        let limited = child_run_id(parent, "limited");
+        rt.start_child_within(
+            parent,
+            limited,
+            &child_name,
+            inbound(),
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .expect("limited child");
+        notified(&started, "the limited child").await;
+        clock.advance(Duration::from_secs(31));
+        wait_until("the limited child's hook", || {
+            child_agent.hook_calls().iter().any(|(r, _)| *r == limited)
+        })
+        .await;
+
+        rt.cancel(parent, "changed my mind").await.expect("cancel");
+        let child = child_run_id(parent, "call-1");
+        wait_until("the child's hook", || {
+            child_agent.hook_calls().iter().any(|(r, _)| *r == child)
+        })
+        .await;
+        worker.stop().await;
+    }
+
     /// Cancelling a parent that waits cancels the child it waits for (ADR 0044 slice 10): the child
     /// is running, its worker sees the parent has ended within one poll and fails it, and what the
     /// child would have answered is not kept.
@@ -7020,6 +7161,10 @@ macro_rules! runtime_suite {
                 a_session_listing_says_how_the_round_ended,
                 a_report_that_lands_while_a_run_finishes_does_not_reopen_it,
                 a_round_that_is_its_own_parent_is_listed_reads_as_started_outside_and_is_never_cancelled_with_a_parent,
+                a_cancel_runs_the_agents_hook_once_with_its_last_state,
+                a_finished_run_runs_no_hook,
+                a_process_with_only_a_starter_runs_no_hook,
+                a_parent_cascade_and_a_deadline_run_the_hook,
             );
         }
     };

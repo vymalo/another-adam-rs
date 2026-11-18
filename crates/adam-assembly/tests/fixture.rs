@@ -208,6 +208,8 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
         rt.agent_names(),
         [
             "coder",
+            // The agent that works the rounds of a session on the remote subagent `billing`.
+            "coder/billing",
             "coder/legacy",
             "coder/researcher",
             "coder/researcher/summarizer",
