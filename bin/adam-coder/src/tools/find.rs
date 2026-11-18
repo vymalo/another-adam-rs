@@ -335,7 +335,13 @@ fn list_in(
 /// List one directory of your worktree (not recursive), sorted; a directory ends in /, a link in
 /// @. Names are shown escaped (\n, \t, \\ and \xNN for other control or non-UTF-8 bytes).
 /// Example: {"path":"src"}
-#[tool(label = "List a directory", icon = "search", paged)]
+#[tool(
+    label = "List a directory",
+    icon = "search",
+    paged,
+    parallel = "read",
+    path = "path"
+)]
 pub async fn list_files(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -426,7 +432,13 @@ async fn find_in(
 /// directory, ** crosses directories; a pattern with no / matches file names anywhere. Paths are
 /// shown escaped (\n, \t, \\ and \xNN for other control or non-UTF-8 bytes).
 /// Example: {"pattern":"**/*.test.ts"}
-#[tool(label = "Find files", icon = "search", paged)]
+#[tool(
+    label = "Find files",
+    icon = "search",
+    paged,
+    parallel = "read",
+    path = "path"
+)]
 pub async fn find_files(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -722,7 +734,13 @@ async fn search_with(
 /// path:line:text, sorted. Files git ignores are left out. Paths are shown escaped (\n, \t, \\ and
 /// \xNN for other control or non-UTF-8 bytes), and control characters of a line as \xNN.
 /// Example: {"pattern":"fn main","include":"*.rs"}
-#[tool(label = "Search files", icon = "search", paged)]
+#[tool(
+    label = "Search files",
+    icon = "search",
+    paged,
+    parallel = "read",
+    path = "path"
+)]
 #[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn search_files(
     env: State<ToolEnv>,

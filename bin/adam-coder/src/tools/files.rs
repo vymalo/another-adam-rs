@@ -890,7 +890,13 @@ pub(super) fn push_published_note(text: &mut String, slot: &adam_workspace::Slot
 /// negative offset reads from the end. A binary file is not shown, except an image (PNG, JPEG, GIF
 /// or WebP) when you can see images: it comes after the result. Example:
 /// {"path":"src/main.rs","offset":2001}
-#[tool(label = "Read a file", icon = "read", paged)]
+#[tool(
+    label = "Read a file",
+    icon = "read",
+    paged,
+    parallel = "read",
+    path = "path"
+)]
 #[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn read_file(
     env: State<ToolEnv>,
@@ -990,7 +996,12 @@ pub async fn read_file(
 /// path is relative to the root of the worktree; nothing inside `.git` and nothing through a
 /// symlink can be written. For a change to part of a file use edit_file (exact text replaced) or
 /// apply_patch (a diff); for a broad, multi-file change write the files one by one.
-#[tool(label = "Write a file", icon = "edit")]
+#[tool(
+    label = "Write a file",
+    icon = "edit",
+    parallel = "write",
+    path = "path"
+)]
 pub async fn write_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -1035,7 +1046,7 @@ pub async fn write_file(
 /// and you are told why. Read the file first, so the context lines match it exactly. Use it for
 /// several changes at once, in one file or several; for one exact replacement edit_file is simpler.
 /// A broad, multi-file change is several of these, or several files written one by one.
-#[tool(label = "Apply a patch", icon = "edit")]
+#[tool(label = "Apply a patch", icon = "edit", parallel = "write")]
 pub async fn apply_patch(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -1400,7 +1411,12 @@ fn not_found(shown: &str, content: &str, old: &str) -> String {
 /// unique). The path is relative to the root of the worktree; nothing inside `.git` and nothing
 /// through a symlink can be edited. The file must be text of at most 1 MiB. To create a file or
 /// replace it whole use write_file, for several files at once apply_patch.
-#[tool(label = "Edit a file", icon = "edit")]
+#[tool(
+    label = "Edit a file",
+    icon = "edit",
+    parallel = "write",
+    path = "path"
+)]
 pub async fn edit_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -1871,6 +1887,41 @@ mod tests {
 
     fn refused(root: &Path, rel: &str, access: Access) -> String {
         confine(root, rel, access).expect_err(rel)
+    }
+
+    /// A read that runs while `write_file` and `edit_file` of the same path write (the calls of one
+    /// turn run at the same time) sees the old file or the new one whole, never half of one: each
+    /// write is a new file renamed over the old.
+    #[test]
+    fn a_read_beside_a_write_or_an_edit_sees_a_whole_file() {
+        let dir = root();
+        let path = dir.path().join("src/shared.txt");
+        let (a, b) = ("a".repeat(400_000), "b".repeat(400_000));
+        fs::write(&path, &a).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..60 {
+                    let text = if i % 2 == 0 { &b } else { &a };
+                    write_in(dir.path(), "src/shared.txt", text).unwrap();
+                    let (from, to) = if i % 2 == 0 { ("b", "a") } else { ("a", "b") };
+                    // An edit rewrites the whole file too: replace every letter of one kind.
+                    edit_in(dir.path(), "src/shared.txt", from, to, true).unwrap();
+                    edit_in(dir.path(), "src/shared.txt", to, from, true).unwrap();
+                }
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let mut reads = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) || reads < 20 {
+                let text = fs::read_to_string(&path).unwrap();
+                assert_eq!(text.len(), 400_000, "a partial file");
+                assert!(
+                    text.bytes().all(|c| c == text.as_bytes()[0]),
+                    "a file that is half of each"
+                );
+                reads += 1;
+            }
+        });
     }
 
     #[test]

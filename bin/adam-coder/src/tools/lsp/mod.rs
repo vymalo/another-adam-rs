@@ -191,7 +191,7 @@ fn position_of(
 /// (`wait` seconds, 1 to 120, default 30; a first line says when it still is). Nothing is changed.
 /// With no server in the environment the answer says so: use run_checks or run_command. Example:
 /// {"path":"src/lib.rs"}
-#[tool(label = "Diagnostics of a file", icon = "search", paged)]
+#[tool(label = "Diagnostics of a file", icon = "search", paged, access = super::access::asks_a_language_server)]
 pub async fn file_diagnostics(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -233,7 +233,7 @@ pub async fn file_diagnostics(
 /// server and may wait for it to index (`wait` seconds, 1 to 120, default 30); where there is no
 /// server the answer says so. Nothing is changed. Example:
 /// {"path":"src/main.rs","line":12,"symbol":"parse_config"}
-#[tool(label = "Find a definition", icon = "search")]
+#[tool(label = "Find a definition", icon = "search", access = super::access::asks_a_language_server)]
 #[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn find_definition(
     env: State<ToolEnv>,
@@ -282,7 +282,7 @@ pub async fn find_definition(
 /// `include_declaration` (default true) lists the definition too. The first call on a project may
 /// wait for the server to index (`wait` seconds, 1 to 120, default 30). Nothing is changed. Example:
 /// {"path":"src/main.rs","line":12,"symbol":"parse_config"}
-#[tool(label = "Find references", icon = "search", paged)]
+#[tool(label = "Find references", icon = "search", paged, access = super::access::asks_a_language_server)]
 #[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn find_references(
     env: State<ToolEnv>,

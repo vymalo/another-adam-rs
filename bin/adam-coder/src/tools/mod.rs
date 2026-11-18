@@ -116,6 +116,7 @@ use sandbox::Meter;
 /// What the description of `ask_user` opens with: the coder's own words about when to ask.
 const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.";
 
+pub mod access;
 pub mod admin;
 pub mod background;
 pub mod checks;
@@ -439,15 +440,15 @@ impl ToolEnv {
     pub(crate) async fn delivery_error(&self, ctx: &ToolCtx, e: &WorkspaceError) -> ToolError {
         if matches!(e, WorkspaceError::Auth(_)) {
             let run = ctx.root_run_id().to_string();
-            let recorded = async {
-                let mut notes = self.notes.load(&run).await?;
-                notes.blocker = Some(format!(
-                    "the credentials were rejected ({e}); check that {}",
-                    self.credentials_hint
-                ));
-                self.notes.save(&run, &notes).await
-            }
-            .await;
+            let recorded = self
+                .notes
+                .update(&run, |notes| {
+                    notes.blocker = Some(format!(
+                        "the credentials were rejected ({e}); check that {}",
+                        self.credentials_hint
+                    ));
+                })
+                .await;
             if let Err(err) = recorded {
                 tracing::warn!(error = %err, "cannot record the credential failure in the run notes");
             }
