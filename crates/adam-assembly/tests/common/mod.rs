@@ -161,3 +161,15 @@ where
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+/// The system prompt of a request without the sentence the loop appends about `after_previous`
+/// (ADR 0049): the agent's own words, as the test wrote them.
+pub fn plain(system: &Option<String>) -> Option<String> {
+    system.as_ref().map(|s| {
+        s.replacen(
+            &format!("\n\n{}", adam_llm_agent::AFTER_PREVIOUS_INSTRUCTION),
+            "",
+            1,
+        )
+    })
+}

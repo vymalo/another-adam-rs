@@ -654,7 +654,8 @@ sequenceDiagram
   model's order, and a call that is `Alone`, repeats the call before it, or follows a limit of 1 runs by itself, after
   the calls before it are applied. The seqs of a segment's steps are reserved in call order
   (`Ctx::reserve_steps`), so the journal is the one a sequential loop writes, and the results are applied in call
-  order whatever order the calls finish in. A tool that declares nothing is `Alone`, so a loop of such tools is
+  order whatever order the calls finish in. A call the model gave `after_previous: true` (an optional argument the loop adds to every schema above a limit of 1)
+  waits for every call before it and holds the ones after it. A tool that declares nothing is `Alone`, so a loop of such tools is
   sequential. A cancel stops new starts and waits up to 5 s for the running calls; a transient failure stops new
   starts, waits for the running ones and retries the transition.
 * **Replay is safe, effects are at-least-once.** The effect runs before its outcome is written, so a

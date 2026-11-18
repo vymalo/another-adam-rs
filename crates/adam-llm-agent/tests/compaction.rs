@@ -986,7 +986,8 @@ async fn a_replay_applies_the_cut_the_journal_recorded() {
     let rig = Rig::with(
         MockModel::new().with_context_window("test-model", 25_696),
         0,
-        |b| b,
+        // The window is measured to the token: no `after_previous` in the request.
+        |b| b.max_parallel(1),
     );
     for n in 0..11 {
         rig.mock.push_tool_calls(vec![big(&format!("c{n}"), 600)]);

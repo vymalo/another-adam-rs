@@ -1928,7 +1928,14 @@ mod cases {
             specs.windows(2).all(|w| w[0] == w[1]),
             "a session changed a spec"
         );
-        let tools: Vec<adam_model::ToolSpec> = rig.parent_mock.requests()[0].tools.clone();
+        let mut tools: Vec<adam_model::ToolSpec> = rig.parent_mock.requests()[0].tools.clone();
+        // The loop adds the optional `after_previous` to every schema (ADR 0049): the rest is the tool's.
+        for tool in &mut tools {
+            let added = tool.parameters["properties"]
+                .as_object_mut()
+                .and_then(|properties| properties.remove("after_previous"));
+            assert_eq!(added.unwrap()["type"], "boolean", "{}", tool.name);
+        }
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,

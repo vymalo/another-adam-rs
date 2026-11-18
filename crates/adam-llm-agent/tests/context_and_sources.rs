@@ -857,6 +857,8 @@ async fn a_source_refines_the_descriptions_of_the_tools_the_model_is_shown() {
         .agent()
         .tool(ReadsContext::new("own", "word").0)
         .tool_source(Describes)
+        // One call at a time: no `after_previous` in the schemas this test compares.
+        .max_parallel(1)
         .build();
     h.mock.push_text("done");
     let rt = h.runtime(&agent);

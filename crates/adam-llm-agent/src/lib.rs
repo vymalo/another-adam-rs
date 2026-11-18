@@ -143,6 +143,7 @@ mod fn_tool;
 mod history;
 mod images;
 mod kept;
+mod order;
 pub mod paging;
 mod plan;
 mod schedule;
@@ -189,6 +190,7 @@ pub use kept::{
     page_of, pointer_line, prepare, read_pointer, scrub_open_end, scrub_open_start,
     scrubbed_for_keeping, unkept_view,
 };
+pub use order::{AFTER_PREVIOUS, INSTRUCTION as AFTER_PREVIOUS_INSTRUCTION};
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};

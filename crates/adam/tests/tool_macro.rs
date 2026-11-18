@@ -469,7 +469,13 @@ async fn the_model_calls_generated_tools_and_reads_their_output() {
     let request = mock.requests().into_iter().next().unwrap();
     let shown: Vec<String> = request.tools.iter().map(|t| t.name.clone()).collect();
     assert_eq!(shown, ["get_weather", "whoami", "web_search"]);
-    assert_eq!(request.tools[0], GetWeather.spec());
+    // ... plus the optional `after_previous` the loop adds to every schema (ADR 0049).
+    let mut generated = request.tools[0].clone();
+    let added = generated.parameters["properties"]
+        .as_object_mut()
+        .and_then(|properties| properties.remove("after_previous"));
+    assert_eq!(added.unwrap()["type"], "boolean");
+    assert_eq!(generated, GetWeather.spec());
 }
 
 #[tokio::test]

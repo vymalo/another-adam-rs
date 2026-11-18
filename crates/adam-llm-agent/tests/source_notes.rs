@@ -426,7 +426,7 @@ async fn a_source_adds_words_to_the_instructions_of_the_turn_and_only_when_it_ha
     let rig = Rig::new();
     let (mut with, _) = Relay::new();
     with.instructions = Some("  ## Mentioned agents\n\n- @coder  ".into());
-    let agent = rig.agent().tool_source(with).build();
+    let agent = rig.agent().max_parallel(1).tool_source(with).build();
     rig.mock.push_text("done");
     rig.run(&agent, "go").await;
     assert_eq!(
@@ -437,7 +437,7 @@ async fn a_source_adds_words_to_the_instructions_of_the_turn_and_only_when_it_ha
 
     let rig = Rig::new();
     let (without, _) = Relay::new();
-    let agent = rig.agent().tool_source(without).build();
+    let agent = rig.agent().max_parallel(1).tool_source(without).build();
     rig.mock.push_text("done");
     rig.run(&agent, "go").await;
     assert_eq!(
@@ -452,6 +452,7 @@ async fn a_source_adds_words_to_the_instructions_of_the_turn_and_only_when_it_ha
     only.instructions = Some("from the source".into());
     let model: DynModel = rig.mock.clone();
     let agent = LlmAgent::builder("llm", model, "test-model")
+        .max_parallel(1)
         .tool_source(only)
         .build();
     rig.mock.push_text("done");

@@ -19,7 +19,7 @@ use adam_mcp::McpPolicy;
 use adam_mcp_testkit::TestHttpServer;
 use adam_model::{Message, MockModel, ModelError, ModelRequest, ToolCall};
 use adam_runtime::{CollectingSink, Runtime};
-use common::{instructions, spawn_worker, wait_done};
+use common::{instructions, plain, spawn_worker, wait_done};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "root-tok-3f9a7c21-secret";
@@ -990,7 +990,7 @@ async fn instructions_appended_stable() {
             requests[0].system, requests[1].system,
             "{backend}: the system prompt is the same on every call"
         );
-        assert_eq!(requests[0].system.as_deref(), Some(prompt.as_str()));
+        assert_eq!(plain(&requests[0].system).as_deref(), Some(prompt.as_str()));
     }
 }
 

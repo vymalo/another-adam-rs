@@ -29,6 +29,18 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 
+/// The system prompt of a request without the sentence the loop appends about `after_previous`
+/// (ADR 0049): the agent's own words, as the test wrote them.
+fn plain(system: &Option<String>) -> Option<String> {
+    system.as_ref().map(|s| {
+        s.replacen(
+            &format!("\n\n{}", adam_llm_agent::AFTER_PREVIOUS_INSTRUCTION),
+            "",
+            1,
+        )
+    })
+}
+
 const TOKEN: &str = "sekret-token-4f1c9a";
 
 fn grant(server: &ThreadToolsServer) -> Map<String, Value> {
@@ -658,7 +670,7 @@ async fn the_mentioned_agents_are_in_the_instructions_only_when_there_are_some()
                "coordinate": {"tool": "ask_agent"}}),
     );
     rig.run("first @researcher then @coder", context).await;
-    let system = rig.mock.requests()[0].system.clone().unwrap();
+    let system = plain(&rig.mock.requests()[0].system).unwrap();
     assert!(
         system.starts_with("You are a test agent.\n\n## Mentioned agents\n\n"),
         "{system}"
@@ -678,7 +690,7 @@ async fn the_mentioned_agents_are_in_the_instructions_only_when_there_are_some()
     rig.mock.push_text("done");
     rig.run("hello", grant(&server)).await;
     assert_eq!(
-        rig.mock.requests()[0].system.as_deref(),
+        plain(&rig.mock.requests()[0].system).as_deref(),
         Some("You are a test agent.")
     );
 }

@@ -11,7 +11,7 @@ use adam_agent_fs::{Dir, Strictness};
 use adam_assembly::{AgentDef, Assembly};
 use adam_llm_agent::{ToolSet, user_message};
 use adam_model::{MockModel, ToolCall};
-use common::{runtime, spawn_worker, tools, wait_done};
+use common::{plain, runtime, spawn_worker, tools, wait_done};
 use serde_json::json;
 
 /// The registered tools the fixture's `tools:` lists name (the root's and the subagents'); the
@@ -229,12 +229,11 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
     let first = &requests[0];
     assert_eq!(first.model, "coder-large");
     assert_eq!(
-        first.system.as_deref(),
+        plain(&first.system).as_deref(),
         Some(assembly.info()[0].prompt.as_str())
     );
     assert!(
-        first
-            .system
+        plain(&first.system)
             .as_deref()
             .unwrap()
             .contains("at most 3 failed check cycles")
@@ -277,7 +276,7 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
     assert_eq!(view.output.as_ref().unwrap()["text"], "LGTM");
     let reviewer = model.last_request().unwrap();
     assert_eq!(
-        reviewer.system.as_deref(),
+        plain(&reviewer.system).as_deref(),
         Some("You review diffs. Report findings as a numbered list.")
     );
     let offered: Vec<&str> = reviewer.tools.iter().map(|t| t.name.as_str()).collect();

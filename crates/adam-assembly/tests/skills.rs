@@ -15,7 +15,7 @@ use adam_assembly::{
 };
 use adam_llm_agent::{Conversation, ToolCtx, ToolError, ToolOutput, ToolSet, user_message};
 use adam_model::{Message, MockModel, ModelRequest, ToolCall};
-use common::{instructions, runtime, spawn_worker, tools, wait_done, write};
+use common::{instructions, plain, runtime, spawn_worker, tools, wait_done, write};
 use serde_json::{Value, json};
 
 /// A directory with a root agent (`frontmatter` is its frontmatter), three skills and a subagent
@@ -464,7 +464,7 @@ async fn the_model_loads_a_skill_then_reads_one_of_its_files() {
     let requests = model.requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(
-        requests[0].system.as_deref(),
+        plain(&requests[0].system).as_deref(),
         Some(info(&assembly, "coder").prompt.as_str())
     );
     assert_eq!(

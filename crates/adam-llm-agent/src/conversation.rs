@@ -414,6 +414,11 @@ pub struct Conversation {
     /// [`pending_wait`](Self::pending_wait).
     #[serde(default)]
     pub pending_calls: Vec<ToolCall>,
+    /// The ids of the calls in [`pending_calls`](Self::pending_calls) whose model set
+    /// `after_previous: true`: each starts when every call before it has finished. The argument itself
+    /// is taken out of the pending call (ADR 0049).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordered_calls: Vec<String>,
     /// Set while the run is parked waiting for the user's answer or for a child
     /// run. Before child runs existed this field was `pending_question` and held
     /// only a question; state stored under that name still loads.

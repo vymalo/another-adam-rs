@@ -29,6 +29,18 @@ use common::{
 use serde_json::json;
 use url::Url;
 
+/// The system prompt of a request without the sentence the loop appends about `after_previous`
+/// (ADR 0049): the agent's own words, as the test wrote them.
+fn plain(system: &Option<String>) -> Option<String> {
+    system.as_ref().map(|s| {
+        s.replacen(
+            &format!("\n\n{}", adam_llm_agent::AFTER_PREVIOUS_INSTRUCTION),
+            "",
+            1,
+        )
+    })
+}
+
 const MCP_TOKEN: &str = "mcp-tok-7d1c4e90-secret";
 
 fn url() -> Url {
@@ -1407,7 +1419,10 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
         ]
     );
     // The child: its own prompt, and no tool (a subagent gets none it does not list).
-    assert_eq!(requests[1].system.as_deref(), Some("You review texts."));
+    assert_eq!(
+        plain(&requests[1].system).as_deref(),
+        Some("You review texts.")
+    );
     assert!(offered(1).is_empty(), "{:?}", offered(1));
     match requests[2].messages.last().unwrap() {
         adam_model::Message::Tool {

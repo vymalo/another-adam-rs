@@ -43,6 +43,7 @@ use crate::images::{
     parse_inbound_images, parts_of, state_bytes,
 };
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
+use crate::order;
 use crate::paging::backstop;
 use crate::plan::Plan;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
@@ -63,14 +64,29 @@ fn has_started_session(state: &Conversation) -> bool {
 /// What the tool sources add to a request: their tools (refined, minus what a source holds back) and
 /// their instructions. The one place both the model turn and the summary request read them, so the
 /// head of the two is the same bytes. Returns what the sources said of the tools they offered.
+///
+/// Last, with `inject`, every tool's schema gets the optional `after_previous` (see [`order`]); the names
+/// of the tools whose own schema has one are returned beside the notes, and the turn records them.
 async fn apply_sources(
     sources: &[DynToolSource],
     source_ctx: Option<&SourceCtx>,
     request: &mut ModelRequest,
-) -> Vec<ToolNote> {
-    let Some(source_ctx) = source_ctx else {
-        return Vec::new();
+    inject: bool,
+) -> (Vec<ToolNote>, Vec<String>) {
+    let notes = match source_ctx {
+        Some(source_ctx) => offered_by(sources, source_ctx, request).await,
+        None => Vec::new(),
     };
+    let own = order::prepare(&mut request.tools, inject);
+    (notes, own)
+}
+
+/// The sources' part of [`apply_sources`].
+async fn offered_by(
+    sources: &[DynToolSource],
+    source_ctx: &SourceCtx,
+    request: &mut ModelRequest,
+) -> Vec<ToolNote> {
     let (more, notes) = offered(sources, source_ctx, &request.tools).await;
     request.tools.extend(more);
     refined(sources, source_ctx, &mut request.tools).await;
@@ -379,6 +395,10 @@ struct Recorded {
     /// Absent in journals written before reports existed, which report under [`old_call_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     call: Option<String>,
+    /// The tools whose own schema has an `after_previous`: their calls keep the argument as it is
+    /// ([`order`]). Absent when none, and in journals written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    own_order: Vec<String>,
 }
 
 /// The id of the stream of the words of turn `turn` of `run`: unique within the task, because the
@@ -480,6 +500,19 @@ pub enum BuildError {
     DuplicateTool {
         /// The repeated name.
         name: String,
+    },
+    /// A tool's own schema has a property called `after_previous`, which the loop reserves for the
+    /// order of the calls of a turn ([`AFTER_PREVIOUS`](crate::AFTER_PREVIOUS)) whenever more than
+    /// one call may run at once. Rename the property, or build the agent with `max_parallel(1)`.
+    #[error(
+        "tool `{tool}` has a property called `{argument}`, which the agent reserves for the order of \
+         parallel tool calls: rename it, or use max_parallel(1)"
+    )]
+    ReservedArgument {
+        /// The tool.
+        tool: String,
+        /// The reserved name.
+        argument: String,
     },
 }
 
@@ -659,6 +692,12 @@ impl LlmAgentBuilder {
                     });
                 }
             }
+            if self.max_parallel > 1 && order::has_own(&tool.spec()) {
+                return Err(BuildError::ReservedArgument {
+                    tool: name,
+                    argument: order::AFTER_PREVIOUS.to_owned(),
+                });
+            }
             if !names.insert(name.clone()) {
                 return Err(BuildError::DuplicateTool { name });
             }
@@ -690,7 +729,17 @@ impl LlmAgentBuilder {
             name: self.name,
             model: self.model,
             model_alias: self.model_alias,
-            instructions: self.instructions,
+            // Above a limit of one the model is told what `after_previous` means.
+            instructions: if self.max_parallel > 1 {
+                Some(match self.instructions {
+                    Some(own) if !own.trim().is_empty() => {
+                        format!("{own}\n\n{}", order::INSTRUCTION)
+                    }
+                    _ => order::INSTRUCTION.to_owned(),
+                })
+            } else {
+                self.instructions
+            },
             tools,
             sources: self.sources,
             index,
@@ -1356,6 +1405,7 @@ impl LlmAgent {
         let run = ctx.run_id();
         let emitter = ctx.emitter();
         let stream_text = self.stream_text;
+        let ordered = self.max_parallel > 1;
         let cancel = ctx.cancel_token();
         // The bytes of the images of the history are read here, inside the step, for this call only:
         // they are never in the journal and never in the history. A model that cannot see is given
@@ -1388,7 +1438,8 @@ impl LlmAgent {
                 // The sources are read here, inside the step, so that a replay of a turn whose model
                 // call is recorded does not read them again: only the answer is journaled, not the
                 // tools it was given.
-                let notes = apply_sources(&sources, source_ctx.as_ref(), &mut request).await;
+                let (notes, own_order) =
+                    apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
@@ -1403,6 +1454,7 @@ impl LlmAgent {
                         notes,
                         seen: Some(seen),
                         call: Some(call_id(run, turn)),
+                        own_order,
                     });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
@@ -1424,6 +1476,7 @@ impl LlmAgent {
                     notes,
                     seen: Some(seen),
                     call: Some(call_id(run, turn)),
+                    own_order,
                 })
             })
             .await?;
@@ -1447,6 +1500,7 @@ impl LlmAgent {
         }
         let answered_stale: bool;
         let seen_at: usize;
+        let own_order: Vec<String>;
         let (response, stream) = match recorded {
             Ok(Recorded {
                 response,
@@ -1454,8 +1508,10 @@ impl LlmAgent {
                 notes,
                 seen,
                 call: _,
+                own_order: own,
             }) => {
                 seen_at = seen.unwrap_or(state.messages.len());
+                own_order = own;
                 // The provider took every image this request carried.
                 state.note_images_sent(sent);
                 // The calls this turn asks for are the ones its listing described.
@@ -1639,7 +1695,9 @@ impl LlmAgent {
             return Ok(Flow::Next);
         }
         state.tool_calls += requested;
+        let (calls, ordered_calls) = ordered_by_the_model(calls, &own_order);
         state.pending_calls = calls;
+        state.ordered_calls = ordered_calls;
         Ok(Flow::Next)
     }
 
@@ -1804,6 +1862,7 @@ impl LlmAgent {
         request.prompt_cache_key = ctx.conversation_id().map(prompt_cache_key);
         request.max_output_tokens = Some(SUMMARY_OUTPUT_TOKENS);
         let model = self.model.clone();
+        let ordered = self.max_parallel > 1;
         let sources = self.sources.clone();
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
@@ -1839,7 +1898,7 @@ impl LlmAgent {
                     )
                     .await;
                 }
-                apply_sources(&sources, source_ctx.as_ref(), &mut request).await;
+                apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
                 let answer = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
@@ -2463,7 +2522,8 @@ impl LlmAgent {
             .map(|call| {
                 let key = call_key(call);
                 // The doom-loop count of a call needs the result of the one before it.
-                let barrier = before.as_deref() == Some(key.as_str());
+                let barrier = before.as_deref() == Some(key.as_str())
+                    || state.ordered_calls.contains(&call.id);
                 before = Some(key);
                 Entry {
                     access: self.access_of(call),
@@ -3979,8 +4039,50 @@ fn limited_output(
 /// The longest part of the text of an invalid call that its error quotes.
 const INVALID_ARGUMENTS_QUOTE: usize = 2048;
 
-/// What the model is told when the arguments of its call were not JSON.
+/// The calls of a turn as the loop runs them: `after_previous` taken out of each (the tool, its access, the
+/// doom-loop key, the hooks and the step's input never see it), and the ids of the calls that said `true`.
+/// A call whose value is not a boolean does not run: it becomes a call with invalid arguments, which
+/// [`invalid_arguments`] answers. A tool in `own` has its own `after_previous`: its calls are left as they
+/// are. The history keeps what the model said.
+fn ordered_by_the_model(calls: Vec<ToolCall>, own: &[String]) -> (Vec<ToolCall>, Vec<String>) {
+    let mut barriers = Vec::new();
+    let calls = calls
+        .into_iter()
+        .map(|mut call| {
+            if call.invalid_arguments.is_some() || own.contains(&call.name) {
+                return call;
+            }
+            let original = call.arguments.clone();
+            match order::take(&mut call.arguments) {
+                order::Order::Plain => {}
+                order::Order::After => barriers.push(call.id.clone()),
+                order::Order::Bad(_) => {
+                    call.invalid_arguments = Some(original.to_string());
+                    call.arguments = Value::String(adam_model::INVALID_ARGUMENTS_MARKER.into());
+                }
+            }
+            call
+        })
+        .collect();
+    (calls, barriers)
+}
+
+/// What the model is told when the arguments of its call were not JSON, or when its `after_previous`
+/// was not a boolean (the arguments are then valid JSON, and the call is kept as invalid by
+/// [`ordered_by_the_model`]).
 fn invalid_arguments(name: &str, raw: &str, output_cut: bool) -> String {
+    if let Ok(Value::Object(mut arguments)) = serde_json::from_str::<Value>(raw)
+        && let Some(value) = arguments.remove(order::AFTER_PREVIOUS)
+    {
+        let mut shown = Value::Object(serde_json::Map::from_iter([(
+            order::AFTER_PREVIOUS.to_owned(),
+            value,
+        )]));
+        let order::Order::Bad(text) = order::take(&mut shown) else {
+            return order::bad_value(name, "something else");
+        };
+        return order::bad_value(name, &text);
+    }
     let why = serde_json::from_str::<Value>(raw)
         .err()
         .map_or_else(String::new, |e| format!(": {e}"));
@@ -4381,6 +4483,7 @@ mod failure_tests {
             notes: Vec::new(),
             seen: None,
             call: None,
+            own_order: Vec::new(),
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -4400,6 +4503,7 @@ mod failure_tests {
             notes: Vec::new(),
             seen: None,
             call: None,
+            own_order: Vec::new(),
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -4411,6 +4515,7 @@ mod failure_tests {
             notes: vec![ToolNote::new("relay__search").reporting_steps()],
             seen: None,
             call: None,
+            own_order: Vec::new(),
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(
@@ -4429,6 +4534,7 @@ mod failure_tests {
             notes: Vec::new(),
             seen: None,
             call: Some("run-c0-a1b2c3d4".into()),
+            own_order: Vec::new(),
         };
         let json = serde_json::to_value(&reported).unwrap();
         assert_eq!(json["call"], "run-c0-a1b2c3d4");

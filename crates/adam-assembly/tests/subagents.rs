@@ -17,7 +17,7 @@ use adam_llm_agent::{FnTool, LlmStarter, Tool, ToolError, ToolOutput, ToolSet, u
 use adam_model::{Message, MockModel, ModelRequest, ToolCall};
 use adam_runtime::{Runtime, child_run_id};
 use common::{
-    def, instructions, manifests, runtime_on, spawn_worker, stub, tools, wait_done, wait_for,
+    def, instructions, manifests, plain, runtime_on, spawn_worker, stub, tools, wait_done, wait_for,
 };
 use serde_json::{Value, json};
 
@@ -205,7 +205,7 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
             unreachable!()
         };
         // The parent: its own tool, and one for the subagent, described by the subagent's file.
-        assert_eq!(r0.system.as_deref(), Some("You are the root."));
+        assert_eq!(plain(&r0.system).as_deref(), Some("You are the root."));
         assert_eq!(
             offered(r0),
             [
@@ -227,7 +227,7 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
         // The child: its own prompt, its own tools (and its own subagent), and a history that
         // starts with `message`, not with the parent's conversation.
         for r in [r1, r2] {
-            assert_eq!(r.system.as_deref(), Some("You research."));
+            assert_eq!(plain(&r.system).as_deref(), Some("You research."));
             assert_eq!(offered(r), ["fetch", "summarizer"]);
             assert_eq!(user_texts(r), ["find the release date"]);
             assert_eq!(r.model, "big", "a subagent inherits the parent's alias");
@@ -235,7 +235,7 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
         assert_eq!(r1.messages.len(), 1);
         assert_eq!(last_tool_result(r2, "f1"), ("fetch-out".into(), false));
         // The grandchild: no tools at all, and nothing but its message.
-        assert_eq!(r3.system.as_deref(), Some("You summarise."));
+        assert_eq!(plain(&r3.system).as_deref(), Some("You summarise."));
         assert!(r3.tools.is_empty());
         assert_eq!(r3.messages.len(), 1);
         assert_eq!(user_texts(r3), ["the page text"]);
@@ -245,7 +245,7 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
             last_tool_result(r5, "c1"),
             ("report: ten lines".into(), false)
         );
-        assert_eq!(r5.system.as_deref(), Some("You are the root."));
+        assert_eq!(plain(&r5.system).as_deref(), Some("You are the root."));
         // Only the child used `fetch`; the parent's tool was not called by anyone.
         assert_eq!(fetch_calls.load(SeqCst), 1);
         assert_eq!(parent_calls.load(SeqCst), 0);
@@ -302,7 +302,7 @@ async fn the_embedded_fixture_runs_a_subagent_end_to_end() {
     let requests = model.requests();
     // The reviewer, from the fixture's own file: its prompt, its two tools, its limits.
     assert_eq!(
-        requests[1].system.as_deref(),
+        plain(&requests[1].system).as_deref(),
         Some("You review diffs. Report findings as a numbered list.")
     );
     assert_eq!(offered(&requests[1]), ["read_diff", "list_files"]);

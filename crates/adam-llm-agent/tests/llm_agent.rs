@@ -305,6 +305,8 @@ async fn model_calls_tool_a_then_b_then_answers() {
     let agent = h
         .agent()
         .instructions("be brief")
+        // One call at a time: the system prompt and the schemas are the agent's own.
+        .max_parallel(1)
         .tool(a)
         .tool(b)
         .limits(Limits {

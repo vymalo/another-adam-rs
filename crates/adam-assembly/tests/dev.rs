@@ -29,7 +29,7 @@ use adam_runtime::{Runtime, RuntimeBuilder};
 use async_trait::async_trait;
 use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
-use common::{instructions, spawn_worker, wait_done, wait_for, write};
+use common::{instructions, plain, spawn_worker, wait_done, wait_for, write};
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -155,7 +155,10 @@ async fn an_edit_reaches_the_next_step_of_a_running_run() {
 
         let run = rt.start(&name, user_message("go"), None).await.unwrap();
         wait_parked(&rt, run).await;
-        assert_eq!(model.requests()[0].system.as_deref(), Some("Old prompt."));
+        assert_eq!(
+            plain(&model.requests()[0].system).as_deref(),
+            Some("Old prompt.")
+        );
 
         // The run is in the middle of its conversation. The file changes, and the run's next step
         // (after the answer) is made with the new text.
@@ -178,7 +181,7 @@ async fn an_edit_reaches_the_next_step_of_a_running_run() {
         let requests = model.requests();
         assert_eq!(requests.len(), 2, "{backend}");
         assert_eq!(
-            requests[1].system.as_deref(),
+            plain(&requests[1].system).as_deref(),
             Some("New prompt."),
             "{backend}"
         );
@@ -306,7 +309,10 @@ async fn an_invalid_edit_keeps_the_old_version_logs_and_exposes_the_diagnostic()
     })
     .await;
     wait_parked(&rt, run).await;
-    assert_eq!(model.requests()[1].system.as_deref(), Some("Old prompt."));
+    assert_eq!(
+        plain(&model.requests()[1].system).as_deref(),
+        Some("Old prompt.")
+    );
 
     // A file that reads but does not bind (a tool nobody registered) is refused the same way,
     // with the bind error.
@@ -341,7 +347,10 @@ async fn an_invalid_edit_keeps_the_old_version_logs_and_exposes_the_diagnostic()
         .unwrap();
     wait_done(&rt, run).await;
     worker.stop().await;
-    assert_eq!(model.requests()[2].system.as_deref(), Some("Fixed prompt."));
+    assert_eq!(
+        plain(&model.requests()[2].system).as_deref(),
+        Some("Fixed prompt.")
+    );
 }
 
 #[tokio::test]
@@ -410,7 +419,7 @@ async fn a_changed_tool_set_applies_to_runs_that_start_later() {
         assert_eq!(requests.len(), 2, "{backend}");
         assert_eq!(tool_names(&requests[1]), ["ask"], "{backend}");
         assert_eq!(
-            requests[1].system.as_deref(),
+            plain(&requests[1].system).as_deref(),
             Some("New prompt."),
             "{backend}"
         );
@@ -429,7 +438,7 @@ async fn a_changed_tool_set_applies_to_runs_that_start_later() {
         assert_eq!(requests.len(), 3, "{backend}");
         assert_eq!(tool_names(&requests[2]), ["ask", "later"], "{backend}");
         assert_eq!(
-            requests[2].system.as_deref(),
+            plain(&requests[2].system).as_deref(),
             Some("Old prompt."),
             "{backend}"
         );
@@ -477,7 +486,10 @@ async fn going_back_to_the_old_tool_set_updates_the_runs_on_it() {
     rt.deliver(run, user_message("answer")).await.unwrap();
     wait_done(&rt, run).await;
     worker.stop().await;
-    assert_eq!(model.requests()[1].system.as_deref(), Some("Three."));
+    assert_eq!(
+        plain(&model.requests()[1].system).as_deref(),
+        Some("Three.")
+    );
 }
 
 // --- new and removed agents -----------------------------------------------------------------
@@ -557,7 +569,7 @@ async fn a_removed_subagent_stays_registered_with_its_last_version() {
     wait_done(&rt, run).await;
     worker.stop().await;
     assert_eq!(
-        model.requests()[0].system.as_deref(),
+        plain(&model.requests()[0].system).as_deref(),
         Some("Old sub prompt.")
     );
 
@@ -807,7 +819,7 @@ async fn remote_subagent_settings_are_applied_again_on_reload() {
     wait_done(&rt, run).await;
     worker.stop().await;
     let requests = model.requests();
-    assert_eq!(requests[0].system.as_deref(), Some("After."));
+    assert_eq!(plain(&requests[0].system).as_deref(), Some("After."));
     let Some(adam_model::Message::Tool {
         content, is_error, ..
     }) = requests[1].messages.last()

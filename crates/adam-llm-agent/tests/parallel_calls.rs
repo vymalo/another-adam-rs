@@ -40,6 +40,8 @@ struct Log {
     starts: Mutex<HashMap<String, usize>>,
     /// Calls that ran to their end, by call id.
     ends: Mutex<HashMap<String, usize>>,
+    /// The arguments each call was given, by call id.
+    args: Mutex<HashMap<String, Value>>,
 }
 
 impl Log {
@@ -125,6 +127,7 @@ impl Tool for Probe {
         let id = ctx.call_id().to_owned();
         let log = &self.log;
         log.events.lock().unwrap().push(format!("start:{id}"));
+        log.args.lock().unwrap().insert(id.clone(), args.clone());
         *log.starts.lock().unwrap().entry(id.clone()).or_default() += 1;
         let now = log.running.fetch_add(1, SeqCst) + 1;
         log.max_running.fetch_max(now, SeqCst);
@@ -1510,4 +1513,512 @@ async fn a_session_tool_runs_alone_even_when_it_declares_independent() {
     worker.stop().await;
     assert_eq!(view.status, RunStatus::Done);
     assert_eq!(log.max_running(), 1, "what the tool declares is not heeded");
+}
+
+// ---------------------------------------------------------------------------
+// Sync on demand: `after_previous` (ADR 0049 decision 12)
+// ---------------------------------------------------------------------------
+
+/// A tool whose own schema forbids every argument but `x`, as a `deny_unknown_fields` one does: it
+/// fails on any other.
+struct Strict {
+    log: Arc<Log>,
+}
+
+#[async_trait]
+impl Tool for Strict {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "strict".into(),
+            description: "strict".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"x": {"type": "integer"}},
+                "required": ["x"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn access(&self, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        self.log
+            .args
+            .lock()
+            .unwrap()
+            .insert(ctx.call_id().to_owned(), args.clone());
+        let keys: Vec<&String> = args.as_object().unwrap().keys().collect();
+        if keys != ["x"] {
+            return Err(ToolError::Permanent(format!("unknown field in {keys:?}")));
+        }
+        Ok(ToolOutput::text(format!("strict:{}", ctx.call_id())))
+    }
+}
+
+fn start_position(log: &Log, id: &str) -> usize {
+    log.position(&format!("start:{id}"))
+}
+
+fn end_position(log: &Log, id: &str) -> usize {
+    log.position(&format!("end:{id}"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_with_after_previous_waits_for_every_call_before_it_and_holds_the_ones_after() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call(
+            "c1",
+            "probe",
+            json!({"ms": 300, "use": "independent", "tag": 1}),
+        ),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 200, "use": "independent", "tag": 2}),
+        ),
+        call(
+            "c3",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 3, "after_previous": true}),
+        ),
+        call(
+            "c4",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 4}),
+        ),
+        call(
+            "c5",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 5}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    let (run, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert!(
+        start_position(&log, "c2") < end_position(&log, "c1"),
+        "the calls before the barrier ran together"
+    );
+    assert!(
+        end_position(&log, "c1") < start_position(&log, "c3")
+            && end_position(&log, "c2") < start_position(&log, "c3"),
+        "the barrier waited for both: {:?}",
+        log.events.lock().unwrap()
+    );
+    assert!(
+        end_position(&log, "c3") < start_position(&log, "c4"),
+        "nothing after the barrier started before it was done"
+    );
+    assert!(
+        start_position(&log, "c5") < end_position(&log, "c4"),
+        "the calls after the barrier run together again"
+    );
+    assert_eq!(log.max_running(), 2);
+    assert_eq!(
+        tool_answers(&view)
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>(),
+        ["ok:c1", "ok:c2", "ok:c3", "ok:c4", "ok:c5"],
+        "results in call order"
+    );
+    // The journal is the sequential one: a step per call, in call order.
+    let names: Vec<String> = h.journal(run).await.into_iter().map(|(_, n)| n).collect();
+    assert_eq!(
+        &names[1..6],
+        ["tool:c1", "tool:c2", "tool:c3", "tool:c4", "tool:c5"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_previous_never_reaches_the_tool_the_doom_loop_key_or_the_step() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "strict", json!({"x": 1, "after_previous": false})),
+        call("c2", "strict", json!({"x": 2, "after_previous": true})),
+        call("c3", "strict", json!({"x": 3, "after_previous": null})),
+    ]);
+    h.mock.push_text("done");
+    let agent = h.agent(10, |b| b.tool(Strict { log: log.clone() }));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(
+        tool_answers(&view),
+        [
+            ("strict:c1".to_owned(), false),
+            ("strict:c2".to_owned(), false),
+            ("strict:c3".to_owned(), false)
+        ],
+        "a strict tool accepted every call"
+    );
+    let args = log.args.lock().unwrap().clone();
+    assert_eq!(args["c1"], json!({"x": 1}));
+    assert_eq!(args["c2"], json!({"x": 2}));
+    assert_eq!(args["c3"], json!({"x": 3}));
+    // The step's input is the call without it; the history keeps what the model said.
+    let inputs: Vec<String> = h
+        .sink
+        .events_for(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) if step.state == StepState::Running => {
+                step.input.map(|v| Value::Object(v).to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inputs.len(), 3, "{inputs:?}");
+    assert!(
+        inputs.iter().all(|i| !i.contains("after_previous")),
+        "{inputs:?}"
+    );
+    let said = conversation(&view)
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls().to_vec())
+        .map(|c| c.arguments)
+        .collect::<Vec<_>>();
+    assert_eq!(said[1], json!({"x": 2, "after_previous": true}));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_doom_loop_key_ignores_after_previous() {
+    // Three calls with the same tool and arguments, one saying `after_previous: false`, are the
+    // same call: the third is refused as it is without the flag.
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "probe", json!({"use": "independent", "out": "same"})),
+        call(
+            "c2",
+            "probe",
+            json!({"use": "independent", "out": "same", "after_previous": false}),
+        ),
+        call("c3", "probe", json!({"use": "independent", "out": "same"})),
+    ]);
+    h.mock.push_text("done");
+    let (_, view) = h.run(10, "go", &log).await;
+    let answers = tool_answers(&view);
+    assert_eq!(answers[0], ("same".to_owned(), false));
+    assert_eq!(answers[1], ("same".to_owned(), false));
+    assert!(
+        answers[2].1,
+        "the third identical call is refused: {answers:?}"
+    );
+    assert_eq!(log.starts("c3"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bad_after_previous_answers_an_error_takes_no_step_and_runs_nothing() {
+    let mut runs = Vec::new();
+    for limit in [1usize, 10] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(vec![
+            call("c1", "probe", json!({"use": "independent", "tag": 1})),
+            call(
+                "c2",
+                "probe",
+                json!({"use": "independent", "tag": 2, "after_previous": "yes"}),
+            ),
+            call("c3", "probe", json!({"use": "independent", "tag": 3})),
+        ]);
+        h.mock.push_text("done");
+        let (run, view) = h.run(limit, "go", &log).await;
+        assert_eq!(view.status, RunStatus::Done);
+        let answers = tool_answers(&view);
+        assert!(answers[1].1, "{answers:?}");
+        assert!(
+            answers[1].0.contains("`after_previous`")
+                && answers[1].0.contains("true or false")
+                && answers[1].0.contains("did not run"),
+            "{}",
+            answers[1].0
+        );
+        assert_eq!(log.starts("c2"), 0, "the call did not run");
+        let journal = h.journal(run).await;
+        assert!(journal.iter().all(|(_, n)| n != "tool:c2"), "{journal:?}");
+        assert_eq!(
+            journal.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            (0..journal.len() as u64).collect::<Vec<_>>(),
+            "contiguous seqs"
+        );
+        runs.push((journal, answers));
+    }
+    assert_eq!(runs[0], runs[1], "the same at both limits");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_journal_and_the_answers_are_the_same_at_a_limit_of_one_and_ten_with_after_previous() {
+    let mut runs = Vec::new();
+    for limit in [1usize, 10] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_tool_calls(vec![
+            call(
+                "c1",
+                "probe",
+                json!({"ms": 30, "use": "independent", "tag": 1}),
+            ),
+            call(
+                "c2",
+                "probe",
+                json!({"ms": 20, "use": "independent", "tag": 2, "after_previous": true}),
+            ),
+            call(
+                "c3",
+                "probe",
+                json!({"ms": 10, "use": "r:files/a", "tag": 3}),
+            ),
+        ]);
+        h.mock.push_text("done");
+        let (run, view) = h.run(limit, "go", &log).await;
+        assert_eq!(view.status, RunStatus::Done);
+        runs.push((h.journal(run).await, tool_answers(&view)));
+    }
+    assert_eq!(runs[0], runs[1]);
+}
+
+#[tokio::test]
+async fn after_previous_is_in_every_schema_above_a_limit_of_one_and_in_none_at_one() {
+    for (limit, injected) in [(10usize, true), (2, true), (1, false)] {
+        let h = Harness::new();
+        let log = Arc::new(Log::default());
+        h.mock.push_text("done");
+        let agent = h.agent(limit, |b| {
+            b.tool(Probe::new(&log))
+                .tool(Strict { log: log.clone() })
+                .tool_source(Sleepers { log: log.clone() })
+        });
+        let rt = h.runtime(agent, Duration::from_secs(10));
+        let run = rt
+            .start("llm", user_message("go"), None)
+            .await
+            .expect("start");
+        let worker = Worker::spawn(&rt);
+        wait_terminal(&rt, run).await;
+        worker.stop().await;
+        let request = &h.mock.requests()[0];
+        let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["probe", "strict", "plain", "slow_a", "slow_b"],
+            "own tools first, then the source's by name"
+        );
+        for tool in &request.tools {
+            let property = &tool.parameters["properties"]["after_previous"];
+            if injected {
+                assert_eq!(property["type"], "boolean", "{}: {property}", tool.name);
+                let required = tool.parameters["required"].as_array();
+                assert!(
+                    required.is_none_or(|r| !r.iter().any(|v| v == "after_previous")),
+                    "{}: never required",
+                    tool.name
+                );
+            } else {
+                assert!(property.is_null(), "{}: {property}", tool.name);
+            }
+        }
+        // The schema's own keys are all still there.
+        let strict = &request.tools[1].parameters;
+        assert_eq!(strict["required"], json!(["x"]));
+        assert_eq!(strict["additionalProperties"], json!(false));
+        assert_eq!(strict["properties"]["x"], json!({"type": "integer"}));
+        let system = request.system.clone().unwrap_or_default();
+        assert_eq!(
+            system.contains("after_previous"),
+            injected,
+            "the instruction says it above a limit of one only: {system:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_schema_that_is_not_an_object_is_left_alone() {
+    struct Odd;
+    #[async_trait]
+    impl Tool for Odd {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "odd".into(),
+                description: "odd".into(),
+                parameters: json!({"type": "string"}),
+            }
+        }
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("odd"))
+        }
+    }
+    let h = Harness::new();
+    h.mock.push_text("done");
+    let agent = h.agent(10, |b| b.tool(Odd));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        h.mock.requests()[0].tools[0].parameters,
+        json!({"type": "string"})
+    );
+}
+
+/// A tool whose own schema already has an `after_previous`: it is the tool's, so nothing is injected
+/// and nothing is stripped.
+struct Owner {
+    log: Arc<Log>,
+}
+
+#[async_trait]
+impl Tool for Owner {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "owner".into(),
+            description: "owner".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"after_previous": {"type": "string"}}
+            }),
+        }
+    }
+
+    fn access(&self, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        self.log
+            .args
+            .lock()
+            .unwrap()
+            .insert(ctx.call_id().to_owned(), args);
+        Ok(ToolOutput::text("owner"))
+    }
+}
+
+#[test]
+fn an_own_tool_whose_schema_has_after_previous_is_a_build_error_above_a_limit_of_one() {
+    let log = Arc::new(Log::default());
+    let model = Arc::new(MockModel::new());
+    let err = LlmAgent::builder("a", model.clone(), "m")
+        .max_parallel(10)
+        .tool(Owner { log: log.clone() })
+        .try_build()
+        .unwrap_err();
+    assert!(
+        matches!(&err, adam_llm_agent::BuildError::ReservedArgument { tool, .. } if tool == "owner"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("after_previous"), "{err}");
+    // At a limit of one nothing is injected, so nothing collides.
+    LlmAgent::builder("a", model, "m")
+        .max_parallel(1)
+        .tool(Owner { log })
+        .try_build()
+        .expect("no collision at a limit of one");
+}
+
+/// A source's tool with an `after_previous` of its own: untouched, and its value reaches it.
+struct Collides {
+    log: Arc<Log>,
+}
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for Collides {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        vec![
+            ToolSpec {
+                name: "mine".into(),
+                description: "has its own".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"after_previous": {"type": "string"}}
+                }),
+            },
+            ToolSpec {
+                name: "theirs".into(),
+                description: "has none".into(),
+                parameters: json!({"type": "object"}),
+            },
+        ]
+    }
+
+    fn access(&self, _name: &str, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+
+    async fn call(
+        &self,
+        ctx: &ToolCtx,
+        name: &str,
+        args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        self.log
+            .args
+            .lock()
+            .unwrap()
+            .insert(ctx.call_id().to_owned(), args);
+        Some(Ok(ToolOutput::text(format!("{name}:{}", ctx.call_id()))))
+    }
+}
+
+#[tokio::test]
+async fn a_source_tool_with_its_own_after_previous_keeps_it_and_the_others_still_get_the_flag() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call("c1", "mine", json!({"after_previous": "later"})),
+        call("c2", "theirs", json!({"after_previous": true, "k": 1})),
+    ]);
+    h.mock.push_text("done");
+    let agent = h.agent(10, |b| b.tool_source(Collides { log: log.clone() }));
+    let rt = h.runtime(agent, Duration::from_secs(10));
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done);
+    let request = &h.mock.requests()[0];
+    assert_eq!(
+        request.tools[0].parameters["properties"]["after_previous"],
+        json!({"type": "string"}),
+        "the tool's own property is not replaced"
+    );
+    assert_eq!(
+        request.tools[1].parameters["properties"]["after_previous"]["type"],
+        "boolean"
+    );
+    let args = log.args.lock().unwrap().clone();
+    assert_eq!(
+        args["c1"],
+        json!({"after_previous": "later"}),
+        "not stripped"
+    );
+    assert_eq!(args["c2"], json!({"k": 1}), "stripped");
+    assert_eq!(
+        tool_answers(&view),
+        [
+            ("mine:c1".to_owned(), false),
+            ("theirs:c2".to_owned(), false)
+        ]
+    );
 }

@@ -114,7 +114,7 @@ at once, or "interrupted" answers (adam replays).
     agrees, and a test catches the bug.
 12. **Sync on demand** is a reserved optional boolean argument, `after_previous`, injected into every schema when the limit is
     above 1 and stripped before the tool, `Tool::access`, `call_key`, hooks and the step's input see the call. A call with it
-    is a barrier. Slice P6 builds it; a one-sentence addition to the instructions says what it means. Alternatives weighed:
+    is a barrier. Slice P6 built it: a one-sentence addition to the instructions says what it means. A bad value answers an error and the call takes no step; a tool whose own schema has the name keeps it (an own tool of the agent is a `BuildError::ReservedArgument`, a source's tool is left alone and logged); the flag is kept in the state with the turn's pending calls, and the names of the tools that have one of their own in the recorded model answer, so a replay does not depend on the sources. Alternatives weighed:
     `after: [index]` (positions are error-prone for models, and needs cycle checks), a wrapper `run_in_order { calls }` (inner
     arguments no schema validates, one result for many calls), and a barrier tool `then {}` (a meaningless call and result in
     the history). The fallback if the extra tokens (an estimate: 300 to 400 per request for about 40 tools) matter is `then {}`.
@@ -209,7 +209,7 @@ stateDiagram-v2
 | P3 | `schedule.rs`: segments, conflicts, barriers, the queue (pure) | built |
 | P4 | `run_pending` by segments, `LlmAgentBuilder::max_parallel` | built |
 | P5 | `MAX_PARALLEL_TOOL_CALLS`, `limits.max_parallel`, the chart key | built |
-| P6 | `after_previous` | not built |
+| P6 | `after_previous` | built |
 | P7 | classes of the library tools: MCP, UI, assembly, `read_output` | not built |
 | P8 | the coder: `NotesStore::update`, the class table, atomic writes | not built |
 | P9 | the batching sentence, the bench pin, calls per turn in the bench | not built |
