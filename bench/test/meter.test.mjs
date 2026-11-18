@@ -618,6 +618,16 @@ test('a stream whose tool calls all say index 0 is counted by the ids that tell 
   }
 });
 
+test('a stream whose tool calls carry no id is counted by their indices', async (t) => {
+  for (const splitToolCalls of [false, true]) {
+    const s = await setup(t, { behavior: { toolCalls: 3, splitToolCalls, noToolCallIds: true } });
+    const { baseUrl } = s.open(`r-${splitToolCalls}`);
+    const text = await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+    assert.ok(!/"id":"call/.test(text), 'no call carries an id');
+    assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.toolCalls), [3], `split: ${splitToolCalls}`);
+  }
+});
+
 test('a client that closes the stream right after [DONE] keeps the tool call count of its answer', async (t) => {
   const s = await setup(t, { behavior: { toolCalls: 2, holdAfterDoneMs: 400 } });
   const { baseUrl } = s.open();
