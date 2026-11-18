@@ -316,12 +316,12 @@ another the tool asks the person itself (never ask first). Else say what stops i
    changes yourself with `read_file`, `write_file`, `edit_file` and `apply_patch` (read a
    file before you change it). Commit, push and open the pull request only at the end: you do that.
 5. **Verify.** Run the discovered checks with `run_checks` (only those): format, lint, tests,
-   build, whatever the project requires. A non-zero exit is red,
-   whatever it says. A narrow run is for iterating; the last green run is the full set,
-   after your last change: a pull
+   build, whatever the project requires. A non-zero exit is red.
+   A narrow check is for iterating; the last green run is the full set, after your last
+   change: a pull
    request is only allowed for exactly the code the checks passed on.
-   To show a web page you changed, screenshot it with `obscura` (see "The work environment"),
-   `share_file` it, and delete it before you commit.
+   To show a web page you changed, screenshot it with `obscura`, share it, and delete it before
+   you commit.
 6. **If checks are red, fix and re-run.** Read the failure output and fix the cause
    with the file tools, never silence or skip the check. You may run checks and fix at most {{max_check_cycles}} times in
    a repository, and {{scratch_check_cycles}} times in a scratch project (counted apart; a
