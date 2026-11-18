@@ -34,13 +34,21 @@ pub fn stops_a_command(_args: &Value) -> ToolAccess {
     ToolAccess::writes(COMMANDS)
 }
 
-/// `list_commands`: it looks at the commands, so it waits for one that is starting or stopping.
+/// `list_commands`: it looks at the commands, and it settles the records of the ones that ended
+/// without anyone noticing, so it changes what `read_output` finds: it keeps its place among the
+/// commands.
 pub fn lists_the_commands(_args: &Value) -> ToolAccess {
-    ToolAccess::reads(COMMANDS)
+    ToolAccess::writes(COMMANDS)
 }
 
 /// `file_diagnostics`, `find_definition`, `find_references`: they read the whole slot (the server
-/// syncs what changed first) and take turns on the servers.
+/// syncs what changed first), take turns on the servers, and never run beside a command: a command
+/// of `run_command` snapshots the slot and puts it back, and a server that syncs in that window
+/// would read files that are about to be undone.
 pub fn asks_a_language_server(_args: &Value) -> ToolAccess {
-    ToolAccess::Uses(vec![Use::read(FILES), Use::write(LSP)])
+    ToolAccess::Uses(vec![
+        Use::read(FILES),
+        Use::write(LSP),
+        Use::write(COMMANDS),
+    ])
 }
