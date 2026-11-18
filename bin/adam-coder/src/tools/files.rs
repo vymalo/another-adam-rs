@@ -3034,6 +3034,31 @@ mod tests {
         );
     }
 
+    /// A match that ends with the line ending takes the whole `\r\n`, not just the `\r`.
+    #[test]
+    fn a_tolerant_edit_that_ends_with_a_newline_takes_the_whole_crlf() {
+        let dir = root();
+        fs::write(dir.path().join("crlf.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let done = edit_in(dir.path(), "crlf.txt", "beta\n", "BETA\n", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("crlf.txt")).unwrap(),
+            "alpha\r\nBETA\ngamma\r\n"
+        );
+    }
+
+    /// A tolerant deletion takes only the matched bytes; the blanks after the match stay.
+    #[test]
+    fn a_tolerant_deletion_keeps_the_blanks_after_the_match() {
+        let dir = root();
+        fs::write(dir.path().join("del.txt"), "a  \nb  \n").unwrap();
+        edit_in(dir.path(), "del.txt", "a\nb", "", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("del.txt")).unwrap(),
+            "  \n"
+        );
+    }
+
     /// Every span is the bytes the match covers: it starts and ends on a character boundary, its
     /// text normalizes to `old`, and it ends at the last byte matched.
     #[test]
