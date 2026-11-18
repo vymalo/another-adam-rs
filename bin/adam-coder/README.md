@@ -2063,6 +2063,18 @@ shipped files stay in the binary and cannot disagree with it.
 * Tests: `tests/environment.rs` (`a_variable_a_mcp_json_names_is_*`, `the_names_the_coders_own_processes_need_*`), `src/config.rs`, `src/redact.rs`, `src/harden.rs`, `src/tools/gitcli.rs` (a malicious filter);
   `adam-assembly/tests/extra_mcp.rs`, `adam-mcp/tests/http.rs` (`an_optional_server_*`).
 
+### Calls at the same time
+
+The calls of one model reply run at the same time (`MAX_PARALLEL_TOOL_CALLS`, 10 by default). Each tool declares what
+its call shares with the others: `tools/access.rs` names the scopes (`files`, `commands`, `lsp`) and the classes with
+two uses, and `#[tool(parallel = "read" | "write" | "exclusive", path = "path")]` the rest. The list, and why the gates
+run alone, is in [the reference](../../docs/reference/coder-agent.md#calls-at-the-same-time); `tests/tool_access.rs`
+holds it. `NotesStore::update` is how a call changes the run's notes (a lock per run around load, change and save);
+`run_checks`, `commit_and_push` and `open_pull_request` run alone and read the notes once and write them once.
+`write_file` and `edit_file` rename a new file over the old, so a read beside them sees one whole file.
+Tests: `tests/tool_access.rs`, `concurrent_updates_of_one_run_keep_every_change` in `src/tools/notes.rs`,
+`a_read_beside_a_write_or_an_edit_sees_a_whole_file` in `src/tools/files.rs`.
+
 ### Retry safety
 
 Each tool's side effect runs inside `LlmAgent`'s journaled `tool:<call id>`

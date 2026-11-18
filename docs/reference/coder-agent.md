@@ -680,6 +680,51 @@ repository or scratch project in the run and nothing delivered it fails with
 form), redacted, whether or not changes are left in the worktree. When a run is cancelled while a command works, the tool
 kills the command and its process group and tells the run's environment which command to kill.
 
+### Calls at the same time
+
+The calls of one model reply run at the same time, up to `MAX_PARALLEL_TOOL_CALLS` (10 by default;
+[ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)). Each tool says what a call
+shares with the others; two calls that share a scope where one of them writes keep the model's order, and
+everything else starts as soon as there is room. The results go back to the model in call order whatever order the
+calls finish in, and the journal is the one a one-at-a-time loop writes.
+
+The scopes: `files` (every slot of the workspace; a path names `files/<path>`, and an absolute path or one with `..`
+widens to `files`; the `repo` argument is not looked at, so equal paths in two slots conflict, which costs time and
+nothing else), `commands` (one command at a time in a workspace), `screen` and `lsp`.
+
+| Tool | Class | Runs beside | Waits for |
+|---|---|---|---|
+| `read_file`, `list_files`, `find_files`, `search_files`, `share_file` | reads `files/<path>` (no path: `files`) | every other read, a write of another path, commands that only read | a write of the same path or of `files` |
+| `write_file`, `edit_file` | writes `files/<path>` | calls on other paths | every call that reads or writes that path, and every command |
+| `apply_patch` | writes `files` | nothing that uses files | |
+| `run_command` | reads `files`, writes `commands` | reads, `ui_catalog`, GitHub | a write of a file, another command |
+| `run`, `start_command` | writes `files` and `commands` | `read_output`, `ui_catalog`, GitHub | any other use of files, another command |
+| `stop_command` | writes `commands` | calls that do not use commands | a command that starts or lists |
+| `list_commands` | reads `commands` | everything but a command | `run_command`, `run`, `start_command`, `stop_command` |
+| `file_diagnostics`, `find_definition`, `find_references` | reads `files`, writes `lsp` | reads | a write of a file, another language server call |
+| `show` | writes `screen` | everything but another `show` | another `show` |
+| `read_output`, `ui_catalog` | independent | everything but a call that must run alone | |
+| the GitHub tools (`github__*`, an MCP server) | independent unless `"parallel": false` in `mcp.json` | everything but a call that must run alone | |
+| `prepare_workspace`, `start_scratch`, `publish_scratch`, `rebuild_environment`, `run_checks`, `commit_and_push`, `open_pull_request`, `rename_repository`, `delete_repository`, `plan_work`, `plan_check`, `plan_add` | alone | nothing | every call before it |
+| `ask_user`, `request_repository`, `create_repository`, `merge_pull_request`, `explorer`, `reviewer` | alone, forced by the loop | nothing | every call before it |
+| the references source (the references a repository declares) | alone | nothing | every call before it |
+
+*Alone* means every earlier call has finished and its result is applied before the call starts, and nothing after it
+starts before it ends: the gates change state the loop must apply first (the notes, the plan, the check cycles), and a
+question parks the run. A model that wants the order of its calls to hold sets `after_previous: true` on a call.
+
+**What makes it safe.** `write_file` and `edit_file` write a new file and rename it over the old, so a read of the
+same path beside a write sees the old file or the new one whole (`a_read_beside_a_write_or_an_edit_sees_a_whole_file`
+in `src/tools/files.rs`). A write through a symlink is refused, so an alias cannot name a path the scope does not. The
+run's notes are changed through `NotesStore::update`, a lock per run around load, change and save, so two calls that
+note something at the same time keep both (`concurrent_updates_of_one_run_keep_every_change`). The gates that run
+alone hold the notes across their work and save them once. `tests/tool_access.rs` pins the class of every tool in
+this table, so a tool added without a decision fails it, and runs the classes through the loop (two reads overlap,
+a read and a write of one path do not, a command waits for a write and runs beside reads, two commands never overlap).
+
+The prompt tells the model to ask for independent calls together in one reply; the bench counts the calls per model
+turn to see whether it does ([bench README](../../bench/README.md), "Calls per model turn").
+
 ### Time limit of each tool
 
 The agent stops a call that runs past its tool's limit (300 s for a tool that declares none) and tells the model it was
