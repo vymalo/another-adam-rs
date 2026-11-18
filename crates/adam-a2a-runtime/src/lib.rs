@@ -33,6 +33,7 @@
 
 mod backend;
 mod caller;
+mod child_sessions;
 mod commands;
 mod convert;
 mod files_in;
@@ -50,6 +51,9 @@ mod words;
 
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use caller::{CONTEXT_CALLER, UNREADABLE_CALLER, asked_by_an_agent};
+pub use child_sessions::{
+    ChildSessionAgent, ChildSessions, MAX_DESCRIPTION_CHARS, MAX_SESSION_ROUNDS,
+};
 pub use commands::{
     CommandRefusal, Commands, MAX_COMMAND_ARGUMENTS, MAX_COMMAND_EXPANSION, RemoteCommand,
 };

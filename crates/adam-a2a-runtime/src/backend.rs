@@ -205,6 +205,8 @@ pub struct RuntimeTaskBackend {
     pub(crate) access_tiers: Option<AccessTiers>,
     /// The commands of `commands/v1` this agent serves, when its card lists them.
     pub(crate) commands: Option<crate::Commands>,
+    /// The helpers of `child-sessions/v1` this agent serves, when its card lists them.
+    pub(crate) child_sessions: Option<crate::ChildSessions>,
 }
 
 impl std::fmt::Debug for RuntimeTaskBackend {
@@ -228,6 +230,7 @@ impl RuntimeTaskBackend {
             inbound: Arc::new(default_inbound),
             access_tiers: None,
             commands: None,
+            child_sessions: None,
         }
     }
 
@@ -286,6 +289,23 @@ impl RuntimeTaskBackend {
     #[must_use]
     pub fn with_commands(mut self, commands: crate::Commands) -> Self {
         self.commands = Some(commands).filter(|c| !c.is_empty());
+        self
+    }
+
+    /// Serve `child-sessions/v1` for an agent whose card lists `sessions`
+    /// ([`ChildSessions::card_extension`](crate::ChildSessions::card_extension)): see the
+    /// [`child_sessions`](crate::ChildSessions) module for the requests. A helper that is not
+    /// registered on the runtime is a wiring mistake: it is logged and the extension is not
+    /// served, so the card must not list it either.
+    #[must_use]
+    pub fn with_child_sessions(mut self, sessions: crate::ChildSessions) -> Self {
+        match sessions.names_exist_in(&self.runtime.agent_names()) {
+            Ok(()) => self.child_sessions = Some(sessions),
+            Err(missing) => tracing::error!(
+                agent = %missing,
+                "a child-sessions helper is not registered on the runtime; the extension is not served"
+            ),
+        }
         self
     }
 
@@ -591,6 +611,109 @@ impl RuntimeTaskBackend {
         Ok(self.said(caller, &view, task_from_view(&view, context, &self.prompt)))
     }
 
+    /// A message to a root context or to a task of the root agent.
+    async fn submit_root(
+        &self,
+        caller: &Caller,
+        message: Message,
+        task_id: Option<String>,
+        context_id: Option<String>,
+    ) -> Result<Task, BackendError> {
+        let mut inbound = (self.inbound)(&message).map_err(BackendError::InvalidParams)?;
+        // A command is expanded here, once, and the expansion is what is stored: a replay never
+        // reads the folder again. A name the agent does not serve in the metadata is refused
+        // before anything is written.
+        if let Some(commands) = &self.commands {
+            crate::commands::apply(
+                &message,
+                &mut inbound,
+                commands,
+                caller.has_extension(COMMANDS_EXTENSION),
+            )
+            .await
+            .map_err(|refusal| match refusal {
+                crate::CommandRefusal::Invalid(why) => BackendError::InvalidParams(why),
+                crate::CommandRefusal::Unavailable(why) => BackendError::unavailable(why),
+            })?;
+        }
+        // A message that activated the extension names a tier the agent honours, or nothing is
+        // written. One that did not is read as it always was.
+        if let Some(tiers) = &self.access_tiers
+            && caller.has_extension(ACCESS_TIER_EXTENSION)
+        {
+            let named = tier::requested(&message, tiers).map_err(BackendError::InvalidParams)?;
+            tier::put(&mut inbound, named).map_err(BackendError::InvalidParams)?;
+        }
+
+        let Some(task_id) = task_id else {
+            let (run, context) = self
+                .start_or_join(caller, &message, inbound, context_id)
+                .await?;
+            let view = self.view_of(run).await?;
+            let mut task = self.said(caller, &view, task_from_view(&view, &context, &self.prompt));
+            let mut first = message;
+            first.task_id = Some(task.id.clone());
+            first.context_id = Some(context);
+            task.history = Some(vec![first]);
+            return Ok(task);
+        };
+
+        let located = self
+            .owned(caller, &task_id)
+            .await?
+            .ok_or_else(|| BackendError::TaskNotFound(task_id.clone()))?;
+        self.follow_up(caller, located, inbound, &task_id, context_id)
+            .await
+    }
+
+    /// A message that names `task_id`, a task of the caller already located: a steer, the answer
+    /// to a question, or the refusal its state calls for (see the type's documentation).
+    pub(crate) async fn follow_up(
+        &self,
+        caller: &Caller,
+        (run, view, context): (RunId, RunView, String),
+        inbound: adam_runtime::Inbound,
+        task_id: &str,
+        context_id: Option<String>,
+    ) -> Result<Task, BackendError> {
+        let state = crate::task_state(&view);
+        let steering = caller.has_extension(STEER_EXTENSION)
+            && matches!(state, TaskState::Submitted | TaskState::Working);
+        if context_id.is_some_and(|c| c != context) {
+            return Err(if steering {
+                BackendError::TaskNotFound(task_id.to_owned())
+            } else {
+                BackendError::InvalidParams("contextId does not match the task".to_owned())
+            });
+        }
+        if state.is_terminal() {
+            return Err(BackendError::UnsupportedOperation(format!(
+                "task {task_id} is {state:?} and cannot take a message"
+            )));
+        }
+        if steering {
+            return self.steer(caller, run, &context, inbound, task_id).await;
+        }
+        if !view.waiting {
+            return Err(BackendError::InvalidParams(format!(
+                "task {task_id} is {state:?} and cannot take a follow-up"
+            )));
+        }
+        self.runtime.deliver(run, inbound).await.map_err(map_err)?;
+
+        // The delivery made the run runnable, so this reads `working`; make
+        // that certain even if the record is read before the commit is visible.
+        let view = self.view_of(run).await?;
+        let mut task = task_from_view(&view, &context, &self.prompt);
+        if task.status.state == TaskState::InputRequired {
+            task.status.state = TaskState::Working;
+            task.status.message = None;
+            // A working task carries no totals: they are said when it ends or waits again.
+            task.metadata = None;
+        }
+        Ok(self.said(caller, &view, task))
+    }
+
     async fn view_of(&self, run: RunId) -> Result<RunView, BackendError> {
         self.runtime
             .view(run)
@@ -764,104 +887,31 @@ impl TaskBackend for RuntimeTaskBackend {
         task_id: Option<String>,
         context_id: Option<String>,
     ) -> Result<Task, BackendError> {
-        let mut inbound = (self.inbound)(&message).map_err(BackendError::InvalidParams)?;
-        // A command is expanded here, once, and the expansion is what is stored: a replay never
-        // reads the folder again. A name the agent does not serve in the metadata is refused
-        // before anything is written.
-        if let Some(commands) = &self.commands {
-            crate::commands::apply(
-                &message,
-                &mut inbound,
-                commands,
-                caller.has_extension(COMMANDS_EXTENSION),
-            )
-            .await
-            .map_err(|refusal| match refusal {
-                crate::CommandRefusal::Invalid(why) => BackendError::InvalidParams(why),
-                crate::CommandRefusal::Unavailable(why) => BackendError::unavailable(why),
-            })?;
-        }
-        // A message that activated the extension names a tier the agent honours, or nothing is
-        // written. One that did not is read as it always was.
-        if let Some(tiers) = &self.access_tiers
-            && caller.has_extension(ACCESS_TIER_EXTENSION)
+        if self.child_sessions.is_some()
+            && let Some(task) = self
+                .submit_child(&caller, &message, task_id.as_deref(), context_id.as_deref())
+                .await?
         {
-            let named = tier::requested(&message, tiers).map_err(BackendError::InvalidParams)?;
-            tier::put(&mut inbound, named).map_err(BackendError::InvalidParams)?;
-        }
-
-        let Some(task_id) = task_id else {
-            let (run, context) = self
-                .start_or_join(&caller, &message, inbound, context_id)
-                .await?;
-            let view = self.view_of(run).await?;
-            let mut task = self.said(
-                &caller,
-                &view,
-                task_from_view(&view, &context, &self.prompt),
-            );
-            let mut first = message;
-            first.task_id = Some(task.id.clone());
-            first.context_id = Some(context);
-            task.history = Some(vec![first]);
             return Ok(task);
-        };
-
-        let (run, view, context) = self
-            .owned(&caller, &task_id)
-            .await?
-            .ok_or_else(|| BackendError::TaskNotFound(task_id.clone()))?;
-        let state = crate::task_state(&view);
-        let steering = caller.has_extension(STEER_EXTENSION)
-            && matches!(state, TaskState::Submitted | TaskState::Working);
-        if context_id.is_some_and(|c| c != context) {
-            return Err(if steering {
-                BackendError::TaskNotFound(task_id)
-            } else {
-                BackendError::InvalidParams("contextId does not match the task".to_owned())
-            });
         }
-        if state.is_terminal() {
-            return Err(BackendError::UnsupportedOperation(format!(
-                "task {task_id} is {state:?} and cannot take a message"
-            )));
-        }
-        if steering {
-            return self.steer(&caller, run, &context, inbound, &task_id).await;
-        }
-        if !view.waiting {
-            return Err(BackendError::InvalidParams(format!(
-                "task {task_id} is {state:?} and cannot take a follow-up"
-            )));
-        }
-        self.runtime.deliver(run, inbound).await.map_err(map_err)?;
-
-        // The delivery made the run runnable, so this reads `working`; make
-        // that certain even if the record is read before the commit is visible.
-        let view = self.view_of(run).await?;
-        let mut task = task_from_view(&view, &context, &self.prompt);
-        if task.status.state == TaskState::InputRequired {
-            task.status.state = TaskState::Working;
-            task.status.message = None;
-            // A working task carries no totals: they are said when it ends or waits again.
-            task.metadata = None;
-        }
-        Ok(self.said(&caller, &view, task))
+        let task = self
+            .submit_root(&caller, message, task_id, context_id)
+            .await?;
+        self.with_sessions(&caller, task).await
     }
 
     async fn get(&self, caller: &Caller, task_id: &str) -> Result<Option<Task>, BackendError> {
-        Ok(self
-            .owned(caller, task_id)
-            .await?
-            .map(|(_, view, context)| {
-                self.said(caller, &view, task_from_view(&view, &context, &self.prompt))
-            }))
+        let Some((_, view, context)) = self.locate(caller, task_id).await? else {
+            return Ok(None);
+        };
+        let task = self.said(caller, &view, task_from_view(&view, &context, &self.prompt));
+        Ok(Some(self.with_sessions(caller, task).await?))
     }
 
     #[tracing::instrument(skip(self, caller), fields(subject = %caller.subject))]
     async fn cancel(&self, caller: &Caller, task_id: &str) -> Result<Task, BackendError> {
         let (run, view, context) = self
-            .owned(caller, task_id)
+            .locate(caller, task_id)
             .await?
             .ok_or_else(|| BackendError::TaskNotFound(task_id.to_owned()))?;
         let mut state = crate::task_state(&view);
@@ -875,7 +925,10 @@ impl TaskBackend for RuntimeTaskBackend {
             state = crate::task_state(&view);
         }
         match state {
-            TaskState::Canceled => Ok(task_from_view(&view, &context, &self.prompt)),
+            TaskState::Canceled => {
+                let task = task_from_view(&view, &context, &self.prompt);
+                self.with_sessions(caller, task).await
+            }
             other => Err(BackendError::NotCancelable {
                 task_id: task_id.to_owned(),
                 state: format!("{other:?}"),

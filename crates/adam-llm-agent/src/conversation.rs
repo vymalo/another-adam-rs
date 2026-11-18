@@ -67,7 +67,7 @@ pub(crate) fn parse_session(payload: &Value) -> Option<SessionHeader> {
 /// which only `subagent_close` writes.
 pub(crate) fn asks_to_close(payload: &Value) -> bool {
     payload
-        .get("close_session")
+        .get(adam_runtime::SESSION_CLOSE_ROUND_KEY)
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }

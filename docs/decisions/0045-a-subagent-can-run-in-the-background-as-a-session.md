@@ -55,6 +55,26 @@ decisions above, each for a reason found while building:
   cannot be read closes its session; a call that acts on a session is committed before it runs; a run that ends cancels rounds it
   could not wait for; at most 4 rounds work at once (`max_working` as a constant); retention must outlast a session's idle life.
 
+*Built 2026-11-18:* slice 6 part a (the A2A front, `crates/adam-a2a-runtime/src/child_sessions.rs`, the card entry in `crates/adam-a2a`, two
+readers and `closing_round_payload` in `crates/adam-runtime`): a client that activates `child-sessions/v1` sees the sessions of a parent
+context on the parent task, follows each round as a task of a child context, and starts, talks to, stops and closes a session;
+`RuntimeTaskBackend::with_child_sessions`, `ChildSessions`, `ExtensionConfig::child_sessions`. Not built: the stream events of the
+contract (slice 6 part b) and the wiring into `adam-assembly`, `adam-service` and `adam-coder` (part c), so no shipped agent lists the
+card yet.
+
+*Amended 2026-11-18* (slice 6 part a; each is a departure found while building, and the contract is
+`docs/api/child-sessions-v1.md` of `vymalo/another-agentic-system`):
+
+* **Decision 11, the close is in the message's metadata** (`metadata[URI].close {cancel}`, the contract's choice), not a data part.
+* **Decision 1, a person's round is its own parent.** A round a person starts has no run of an agent behind it, so it is started with
+  its own id as parent: no run's end cancels it and no run waits for it. The runtime says it
+  (`SessionView::started_outside_a_run`) and the A2A front derives `by: person` from it. A round the model starts is unchanged.
+* **Decision 7**: a person's round reports to no parent; the report of a person's round to the parent run waits for slice 3.
+* **Decision 9**: a round a person starts always has a tier written (the one its message names, else the agent's default).
+* **Decision 5**: the card's `maxOpen` is the value the deployment passes to `ChildSessions::new`, which must equal the model tools' constant (16) until slice 4 makes it a setting. It is checked before a start, so concurrent starts may exceed it by the number racing, as the tools' check may.
+* **Not built here:** the live usage of a model round stays on the parent until the loop is free to change; push configs on round
+  tasks are unsupported.
+
 ## Context
 
 *Verified 2026-11-14 by reading adam-rs at `103965f`:*

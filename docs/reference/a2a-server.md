@@ -272,6 +272,70 @@ task says `metadata[URI] = {"tier": ..}`: on the answer of `SendMessage`, on `Ge
 status update when it changes. `RuntimeTaskBackend::with_access_tiers` is the backend side; what the coder does with each tier is
 its README, *Access tiers*.
 
+## Child sessions (`child-sessions/v1`)
+
+A session ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) is a chain of runs of a helper agent
+that share one conversation. A client that **activates** `https://agents.vymalo.com/a2a/extensions/child-sessions/v1` (the
+contract is the orchestration layer's `docs/api/child-sessions-v1.md`) sees the sessions of a parent context on the parent task,
+follows each round as an ordinary task of a **child context**, and starts, talks to, stops and closes a session.
+`RuntimeTaskBackend::with_child_sessions` is the backend side (`crates/adam-a2a-runtime/src/child_sessions.rs`); the card entry is
+`ExtensionConfig::child_sessions`. No shipped agent lists it yet (slice 6 part c).
+
+```mermaid
+sequenceDiagram
+  participant C as Client (activates the extension)
+  participant B as RuntimeTaskBackend
+  participant R as Runtime
+  C->>B: SendMessage {contextId C, metadata start}
+  B->>R: start_child_continuing_within (session id S, its own parent)
+  B-->>C: round 1 as a task of K, metadata sessions object
+  C->>B: SendMessage {contextId K}
+  B->>R: session_view
+  alt the session is idle
+    B->>R: start_child_continuing_within (round 2, prior is the latest round)
+  else the session is working
+    B->>R: deliver (into the open round)
+  end
+  B-->>C: the round as a task of K
+  C->>B: SendMessage {contextId K, metadata close}
+  B->>R: start_child_continuing_within (a round that only closes) or deliver (the close kind)
+  B-->>C: the round, its session says closed or closing
+  C->>B: CancelTask {round}
+  B->>R: cancel
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> working: start
+  working --> idle: the round ended and the session is kept open
+  working --> closed: the round ended and the session is not kept open
+  working --> idle: CancelTask of the round and the session is kept open
+  working --> closed: CancelTask of the round and it is not kept open
+  working --> closed: the round ended after a close (closing)
+  working --> closed: a close with cancel
+  idle --> working: a message to the child context
+  idle --> closed: a close
+  closed --> [*]
+```
+
+* **Ids.** The client says `K = <C escaped>/s/<S>` for the child context of session `S`. The store keeps the caller's subject in
+  the stored parent part, so ownership needs no side table: a context of another caller is as an unknown one. `K` is reserved: a
+  message to a root context with that shape is `InvalidParams`, and a session cannot hold a session.
+* **Requests.** Without activation every request about `K` or a round is `InvalidParams` (`TaskNotFound` for another caller's
+  round) before anything is written. Activated: a `start` on a message to `C` (no `taskId`) makes round 1 and no turn of the
+  parent; a message to `K` is delivered into a working round, starts the next round of an idle session, or is
+  `UnsupportedOperation` for a closed one; a `close` closes an idle session by a round that calls no model and a working one when
+  its round ends (`cancel` stops the round first); `taskId` of a round follows the rules of any task (`steer/v1`);
+  `ListTasks {contextId: K}` lists the rounds, an unknown or foreign `K` is an empty page.
+* **A person's round is its own parent**, so no run's end cancels it and no run waits for it; its tasks say `by: person`.
+* **What a task says.** The parent's tasks: `metadata[URI].sessions`, open first then the 16 most recently closed. A round:
+  `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}`. Today only the snapshot of a stream,
+  `GetTask`, `ListTasks` and the answers carry them. Part b (not built) adds the parent stream's events (`opened`, `round`,
+  `reported`, `closed`, with `opened` and `by: person` on a running parent) and the round stream's status updates when a round
+  ends and when `closing` turns true. A task whose sessions cannot be listed carries no sessions object.
+* **Limits.** `maxOpen` (the card's), checked before the start: two concurrent starts may exceed it by the number racing, as the model's start tool may. 20 rounds a session (a close is always allowed, even at the limit), a description of at most 80 characters on one line. A round a person
+  starts runs under the tier its message names, else the agent's default; commands are not expanded in a child context.
+
 ## Commands (`commands/v1`)
 
 An agent that has prompt templates ([`commands/<name>.md`](agent-files.md#commands-commandsnamemd)) lists

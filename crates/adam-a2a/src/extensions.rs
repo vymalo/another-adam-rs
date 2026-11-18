@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Eleven extensions, each optional (a client that does not know one ignores it), detected by the
+//! Twelve extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -16,6 +16,7 @@
 //! | `usage/v1` | [`USAGE_EXTENSION`] | the agent reports the tokens of each model call, to a client whose request activated it, and writes a task's totals on the task when it ends or waits |
 //! | `access-tier/v1` | [`ACCESS_TIER_EXTENSION`] | the person picks how much the agent may do alone for each message (`plan`, `edits`, `auto`, `bypass`); the agent keeps to it and says which tier it worked under |
 //! | `commands/v1` | [`COMMANDS_EXTENSION`] | the card lists the prompt templates the agent serves; a message names one and the agent expands it before it is stored |
+//! | `child-sessions/v1` | [`CHILD_SESSIONS_EXTENSION`] | the card lists the helpers a person may start a session with; a client that activates it sees the agent's sessions, follows their rounds as tasks, and starts, talks to and closes one |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
@@ -95,6 +96,35 @@ pub const ACCESS_TIER_EXTENSION: &str = "https://agents.vymalo.com/a2a/extension
 /// orchestration layer's (`docs/api/commands-v1.md` of `vymalo/another-agentic-system`, not written
 /// yet).
 pub const COMMANDS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/commands/v1";
+
+/// The URI of the `child-sessions/v1` extension: the card lists the helpers a person may start a
+/// session with (`params`: `{"agents": [{"name", "description"}], "maxOpen"}`). A client that
+/// activates it sees an agent's sessions on the parent task, follows each round as a task of its own
+/// child context, and starts, talks to and closes a session. The contract is the orchestration
+/// layer's (`docs/api/child-sessions-v1.md` of `vymalo/another-agentic-system`); ADR 0045 decision 11
+/// is this repository's side.
+pub const CHILD_SESSIONS_EXTENSION: &str =
+    "https://agents.vymalo.com/a2a/extensions/child-sessions/v1";
+
+/// One helper of the card's `child-sessions/v1` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChildSessionInfo {
+    /// The name a `start` names.
+    pub name: String,
+    /// What the helper does, for a person to read.
+    pub description: String,
+}
+
+impl ChildSessionInfo {
+    /// A helper `name` with its `description`.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
 
 /// One command of the card's `commands/v1` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +321,33 @@ impl ExtensionConfig {
         Some(extension)
     }
 
+    /// The `child-sessions/v1` extension: `params.agents` lists the helpers (in the order given,
+    /// each name once) and `params.maxOpen` the most sessions open in one parent context. `None`
+    /// when there is no helper or `max_open` is 0 (the contract needs both): such an agent does not
+    /// list the extension. A repeated name keeps its first entry.
+    pub fn child_sessions(agents: &[ChildSessionInfo], max_open: u32) -> Option<Self> {
+        if max_open == 0 {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let listed: Vec<serde_json::Value> = agents
+            .iter()
+            .filter(|a| !a.name.trim().is_empty() && seen.insert(a.name.as_str()))
+            .map(|a| json!({"name": a.name, "description": a.description}))
+            .collect();
+        if listed.is_empty() {
+            return None;
+        }
+        let mut extension = Self::new(CHILD_SESSIONS_EXTENSION);
+        extension.description =
+            Some("Runs its helpers as sessions a client can open, talk to and close.".into());
+        extension
+            .params
+            .insert("agents".into(), serde_json::Value::Array(listed));
+        extension.params.insert("maxOpen".into(), json!(max_open));
+        Some(extension)
+    }
+
     /// The `mentions/v1` extension: the agent reads the agents a person mentioned in a message and
     /// asks them. Optional, no parameters; the description is the contract's.
     pub fn mentions() -> Self {
@@ -378,6 +435,55 @@ mod tests {
             "https://a2ui.org/a2a-extension/a2ui/v0.9.1"
         );
         assert_eq!(A2UI_MEDIA_TYPE, "application/a2ui+json");
+    }
+
+    #[test]
+    fn the_child_sessions_entry_is_the_contracts_word_for_word() {
+        assert_eq!(
+            CHILD_SESSIONS_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/child-sessions/v1"
+        );
+        let info = |n: &str, d: &str| ChildSessionInfo {
+            name: n.into(),
+            description: d.into(),
+        };
+        let e = ExtensionConfig::child_sessions(
+            &[
+                info("planner", "Breaks a request into steps."),
+                info("researcher", "Looks things up."),
+                info("planner", "again"),
+            ],
+            16,
+        )
+        .expect("listed");
+        assert_eq!(e.uri, CHILD_SESSIONS_EXTENSION);
+        assert!(!e.required);
+        assert_eq!(
+            e.description.as_deref(),
+            Some("Runs its helpers as sessions a client can open, talk to and close.")
+        );
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({"agents": [
+                {"name": "planner", "description": "Breaks a request into steps."},
+                {"name": "researcher", "description": "Looks things up."}
+            ], "maxOpen": 16})
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_helper_or_no_room_does_not_list_child_sessions() {
+        let one = [ChildSessionInfo {
+            name: "p".into(),
+            description: String::new(),
+        }];
+        assert!(ExtensionConfig::child_sessions(&[], 16).is_none());
+        assert!(ExtensionConfig::child_sessions(&one, 0).is_none());
+        let blank = [ChildSessionInfo {
+            name: "  ".into(),
+            description: String::new(),
+        }];
+        assert!(ExtensionConfig::child_sessions(&blank, 4).is_none());
     }
 
     #[test]

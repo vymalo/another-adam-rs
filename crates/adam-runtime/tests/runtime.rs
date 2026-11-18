@@ -6304,6 +6304,63 @@ mod cases {
         );
     }
 
+    /// A round whose parent is the round itself (a person started it: no run of an agent did) reads
+    /// as started outside a run, which a round of a parent run does not; the runtime never
+    /// cancels it because another run ended.
+    pub async fn a_round_that_is_its_own_parent_is_listed_reads_as_started_outside_and_is_never_cancelled_with_a_parent(
+        store: DynStore,
+    ) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let rt = rounds_runtime(&store, &parent_name, &[(&agent, true)]);
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        let ctx = uniq("u:ctx");
+
+        let by_agent = child_run_id(parent, "a");
+        let by_agent_conv = session_conversation_id(&ctx, by_agent);
+        rt.start_child_continuing(parent, by_agent, &agent, say("a"), &by_agent_conv, None)
+            .await
+            .unwrap();
+        let alone = RunId::new();
+        let alone_conv = session_conversation_id(&ctx, alone);
+        rt.start_child_continuing(alone, alone, &agent, say("b"), &alone_conv, None)
+            .await
+            .unwrap();
+        wait_waiting(&rt, by_agent).await;
+        wait_waiting(&rt, alone).await;
+
+        let listed = rt
+            .list_sessions(&ctx, &[agent.as_str()], 0, 10)
+            .await
+            .unwrap();
+        let summary = |id: RunId| listed.sessions.iter().find(|s| s.id == id).unwrap();
+        assert!(!summary(by_agent).started_outside_a_run());
+        assert!(summary(alone).started_outside_a_run());
+        assert_eq!(summary(alone).started_by, Some(alone));
+        let view = rt.session_view(&ctx, alone).await.unwrap().unwrap();
+        assert!(view.started_outside_a_run());
+        assert!(
+            !rt.session_view(&ctx, by_agent)
+                .await
+                .unwrap()
+                .unwrap()
+                .started_outside_a_run()
+        );
+
+        // The parent run ends; both rounds are woken. The parent's round is cancelled when it
+        // steps, the person's round is not: it steps and finishes.
+        rt.cancel(parent, "done").await.unwrap();
+        rt.deliver(by_agent, say("again")).await.unwrap();
+        rt.deliver(alone, say("again")).await.unwrap();
+        wait_failed(&rt, by_agent).await;
+        let again = wait_done(&rt, alone).await;
+        assert_eq!(
+            again.error, None,
+            "the parent's end does not cancel a round that is its own parent"
+        );
+        worker.stop().await;
+    }
+
     /// A round's terminal commit lands but telling the parent fails: the parent has no notice and
     /// learns of the round by reading it (`Ctx::child_status`) at its next step, as it does for a
     /// one-shot child.
@@ -6962,6 +7019,7 @@ macro_rules! runtime_suite {
                 a_session_listing_dedupes_agents_caps_the_page_and_reads_every_page,
                 a_session_listing_says_how_the_round_ended,
                 a_report_that_lands_while_a_run_finishes_does_not_reopen_it,
+                a_round_that_is_its_own_parent_is_listed_reads_as_started_outside_and_is_never_cancelled_with_a_parent,
             );
         }
     };

@@ -19,12 +19,14 @@
 
 use a2a::{Task, TaskState};
 use adam_a2a::{BackendError, Caller, PageToken, TaskPage, TaskQuery};
-use adam_core::{ConversationScope, RunId, RunQuery, RunStatus};
+use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, RunStatus};
+use adam_runtime::RunView;
 use adam_runtime::RuntimeError;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
+use crate::child_sessions::{ContextKind, kind_of};
 use crate::convert::{decode_conversation, encode_conversation, task_from_view};
 
 /// The most runs one page reads while looking for matches that need their state read. A filter
@@ -49,10 +51,70 @@ fn narrowing(state: Option<&TaskState>) -> (Option<Vec<RunStatus>>, bool) {
 }
 
 impl RuntimeTaskBackend {
+    /// The record as a task: of its root context, or a round of the session being listed.
+    fn shaped(
+        &self,
+        rec: &RunRecord,
+        view: RunView,
+        session: Option<&(adam_runtime::SessionView, String)>,
+    ) -> Option<Task> {
+        match session {
+            Some((session, parent)) => {
+                let context = adam_runtime::session_conversation_id(parent, session.id);
+                Some(self.listed_round(session, &context, parent, rec, view))
+            }
+            None => {
+                let (_, context) = decode_conversation(rec.conversation_id.as_deref()?)?;
+                Some(task_from_view(&view, &context, &self.prompt))
+            }
+        }
+    }
+
     pub(crate) async fn list_tasks(
         &self,
         caller: &Caller,
         query: &TaskQuery,
+    ) -> Result<TaskPage, BackendError> {
+        let kind = query.context_id.as_deref().map(kind_of);
+        let Some(ContextKind::Child(parent, session)) = kind else {
+            if matches!(kind, Some(ContextKind::TooDeep)) && self.sessions_activated(caller) {
+                return Ok(TaskPage::default());
+            }
+            let mut page = self.scan(caller, query, &self.agent, None).await?;
+            // The tasks of one parent context all say the same sessions.
+            if let Some(context) = query.context_id.as_deref()
+                && self.sessions_activated(caller)
+                && let Some(entry) = self.sessions_object(caller, context).await
+            {
+                for task in &mut page.tasks {
+                    task.metadata
+                        .get_or_insert_with(Default::default)
+                        .insert(adam_a2a::CHILD_SESSIONS_EXTENSION.to_owned(), entry.clone());
+                }
+            }
+            return Ok(page);
+        };
+        if !self.sessions_activated(caller) {
+            return Err(BackendError::InvalidParams(
+                "a child context is listed with child-sessions/v1 activated".to_owned(),
+            ));
+        }
+        // An unknown session, or another caller's, is an empty page.
+        let Some(view) = self.session_of(caller, &parent, session).await? else {
+            return Ok(TaskPage::default());
+        };
+        let agent = view.agent.clone();
+        self.scan(caller, query, &agent, Some((view, parent))).await
+    }
+
+    /// The scan of one agent's runs in the scope the query names. `session` is the session a child
+    /// context lists (its runs are shaped as rounds); `None` lists root tasks.
+    async fn scan(
+        &self,
+        caller: &Caller,
+        query: &TaskQuery,
+        agent: &str,
+        session: Option<(adam_runtime::SessionView, String)>,
     ) -> Result<TaskPage, BackendError> {
         let after = query
             .page_token
@@ -67,15 +129,18 @@ impl RuntimeTaskBackend {
             .transpose()?;
 
         // Only the caller's conversations, before anything else: `<subject>:` is a prefix no other
-        // subject's conversations share (a `:` in a subject is escaped).
-        let scope = match &query.context_id {
-            Some(context) => {
+        // subject's conversations share (a `:` in a subject is escaped). The agent stays in the
+        // query: a session's conversation id also starts with `<subject>:`, and only its helper
+        // agent's runs may be listed from there.
+        let scope = match (&session, &query.context_id) {
+            (Some((view, _)), _) => ConversationScope::Exact(view.conversation_id.clone()),
+            (None, Some(context)) => {
                 ConversationScope::Exact(encode_conversation(&caller.subject, context))
             }
-            None => ConversationScope::Prefix(encode_conversation(&caller.subject, "")),
+            (None, None) => ConversationScope::Prefix(encode_conversation(&caller.subject, "")),
         };
         let (statuses, exact) = narrowing(query.status.as_ref());
-        let mut runs = RunQuery::new(&self.agent, scope, 0);
+        let mut runs = RunQuery::new(agent, scope, 0);
         runs.statuses = statuses;
         runs.updated_since = query.status_timestamp_after;
         if runs.statuses.as_ref().is_some_and(Vec::is_empty) {
@@ -104,11 +169,6 @@ impl RuntimeTaskBackend {
             for rec in page {
                 cursor = Some((rec.updated_at, rec.id));
                 scanned += 1;
-                let Some((_, context)) =
-                    rec.conversation_id.as_deref().and_then(decode_conversation)
-                else {
-                    continue;
-                };
                 let view = match self.runtime.view(rec.id).await {
                     Ok(Some(view)) => view,
                     Ok(None) => continue,
@@ -118,7 +178,9 @@ impl RuntimeTaskBackend {
                     }
                     Err(e) => return Err(map_err(e)),
                 };
-                let task = task_from_view(&view, &context, &self.prompt);
+                let Some(task) = self.shaped(&rec, view, session.as_ref()) else {
+                    continue;
+                };
                 if !exact
                     && query
                         .status

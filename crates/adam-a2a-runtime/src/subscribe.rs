@@ -293,12 +293,12 @@ async fn pump(
     // Attach to live events first, so nothing that happens between the
     // snapshot and the first poll is missed by both. The subscription also starts
     // with the run's recent events, which covers the gap between `submit` and here.
-    let Some((run, view, context_id)) = backend.owned(caller, task_id).await? else {
+    let Some((run, view, context_id)) = backend.locate(caller, task_id).await? else {
         return Err(BackendError::TaskNotFound(task_id.to_owned()));
     };
     let mut live: Option<RunSubscription> = Some(backend.events.subscribe_run(run));
     // Re-read after attaching: the snapshot must not predate the attach.
-    let view = match backend.owned(caller, task_id).await? {
+    let view = match backend.locate(caller, task_id).await? {
         Some((_, fresher, _)) => fresher,
         None => view,
     };
@@ -309,6 +309,7 @@ async fn pump(
         &view,
         task_from_view(&view, &context_id, &backend.prompt),
     );
+    let task = backend.with_sessions(caller, task).await?;
     let mut tracker = Tracker {
         task_id: task.id.clone(),
         context_id,

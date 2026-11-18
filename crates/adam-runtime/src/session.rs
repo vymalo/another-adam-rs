@@ -120,6 +120,23 @@ pub const SESSION_STATE_KEY: &str = "session";
 /// session: the round finishes its work, and the session then takes no more messages.
 pub const SESSION_CLOSE_KIND: &str = "adam.session.close";
 
+/// The key of a round's first message that asks for a round which only closes its session
+/// (`close_session: true`): the round calls no model, and its header says `closing`.
+pub const SESSION_CLOSE_ROUND_KEY: &str = "close_session";
+
+/// The payload of the first message of a round that only closes the session `header` describes:
+/// `{"close_session": true, "session": <header>}`. The header must already be the closing round's
+/// (the next round number, `closed` and `closing`).
+pub fn closing_round_payload(header: &SessionHeader) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(SESSION_CLOSE_ROUND_KEY.to_owned(), Value::Bool(true));
+    payload.insert(
+        SESSION_STATE_KEY.to_owned(),
+        serde_json::to_value(header).unwrap_or(Value::Null),
+    );
+    Value::Object(payload)
+}
+
 /// What a round of a session says about the session, in the state of the round's agent (ADR 0045).
 ///
 /// **The truth is the latest round's header** (nothing else stores a session). A session whose
@@ -233,6 +250,14 @@ pub struct SessionSummary {
     pub closing: bool,
     /// The run that started the latest round: the parent run of that round.
     pub started_by: Option<RunId>,
+}
+
+impl SessionSummary {
+    /// Whether the latest round was started by a person and not by a run of an agent: a round
+    /// that is its own parent (ADR 0045, decision 1, as amended for a person's rounds).
+    pub fn started_outside_a_run(&self) -> bool {
+        self.started_by == Some(self.latest_run)
+    }
 }
 
 /// One page of [`Runtime::list_sessions`](crate::Runtime::list_sessions).
@@ -394,6 +419,12 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    /// Whether the latest round was started by a person and not by a run of an agent: a round
+    /// that is its own parent.
+    pub fn started_outside_a_run(&self) -> bool {
+        self.started_by == Some(self.latest_run)
+    }
+
     pub(crate) fn from_rounds(session: RunId, runs: Vec<RunRecord>) -> Option<Self> {
         let runs = ordered(runs);
         let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
@@ -465,6 +496,23 @@ mod tests {
         assert_eq!(session_of("alice:x", &nested), None);
         assert_eq!(session_of("alice:x/s/y", &nested), Some(session));
         assert_eq!(parse_session_conversation_id("a%2fb/s/x"), None);
+    }
+
+    #[test]
+    fn a_closing_round_says_close_and_carries_its_header() {
+        let header = SessionHeader {
+            id: RunId::new(),
+            agent: "helper".into(),
+            description: "d".into(),
+            keep_open: true,
+            closed: true,
+            closing: true,
+            round: 3,
+        };
+        let payload = closing_round_payload(&header);
+        assert_eq!(payload[SESSION_CLOSE_ROUND_KEY], Value::Bool(true));
+        assert_eq!(payload.as_object().map(|o| o.len()), Some(2));
+        assert_eq!(header_of(&payload), Some(header));
     }
 
     fn record(

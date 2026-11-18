@@ -931,13 +931,7 @@ impl Tool for Close {
             header.round = view.round + 1;
             header.closed = true;
             header.closing = true;
-            let mut input = Inbound::new(MESSAGE_KIND, json!({ "close_session": true }));
-            if let Some(payload) = input.payload.as_object_mut() {
-                payload.insert(
-                    adam_runtime::SESSION_STATE_KEY.to_owned(),
-                    header_json(&header),
-                );
-            }
+            let input = Inbound::new(MESSAGE_KIND, adam_runtime::closing_round_payload(&header));
             match starter
                 .start_round(
                     session,

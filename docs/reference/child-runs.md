@@ -302,6 +302,14 @@ is read from the store, the notice is only a wake-up).
 (`idle_ttl`, `max_working`), remote sessions, the `child-sessions/v1` extension, the coder's kept-open helpers, a child that asks
 the person.
 
+**A person's round.** The A2A front (`adam-a2a-runtime`, *Child sessions*) lets a person start a session and send rounds with no run
+of an agent behind them. Such a round is **its own parent** (`start_child_continuing(id, id, ..)`): `parent_id` is its own id, so
+the worker's check of the parent (`parent_has_ended`) reads a run that has not ended, no run's end cancels it and no run waits for it
+(the turn-end wait and `end_sessions` look for rounds started by the run that is ending, `started_by == that run`). `SessionView::started_outside_a_run`
+and `SessionSummary::started_outside_a_run` say it. Its end notice goes to the round itself, which is finished by then, and is dropped (`notify_parent`, "nobody to tell"); a parent
+learns the round by reading the session, as for any round it did not start. `closing_round_payload` builds the first message of a
+round that only closes a session, for the tools and for the A2A front.
+
 ## Remote tasks: the same wait without a message
 
 A subagent on another A2A agent (`a2a:` in its file) is the same idea with one thing missing: nothing tells

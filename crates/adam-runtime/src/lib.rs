@@ -121,9 +121,9 @@ pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
 pub use session::{
     MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_PAGE, MAX_SESSION_ROUNDS_SCANNED, RoundOutcome,
-    SESSION_CLOSE_KIND, SESSION_STATE_KEY, SessionHeader, SessionList, SessionState,
-    SessionSummary, SessionView, parse_session_conversation_id, session_conversation_id,
-    session_conversation_prefix,
+    SESSION_CLOSE_KIND, SESSION_CLOSE_ROUND_KEY, SESSION_STATE_KEY, SessionHeader, SessionList,
+    SessionState, SessionSummary, SessionView, closing_round_payload,
+    parse_session_conversation_id, session_conversation_id, session_conversation_prefix,
 };
 pub use step::{
     MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, STEP_INPUT_MAX_BYTES,
