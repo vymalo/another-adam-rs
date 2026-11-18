@@ -247,6 +247,10 @@ struct Rig {
     within: Option<Duration>,
     /// A tool the parent can call that waits for the test.
     hold: Option<Arc<HoldTool>>,
+    /// Hold the parent's n-th model call (0-based) at the gate.
+    hold_parent_on: Option<(usize, Arc<Gate>)>,
+    /// Build the parent as a build before session reports was: it never lists sessions to report.
+    reports_off: bool,
     sink: CollectingSink,
     clock: ManualClock,
 }
@@ -265,6 +269,8 @@ impl Rig {
             history_tokens: None,
             within: None,
             hold: None,
+            hold_parent_on: None,
+            reports_off: false,
             sink: CollectingSink::new(),
             clock: ManualClock::new(),
         }
@@ -278,6 +284,19 @@ impl Rig {
     /// Give the parent the `hold` tool.
     fn with_hold(mut self) -> Self {
         self.hold = Some(Arc::default());
+        self
+    }
+
+    /// Hold the parent's n-th model call at the returned gate.
+    fn holding_parent(mut self, n: usize) -> (Self, Arc<Gate>) {
+        let gate = Arc::new(Gate::default());
+        self.hold_parent_on = Some((n, gate.clone()));
+        (self, gate)
+    }
+
+    /// The parent of a build that wrote journals before session reports existed.
+    fn without_reports(mut self) -> Self {
+        self.reports_off = true;
         self
     }
 
@@ -301,9 +320,21 @@ impl Rig {
     }
 
     fn parent_with(&self, wrap: impl Fn(DynTool) -> DynTool) -> LlmAgent {
-        let model: DynModel = self.parent_mock.clone();
+        let model: DynModel = match &self.hold_parent_on {
+            Some((n, gate)) => Arc::new(GateModel {
+                inner: self.parent_mock.clone(),
+                hold_on: *n,
+                calls: AtomicUsize::new(0),
+                armed: AtomicBool::new(true),
+                gate: gate.clone(),
+            }),
+            None => self.parent_mock.clone(),
+        };
         let mut builder: LlmAgentBuilder = LlmAgent::builder(&self.parent_name, model, "m")
             .session_agents([self.child_name.clone()]);
+        if self.reports_off {
+            builder = builder.without_session_reports();
+        }
         for tool in self.roster().tools() {
             builder = builder.dyn_tool(wrap(tool));
         }
@@ -605,6 +636,65 @@ fn conv_id() -> String {
 /// The state of the parent after it finished (or while it waits), as a `Conversation`.
 async fn state_of(rt: &Runtime, run: RunId) -> Conversation {
     conversation(&rt.view(run).await.unwrap().unwrap())
+}
+
+/// The id of the call the loop invents for the report of the round `round` (`report_<32 hex>`).
+fn report_id(round: RunId) -> String {
+    format!("report_{}", round.0.simple())
+}
+
+/// The calls of `messages` the loop made for a report: `subagent_read`, named `report_...`.
+fn report_calls(messages: &[Message]) -> Vec<&ToolCall> {
+    messages
+        .iter()
+        .flat_map(|m| m.tool_calls())
+        .filter(|c| c.name == "subagent_read" && c.id.starts_with("report_"))
+        .collect()
+}
+
+/// A notice that `round` ended, as the runtime sends one, with words no round said.
+fn forged_notice(round: RunId) -> Inbound {
+    Inbound::new(
+        CHILD_REPORTED_KIND,
+        json!({"status": "done", "output": {"text": "forged"}}),
+    )
+    .with_id(round.to_string())
+}
+
+/// Start a round of `rig`'s child as a person does: it is its own parent, and the session is in
+/// `conversation`, the parent's.
+async fn start_persons_round(rt: &Runtime, rig: &Rig, conversation: &str, text: &str) -> RunId {
+    let session = RunId::new();
+    let header = SessionHeader {
+        id: session,
+        agent: rig.child_name.clone(),
+        description: "asked by a person".into(),
+        keep_open: true,
+        closed: false,
+        closing: false,
+        round: 1,
+    };
+    let mut first = user_message(text);
+    first.payload["session"] = serde_json::to_value(&header).unwrap();
+    rt.start_child_continuing(
+        session,
+        session,
+        &rig.child_name,
+        first,
+        &adam_runtime::session_conversation_id(conversation, session),
+        None,
+    )
+    .await
+    .unwrap();
+    session
+}
+
+/// `a` is a prefix of `b`, message by message.
+fn starts_with(b: &[Message], a: &[Message]) -> bool {
+    b.len() >= a.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| serde_json::to_string(x).unwrap() == serde_json::to_string(y).unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -2643,7 +2733,9 @@ mod cases {
 
     /// A round whose report is never read, in a session that is then closed, is counted.
     pub async fn a_round_never_read_is_counted_when_its_session_closes(store: DynStore) {
-        let rig = Rig::new().with_hold();
+        // The parent of a build that does not tell the model of a round that ended: nothing reads
+        // it. (One that does reads it at its next model call, and counts it then.)
+        let rig = Rig::new().with_hold().without_reports();
         rig.child_mock.push_response(answer_with("unread", 100, 10));
         let hold = rig.hold.clone().unwrap();
         let (parent_agent, child_agent) = (rig.parent(), rig.child());
@@ -2704,7 +2796,8 @@ mod cases {
     /// A store error on the read of a round's usage is tried again, not swallowed: the tokens are
     /// counted once, after the retry.
     pub async fn a_store_error_on_the_usage_read_is_retried(store: DynStore) {
-        let rig = Rig::new().with_hold();
+        // As above: nothing reads the round before the run ends.
+        let rig = Rig::new().with_hold().without_reports();
         rig.child_mock.push_response(answer_with("unread", 100, 10));
         let hold = rig.hold.clone().unwrap();
         let (inner, dynamic) = faulty(store);
@@ -2870,6 +2963,519 @@ mod cases {
         rig.child_gate.release.notify_one();
         worker.stop().await;
     }
+
+    // -----------------------------------------------------------------------
+    // Reports during a turn (ADR 0045, slice 3)
+    // -----------------------------------------------------------------------
+
+    /// A round that ends while the parent does something else is reported to the model by the
+    /// next model call: a `subagent_read` call and its result are appended before the request, with
+    /// no read by the model and no wait.
+    pub async fn a_report_that_ends_mid_turn_reaches_the_next_model_call(store: DynStore) {
+        let rig = Rig::new().with_hold().holding(0);
+        rig.child_mock.push_text("child says 42");
+        let hold = rig.hold.clone().unwrap();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_tool_calls(vec![call("h1", "hold", json!({}))])
+            .push_text("the helper said 42");
+        let worker = spawn_worker(&rt);
+        reached(&hold.reached, "the parent's other work").await;
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, session).await;
+        hold.release.notify_one();
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+        assert_eq!(done.output.expect("output")["text"], "the helper said 42");
+
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 3, "no wait, no extra call");
+        let id = report_id(session);
+        let sent = &requests[2].messages;
+        let n = sent.len();
+        match &sent[n - 2] {
+            Message::Assistant { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].name, "subagent_read");
+                assert_eq!(tool_calls[0].id, id);
+                assert_eq!(tool_calls[0].arguments["session"], session.to_string());
+            }
+            other => panic!("the report's call comes first: {other:?}"),
+        }
+        match &sent[n - 1] {
+            Message::Tool {
+                call_id,
+                content,
+                is_error,
+                ..
+            } => {
+                assert_eq!(*call_id, id);
+                assert!(!*is_error);
+                assert!(content.contains("report: done"), "{content}");
+                assert!(content.contains("child says 42"), "{content}");
+                assert!(!content.contains("started by the person"), "{content}");
+            }
+            other => panic!("the report's result is last: {other:?}"),
+        }
+        let state = state_of(&rt, parent).await;
+        assert_eq!(report_calls(&state.messages).len(), 1);
+        assert_eq!(state.reported_rounds, vec![session]);
+        assert!(
+            !state
+                .messages
+                .iter()
+                .flat_map(|m| m.tool_calls())
+                .any(|c| c.id.starts_with("wait_")),
+            "the report was not waited for"
+        );
+        // The report counted the round's tokens, as a read does.
+        assert!(
+            state.rounds_started.is_empty(),
+            "{:?}",
+            state.rounds_started
+        );
+        assert_eq!(state.turns, 3);
+    }
+
+    /// Every request of a run that is told a report in the middle of a turn starts with the one
+    /// before it, and the system and the tools are the same bytes: the report is only appended.
+    pub async fn reports_during_a_turn_keep_the_prefix(store: DynStore) {
+        let rig = Rig::new().with_hold().holding(0);
+        rig.child_mock.push_text("child says 42");
+        let hold = rig.hold.clone().unwrap();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_tool_calls(vec![call("h1", "hold", json!({}))])
+            .push_text("the helper said 42");
+        let worker = spawn_worker(&rt);
+        reached(&hold.reached, "the parent's other work").await;
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, session).await;
+        hold.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let state = state_of(&rt, parent).await;
+        assert!(state.shortenings.is_empty());
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            assert_eq!(
+                serde_json::to_string(&(&pair[0].system, &pair[0].tools)).unwrap(),
+                serde_json::to_string(&(&pair[1].system, &pair[1].tools)).unwrap(),
+                "system and tools are the same bytes"
+            );
+            assert!(
+                starts_with(&pair[1].messages, &pair[0].messages),
+                "a request starts with the one before it:\n{:?}\n{:?}",
+                pair[0].messages,
+                pair[1].messages
+            );
+        }
+        assert_eq!(report_calls(&requests[2].messages).len(), 1);
+        // What the model was sent last is the history it now has.
+        assert!(starts_with(&state.messages, &requests[2].messages));
+    }
+
+    /// A round that ends while the parent's last model call is out is not lost: the turn does not
+    /// end on that answer. It is read from the store, as a round that still works is waited for.
+    pub async fn a_report_during_the_final_model_call_reopens_the_turn(store: DynStore) {
+        let (rig, parent_gate) = Rig::new().holding(0).holding_parent(1);
+        rig.child_mock.push_text("child says 42");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_text("started it, and that is all")
+            .push_text("the helper said 42");
+        let worker = spawn_worker(&rt);
+        reached(&parent_gate.reached, "the parent's last model call").await;
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, session).await;
+        parent_gate.release.notify_one();
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+        assert_eq!(
+            done.output.expect("output")["text"],
+            "the helper said 42",
+            "the run did not end on the answer the report missed"
+        );
+        let state = state_of(&rt, parent).await;
+        let results = tool_results(&state);
+        let report = &result_of(&results, "wait_1").1;
+        assert!(report.contains("child says 42"), "{report}");
+        assert_eq!(rig.parent_mock.requests().len(), 3);
+        assert_eq!(state.reported_rounds, vec![session]);
+    }
+
+    /// The notice that a round ended is a wake-up: when it is lost (the commit that would deliver
+    /// it fails) the next model call finds the report in the store, with no timer.
+    pub async fn a_lost_report_notice_costs_at_most_one_turn(store: DynStore) {
+        let rig = Rig::new().with_hold();
+        rig.child_mock.push_text("found without a notice");
+        let hold = rig.hold.clone().unwrap();
+        let (inner, dynamic) = faulty(store);
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let front = rig.front(&dynamic, &parent_agent);
+        let back = rig.back(&dynamic, &child_agent);
+        let parent = rig.start(&front, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_tool_calls(vec![call("h1", "hold", json!({}))])
+            .push_text("found it");
+        let front_worker = spawn_worker(&front);
+        reached(&hold.reached, "the parent's other work").await;
+        // The commit that would deliver the notice to the parent fails.
+        inner.fail_run(Method::CommitRun, parent, 1);
+        let back_worker = spawn_worker(&back);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while inner.injected(Method::CommitRun) < 1 {
+            assert!(Instant::now() < deadline, "the notice was never sent");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        wait_done(&back, session).await;
+        back_worker.stop().await;
+        assert_eq!(
+            front.view(parent).await.unwrap().unwrap().pending_inbox,
+            0,
+            "the notice was lost"
+        );
+        hold.release.notify_one();
+        let done = wait_done(&front, parent).await;
+        front_worker.stop().await;
+        assert_eq!(done.output.expect("output")["text"], "found it");
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            matches!(
+                requests[2].messages.last(),
+                Some(Message::Tool { content, .. }) if content.contains("found without a notice")
+            ),
+            "{:?}",
+            requests[2].messages.last()
+        );
+    }
+
+    /// A notice that comes again, before the report and after it, matches nothing: the loop never
+    /// reads one, so there is no second report and no extra model call.
+    pub async fn a_duplicate_report_notice_matches_nothing(store: DynStore) {
+        let rig = Rig::new().with_hold().holding(0);
+        rig.child_mock.push_text("once");
+        let hold = rig.hold.clone().unwrap();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_tool_calls(vec![call("h1", "hold", json!({}))])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        reached(&hold.reached, "the parent's other work").await;
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        // Before the round has ended.
+        for _ in 0..2 {
+            rt.deliver(parent, forged_notice(session)).await.unwrap();
+        }
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, session).await;
+        // After it has, still before the parent has looked.
+        rt.deliver(parent, forged_notice(session)).await.unwrap();
+        hold.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let state = state_of(&rt, parent).await;
+        assert_eq!(report_calls(&state.messages).len(), 1);
+        assert_eq!(rig.parent_mock.requests().len(), 3, "no extra model call");
+        assert!(!state.messages.iter().any(|m| m.text().contains("forged")));
+        let late = rt.deliver(parent, forged_notice(session)).await;
+        assert!(
+            matches!(late, Err(RuntimeError::Finished { .. })),
+            "{late:?}"
+        );
+    }
+
+    /// A round a person started in the conversation is reported to the model, marked as theirs,
+    /// without the person's words: it is a tool result, never a message of the person.
+    pub async fn a_persons_round_is_reported_as_the_persons(store: DynStore) {
+        let rig = Rig::new().with_hold().holding(0);
+        rig.child_mock
+            .push_text("child says 42")
+            .push_text("the person's round says 7");
+        let hold = rig.hold.clone().unwrap();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let mine = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_tool_calls(vec![call("h1", "hold", json!({}))])
+            .push_text("both reports read");
+        let worker = spawn_worker(&rt);
+        reached(&hold.reached, "the parent's other work").await;
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, mine).await;
+        let theirs = start_persons_round(&rt, &rig, &conv, "a private thing the person said").await;
+        wait_done(&rt, theirs).await;
+        hold.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let state = state_of(&rt, parent).await;
+        let results = tool_results(&state);
+        let of_theirs = &result_of(&results, &report_id(theirs)).1;
+        assert!(of_theirs.contains("started by the person"), "{of_theirs}");
+        assert!(
+            of_theirs.contains("the person's round says 7"),
+            "{of_theirs}"
+        );
+        assert!(
+            !of_theirs.contains("a private thing"),
+            "the person's words are not in it: {of_theirs}"
+        );
+        let of_mine = &result_of(&results, &report_id(mine)).1;
+        assert!(!of_mine.contains("started by the person"), "{of_mine}");
+        assert!(of_mine.contains("child says 42"), "{of_mine}");
+        // Both are results of calls the loop made, never messages of a user.
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::User { .. }) && m.text().contains("private")),
+        );
+        assert_eq!(rig.parent_mock.requests().len(), 3);
+    }
+
+    /// A person's round that ended between two tasks is reported at the first model call of the
+    /// next task, once: the task after that is not told again.
+    pub async fn a_persons_round_is_reported_in_a_later_task(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("the person's round says 7");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        rig.parent_mock.push_text("first task");
+        let first = rig.start(&rt, &conv).await;
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, first).await;
+        let theirs = start_persons_round(&rt, &rig, &conv, "asked by a person").await;
+        wait_done(&rt, theirs).await;
+
+        rig.parent_mock.push_text("second task");
+        let second = rig.start(&rt, &conv).await;
+        wait_done(&rt, second).await;
+        rig.parent_mock.push_text("third task");
+        let third = rig.start(&rt, &conv).await;
+        wait_done(&rt, third).await;
+        worker.stop().await;
+
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(report_calls(&requests[0].messages).is_empty());
+        let told = report_calls(&requests[1].messages);
+        assert_eq!(told.len(), 1, "{:?}", requests[1].messages);
+        assert_eq!(told[0].id, report_id(theirs));
+        assert!(matches!(
+            requests[1].messages.last(),
+            Some(Message::Tool { content, .. })
+                if content.contains("started by the person") && content.contains("round says 7")
+        ));
+        assert_eq!(
+            report_calls(&requests[2].messages).len(),
+            1,
+            "the third task has the report in its history and is not told again"
+        );
+        let state = state_of(&rt, third).await;
+        assert_eq!(state.reported_rounds, vec![theirs], "carried across tasks");
+    }
+
+    /// A report the model read itself (a read that waited for it) is not appended again.
+    pub async fn a_report_read_by_the_model_is_not_appended_again(store: DynStore) {
+        let rig = Rig::new().with_hold().holding(0);
+        rig.child_mock.push_text("child says 42");
+        let hold = rig.hold.clone().unwrap();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_tool_calls(vec![call("h1", "hold", json!({}))])
+            .push_text("read it myself");
+        let worker = spawn_worker(&rt);
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        wait_waiting_on_a_session(&rt, parent).await;
+        rig.child_gate.release.notify_one();
+        reached(&hold.reached, "the parent's other work").await;
+        hold.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let state = state_of(&rt, parent).await;
+        assert!(
+            report_calls(&state.messages).is_empty(),
+            "{:?}",
+            report_calls(&state.messages)
+        );
+        assert_eq!(state.reported_rounds, vec![session]);
+        let results = tool_results(&state);
+        assert!(result_of(&results, "c2").1.contains("child says 42"));
+        assert_eq!(rig.parent_mock.requests().len(), 4);
+    }
+
+    /// A run that never opens a session asks the store for them at its first model call and no
+    /// more: the later calls of its turns cost nothing.
+    pub async fn a_run_without_sessions_lists_only_at_its_first_model_call(store: DynStore) {
+        let rig = Rig::new().with_hold();
+        let hold = rig.hold.clone().unwrap();
+        let (inner, dynamic) = faulty(store);
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&dynamic, &parent_agent, &child_agent);
+        let worker = spawn_worker(&rt);
+
+        rig.parent_mock.push_text("one call");
+        let before = inner.calls(Method::CountRuns);
+        let one = rig.start(&rt, &conv_id()).await;
+        wait_done(&rt, one).await;
+        let listing = inner.calls(Method::CountRuns) - before;
+        assert!(listing > 0, "the first call looks");
+
+        rig.parent_mock
+            .push_tool_calls(vec![call("h1", "hold", json!({}))])
+            .push_tool_calls(vec![call("h2", "hold", json!({}))])
+            .push_text("three calls");
+        let before = inner.calls(Method::CountRuns);
+        let three = rig.start(&rt, &conv_id()).await;
+        for _ in 0..2 {
+            reached(&hold.reached, "the parent's other work").await;
+            hold.release.notify_one();
+        }
+        wait_done(&rt, three).await;
+        worker.stop().await;
+        assert_eq!(
+            inner.calls(Method::CountRuns) - before,
+            listing,
+            "three model calls, one listing"
+        );
+        assert_eq!(rig.parent_mock.requests().len(), 4);
+    }
+
+    /// A journal written before reports existed (no listing in its model steps) replays to the
+    /// same history under a build that has them, with no model asked and no disagreement.
+    pub async fn a_journal_from_before_reports_replays_to_the_same_history(store: DynStore) {
+        let rig = Rig::new().holding(0).without_reports();
+        rig.child_mock.push_text("child says 42");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_text("started it")
+            .push_text("the helper said 42");
+        let worker = spawn_worker(&rt);
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        wait_waiting_on_a_session(&rt, parent).await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let original = state_of(&rt, parent).await;
+        assert!(!original.sessions_open, "the old build listed nothing");
+
+        let again = Rig::new();
+        let (parent_agent, child_agent) = (again.parent(), again.child());
+        let again_rt = again.together(&store, &parent_agent, &child_agent);
+        let copy = again.start(&again_rt, &conv_id()).await;
+        let mut seq = 0;
+        while let Some(entry) = store.journal_get(parent, seq).await.unwrap() {
+            store.journal_put(copy, entry).await.unwrap();
+            seq += 1;
+        }
+        assert!(seq > 4, "the journal has the steps of the run: {seq}");
+        let worker = spawn_worker(&again_rt);
+        let clock = again.clock.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                clock.advance(Duration::from_secs(61));
+            }
+        });
+        wait_done(&again_rt, copy).await;
+        ticker.abort();
+        worker.stop().await;
+        let replayed = state_of(&again_rt, copy).await;
+        let text = |c: &Conversation, run: RunId| {
+            serde_json::to_string(&c.messages)
+                .unwrap()
+                .replace(&run.to_string(), "<run>")
+        };
+        assert_eq!(text(&replayed, copy), text(&original, parent));
+        assert_eq!(again.parent_mock.requests().len(), 0, "no model was asked");
+        assert_eq!(again.child_mock.requests().len(), 0, "no child ran");
+    }
+
+    /// The journal of a run that was told a report in the middle of a turn replays to the same
+    /// history: the same report, under the same call id, with no model and no child.
+    pub async fn a_replay_appends_the_same_reports(store: DynStore) {
+        let rig = Rig::new().with_hold().holding(0);
+        rig.child_mock.push_text("child says 42");
+        let hold = rig.hold.clone().unwrap();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_tool_calls(vec![call("h1", "hold", json!({}))])
+            .push_text("the helper said 42");
+        let worker = spawn_worker(&rt);
+        reached(&hold.reached, "the parent's other work").await;
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, session).await;
+        hold.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let original = state_of(&rt, parent).await;
+        assert_eq!(report_calls(&original.messages).len(), 1);
+
+        let again = Rig::new().with_hold();
+        let (parent_agent, child_agent) = (again.parent(), again.child());
+        let again_rt = again.together(&store, &parent_agent, &child_agent);
+        let copy = again.start(&again_rt, &conv_id()).await;
+        let mut seq = 0;
+        while let Some(entry) = store.journal_get(parent, seq).await.unwrap() {
+            store.journal_put(copy, entry).await.unwrap();
+            seq += 1;
+        }
+        let worker = spawn_worker(&again_rt);
+        wait_done(&again_rt, copy).await;
+        worker.stop().await;
+        let replayed = state_of(&again_rt, copy).await;
+        let text = |c: &Conversation, run: RunId| {
+            serde_json::to_string(&c.messages)
+                .unwrap()
+                .replace(&run.to_string(), "<run>")
+        };
+        assert_eq!(text(&replayed, copy), text(&original, parent));
+        assert_eq!(replayed.reported_rounds, original.reported_rounds);
+        assert_eq!(again.parent_mock.requests().len(), 0, "no model was asked");
+        assert_eq!(again.child_mock.requests().len(), 0, "no child ran");
+    }
 }
 
 /// The five specs, as the model sees them, pinned: a spec is the model's contract, so a change is
@@ -2962,6 +3568,17 @@ macro_rules! session_suite {
                 a_round_never_read_is_counted_when_the_parent_ends,
                 a_store_error_on_the_usage_read_is_retried,
                 a_replay_counts_the_same_tokens,
+                a_report_that_ends_mid_turn_reaches_the_next_model_call,
+                reports_during_a_turn_keep_the_prefix,
+                a_report_during_the_final_model_call_reopens_the_turn,
+                a_lost_report_notice_costs_at_most_one_turn,
+                a_duplicate_report_notice_matches_nothing,
+                a_persons_round_is_reported_as_the_persons,
+                a_persons_round_is_reported_in_a_later_task,
+                a_report_read_by_the_model_is_not_appended_again,
+                a_run_without_sessions_lists_only_at_its_first_model_call,
+                a_journal_from_before_reports_replays_to_the_same_history,
+                a_replay_appends_the_same_reports,
             );
         }
     };
