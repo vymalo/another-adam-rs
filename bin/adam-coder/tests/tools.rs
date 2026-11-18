@@ -1459,6 +1459,302 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
     assert_eq!(rig.fx.created_pulls().await.len(), 1);
 }
 
+/// One call does what the two did: commit, push, and open the pull request through the same gate,
+/// with the three artifacts in the order a consumer reads them (the verdict, the branch, the pull
+/// request). A replay after a crash opens no second pull request.
+#[tokio::test]
+async fn commit_and_push_opens_the_pull_request_in_the_same_call() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    RunChecks
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap();
+    let args = json!({
+        "message": "feat: add a",
+        "pull_request": {"title": "feat: a", "body": "Adds a.\n\n## Verification\n- ok"},
+    });
+
+    let out = CommitAndPush.call(&rig.ctx, args.clone()).await.unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let names: Vec<_> = out.artifacts.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["checks", "branch", "pull_request"],
+        "the verdict bound to the pushed commit, the branch, then the pull request"
+    );
+    assert_eq!(out.artifacts[0].data["passed"], true, "{out:?}");
+    assert_eq!(
+        out.artifacts[0].data["commit"],
+        out.artifacts[1].data["commit"]
+    );
+    assert_eq!(out.artifacts[2].data["url"], PR_URL);
+    assert!(out.content.starts_with("Committed "), "{}", out.content);
+    assert!(out.content.contains(PR_URL), "{}", out.content);
+    let branch = out.artifacts[1].data["branch"].as_str().unwrap().to_owned();
+    let repository = out.artifacts[1].data["repository"].as_str().unwrap();
+    assert!(
+        out.content
+            .ends_with(&format!("repository: {repository}\nbranch: {branch}")),
+        "the two lines a later task reads are still the last ones: {}",
+        out.content
+    );
+    assert_eq!(rig.fx.file_on(&branch, "a.txt"), "a");
+    let pulls = rig.fx.created_pulls().await;
+    assert_eq!(pulls.len(), 1, "{pulls:?}");
+    assert_eq!(pulls[0]["title"], "feat: a");
+    assert!(
+        pulls[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("## Verification"),
+        "{}",
+        pulls[0]["body"]
+    );
+
+    // The step runs again (a crash before its result was journaled): same commit, same pull
+    // request, and no second POST.
+    let again = CommitAndPush.call(&rig.ctx, args).await.unwrap();
+    assert!(!again.is_error, "{}", again.content);
+    assert!(
+        again.content.contains("Nothing new to commit"),
+        "{}",
+        again.content
+    );
+    assert!(
+        again.content.contains("was already open"),
+        "{}",
+        again.content
+    );
+    assert_eq!(
+        again.artifacts, out.artifacts,
+        "a repeated step emits the same artifacts"
+    );
+    assert_eq!(
+        rig.fx.created_pulls().await.len(),
+        1,
+        "no second pull request"
+    );
+}
+
+/// The `pull_request` of a `commit_and_push` is the gate of `open_pull_request`, in its words: a
+/// refusal leaves the commit and the push standing (as the second call would), and opens nothing.
+#[tokio::test]
+async fn a_commit_and_push_with_pull_request_refuses_red_or_stale_checks() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+
+    // No check ran at all.
+    let unchecked = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({
+                "message": "feat: add a",
+                "pull_request": {"title": "feat: a", "body": "Adds a."},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(unchecked.is_error, "{}", unchecked.content);
+    assert!(
+        unchecked
+            .content
+            .contains("Refusing to open a pull request")
+            && unchecked.content.contains("no check was run"),
+        "{}",
+        unchecked.content
+    );
+    let names: Vec<_> = unchecked
+        .artifacts
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["checks", "branch"],
+        "the commit and the push stand whatever the pull request says"
+    );
+    let branch = unchecked.artifacts[1].data["branch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(rig.fx.commits_ahead(&branch), 1, "the branch was pushed");
+    assert!(rig.fx.created_pulls().await.is_empty());
+
+    // The pull request's own arguments are checked the same way.
+    let blank = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({
+                "message": "feat: add a",
+                "pull_request": {"title": "  ", "body": "Adds a."},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(blank.is_error, "{}", blank.content);
+    assert!(
+        blank.content.contains("title and body are required"),
+        "{}",
+        blank.content
+    );
+    assert!(rig.fx.created_pulls().await.is_empty());
+
+    // Green on this code, then a change: the pushed tree is not the code that passed.
+    RunChecks
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap();
+    std::fs::write(rig.worktree().join("b.txt"), "b\n").unwrap();
+    let stale = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({
+                "message": "feat: add b",
+                "pull_request": {"title": "feat: b", "body": "Adds b."},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(stale.is_error, "{}", stale.content);
+    assert!(
+        stale.content.contains("Refusing to open a pull request")
+            && stale
+                .content
+                .contains("code changed since the last passing check run"),
+        "{}",
+        stale.content
+    );
+    assert_eq!(rig.fx.commits_ahead(&branch), 2, "the branch was pushed");
+    assert!(rig.fx.created_pulls().await.is_empty());
+
+    // Red on exactly this tree, and not on the base (so not pre-existing): refused, with the same
+    // words; the person's explicit consent in `pull_request` opens it, and the body says the checks
+    // were not green.
+    std::fs::write(rig.worktree().join("c.txt"), "c\n").unwrap();
+    RunChecks
+        .call(&rig.ctx, json!({"command": "test ! -f c.txt"}))
+        .await
+        .unwrap();
+    let red = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({
+                "message": "feat: add b",
+                "pull_request": {"title": "feat: b", "body": "Adds b."},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(red.is_error, "{}", red.content);
+    assert!(
+        red.content.contains("Refusing to open a pull request")
+            && red.content.contains("failed with exit code 1"),
+        "{}",
+        red.content
+    );
+    assert!(rig.fx.created_pulls().await.is_empty());
+    let accepted = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({
+                "message": "feat: add b",
+                "pull_request": {
+                    "title": "feat: b",
+                    "body": "Adds b.",
+                    "accept_red_checks": true,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!accepted.is_error, "{}", accepted.content);
+    assert_eq!(accepted.artifacts[2].data["url"], PR_URL);
+    let pulls = rig.fx.created_pulls().await;
+    assert_eq!(pulls.len(), 1, "{pulls:?}");
+    assert!(
+        pulls[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("the checks were not green for this exact code"),
+        "{}",
+        pulls[0]["body"]
+    );
+}
+
+/// The check-cycle limit is the refusal that runs before anything is committed or pushed, also
+/// when the same call carries the pull request.
+#[tokio::test]
+async fn a_commit_and_push_with_pull_request_refuses_before_any_git_write_when_the_cycles_are_spent()
+ {
+    let rig = with_red_checks((3, 0)).await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    let out = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({
+                "message": "feat: add a",
+                "repo": "remote",
+                "pull_request": {"title": "feat: a", "body": "Adds a."},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("Check-cycle limit reached")
+            && out.content.contains("nothing may be committed or pushed"),
+        "{}",
+        out.content
+    );
+    assert!(out.artifacts.is_empty());
+    assert_eq!(
+        common::git(&rig.worktree(), &["rev-list", "--count", "HEAD"]),
+        "1",
+        "nothing was committed"
+    );
+    assert!(rig.fx.agent_branches().is_empty(), "nothing was pushed");
+    assert!(rig.fx.created_pulls().await.is_empty());
+}
+
+/// A scratch project has no remote: the local commit happens, and the pull request is refused with
+/// the words `open_pull_request` uses.
+#[tokio::test]
+async fn a_scratch_commit_with_pull_request_commits_locally_and_refuses_the_pull_request() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "fib").await;
+    let dir = slot_of(&rig, "fib");
+    std::fs::write(dir.join("fib.sh"), "echo 0 1 1 2 3 5 8\n").unwrap();
+    let out = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({
+                "message": "feat: fib",
+                "repo": "fib",
+                "pull_request": {"title": "feat: fib", "body": "Adds fib."},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "a scratch project has no pull request");
+    assert!(
+        out.content.contains("Committed ") && out.content.contains("locally"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("scratch project") && out.content.contains("publish_scratch"),
+        "{}",
+        out.content
+    );
+    assert!(out.artifacts.is_empty());
+    assert_eq!(common::git(&dir, &["rev-list", "--count", "HEAD"]), "2");
+    assert!(rig.fx.agent_branches().is_empty(), "nothing was pushed");
+    assert!(rig.fx.created_pulls().await.is_empty());
+}
+
 /// A cancelled run must not publish, even if the model asked for several
 /// calls in one turn and a later one is next in line: the cancelled tool's
 /// result is only an error to the loop, which goes on to the next call.
@@ -2391,6 +2687,79 @@ async fn a_later_task_continues_the_pushed_branch_and_reports_the_same_pull_requ
     assert_eq!(rig.fx.commits_ahead(&branch), 2);
     assert_eq!(rig.fx.file_on(&branch, "two.txt"), "two");
     assert!(rig.fx.comments().await.is_empty(), "verified: no note");
+}
+
+/// The one-call form on a continued branch: the fast-forward is inside the gate, so a refusal
+/// leaves the continued branch (and its pull request) exactly as the last verified task left them,
+/// and the call that passes moves it and reports the pull request that was already open.
+#[tokio::test]
+async fn a_commit_and_push_with_pull_request_continues_the_branch_only_after_the_gate() {
+    let rig = Rig::new().await;
+    let (two, worktree, branch, _tip) = rework_of_an_open_pull_request(&rig).await;
+    std::fs::write(worktree.join("two.txt"), "two\n").unwrap();
+
+    // Red on this code and not on the base: the pull request is refused before the fast-forward.
+    RunChecks
+        .call(&two, json!({"command": "test ! -f two.txt"}))
+        .await
+        .unwrap();
+    let refused = CommitAndPush
+        .call(
+            &two,
+            json!({
+                "message": "fix: two",
+                "pull_request": {"title": "fix: two", "body": "Two."},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(refused.is_error, "{}", refused.content);
+    assert!(
+        refused.content.contains("Refusing to open a pull request"),
+        "{}",
+        refused.content
+    );
+    assert_eq!(
+        rig.fx.commits_ahead(&branch),
+        1,
+        "the continued branch was not moved"
+    );
+    assert_eq!(
+        rig.fx.created_pulls().await.len(),
+        1,
+        "no second pull request"
+    );
+
+    // Green on exactly the pushed code: the same call moves the branch and reports the pull
+    // request that is already open.
+    RunChecks
+        .call(&two, json!({"command": "true"}))
+        .await
+        .unwrap();
+    let done = CommitAndPush
+        .call(
+            &two,
+            json!({
+                "message": "fix: two",
+                "pull_request": {"title": "fix: two", "body": "Two."},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!done.is_error, "{}", done.content);
+    assert!(
+        done.content.contains("was already open"),
+        "{}",
+        done.content
+    );
+    assert_eq!(rig.fx.commits_ahead(&branch), 2);
+    assert_eq!(rig.fx.file_on(&branch, "two.txt"), "two");
+    assert_eq!(
+        rig.fx.created_pulls().await.len(),
+        1,
+        "the same pull request"
+    );
+    assert_eq!(done.artifacts[2].data["url"], PR_URL);
 }
 
 /// A second task on a continued branch, in a fixture where the first task's pull request is open:
@@ -6068,6 +6437,27 @@ async fn scratch_work_gets_five_check_cycles_and_a_repository_three() {
         "{}",
         commit.content
     );
+}
+
+/// The pull request's own gate refuses a spent budget too, in its words (the `pull_request` of
+/// `commit_and_push` meets the commit's refusal first, before anything is written).
+#[tokio::test]
+async fn open_pull_request_refuses_a_spent_check_budget() {
+    let rig = with_red_checks((3, 0)).await;
+    let out = OpenPullRequest
+        .call(
+            &rig.ctx,
+            json!({"title": "feat: x", "body": "x", "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("Check-cycle limit reached (3 of 3)"),
+        "{}",
+        out.content
+    );
+    assert!(rig.fx.created_pulls().await.is_empty());
 }
 
 /// A subagent is a child run with an id of its own, and it works for its root run: the worktree is

@@ -65,16 +65,18 @@ sequenceDiagram
         end
     end
 
-    A->>G: commit_and_push(message)
+    A->>G: commit_and_push(message, pull_request?)
     G->>G: git add -A, git commit
     G->>R: git push origin agent/short-run-id (never forced)
     A-->>C: artifact "checks" (bound to the pushed commit)
     A-->>C: artifact "branch"
 
-    A->>A: open_pull_request guard: HEAD is pushed, and the last check passed on this exact tree
-    A->>H: find an open PR for the branch, else POST the pull request
-    H-->>A: number and URL
-    A-->>C: artifact "pull_request"
+    opt pull_request was passed, or the model calls open_pull_request
+        A->>A: the gate: HEAD is pushed, and the last check passed on this exact tree
+        A->>H: find an open PR for the branch, else POST the pull request
+        H-->>A: number and URL
+        A-->>C: artifact "pull_request"
+    end
 
     opt the model needs a decision from the user
         A-->>C: input-required (ask_user question)
@@ -86,7 +88,8 @@ sequenceDiagram
 Artifacts:
 
 * `pull_request`: a data part (`url`, `number`, `branch`, `repository`) and an A2A `url` part, so a chat
-  surface shows a link (`adam_a2a_runtime::artifact_of`).
+  surface shows a link (`adam_a2a_runtime::artifact_of`). It comes from `open_pull_request`, or from the
+  `pull_request` of a `commit_and_push`, which runs the same gate and the same code path in the same call.
 * `checks` (`passed`, `commit`, `tree`, optional `summary`, `findings`, and `preexisting` with `base_commit` when the
   command fails on the base too): reported by every `run_checks` that ran; `commit_and_push` emits one bound to the pushed commit (the last run's report if it ran on the
   pushed tree, else `passed: false`). An orchestrator gates on the last `checks` whose `commit` is the
@@ -154,8 +157,8 @@ stateDiagram-v2
     ChecksPreexisting --> Edited: the file tools, the change must not make it worse
     ChecksPreexisting --> Pushed: commit_and_push
     Pushed --> Edited: more changes, the green run no longer covers the tree
-    Pushed --> PullRequest: open_pull_request, checks green on the pushed tree
-    Pushed --> PullRequest: open_pull_request, the last check fails on the base too, a note in the body
+    Pushed --> PullRequest: open_pull_request or the pull_request of commit_and_push, checks green on the pushed tree
+    Pushed --> PullRequest: the same, the last check fails on the base too, a note in the body
     Pushed --> PullRequest: accept_red_checks after the user agreed through ask_user
     PullRequest --> Completed: the model ends its turn
     Exhausted --> FailedRun: the model reports the findings and stops, the run fails
@@ -610,13 +613,13 @@ suite yet.
 | The person picks an **access tier** for each message (`plan`, `edits`, `auto` by default, `bypass`): a tool above it is not shown to the model and a call to one is refused, in code, and again from the root run's notes; `merge_pull_request` needs `auto`, and merges only a pull request whose checks passed on the commit it merges: one this conversation pushed at once, any other (or one opened with red checks accepted) on the person's yes to a form the tool draws itself, and with no question at `bypass`; it never reads what the person typed; `rename_repository` and `delete_repository` (`confirm` = `owner/name`, only a repository the person named) need `bypass`, which the deployment must allow (`MAX_ACCESS_TIER=bypass`, default `auto`); from `auto` a repository the person wrote by its name alone, as a word of their newest message, counts as named when one owner applies. **The tier does not confine a command**: with the commands in the coder's own container, a command can read the GitHub App's key (the coder warns at startup; use run pods or Podman). GitHub's own rules decide at every tier, and its refusals reach the model in its own words. | [coder README](../../bin/adam-coder/README.md#access-tiers-what-the-person-lets-it-do-alone), [ADR 0036](../decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md) |
 | A check that fails in a repository is run once on `origin/<base>`: when it fails there too it is **pre-existing**, spends no cycle, is told to the model and carries `preexisting` in the `checks` artifact, and does not stop `open_pull_request` (the body says so). Not for a scratch project or a timeout. | [ADR 0026](../decisions/0026-a-failure-the-base-has-too-is-not-the-runs.md) |
 | After `MAX_CHECK_CYCLES` (3) failed check runs in a repository, `run_checks`, `commit_and_push` and `open_pull_request` refuse there. A scratch project has `SCRATCH_CHECK_CYCLES` (5), counted apart. | ADR 0013 |
-| `open_pull_request` refuses unless the pushed `HEAD` is the current commit **and** the last check passed on exactly that tree. A continued branch is fast-forwarded only after this gate (never forced). | |
+| `open_pull_request` refuses unless the pushed `HEAD` is the current commit **and** the last check passed on exactly that tree; the `pull_request` of `commit_and_push` runs the same gate and the same path. A continued branch is fast-forwarded only after this gate (never forced). | |
 | The shell has three tools of one job each: `run_command` looks (its changes are undone), `run` makes (file changes kept, git untouched), `run_checks` checks and is the only one the gate sees. | [ADR 0013](../decisions/0013-run-keeps-changes-edit-file-and-scratch-completion.md) |
 | The file tools refuse a path that is empty, absolute, has `..`, names `.git`, or leaves the worktree through a symlink. A patch is checked by the paths `git apply --numstat -z` reports and refused if it creates a symlink or submodule. `edit_file` replaces exact text and, when it cannot, changes nothing and shows the closest region. | [coder README](../../bin/adam-coder/README.md#reading-and-changing-files-itself) |
 | **Long output is kept** ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), slice 3): a command whose output is over 16 KiB (`CHECK_OUTPUT_TAIL_BYTES`) shows its head and its tail with the bytes between and an **output id**, and the whole is kept on the workspace volume (not in the journal; the same in a run pod and a devcontainer, since the coder captures it). `read_output { id, offset?, limit? }` (tier `plan`, paged as above) reads it by lines; an id that is not an id, or that nobody kept in this run (another run's, an earlier task's, one whose files were removed) is an error that says so and to run the command again. What is kept is scrubbed before it is written (a cut output has its end cut back by 64 KiB at a place no secret straddles, so no part of a secret is kept at the cut), and every page is scrubbed again on its way out by the tools' redacting layer: **that layer is the read-time guarantee**, not the file. A command that runs as the coder's user (local, Podman) can rewrite a kept file, so what is read back is no more trusted than a command's output, and nothing decides on it (the verdict of `run_checks` is its exit code). A line of the output that starts with `[` is shown as `\x5b...`, so no output can forge the last line of a page. An output over 16 MiB is kept cut, and says so. A long MCP result is kept the same way. `run_command`, `run` and `run_checks` take `timeout` (seconds), at most `CHECK_TIMEOUT_SECS`: a larger one is an error that names the limit. | [coder README](../../bin/adam-coder/README.md#kept-output-read_output-and-the-timeout-of-a-command) |
 | **Reads are paged** ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)): `read_file` (2,000 lines or 50 KiB), `list_files` (200 entries), `find_files` and `search_files` (100 each) take `offset` and `limit` and end with one line, `[more: ... next page: offset=N]` or `[end: ...]`; the same call gives the same bytes. A page also stops at 50 KiB and N is the first item **not shown**, so the line is always last and whole; names are printed escaped, so none can forge it. The last three are tier `plan`, read in the coder's own process (never in a run pod), take their files from `git ls-files` through the git sandbox (an ignored file is left out; with git unavailable they fail, they never walk the directory), use linear-time pattern engines, and a call that runs over 30 s is an error, never a partial page. The loop cuts any tool result over 64 KiB (before it enters the history: the journal keeps the tool's whole output, the model, the history and the step event carry the cut text); only a tool that **declares** it pages is told to call again with a later `offset`. | [coder README](../../bin/adam-coder/README.md#paged-reads-read_file-list_files-find_files-search_files) |
 | A command the shell cannot find (exit 127) is a missing toolchain: reported to the model, no check cycle used, the model asks the person. | |
-| A **scratch project** has no remote and lives for the conversation (the next task takes it over; it goes after `SCRATCH_IDLE_DAYS` without a task): `commit_and_push` there is a local commit; `open_pull_request` refuses. `publish_scratch` copies all or nothing into a repository the person named. | [coder README](../../bin/adam-coder/README.md#scratch-projects) |
+| A **scratch project** has no remote and lives for the conversation (the next task takes it over; it goes after `SCRATCH_IDLE_DAYS` without a task): `commit_and_push` there is a local commit, and the `pull_request` of that call or `open_pull_request` is refused. `publish_scratch` copies all or nothing into a repository the person named. | [coder README](../../bin/adam-coder/README.md#scratch-projects) |
 | A workspace of several slots: the tools take an optional `repo`, refused with the list of slots when there are several and none is given. The run notes keep the last 32 check records for the gate. | [coder README](../../bin/adam-coder/README.md#the-workspace-of-a-run) |
 
 How a run **ends** (`CoderAgent::verdict`): "the model said it is done" is not "delivered".
@@ -630,7 +633,8 @@ How a run **ends** (`CoderAgent::verdict`): "the model said it is done" is not "
 
 Every tool is safe to repeat (a crash before the result is journaled runs it again): `prepare_workspace`
 reuses the run's slot, `start_scratch` returns the project of that name, `commit_and_push` does nothing when
-there is nothing new, `open_pull_request` returns the open pull request of the same branch.
+there is nothing new, and its `pull_request` finds the pull request already open for the branch, as
+`open_pull_request` does.
 
 ## Continuing a task
 

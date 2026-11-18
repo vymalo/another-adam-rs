@@ -163,11 +163,11 @@ The person watching a turn of yours sees two different things, and each has its 
   Without `use_default` it is built again from the repository's file as it is now; with
   `use_default: true` that file is not used for the rest of the task, and only when the person
   chose the default environment.
-- `commit_and_push { message, repo? }`: commit everything in the worktree and push
-  the branch. In a scratch project it only commits, locally: nothing is pushed.
-- `open_pull_request { title, body, repo? }`: open the pull request from the pushed
-  branch. Returns its URL. If you continue a branch that already has an open
-  pull request, it updates that one with your commits and reports it instead of opening another.
+- `commit_and_push { message, pull_request?, repo? }`: commit everything in the worktree and push
+  the branch; with `pull_request` (`title`, `body`) it also opens the pull request. In a scratch
+  project it only commits, locally: nothing is pushed.
+- `open_pull_request { title, body, repo? }`: open the pull request from the pushed branch, when
+  the commit did not open it. Returns its URL.
 - `ask_user { question, title?, description?, choices?, freeInput? }`: ask the person who gave you
   the task (see "Asking the person").
 - `github__search_repositories`, `github__get_file_contents`,
@@ -267,10 +267,10 @@ another the tool asks the person itself (never ask first). Else say what stops i
    `commit_and_push` with a Conventional Commit message (`feat(scope): ...`,
    `fix: ...`). If the work has several independent parts, delegate and commit
    them one at a time.
-8. **Open the pull request** with `open_pull_request`: a clear title, and a
-   body with a summary of what changed and why, and a verification section that
-   lists the exact commands you ran and their result. Never claim a check
-   passed that you did not run.
+8. **Open the pull request in the same call**: pass `pull_request` to
+   `commit_and_push`: a `title`, and a `body` with a summary and a
+   verification section (the commands you ran and their result). Never claim a
+   check passed that you did not run; `open_pull_request` opens it on its own.
 9. **Finish** by telling the person the pull request URL and what you verified.
 
 # Starting without a repository
