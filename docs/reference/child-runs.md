@@ -282,16 +282,19 @@ A round that only closes a session is not waited for and not cancelled: it repor
 `max_tool_calls`, the run ends and the round goes on without anyone to read it.
 
 **Reports during a turn (slice 3).** A round that ends while the parent does something else is told to the model by its next
-call, with no read of its own. Inside the step `model:<turn>` (no new step: a journal from before replays as it was) the loop lists
-the sessions of the conversation and reads the report of each round that is **due**: it has ended, it is not a closing round, it is
-not in `Conversation::reported_rounds`, and this run started it or a person did. A round an earlier task's run started is not due:
-that run waited for it or cancelled it. The request is the history, then one assistant message with a `subagent_read` call per
-report (id `report_` and the round's 32 hex digits) and the results; the record of the call holds them (`reports`), so a replay tells
-the model the same words and the prefix of every request is the one before it. The listing is made at the first model call of a run
-and, while `Conversation::sessions_open` is set (a session not closed was seen, or a call started or sent to one), before every
-call. The notice that a round ended stays a wake-up: a lost one costs at most one turn (the next call lists again), a duplicate
-matches nothing, and a round that ends during the final model call is found by the turn-end read of the store, not by a notice.
-A report that cannot be listed or read is skipped with a warning and found at the next call.
+call, with no read of its own. Inside the step `model:<turn>` (no new step: a committed journal from before replays as it was) the loop lists
+the sessions of the conversation and reads the report of each one that is **due**. A session's report is of the latest round that worked, so a
+closing round that follows does not hide it, and a round that a later round replaced before the parent looked, or that the close that follows it cancelled, is not reported on its own. It is due
+when that round has ended, is not in `Conversation::reported_rounds`, its call id is not in the history already (the cap of 128 can give up a round
+that is still due), and this run started it or a person did after the chain of tasks began (`Conversation::chain_started`: a task that does not
+continue another does not re-tell a person's old round). A round an earlier task's run started is not due: that run waited for it or cancelled it.
+The request is the history, then one assistant message with a `subagent_read` call per report (id `report_` and the round's 32 hex digits) and the
+results; the record of the call holds them (`reports`), so a replay tells the model the same words and the prefix of every request is the one before
+it. The listing is made at the first model call of a run and, while `Conversation::sessions_open` is set, before every call; it stays set while a due
+report was not appended (a failed read, an error, a stale answer). The rounds are counted (`usage:<call>`) whenever a record holds reports, whether or
+not the history takes them, so a replay takes the steps the first try took. The notice that a round ended stays a wake-up: a lost one costs at most
+one turn (the next call lists again), a duplicate matches nothing, and a round that ends during the final model call is found by the turn-end read of
+the store, not by a notice. **No mixed versions**: stop every worker of the old revision before a run uses sessions.
 
 ```mermaid
 sequenceDiagram
@@ -302,25 +305,37 @@ sequenceDiagram
     participant DB as Store
     participant C as round run<br/>LlmAgent
     M->>P: call subagent_start(...), keep_open false
-    P-->>M: {session, state: working}, the turn goes on with another tool
+    P->>RT: tool:c1 start_round(session = child_run_id(parent, c1))
+    P-->>M: {session, state: working}
+    M->>P: call another tool, which takes a while
     C->>DB: the round's final commit, while that tool runs
     RT->>P: adam.child.reported, a wake-up the loop never reads
-    P->>RT: model:2 (one journaled step) sessions(), then poll_remote(session) of each round due
+    P-->>M: the result of the other tool
+    P->>RT: model:3 (one journaled step) sessions(), then poll_remote(session) of each round due
     RT->>DB: list the rounds, read the latest
-    P->>M: request = history, then subagent_read call report_(round) and its result
-    M-->>P: the answer
-    P->>P: history = the report's call and result, then the answer, and the round is in reported_rounds
-    M->>P: the answer carries no call, a round ended during the call
-    P->>P: sessions:2 finds it due, the turn goes on with wait_2, a read that answers at once
+    P->>M: model call, request = history, then subagent_read call report_(round) and its result
+    M-->>P: an answer with no call, while a second round ends
+    C->>DB: the second round's final commit
+    P->>RT: sessions:3 (a journaled step) finds that round due
+    P->>RT: tool:wait_3, a subagent_read that answers at once
+    P->>M: model call, request = history, then the result of wait_3
+    M-->>P: the final answer
 ```
 
 ```mermaid
 stateDiagram-v2
     [*] --> Working: a round starts
-    Working --> Due: the round ended, it is not a closing round, this run or a person started it
+    Working --> Due: the round ended, it is the latest that worked, this run or a person after the chain began started it
+    Working --> Working: a later round of the session replaces it, only the latest round that worked is reported
     Due --> Reported: appended before a model call, read by the model, or read by wait_turn
+    Due --> Due: a limit turn or max_tool_calls ends the run, the next listing finds it
     Reported --> [*]
 ```
+
+**Unverified risks** of reports during a turn (none was tried against a live model): the synthetic assistant message carries no reasoning, which a model run
+with `echo_reasoning` may expect; a history can hold two assistant messages in a row (a report appended after an answer that was not sent back); the
+listing runs inside `model:<turn>` before the call and has no time limit of its own; the step events of the appended reads are emitted after the
+answer has streamed, not before the call.
 
 ### Session interleavings
 
@@ -339,12 +354,12 @@ is read from the store, the notice is only a wake-up).
 | S8 | A message reaches a working round, or a close request does | The message is read as a steer (the round's next request ends with it); the request makes the round the last and costs no model turn | `a_message_to_a_working_round_is_steered`, `closing_a_working_session_lets_the_round_finish` |
 | S9 | An id that is unknown, malformed or another conversation's | An error result in words that say what to do; nothing is started | `a_session_that_is_not_ours_is_refused_in_words` |
 | S10 | A session on a remote subagent | A round of the agent registered under the subagent's name, which talks to the remote ([below](#remote-sessions)) | `a_remote_subagent_starts_a_round_of_its_registered_agent` |
-| S11 | A round ends while the parent does other work | The next model call lists the sessions and is given the round's report as a `subagent_read` call and result, with no read by the model; the request starts with the one before | `a_report_that_ends_mid_turn_reaches_the_next_model_call`, `reports_during_a_turn_keep_the_prefix` |
+| S11 | A round ends while the parent does other work, and a closing round may follow it | The next model call lists the sessions and is given the round's report as a `subagent_read` call and result, with no read by the model; the request starts with the one before; a closing round does not hide it | `a_report_that_ends_mid_turn_reaches_the_next_model_call`, `reports_during_a_turn_keep_the_prefix`, `a_closing_round_does_not_hide_the_report_of_the_round_before` |
 | S12 | A round ends during the parent's final model call | The turn does not end on that answer: `sessions:<turn>` finds the round due and `wait_<turn>` reads it at once | `a_report_during_the_final_model_call_reopens_the_turn` |
-| S13 | The notice of that end is lost, or comes twice | The next call finds the report in the store; a copy of a notice matches nothing: no second report, no extra model call | `a_lost_report_notice_costs_at_most_one_turn`, `a_duplicate_report_notice_matches_nothing` |
-| S14 | A person's round ended | It is reported at the next listing, in this task while a session is open or at the first call of a later task, once; the header says "started by the person" and the person's words are not in it | `a_persons_round_is_reported_as_the_persons`, `a_persons_round_is_reported_in_a_later_task` |
+| S13 | The notice of that end is lost, or comes twice | The next call finds the report in the store; a copy of a notice matches nothing: no second report, no extra model call | `a_report_is_found_in_the_store_when_its_notice_is_lost`, `a_lost_notice_while_the_parent_is_parked_costs_one_turn`, `a_duplicate_report_notice_matches_nothing` |
+| S14 | A person's round ended | It is reported at the next listing, in this task while a session is open or at the first call of a task that continues this one, once (a task that does not continue another is not told of a round that ended before it began); the header says "started by the person" and the person's words are not in it | `a_persons_round_is_reported_as_the_persons`, `a_persons_round_is_reported_in_a_later_task`, `a_fresh_task_tells_only_the_persons_rounds_that_ended_after_it_began` |
 | S15 | The model read the report itself, or the run has no session | A report the model read is not appended again; a run that never opens a session lists once, at its first call | `a_report_read_by_the_model_is_not_appended_again`, `a_run_without_sessions_lists_only_at_its_first_model_call` |
-| S16 | A journal from before slice 3, or one with reports, is replayed | The same history, no model asked, no child run, no disagreement | `a_journal_from_before_reports_replays_to_the_same_history`, `a_replay_appends_the_same_reports` |
+| S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale | `a_journal_from_before_reports_replays_to_the_same_history`, `a_replay_appends_the_same_reports`, `a_replay_of_a_stale_answer_counts_each_round_once` |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start is refused.
 
