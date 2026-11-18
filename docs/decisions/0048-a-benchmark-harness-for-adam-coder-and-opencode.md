@@ -287,7 +287,7 @@ own file unchanged. Every replaced or dropped phrase:
 | `edit_file` | `edit` |
 | `apply_patch` | `edit` |
 
-**Tools OpenCode has no counterpart for** (`prepare_workspace`, `run_checks`, `ask_user`, `commit_and_push`, `open_pull_request`, `share_file`, `start_scratch`, `request_repository`): the sentence that uses each is rewritten to a fixed neutral sentence or dropped, as listed next. In this benchmark the repository is already checked out, nobody answers a question, and the harness collects the working tree, so there is no pull request.
+**Tools OpenCode has no counterpart for** (`prepare_workspace`, `run_checks`, `ask_user`, `commit_and_push`, `open_pull_request`, `share_file`, `start_scratch`, `request_repository`, `read_files`): the sentence that uses each is rewritten to a fixed neutral sentence or dropped, as listed next. In this benchmark the repository is already checked out, nobody answers a question, and the harness collects the working tree, so there is no pull request.
 
 | Where | Change | adam's words | OpenCode's words |
 |---|---|---|---|
@@ -299,12 +299,12 @@ own file unchanged. Every replaced or dropped phrase:
 | how-4-commit | rewritten | Commit, push and open the pull request only at the end: you do that. | Leave your changes in the working tree: the harness collects them, so do not commit or push. |
 | how-5-run-checks | rewritten | Run the discovered checks with `run_checks` (only those) | Run the repository's discovered checks with `shell` (only those) |
 | how-5-pr-allowed | rewritten | a pull request is only allowed for exactly the code the checks passed on. | a change is only as good as the code the checks passed on. |
-| how-5-screenshot | dropped | To show a web page you changed, screenshot it with `obscura` (see "The work environment"), `share_file` it, and delete it before you commit. | (nothing) |
+| how-5-screenshot | dropped | To show a web page you changed, screenshot it with `obscura` (see "The work environment"), `share_file` it, and delete it before you commit. (in a later revision: To show a web page you changed, screenshot it with `obscura`, share it, and delete it before you commit.) | (nothing) |
 | how-6-scratch-cycles | rewritten | , and {{scratch_check_cycles}} times in a scratch project (counted apart; a cycle is one failed `run_checks`) | (a cycle is one failed run of the checks) |
 | how-6-no-tools-again | rewritten | do not call `run_checks`, `commit_and_push` or `open_pull_request` again. | do not run the checks again. |
 | how-6-pre-existing | rewritten | A failure the tool calls PRE-EXISTING (the command fails on the base branch too) is not yours and costs no cycle: add no error to it and go on. The pull request is allowed and says so. | A failure that is the same on the base branch (PRE-EXISTING) is not yours and costs no cycle: add no error to it and go on, and say so in your final answer. |
 | how-7-commit | rewritten | 7. **Commit in small, focused commits.** When checks are green, call `commit_and_push` with a Conventional Commit message (`feat(scope): ...`, `fix: ...`). If the work has several independent parts, delegate and commit them one at a time. | 7. **Stop when the checks are green.** Your changes stay in the working tree for the harness to collect. |
-| how-8-pull-request | rewritten | 8. **Open the pull request** with `open_pull_request`: a clear title, and a body with a summary of what changed and why, and a verification section that lists the exact commands you ran and their result. Never claim a check passed that you did not run. | 8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run. |
+| how-8-pull-request | rewritten | 8. **Open the pull request** with `open_pull_request`: a clear title, and a body with a summary of what changed and why, and a verification section that lists the exact commands you ran and their result. Never claim a check passed that you did not run. (in a later revision: 8. **Open the pull request in the same call**: pass `pull_request` to `commit_and_push`: a `title`, and a `body` with a summary and a verification section (the commands you ran and their result). Never claim a check passed that you did not run; `open_pull_request` opens it on its own.) | 8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run. |
 | how-9-finish | rewritten | telling the person the pull request URL and what you verified. | telling the person what you changed and what you verified. |
 | toolchain-which-tools | rewritten | When `run_checks`, `run` or `run_command` says the workspace has no `mvn` | When a command says the workspace has no `mvn` |
 | toolchain-result-says | dropped | The result says whether the tool has to be added to the repository's devcontainer or the repository has none. | (nothing) |
@@ -320,7 +320,7 @@ own file unchanged. Every replaced or dropped phrase:
 | rules-scratch | dropped | - Never publish a scratch project to a repository the person did not name; the tool refuses, and so must you. Ask which one. | (nothing) |
 | rules-unclear | rewritten | - When something is unclear and a wrong guess would waste real work, ask once with `ask_user`, with a specific question. | - When something is unclear, decide yourself, say what you assumed in your final answer, and finish. |
 
-Renames outside those spans: `read_file` 1 time, `edit_file` 1 time.
+Renames outside those spans: none at `3f668c3` (`edit_file` 1 time at `2d5d0b3`).
 
 The hash of the mapped text is part of the ledger's configuration fingerprint. *Verified 2026-11-17*: that the configuration schema of OpenCode 2.3.0 has an agent `prompt` and an
 `instructions` list. *Unverified*: the effect of `instructions` with the pinned binary, which a gated test checks (`BENCH_TEST_OPENCODE_BIN`).

@@ -22,7 +22,7 @@ export const NAMES = Object.freeze({
 });
 
 /** adam tools OpenCode has no counterpart for: each is handled by a span below. */
-export const NO_COUNTERPART = Object.freeze(['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository']);
+export const NO_COUNTERPART = Object.freeze(['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository', 'read_files']);
 
 const NOBODY = 'Nobody can answer questions in this run';
 

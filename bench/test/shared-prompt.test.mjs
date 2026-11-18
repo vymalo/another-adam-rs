@@ -74,7 +74,7 @@ test('a section that names an adam-only tool is never shared, except the four th
   assert.deepEqual(offenders.map((s) => s.heading), [], 'no other shared section names a tool');
   // The four the owner named do name tools OpenCode does not have; kept word for word as decided, and listed so the README is held to it.
   const named = new Set(sections.filter((s) => SECTIONS[s.heading].owner).flatMap((s) => namedTools(s.raw, tools)));
-  assert.deepEqual([...named].sort(), ['apply_patch', 'ask_user', 'commit_and_push', 'edit_file', 'open_pull_request', 'prepare_workspace', 'read_file', 'request_repository', 'run', 'run_checks', 'run_command', 'share_file', 'start_scratch', 'write_file']);
+  assert.deepEqual([...named].sort(), ['apply_patch', 'ask_user', 'commit_and_push', 'edit_file', 'open_pull_request', 'prepare_workspace', 'read_file', 'read_files', 'request_repository', 'run', 'run_checks', 'run_command', 'share_file', 'start_scratch', 'write_file']);
   assert.ok(named.has('prepare_workspace') && named.has('run_checks') && named.has('open_pull_request'));
   // and the sections that were left out do name them, which is part of why
   const left = sections.filter((s) => !SECTIONS[s.heading].shared && s.heading !== PREAMBLE);
