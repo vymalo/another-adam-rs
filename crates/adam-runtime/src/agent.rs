@@ -292,6 +292,18 @@ pub trait Agent: Send + Sync + 'static {
         ctx: &mut Ctx,
         state: Self::State,
     ) -> Result<Transition<Self::State>, AgentError>;
+
+    /// Called once after a cancel has committed `run` as `Failed` (`Runtime::cancel`, a parent
+    /// that ended, a time limit, a cancel from the A2A front), with the agent state that commit
+    /// holds as JSON, so an agent can tell a system it started elsewhere (a remote task) to stop.
+    ///
+    /// Best effort: it runs on a spawned task in the process that committed the cancel, only where
+    /// the full agent is registered (never for a start-only registration), it is not retried, and
+    /// the process may end before it finishes. A step that was running when the cancel landed has
+    /// committed nothing, so `state` does not hold what that step did. The default does nothing.
+    async fn on_cancelled(&self, run: RunId, state: serde_json::Value) {
+        let _ = (run, state);
+    }
 }
 
 /// The start-only half of an [`Agent`]: a name and the initial state of a

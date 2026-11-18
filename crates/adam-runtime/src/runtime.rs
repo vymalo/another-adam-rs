@@ -364,6 +364,7 @@ impl Inner {
                     self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
                         .await;
                     self.notify_parent(&committed).await;
+                    self.run_cancel_hook(run, &rec.agent, env.agent);
                     return Ok(());
                 }
                 Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
@@ -371,6 +372,15 @@ impl Inner {
             }
         }
         Err(RuntimeError::Contended(format!("run {run}")))
+    }
+
+    /// Tell the agent of a run this process just cancelled, on a task of its own: best effort, and
+    /// only where the full agent is registered.
+    fn run_cancel_hook(&self, run: RunId, agent: &str, state: serde_json::Value) {
+        if let Some(agent) = self.agents.get(agent).and_then(Registered::agent) {
+            let agent = agent.clone();
+            tokio::spawn(async move { agent.on_cancelled(run, state).await });
+        }
     }
 
     /// Append `inbound` to the inbox of `run`; see [`Runtime::deliver`].
@@ -1330,8 +1340,10 @@ impl Runtime {
     /// minute away, and at it the runtime reads the parent **before** the agent is stepped, then parks
     /// the run again without stepping the agent when nothing else is due. A parent that is `Done`
     /// changes nothing, and one that cannot be loaded (purged by retention, or the store is down) is
-    /// unknown and cancels nothing. Remote A2A tasks a run started are not cancelled by this. Asking twice, or for a
-    /// finished run, is a no-op.
+    /// unknown and cancels nothing. A task a run started on a remote A2A agent is not cancelled by the
+    /// runtime: after a successful cancel commit it calls [`Agent::on_cancelled`] of the run's agent
+    /// (on a spawned task, best effort, once per commit, and only in a process that registered the
+    /// full agent), and the agent decides. Asking twice, or for a finished run, is a no-op.
     #[tracing::instrument(skip(self))]
     pub async fn cancel(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
         self.inner.cancel_run(run, reason).await
