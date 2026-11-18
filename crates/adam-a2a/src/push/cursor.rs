@@ -338,9 +338,11 @@ pub fn is_final(task: &Task) -> bool {
 }
 
 /// What digesting an artifact costs, for the test that proves a poll of an artifact that did not
-/// change does not digest it again. Thread-local: the tests run in parallel, each on its own thread.
+/// change does not digest it again (and that a backfilled cursor stays backfilled through the
+/// store, which `deliverer`'s test checks). Thread-local: the tests run in parallel, each on its own
+/// thread.
 #[cfg(test)]
-mod work {
+pub(crate) mod work {
     use std::cell::Cell;
 
     thread_local! {

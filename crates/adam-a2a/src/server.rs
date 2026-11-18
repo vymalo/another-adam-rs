@@ -518,6 +518,9 @@ fn legacy_push_config(body: &[u8]) -> Option<a2a::JsonRpcId> {
     // Cheap first: almost every request does not contain the word, and the scan allocates nothing.
     const LEGACY: &[u8] = b"\"pushNotificationConfig\"";
     memchr::memmem::find(body, LEGACY)?;
+    // A body that names the member is still read whole, into a `Value` of up to the SDK's 10 MiB:
+    // the check needs the configuration's shape, and the needle is rare (a normal request never
+    // contains it, and the SDK reads the whole body anyway).
     let request = full_body(body)?;
     if !matches!(
         request["method"].as_str(),
@@ -670,6 +673,23 @@ mod tests {
                 message_extensions(body.as_bytes()),
                 as_value(body.as_bytes()),
                 "{body}"
+            );
+        }
+        // The twelfth shape, which the `Value` oracle cannot judge: duplicate members. The typed
+        // read refuses the body, where indexing a `Value` takes the last member. The SDK reads a
+        // request with a derived `Deserialize` into `JsonRpcRequest`, which refuses a duplicate
+        // field too, so such a request is answered with an error either way and the echo is empty.
+        for duplicate in [
+            // duplicate `method`
+            r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","method":"GetTask","params":{"message":{"extensions":["urn:a"]}}}"#,
+            // duplicate `params`
+            r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"extensions":["urn:a"]}},"params":{}}"#,
+            // duplicate `extensions`
+            r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"extensions":["urn:a"],"extensions":["urn:b"]}}}"#,
+        ] {
+            assert!(
+                message_extensions(duplicate.as_bytes()).is_empty(),
+                "{duplicate}"
             );
         }
     }

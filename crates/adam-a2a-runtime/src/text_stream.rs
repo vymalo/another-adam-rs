@@ -146,6 +146,24 @@ fn build(task_id: &str, context_id: &str, piece: &Piece<'_>) -> Option<TaskArtif
     })
 }
 
+/// Whether `update` is a piece of a stream rather than a durable artifact: [`chunk`] and
+/// [`reasoning_chunk`] mark it with the extension's URI, and a piece always says `append`, which a
+/// durable artifact of a subscription never does. A piece is **transient** — never in a `GetTask`,
+/// never replayed from the record — so a subscription must never drop it (a durable artifact it
+/// drops is in the task, and `GetTask` or a resubscription brings it back).
+pub(crate) fn is_chunk(update: &TaskArtifactUpdateEvent) -> bool {
+    update.append.is_some()
+        || update
+            .artifact
+            .extensions
+            .as_deref()
+            .is_some_and(|extensions| {
+                extensions
+                    .iter()
+                    .any(|e| e.as_str() == TEXT_STREAM_EXTENSION)
+            })
+}
+
 /// `{URI: {"streamId": stream}}`: what says that a status message states the whole text of `stream`.
 fn marker(stream: &str) -> HashMap<String, Value> {
     HashMap::from([(
@@ -303,6 +321,35 @@ mod tests {
             failed.artifact.metadata.expect("metadata")[TEXT_STREAM_EXTENSION],
             json!({"offset": 10, "abandoned": true})
         );
+    }
+
+    #[test]
+    fn a_piece_of_a_stream_is_told_from_a_durable_artifact() {
+        let piece = chunk("t1", "c1", "s1", 0, "Hi".into(), false, false).expect("a chunk");
+        assert!(is_chunk(&piece));
+        let later = chunk("t1", "c1", "s1", 2, " there".into(), true, false).expect("a chunk");
+        assert!(is_chunk(&later));
+        let reasoning =
+            reasoning_chunk("t1", "c1", "s1-r", 0, "Why".into(), false, false).expect("a chunk");
+        assert!(is_chunk(&reasoning));
+        // What a durable artifact of a subscription looks like (`subscribe::Tracker`): no `append`,
+        // and no extension marker on the artifact.
+        let durable = TaskArtifactUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            artifact: Artifact {
+                artifact_id: "plan-x".into(),
+                name: Some("plan".into()),
+                description: None,
+                parts: vec![Part::text("A")],
+                metadata: Some(HashMap::from([("vymalo.replaceable".into(), json!(true))])),
+                extensions: None,
+            },
+            append: None,
+            last_chunk: Some(true),
+            metadata: None,
+        };
+        assert!(!is_chunk(&durable));
     }
 
     #[test]

@@ -40,9 +40,13 @@ const MAX_READ_FAILURES: u32 = 20;
 const CHANNEL_CAPACITY: usize = 64;
 
 /// The most bytes of event payload one subscription holds for a client that does not read: without
-/// it, 64 events of a 4 MiB file artifact would be 256 MiB per subscriber. Past it, artifact events
-/// are dropped for that subscriber (the stream is resumable and `GetTask` is the truth); a snapshot
-/// and a status are never dropped, because they carry the state that ends the stream.
+/// it, 64 events of a 4 MiB file artifact would be 256 MiB per subscriber. Past it, a **durable**
+/// artifact event is dropped for that subscriber (it is in the task: `GetTask`, or a resubscription's
+/// snapshot, brings it back); a transient chunk of a stream, a snapshot, a status and an error wait
+/// for room instead, because no read can bring them back. A snapshot larger than this takes the
+/// whole budget and its excess is outside it, so a subscriber holds at most one snapshot plus this
+/// much. The cap is per subscriber: N subscribers on a stalled run hold N times it, not one shared
+/// copy.
 const CHANNEL_BYTES: usize = 8 * 1024 * 1024;
 
 /// How often a step reports the same state again to a client that activated `steps/v1`: the
@@ -106,21 +110,30 @@ impl Queue {
         Some(ends)
     }
 
-    /// Queue one item; `false` when the subscriber is gone. An artifact that does not fit the byte
-    /// budget is dropped (its subscriber reads the task with `GetTask`, or resubscribes for a fresh
-    /// snapshot); a snapshot, a status or an error waits for room instead.
+    /// Queue one item; `false` when the subscriber is gone. A **durable** artifact that would fit an
+    /// empty queue (`bytes < CHANNEL_BYTES`) and does not fit now is dropped: it is in the task, so
+    /// `GetTask` and a resubscription's snapshot bring it back. An artifact larger than the whole
+    /// budget waits for the queue to drain — it could not have fitted even an empty one, so dropping
+    /// it would lose what the stream alone carries. A transient chunk, a snapshot, a status and an
+    /// error are never dropped either: they wait for room.
     async fn push(&self, item: Result<TaskEvent, BackendError>) -> bool {
         let bytes = item_bytes(&item);
         let want = u32::try_from(bytes.min(CHANNEL_BYTES)).unwrap_or(u32::MAX);
+        // Only what could have fitted an empty queue may be dropped: an item clamped to the whole
+        // budget is larger than it, and dropping it would lose it for good.
+        let fits_empty = bytes < CHANNEL_BYTES;
         let permit = match self.budget.clone().try_acquire_many_owned(want) {
             Ok(permit) => Some(permit),
-            Err(_) if droppable(&item) => {
-                tracing::debug!(bytes, "dropping an artifact event for a slow subscriber");
+            Err(_) if fits_empty && droppable(&item) => {
+                tracing::debug!(
+                    bytes,
+                    "dropping a durable artifact event for a slow subscriber"
+                );
                 return true;
             }
             Err(_) => {
-                // What ends the stream is never dropped: wait for the client to read, or leave
-                // when it went away.
+                // What no read can bring back waits for the client to read, or leaves when it went
+                // away.
                 tokio::select! {
                     permit = self.budget.clone().acquire_many_owned(want) => match permit {
                         Ok(permit) => Some(permit),
@@ -140,11 +153,17 @@ impl Queue {
     }
 }
 
-/// Whether an item may be dropped for a subscriber that does not read: an artifact is in the
-/// durable task too (a `GetTask`, or the next subscription's snapshot), a snapshot and a status are
-/// the state itself.
+/// Whether an item may be dropped for a subscriber that does not read. A **durable** artifact is
+/// also in the task: `GetTask` reads it, and a resubscription's snapshot carries it, so losing it
+/// from the stream costs a read, not the artifact. A **transient** chunk of a stream (a
+/// `text-stream/v1` reply or its reasoning) is nowhere else — never in a `GetTask`, never replayed
+/// from the record — so it is never dropped: it is small, and waiting for room is free. A snapshot,
+/// a status and an error are the state that ends the stream and are never dropped either.
 fn droppable(item: &Result<TaskEvent, BackendError>) -> bool {
-    matches!(item, Ok(TaskEvent::Artifact(_)))
+    match item {
+        Ok(TaskEvent::Artifact(update)) => !text_stream::is_chunk(update),
+        _ => false,
+    }
 }
 
 /// The bytes of payload an item holds, for the queue bound: the parts of its artifact or message (a
@@ -1105,5 +1124,75 @@ mod queue_tests {
         assert!(status.await.is_some(), "then it is queued");
         let (last, _permit) = rx.recv().await.expect("the status");
         assert!(matches!(last, Ok(TaskEvent::Status(_))));
+    }
+
+    /// A chunk of a stream is transient: it is never in a `GetTask` and is never replayed from the
+    /// record, so it is never dropped, even when the budget is exhausted. A durable artifact that
+    /// would have fitted an empty queue may be dropped: `GetTask` (or a resubscription) has it.
+    #[tokio::test]
+    async fn a_transient_chunk_waits_for_room_and_a_durable_artifact_may_be_dropped() {
+        let (queue, mut rx) = Queue::new();
+        // One artifact takes the whole budget: nothing else fits until it is read.
+        assert!(
+            queue
+                .send(vec![artifact("big", CHANNEL_BYTES)])
+                .await
+                .is_some()
+        );
+        assert_eq!(queue.queued_bytes(), CHANNEL_BYTES);
+
+        let piece = TaskEvent::Artifact(
+            text_stream::chunk("t", "c", "stream", 0, "hello".into(), false, false)
+                .expect("a chunk"),
+        );
+        let mut sending = Box::pin(queue.send(vec![piece]));
+        assert!(
+            sending.as_mut().now_or_never().is_none(),
+            "the chunk waits for room"
+        );
+
+        // A durable artifact of the same task is dropped: the task still has it.
+        let before = queue.queued_bytes();
+        assert!(queue.send(vec![artifact("small", 1024)]).await.is_some());
+        assert_eq!(
+            queue.queued_bytes(),
+            before,
+            "the durable artifact was dropped"
+        );
+
+        // The big artifact is read, the budget frees, and the chunk arrives.
+        let _ = rx.recv().await.expect("the big artifact");
+        assert!(sending.await.is_some(), "the chunk is queued");
+        let (item, _permit) = rx.recv().await.expect("the chunk");
+        match item.expect("an event") {
+            TaskEvent::Artifact(update) => assert_eq!(update.artifact.artifact_id, "stream"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "the dropped artifact is not queued");
+    }
+
+    /// An artifact larger than the whole budget could not have fitted even an empty queue, so it is
+    /// never dropped: it waits for the queue to drain and then arrives.
+    #[tokio::test]
+    async fn an_over_budget_artifact_waits_for_the_queue_to_drain() {
+        let (queue, mut rx) = Queue::new();
+        // A status in flight holds some permits, so the artifact does not fit at once.
+        assert!(queue.send(vec![completed()]).await.is_some());
+        assert!(queue.queued_bytes() > 0);
+
+        let mut sending = Box::pin(queue.send(vec![artifact("huge", CHANNEL_BYTES + 1)]));
+        assert!(
+            sending.as_mut().now_or_never().is_none(),
+            "the artifact waits instead of being dropped"
+        );
+
+        // The status is read; the artifact takes the whole budget and arrives.
+        let _ = rx.recv().await.expect("the status");
+        assert!(sending.await.is_some(), "the artifact is queued");
+        let (item, _permit) = rx.recv().await.expect("the artifact");
+        match item.expect("an event") {
+            TaskEvent::Artifact(update) => assert_eq!(update.artifact.artifact_id, "huge"),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
