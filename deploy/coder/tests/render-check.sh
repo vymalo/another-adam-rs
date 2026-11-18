@@ -110,6 +110,29 @@ for bad in 0 -1 1.5 9007199254740992 lots true; do
 done
 check "modelContextWindow and extraEnv MODEL_CONTEXT_WINDOW together are refused" \
   fails helm_reasoning --set config.modelContextWindow=131072 --set-string config.extraEnv.MODEL_CONTEXT_WINDOW=131072
+# The tool calls of a model turn that run at once (ADR 0049): MAX_PARALLEL_TOOL_CALLS, nothing by default.
+helm_reasoning > "$out"
+check "by default no MAX_PARALLEL_TOOL_CALLS is rendered" lacks 'MAX_PARALLEL_TOOL_CALLS'
+for limit in 1 4 32; do
+  printf 'config:\n  maxParallelToolCalls: %s\n' "$limit" > "$vals"
+  helm_reasoning -f "$vals" > "$out"
+  check "maxParallelToolCalls $limit from a values file is MAX_PARALLEL_TOOL_CALLS" \
+    envval MAX_PARALLEL_TOOL_CALLS "$limit"
+done
+helm_reasoning --set config.maxParallelToolCalls=6 > "$out"
+check "... and from --set" envval MAX_PARALLEL_TOOL_CALLS 6
+check "... once" count 'name: MAX_PARALLEL_TOOL_CALLS' 1
+helm_reasoning --set config.maxParallelToolCalls=6 --set config.role=control-plane > "$out"
+check "a control plane runs no tools: no MAX_PARALLEL_TOOL_CALLS" lacks 'MAX_PARALLEL_TOOL_CALLS'
+helm_reasoning --set config.maxParallelToolCalls=6 --set topology=split > "$out"
+check "split: the worker StatefulSet has it" envval MAX_PARALLEL_TOOL_CALLS 6
+check "split: the front has not" dlacks Deployment 'MAX_PARALLEL_TOOL_CALLS'
+for bad in 0 -1 33 2.5 lots true; do
+  printf 'config:\n  maxParallelToolCalls: %s\n' "$bad" > "$vals"
+  check "maxParallelToolCalls $bad is refused" fails helm_reasoning -f "$vals"
+done
+check "maxParallelToolCalls and extraEnv MAX_PARALLEL_TOOL_CALLS together are refused" \
+  fails helm_reasoning --set config.maxParallelToolCalls=6 --set-string config.extraEnv.MAX_PARALLEL_TOOL_CALLS=6
 # The checks below read the default render again.
 helm_reasoning > "$out"
 

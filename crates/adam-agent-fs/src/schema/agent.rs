@@ -120,6 +120,9 @@ impl<'de> Deserialize<'de> for ModelRef {
 /// The largest `limits.max_minutes`: 24 hours.
 pub const MAX_MINUTES_LIMIT: u32 = 1_440;
 
+/// The most `limits.max_parallel` may say: the bound of `MAX_PARALLEL_TOOL_CALLS`.
+pub const MAX_PARALLEL_LIMIT: u32 = 32;
+
 /// The limits of the agent loop (`adam_llm_agent::Limits`). Absent fields keep the loop's
 /// default. Claude Code's top-level `maxTurns` is read as `max_turns`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -142,6 +145,12 @@ pub struct Limits {
     /// with a warning.
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxMinutes")]
     pub max_minutes: Option<u32>,
+    /// The most tool calls of one model turn that run at the same time, 1 to [`MAX_PARALLEL_LIMIT`]
+    /// (`1` is one at a time). It only **lowers** the deployment's `MAX_PARALLEL_TOOL_CALLS`: a
+    /// larger value is lowered to the deployment's with a warning at startup. Absent: the
+    /// deployment's value. Not a field of `adam_llm_agent::Limits` (ADR 0049).
+    #[serde(skip_serializing_if = "Option::is_none", alias = "maxParallel")]
+    pub max_parallel: Option<u32>,
     /// Keys this schema does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

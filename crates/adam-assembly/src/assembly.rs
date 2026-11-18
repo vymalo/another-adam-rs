@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
 use adam_llm_agent::{
-    DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder, SESSION_TOOLS, StepIo, ToolSource,
+    DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
+    MAX_PARALLEL_LIMIT, SESSION_TOOLS, StepIo, ToolSource,
 };
 use adam_model::DynModel;
 use adam_runtime::RuntimeBuilder;
@@ -33,6 +34,7 @@ pub struct BoundDef {
     sources: Vec<DynToolSource>,
     aliases: Option<Vec<String>>,
     wait_poll: Option<Duration>,
+    max_parallel: Option<usize>,
     step_io: Option<StepIo>,
     scrub: Option<Scrub>,
     scrub_longest: Option<crate::scrub::Longest>,
@@ -68,6 +70,7 @@ impl BoundDef {
             sources: Vec::new(),
             aliases: None,
             wait_poll: None,
+            max_parallel: None,
             step_io: None,
             scrub: None,
             scrub_longest: None,
@@ -126,6 +129,39 @@ impl BoundDef {
     pub fn wait_poll(mut self, every: Duration) -> Self {
         self.wait_poll = Some(every);
         self
+    }
+
+    /// The most tool calls of one model turn that run at the same time, for every agent: the
+    /// deployment's `MAX_PARALLEL_TOOL_CALLS` ([`LlmAgentBuilder::max_parallel`], 1 to 32; the
+    /// loop's default is 10). An agent's file may **lower** it for that agent with
+    /// `limits.max_parallel`, never raise it: a larger value in a file is the deployment's, with a
+    /// warning.
+    #[must_use]
+    pub fn max_parallel(mut self, n: usize) -> Self {
+        self.max_parallel = Some(n);
+        self
+    }
+
+    /// The limit of the agent `node`: the deployment's (or the loop's default) lowered by the
+    /// agent's own file.
+    fn parallel_of(&self, node: &Node) -> usize {
+        let allowed = self
+            .max_parallel
+            .map_or(DEFAULT_MAX_PARALLEL, |n| n.clamp(1, MAX_PARALLEL_LIMIT));
+        match node.max_parallel {
+            Some(asked) if asked > allowed => {
+                tracing::warn!(
+                    agent = %node.name,
+                    asked,
+                    allowed,
+                    "`limits.max_parallel` is more than the deployment allows (MAX_PARALLEL_TOOL_CALLS): \
+                     the agent runs {allowed} tool calls at once"
+                );
+                allowed
+            }
+            Some(asked) => asked.max(1),
+            None => allowed,
+        }
     }
 
     /// How the step of a tool call reports its input and output, for every agent:
@@ -281,7 +317,8 @@ impl BoundDef {
     ) -> Result<LlmAgent, Error> {
         let mut builder = LlmAgent::builder(node.name.clone(), Arc::clone(model), alias)
             .instructions(node.prompt.clone())
-            .limits(node.limits);
+            .limits(node.limits)
+            .max_parallel(self.parallel_of(node));
         if let Some(every) = self.wait_poll {
             builder = builder.wait_poll(every);
         }

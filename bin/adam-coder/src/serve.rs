@@ -111,6 +111,7 @@ async fn build_agent(
     settings.language_servers = worker.language_servers;
     settings.language_server_idle = worker.language_server_idle;
     settings.language_servers_max = worker.language_servers_max;
+    settings.max_parallel_tool_calls = worker.max_parallel_tool_calls;
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 

@@ -362,6 +362,39 @@ mod tests {
         assert!(parse(&vars).unwrap().worker.is_none());
     }
 
+    /// `MAX_PARALLEL_TOOL_CALLS` is read with the workers' settings: 1 to 32, 10 by default; anything
+    /// else stops the start (78) and names the variable; a control plane does not read it.
+    #[test]
+    fn the_parallel_limit_is_read_by_the_workers_and_a_bad_one_stops_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = full(dir.path());
+        let limit = |vars: &HashMap<String, String>| {
+            parse(vars)
+                .unwrap()
+                .service
+                .worker
+                .unwrap()
+                .max_parallel_tool_calls
+        };
+        assert_eq!(limit(&vars), 10);
+        vars.insert("MAX_PARALLEL_TOOL_CALLS".into(), "4".into());
+        assert_eq!(limit(&vars), 4);
+        for bad in ["0", "33", "many"] {
+            vars.insert("MAX_PARALLEL_TOOL_CALLS".into(), bad.into());
+            let error = parse(&vars).unwrap_err();
+            assert!(
+                error
+                    .problems
+                    .iter()
+                    .any(|p| p.starts_with("MAX_PARALLEL_TOOL_CALLS")),
+                "{bad}: {error}"
+            );
+            assert_eq!(adam_service::exit_code(&error), 78);
+        }
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).unwrap().service.worker.is_none());
+    }
+
     /// A control plane serves the card and starts runs, which needs no model and no MCP server, so
     /// it reads and validates none of their variables.
     #[test]

@@ -238,6 +238,8 @@ pub struct CoderSettings {
     pub language_server_idle: Duration,
     /// The most language servers this worker holds at once, for every run (`LANGUAGE_SERVERS_MAX`).
     pub language_servers_max: usize,
+    /// The most tool calls of one model turn that run at once (`MAX_PARALLEL_TOOL_CALLS`, 1 to 32).
+    pub max_parallel_tool_calls: usize,
 }
 
 impl Default for CoderSettings {
@@ -287,6 +289,7 @@ impl CoderSettings {
             language_servers: true,
             language_server_idle: Duration::from_secs(600),
             language_servers_max: 4,
+            max_parallel_tool_calls: adam_llm_agent::DEFAULT_MAX_PARALLEL,
         }
     }
 }

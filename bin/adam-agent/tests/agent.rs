@@ -54,6 +54,7 @@ fn worker(model: DynModel, mcp: McpPolicy) -> WorkerParts<'static> {
         mcp,
         options: options(),
         step_io: adam_llm_agent::StepIo::default(),
+        max_parallel: 10,
     }
 }
 
@@ -2081,4 +2082,36 @@ async fn a_control_plane_refuses_a_prompt_it_cannot_expand_and_warns_at_start() 
             .await
             .is_ok()
     );
+}
+
+/// `MAX_PARALLEL_TOOL_CALLS` reaches the folder's agents, and the folder's own `limits.max_parallel`
+/// can only lower it (ADR 0049).
+#[tokio::test]
+async fn the_deployments_parallel_limit_reaches_the_agent_and_the_file_only_lowers_it() {
+    let limit = |folder: &tempfile::TempDir, setting: usize| {
+        let def = def_of(folder);
+        let model: DynModel = Arc::new(MockModel::new());
+        async move {
+            adam_agent::assemble_limited(
+                def,
+                model,
+                "test-model",
+                &McpPolicy::default(),
+                adam_llm_agent::StepIo::default(),
+                setting,
+            )
+            .await
+            .expect("the folder assembles")
+            .root()
+            .max_parallel()
+        }
+    };
+    let folder = chat();
+    assert_eq!(limit(&folder, 6).await, 6);
+    assert_eq!(limit(&folder, 1).await, 1);
+    edit_instructions(&folder, |t| {
+        t.replacen("limits:", "limits:\n  max_parallel: 2", 1)
+    });
+    assert_eq!(limit(&folder, 6).await, 2, "the file lowers it");
+    assert_eq!(limit(&folder, 1).await, 1, "and never raises it");
 }

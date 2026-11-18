@@ -7,8 +7,8 @@ use crate::diagnostic::Sink;
 use crate::frontmatter::{Split, clean_body, key_line};
 use crate::manifest::RemoteAuth;
 use crate::schema::{
-    AgentFrontmatter, MAX_MINUTES_LIMIT, ModelRef, ToolList, check_references, is_agent_name,
-    is_env_name, is_tool_name,
+    AgentFrontmatter, MAX_MINUTES_LIMIT, MAX_PARALLEL_LIMIT, ModelRef, ToolList, check_references,
+    is_agent_name, is_env_name, is_tool_name,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -379,6 +379,16 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
             key_line(split, "limits"),
             format!(
                 "`limits.max_minutes` is at most {MAX_MINUTES_LIMIT} (24 hours), and `0` means no limit; it is {minutes}"
+            ),
+        );
+    }
+    if let Some(n) = fm.limits.as_ref().and_then(|limits| limits.max_parallel)
+        && !(1..=MAX_PARALLEL_LIMIT).contains(&n)
+    {
+        sink.error(
+            key_line(split, "limits"),
+            format!(
+                "`limits.max_parallel` is from 1 to {MAX_PARALLEL_LIMIT} (the tool calls of a turn that run at once); it is {n}"
             ),
         );
     }

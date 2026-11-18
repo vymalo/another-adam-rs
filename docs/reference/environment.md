@@ -21,6 +21,7 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLI
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (goes in the agent card) | required by `all`, `control-plane` |
 | `LISTEN_ADDR` | the A2A server, or a worker's `/healthz` | `0.0.0.0:8080` |
 | `WORKERS` | runs advanced concurrently | `4` |
+| `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); anything else is exit 78. An agent file's `limits.max_parallel` may lower it for that agent, never raise it. Which calls may overlap is the tools' own declaration ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)) | `10` |
 | `WORKER_ID` | lease identity: 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; required by `affinity`, `isolated` |
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and key | required by `all`, `worker` (key may be empty) |
 | `MODEL` | the agent's model alias | required by `all`, `worker` |

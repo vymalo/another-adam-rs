@@ -91,6 +91,11 @@ config:
   publicUrl: ""
   # Runs advanced at the same time.
   workers: 4
+  # MAX_PARALLEL_TOOL_CALLS: the most tool calls of one model turn that run at the same time (ADR 0049),
+  # a whole number from 1 to 32; 1 is one at a time. null (default): nothing is rendered and the binary
+  # runs 10. An agent file's `limits.max_parallel` may lower it for that agent, never raise it. Roles
+  # that run workers only.
+  maxParallelToolCalls: null
   # Failed run_checks after which the agent must stop and report.
   maxCheckCycles: 3
   # Time limit of one run_checks command, in seconds.

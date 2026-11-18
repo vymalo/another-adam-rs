@@ -208,7 +208,7 @@ stateDiagram-v2
 | P2 | `ToolAccess`, `Use`, `Tool::access`, `ToolSource::access`, `#[tool(parallel, path, access)]`, `FnTool::with_access`, forwarding in every wrapper | built |
 | P3 | `schedule.rs`: segments, conflicts, barriers, the queue (pure) | built |
 | P4 | `run_pending` by segments, `LlmAgentBuilder::max_parallel` | built |
-| P5 | `MAX_PARALLEL_TOOL_CALLS`, `limits.max_parallel`, the chart key | not built |
+| P5 | `MAX_PARALLEL_TOOL_CALLS`, `limits.max_parallel`, the chart key | built |
 | P6 | `after_previous` | not built |
 | P7 | classes of the library tools: MCP, UI, assembly, `read_output` | not built |
 | P8 | the coder: `NotesStore::update`, the class table, atomic writes | not built |

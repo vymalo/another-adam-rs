@@ -517,6 +517,8 @@ pub(crate) struct Node {
     pub(crate) prompt: String,
     pub(crate) tools: Vec<(String, DynTool)>,
     pub(crate) limits: Limits,
+    /// `limits.max_parallel` of the agent's file: it lowers the deployment's setting for this agent.
+    pub(crate) max_parallel: Option<usize>,
     /// The skills the agent may use, in order.
     pub(crate) skills: Vec<String>,
     /// The skills whose body is in the prompt.
@@ -658,6 +660,12 @@ impl Walk<'_> {
             prompt,
             tools,
             limits: limits(manifest.frontmatter.limits.as_ref()),
+            max_parallel: manifest
+                .frontmatter
+                .limits
+                .as_ref()
+                .and_then(|file| file.max_parallel)
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
             skills,
             preloaded,
             session_agents,

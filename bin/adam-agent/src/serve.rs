@@ -78,6 +78,7 @@ pub async fn serve(
             // What a call was given and what it answered go into its step: the secrets of this
             // process (the configuration's and the environment's) are scrubbed from both.
             step_io: redact::step_io_named(&config, redact::process_vars(), &named_vars),
+            max_parallel: settings.max_parallel_tool_calls,
         }),
         _ => None,
     };

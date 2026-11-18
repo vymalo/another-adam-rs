@@ -317,6 +317,9 @@ impl CoderAgent {
         let bound = bound
             // The tools of the conversation's endpoint, offered at every model turn.
             .tool_source(env.ui.source())
+            // How many calls of one model turn run at once: the deployment's setting, which a file's
+            // `limits.max_parallel` may lower (ADR 0049).
+            .max_parallel(env.settings.max_parallel_tool_calls)
             // The access tier of the message: tools above it are not shown and not run.
             .tool_source(crate::tier::TierSource::new(
                 env.notes.clone(),

@@ -223,6 +223,11 @@ spec:
             {{- end }}
             - name: WORKERS
               value: {{ .Values.config.workers | quote }}
+            {{- with include "coder.maxParallelToolCalls" . }}
+            {{- /* config.maxParallelToolCalls: the tool calls of a model turn that run at once (ADR 0049). Unset: the binary's 10. */}}
+            - name: MAX_PARALLEL_TOOL_CALLS
+              value: {{ . | quote }}
+            {{- end }}
             - name: MAX_CHECK_CYCLES
               value: {{ .Values.config.maxCheckCycles | quote }}
             - name: CHECK_TIMEOUT_SECS

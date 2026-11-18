@@ -155,6 +155,7 @@ Each model call's `usage/v1` report can say the model's window, so a screen show
 
 | Value | Variable | What |
 |---|---|---|
+| `config.maxParallelToolCalls` | `MAX_PARALLEL_TOOL_CALLS` | The most tool calls of one model turn that run at the same time: a whole number from 1 to 32 (`1` is one at a time). `null` (default) renders nothing and the binary runs 10, **so the render of a deployment that does not set it is unchanged**. An agent file's `limits.max_parallel` may lower it for that agent. The chart refuses a value outside 1 to 32 and one given beside `config.extraEnv.MAX_PARALLEL_TOOL_CALLS`; a control plane renders none |
 | `config.modelContextWindow` | `MODEL_CONTEXT_WINDOW` | The window of `config.model`, in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias and OpenCode report no window |
 
 ## Topology
@@ -323,7 +324,7 @@ refuses a non-empty `config.role`. See the crate README (`bin/adam-coder/README.
 
 A control plane needs no model, GitHub or workspace configuration, so with
 `config.role=control-plane` the chart leaves out `MODEL_BASE_URL` (the literal, or the Secret key of `config.modelBaseUrlFromSecret`), `MODEL`,
-`WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `WORKSPACE_SWEEP_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
+`WORKERS`, `MAX_PARALLEL_TOOL_CALLS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `WORKSPACE_SWEEP_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
 `PR_DRAFT`, `GIT_AUTHOR_*`, `WORKSPACE_ROOT`, `GITHUB_MCP_URL` and the GitHub MCP server sidecar, the GitHub App settings and key volume (`github.auth: app`) and the two secrets above (the helper
 `coder.runsWorkers` in `templates/_helpers.tpl`). The render of `all` and `worker` is unchanged.
 A `combined` control plane still mounts the `work` volume, because a StatefulSet's

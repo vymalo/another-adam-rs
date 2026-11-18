@@ -11,8 +11,8 @@ pub mod redact;
 mod serve;
 
 pub use agent::{
-    BUILD_REVISION, VERSION, WorkerParts, agents, assemble, assemble_with, build_version, card_of,
-    card_of_folder,
+    BUILD_REVISION, VERSION, WorkerParts, agents, assemble, assemble_limited, assemble_with,
+    build_version, card_of, card_of_folder,
 };
 pub use config::{Config, ConfigError, McpSettings, WorkerConfig};
 pub use error::AgentError;

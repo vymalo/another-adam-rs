@@ -171,6 +171,15 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "config.modelContextWindow is set and config.extraEnv sets MODEL_CONTEXT_WINDOW: set one" -}}
 {{- end -}}
 {{- end -}}
+{{- /* config.maxParallelToolCalls: a whole number from 1 to 32, which the binary would otherwise refuse with exit 78. */ -}}
+{{- with include "coder.maxParallelToolCalls" . -}}
+{{- if or (not (regexMatch "^[1-9][0-9]?$" .)) (gt (int64 .) 32) -}}
+{{- fail (printf "config.maxParallelToolCalls must be a whole number from 1 to 32 (the tool calls of a model turn that run at once), got %q" .) -}}
+{{- end -}}
+{{- if hasKey $.Values.config.extraEnv "MAX_PARALLEL_TOOL_CALLS" -}}
+{{- fail "config.maxParallelToolCalls is set and config.extraEnv sets MAX_PARALLEL_TOOL_CALLS: set one" -}}
+{{- end -}}
+{{- end -}}
 {{- /* config.modelBaseUrlFromSecret: MODEL_BASE_URL from the ExternalSecret, not from config.modelBaseUrl. */ -}}
 {{- if not (kindIs "bool" .Values.config.modelBaseUrlFromSecret) -}}
 {{- fail (printf "config.modelBaseUrlFromSecret must be true or false, got %q" (toString .Values.config.modelBaseUrlFromSecret)) -}}

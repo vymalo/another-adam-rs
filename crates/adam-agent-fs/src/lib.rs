@@ -63,12 +63,12 @@ pub use manifest::{
 };
 pub use schema::{
     AgentFrontmatter, Card, CardSkill, CommandFrontmatter, EnvRef, ExtendedCard, Limits,
-    MAX_MINUTES_LIMIT, MAX_REFERENCES, McpConfig, McpServer, McpSettings, ModelRef,
-    REFERENCE_BRANCH_MAX, REFERENCE_DESCRIPTION_MAX, REFERENCE_URL_MAX, REFERENCES_FILE_MAX,
-    ReferenceDef, ReferencesRead, RemoteKind, ScheduleFrontmatter, Segment, SkillFrontmatter,
-    SkillSelection, ToolList, check_references, is_agent_name, is_env_name, is_reference_name,
-    is_skill_name, is_tool_name, parse_references_file, read_references_leniently,
-    split_env_references,
+    MAX_MINUTES_LIMIT, MAX_PARALLEL_LIMIT, MAX_REFERENCES, McpConfig, McpServer, McpSettings,
+    ModelRef, REFERENCE_BRANCH_MAX, REFERENCE_DESCRIPTION_MAX, REFERENCE_URL_MAX,
+    REFERENCES_FILE_MAX, ReferenceDef, ReferencesRead, RemoteKind, ScheduleFrontmatter, Segment,
+    SkillFrontmatter, SkillSelection, ToolList, check_references, is_agent_name, is_env_name,
+    is_reference_name, is_skill_name, is_tool_name, parse_references_file,
+    read_references_leniently, split_env_references,
 };
 pub use source::{Dir, ManifestSource};
 

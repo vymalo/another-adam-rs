@@ -87,6 +87,7 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
+  max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 references:                    # root only: repositories the coder reads and never writes (below)
   - { name: design-system, url: "https://github.com/acme/design-system", description: Tokens and components the UI follows. }

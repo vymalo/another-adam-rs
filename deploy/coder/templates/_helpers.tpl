@@ -114,6 +114,20 @@ _validate.tpl to refuse. Null or empty is nothing at all.
 {{- end -}}
 
 {{/*
+config.maxParallelToolCalls as the text MAX_PARALLEL_TOOL_CALLS holds: Helm reads the numbers of a values
+file as floats, so a whole one is written in full; anything else is written as it is, for _validate.tpl to
+refuse. Null or empty is nothing at all.
+*/}}
+{{- define "coder.maxParallelToolCalls" -}}
+{{- $v := .Values.config.maxParallelToolCalls -}}
+{{- if and (kindIs "float64" $v) (eq $v (floor $v)) -}}
+{{- printf "%.0f" $v -}}
+{{- else if not (kindIs "invalid" $v) -}}
+{{- toString $v | trim -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Whether config.modelBaseUrl holds a URL somebody chose: not empty and not the placeholder above.
 Renders "true" or nothing.
 */}}

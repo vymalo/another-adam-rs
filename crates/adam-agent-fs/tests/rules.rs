@@ -285,6 +285,24 @@ fn cases() -> Vec<Case> {
             "`limits.max_minutes` is at most 1440",
         ),
         (
+            "max_parallel of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_parallel: 0 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_parallel` is from 1 to 32",
+        ),
+        (
+            "max_parallel over 32",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_parallel: 33 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_parallel` is from 1 to 32",
+        ),
+        (
             "unknown card key",
             vec![(
                 "agent/instructions.md",
@@ -1364,4 +1382,21 @@ fn merging_adds_servers_and_refuses_a_name_both_have() {
         ["github"],
         "the clashing names, and nothing merged"
     );
+}
+
+#[test]
+fn max_parallel_from_1_to_32_is_read_and_is_no_diagnostic() {
+    for n in [1u32, 10, 32] {
+        let text = format!("---\nname: root\nlimits: {{ max_parallel: {n} }}\n---\nHi.\n");
+        let dir = write(&[("agent/instructions.md", text.as_str())]);
+        let report = load(dir.path());
+        assert!(
+            report.diagnostics.is_empty(),
+            "{n}: {:?}",
+            report.diagnostics
+        );
+        let package = report.into_package(Strictness::Strict).unwrap();
+        let limits = package.agents[0].frontmatter.limits.as_ref().unwrap();
+        assert_eq!(limits.max_parallel, Some(n));
+    }
 }

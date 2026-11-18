@@ -16,6 +16,7 @@
 //! | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` turns them off ([`A2aSettings::docs`]) | `true` |
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
+//! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]) | `10` |
 //! | `WORKER_ID` | stable identity of this worker (the lease identity; the run owner for a binary that pins runs); letters, digits, `.`, `_`, `-` | random per process |
 //! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix ([`ModelConfig`]) | required for `all` and `worker` |
 //! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker` |
@@ -484,13 +485,37 @@ impl A2aSettings {
     }
 }
 
-/// `WORKERS` and `WORKER_ID`: how a worker process takes runs.
+/// The default of `MAX_PARALLEL_TOOL_CALLS`.
+pub const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 10;
+
+/// The most `MAX_PARALLEL_TOOL_CALLS` may say.
+pub const MAX_PARALLEL_TOOL_CALLS_LIMIT: usize = 32;
+
+/// `MAX_PARALLEL_TOOL_CALLS`: 1 to [`MAX_PARALLEL_TOOL_CALLS_LIMIT`], the default when unset or blank;
+/// anything else is a problem and the default.
+fn parse_max_parallel(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> usize {
+    const NAME: &str = "MAX_PARALLEL_TOOL_CALLS";
+    let n = parse_or(get, NAME, DEFAULT_MAX_PARALLEL_TOOL_CALLS, problems);
+    if (1..=MAX_PARALLEL_TOOL_CALLS_LIMIT).contains(&n) {
+        return n;
+    }
+    problems.push(format!(
+        "{NAME} must be between 1 and {MAX_PARALLEL_TOOL_CALLS_LIMIT}, got {n}"
+    ));
+    DEFAULT_MAX_PARALLEL_TOOL_CALLS
+}
+
+/// `WORKERS`, `WORKER_ID` and `MAX_PARALLEL_TOOL_CALLS`: how a worker process takes runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerSettings {
     /// `WORKERS`: runs advanced concurrently.
     pub workers: usize,
     /// `WORKER_ID`: the lease identity of this worker. `None`: a random one per process.
     pub worker_id: Option<String>,
+    /// `MAX_PARALLEL_TOOL_CALLS`: the most tool calls of one model turn that run at the same time,
+    /// 1 to [`MAX_PARALLEL_TOOL_CALLS_LIMIT`] (`1` is one at a time). An agent file's
+    /// `limits.max_parallel` may lower it for that agent, never raise it.
+    pub max_parallel_tool_calls: usize,
 }
 
 impl WorkerSettings {
@@ -510,7 +535,12 @@ impl WorkerSettings {
                 "WORKER_ID {id:?} is not usable: 1 to 128 letters, digits, `.`, `_` or `-`, not starting with `.`"
             ));
         }
-        Self { workers, worker_id }
+        let max_parallel_tool_calls = parse_max_parallel(&get, problems);
+        Self {
+            workers,
+            worker_id,
+            max_parallel_tool_calls,
+        }
     }
 
     /// The runtime options these settings give: this many runs at once, under this id. The claim
@@ -1093,7 +1123,8 @@ mod tests {
             c.worker,
             Some(WorkerSettings {
                 workers: 4,
-                worker_id: None
+                worker_id: None,
+                max_parallel_tool_calls: 10,
             })
         );
     }
@@ -1119,6 +1150,36 @@ mod tests {
                 "{name} missing from {problems:?}"
             );
         }
+    }
+
+    #[test]
+    fn max_parallel_tool_calls_is_10_by_default_and_1_to_32() {
+        let workers = |value: Option<&'static str>| {
+            let mut vars = full();
+            if let Some(value) = value {
+                vars.insert("MAX_PARALLEL_TOOL_CALLS", value);
+            }
+            parse(&vars).map(|c| c.worker.unwrap().max_parallel_tool_calls)
+        };
+        assert_eq!(workers(None).unwrap(), 10);
+        assert_eq!(workers(Some("  ")).unwrap(), 10, "blank is unset");
+        assert_eq!(workers(Some("1")).unwrap(), 1);
+        assert_eq!(workers(Some(" 32 ")).unwrap(), 32);
+        for bad in ["0", "33", "x", "-1", "2.5"] {
+            let problems = workers(Some(bad)).unwrap_err().problems;
+            assert!(
+                mentions(&problems, "MAX_PARALLEL_TOOL_CALLS"),
+                "{bad}: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_plane_does_not_validate_max_parallel_tool_calls() {
+        let mut vars = with_role("control-plane");
+        vars.insert("MAX_PARALLEL_TOOL_CALLS", "99");
+        let config = parse(&vars).expect("a control plane does not read it");
+        assert!(config.worker.is_none());
     }
 
     #[test]

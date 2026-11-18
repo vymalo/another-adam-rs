@@ -4,7 +4,7 @@
 use adam::mcp::McpPolicy;
 use adam::{AgentDef, AgentFolder, Assembly};
 use adam_a2a::AgentCardConfig;
-use adam_llm_agent::{LlmStarter, StepIo};
+use adam_llm_agent::{DEFAULT_MAX_PARALLEL, LlmStarter, StepIo};
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions};
 use adam_ui::Ui;
@@ -98,6 +98,9 @@ pub struct WorkerParts<'a> {
     /// scrubbed from both ([`redact::step_io`](crate::redact::step_io)), then the contract's cuts.
     /// [`StepIo::default`] sends both unscrubbed.
     pub step_io: StepIo,
+    /// The most tool calls of one model turn that run at the same time (`MAX_PARALLEL_TOOL_CALLS`,
+    /// 1 to 32): an agent file's `limits.max_parallel` may lower it for its agent.
+    pub max_parallel: usize,
 }
 
 /// Assemble the agent of `def` for a role that runs workers: connect the MCP servers of its
@@ -120,7 +123,8 @@ pub async fn assemble(
 }
 
 /// [`assemble`], with `step_io` saying how the step of each tool call reports its input and output
-/// (the secrets to scrub from them: [`redact::step_io`](crate::redact::step_io)).
+/// (the secrets to scrub from them: [`redact::step_io`](crate::redact::step_io)). The agents run
+/// [`DEFAULT_MAX_PARALLEL`] tool calls of a turn at once.
 ///
 /// # Errors
 ///
@@ -131,6 +135,24 @@ pub async fn assemble_with(
     alias: &str,
     mcp: &McpPolicy,
     step_io: StepIo,
+) -> Result<Assembly, AgentError> {
+    assemble_limited(def, model, alias, mcp, step_io, DEFAULT_MAX_PARALLEL).await
+}
+
+/// [`assemble_with`], with `max_parallel` the most tool calls of one model turn that run at the same
+/// time for every agent (`MAX_PARALLEL_TOOL_CALLS`, 1 to 32); an agent file's `limits.max_parallel`
+/// may lower it for that agent, never raise it.
+///
+/// # Errors
+///
+/// As [`assemble`].
+pub async fn assemble_limited(
+    def: AgentDef,
+    model: DynModel,
+    alias: &str,
+    mcp: &McpPolicy,
+    step_io: StepIo,
+    max_parallel: usize,
 ) -> Result<Assembly, AgentError> {
     // The servers are connected now, at startup, before the agent is bound: a server that is down,
     // a local process the policy does not allow, a `${VAR}` that is unset are startup errors with
@@ -147,6 +169,7 @@ pub async fn assemble_with(
         .bind(ui.tools())
         .map_err(|e| AgentError::Assembly(Box::new(e)))?
         .tool_source(ui.source())
+        .max_parallel(max_parallel)
         .step_io(step_io);
     bound
         .model(model, alias)
@@ -175,8 +198,15 @@ pub async fn agents(
     let commands = adam_a2a_runtime::Commands::from_manifest(&def.manifest().commands);
     let (agents, commands, card) = match workers {
         Some(parts) => {
-            let assembly =
-                assemble_with(def, parts.model, parts.alias, &parts.mcp, parts.step_io).await?;
+            let assembly = assemble_limited(
+                def,
+                parts.model,
+                parts.alias,
+                &parts.mcp,
+                parts.step_io,
+                parts.max_parallel,
+            )
+            .await?;
             // The prompts of the root's MCP servers are commands too, known only now that the
             // servers are connected: a role without workers connects none, so it serves none.
             let (commands, listed) =

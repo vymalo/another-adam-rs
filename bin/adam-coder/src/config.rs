@@ -202,6 +202,8 @@ pub struct WorkerConfig {
     pub worker_id: Option<String>,
     /// `WORKERS`.
     pub workers: usize,
+    /// `MAX_PARALLEL_TOOL_CALLS`: the most tool calls of one model turn that run at once.
+    pub max_parallel_tool_calls: usize,
     /// `MAX_CHECK_CYCLES`.
     pub max_check_cycles: u32,
     /// `SCRATCH_CHECK_CYCLES`.
@@ -899,6 +901,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("language_servers", &self.language_servers)
             .field("language_server_idle", &self.language_server_idle)
             .field("language_servers_max", &self.language_servers_max)
+            .field("max_parallel_tool_calls", &self.max_parallel_tool_calls)
             .field("pr_draft", &self.pr_draft)
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
@@ -1241,6 +1244,7 @@ impl WorkerConfig {
             placement,
             worker_id: settings.worker_id.clone(),
             workers: settings.workers,
+            max_parallel_tool_calls: settings.max_parallel_tool_calls,
             max_check_cycles,
             scratch_check_cycles,
             workspace_sweep: workspace_sweep.map(Duration::from_secs),
@@ -1582,6 +1586,33 @@ mod tests {
                 err.problems.iter().any(|p| p.starts_with(name)),
                 "{name}={bad}: {:?}",
                 err.problems
+            );
+        }
+    }
+
+    #[test]
+    fn the_parallel_limit_defaults_to_10_and_a_bad_one_is_78() {
+        let c = parse(&full()).expect("valid").worker.expect("a worker");
+        assert_eq!(c.max_parallel_tool_calls, 10);
+        let mut vars = full();
+        vars.insert("MAX_PARALLEL_TOOL_CALLS", "32");
+        let c = parse(&vars).expect("valid").worker.expect("a worker");
+        assert_eq!(c.max_parallel_tool_calls, 32);
+        for bad in ["0", "33", "x"] {
+            let mut vars = full();
+            vars.insert("MAX_PARALLEL_TOOL_CALLS", bad);
+            let err = parse(&vars).unwrap_err();
+            assert!(
+                err.problems
+                    .iter()
+                    .any(|p| p.starts_with("MAX_PARALLEL_TOOL_CALLS")),
+                "{bad}: {:?}",
+                err.problems
+            );
+            assert_eq!(
+                crate::exit_code(&anyhow::Error::from(err)),
+                78,
+                "MAX_PARALLEL_TOOL_CALLS={bad}"
             );
         }
     }
