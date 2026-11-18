@@ -47,6 +47,9 @@ a2a-client-lf = "0.2"
 a2a-lf = "0.3"
 a2a-server-lf = "0.4"
 agent-client-protocol = "2.2"
+# The coder's redactor scans an output once for every registered secret: already in the tree under
+# regex, with the default (contiguous NFA) engine.
+aho-corasick = "1"
 anyhow = "1"
 async-trait = "0.1"
 # Signs the JWT of a GitHub App (adam-workspace): already in the tree under rustls, with the features
