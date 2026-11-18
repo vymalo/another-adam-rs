@@ -121,6 +121,19 @@ impl GitAt {
             .is_ok()
     }
 
+    /// The repository's common directory when the coder's metadata names it (a worktree's mirror,
+    /// a scratch project's `.git`): the pin already says what `git rev-parse --git-common-dir`
+    /// would answer, and asking it would be a process for a value that cannot change. `None` for a
+    /// directory `git` finds by itself (the tests'), which has to be asked.
+    fn pinned_common_dir(&self) -> Option<&Path> {
+        match &self.pin {
+            Pin::Pinned(pin) => Some(pin.common_dir()),
+            #[cfg(test)]
+            Pin::Plain => None,
+            Pin::Refused => None,
+        }
+    }
+
     /// The repository's index: the file in the git directory the pin names (not what `git` is
     /// asked, which reads files a run writes), or, for a directory `git` finds by itself, what it
     /// says. `None` for a refused repository.
@@ -424,6 +437,15 @@ fn moved_by_others(refname: &str) -> bool {
         || refname == "refs/stash"
 }
 
+/// [`moved_by_others`] as `for-each-ref --exclude` patterns (git 2.43), so that the scan does not
+/// produce a line per run's branch only to drop it: the two lists name the same namespaces.
+const MOVED_BY_OTHERS: [&str; 4] = [
+    "refs/heads/agent/*",
+    "refs/remotes/*",
+    "refs/tags/*",
+    "refs/stash",
+];
+
 /// Whether `key` is one that `prepare` and `push` write for a run's own branch.
 fn written_per_run(key: &str) -> bool {
     key.starts_with("branch.agent/")
@@ -437,8 +459,13 @@ const MAX_EXCLUDE: u64 = 1024 * 1024;
 
 /// `<common dir>/info/exclude`, where the repository's local ignore rules live.
 async fn exclude_path(at: &GitAt) -> Option<std::path::PathBuf> {
-    let common = git_stdout(at, &["rev-parse", "--git-common-dir"]).await?;
-    Some(at.path().join(common).join("info/exclude"))
+    let common = match at.pinned_common_dir() {
+        Some(dir) => dir.to_path_buf(),
+        None => at
+            .path()
+            .join(git_stdout(at, &["rev-parse", "--git-common-dir"]).await?),
+    };
+    Some(common.join("info/exclude"))
 }
 
 /// The content of the exclude file at `path`: `Some(None)` when there is none, and `None` when it
@@ -517,7 +544,12 @@ async fn put_exclude(at: &GitAt, path: &Path, content: Option<&str>) -> bool {
 
 /// [`RepoState`] now, `None` when it cannot be read.
 pub(crate) async fn repo_state(at: &GitAt) -> Option<RepoState> {
-    let refs = git_stdout(at, &["for-each-ref", "--format=%(refname) %(objectname)"]).await?;
+    let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)"];
+    for pattern in MOVED_BY_OTHERS {
+        args.push("--exclude");
+        args.push(pattern);
+    }
+    let refs = git_stdout(at, &args).await?;
     let refs = refs
         .lines()
         .filter_map(|l| l.split_once(' '))
@@ -941,6 +973,25 @@ mod tests {
         // `CARGO_PKG_NAME` is set by cargo in every test process: it stands for a secret.
         assert!(!env.contains("CARGO_PKG_NAME"), "{env}");
         assert!(env.contains("PATH="), "what git needs is kept: {env}");
+    }
+
+    /// The refs left out of the `for-each-ref` scan are the refs [`moved_by_others`] leaves out of
+    /// the comparison: a branch literally named `agent` is not a run's branch and is kept.
+    #[test]
+    fn the_scan_leaves_out_the_namespaces_the_comparison_leaves_out() {
+        assert_eq!(MOVED_BY_OTHERS.len(), 4);
+        for name in [
+            "refs/heads/agent/run-1",
+            "refs/heads/agent/run-1/w1",
+            "refs/remotes/origin/main",
+            "refs/tags/v1",
+            "refs/stash",
+        ] {
+            assert!(moved_by_others(name), "{name}");
+        }
+        for name in ["refs/heads/agent", "refs/heads/main", "refs/notes/commits"] {
+            assert!(!moved_by_others(name), "{name}");
+        }
     }
 }
 

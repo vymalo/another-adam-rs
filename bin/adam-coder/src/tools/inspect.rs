@@ -187,15 +187,23 @@ impl Snapshot {
     /// The state of the worktree `at`. `own` is the branch the run's metadata says the worktree is on
     /// (a repository's worktree; `None` for a scratch project).
     pub(super) async fn take(at: &GitAt, own: Option<&str>) -> Option<Self> {
-        let git_dir = git_stdout(at, &["rev-parse", "--absolute-git-dir"]).await?;
-        // The file is in the slot, which a command can have replaced: read as a regular file, in
-        // the directory the coder opened as the slot, and not through a link.
-        let dot_git = at.dot_git().await;
-        let branch = head_ref(at).await;
-        let head = head_sha(at).await?;
+        // Every question is an independent read of the worktree, and each one is a `git` process:
+        // asked at once they cost one round of starts rather than six, and a command has already
+        // ended by the time this is called. `status` is the fallback of the tree id, so it waits
+        // for it.
+        let (git_dir, dot_git, branch, head, tree, repo) = tokio::join!(
+            git_stdout(at, &["rev-parse", "--absolute-git-dir"]),
+            at.dot_git(),
+            head_ref(at),
+            head_sha(at),
+            working_tree_id(at),
+            repo_state(at),
+        );
+        let git_dir = git_dir?;
+        let head = head?;
+        let repo = repo?;
         let head_is_foreign =
             own.is_some_and(|own| branch.as_deref() != Some(format!("refs/heads/{own}").as_str()));
-        let tree = working_tree_id(at).await;
         let status = match tree {
             Some(_) => None,
             None => Some(status_text(at).await?),
@@ -209,7 +217,7 @@ impl Snapshot {
             head_is_foreign,
             tree,
             status,
-            repo: repo_state(at).await?,
+            repo,
         })
     }
 
