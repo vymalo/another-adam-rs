@@ -29,7 +29,7 @@
 //!
 //! An image is not scrubbed: only text is. It is sent only from the sources the deployment allows.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use adam_model::{ImageData, ImageLimits, ImageOrigin, ImageRef, human_bytes};
@@ -37,6 +37,7 @@ use adam_runtime::{SystemLine, checked_media_type, image_size, safe_file_name};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -610,36 +611,145 @@ pub(crate) struct ImagePolicy {
     pub(crate) root_run: String,
 }
 
+/// The verified bytes of the images a request names, by scope and SHA-256, for the life of the
+/// agent.
+///
+/// A reference names its bytes by their hash: bytes read once and checked against it are the bytes
+/// every later request of the same scope wants, so a turn reads (and hashes) a file once, not once
+/// per model call. A hash the cache has never seen in this scope is still read and checked, so a
+/// reference cannot reach another conversation's bytes through the cache. Bounded by
+/// [`MAX_SCOPE_IMAGE_BYTES`] in all (what one scope may hold on a volume); the oldest entry goes
+/// first.
+#[derive(Debug, Default)]
+pub(crate) struct ImageCache {
+    bytes: HashMap<(String, String), Arc<[u8]>>,
+    order: VecDeque<(String, String)>,
+    total: usize,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl ImageCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The bytes checked for `sha256` in `scope`, if they were read before.
+    fn get(&mut self, scope: &str, sha256: &str) -> Option<Arc<[u8]>> {
+        let key = (scope.to_owned(), sha256.to_owned());
+        let bytes = self.bytes.get(&key).cloned();
+        #[cfg(test)]
+        {
+            if bytes.is_some() {
+                self.hits += 1;
+            } else {
+                self.misses += 1;
+            }
+        }
+        bytes
+    }
+
+    fn insert(&mut self, scope: &str, sha256: String, bytes: Arc<[u8]>) {
+        let key = (scope.to_owned(), sha256);
+        if self.bytes.contains_key(&key) {
+            return;
+        }
+        self.total = self.total.saturating_add(bytes.len());
+        self.bytes.insert(key.clone(), bytes);
+        self.order.push_back(key);
+        while self.total > MAX_SCOPE_IMAGE_BYTES as usize {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(gone) = self.bytes.remove(&oldest) {
+                self.total = self.total.saturating_sub(gone.len());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        (self.misses, self.hits)
+    }
+}
+
 /// The bytes the images of `messages` need, read from the keeper or the run's state: the ones that
 /// cannot be read (not kept, changed, gone) are left out, and the client sends the line that says
 /// so. `refs` are the images of the request as it is sent ([`for_sending`]), so a model that does
 /// not see, or an image the deployment no longer sends, is never loaded.
+///
+/// A reference names its bytes by their SHA-256, so the bytes checked against the hash once are
+/// the bytes every later request wants: `cache` keeps them for the life of the agent, and only a
+/// hash it has never seen is read (and checked) again. The first read of a hash is the integrity
+/// check; a file changed behind its back is never served, because what was checked is what stays.
 pub(crate) async fn image_data(
     refs: Vec<&ImageRef>,
     store: Option<&ImageStore>,
     scope: &str,
     state: &StateImages,
+    cache: &Mutex<ImageCache>,
 ) -> ImageData {
     let mut data = ImageData::new();
-    for image in refs {
-        if data.get(&image.sha256).is_some() {
-            continue;
-        }
-        let bytes = match store {
-            Some(store) => match store.0.load(scope, &image.sha256).await {
-                Ok(bytes) => Some(bytes),
-                Err(error) => {
-                    tracing::warn!(%error, "an image could not be read back: a line is sent in its place");
-                    None
+    let mut wanted: Vec<&ImageRef> = Vec::new();
+    {
+        let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        for image in refs {
+            if data.get(&image.sha256).is_some() || wanted.iter().any(|w| w.sha256 == image.sha256)
+            {
+                continue;
+            }
+            match cache.get(scope, &image.sha256) {
+                Some(bytes) => {
+                    data.insert(image.sha256.clone(), bytes);
                 }
-            },
-            None => state
-                .get(&image.sha256)
-                .and_then(|s| STANDARD.decode(&s.data).ok()),
-        };
+                None => wanted.push(image),
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return data;
+    }
+    // The images of one request are read at the same time: one blocking read each, and a
+    // sequential loop would make a request with eight images wait for eight reads.
+    let loaded: Vec<Option<Vec<u8>>> = match store {
+        Some(store) => {
+            let store = store.clone();
+            join_all(wanted.iter().map(|image| {
+                let store = store.clone();
+                let sha256 = image.sha256.clone();
+                async move {
+                    match store.0.load(scope, &sha256).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "an image could not be read back: a line is sent in its place"
+                            );
+                            None
+                        }
+                    }
+                }
+            }))
+            .await
+        }
+        None => wanted
+            .iter()
+            .map(|image| {
+                state
+                    .get(&image.sha256)
+                    .and_then(|s| STANDARD.decode(&s.data).ok())
+            })
+            .collect(),
+    };
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    for (image, bytes) in wanted.into_iter().zip(loaded) {
         // Whatever a keeper hands back is the image the reference names, or it is not sent.
         if let Some(bytes) = bytes.filter(|b| sha256_hex(b) == image.sha256) {
-            data.insert(image.sha256.clone(), Arc::from(bytes));
+            let bytes: Arc<[u8]> = Arc::from(bytes);
+            cache.insert(scope, image.sha256.clone(), Arc::clone(&bytes));
+            data.insert(image.sha256.clone(), bytes);
         }
     }
     data
@@ -1031,6 +1141,7 @@ pub async fn kept_images_conformance(store: &dyn KeptImages, tamper: Option<&Tam
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     fn limits() -> ImageLimits {
         ImageLimits {
@@ -1543,10 +1654,12 @@ mod tests {
             },
         );
         let scope = image_scope(Some("c"), "r");
-        let data = image_data(vec![&named, &never], None, &scope, &state).await;
+        let cache = Mutex::new(ImageCache::new());
+        let data = image_data(vec![&named, &never], None, &scope, &state, &cache).await;
         assert_eq!(data.len(), 1);
         assert_eq!(data.get(&sha).map(|b| b.to_vec()), Some(bytes.clone()));
-        // What was changed in the state is not served: the hash is checked every time.
+        // What was changed in the state is not served to a cache that has never seen the hash: the
+        // hash is checked on the first read.
         state.insert(
             sha.clone(),
             StateImage {
@@ -1554,11 +1667,16 @@ mod tests {
                 data: STANDARD.encode(b"changed"),
             },
         );
+        let fresh = Mutex::new(ImageCache::new());
         assert!(
-            image_data(vec![&named], None, &scope, &state)
+            image_data(vec![&named], None, &scope, &state, &fresh)
                 .await
                 .is_empty()
         );
+        // The bytes already checked for the hash are the ones served for it: the changed copy is
+        // never sent.
+        let again = image_data(vec![&named], None, &scope, &state, &cache).await;
+        assert_eq!(again.get(&sha).map(|b| b.to_vec()), Some(bytes));
         // And what is not base64 is nothing.
         state.insert(
             sha,
@@ -1567,10 +1685,109 @@ mod tests {
                 data: "@@@".into(),
             },
         );
+        let fresh = Mutex::new(ImageCache::new());
         assert!(
-            image_data(vec![&named], None, &scope, &state)
+            image_data(vec![&named], None, &scope, &state, &fresh)
                 .await
                 .is_empty()
         );
+    }
+
+    /// A keeper that counts the loads it is asked for.
+    struct Counting {
+        inner: MemoryImages,
+        loads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl KeptImages for Counting {
+        async fn keep(
+            &self,
+            scope: &str,
+            sha256: &str,
+            media_type: &str,
+            bytes: &[u8],
+        ) -> Result<(), ImageKeepError> {
+            self.inner.keep(scope, sha256, media_type, bytes).await
+        }
+        async fn load(&self, scope: &str, sha256: &str) -> Result<Vec<u8>, ImageKeepError> {
+            self.loads.fetch_add(1, SeqCst);
+            self.inner.load(scope, sha256).await
+        }
+    }
+
+    /// A hash is read and checked once: the second request for the same reference is served from
+    /// the bytes the first one checked, and reads nothing.
+    #[tokio::test]
+    async fn the_bytes_of_a_hash_are_read_once() {
+        let bytes = png(8, 8, 9);
+        let sha = sha256_hex(&bytes);
+        let keeper = Arc::new(Counting {
+            inner: MemoryImages::new(),
+            loads: AtomicUsize::new(0),
+        });
+        let scope = image_scope(Some("c"), "r");
+        keeper
+            .keep(&scope, &sha, "image/png", &bytes)
+            .await
+            .unwrap();
+        let store = ImageStore(keeper.clone());
+        let named = ImageRef {
+            sha256: sha.clone(),
+            media_type: "image/png".into(),
+            bytes: bytes.len() as u64,
+            width: 8,
+            height: 8,
+            name: None,
+            origin: ImageOrigin::Person,
+        };
+        let state = StateImages::new();
+        let cache = Mutex::new(ImageCache::new());
+        for _ in 0..2 {
+            let data = image_data(vec![&named], Some(&store), &scope, &state, &cache).await;
+            assert_eq!(data.get(&sha).map(|b| b.to_vec()), Some(bytes.clone()));
+        }
+        assert_eq!(
+            keeper.loads.load(SeqCst),
+            1,
+            "the second request reads nothing"
+        );
+        assert_eq!(cache.lock().unwrap().counts(), (1, 1), "one miss, one hit");
+    }
+
+    /// The cache is per scope: the bytes checked for one conversation's image are not served to a
+    /// reference in another scope, which reads (and misses) as it always did.
+    #[tokio::test]
+    async fn the_cache_does_not_serve_one_scope_to_another() {
+        let bytes = png(8, 8, 11);
+        let sha = sha256_hex(&bytes);
+        let keeper = Arc::new(Counting {
+            inner: MemoryImages::new(),
+            loads: AtomicUsize::new(0),
+        });
+        let a = image_scope(Some("a"), "r");
+        keeper.keep(&a, &sha, "image/png", &bytes).await.unwrap();
+        let store = ImageStore(keeper.clone());
+        let named = ImageRef {
+            sha256: sha.clone(),
+            media_type: "image/png".into(),
+            bytes: bytes.len() as u64,
+            width: 8,
+            height: 8,
+            name: None,
+            origin: ImageOrigin::Person,
+        };
+        let state = StateImages::new();
+        let cache = Mutex::new(ImageCache::new());
+        let data = image_data(vec![&named], Some(&store), &a, &state, &cache).await;
+        assert_eq!(data.get(&sha).map(|b| b.to_vec()), Some(bytes));
+        // Scope `b` never checked this hash, and the store keeps no image for it: nothing is sent.
+        let b = image_scope(Some("b"), "r");
+        assert!(
+            image_data(vec![&named], Some(&store), &b, &state, &cache)
+                .await
+                .is_empty()
+        );
+        assert_eq!(keeper.loads.load(SeqCst), 2, "scope b reads, and misses");
     }
 }

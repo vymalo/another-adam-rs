@@ -38,9 +38,9 @@ use crate::conversation::{
 };
 use crate::history::record_shortenings;
 use crate::images::{
-    ImageGate, ImageStore, InboundImage, Item, KeptImage, MAX_RUN_JOURNALED_IMAGE_BYTES,
-    admit_inbound, answer_with, described, for_sending, image_data, image_scope, image_step,
-    parse_inbound_images, parts_of, state_bytes,
+    ImageCache, ImageGate, ImageStore, InboundImage, Item, KeptImage,
+    MAX_RUN_JOURNALED_IMAGE_BYTES, admit_inbound, answer_with, described, for_sending, image_data,
+    image_scope, image_step, parse_inbound_images, parts_of, state_bytes,
 };
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
 use crate::order;
@@ -761,6 +761,7 @@ impl LlmAgentBuilder {
             step_io: self.step_io,
             session_agents: self.session_agents.into(),
             max_parallel: self.max_parallel,
+            images_cache: Arc::new(Mutex::new(ImageCache::new())),
         }
     }
 }
@@ -927,6 +928,9 @@ pub struct LlmAgent {
     session_agents: Arc<[String]>,
     /// The most tool calls of a turn that run at the same time.
     max_parallel: usize,
+    /// The bytes of the images already read and checked, by SHA-256, shared by every run of this
+    /// agent: a turn reads an image file once, not once per model call.
+    images_cache: Arc<Mutex<ImageCache>>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -1438,6 +1442,7 @@ impl LlmAgent {
             &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
         );
         let images_state = Arc::clone(&state.images);
+        let images_cache = Arc::clone(&self.images_cache);
         let recorded: Result<Recorded, ModelFailure> = ctx
             .step(&format!("model:{turn}"), move || async move {
                 if !named.is_empty() {
@@ -1446,6 +1451,7 @@ impl LlmAgent {
                         images_store.as_ref(),
                         &images_scope,
                         &images_state,
+                        &images_cache,
                     )
                     .await;
                 }
@@ -1898,6 +1904,7 @@ impl LlmAgent {
             &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
         );
         let images_state = Arc::clone(&state.images);
+        let images_cache = Arc::clone(&self.images_cache);
         let recorded: Result<Summarised, ModelFailure> = ctx
             .step(&id, move || async move {
                 if !named.is_empty() {
@@ -1906,6 +1913,7 @@ impl LlmAgent {
                         images_store.as_ref(),
                         &images_scope,
                         &images_state,
+                        &images_cache,
                     )
                     .await;
                 }

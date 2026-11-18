@@ -1712,10 +1712,45 @@ async fn a_model_that_stops_seeing_is_sent_lines_and_no_bytes_are_read() {
     assert!(loads.load(SeqCst) >= 1);
 }
 
-/// The bytes of an image gone between two turns (the file was changed) are the one case for the line
-/// "could not be loaded": the reference stays in the request, and its bytes are not sent.
+/// A keeper is asked for an image's bytes once: the turns after the first are served from the bytes
+/// the first one checked, not read (and hashed) again for every request that names them.
 #[tokio::test]
-async fn an_image_whose_bytes_vanish_is_a_reference_without_bytes() {
+async fn the_bytes_of_an_image_are_read_once_for_the_run() {
+    let keeper = Arc::new(Counting {
+        inner: MemoryImages::new(),
+        loads: AtomicUsize::new(0),
+    });
+    let rig = Rig::seeing(0, limits(8), {
+        let keeper = keeper.clone();
+        move |b| b.state(Arc::new(ImageStore(keeper))).tool(Snap)
+    });
+    rig.mock
+        .push_tool_calls(vec![snap(1)])
+        .push_tool_calls(vec![snap(2)])
+        .push_text("done");
+    let run = rig.rt.start("llm", looking(4), None).await.expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, _) = rig.finish(run).await;
+    assert_eq!(requests.len(), 3);
+    let person = adam_llm_agent::sha256_hex(&png(64, 64, 4));
+    for request in &requests {
+        assert!(
+            images_of(&request.messages)
+                .iter()
+                .any(|image| image.sha256 == person),
+            "the person's image is in every request"
+        );
+        assert!(request.image_data.get(&person).is_some());
+    }
+    // The person's and the two tool images, each read once: six reads before the cache.
+    assert_eq!(keeper.loads.load(SeqCst), 3);
+}
+
+/// The bytes of an image changed between two turns are the bytes already checked for its hash: the
+/// reference stays in the request, the bytes it names are sent from the cache, and what was written
+/// over the file is never sent.
+#[tokio::test]
+async fn an_image_changed_between_turns_is_sent_from_the_bytes_already_checked() {
     let images = Arc::new(MemoryImages::new());
     let rig = Rig::seeing(0, limits(8), {
         let images = images.clone();
@@ -1737,13 +1772,21 @@ async fn an_image_whose_bytes_vanish_is_a_reference_without_bytes() {
     *rig.arm.run.lock().unwrap() = Some(run);
     let (requests, _) = rig.finish(run).await;
     assert_eq!(requests[0].image_data.len(), 1);
-    // The reference is still in the second request, and its bytes are not there.
+    // The reference is still in the second request, and its bytes are the ones the first request
+    // checked: the changed file is not served.
     assert_eq!(images_of(&requests[1].messages).len(), 2);
     assert_eq!(
         requests[1].image_data.len(),
-        1,
-        "only the tool's image has bytes"
+        2,
+        "the person's bytes are the checked ones; the tool's image has its own"
     );
+    let person = adam_llm_agent::sha256_hex(&png(64, 64, 4));
+    let bytes = requests[1]
+        .image_data
+        .get(&person)
+        .expect("the person's bytes");
+    assert_eq!(bytes.as_ref(), png(64, 64, 4).as_slice());
+    assert_ne!(bytes.as_ref(), b"changed behind its back");
 }
 
 /// A request the provider refuses for itself, with images no earlier request carried: they are
