@@ -271,7 +271,9 @@ impl Ctx {
     /// transient retry re-runs the steps of the failed try. Make side effects
     /// idempotent (idempotency keys, "create if absent", upserts) when running
     /// them twice would be harmful.
-    #[tracing::instrument(skip(self, f), fields(run = %self.run, seq = self.seq))]
+    /// A step is one journaled side effect, and there are several per transition: the span is
+    /// `debug`, so a worker at `info` pays nothing for it.
+    #[tracing::instrument(level = "debug", skip(self, f), fields(run = %self.run, seq = self.seq))]
     pub async fn step<T, E, F, Fut>(&mut self, name: &str, f: F) -> Result<Result<T, E>, AgentError>
     where
         T: Serialize + DeserializeOwned,

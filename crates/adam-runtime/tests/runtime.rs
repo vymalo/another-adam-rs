@@ -7044,6 +7044,81 @@ mod cases {
         assert_eq!(count(&phase0_runs), 1);
         assert_eq!(arrived.load(SeqCst), 0, "a report is not an arrival yet");
     }
+
+    /// A few MiB of transcript, carried through two commits: the state a commit lands is exactly
+    /// the one the agent returned, and the turns before it are untouched. The size is what makes a
+    /// copy per commit (or a state that does not survive the store) show up.
+    pub async fn a_large_state_lands_unchanged(store: DynStore) {
+        const MESSAGES: usize = 48;
+        const TEXT: usize = 64 * 1024;
+        let name = uniq("large-state");
+        let text = "x".repeat(TEXT);
+        let transcript: Vec<Value> = (0..MESSAGES)
+            .map(|i| {
+                json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "text": text,
+                })
+            })
+            .collect();
+        let start = json!({"messages": transcript});
+        let bytes = serde_json::to_vec(&start)
+            .expect("the state serialises")
+            .len();
+        assert!(
+            bytes > 3 * 1024 * 1024,
+            "the state is a few MiB, not {bytes} bytes"
+        );
+
+        let turns = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let turns = turns.clone();
+                move |_ctx, mut state| {
+                    let turns = turns.clone();
+                    async move {
+                        let messages = state["messages"].as_array_mut().expect("a transcript");
+                        let at = messages.len();
+                        messages.push(json!({"role": "assistant", "text": format!("turn {at}")}));
+                        if turns.fetch_add(1, SeqCst) == 0 {
+                            Ok(Transition::Continue(state))
+                        } else {
+                            Ok(Transition::Done {
+                                state,
+                                output: json!("finished"),
+                            })
+                        }
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let worker = spawn_worker(&rt);
+        let run = rt
+            .start(&name, Inbound::new("start", start.clone()), None)
+            .await
+            .expect("start");
+        let view = wait_done(&rt, run).await;
+        worker.stop().await;
+
+        let appended: Vec<Value> = (MESSAGES..MESSAGES + 2)
+            .map(|i| json!({"role": "assistant", "text": format!("turn {i}")}))
+            .collect();
+        let messages = view.state["messages"].as_array().expect("the transcript");
+        assert_eq!(messages.len(), MESSAGES + 2, "both turns were appended");
+        assert_eq!(
+            &messages[..MESSAGES],
+            start["messages"]
+                .as_array()
+                .expect("a transcript")
+                .as_slice(),
+            "the transcript it started with is the one that landed"
+        );
+        assert_eq!(&messages[MESSAGES..], appended.as_slice());
+        assert_eq!(view.output, Some(json!("finished")));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7160,6 +7235,7 @@ macro_rules! runtime_suite {
                 a_session_listing_dedupes_agents_caps_the_page_and_reads_every_page,
                 a_session_listing_says_how_the_round_ended,
                 a_report_that_lands_while_a_run_finishes_does_not_reopen_it,
+                a_large_state_lands_unchanged,
                 a_round_that_is_its_own_parent_is_listed_reads_as_started_outside_and_is_never_cancelled_with_a_parent,
                 a_cancel_runs_the_agents_hook_once_with_its_last_state,
                 a_finished_run_runs_no_hook,
