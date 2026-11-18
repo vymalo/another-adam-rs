@@ -36,7 +36,7 @@ use crate::conversation::{
     PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_root_run,
     parse_root_step, parse_session, parse_user_text,
 };
-use crate::history::record_shortenings;
+use crate::history::{RunChars, record_shortenings};
 use crate::images::{
     ImageCache, ImageGate, ImageStore, InboundImage, Item, KeptImage,
     MAX_RUN_JOURNALED_IMAGE_BYTES, admit_inbound, answer_with, described, for_sending, image_data,
@@ -762,6 +762,7 @@ impl LlmAgentBuilder {
             session_agents: self.session_agents.into(),
             max_parallel: self.max_parallel,
             images_cache: Arc::new(Mutex::new(ImageCache::new())),
+            run_chars: Arc::new(Mutex::new(RunChars::default())),
         }
     }
 }
@@ -931,6 +932,9 @@ pub struct LlmAgent {
     /// The bytes of the images already read and checked, by SHA-256, shared by every run of this
     /// agent: a turn reads an image file once, not once per model call.
     images_cache: Arc<Mutex<ImageCache>>,
+    /// The characters of each run's history as this worker last counted it: a turn counts only the
+    /// messages appended since, not the whole transcript again.
+    run_chars: Arc<Mutex<RunChars>>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -1210,6 +1214,9 @@ impl LlmAgent {
                     |p| !matches!(p, adam_model::ContentPart::Text { text } if text.is_empty()),
                 );
                 content.extend(parts_of("", &items));
+                // The message the run started with changed in place: the count of the history this
+                // worker keeps no longer describes it, so the next turn counts in full.
+                self.forget_chars(ctx.run_id());
             }
         }
         for inbound in inbox {
@@ -1557,7 +1564,12 @@ impl LlmAgent {
             // The provider refused the request itself: if images no earlier request carried are in
             // it, they may be why.
             Err(f) if f.refused => {
-                return Ok(Self::refused_with_images(state, &carried, &f.message));
+                let flow = Self::refused_with_images(state, &carried, &f.message);
+                if matches!(flow, Flow::Next) {
+                    // Images left the history in place: count it afresh next turn.
+                    self.forget_chars(run);
+                }
+                return Ok(flow);
             }
             Err(f) => return Ok(Flow::Fail(format!("model call failed: {}", f.message))),
         };
@@ -1733,6 +1745,14 @@ impl LlmAgent {
     /// Characters a request holds besides the history: the instructions and the tools.
     fn fixed_chars(&self) -> usize {
         self.fixed_chars
+    }
+
+    /// Forget the character count of a run that ends: nothing of its history is counted again.
+    fn forget_chars(&self, run: RunId) {
+        self.run_chars
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .forget(run);
     }
 
     /// The estimate of the next request, in tokens.
@@ -4189,6 +4209,7 @@ impl Agent for LlmAgent {
                 .map(Message::text)
                 .unwrap_or_default();
             let output = json!({ "text": text, "artifacts": [], "closed": true });
+            self.forget_chars(ctx.run_id());
             return Ok(Transition::Done { state, output });
         }
         // The history is shortened here, in the state, from the state as it was committed: before
@@ -4213,15 +4234,40 @@ impl Agent for LlmAgent {
         if self.compact_if_due(ctx, &mut state, &output_id_of).await? {
             return Ok(Transition::Continue(state));
         }
+        let mut counted = {
+            let mut totals = self
+                .run_chars
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            totals.begin(
+                run,
+                state.turns,
+                state.shortenings.len(),
+                state.compactions.len(),
+            )
+        };
         if record_shortenings(
             &mut state.messages,
             self.limits.max_history_tokens,
             &output_id_of,
+            &mut counted,
         ) {
             state.shortenings.push(state.turns);
             state.last_prompt = None;
             // The images of a result that was shortened left the history with it.
             state.drop_unnamed_images();
+        }
+        {
+            let mut totals = self
+                .run_chars
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            totals.end(
+                run,
+                counted,
+                state.shortenings.len(),
+                state.compactions.len(),
+            );
         }
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx
             .take_inbox()
@@ -4416,9 +4462,13 @@ impl Agent for LlmAgent {
             },
             Flow::Done(mut output) => {
                 self.end_sessions(ctx, &mut state, &mut output).await?;
+                self.forget_chars(ctx.run_id());
                 Transition::Done { state, output }
             }
-            Flow::Fail(error) => Transition::Fail { state, error },
+            Flow::Fail(error) => {
+                self.forget_chars(ctx.run_id());
+                Transition::Fail { state, error }
+            }
         })
     }
 }
