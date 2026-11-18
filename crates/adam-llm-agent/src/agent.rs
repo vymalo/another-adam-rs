@@ -168,7 +168,7 @@ fn has_effect(tool: &str) -> bool {
 /// closes the session is not: it calls no model, ends by itself and reports nothing new, so a run
 /// neither waits for it at the end of a turn nor cancels it when it ends.
 fn does_work(session: &SessionSummary) -> bool {
-    session.state == SessionState::Working && !session.closing
+    session.does_work()
 }
 use crate::source::{
     DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined, withheld,

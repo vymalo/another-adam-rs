@@ -712,6 +712,88 @@ async fn max_parallel_tool_calls_reaches_the_agent_the_process_serves() {
     db.finish().await;
 }
 
+/// A folder with one local subagent, so its root has the session tools, and `root_limits` in the
+/// root's `limits:`.
+fn sessions_folder(root_limits: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("agent/subagents")).unwrap();
+    std::fs::write(
+        dir.path().join("agent/instructions.md"),
+        format!(
+            "---\nname: chat\ndescription: Chats.\ntools: []\nlimits: {{ {root_limits} }}\n---\nHello.\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("agent/subagents/helper.md"),
+        "---\ndescription: Helps.\n---\nHelp.\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// `SESSION_*` and the root's `limits` reach the agent the process serves: the deployment's values
+/// stand, the file lowers one and cannot raise another (with a warning), and every role reads them.
+#[tokio::test]
+async fn session_settings_reach_the_agent_the_process_serves() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let folder = sessions_folder("max_open_sessions: 50, max_working_sessions: 2");
+    for role in ["all", "control-plane"] {
+        let mut env = role_env(role, &db.url(), folder.path());
+        env.push(pair("SESSION_MAX_OPEN", "8"));
+        env.push(pair("SESSION_MAX_WORKING", "3"));
+        env.push(pair("SESSION_MAX_ROUNDS", "10"));
+        env.push(pair("SESSION_IDLE_DAYS", "2"));
+        let mut p = Proc::spawn(&env);
+        p.ready().await;
+        let line = p.line("session limits").unwrap_or_else(|| {
+            panic!("{role}: the `session limits` line\n{}", p.logs());
+        });
+        assert_eq!(
+            line["max_open"], 8,
+            "{role}: the file's 50 does not raise 8: {line}"
+        );
+        assert_eq!(line["max_working"], 2, "{role}: the file lowers 3: {line}");
+        assert_eq!(line["max_rounds"], 10, "{role}: {line}");
+        assert_eq!(line["idle_days"], 2, "{role}: {line}");
+        if role == "all" {
+            assert!(
+                p.stdout()
+                    .contains("`limits.max_open_sessions` is more than the deployment allows"),
+                "{}",
+                p.logs()
+            );
+        }
+        p.stop_cleanly().await;
+    }
+    db.finish().await;
+}
+
+/// A bad `SESSION_*` value stops every role (exit 78) and names the variable; nothing connects.
+#[tokio::test]
+async fn a_bad_session_setting_exits_78_for_every_role() {
+    let folder = sessions_folder("max_session_rounds: 5");
+    for role in ["all", "control-plane", "worker"] {
+        for (name, bad) in [
+            ("SESSION_IDLE_DAYS", "0"),
+            ("SESSION_MAX_OPEN", "101"),
+            ("SESSION_MAX_WORKING", "33"),
+            ("SESSION_MAX_ROUNDS", "1"),
+        ] {
+            let mut env = role_env(role, "postgres://u:p@127.0.0.1:1/x", folder.path());
+            env.push(pair(name, bad));
+            let err = refused(&env, 78).await;
+            assert!(err.contains(name), "{role} {name}={bad}: {err}");
+            assert!(
+                !err.contains("connecting to Postgres"),
+                "{role}: stops before anything connects:\n{err}"
+            );
+        }
+    }
+}
+
 /// A control plane serves the card of the folder and starts runs with no model, no MCP flag and
 /// nothing else a worker needs; a worker in another process steps the run, serves only `/healthz`,
 /// and needs no front variable. They meet in the database.

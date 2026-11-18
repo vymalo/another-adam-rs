@@ -17,6 +17,10 @@
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]) | `10` |
+//! | `SESSION_MAX_OPEN` | the most sessions (a subagent that runs in the background) of one conversation open at once, 1 to 100; read by **every role**; the root agent's `limits.max_open_sessions` may lower it ([`SessionSettings::limits`]) | `16` |
+//! | `SESSION_MAX_WORKING` | the most rounds of one conversation working at once, 1 to 32 and at most `SESSION_MAX_OPEN`; `limits.max_working_sessions` may lower it | `4` |
+//! | `SESSION_MAX_ROUNDS` | the most rounds one session may have, 2 to 200; `limits.max_session_rounds` may lower it | `20` |
+//! | `SESSION_IDLE_DAYS` | days a kept-open session may sit idle before it reads closed, 1 to 365; the same on every process that serves one store ([`SessionSettings::idle_ttl`]) | `7` |
 //! | `WORKER_ID` | stable identity of this worker (the lease identity; the run owner for a binary that pins runs); letters, digits, `.`, `_`, `-` | random per process |
 //! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix ([`ModelConfig`]) | required for `all` and `worker` |
 //! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker` |
@@ -44,7 +48,9 @@
 //!
 //! `ROLE` picks the halves a process runs, and each half brings its own variables:
 //!
-//! * **Every role** needs `DATABASE_URL`, and reads `LISTEN_ADDR`.
+//! * **Every role** needs `DATABASE_URL`, and reads `LISTEN_ADDR` and the `SESSION_*` limits
+//!   ([`ServiceConfig::sessions`]): the control plane checks a person's start of a session and
+//!   reads the listing, the workers run the tools.
 //! * **The control plane** (`all`, `control-plane`) also needs `A2A_BEARER_TOKENS` and
 //!   `PUBLIC_URL`: it serves A2A and starts, delivers to, cancels and views runs, which needs only
 //!   the agent's name and its `init`, so it holds no model configuration.
@@ -73,6 +79,8 @@ use std::collections::BTreeSet;
 use url::Url;
 
 use crate::service::RuntimeOptions;
+use adam_runtime::SessionLimits;
+use std::time::Duration;
 
 /// One or more environment variables are missing or unusable.
 ///
@@ -207,6 +215,9 @@ pub struct ServiceConfig {
     /// The optional A2A features (push notifications, the signature of the card): read only by a
     /// role that serves A2A, and nothing is on unless the environment turns it on.
     pub a2a: A2aSettings,
+    /// `SESSION_*`: the limits on the sessions of one conversation and how long an idle one stays
+    /// open. Read by every role.
+    pub sessions: SessionSettings,
 }
 
 impl std::fmt::Debug for ServiceConfig {
@@ -225,6 +236,7 @@ impl std::fmt::Debug for ServiceConfig {
             .field("listen_addr", &self.listen_addr)
             .field("worker", &self.worker)
             .field("a2a", &self.a2a)
+            .field("sessions", &self.sessions)
             .finish()
     }
 }
@@ -320,6 +332,97 @@ impl ServiceConfig {
             listen_addr,
             worker,
             a2a,
+            sessions: SessionSettings::parse(lookup, problems),
+        }
+    }
+}
+
+/// The default of `SESSION_IDLE_DAYS`.
+pub const DEFAULT_SESSION_IDLE_DAYS: u64 = 7;
+
+/// The most `SESSION_IDLE_DAYS` may say.
+pub const MAX_SESSION_IDLE_DAYS: u64 = 365;
+
+/// `SESSION_MAX_OPEN`, `SESSION_MAX_WORKING`, `SESSION_MAX_ROUNDS` and `SESSION_IDLE_DAYS`
+/// ([ADR 0045](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)
+/// decision 5): what the deployment allows of the sessions of one conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSettings {
+    /// The most open, the most working and the most rounds. The root agent's file may lower each
+    /// (`AgentDef::session_limits` of `adam-assembly` takes these).
+    pub limits: SessionLimits,
+    /// How long a kept-open session may sit idle (its latest round ended, nobody wrote to it)
+    /// before it reads closed ([`RuntimeOptions::session_idle_ttl`]).
+    pub idle_ttl: Duration,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            limits: SessionLimits::default(),
+            idle_ttl: Duration::from_secs(DEFAULT_SESSION_IDLE_DAYS * 24 * 3600),
+        }
+    }
+}
+
+impl SessionSettings {
+    /// Read the four variables, each the default when unset or blank; a value out of its range,
+    /// and a `SESSION_MAX_WORKING` that is set and above `SESSION_MAX_OPEN`, are problems (and the
+    /// default). A `SESSION_MAX_WORKING` that is not set is cut down to `SESSION_MAX_OPEN`, so
+    /// setting a small `SESSION_MAX_OPEN` alone is not an error.
+    pub fn parse(lookup: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Self {
+        let get = |name: &str| not_blank(lookup, name);
+        let default = Self::default();
+        // The value, and whether it is usable: a bad one is a problem and the default.
+        let mut bounded = |name: &str, default: u32, low: u32, high: u32| {
+            let before = problems.len();
+            let n = parse_or(&get, name, default, problems);
+            if problems.len() != before {
+                return (default, false);
+            }
+            if (low..=high).contains(&n) {
+                return (n, true);
+            }
+            problems.push(format!("{name} must be between {low} and {high}, got {n}"));
+            (default, false)
+        };
+        let page = u32::try_from(adam_runtime::MAX_SESSION_PAGE).unwrap_or(100);
+        let (max_open, open_ok) = bounded("SESSION_MAX_OPEN", default.limits.max_open(), 1, page);
+        let working_set = get("SESSION_MAX_WORKING").is_some();
+        let (max_working, working_ok) = bounded(
+            "SESSION_MAX_WORKING",
+            // Unset: the default, never more than may be open.
+            default.limits.max_working().min(max_open),
+            1,
+            SessionLimits::MAX_WORKING_BOUND,
+        );
+        let (low, high) = SessionLimits::MAX_ROUNDS_BOUNDS;
+        let (max_rounds, _) = bounded("SESSION_MAX_ROUNDS", default.limits.max_rounds(), low, high);
+        let days = parse_or(
+            &get,
+            "SESSION_IDLE_DAYS",
+            DEFAULT_SESSION_IDLE_DAYS,
+            problems,
+        );
+        let days = if (1..=MAX_SESSION_IDLE_DAYS).contains(&days) {
+            days
+        } else {
+            problems.push(format!(
+                "SESSION_IDLE_DAYS must be between 1 and {MAX_SESSION_IDLE_DAYS}, got {days}"
+            ));
+            DEFAULT_SESSION_IDLE_DAYS
+        };
+        // Only two values that are each fine can conflict; a bad one is already a problem.
+        if open_ok && working_ok && working_set && max_working > max_open {
+            problems.push(format!(
+                "SESSION_MAX_WORKING ({max_working}) is more than SESSION_MAX_OPEN ({max_open})"
+            ));
+        }
+        let limits =
+            SessionLimits::new(max_open, max_working, max_rounds).unwrap_or(default.limits);
+        Self {
+            limits,
+            idle_ttl: Duration::from_secs(days * 24 * 3600),
         }
     }
 }
@@ -1180,6 +1283,137 @@ mod tests {
         vars.insert("MAX_PARALLEL_TOOL_CALLS", "99");
         let config = parse(&vars).expect("a control plane does not read it");
         assert!(config.worker.is_none());
+    }
+
+    #[test]
+    fn session_settings_have_defaults_and_bounds() {
+        let sessions = |pairs: &[(&'static str, &'static str)]| {
+            let mut vars = full();
+            for (k, v) in pairs {
+                vars.insert(*k, *v);
+            }
+            parse(&vars).map(|c| c.sessions)
+        };
+        let d = sessions(&[]).unwrap();
+        assert_eq!(d, SessionSettings::default());
+        assert_eq!(
+            (
+                d.limits.max_open(),
+                d.limits.max_working(),
+                d.limits.max_rounds()
+            ),
+            (16, 4, 20)
+        );
+        assert_eq!(d.idle_ttl, Duration::from_secs(7 * 24 * 3600));
+        assert_eq!(
+            sessions(&[("SESSION_MAX_OPEN", "  ")]).unwrap(),
+            d,
+            "blank is unset"
+        );
+
+        let set = sessions(&[
+            ("SESSION_MAX_OPEN", "100"),
+            ("SESSION_MAX_WORKING", " 32 "),
+            ("SESSION_MAX_ROUNDS", "200"),
+            ("SESSION_IDLE_DAYS", "365"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                set.limits.max_open(),
+                set.limits.max_working(),
+                set.limits.max_rounds()
+            ),
+            (100, 32, 200)
+        );
+        assert_eq!(set.idle_ttl, Duration::from_secs(365 * 24 * 3600));
+        let low = sessions(&[
+            ("SESSION_MAX_OPEN", "1"),
+            ("SESSION_MAX_WORKING", "1"),
+            ("SESSION_MAX_ROUNDS", "2"),
+            ("SESSION_IDLE_DAYS", "1"),
+        ])
+        .unwrap();
+        assert_eq!(low.idle_ttl, Duration::from_secs(24 * 3600));
+
+        for (name, bad) in [
+            ("SESSION_MAX_OPEN", "0"),
+            ("SESSION_MAX_OPEN", "101"),
+            ("SESSION_MAX_OPEN", "x"),
+            ("SESSION_MAX_WORKING", "0"),
+            ("SESSION_MAX_WORKING", "33"),
+            ("SESSION_MAX_ROUNDS", "1"),
+            ("SESSION_MAX_ROUNDS", "201"),
+            ("SESSION_MAX_ROUNDS", "-1"),
+            ("SESSION_IDLE_DAYS", "0"),
+            ("SESSION_IDLE_DAYS", "366"),
+            ("SESSION_IDLE_DAYS", "1.5"),
+        ] {
+            let problems = sessions(&[(name, bad)]).unwrap_err().problems;
+            assert!(mentions(&problems, name), "{name}={bad}: {problems:?}");
+        }
+        // More working than open is one problem, naming both.
+        let problems = sessions(&[("SESSION_MAX_OPEN", "3"), ("SESSION_MAX_WORKING", "5")])
+            .unwrap_err()
+            .problems;
+        assert!(
+            mentions(&problems, "SESSION_MAX_WORKING") && problems[0].contains("SESSION_MAX_OPEN"),
+            "{problems:?}"
+        );
+        // The default working is cut to open when only open is set: no variable is blamed that the
+        // operator never set.
+        for open in ["2", "3"] {
+            let c = sessions(&[("SESSION_MAX_OPEN", open)]).unwrap();
+            let open: u32 = open.parse().unwrap();
+            assert_eq!(
+                (c.limits.max_open(), c.limits.max_working()),
+                (open, open.min(4)),
+                "SESSION_MAX_OPEN={open}"
+            );
+        }
+        assert_eq!(
+            sessions(&[("SESSION_MAX_OPEN", "9")])
+                .unwrap()
+                .limits
+                .max_working(),
+            4,
+            "the default stands when open is larger"
+        );
+        // A bad open value is one problem, and says nothing of working.
+        for bad in ["0", "101"] {
+            let problems = sessions(&[("SESSION_MAX_OPEN", bad)]).unwrap_err().problems;
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert!(mentions(&problems, "SESSION_MAX_OPEN"), "{problems:?}");
+        }
+    }
+
+    #[test]
+    fn a_control_plane_reads_the_session_settings() {
+        // The front checks a person's start and reads the listing, so every role reads them.
+        for role in Role::VALUES {
+            let mut vars = with_role(role.as_str());
+            vars.insert("SESSION_MAX_OPEN", "5");
+            vars.insert("SESSION_MAX_WORKING", "2");
+            vars.insert("SESSION_MAX_ROUNDS", "9");
+            vars.insert("SESSION_IDLE_DAYS", "3");
+            let c = parse(&vars).unwrap().sessions;
+            assert_eq!(
+                (
+                    c.limits.max_open(),
+                    c.limits.max_working(),
+                    c.limits.max_rounds()
+                ),
+                (5, 2, 9),
+                "{role}"
+            );
+            assert_eq!(c.idle_ttl, Duration::from_secs(3 * 24 * 3600), "{role}");
+            let mut bad = with_role(role.as_str());
+            bad.insert("SESSION_IDLE_DAYS", "0");
+            assert!(
+                mentions(&problems_of(&bad), "SESSION_IDLE_DAYS"),
+                "{role} does not stop at a bad value"
+            );
+        }
     }
 
     #[test]

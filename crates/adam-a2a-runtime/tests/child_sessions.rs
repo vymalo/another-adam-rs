@@ -24,7 +24,9 @@ use adam_llm_agent::{LlmAgent, SessionAgent, SessionTools};
 use adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall,
 };
-use adam_runtime::{BroadcastSink, Runtime, parse_session_conversation_id};
+use adam_runtime::{
+    BroadcastSink, ManualClock, Runtime, SessionLimits, parse_session_conversation_id,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -58,13 +60,18 @@ struct GateModel {
     inner: Arc<MockModel>,
     calls: AtomicUsize,
     hold_on: Option<usize>,
+    /// How many calls from `hold_on` on wait at the gate (one unless a test holds several).
+    hold_count: usize,
     gate: Arc<Gate>,
 }
 
 impl GateModel {
     async fn hold(&self) {
         let n = self.calls.fetch_add(1, SeqCst);
-        if self.hold_on == Some(n) {
+        if self
+            .hold_on
+            .is_some_and(|h| (h..h + self.hold_count).contains(&n))
+        {
             self.gate.reached.notify_one();
             self.gate.release.notified().await;
         }
@@ -104,22 +111,30 @@ struct Rig {
 
 struct Options {
     hold_helper_on: Option<usize>,
+    hold_helper_count: usize,
     hold_parent_on: Option<usize>,
     max_open: u32,
     tiers: bool,
     listing_page: usize,
     max_rounds: u32,
+    /// `ChildSessions::with_limits`, applied last.
+    limits: Option<SessionLimits>,
+    /// The runtime's idle TTL and clock, when a test moves time.
+    idle: Option<(Duration, ManualClock)>,
 }
 
 impl Options {
     fn new() -> Self {
         Self {
             hold_helper_on: None,
+            hold_helper_count: 1,
             hold_parent_on: None,
             max_open: 16,
             tiers: false,
             listing_page: 100,
             max_rounds: 20,
+            limits: None,
+            idle: None,
         }
     }
 }
@@ -142,12 +157,14 @@ impl Rig {
             inner: parent_mock.clone(),
             calls: AtomicUsize::new(0),
             hold_on: options.hold_parent_on,
+            hold_count: 1,
             gate: parent_gate.clone(),
         });
         let helper_model: DynModel = Arc::new(GateModel {
             inner: helper_mock.clone(),
             calls: AtomicUsize::new(0),
             hold_on: options.hold_helper_on,
+            hold_count: options.hold_helper_count,
             gate: gate.clone(),
         });
         let tools = SessionTools::new([
@@ -173,7 +190,11 @@ impl Rig {
             parent_agent = parent_agent.dyn_tool(tool);
         }
         let events = BroadcastSink::default();
-        let runtime = Runtime::builder(store.clone())
+        let mut builder = Runtime::builder(store.clone());
+        if let Some((ttl, clock)) = &options.idle {
+            builder = builder.session_idle_ttl(*ttl).clock(clock.clone());
+        }
+        let runtime = builder
             .agent(parent_agent.build())
             .agent(LlmAgent::builder(&helper, helper_model, "m").build())
             .agent(LlmAgent::builder(&hidden, hidden_mock.clone() as DynModel, "m").build())
@@ -187,6 +208,10 @@ impl Rig {
         .unwrap()
         .with_listing_page(options.listing_page)
         .with_max_rounds(options.max_rounds);
+        let sessions = match options.limits {
+            Some(limits) => sessions.with_limits(limits),
+            None => sessions,
+        };
         let mut backend = RuntimeTaskBackend::new(runtime.clone(), events, parent)
             .with_poll_interval(Duration::from_millis(10))
             .with_child_sessions(sessions);
@@ -1741,6 +1766,151 @@ async fn a_failed_round_is_reported_failed() {
         );
         assert_eq!(told[1]["round"]["state"], "TASK_STATE_FAILED");
         rig.parent_gate.release.notify_one();
+        rig.stop().await;
+    }
+}
+
+/// `with_limits` sets what the card says as `maxOpen`, so the card follows the deployment's setting.
+#[test]
+fn the_card_max_open_follows_the_limits() {
+    let sessions = ChildSessions::new(
+        [ChildSessionAgent::new("planner", "x/planner", "Plans.")],
+        16,
+    )
+    .unwrap()
+    .with_limits(SessionLimits::new(5, 2, 7).unwrap());
+    let card = sessions.card_extension().unwrap();
+    assert_eq!(card.params["maxOpen"], 5);
+}
+
+fn refusal(result: Result<Task, BackendError>) -> String {
+    match result {
+        Err(BackendError::UnsupportedOperation(words)) => words,
+        other => panic!("expected UnsupportedOperation, got {other:?}"),
+    }
+}
+
+/// A person's start, and a message that would start a round, past `max_working` are refused in
+/// words; a message steered into a working round is not; the slot frees when the round ends.
+#[tokio::test]
+async fn a_persons_round_past_max_working_is_refused_in_words() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_helper_on: Some(1),
+                limits: Some(SessionLimits::new(4, 1, 20).unwrap()),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock
+            .push_text("one")
+            .push_text("two")
+            .push_text("three");
+        let one = rig.start(&alice(), Some("ctx-w"), "first", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        // The second session's round is held in its model call: it works.
+        let two = rig.start(&alice(), Some("ctx-w"), "second", true).await;
+
+        let mut start = said("third", Some("ctx-w"));
+        start.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"start": {"agent": "planner", "description": "d"}}),
+        )]));
+        let words = refusal(rig.submit(&alice(), start.clone(), None).await);
+        assert!(
+            words.contains("1 round") && words.contains("working"),
+            "{words}"
+        );
+        // A message that would start round 2 of the idle first session.
+        let words = refusal(
+            rig.submit(&alice(), said("again", Some(&one.context_id)), None)
+                .await,
+        );
+        assert!(
+            words.contains("1 round") && words.contains("working"),
+            "{words}"
+        );
+        // A message steered into the working round is not a new round.
+        assert!(
+            rig.submit(&alice(), said("steer", Some(&two.context_id)), None)
+                .await
+                .is_ok()
+        );
+        rig.gate.release.notify_one();
+        rig.until(&alice(), &two.id, TaskState::Completed).await;
+        assert!(
+            rig.submit(&alice(), said("again", Some(&one.context_id)), None)
+                .await
+                .is_ok(),
+            "the slot is free once the round ended"
+        );
+        rig.stop().await;
+    }
+}
+
+/// A kept-open session idle for the runtime's TTL refuses a message as closed, and says why.
+#[tokio::test]
+async fn an_expired_session_refuses_a_message() {
+    for store in stores().await {
+        let clock = ManualClock::new();
+        let rig = Rig::with(
+            &store,
+            Options {
+                idle: Some((Duration::from_secs(3600), clock.clone())),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("done");
+        let one = rig.start(&alice(), None, "first", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        clock.advance(Duration::from_secs(2 * 3600));
+        let words = refusal(
+            rig.submit(&alice(), said("later", Some(&one.context_id)), None)
+                .await,
+        );
+        assert!(
+            words.contains("closed") && words.contains("idle"),
+            "{words}"
+        );
+        rig.stop().await;
+    }
+}
+
+/// The working count reads every page of the listing: with a page of one, two rounds working and an
+/// idle session, a message that would start a round is refused at `max_working` of two.
+#[tokio::test]
+async fn max_working_counts_across_pages() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_helper_on: Some(1),
+                hold_helper_count: 2,
+                listing_page: 1,
+                limits: Some(SessionLimits::new(4, 2, 20).unwrap()),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock
+            .push_text("one")
+            .push_text("two")
+            .push_text("three")
+            .push_text("again");
+        let one = rig.start(&alice(), Some("ctx-m"), "first", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        let _two = rig.start(&alice(), Some("ctx-m"), "second", true).await;
+        let _three = rig.start(&alice(), Some("ctx-m"), "third", true).await;
+        let words = refusal(
+            rig.submit(&alice(), said("again", Some(&one.context_id)), None)
+                .await,
+        );
+        assert!(
+            words.contains("2 rounds") && words.contains("working"),
+            "{words}"
+        );
+        rig.gate.release.notify_one();
+        rig.gate.release.notify_one();
         rig.stop().await;
     }
 }
