@@ -63,7 +63,7 @@ sequenceDiagram
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` | Refused in a reference.
 | `edit_file { path, old, new, replace_all?, repo? }` | replaces **exact text** in a file of the worktree, confined like `write_file` ([below](#reading-and-changing-files-itself)): `old` (blanks and line breaks included) must be in the file, once unless `replace_all`. A file that is not there, a directory, binary or non-UTF-8 content, one over 1 MiB, an empty `old`, and `old == new` are results that say so. **When `old` is not found it changes nothing and shows the closest region**: its line numbers, two lines of context around it, the first line where it and `old` differ, and a hint when only blanks differ or the file has CRLF endings. **When `old` is in the file several times and `replace_all` is not set** it says how many times and at which lines. Written like `write_file` (a new file renamed over the old, the mode kept). Progress line: `edited <path> (<slot>)` | Refused in a reference.
 | `share_file { path, repo?, name? }` | shows the person **a file of the workspace**: the file is read in this process (confined like `read_file`: relative to the slot, no `..`, nothing inside `.git`, a symlink only while it stays inside the worktree), must be a regular file of at most 4 MiB, and comes back as a **file artifact** with its media type and filename; the model's result is one line, `Shared chart.svg (1.2 KiB, image/svg+xml). To show it in your answer, write ![description](chart.svg).` (the second sentence for an image only; a third gives its SHA-256, `To use it as the picture of an \`ask_user\` option, pass image {sha256: "<hash>", alt}.`), never the bytes. It works on what a command made inside the repository's devcontainer too (the workspace is one directory). See [Sharing a file](#sharing-a-file) and [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md). Progress line: `sharing <path> (<slot>)` |
-| `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check; a failure the base commit has too is **pre-existing** (below), not a cycle |
+| `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check; a failure the base commit has too is **pre-existing** (below), not a cycle. A **failed** check asked again for the same command, directory and slot on exactly the same tree, at the same epoch (`run` and `rebuild_environment` bump it), is **not run again**: the answer quotes its findings, names the call that made them, spends no cycle and emits no artifact; a pass is never reused |
 | `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
 | `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
@@ -270,7 +270,8 @@ subscriber sees it once. The exception is a file the coder shares with `share_fi
 * **From `run_checks`: one artifact per call that ran**, reflecting that run and bound to `HEAD`, with `tree`.
   The agent runs its checks before `commit_and_push`, so this is usually the commit *below* the one that gets
   pushed, with the change still uncommitted (the summary says so). Calls the tool refuses before running anything
-  (a bad `cwd`, no workspace, the exhausted cycle budget) emit none.
+  (a bad `cwd`, no workspace, the exhausted cycle budget) emit none, and so does a call answered from a failure
+  already recorded on exactly the same unchanged tree: that earlier run's artifact is the verdict on the tree.
 * **From `commit_and_push`: the verdict on the pushed commit,** emitted before `branch`, so a consumer that has
   seen `branch` already has it. The tool compares the tree of the pushed commit with the `tree` of the run's last
   `run_checks`:
@@ -322,7 +323,9 @@ make them hold:
   time, and says so. A timeout, a missing tool, a signal or an environment that cannot run it is not conclusive: the
   failure is the change's, as before. It does not prove the change adds no error: the model is shown both outputs.
 * **Cycle limit.** Every failed `run_checks` that is the change's costs a cycle, counted per tool call
-  id (a replay never counts twice). At `MAX_CHECK_CYCLES` the tool tells the
+  id (a replay never counts twice). A failed check asked again on exactly the tree it failed on, with
+  nothing a check reads changed since, is answered from the notes and costs nothing (see
+  [Artifacts](#artifacts)). At `MAX_CHECK_CYCLES` the tool tells the
   model to stop and refuses to run anything; `commit_and_push` and
   `open_pull_request` refuse too. The run then ends `failed` with the findings
   (the output of the last failing check) and no pull request. **Scratch work and repositories have a budget each,
@@ -1706,7 +1709,7 @@ sequenceDiagram
     alt the shell could not find a command
       T-->>M: the workspace lacks it: no cycle, no checks
     else it ran
-      T-->>M: exit code, output and the files that changed, no artifact, no cycle, nothing in the notes
+      T-->>M: exit code, output and the files that changed, no artifact, no cycle, no check record in the notes
     end
   else git differs
     T->>W: reset --hard, clean, read-tree: back to the record, files too
@@ -2960,7 +2963,7 @@ database of its own, so the role needs `CREATEDB`):
   `run_command_still_works_when_the_tree_cannot_be_computed` and
   `a_project_dependency_is_to_be_installed_and_a_nested_not_found_is_a_failed_check` are in `tests/tools.rs` too.
 * `run`, `edit_file`, the scratch completion and the two check budgets (ADR 0013): `tests/tools.rs` has
-  `run_keeps_what_a_command_makes_and_is_never_a_check` (a file kept, no artifact, no cycle, nothing in the notes, an earlier
+  `run_keeps_what_a_command_makes_and_is_never_a_check` (a file kept, no artifact, no cycle, no check record in the notes, an earlier
   green check stale for the gate), `run_undoes_a_command_that_touches_git_entirely_and_refuses_it` (a commit, a branch, a
   ref, configuration, a rewritten `.git` file: each undone with the files it made), `run_respects_the_timeout_the_cwd_rule_and_a_missing_tool`,
   `run_works_in_a_scratch_project_and_keeps_what_git_ignores`, `edit_file_*` (once and everywhere, the closest region of a miss,

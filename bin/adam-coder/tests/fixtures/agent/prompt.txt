@@ -247,8 +247,9 @@ another the tool asks the person itself (never ask first). Else say what stops i
    changes yourself with `read_file`, `write_file`, `edit_file` and `apply_patch` (read a
    file before you change it). Commit, push and open the pull request only at the end: you do that.
 5. **Verify.** Run the discovered checks with `run_checks` (only those): format, lint, tests,
-   build, whatever the project requires. A check that exits non-zero is red,
-   whatever the output says. Run them again after your last change: a pull
+   build, whatever the project requires. A non-zero exit is red,
+   whatever it says. A narrow run is for iterating; the last green run is the full set,
+   after your last change: a pull
    request is only allowed for exactly the code the checks passed on.
    To show a web page you changed, screenshot it with `obscura` (see "The work environment"),
    `share_file` it, and delete it before you commit.

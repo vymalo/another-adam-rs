@@ -675,18 +675,281 @@ async fn a_replayed_failing_check_counts_one_cycle() {
     let rig = Rig::new().await;
     rig.prepare().await;
     let tool = RunChecks;
-    for _ in 0..3 {
+    for n in 0..3 {
         let out = tool
             .call(&rig.ctx, json!({"command": common::red("exit 2")}))
             .await
             .unwrap();
         assert!(out.is_error);
-        assert!(
-            out.content.contains("failed check run 1 of 3"),
-            "the same call id never costs a second cycle: {}",
-            out.content
-        );
+        if n == 0 {
+            assert!(
+                out.content.contains("failed check run 1 of 3"),
+                "{}",
+                out.content
+            );
+        } else {
+            assert!(
+                out.content.contains("not run again")
+                    && out.content.contains("no check cycle")
+                    && out.content.contains("1 of 3 used so far"),
+                "the same call id never costs a second cycle: {}",
+                out.content
+            );
+        }
     }
+    assert_eq!(notes_of(&rig).await.checks.failures, 1);
+}
+
+/// A failed check on a tree is not run again on the same tree: the same command, in the same slot,
+/// on the same code, with nothing a check reads changed since, is answered from the notes, with the
+/// same findings and the call that made them, and spends no cycle. It is still a failure: no
+/// `checks` artifact, and the gate refuses the pull request.
+#[tokio::test]
+async fn a_failed_check_is_not_run_again_on_the_same_tree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let message = dir.path().join("message");
+    std::fs::write(&message, "the same failure\n").unwrap();
+    let command = format!(
+        "echo x >> {}; cat {}; test ! -f broken.flag",
+        counter.display(),
+        message.display()
+    );
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 2, "in the worktree, then on the base");
+    assert_eq!(checks_of(&first)["passed"], false);
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert_eq!(runs_of(&counter), 2, "the same tree: it is not run again");
+    assert!(
+        again.artifacts.is_empty(),
+        "a reused failure emits no new artifact: {:?}",
+        again.artifacts
+    );
+    assert!(
+        again.content.contains("not run again")
+            && again.content.contains("unchanged")
+            && again.content.contains("the same failure")
+            && again.content.contains("call-1")
+            && again
+                .content
+                .contains("Change the code, then run the check again"),
+        "{}",
+        again.content
+    );
+    assert!(
+        again.content.contains("no check cycle") && again.content.contains("not a green"),
+        "{}",
+        again.content
+    );
+    let notes = notes_of(&rig).await;
+    assert_eq!(
+        notes.checks.failures, 1,
+        "the first run spent the only cycle"
+    );
+    assert_eq!(notes.checks.history.len(), 1, "the reuse records nothing");
+    assert_eq!(notes.checks.counted, ["call-1"]);
+}
+
+/// The reuse is for exactly the code: a file written after the failure changes the tree, so the
+/// same command runs again.
+#[tokio::test]
+async fn a_failed_check_runs_again_after_the_tree_changes() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; test ! -f broken.flag", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 2, "in the worktree, then on the base");
+
+    WriteFile
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"path": "a.txt", "content": "a\n"}),
+        )
+        .await
+        .unwrap();
+    let again = RunChecks
+        .call(&another_call(&rig, "call-3"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert_eq!(
+        runs_of(&counter),
+        3,
+        "the tree changed: it ran again (the base result is cached)"
+    );
+    assert!(
+        again.content.contains("failed check run 2 of 3"),
+        "{}",
+        again.content
+    );
+    assert_eq!(checks_of(&again)["passed"], false);
+    assert_eq!(notes_of(&rig).await.checks.failures, 2);
+}
+
+/// `run` keeps files a check reads that the tree does not show (an ignored `target/`, a
+/// `node_modules/`): the epoch it bumps makes a failed record on the same tree run again.
+#[tokio::test]
+async fn a_failed_check_runs_again_after_run_kept_files_the_tree_does_not_show() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; test ! -f broken.flag", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 2, "in the worktree, then on the base");
+
+    let made = Run
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"command": "mkdir -p target && echo x > target/dependency"}),
+        )
+        .await
+        .unwrap();
+    assert!(!made.is_error, "{}", made.content);
+    assert!(
+        made.content.contains("git sees no change"),
+        "the ignored file is not in the tree: {}",
+        made.content
+    );
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-3"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert_eq!(
+        runs_of(&counter),
+        3,
+        "`run` may have changed what the check reads: it runs again"
+    );
+    assert!(
+        again.content.contains("failed check run 2 of 3"),
+        "{}",
+        again.content
+    );
+}
+
+/// A passing run is never reused: the model may be confirming it, and the environment may have
+/// changed under it, so the command runs again.
+#[tokio::test]
+async fn a_passing_check_runs_again_on_the_same_tree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; true", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 1);
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(runs_of(&counter), 2, "a pass is never reused");
+    assert_eq!(checks_of(&again)["passed"], true);
+}
+
+/// The gate is unchanged by the reuse: a pull request on a tree whose only check failed is refused,
+/// and one after a real green run on the pushed tree opens.
+#[tokio::test]
+async fn a_reused_failure_still_refuses_the_pull_request_and_a_real_green_opens_it() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let command = "test ! -f broken.flag";
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    let reused = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(reused.is_error, "{}", reused.content);
+    assert!(
+        reused.content.contains("not run again"),
+        "{}",
+        reused.content
+    );
+
+    // The tree is the one the failure was seen on: commit and push it, and the gate refuses.
+    CommitAndPush
+        .call(
+            &another_call(&rig, "call-3"),
+            json!({"message": "feat: add a"}),
+        )
+        .await
+        .unwrap();
+    let args = json!({"title": "feat: a", "body": "Adds a.\n\n## Verification\n- `test ! -f broken.flag` fails"});
+    let refused = OpenPullRequest
+        .call(&another_call(&rig, "call-4"), args.clone())
+        .await;
+    assert!(is_error(&refused), "{refused:?}");
+    let said = text(refused);
+    assert!(said.contains("Refusing"), "the gate still refuses: {said}");
+    assert!(rig.fx.created_pulls().await.is_empty());
+
+    // The code changes, the same command runs and passes, and the pull request opens.
+    std::fs::remove_file(rig.worktree().join("broken.flag")).unwrap();
+    let green = RunChecks
+        .call(&another_call(&rig, "call-5"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!green.is_error, "{}", green.content);
+    assert_eq!(checks_of(&green)["passed"], true);
+    CommitAndPush
+        .call(
+            &another_call(&rig, "call-6"),
+            json!({"message": "fix: drop the flag"}),
+        )
+        .await
+        .unwrap();
+    let opened = OpenPullRequest
+        .call(
+            &another_call(&rig, "call-7"),
+            json!({"title": "feat: a", "body": "Adds a.\n\n## Verification\n- `test ! -f broken.flag` passes"}),
+        )
+        .await
+        .unwrap();
+    assert!(!opened.is_error, "{}", opened.content);
+    assert_eq!(rig.fx.created_pulls().await.len(), 1);
 }
 
 /// The tail of a long output that the base commit's run keeps (and the notes and the model read) is
@@ -859,6 +1122,8 @@ async fn a_failure_the_change_caused_costs_a_cycle_and_says_the_base_passes() {
     assert!(!notes.checks.last.as_ref().unwrap().preexisting);
     assert!(!notes.checks.base[0].failed);
 
+    // The code changes: the same command runs again, and the base result is not run again.
+    std::fs::write(rig.worktree().join("changed.txt"), "x\n").unwrap();
     let again = RunChecks
         .call(&another_call(&rig, "call-2"), json!({"command": command}))
         .await
@@ -1018,6 +1283,32 @@ async fn a_passing_check_emits_a_passing_checks_artifact_for_head() {
     // Nothing changed: the tree checked is the tree of HEAD.
     let tree = common::git(&rig.worktree(), &["rev-parse", "HEAD^{tree}"]);
     assert_eq!(data["tree"], tree.as_str());
+}
+
+/// The report is bound to the code the command leaves, not only the code it started from: a check
+/// that writes the file it verifies passes for the tree `commit_and_push` will commit.
+#[tokio::test]
+async fn a_check_that_writes_a_file_is_bound_to_the_tree_it_leaves() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let before = common::git(&rig.worktree(), &["rev-parse", "HEAD^{tree}"]);
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": "echo x > made.txt; true"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let data = checks_of(&out);
+    assert_eq!(data["passed"], true);
+    assert_ne!(data["tree"], before.as_str(), "the check made a file");
+    let pushed = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: make a file"}))
+        .await
+        .unwrap();
+    let (bound, _) = commit_artifacts(&pushed);
+    assert_eq!(
+        bound["passed"], true,
+        "the check ran on the tree that was committed: {bound}"
+    );
 }
 
 #[tokio::test]
@@ -5393,8 +5684,9 @@ async fn notes_of(rig: &Rig) -> adam_coder::tools::notes::RunNotes {
         .unwrap()
 }
 
-/// `run` keeps what a command makes, and is never a check: no artifact, no cycle, nothing in the
-/// notes for the gate to read, and the files it changed make the earlier checks stale.
+/// `run` keeps what a command makes, and is never a check: no artifact, no cycle, no check record in
+/// the notes for the gate to read (it moves the epoch, so an earlier failure is not reused), and the
+/// files it changed make the earlier checks stale.
 #[tokio::test]
 async fn run_keeps_what_a_command_makes_and_is_never_a_check() {
     let rig = Rig::new().await;
@@ -5435,6 +5727,7 @@ async fn run_keeps_what_a_command_makes_and_is_never_a_check() {
     let notes = notes_of(&rig).await;
     assert_eq!(notes.checks.failures, 0);
     assert!(notes.checks.last.is_none() && notes.checks.history.is_empty());
+    assert_eq!(notes.checks.epoch, 1, "`run` moved the check epoch");
     // A failing command is an answer too, and costs nothing, however often.
     for _ in 0..(rig.fx.env.settings.max_check_cycles + 2) {
         let out = Run
@@ -5936,6 +6229,8 @@ fn failed(call: &str, scratch: bool) -> CheckRecord {
         exit_code: Some(1),
         tail: "red".into(),
         tree: None,
+        cwd: String::new(),
+        epoch: 0,
         report: None,
         slot: None,
         scratch,
@@ -6134,6 +6429,7 @@ async fn a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run() {
 
 /// Call ids are unique only within the run that made them: a subagent's call `call-1` is not the
 /// root's `call-1`, so its failed check is a cycle of its own on the root's budget, not a replay.
+/// (Its command is its own too, so the reuse of a failure on an unchanged tree does not apply.)
 #[tokio::test]
 async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
     let rig = Rig::new().await;
@@ -6150,7 +6446,7 @@ async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
         .with_root_run(root);
     assert_eq!(child.call_id(), rig.ctx.call_id());
     let again = RunChecks
-        .call(&child, json!({"command": common::red("false")}))
+        .call(&child, json!({"command": common::red("exit 3")}))
         .await
         .unwrap();
     assert!(again.is_error, "{}", again.content);

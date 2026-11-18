@@ -640,6 +640,48 @@ async fn rebuilding_without_use_default_makes_it_again_from_the_file() {
     assert!(!notes.environment.use_default);
 }
 
+/// A rebuilt environment may have other tools and dependencies: the check epoch moves, so a failed
+/// check from before the rebuild is run again on the same tree.
+#[tokio::test]
+async fn a_rebuild_makes_a_failed_check_run_again_on_the_same_tree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; test ! -f broken.flag", counter.display());
+    let runs = || std::fs::read_to_string(&counter).map_or(0, |text| text.lines().count());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(runs(), 2, "in the worktree, then on the base");
+
+    let rebuilt = RebuildEnvironment.call(&rig.ctx, json!({})).await.unwrap();
+    assert!(!rebuilt.is_error, "{}", rebuilt.content);
+
+    let again = RunChecks
+        .call(
+            &ToolCtx::detached("tool", "call-2", Arc::new(CollectingSink::new()))
+                .with_state(rig.fx.env.clone())
+                .with_root_run(rig.ctx.run_id()),
+            json!({"command": command}),
+        )
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert_eq!(runs(), 3, "the environment was made again");
+    assert!(
+        again.content.contains("failed check run 2 of 3"),
+        "{}",
+        again.content
+    );
+    let run = rig.ctx.run_id().to_string();
+    assert_eq!(rig.fx.env.notes.load(&run).await.unwrap().checks.epoch, 1);
+}
+
 #[tokio::test]
 async fn rebuilding_where_commands_run_in_the_coders_own_environment_says_there_is_nothing_to_rebuild()
  {
