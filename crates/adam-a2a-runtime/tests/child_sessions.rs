@@ -60,13 +60,18 @@ struct GateModel {
     inner: Arc<MockModel>,
     calls: AtomicUsize,
     hold_on: Option<usize>,
+    /// How many calls from `hold_on` on wait at the gate (one unless a test holds several).
+    hold_count: usize,
     gate: Arc<Gate>,
 }
 
 impl GateModel {
     async fn hold(&self) {
         let n = self.calls.fetch_add(1, SeqCst);
-        if self.hold_on == Some(n) {
+        if self
+            .hold_on
+            .is_some_and(|h| (h..h + self.hold_count).contains(&n))
+        {
             self.gate.reached.notify_one();
             self.gate.release.notified().await;
         }
@@ -106,6 +111,7 @@ struct Rig {
 
 struct Options {
     hold_helper_on: Option<usize>,
+    hold_helper_count: usize,
     hold_parent_on: Option<usize>,
     max_open: u32,
     tiers: bool,
@@ -121,6 +127,7 @@ impl Options {
     fn new() -> Self {
         Self {
             hold_helper_on: None,
+            hold_helper_count: 1,
             hold_parent_on: None,
             max_open: 16,
             tiers: false,
@@ -150,12 +157,14 @@ impl Rig {
             inner: parent_mock.clone(),
             calls: AtomicUsize::new(0),
             hold_on: options.hold_parent_on,
+            hold_count: 1,
             gate: parent_gate.clone(),
         });
         let helper_model: DynModel = Arc::new(GateModel {
             inner: helper_mock.clone(),
             calls: AtomicUsize::new(0),
             hold_on: options.hold_helper_on,
+            hold_count: options.hold_helper_count,
             gate: gate.clone(),
         });
         let tools = SessionTools::new([
@@ -1864,6 +1873,44 @@ async fn an_expired_session_refuses_a_message() {
             words.contains("closed") && words.contains("idle"),
             "{words}"
         );
+        rig.stop().await;
+    }
+}
+
+/// The working count reads every page of the listing: with a page of one, two rounds working and an
+/// idle session, a message that would start a round is refused at `max_working` of two.
+#[tokio::test]
+async fn max_working_counts_across_pages() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_helper_on: Some(1),
+                hold_helper_count: 2,
+                listing_page: 1,
+                limits: Some(SessionLimits::new(4, 2, 20).unwrap()),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock
+            .push_text("one")
+            .push_text("two")
+            .push_text("three")
+            .push_text("again");
+        let one = rig.start(&alice(), Some("ctx-m"), "first", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        let _two = rig.start(&alice(), Some("ctx-m"), "second", true).await;
+        let _three = rig.start(&alice(), Some("ctx-m"), "third", true).await;
+        let words = refusal(
+            rig.submit(&alice(), said("again", Some(&one.context_id)), None)
+                .await,
+        );
+        assert!(
+            words.contains("2 rounds") && words.contains("working"),
+            "{words}"
+        );
+        rig.gate.release.notify_one();
+        rig.gate.release.notify_one();
         rig.stop().await;
     }
 }

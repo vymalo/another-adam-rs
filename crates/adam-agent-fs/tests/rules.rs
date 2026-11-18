@@ -1505,6 +1505,23 @@ fn session_limits_are_read_in_both_spellings_and_are_no_diagnostic() {
 }
 
 #[test]
+fn session_limits_at_their_bounds_are_accepted() {
+    for text in [
+        "---\nname: root\nlimits: { max_open_sessions: 100, max_working_sessions: 32, max_session_rounds: 200 }\n---\nHi.\n",
+        "---\nname: root\nlimits: { max_open_sessions: 1, max_working_sessions: 1, max_session_rounds: 2 }\n---\nHi.\n",
+        "---\nname: root\nlimits: { max_open_sessions: 3, max_working_sessions: 3 }\n---\nHi.\n",
+    ] {
+        let dir = write(&[("agent/instructions.md", text)]);
+        let report = load(dir.path());
+        assert!(
+            report.diagnostics.is_empty(),
+            "{text}: {:?}",
+            report.diagnostics
+        );
+    }
+}
+
+#[test]
 fn parallel_false_is_read_per_server_and_is_on_by_default() {
     let (config, diagnostics) = parse_servers(
         r#"{"mcpServers":{
