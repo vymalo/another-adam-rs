@@ -195,10 +195,12 @@ struct ListedState {
     error: Option<String>,
 }
 
-/// The one member of an inbox message a listing reads.
+/// The one member of an inbox message a listing reads. Required, as it is in [`Inbound`]: a message
+/// without one is not a state the runtime wrote.
+///
+/// [`Inbound`]: crate::agent::Inbound
 #[derive(Deserialize)]
 struct ListedInbound {
-    #[serde(default)]
     kind: String,
 }
 
@@ -219,8 +221,17 @@ impl RoundFacts {
     }
 
     fn read(rec: &RunRecord) -> Option<Self> {
-        // Every state the runtime wrote names its agent; one that does not is not a state.
+        // The envelope's version gate, without the envelope: a state another version wrote is not
+        // read here, exactly as `Envelope::decode` refuses it.
+        if rec.state.get("v").and_then(Value::as_u64) != Some(u64::from(crate::envelope::VERSION)) {
+            return None;
+        }
+        // `agent` is required, and `artifacts` must be the array the envelope says: a listing keeps
+        // neither, and a state whose artifacts are malformed is as unreadable as one without them.
         let agent = rec.state.get("agent")?;
+        if !rec.state.get("artifacts").is_none_or(Value::is_array) {
+            return None;
+        }
         let state = ListedState::deserialize(&rec.state).ok()?;
         Some(Self {
             header: header_of(agent),
@@ -826,9 +837,8 @@ mod tests {
         assert_eq!(read.state, SessionState::Closed);
     }
 
-    /// A round as an `LlmAgent` commits one — a header and a transcript of about `bytes` bytes under
-    /// `agent.messages` — but with no envelope version, so a reader that builds the envelope cannot
-    /// read it at all.
+    /// A round as an `LlmAgent` commits one: a valid envelope whose `agent` holds the round's header
+    /// and a transcript of about `bytes` bytes under `messages`.
     fn round_with_a_transcript(id: RunId, header: SessionHeader, bytes: usize) -> RunRecord {
         let messages: Vec<Value> = (0..bytes / 128)
             .map(|n| {
@@ -848,7 +858,9 @@ mod tests {
             conversation_id: Some(session_conversation_id("p", id)),
             parent_id: Some(RunId::new()),
             status: RunStatus::Done,
-            state: serde_json::json!({ "agent": Value::Object(agent) }),
+            state: crate::envelope::Envelope::new(Value::Object(agent))
+                .encode()
+                .expect("an envelope"),
             wake_at: None,
             version: 2,
             created_at: t,
@@ -856,10 +868,56 @@ mod tests {
         }
     }
 
-    /// A listing reads each round's header from the raw state: it must not build the envelope, whose
-    /// `agent` member is the whole transcript. These states are not envelopes (they have no `v`), so
-    /// the path that decoded one saw no header at all — while each round here carries a 100 KiB
-    /// transcript.
+    /// A state the envelope would refuse stays unreadable to the listing — another version, a
+    /// missing one, malformed artifacts, an inbox message without its kind — so its session closes,
+    /// as it did when the listing built the envelope.
+    #[test]
+    fn a_state_the_envelope_would_refuse_closes_its_session() {
+        let id = RunId::new();
+        let unreadable = |mut state: Value, break_it: fn(&mut Value)| {
+            break_it(&mut state);
+            let mut rec = with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]);
+            rec.state = state;
+            let facts = RoundFacts::of(&rec);
+            assert!(
+                facts.header.is_none() && facts.close_asked,
+                "the state is not read"
+            );
+            let read = read_latest(&rec, &facts);
+            assert!(read.closed);
+            assert_eq!(read.state, SessionState::Closed);
+        };
+        let base = || with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]).state;
+
+        unreadable(base(), |state| state["v"] = serde_json::json!(2));
+        unreadable(base(), |state| {
+            state.as_object_mut().expect("an envelope").remove("v");
+        });
+        unreadable(base(), |state| state["artifacts"] = serde_json::json!("x"));
+        unreadable(
+            with_header(
+                id,
+                Some(header(id, true, false)),
+                RunStatus::Done,
+                vec![crate::agent::Inbound::new(
+                    SESSION_CLOSE_KIND,
+                    serde_json::json!({}),
+                )],
+            )
+            .state,
+            |state| {
+                state["inbox"][0]
+                    .as_object_mut()
+                    .expect("a message")
+                    .remove("kind");
+            },
+        );
+    }
+
+    /// A listing reads each round's header from the raw state and never builds the envelope, whose
+    /// `agent` member is the whole transcript: 20 rounds of a 100 KiB transcript cost no decode. The
+    /// one place that reads a report, `ChildStatus::from_record`, reads the latest round once,
+    /// whatever the number of rounds.
     #[test]
     fn a_listing_reads_headers_without_building_the_envelope() {
         let parent = RunId::new();
@@ -877,25 +935,34 @@ mod tests {
             runs.push(rec);
             last = id;
         }
-        // The transcripts really are large, and the states really are not envelopes.
+        // The transcripts really are large, and the states really are envelopes.
         let transcript = serde_json::to_vec(&runs[0].state["agent"]["messages"])
             .expect("a transcript")
             .len();
         assert!(transcript >= 100 * 1024, "{transcript}");
-        assert!(
-            crate::envelope::Envelope::decode(runs[0].id, &runs[0].state).is_err(),
-            "a reader that builds the envelope cannot see these headers"
-        );
+        assert!(crate::envelope::Envelope::decode(runs[0].id, &runs[0].state).is_ok());
 
+        // A session view reads one report, so at most one decode, however many rounds it ordered.
+        let _ = crate::envelope::decodes::take();
         let view = SessionView::from_rounds(session, runs.clone()).expect("a session");
+        let decodes = crate::envelope::decodes::take();
+        assert!(
+            decodes <= 1,
+            "{decodes} envelopes decoded for 20 rounds: the report reads the latest once"
+        );
         assert_eq!(view.round, 20);
         assert_eq!(view.header.as_ref().map(|h| h.round), Some(20));
         assert!(!view.closed);
-        // The report is read from the envelope (`ChildStatus::from_record`), which these states are
-        // not: only the header and the listing are envelope-free.
-        assert_eq!(view.latest.status, RunStatus::Failed);
+        assert_eq!(view.latest.status, RunStatus::Done);
 
+        // A listing builds no envelope at all.
+        let _ = crate::envelope::decodes::take();
         let list = page_of_sessions("p", rounds(runs), 0, 10);
+        assert_eq!(
+            crate::envelope::decodes::count(),
+            0,
+            "a listing decodes no envelope"
+        );
         assert_eq!(list.sessions.len(), 1);
         let summary = &list.sessions[0];
         assert_eq!(summary.round, 20);

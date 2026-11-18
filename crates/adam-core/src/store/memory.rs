@@ -499,7 +499,8 @@ mod tests {
         }
         assert_eq!(seen, expected, "every run once, in the documented order");
 
-        // A page in the middle is the slice after its cursor, and the filters still apply.
+        // A page in the middle is the slice after its cursor, records and all, and the filters
+        // still apply.
         let mut middle = RunQuery::new("a", ConversationScope::Prefix("owner:".into()), 3);
         middle.after = Some((made[499].updated_at, made[499].id));
         assert_eq!(
@@ -508,9 +509,12 @@ mod tests {
                 .await
                 .expect("list")
                 .iter()
-                .map(|r| r.id)
+                .map(|r| (r.id, r.updated_at, r.version, r.state.clone()))
                 .collect::<Vec<_>>(),
-            expected[500..503]
+            made[500..503]
+                .iter()
+                .map(|r| (r.id, r.updated_at, r.version, r.state.clone()))
+                .collect::<Vec<_>>()
         );
         middle.statuses = Some(vec![RunStatus::Parked]);
         assert!(

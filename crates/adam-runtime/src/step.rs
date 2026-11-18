@@ -736,6 +736,21 @@ mod tests {
         );
     }
 
+    /// `bytes` is the size of the input as JSON writes it: an escaped control character and a
+    /// multi-byte character count their bytes, not their characters.
+    #[test]
+    fn a_cut_input_counts_its_bytes_as_json_writes_them() {
+        let input = object(serde_json::json!({"k\u{7}ey": "a\u{0}b", "é": "ü"}));
+        let original = serde_json::to_string(&input).expect("serialises").len();
+        // A bound of one byte forces the `_cut` map, whose `bytes` is the unbounded input's size.
+        let step = StepEvent::new("tool:c1", StepKind::Tool, "t", StepState::Running)
+            .with_input_within(input, 1);
+        assert_eq!(
+            serde_json::to_value(step.input.expect("an input")).expect("serialises"),
+            serde_json::json!({"_cut": true, "bytes": original})
+        );
+    }
+
     /// A string that needs no cleaning is borrowed, not rebuilt; one that does is rebuilt.
     #[test]
     fn printable_borrows_a_clean_string() {

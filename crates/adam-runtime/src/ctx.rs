@@ -1020,8 +1020,7 @@ mod tests {
         );
     }
 
-    /// A step's payload moves out of the journal entry into the value: a 1 MiB result is decoded on
-    /// the run and again on the replay, with no copy of the payload made for either.
+    /// A 1 MiB step payload survives a fresh step and a replay of it.
     #[tokio::test]
     async fn a_megabyte_step_payload_decodes_on_the_run_and_on_the_replay() {
         let sink = CollectingSink::new();
@@ -1038,7 +1037,7 @@ mod tests {
             .expect("recorded");
         assert_eq!(recorded.payload.as_str().map(str::len), Some(1024 * 1024));
 
-        // The replay reads the recorded 1 MiB back, by move: the closure does not run.
+        // The replay reads the recorded 1 MiB back: the closure does not run.
         let (store, run) = (ctx.store.clone(), ctx.run_id());
         let mut replay = ctx_on(&store, run, 0);
         let again: Result<Result<String, String>, AgentError> =

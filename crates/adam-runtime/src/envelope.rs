@@ -115,16 +115,44 @@ impl Envelope {
             None => return Err(corrupt("missing envelope version".into())),
         }
         // `&Value` is a deserialiser: no copy of the state is made before it is read.
-        Self::deserialize(state).map_err(|e| RuntimeError::Corrupt {
+        let decoded = Self::deserialize(state).map_err(|e| RuntimeError::Corrupt {
             run,
             reason: "the envelope does not decode".into(),
             source: Some(Box::new(e)),
-        })
+        });
+        #[cfg(test)]
+        decodes::bump();
+        decoded
     }
 
     pub fn encode(&self) -> Result<Value, StoreError> {
         serde_json::to_value(self)
             .map_err(|e| StoreError::InvalidInput(format!("the envelope does not serialize: {e}")))
+    }
+}
+
+/// How many envelopes a thread decoded, in tests: what a test asserts a listing does not do.
+#[cfg(test)]
+pub(crate) mod decodes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Note one decode.
+    pub(crate) fn bump() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    /// How many decodes this thread took, resetting the count.
+    pub(crate) fn take() -> usize {
+        COUNT.with(|count| count.replace(0))
+    }
+
+    /// How many decodes this thread took, leaving the count.
+    pub(crate) fn count() -> usize {
+        COUNT.with(Cell::get)
     }
 }
 

@@ -552,12 +552,6 @@ fn is_invisible_format(c: char) -> bool {
     matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
 }
 
-/// The first 8 hexadecimal digits of the SHA-256 of `bytes`: how a test names a shared file.
-#[cfg(test)]
-fn short_hash(bytes: &[u8]) -> String {
-    short_hex(&digest_of(bytes))
-}
-
 /// The SHA-256 of `bytes`, as 64 lower-case hexadecimal digits.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_of(&digest_of(bytes))
@@ -624,6 +618,17 @@ pub fn human_size(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The short hash as it was first written — one `format!("{b:02x}")` per byte — kept as an
+    /// oracle that shares no code with the implementation under test.
+    fn short_hash(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
     const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>";
@@ -835,7 +840,8 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_eq!(short_hash(b"abc"), "ba7816bf");
+        assert_eq!(short_hex(&digest_of(b"abc")), "ba7816bf");
+        assert_eq!(short_hash(b"abc"), "ba7816bf", "the oracle agrees");
     }
 
     /// The same bytes are the same name, so a replay names a file as the first run did; two files
