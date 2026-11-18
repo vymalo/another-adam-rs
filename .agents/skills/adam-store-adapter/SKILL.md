@@ -87,9 +87,11 @@ trait at your rev: its doc comments are the contract.
 ## Pitfalls
 
 * `migrate` must be idempotent and safe to call from every replica at once.
-* A run's state is JSON: a backend that cannot hold some values (a NUL in a Postgres `JSONB`
-  string, an integer above `i64::MAX` in BSON) must reject them with `InvalidInput`, not a driver
-  error (`docs/reference/store-adapters.md`, "Data caveats").
+* A run's state is JSON. Apply `adam_core::storable` (or `storable_owned`) to every JSON value
+  before you write it — a NUL in a string or a key becomes U+FFFD — and return what you stored, so
+  a tool that printed a NUL does not fail the run and every backend holds the same value
+  (`docs/reference/store-adapters.md`, "Data caveats"; ADR 0051). Other data a backend cannot hold
+  (an integer above `i64::MAX` in BSON) is `InvalidInput`, not a driver error.
 * Claiming must be exclusive under concurrency (the suite races workers); a read-then-write claim
   without a conditional write fails it.
 * `release_lease` never clears the run's owner (pinned claims).

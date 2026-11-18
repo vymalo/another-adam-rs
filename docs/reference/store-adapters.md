@@ -50,9 +50,13 @@ cron tick across all replicas. A second message on a conversation that has an op
 * **MongoDB keys.** Agent state often contains JSON Schema keys like `$ref` and `$defs`, dotted keys and
   empty keys. They are escaped reversibly (`%` prefix plus percent-encoding of `%`, `.`, `$`, NUL);
   ordinary keys are stored as-is so `state.messages.role` still works in queries
-  (`crates/adam-store-mongodb/src/codec.rs`).
+  (`crates/adam-store-mongodb/src/codec.rs`). The store replaces a NUL with U+FFFD before the codec
+  (`adam_core::storable`), so the NUL escape is only for data written before ADR 0051.
 * **MongoDB integers** above `i64::MAX` are rejected with `InvalidInput`.
-* **PostgreSQL NUL.** `JSONB` cannot hold `\u0000`; such state is rejected with `InvalidInput`.
+* **NUL characters.** `JSONB` cannot hold `\u0000`. Every adapter replaces it with U+FFFD
+  (`adam_core::storable`) before it writes a state, a journal payload or a push configuration,
+  and returns what it stored, so the value is the same in every backend and a tool that printed a
+  NUL does not fail the run ([ADR 0051](../decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
 * **Time** is truncated to milliseconds in every store. Lease expiry uses the `now` the caller passes in:
   keep worker clocks in sync (NTP) and lease TTLs well above the expected skew.
 
