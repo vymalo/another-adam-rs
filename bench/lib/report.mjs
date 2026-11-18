@@ -226,6 +226,7 @@ export function buildReport(foldedOrRecords, opts = {}) {
   out.push('Every figure of this section sums all attempts of a run (an interrupted attempt that was run again is in it), and counts only Done runs.\n\n');
   const costRows = [];
   const timeRows = [];
+  const turnRows = [];
   for (const [cell, rs] of group(counted, cellKey)) {
     const solved = rs.filter(passed).length;
     const cost = sum(rs.map((v) => v.spentMicro));
@@ -260,10 +261,24 @@ export function buildReport(foldedOrRecords, opts = {}) {
       sum(rs.map((v) => v.calls.refused)),
       sum(rs.map((v) => v.calls.usageMissing)),
     ]);
+    // What the meter read in the answers: how many tool calls each model turn asked for.
+    const turns = sum(rs.map((v) => v.toolCalls.turns));
+    const asked = sum(rs.map((v) => v.toolCalls.calls));
+    turnRows.push([
+      rs[0].agent,
+      rs[0].arm,
+      turns,
+      asked,
+      turns > 0 ? (asked / turns).toFixed(2) : 'n/a',
+      turns > 0 ? sum(rs.map((v) => v.toolCalls.multiTurns)) : 'n/a',
+      turns > 0 ? Math.max(...rs.map((v) => v.toolCalls.maxInTurn)) : 'n/a',
+    ]);
   }
   out.push(table(['Agent', 'Arm', 'Cost', 'Cost per solved task', 'Input', 'Cached', 'Cache write', 'Output', 'Reasoning (in output)', 'Median per run: input / output / reasoning', 'Cost per run', 'Cache-hit rate (cached / input, all attempts)', 'Spend on unsolved runs', 'Spend per solved task, every run of the cell'], costRows));
   out.push('\n');
   out.push(table(['Agent', 'Arm', 'Wall median', 'Wall p90', 'Model calls (median)', 'Refused calls', 'Calls with no usage (charged worst case)'], timeRows));
+  out.push('\n\nTool calls per model turn, read from the model\'s answers (a turn with a count of its own; a run recorded before the count has none):\n\n');
+  out.push(table(['Agent', 'Arm', 'Model turns counted', 'Tool calls asked', 'Tool calls per turn', 'Turns with several calls', 'Most calls in one turn'], turnRows));
 
   h('Infrastructure failures');
   out.push('A run that failed in the infrastructure (the environment, the model endpoint, a container that would not stop) is tried again at most twice and is never a fail. Left out of the rates when it never finished.\n\n');

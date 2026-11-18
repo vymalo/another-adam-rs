@@ -577,6 +577,29 @@ test('a chunked upload with no content-length is counted in total and refused wi
   assert.equal(s.model.requests.length, 0);
 });
 
+test('the settled record counts the tool calls of the answer, plain and stream (calls per model turn, ADR 0049)', async (t) => {
+  const s = await setup(t, { behavior: { toolCalls: 3 } });
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+  s.model.behavior.toolCalls = 0;
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+  assert.deepEqual(
+    callRecords(s.ledger, 'settled').map((r) => r.toolCalls),
+    [3, 3, 0, 0],
+  );
+});
+
+test('a failed call has no tool call count', async (t) => {
+  const s = await setup(t, { behavior: { status: 500 } });
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
+  const done = s.ledger.records.filter((r) => r.kind === 'call' && r.phase !== 'pending');
+  assert.ok(done.length >= 1);
+  for (const r of done) assert.equal(r.toolCalls, undefined);
+});
+
 test('S1: a client that closes the stream right after [DONE] is charged the usage the meter already saw, not the worst case', async (t) => {
   const s = await setup(t, { behavior: { holdAfterDoneMs: 400 } });
   const { baseUrl } = s.open();

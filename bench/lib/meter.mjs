@@ -124,6 +124,7 @@ class UsageSniffer {
     this.decoder = new StringDecoder('utf8');
     this.partial = '';
     this.usage = null;
+    this.toolCalls = 0; // the most tool calls any choice of the stream has begun (the highest `index` seen, plus one)
     this.done = false; // the stream said `[DONE]`: it is over, and the usage it carried is the whole of it
     this.gaveUp = false;
   }
@@ -157,6 +158,11 @@ class UsageSniffer {
     try {
       const chunk = JSON.parse(data);
       if (isObject(chunk) && isObject(chunk.usage)) this.usage = chunk.usage;
+      for (const choice of Array.isArray(chunk?.choices) ? chunk.choices : []) {
+        const calls = choice?.delta?.tool_calls;
+        if (!Array.isArray(calls)) continue;
+        for (const c of calls) if (Number.isInteger(c?.index) && c.index >= 0) this.toolCalls = Math.max(this.toolCalls, c.index + 1);
+      }
     } catch {
       // not JSON: ignored
     }
@@ -253,7 +259,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
   /** One settlement per call: write the actual cost, free the worst case. `sent` says the request left. */
   function makeSettler({ run, base, worstMicro }) {
     const call = { done: false, sent: false, worstMicro, base, run };
-    call.settle = ({ rawUsage, status, reason, free = false }) => {
+    call.settle = ({ rawUsage, status, reason, free = false, toolCalls }) => {
       if (call.done) return false;
       call.done = true;
       let outcome;
@@ -268,6 +274,8 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
           usageMissing: outcome.usageMissing,
           ...(status === undefined ? {} : { status }),
           ...(reason ? { reason } : {}),
+          // How many tool calls the answer asked for (calls per model turn): only when the answer was read.
+          ...(!free && Number.isInteger(toolCalls) ? { toolCalls } : {}),
         });
       } catch {
         // The truth cannot be written: stop serving rather than spend unrecorded.
@@ -314,7 +322,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
         clientGone = true;
         upstreamReq?.destroy();
         sniffer?.end();
-        if (sniffer?.done && sniffer.usage) settle({ rawUsage: sniffer.usage, status: 200 });
+        if (sniffer?.done && sniffer.usage) settle({ rawUsage: sniffer.usage, status: 200, toolCalls: sniffer.toolCalls });
         else settle({ rawUsage: null, reason: 'client_abort' });
         resolve();
       });
@@ -389,7 +397,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
             ur.on('end', () => {
               sniffer.end();
               if (clientGone) return resolve();
-              settle({ rawUsage: sniffer.usage, status });
+              settle({ rawUsage: sniffer.usage, status, toolCalls: sniffer.toolCalls });
               res.end();
               resolve();
             });
@@ -404,13 +412,16 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
             if (clientGone || call.done) return resolve();
             const body = Buffer.concat(chunks);
             let usage = null;
+            let toolCalls;
             try {
               const parsedBody = JSON.parse(body.toString('utf8'));
               if (isObject(parsedBody) && isObject(parsedBody.usage)) usage = parsedBody.usage;
+              const choice = Array.isArray(parsedBody?.choices) ? parsedBody.choices[0] : null;
+              if (isObject(choice?.message)) toolCalls = Array.isArray(choice.message.tool_calls) ? choice.message.tool_calls.length : 0;
             } catch {
               // not JSON: usage stays missing
             }
-            settle({ rawUsage: usage, status });
+            settle({ rawUsage: usage, status, toolCalls });
             res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
             res.end(body);
             resolve();

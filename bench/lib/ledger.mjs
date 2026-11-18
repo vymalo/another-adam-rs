@@ -343,7 +343,7 @@ export function foldRecords(records) {
       if (rec.phase === 'pending') {
         a.calls.set(key, { ...prior, worstMicro: rec.worstMicro ?? 0 });
       } else if (rec.phase === 'settled' || rec.phase === 'failed') {
-        a.calls.set(key, { ...prior, costMicro: rec.costMicro ?? 0 });
+        a.calls.set(key, { ...prior, costMicro: rec.costMicro ?? 0, ...(Number.isInteger(rec.toolCalls) ? { toolCalls: rec.toolCalls } : {}) });
         if (rec.phase === 'failed') a.failed += 1;
         else a.settled += 1;
         if (rec.usageMissing) a.usageMissing += 1;
@@ -369,8 +369,17 @@ export function foldRecords(records) {
     // Tokens and calls, like the spend, are of all attempts of the run.
     v.tokens = emptyTokens();
     v.calls = { settled: 0, failed: 0, refused: 0, usageMissing: 0 };
+    // Calls per model turn: a turn is a settled answer whose tool call count the meter read.
+    v.toolCalls = { turns: 0, calls: 0, multiTurns: 0, maxInTurn: 0 };
     for (const a of v.attempts) {
       if (!a) continue;
+      for (const c of a.calls.values()) {
+        if (c.toolCalls === undefined) continue;
+        v.toolCalls.turns += 1;
+        v.toolCalls.calls += c.toolCalls;
+        if (c.toolCalls >= 2) v.toolCalls.multiTurns += 1;
+        v.toolCalls.maxInTurn = Math.max(v.toolCalls.maxInTurn, c.toolCalls);
+      }
       for (const k of Object.keys(v.tokens)) v.tokens[k] += a.tokens[k];
       for (const k of Object.keys(v.calls)) v.calls[k] += a[k];
     }

@@ -26,6 +26,7 @@ export function createScriptedModel(initial = {}) {
     endlessChunkBytes: 100,
     endlessEveryMs: 5,
     holdBeforeDoneMs: 0, // the usage chunk is sent, then this long passes before `[DONE]` (a client that aborts in it aborts before the end)
+    toolCalls: 0, // an answer that asks for this many tool calls at once (a number above 0), whatever the script says
     holdAfterDoneMs: 0, // a stream ends this long after `[DONE]` (a client that closes at `[DONE]` closes first)
     ...initial,
   };
@@ -72,7 +73,8 @@ export function createScriptedModel(initial = {}) {
         }
         const base = { id: 'chatcmpl-scripted', object: 'chat.completion', created: 1, model: body?.model ?? 'unknown' };
         const turn = behavior.script === 'agents' ? nextTurn(body) : null;
-        const toolCall = turn?.tool ? [{ id: turn.tool.id, type: 'function', function: { name: turn.tool.name, arguments: JSON.stringify(turn.tool.args) } }] : null;
+        const several = behavior.toolCalls > 0 ? Array.from({ length: behavior.toolCalls }, (_, i) => ({ id: `call-${i + 1}`, type: 'function', function: { name: 'probe', arguments: JSON.stringify({ n: i + 1 }) } })) : null;
+        const toolCall = turn?.tool ? [{ id: turn.tool.id, type: 'function', function: { name: turn.tool.name, arguments: JSON.stringify(turn.tool.args) } }] : several;
         if (body?.stream !== true) {
           const message = toolCall ? { role: 'assistant', content: null, tool_calls: toolCall } : { role: 'assistant', content: turn ? turn.text : 'done'.padEnd(behavior.padBytes, 'x') };
           const out = { ...base, choices: [{ index: 0, message, finish_reason: toolCall ? 'tool_calls' : 'stop' }] };
