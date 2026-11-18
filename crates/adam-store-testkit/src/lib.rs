@@ -45,7 +45,7 @@ use serde_json::json;
 macro_rules! store_conformance {
     ($make:path) => {
         $crate::store_conformance!(@cases $make;
-            create_and_load, state_roundtrip, nul_characters_roundtrip_or_reject_cleanly,
+            create_and_load, state_roundtrip, nul_characters_are_stored_as_the_replacement_character,
             create_duplicate_id, load_missing,
             commit_advances_version, commit_stale_version_conflicts, commit_missing_run,
             concurrent_commits_single_winner, journal_roundtrip_and_order,
@@ -175,19 +175,91 @@ pub mod cases {
         );
     }
 
-    /// Some backends (PostgreSQL JSONB) cannot store `\u0000`. They must say so
-    /// with `InvalidInput`, not an opaque backend error, and must not corrupt it.
-    pub async fn nul_characters_roundtrip_or_reject_cleanly(store: DynStore) {
-        for state in [json!({"text": "a\u{0}b"}), json!({"k\u{0}ey": 1})] {
-            match store.create_run(NewRun::new(agent(), state.clone())).await {
-                Ok(run) => {
-                    assert_eq!(run.state, state);
-                    assert_eq!(store.load_run(run.id).await.unwrap().unwrap().state, state);
-                }
-                Err(StoreError::InvalidInput(_)) => {}
-                Err(other) => panic!("expected a roundtrip or InvalidInput, got {other:?}"),
-            }
+    /// A NUL cannot be stored by every backend (PostgreSQL's `JSONB` refuses it), so every store
+    /// replaces it with U+FFFD in strings and keys, before it writes: the value a store returns is
+    /// the value every other store would hold, and a run that printed a NUL does not fail on the
+    /// store it happens to run on (ADR 0051).
+    pub async fn nul_characters_are_stored_as_the_replacement_character(store: DynStore) {
+        for (state, want) in [
+            (json!({"text": "a\u{0}b"}), json!({"text": "a\u{FFFD}b"})),
+            (json!({"k\u{0}ey": 1}), json!({"k\u{FFFD}ey": 1})),
+            (
+                json!({"nested": [{"deep": "x\u{0}\u{0}y"}]}),
+                json!({"nested": [{"deep": "x\u{FFFD}\u{FFFD}y"}]}),
+            ),
+        ] {
+            let run = store.create_run(NewRun::new(agent(), state)).await.unwrap();
+            assert_eq!(run.state, want, "create_run returns what is stored");
+            assert_eq!(
+                store.load_run(run.id).await.unwrap().unwrap().state,
+                want,
+                "the state read back is the one stored"
+            );
         }
+        // A journal payload too: a tool's output is where a NUL comes from.
+        let run = store
+            .create_run(NewRun::new(agent(), json!({})))
+            .await
+            .unwrap();
+        let entry = store
+            .journal_put(
+                run.id,
+                JournalEntry::ok(0, "tool", json!({"content": "before\u{0}after"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entry.payload,
+            json!({"content": "before\u{FFFD}after"}),
+            "journal_put returns what is stored"
+        );
+        assert_eq!(
+            store.journal_get(run.id, 0).await.unwrap().unwrap().payload,
+            entry.payload
+        );
+        // A commit, which is the state a run keeps between transitions.
+        let committed = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"text": "a\u{0}b"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.state, json!({"text": "a\u{FFFD}b"}));
+        assert_eq!(
+            store.load_run(run.id).await.unwrap().unwrap().state,
+            json!({"text": "a\u{FFFD}b"})
+        );
+        // A push configuration and its cursor.
+        let mut new = new_push(run.id, &agent(), "c1");
+        new.config = json!({"url": "https://hooks.example/\u{0}"});
+        new.cursor = json!({"status": "\u{0}"});
+        let push = store.push_put(new).await.unwrap();
+        assert_eq!(
+            push.config,
+            json!({"url": "https://hooks.example/\u{FFFD}"})
+        );
+        assert_eq!(push.cursor, json!({"status": "\u{FFFD}"}));
+        let committed_push = store
+            .push_commit(
+                run.id,
+                "c1",
+                push.version,
+                PushProgress {
+                    state: PushState::Active,
+                    cursor: json!({"status": "a\u{0}b"}),
+                    attempts: 1,
+                    last_error: Some("status 503".into()),
+                    next_attempt_at: now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed_push.cursor, json!({"status": "a\u{FFFD}b"}));
+        // `last_error` is a text column, not JSON: a NUL there is the caller's, not a tool's output,
+        // and PostgreSQL refuses it (ADR 0051 says what this decision covers).
+        assert_eq!(committed_push.last_error.as_deref(), Some("status 503"));
     }
 
     pub async fn create_duplicate_id(store: DynStore) {

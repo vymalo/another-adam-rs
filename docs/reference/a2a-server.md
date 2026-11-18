@@ -382,7 +382,8 @@ A message invokes one in either of two forms, and both give the same stored text
 * **A form's answer is never a command.** A message with an A2UI `action` part (the person's click on a form) is stored as it is:
   its text is not read as `/name`, even when the inbound function joins the parts into one text. A command named in the
   metadata of such a message is `InvalidParams` and nothing is written. A NUL character in the metadata `arguments` is
-  `InvalidParams` too (the store cannot hold it), and an unknown name in an error is cut at 64 characters and escaped.
+  `InvalidParams` too (a NUL is not text a command can carry; a tool's own output may hold one, and the store keeps it
+  as U+FFFD), and an unknown name in an error is cut at 64 characters and escaped.
 * **Both forms agree.** The arguments are trimmed in what is stored (`command.arguments`) as in what is substituted; when a
   message carries both forms the metadata wins and its text is not read; an expansion that is only whitespace is refused.
 * **Expansion** is plain substitution, once, with this grammar (tests: `crates/adam-a2a-runtime/src/commands.rs`):

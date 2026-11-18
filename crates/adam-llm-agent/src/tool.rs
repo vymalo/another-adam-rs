@@ -484,7 +484,54 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Replace every NUL of `text` with U+FFFD, in place.
+fn clean_text(text: &mut String) {
+    if let std::borrow::Cow::Owned(clean) = adam_core::storable_text(text) {
+        *text = clean;
+    }
+}
+
 impl ToolOutput {
+    /// The result as the loop keeps and shows it: every text the tool wrote has a NUL replaced by
+    /// U+FFFD ([`adam_core::storable_text`], the same rule every store applies), so a command that
+    /// printed one neither fails a store that cannot hold it nor replays differently from what the
+    /// live run showed. Applied once, where a call's output becomes its journaled step and its model
+    /// message (ADR 0051); a value without a NUL is unchanged.
+    pub(crate) fn sanitized(mut self) -> Self {
+        clean_text(&mut self.content);
+        if let Some(answer) = &mut self.answer {
+            clean_text(answer);
+        }
+        if let Some(key) = &mut self.repeat_key {
+            clean_text(key);
+        }
+        if let Some(kept) = &mut self.kept {
+            clean_text(&mut kept.text);
+        }
+        if let Some(plan) = &mut self.plan {
+            if let Some(title) = &mut plan.title {
+                clean_text(title);
+            }
+            for item in &mut plan.items {
+                clean_text(&mut item.text);
+                if let Some(note) = &mut item.note {
+                    clean_text(note);
+                }
+            }
+        }
+        for artifact in &mut self.artifacts {
+            clean_text(&mut artifact.name);
+            if let Some(mime) = &mut artifact.mime_type {
+                clean_text(mime);
+            }
+            artifact.data = adam_core::storable(&artifact.data).into_owned();
+            if let Some(file) = &mut artifact.file {
+                clean_text(&mut file.filename);
+            }
+        }
+        self
+    }
+
     /// A successful result with no artifacts.
     pub fn text(content: impl Into<String>) -> Self {
         Self {
@@ -1450,8 +1497,56 @@ impl ToolCtx {
 #[cfg(test)]
 mod tests {
     use adam_error::{Classify, ErrorClass};
+    use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn sanitized_replaces_a_nul_in_every_text_a_tool_can_write() {
+        use crate::plan::{PlanItem, PlanStatus};
+
+        let output = ToolOutput::text("a\u{0}b")
+            .announcing("c\u{0}d")
+            .with_repeat_key("e\u{0}f")
+            .with_artifact(Artifact::new(
+                "g\u{0}h",
+                Some("i\u{0}j".into()),
+                json!({"k\u{0}": "v\u{0}"}),
+            ))
+            .with_plan(Plan {
+                title: Some("t\u{0}".into()),
+                items: vec![PlanItem {
+                    id: 1,
+                    text: "x\u{0}".into(),
+                    status: PlanStatus::Pending,
+                    note: Some("n\u{0}".into()),
+                }],
+            })
+            .sanitized();
+        assert_eq!(output.content, "a\u{FFFD}b");
+        assert_eq!(output.answer.as_deref(), Some("c\u{FFFD}d"));
+        assert_eq!(
+            output.repeat_key.as_deref().map(String::as_str),
+            Some("e\u{FFFD}f")
+        );
+        assert_eq!(output.artifacts[0].name, "g\u{FFFD}h");
+        assert_eq!(output.artifacts[0].mime_type.as_deref(), Some("i\u{FFFD}j"));
+        assert_eq!(output.artifacts[0].data, json!({"k\u{FFFD}": "v\u{FFFD}"}));
+        let plan = output.plan.as_ref().unwrap();
+        assert_eq!(plan.title.as_deref(), Some("t\u{FFFD}"));
+        assert_eq!(plan.items[0].text, "x\u{FFFD}");
+        assert_eq!(plan.items[0].note.as_deref(), Some("n\u{FFFD}"));
+    }
+
+    #[test]
+    fn sanitized_leaves_a_clean_output_as_it_was() {
+        let clean = ToolOutput::text("a\u{1}b").announcing("c");
+        let content = clean.content.clone();
+        let answer = clean.answer.clone();
+        let sanitized = clean.sanitized();
+        assert_eq!(sanitized.content, content);
+        assert_eq!(sanitized.answer, answer);
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("outer")]

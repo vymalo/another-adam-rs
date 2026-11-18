@@ -293,6 +293,7 @@ async fn only_the_optional_arguments_are_nullable() {
         found,
         [
             "apply_patch.repo",
+            "commit_and_push.pull_request",
             "commit_and_push.repo",
             "create_repository.description",
             "create_repository.private",

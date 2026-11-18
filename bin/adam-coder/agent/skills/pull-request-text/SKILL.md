@@ -4,9 +4,9 @@ description: "Write the title and body of a pull request a reviewer can act on: 
 ---
 # Write the pull request text
 
-Call `open_pull_request` with a `title` and a `body` only after the last check passed. The
-reviewer reads the title in a list and the body once, so make both stand alone. Write for a
-person who has not seen this conversation.
+Call `open_pull_request`, or the last `commit_and_push` with `pull_request`, with a `title` and a
+`body` only after the last check passed. The reviewer reads the title in a list and the body
+once, so make both stand alone. Write for a person who has not seen this conversation.
 
 ## 1. Look at what the repository asks for
 
@@ -73,9 +73,10 @@ nothing to say:
 
 ## 5. When you update a pull request
 
-When you continued a branch that already has a pull request, `open_pull_request` updates it.
-Write the body for the whole pull request as it now stands, not only for the last commit, and
-make the Verification section describe the last green run on the final code.
+When you continued a branch that already has a pull request, `open_pull_request` (or the
+`pull_request` of `commit_and_push`) updates it. Write the body for the whole pull request as it
+now stands, not only for the last commit, and make the Verification section describe the last
+green run on the final code.
 
 ## 6. A check before you send it
 

@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use super::{
     ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord, PushState,
     RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult, add_ttl, now,
-    truncate_ms,
+    storable_owned, truncate_ms,
 };
 
 #[derive(Default)]
@@ -86,7 +86,7 @@ impl Store for MemoryStore {
             conversation_id: new.conversation_id,
             parent_id: new.parent_id,
             status: new.status,
-            state: new.state,
+            state: storable_owned(new.state),
             wake_at: new.wake_at.map(truncate_ms),
             version: 1,
             created_at: t,
@@ -137,7 +137,7 @@ impl Store for MemoryStore {
         )]
         let slot = inner.runs.get_mut(&id).expect("checked above");
         slot.run.status = update.status;
-        slot.run.state = update.state;
+        slot.run.state = storable_owned(update.state);
         slot.run.wake_at = update.wake_at.map(truncate_ms);
         slot.run.version += 1;
         slot.run.updated_at = now();
@@ -177,6 +177,7 @@ impl Store for MemoryStore {
         if !inner.runs.contains_key(&run) {
             return Err(StoreError::NotFound(run));
         }
+        entry.payload = storable_owned(std::mem::take(&mut entry.payload));
         entry.recorded_at = truncate_ms(entry.recorded_at);
         inner.journal.insert((run, entry.seq), entry.clone());
         Ok(entry)
@@ -330,8 +331,8 @@ impl Store for MemoryStore {
             id: new.id,
             agent: new.agent,
             owner: new.owner,
-            config: new.config,
-            cursor: new.cursor,
+            config: storable_owned(new.config),
+            cursor: storable_owned(new.cursor),
             state: PushState::Active,
             attempts: 0,
             last_error: None,
@@ -420,7 +421,7 @@ impl Store for MemoryStore {
         }
         let record = &mut slot.record;
         record.state = progress.state;
-        record.cursor = progress.cursor;
+        record.cursor = storable_owned(progress.cursor);
         record.attempts = progress.attempts;
         record.last_error = progress.last_error;
         record.next_attempt_at = truncate_ms(progress.next_attempt_at);
