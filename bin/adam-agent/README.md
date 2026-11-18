@@ -367,7 +367,7 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   two-agent folder (78 with `path:line`, before anything connects), Postgres unreachable (69, no password in
   the output), the card and `/healthz` served and a clean SIGTERM, **a chat folder answering "hi" in role through
   the official A2A client against a model scripted by the prompt, and the same database after an edit and a
-  restart saying the edited words**, a researcher answering with its source through a stateless MCP server, a control plane and a worker in two processes completing a task over one
+  restart saying the edited words**, a researcher answering with its source through a stateless MCP server, `MAX_PARALLEL_TOOL_CALLS` at 1 and at 2 read in the model's request (the `after_previous` property and sentence absent and present), a control plane and a worker in two processes completing a task over one
   database, and the MCP cases of the section above as a process.
 * The mock models `mock-assistant` (`dev/wiremock/mock-openai/mappings/agent-script.json`) and `mock-researcher`
   (`researcher-cards.json`, the script of `[mock:cards]`) are probed by the `compose` job of `ci.yml`; the container
