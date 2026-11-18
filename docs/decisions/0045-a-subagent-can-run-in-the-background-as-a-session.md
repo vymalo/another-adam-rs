@@ -100,6 +100,17 @@ round agents' starters on the A2A front; a reload of `LiveAssembly` keeps the ro
 9. **The card is read once per round**, on a client rebuilt from it, so a card that changed between rounds is read again.
 10. **The one-shot tool is unchanged.** A subagent called through its tool behaves as before.
 
+*Amended 2026-11-18* (slice 5, after review):
+
+* **A cancel while the send is answered is recoverable.** The round commits the send's request before the call (`sending`). If a
+  cancel lands before the task id is committed, `on_cancelled`, or the next round (`cancel-prior`), repeats that send under its
+  message id and cancels the task found. This needs a remote that deduplicates message ids to avoid a second task; one that does
+  not makes a task and cancels it. Every cancel is one try, logged, not repeated.
+* **A closing round cancels what the round before left first.**
+* **Messages a failed or cancelled round never sent** go first in the next round.
+* **A round limits itself**: it records its first step and fails after `remote_timeout`, because the A2A front starts a person's round with no runtime limit. `remote_timeout` is both the one-shot tool's wait cap and a round's limit.
+* **`read_ids` keeps 64 ids**: a copy delivered after 64 newer messages is sent again.
+
 *Amended 2026-11-18* (slice 6 part a; each is a departure found while building, and the contract is
 `docs/api/child-sessions-v1.md` of `vymalo/another-agentic-system`):
 

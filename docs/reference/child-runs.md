@@ -348,16 +348,20 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> ReadCard: the round starts
+    [*] --> CancelPrior: the round before left a task or a send that may have been made
+    CancelPrior --> ReadCard: cancelled, one try
+    CancelPrior --> Done: a closing round
     ReadCard --> Send: the card is read once per round
     Send --> Poll: the task works
     Send --> Finish: a final answer or a plain message
     Poll --> Poll: GetTask finds it working, Park
     Poll --> Poll: a message is steered or queued
+    Poll --> Poll: a steer the remote refuses is queued
+    Poll --> Failed: the round's limit passed, CancelTask sent
     Poll --> Send: the task ended and messages are queued
     Poll --> Finish: the task ended and nothing is queued
     Finish --> Done: completed, or a question for the person
     Finish --> Failed: failed, canceled, rejected or auth-required
-    Done --> Send: a message arrived as the round finished
     ReadCard --> Cancelled: Runtime cancel
     Send --> Cancelled: Runtime cancel
     Poll --> Cancelled: Runtime cancel
@@ -368,7 +372,7 @@ stateDiagram-v2
 
 **One transition, one action.** `RoundState::next` picks it from the state alone: read the card, deal with a message, send,
 look, or report. Every call to the remote is a journaled step (`card`, `send:<n>`, `steer:<id>`, `poll:<task>:<looks>`,
-`cancel-prior`, `cancel-now`), and the task id is committed with the transition that learns it.
+`cancel-prior`, `cancel-limit`), and the task id is committed with the transition that learns it.
 
 * **Message ids.** Round 1's first send uses the round's run id, a later send of the round `child_run_id(round, "queued:<n>")`,
   a steer `child_run_id(round, message id)`: a replay sends the id again, and a remote that deduplicates (`adam-a2a-runtime`
@@ -381,6 +385,11 @@ look, or report. Every call to the remote is a journaled step (`card`, `send:<n>
   refused: it is queued and sent, with the others that waited, as the next task of the round. `subagent_send` reads
   `queues_messages` from the round's state and says `queued` or `steered`; it is `true` until the card is read, because a
   message that arrives first joins the first send.
+* **Window of a message id.** A round remembers the last 64 message ids it read (`read_ids`, what a retried
+  `subagent_send` checks). A copy delivered again after 64 newer messages is read as new and sent again.
+* **Limit.** `AgentDef::remote_timeout` (`RemoteSettings::max_wait`) is both the wait cap of the one-shot tool and the limit
+  of a session round. The tools give it to the runtime as the round's time limit, and the round also records its first step
+  and fails at the limit itself (`cancel-limit`), because a round the A2A front starts has no runtime limit.
 * **Looks.** The first look is 2 s after the send, then 4 s, 8 s and so on up to `wait_poll`, each a journaled `GetTask`.
   The report waits at most that long.
 * **Not carried.** The remote's tokens are not counted in the parent. A file in an answer is described in a line, not
@@ -403,9 +412,13 @@ Each has a test in `crates/adam-assembly/tests/remote_sessions.rs` (memory, and 
 | R9 | The round is cancelled: `subagent_close` with `cancel`, the parent, or the time limit | `Agent::on_cancelled` sends `CancelTask` (10 s limit, best effort) | `cancelling_a_remote_session_sends_cancel_task`, `cancelling_the_parent_sends_cancel_task`, `a_round_past_its_limit_cancels_the_remote_task` |
 | R10 | The cancel is lost | The next round of the session cancels the task the round before left working (`cancel-prior`) | `a_lost_cancel_is_sent_by_the_next_round` |
 
-**Limits.** The cancel is not durable: it is sent once by the process that commits the cancel, and a process that registered
-only the starter sends nothing (the next round recovers it). A cancel that lands while the send is in flight is sent from
-the round's own step (`cancel-now`) once it knows the task. A reload of `LiveAssembly` does not replace the round agents:
+**Limits.** The cancel is not durable, and every cancel here (`on_cancelled`, `cancel-prior`, `cancel-limit`) is one try:
+a failed `CancelTask` is logged and not repeated. The send's request is committed before the call (`sending`), so a cancel
+that lands while the remote answers still leaves what is needed: the hook, or the next round, repeats the send under the same
+message id, which a deduplicating remote answers with the task it made, and cancels that. (A remote that does not deduplicate
+makes a task and then cancels it.) A closing round cancels what the round before left before it closes. Messages a failed or
+cancelled round never sent go first in the next round. The cancel is not durable: it is sent once by the process that commits the cancel, and a process that registered
+only the starter sends nothing (the next round recovers it). A reload of `LiveAssembly` does not replace the round agents:
 a changed remote needs a restart. A parent that has a remote subagent and no local one now has the five session tools.
 
 ## Remote tasks: the same wait without a message

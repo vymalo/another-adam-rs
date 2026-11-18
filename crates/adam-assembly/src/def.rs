@@ -877,6 +877,7 @@ fn add_subagent_tools(
                     rounds.push(RemoteRoundAgent::new(
                         format!("{}/{}", origin.agent, agent.name),
                         Arc::clone(tool.endpoint()),
+                        remote.max_wait,
                     ));
                 }
                 Arc::new(tool)

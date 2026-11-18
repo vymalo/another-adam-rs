@@ -86,6 +86,21 @@ pub struct RoundState {
     /// remote): this round cancels it first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prior_open_task: Option<String>,
+    /// A send the round before may have made without learning the task (it was cancelled while the
+    /// remote answered): this round repeats it, under the same message id, to find the task and
+    /// cancel it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_sending: Option<SendMessageRequest>,
+    /// The send about to be made, committed before the call: a cancel that lands while the remote
+    /// answers leaves the request here, so the task can be found again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sending: Option<SendMessageRequest>,
+    /// How many of `queued` the `sending` request carries.
+    #[serde(default)]
+    sending_count: usize,
+    /// When the round first stepped: the round gives up `max_wait` after it, whatever started it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started: Option<chrono::DateTime<chrono::Utc>>,
     /// Messages taken from the inbox that no step has dealt with yet.
     #[serde(default)]
     unhandled: Vec<Queued>,
@@ -165,7 +180,7 @@ enum Action {
     /// A round that only closes its session: answer with the last report and call nothing.
     Close,
     /// Cancel the task the round before left working.
-    CancelPrior(String),
+    CancelPrior,
     /// Read the agent card, to know whether a working task takes messages.
     ReadCard,
     /// Deal with a message taken from the inbox: steer it into the working task or queue it.
@@ -184,11 +199,12 @@ impl RoundState {
     }
 
     fn next(&self) -> Action {
+        // What the round before left working is cancelled first, a closing round included.
+        if self.prior_open_task.is_some() || self.prior_sending.is_some() {
+            return Action::CancelPrior;
+        }
         if self.closing() {
             return Action::Close;
-        }
-        if let Some(task) = &self.prior_open_task {
-            return Action::CancelPrior(task.clone());
         }
         if !self.card_read {
             return Action::ReadCard;
@@ -261,7 +277,6 @@ impl RoundState {
             Stage::Failed => {
                 self.failure = Some(seen.text);
                 self.last_task = seen.task.or(self.last_task.take());
-                self.queued.clear();
             }
         }
     }
@@ -305,13 +320,17 @@ pub struct RemoteRoundAgent {
     name: String,
     endpoint: Arc<RemoteEndpoint>,
     wait_poll: Duration,
+    /// The longest a round works, from its first step: the round's own limit, for a round the
+    /// runtime was given none for.
+    max_wait: Duration,
 }
 
 impl RemoteRoundAgent {
-    pub(crate) fn new(name: String, endpoint: Arc<RemoteEndpoint>) -> Self {
+    pub(crate) fn new(name: String, endpoint: Arc<RemoteEndpoint>, max_wait: Duration) -> Self {
         Self {
             name,
             endpoint,
+            max_wait,
             wait_poll: DEFAULT_WAIT_POLL,
         }
     }
@@ -367,6 +386,21 @@ impl RemoteRoundAgent {
         state.answer_task.clone_from(&prior.answer_task);
         state.last_text.clone_from(&prior.last_text);
         state.prior_open_task = prior.task.clone().or_else(|| prior.prior_open_task.clone());
+        state.prior_sending = prior
+            .sending
+            .clone()
+            .or_else(|| prior.prior_sending.clone());
+        // What waited and was never sent goes first: the person's words are not dropped with a failure.
+        if state.queued.len() == 1 && !state.closing() {
+            let mut carried: Vec<Queued> = prior
+                .unhandled
+                .iter()
+                .chain(&prior.queued)
+                .cloned()
+                .collect();
+            carried.append(&mut state.queued);
+            state.queued = carried;
+        }
         Ok(state)
     }
 
@@ -390,11 +424,11 @@ impl RemoteRoundAgent {
         }
     }
 
-    fn message(&self, ctx: &Ctx, st: &RoundState, text: &str) -> SendMessageRequest {
+    fn message(run: adam_core::RunId, st: &RoundState, text: &str) -> SendMessageRequest {
         let message_id = if st.sent == 0 {
-            ctx.run_id().to_string()
+            run.to_string()
         } else {
-            child_run_id(ctx.run_id(), &format!("queued:{}", st.sent)).to_string()
+            child_run_id(run, &format!("queued:{}", st.sent)).to_string()
         };
         let mut message = Message::new(Role::User, vec![Part::text(text)]);
         message.message_id = message_id;
@@ -430,22 +464,18 @@ impl RemoteRoundAgent {
         })
     }
 
-    async fn cancel_prior(
-        &self,
-        ctx: &mut Ctx,
-        st: &mut RoundState,
-        task: String,
-    ) -> Result<(), AgentError> {
-        let endpoint = self.endpoint.clone();
-        let name = self.name.clone();
+    async fn cancel_prior(&self, ctx: &mut Ctx, st: &mut RoundState) -> Result<(), AgentError> {
+        let (endpoint, name) = (self.endpoint.clone(), self.name.clone());
+        let (task, probe) = (st.prior_open_task.clone(), st.prior_sending.clone());
         let sent: Result<(), CallFailure> = ctx
             .step("cancel-prior", move || async move {
-                cancel_task(&endpoint, &name, &task, "the round before").await;
+                stop_tasks(&endpoint, &name, task, probe, "the round before").await;
                 Ok(())
             })
             .await?;
         let _ = sent;
         st.prior_open_task = None;
+        st.prior_sending = None;
         Ok(())
     }
 
@@ -489,13 +519,19 @@ impl RemoteRoundAgent {
 
     /// Send what is queued. Returns the failure text when the round cannot go on.
     async fn send(&self, ctx: &mut Ctx, st: &mut RoundState) -> Result<Option<String>, AgentError> {
-        let text = st
-            .queued
-            .iter()
-            .map(|queued| queued.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let request = self.message(ctx, st, &text);
+        // The request is committed before it is made, so a cancel that lands while the remote
+        // answers leaves what is needed to find the task again.
+        let Some(request) = st.sending.clone() else {
+            let text = st
+                .queued
+                .iter()
+                .map(|queued| queued.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            st.sending = Some(Self::message(ctx.run_id(), st, &text));
+            st.sending_count = st.queued.len();
+            return Ok(None);
+        };
         let endpoint = self.endpoint.clone();
         let seen = Self::remote_step(ctx, &format!("send:{}", st.sent), move || async move {
             let client = endpoint.client().await.map_err(CallFailure::of)?;
@@ -511,32 +547,31 @@ impl RemoteRoundAgent {
             Err(text) => return Ok(Some(text)),
         };
         st.sent += 1;
-        st.queued.clear();
+        let taken = st.sending_count.min(st.queued.len());
+        st.queued.drain(..taken);
+        st.sending = None;
+        st.sending_count = 0;
         st.answer_task = None;
         st.question = None;
         st.looks = 0;
         st.record(seen);
-        if st.task.is_some() && ctx.is_cancelled() {
-            self.cancel_now(ctx, st).await?;
-        }
         Ok(None)
     }
 
-    /// The run was cancelled while the send was in flight: the committed state does not hold the
-    /// task, so the cancel is sent from here.
-    async fn cancel_now(&self, ctx: &mut Ctx, st: &RoundState) -> Result<(), AgentError> {
-        let Some(task) = st.task.clone() else {
-            return Ok(());
-        };
+    /// The round has worked past its limit: stop the task and fail.
+    async fn give_up(&self, ctx: &mut Ctx, task: String) -> Result<String, AgentError> {
         let (endpoint, name) = (self.endpoint.clone(), self.name.clone());
         let sent: Result<(), CallFailure> = ctx
-            .step("cancel-now", move || async move {
-                cancel_task(&endpoint, &name, &task, "the run").await;
+            .step("cancel-limit", move || async move {
+                stop_tasks(&endpoint, &name, Some(task), None, "the time limit").await;
                 Ok(())
             })
             .await?;
         let _ = sent;
-        Ok(())
+        Ok(format!(
+            "time limit: the remote task did not finish within {} s",
+            self.max_wait.as_secs()
+        ))
     }
 
     /// Look at the working task. `Ok(Some(text))`: the round cannot go on.
@@ -593,6 +628,7 @@ impl RemoteRoundAgent {
         mut st: RoundState,
     ) -> Result<Transition<RoundState>, AgentError> {
         ctx.reopen_on_arrival();
+        let started = *st.started.get_or_insert_with(|| ctx.now());
         st.absorb_inbox(ctx.take_inbox());
         ctx.read_already(&st.read_ids);
         let failed = match st.next() {
@@ -600,8 +636,8 @@ impl RemoteRoundAgent {
                 let output = json!({ "text": st.last_text, "closed": true });
                 return Ok(Transition::Done { state: st, output });
             }
-            Action::CancelPrior(task) => {
-                self.cancel_prior(ctx, &mut st, task).await?;
+            Action::CancelPrior => {
+                self.cancel_prior(ctx, &mut st).await?;
                 None
             }
             Action::ReadCard => self.read_card(ctx, &mut st).await?,
@@ -610,6 +646,10 @@ impl RemoteRoundAgent {
                 None
             }
             Action::Send => self.send(ctx, &mut st).await?,
+            Action::Poll(task) if past_limit(ctx.now(), started, self.max_wait) => {
+                st.task = None;
+                Some(self.give_up(ctx, task).await?)
+            }
             Action::Poll(task) => {
                 let failed = self.poll(ctx, &mut st, task).await?;
                 if failed.is_none() && st.task.is_some() {
@@ -637,6 +677,15 @@ impl RemoteRoundAgent {
             None => Transition::Continue(st),
         })
     }
+}
+
+/// Whether a round that first stepped at `started` has worked `max_wait`.
+fn past_limit(
+    now: chrono::DateTime<chrono::Utc>,
+    started: chrono::DateTime<chrono::Utc>,
+    max_wait: Duration,
+) -> bool {
+    ChronoDuration::from_std(max_wait).is_ok_and(|limit| now - started > limit)
 }
 
 fn request_of(message: Message) -> SendMessageRequest {
@@ -718,6 +767,40 @@ async fn cancel_task(endpoint: &RemoteEndpoint, agent: &str, task: &str, why: &s
     }
 }
 
+/// Repeat a send that may have been made, under its own message id: a remote that deduplicates
+/// returns the task it made, and its id is what to cancel. A remote that made none now makes one,
+/// which is then cancelled.
+async fn find_task(endpoint: &RemoteEndpoint, request: &SendMessageRequest) -> Option<String> {
+    let attempt = async {
+        let client = endpoint.client().await.ok()?;
+        match client.send_message(request).await.ok()? {
+            SendMessageResponse::Task(task) => Some(task.id),
+            SendMessageResponse::Message(_) => None,
+        }
+    };
+    tokio::time::timeout(CANCEL_TIMEOUT, attempt)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Cancel the working `task`, and the task a send that may have been made started. One try each.
+async fn stop_tasks(
+    endpoint: &RemoteEndpoint,
+    agent: &str,
+    task: Option<String>,
+    probe: Option<SendMessageRequest>,
+    why: &str,
+) {
+    let found = match (&task, &probe) {
+        (None, Some(request)) => find_task(endpoint, request).await,
+        _ => None,
+    };
+    for task in task.into_iter().chain(found) {
+        cancel_task(endpoint, agent, &task, why).await;
+    }
+}
+
 #[async_trait]
 impl Agent for RemoteRoundAgent {
     type State = RoundState;
@@ -751,11 +834,17 @@ impl Agent for RemoteRoundAgent {
         let Ok(state) = serde_json::from_value::<RoundState>(state) else {
             return;
         };
-        let tasks = state.task.iter().chain(state.prior_open_task.iter());
-        for task in tasks {
-            tracing::debug!(agent = %self.name, %run, "the round was cancelled");
-            cancel_task(&self.endpoint, &self.name, task, "the round was cancelled").await;
-        }
+        tracing::debug!(agent = %self.name, %run, "the round was cancelled");
+        let why = "the round was cancelled";
+        stop_tasks(&self.endpoint, &self.name, state.task, state.sending, why).await;
+        stop_tasks(
+            &self.endpoint,
+            &self.name,
+            state.prior_open_task,
+            state.prior_sending,
+            why,
+        )
+        .await;
     }
 }
 
@@ -829,8 +918,6 @@ mod tests {
             matches!(state.next(), Action::Handle(m) if m.id == "m1"),
             "a message is dealt with before the next look"
         );
-        state.prior_open_task = Some("old".into());
-        assert_eq!(state.next(), Action::CancelPrior("old".into()));
         state.session = Some(SessionHeader {
             id: adam_core::RunId::new(),
             agent: "a".into(),
@@ -841,6 +928,9 @@ mod tests {
             round: 2,
         });
         assert_eq!(state.next(), Action::Close, "a closing round calls nothing");
+        // But it cancels what the round before left working first.
+        state.prior_open_task = Some("old".into());
+        assert_eq!(state.next(), Action::CancelPrior);
     }
 
     #[test]
@@ -882,9 +972,15 @@ mod tests {
 
         let mut failing = started();
         failing.record(seen(Stage::Failed, "t3", "out of budget"));
-        assert!(
-            failing.queued.is_empty(),
+        assert_eq!(
+            failing.next(),
+            Action::Finish,
             "a failed round sends nothing more"
+        );
+        assert_eq!(
+            failing.queued.len(),
+            1,
+            "what waited is kept for the next round"
         );
         assert_eq!(failing.finish().unwrap_err(), "out of budget");
     }
@@ -920,7 +1016,11 @@ mod tests {
             &settings,
         )
         .unwrap();
-        let round = RemoteRoundAgent::new("coder/billing".into(), Arc::new(endpoint));
+        let round = RemoteRoundAgent::new(
+            "coder/billing".into(),
+            Arc::new(endpoint),
+            DEFAULT_WAIT_POLL,
+        );
         let debug = format!("{round:?}");
         assert!(
             debug.contains("[REDACTED]") && !debug.contains("s3cret"),
@@ -950,7 +1050,11 @@ mod tests {
             &RemoteSettings::default(),
         )
         .unwrap();
-        let round = RemoteRoundAgent::new("coder/billing".into(), Arc::new(endpoint));
+        let round = RemoteRoundAgent::new(
+            "coder/billing".into(),
+            Arc::new(endpoint),
+            DEFAULT_WAIT_POLL,
+        );
         let first = round
             .start(&Inbound::new("start", json!({"text": "invoice 7"})))
             .unwrap();
@@ -974,6 +1078,11 @@ mod tests {
         assert_eq!(next.last_task.as_deref(), Some("t1"));
         assert_eq!(next.prior_open_task.as_deref(), Some("t2"));
         assert!(!next.card_read, "the card is read once per round");
-        assert_eq!(next.queued[0].text, "next");
+        let texts: Vec<&str> = next.queued.iter().map(|q| q.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["invoice 7", "next"],
+            "what was never sent goes first"
+        );
     }
 }

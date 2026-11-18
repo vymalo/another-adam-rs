@@ -748,9 +748,9 @@ subagents have one; a remote under a local subagent has no session. The sequence
   tool), and the remote's tokens are not counted in the parent's. A question (`input-required`) is the report, and the
   next round's message answers that task. `failed`, `canceled`, `rejected` and `auth-required` fail the round; the
   session stays usable.
-* **Time and cancel.** A round has the time limit `AgentDef::remote_timeout` (one hour by default). A round that is
+* **Time and cancel.** `AgentDef::remote_timeout` (one hour by default) is the one-shot tool's wait cap and a round's time limit. A round that is
   cancelled (`subagent_close` with `cancel`, a cancelled parent, the limit) sends the remote `CancelTask`, best effort.
-  A process that registered only the starter of the round agent sends none.
+  Each cancel is one try, logged and not repeated. A process that registered only the starter of the round agent sends none.
 * **Closing** a session is local: the closing round calls nothing and repeats the last report.
 
 More in the [`adam-assembly` README](../../crates/adam-assembly/README.md#subagents).

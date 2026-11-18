@@ -149,6 +149,8 @@ pub(crate) struct RemoteEndpoint {
     /// `files: true` in the file: the file parts of the answer are shared, not described.
     files: bool,
     client: RwLock<Option<Arc<Client>>>,
+    /// One dial at a time, so a dial does not hold the lock the other sessions read the client under.
+    dialing: tokio::sync::Mutex<()>,
 }
 
 pub(crate) type Client = A2AClient<Box<dyn Transport>>;
@@ -212,6 +214,7 @@ impl RemoteEndpoint {
             allow_insecure: settings.allow_insecure,
             files: agent.files,
             client: RwLock::new(None),
+            dialing: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -224,21 +227,21 @@ impl RemoteEndpoint {
         if let Some(client) = self.client.read().await.as_ref() {
             return Ok(client.clone());
         }
-        let mut slot = self.client.write().await;
-        if let Some(client) = slot.as_ref() {
+        let _dialing = self.dialing.lock().await;
+        if let Some(client) = self.client.read().await.as_ref() {
             return Ok(client.clone());
         }
         let (client, _) = self.dial().await?;
-        *slot = Some(client.clone());
+        *self.client.write().await = Some(client.clone());
         Ok(client)
     }
 
     /// Fetch the card again and rebuild the client from it, so a card that changed is read. Says
-    /// whether the card lists `steer/v1`.
+    /// whether the card lists `steer/v1`. The network call holds no lock the readers need.
     pub(crate) async fn refresh(&self) -> Result<(Arc<Client>, bool), ToolError> {
-        let mut slot = self.client.write().await;
+        let _dialing = self.dialing.lock().await;
         let (client, steers) = self.dial().await?;
-        *slot = Some(client.clone());
+        *self.client.write().await = Some(client.clone());
         Ok((client, steers))
     }
 

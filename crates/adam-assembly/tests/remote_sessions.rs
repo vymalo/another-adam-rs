@@ -99,6 +99,10 @@ struct Remote {
     done_after: Arc<AtomicUsize>,
     lose_first_response: Arc<AtomicBool>,
     fail_next_cancel: Arc<AtomicBool>,
+    /// Refuse a steer, as a remote whose task just ended does.
+    refuse_steer: Arc<AtomicBool>,
+    /// Cancel this round once, while the first `SendMessage` is being answered.
+    cancel_on_submit: Arc<Mutex<Option<(Runtime, RunId)>>>,
 }
 
 impl Remote {
@@ -108,6 +112,8 @@ impl Remote {
             done_after: Arc::new(AtomicUsize::new(done_after)),
             lose_first_response: Arc::default(),
             fail_next_cancel: Arc::default(),
+            refuse_steer: Arc::default(),
+            cancel_on_submit: Arc::default(),
         }
     }
 
@@ -155,6 +161,23 @@ impl TaskBackend for Remote {
         context_id: Option<String>,
     ) -> Result<Task, BackendError> {
         let text = message.text().unwrap_or_default().to_owned();
+        let steering = message
+            .extensions
+            .iter()
+            .flatten()
+            .any(|e| e == STEER_EXTENSION);
+        if steering && self.refuse_steer.load(SeqCst) {
+            self.book.lock().unwrap().submits.push(Submit {
+                message_id: message.message_id.clone(),
+                text,
+                task_id,
+                context_id,
+                reference_task_ids: Vec::new(),
+                extensions: vec![STEER_EXTENSION.to_owned()],
+                subject: caller.subject.clone(),
+            });
+            return Err(BackendError::UnsupportedOperation("the task ended".into()));
+        }
         let task = {
             let mut book = self.book.lock().unwrap();
             let extensions = message.extensions.clone().unwrap_or_default();
@@ -201,6 +224,10 @@ impl TaskBackend for Remote {
                 task
             }
         };
+        let hook = self.cancel_on_submit.lock().unwrap().take();
+        if let Some((rt, run)) = hook {
+            rt.cancel(run, "stop").await.unwrap();
+        }
         if self.lose_first_response.swap(false, SeqCst) {
             return Err(BackendError::unavailable("the response was lost"));
         }
@@ -245,9 +272,14 @@ impl TaskBackend for Remote {
         let Some(entry) = book.tasks.get_mut(task_id) else {
             return Err(BackendError::TaskNotFound(task_id.to_owned()));
         };
+        // Cancelling a task that is cancelled already changes nothing: the closing round of a
+        // session asks again, as a backstop.
+        let again = entry.task.status.state == TaskState::Canceled;
         entry.task.status = status(TaskState::Canceled, None);
         let task = entry.task.clone();
-        book.cancels.push(task_id.to_owned());
+        if !again {
+            book.cancels.push(task_id.to_owned());
+        }
         Ok(task)
     }
 
@@ -596,8 +628,14 @@ async fn a_message_is_queued_and_sent_as_the_next_task_when_the_card_does_not() 
             (!rig.remote.made().is_empty()).then_some(())
         })
         .await;
-        // The message waits: the remote has been asked once, however long it takes.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The round has taken the message and keeps it: the remote has been asked once.
+        let round = child_run_id(parent, "c1");
+        wait_for("the message to be queued", || async {
+            let rec = store.load_run(round).await.unwrap()?;
+            let agent = &rec.state["agent"];
+            (agent["task"].is_string() && agent["queued"].as_array()?.len() == 1).then_some(())
+        })
+        .await;
         assert_eq!(rig.remote.submits().len(), 1, "{backend}");
         rig.remote.release();
         wait_done(&rt, parent).await;
@@ -954,5 +992,149 @@ async fn a_lost_cancel_is_sent_by_the_next_round() {
         .await;
         worker.stop().await;
         assert!(rig.remote.cancels().contains(&made[0].0), "{backend}");
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_between_the_send_and_its_commit_still_cancels_the_task() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new(usize::MAX, false).await;
+        let rt = rig.runtime(&store, None);
+        let parent = rig
+            .start(&rt, |model, _| {
+                model
+                    .push_tool_calls(vec![start("invoice 7", true)])
+                    .push_text("started");
+            })
+            .await;
+        // The round is cancelled while the remote is answering its send: the task id never reaches
+        // the round's state.
+        let round = child_run_id(parent, "c1");
+        *rig.remote.cancel_on_submit.lock().unwrap() = Some((rt.clone(), round));
+        let worker = spawn_worker(&rt);
+        wait_for("the CancelTask", || async {
+            (!rig.remote.cancels().is_empty()).then_some(())
+        })
+        .await;
+        worker.stop().await;
+        let made = rig.remote.made();
+        assert_eq!(made.len(), 1, "{backend}: the recovery made no second task");
+        assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+    }
+}
+
+#[tokio::test]
+async fn messages_that_waited_for_a_failed_round_go_first_in_the_next() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new(usize::MAX, false).await;
+        let rt = rig.runtime(&store, None);
+        let parent = rig
+            .start(&rt, |model, session| {
+                model
+                    .push_tool_calls(vec![start("invoice [fail]", true)])
+                    .push_tool_calls(vec![gate_call("g", json!({"submits": 1}))])
+                    .push_tool_calls(vec![send("c3", session, "second")])
+                    .push_tool_calls(vec![gate_call("h", json!({"open": true}))])
+                    .push_tool_calls(vec![read("c5", session)])
+                    .push_tool_calls(vec![send("c6", session, "third")])
+                    .push_tool_calls(vec![read("c7", session)])
+                    .push_text("done");
+            })
+            .await;
+        let worker = spawn_worker(&rt);
+        wait_for("the first task", || async {
+            (!rig.remote.made().is_empty()).then_some(())
+        })
+        .await;
+        // `second` is read by the round before the task fails.
+        let round = child_run_id(parent, "c1");
+        wait_for("the message to be taken", || async {
+            let rec = store.load_run(round).await.unwrap()?;
+            let agent = &rec.state["agent"];
+            (agent["task"].is_string() && agent["queued"].as_array()?.len() == 1).then_some(())
+        })
+        .await;
+        rig.remote.release();
+        rig.open.store(true, SeqCst);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let results = results(&rig.model);
+        assert!(
+            text_of(&results, "c5").contains("out of budget"),
+            "{backend}"
+        );
+        let submits = rig.remote.submits();
+        assert_eq!(submits.len(), 2, "{backend}: {submits:?}");
+        assert_eq!(submits[1].text, "second\n\nthird", "{backend}");
+    }
+}
+
+#[tokio::test]
+async fn a_steer_the_remote_refuses_is_sent_as_the_next_task() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new(usize::MAX, true).await;
+        rig.remote.refuse_steer.store(true, SeqCst);
+        let rt = rig.runtime(&store, None);
+        let parent = rig
+            .start(&rt, |model, session| {
+                model
+                    .push_tool_calls(vec![start("invoice 7", true)])
+                    .push_tool_calls(vec![gate_call("g", json!({"submits": 1}))])
+                    .push_tool_calls(vec![send("c3", session, "and invoice 9")])
+                    .push_tool_calls(vec![gate_call("h", json!({"submits": 3}))])
+                    .push_tool_calls(vec![read("c5", session)])
+                    .push_text("settled");
+            })
+            .await;
+        let worker = spawn_worker(&rt);
+        wait_for("the refused steer", || async {
+            (rig.remote.submits().len() >= 2).then_some(())
+        })
+        .await;
+        rig.remote.release();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let submits = rig.remote.submits();
+        assert_eq!(submits.len(), 3, "{backend}: {submits:?}");
+        assert!(submits[1].task_id.is_some(), "{backend}: the refused steer");
+        assert_eq!(submits[2].text, "and invoice 9", "{backend}");
+        assert_eq!(submits[2].task_id, None, "{backend}");
+        let report = text_of(&results(&rig.model), "c5");
+        assert!(
+            report.contains("done: and invoice 9"),
+            "{backend}: {report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_round_started_without_a_limit_gives_up_at_the_remote_timeout() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new(usize::MAX, false).await;
+        let rt = rig.runtime(&store, Some(Duration::from_millis(400)));
+        let name = format!("{}/billing", rig.root);
+        // As the A2A front starts a person's round: no time limit from the runtime.
+        let round = rt
+            .start(
+                &name,
+                adam_runtime::Inbound::new("start", json!({"text": "invoice 7"})),
+                None,
+            )
+            .await
+            .unwrap();
+        let worker = spawn_worker(&rt);
+        let view = wait_for("the round to give up", || async {
+            let view = rt.view(round).await.unwrap()?;
+            (view.status == RunStatus::Failed).then_some(view)
+        })
+        .await;
+        wait_for("the CancelTask", || async {
+            (!rig.remote.cancels().is_empty()).then_some(())
+        })
+        .await;
+        worker.stop().await;
+        assert!(view.error.unwrap().contains("time limit"), "{backend}");
     }
 }
