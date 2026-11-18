@@ -26,6 +26,27 @@ use crate::task_state;
 /// parent's own record when a person acts on it.
 pub(crate) const SESSIONS_POLL: Duration = Duration::from_secs(1);
 
+/// The least time between two listings when the parent's record changed: a busy parent commits far
+/// more often than a client needs to hear of its sessions, and each listing pages the sessions
+/// and reads a view per open one.
+pub(crate) const SESSIONS_MIN_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Whether a subscription reads its sessions again: [`SESSIONS_POLL`] after the last read, or
+/// [`SESSIONS_MIN_INTERVAL`] after it when the parent's record changed. A read that failed waits
+/// the whole [`SESSIONS_POLL`], whatever changed.
+pub(crate) fn read_due(changed: bool, failed: bool, since_last: Duration) -> bool {
+    since_last >= SESSIONS_POLL || (changed && !failed && since_last >= SESSIONS_MIN_INTERVAL)
+}
+
+/// `status` as an event of a session says it: the state, with no message (the message was the
+/// task's, for the moment it was sent).
+pub(crate) fn quiet(status: &TaskStatus) -> TaskStatus {
+    TaskStatus {
+        message: None,
+        ..status.clone()
+    }
+}
+
 /// Who acted: the parent's model, or a person.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum By {
@@ -116,11 +137,13 @@ impl RoundState {
         }
     }
 
-    fn of_outcome(outcome: Option<RoundOutcome>) -> Self {
-        match outcome {
-            Some(RoundOutcome::Done) => Self::Done,
-            Some(RoundOutcome::Cancelled) => Self::Canceled,
-            Some(RoundOutcome::Failed) | None => Self::Failed,
+    /// How a round that is not open ended; `None` when the listing did not say (the round is not
+    /// readable yet, and nothing is reported of it until it is).
+    fn of_outcome(outcome: Option<RoundOutcome>) -> Option<Self> {
+        match outcome? {
+            RoundOutcome::Done => Some(Self::Done),
+            RoundOutcome::Cancelled => Some(Self::Canceled),
+            RoundOutcome::Failed => Some(Self::Failed),
         }
     }
 }
@@ -212,6 +235,8 @@ pub(crate) struct SessionsTracker {
     seen: HashMap<RunId, Seen>,
     listed_at: Instant,
     version: u64,
+    /// The last listing failed: the next waits a whole interval.
+    failed: bool,
 }
 
 impl SessionsTracker {
@@ -228,12 +253,17 @@ impl SessionsTracker {
             seen: seen.into_iter().map(|s| (s.session, s)).collect(),
             listed_at: Instant::now(),
             version,
+            failed: false,
         })
     }
 
     /// Whether the sessions are worth listing again.
     pub(crate) fn due(&self, version: u64) -> bool {
-        version != self.version || self.listed_at.elapsed() >= SESSIONS_POLL
+        read_due(
+            version != self.version,
+            self.failed,
+            self.listed_at.elapsed(),
+        )
     }
 
     /// List the sessions and say what changed, each event a status update of the parent task that
@@ -247,11 +277,15 @@ impl SessionsTracker {
         version: u64,
         status: &TaskStatus,
     ) -> Vec<TaskEvent> {
-        let Some(now) = backend.sessions_seen(caller, context_id).await else {
-            return Vec::new();
-        };
+        // Noted before the read, so a read that fails waits for the next interval.
         self.listed_at = Instant::now();
         self.version = version;
+        let Some(now) = backend.sessions_seen(caller, context_id).await else {
+            self.failed = true;
+            return Vec::new();
+        };
+        self.failed = false;
+        let status = &quiet(status);
         let mut events = Vec::new();
         for now in now {
             let prev = self.seen.get(&now.session).cloned();
@@ -287,7 +321,12 @@ impl SessionsTracker {
 }
 
 impl RuntimeTaskBackend {
-    /// The sessions of parent context `context` as [`Seen`]; `None` when they could not be listed.
+    /// The sessions of parent context `context` as [`Seen`]; `None` when they could not be listed
+    /// (a warning, at most one per interval: the caller backs off). A session whose latest round
+    /// is not readable is left out, so nothing is said of it yet.
+    ///
+    /// The listing is paged and the sessions can move between pages while it is read, so a session
+    /// may be missed by one listing and told `opened` by a later one.
     async fn sessions_seen(&self, caller: &Caller, context: &str) -> Option<Vec<Seen>> {
         let listed = match self.listed_sessions(caller, context).await {
             Ok(listed) => listed,
@@ -298,21 +337,21 @@ impl RuntimeTaskBackend {
         };
         let mut out = Vec::with_capacity(listed.len());
         for s in &listed {
-            out.push(self.seen_of(context, s).await);
+            out.extend(self.seen_of(context, s).await);
         }
         Some(out)
     }
 
-    async fn seen_of(&self, context: &str, s: &SessionSummary) -> Seen {
+    async fn seen_of(&self, context: &str, s: &SessionSummary) -> Option<Seen> {
         let state = match s.state {
             // Only an open round can wait for the person, and only its view says so.
             SessionState::Working => match self.runtime.view(s.latest_run).await {
                 Ok(Some(view)) => RoundState::of_task(&task_state(&view)),
                 _ => RoundState::Working,
             },
-            SessionState::Idle | SessionState::Closed => RoundState::of_outcome(s.outcome),
+            SessionState::Idle | SessionState::Closed => RoundState::of_outcome(s.outcome)?,
         };
-        Seen {
+        Some(Seen {
             session: s.id,
             context: session_conversation_id(context, s.id),
             agent: self.session_agent_name(&s.agent),
@@ -328,7 +367,7 @@ impl RuntimeTaskBackend {
             state,
             closing_round: s.closing,
             closed: wire_state(s.state, s.closing) == "closed",
-        }
+        })
     }
 
     /// How `prev`'s round ended, read from its run: `prev` as it stood when that round was over.
@@ -557,13 +596,43 @@ mod tests {
             assert_eq!(RoundState::of_task(&task), want, "{task:?}");
         }
         for (outcome, want) in [
-            (Some(RoundOutcome::Done), Done),
-            (Some(RoundOutcome::Failed), Failed),
-            (Some(RoundOutcome::Cancelled), Canceled),
-            (None, Failed),
+            (Some(RoundOutcome::Done), Some(Done)),
+            (Some(RoundOutcome::Failed), Some(Failed)),
+            (Some(RoundOutcome::Cancelled), Some(Canceled)),
+            (None, None),
         ] {
             assert_eq!(RoundState::of_outcome(outcome), want, "{outcome:?}");
         }
+    }
+
+    #[test]
+    fn a_read_waits_for_the_interval_a_busy_parent_for_the_minimum_and_a_failed_read_for_the_interval()
+     {
+        let ms = Duration::from_millis;
+        // Nothing changed: once a second.
+        assert!(!read_due(false, false, ms(999)));
+        assert!(read_due(false, false, ms(1000)));
+        // The parent's record changed: after the minimum, not at once.
+        assert!(!read_due(true, false, ms(199)));
+        assert!(read_due(true, false, ms(200)));
+        // A read that failed is not retried on a change.
+        assert!(!read_due(true, true, ms(500)));
+        assert!(read_due(true, true, ms(1000)));
+    }
+
+    #[test]
+    fn an_event_status_keeps_the_state_and_drops_the_message() {
+        let status = TaskStatus {
+            state: TaskState::Working,
+            message: Some(a2a::Message::new(
+                a2a::Role::Agent,
+                vec![a2a::Part::text("hi")],
+            )),
+            timestamp: None,
+        };
+        let quiet = quiet(&status);
+        assert_eq!(quiet.state, TaskState::Working);
+        assert!(quiet.message.is_none());
     }
 
     #[test]

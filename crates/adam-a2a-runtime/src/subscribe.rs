@@ -24,7 +24,7 @@ use crate::child_sessions::{ContextKind, Round, kind_of};
 use crate::convert::{
     StatusKey, artifact_of, artifact_slot, status_key, status_of, task_from_view,
 };
-use crate::session_events::{SESSIONS_POLL, SessionsTracker};
+use crate::session_events::{SessionsTracker, quiet, read_due};
 use crate::steps::step_message;
 use crate::text_stream;
 use crate::tier;
@@ -97,7 +97,7 @@ struct RoundStream {
 
 impl RoundStream {
     fn due(&self, version: u64) -> bool {
-        version != self.version || self.checked_at.elapsed() >= SESSIONS_POLL
+        read_due(version != self.version, false, self.checked_at.elapsed())
     }
 }
 
@@ -118,7 +118,7 @@ impl Tracker {
         let status = status_of(view, &backend.prompt);
         let key = status_key(&status);
         if !waits(&status.state) {
-            self.open_status = status.clone();
+            self.open_status = quiet(&status);
         }
         // A tier that changed is said once, on the status update that carries it: the one of a
         // change of state, or one of its own with the state as it is.
@@ -352,7 +352,14 @@ async fn pump(
     if backend.sessions_activated(caller)
         && matches!(kind, ContextKind::Child(..))
         && !waits(&task.status.state)
-        && let Some(round) = backend.round_of(caller, task_id).await?
+        && let Some(round) = backend
+            .round_of(caller, task_id)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "the round could not be read: its stream carries no session object");
+            })
+            .ok()
+            .flatten()
     {
         let closing = task
             .metadata
@@ -376,7 +383,7 @@ async fn pump(
         text_stream: caller.has_extension(TEXT_STREAM_EXTENSION),
         usage: caller.has_extension(USAGE_EXTENSION),
         tier: told,
-        open_status: task.status.clone(),
+        open_status: quiet(&task.status),
     };
     let ends = task.status.state.is_terminal()
         || matches!(
