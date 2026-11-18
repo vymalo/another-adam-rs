@@ -1163,29 +1163,46 @@ fn edit_in(
         return Err(binary_notice(shown, meta.size()));
     }
 
-    let places: Vec<usize> = content.match_indices(old).map(|(at, _)| at).collect();
-    let lines: Vec<usize> = places.iter().map(|at| line_of(&content, *at)).collect();
-    match places.len() {
-        0 => return Err(not_found(shown, &content, old)),
-        1 => {}
-        n if !replace_all => {
-            return Err(format!(
-                "`old` is in `{shown}` {n} times (starting at {}): nothing was changed. Add the \
-                 lines around the one you mean to `old` so that it matches once, or set \
-                 replace_all to replace every one",
-                places_listed(&lines)
-            ));
+    let exact: Vec<usize> = content.match_indices(old).map(|(at, _)| at).collect();
+    let (edited, lines) = if exact.is_empty() {
+        // The exact match is the rule; the tolerance is the one fallback that keeps a model from
+        // spending a turn on a line ending or a blank it copied wrong. Leading whitespace is never
+        // ignored: an indentation is semantic.
+        let Some(places) = normalized_places(&content, old) else {
+            return Err(not_found(shown, &content, old));
+        };
+        if places.len() > 1 && !replace_all {
+            return Err(not_found(shown, &content, old));
         }
-        _ => {}
-    }
-    let edited = if replace_all {
-        content.replace(old, new)
+        let lines: Vec<usize> = places
+            .iter()
+            .map(|(at, _)| line_of(&content, *at))
+            .collect();
+        (replace_spans(&content, &places, new), lines)
     } else {
-        content.replacen(old, new, 1)
+        let lines: Vec<usize> = exact.iter().map(|at| line_of(&content, *at)).collect();
+        match exact.len() {
+            1 => {}
+            n if !replace_all => {
+                return Err(format!(
+                    "`old` is in `{shown}` {n} times (starting at {}): nothing was changed. Add the \
+                     lines around the one you mean to `old` so that it matches once, or set \
+                     replace_all to replace every one",
+                    places_listed(&lines)
+                ));
+            }
+            _ => {}
+        }
+        let edited = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        (edited, lines)
     };
     let written = write_located(&located, &edited)?;
     Ok(Edited {
-        replaced: places.len(),
+        replaced: lines.len(),
         lines,
         bytes: written.bytes,
     })
@@ -1194,6 +1211,72 @@ fn edit_in(
 /// The 1-based line of the byte offset `at` of `text`.
 fn line_of(text: &str, at: usize) -> usize {
     text[..at].bytes().filter(|b| *b == b'\n').count() + 1
+}
+
+/// `text` with `\r\n` and `\r` read as `\n`, and the spaces and tabs at the end of every line
+/// dropped, and where each byte of the result came from: `bounds[i]` is the byte of `text` the
+/// result's byte `i` starts at, and `bounds[result.len()]` is the end of `text` (so a match that
+/// runs to the end of the result takes the blanks ignored at the end of the last line too).
+fn normalized(text: &str) -> (String, Vec<usize>) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut bounds = Vec::with_capacity(bytes.len() + 1);
+    let mut at = 0;
+    while at < bytes.len() {
+        let mut end = at;
+        while end < bytes.len() && bytes[end] != b'\r' && bytes[end] != b'\n' {
+            end += 1;
+        }
+        let mut kept = end;
+        while kept > at && (bytes[kept - 1] == b' ' || bytes[kept - 1] == b'\t') {
+            kept -= 1;
+        }
+        bounds.extend(at..kept);
+        out.push_str(&text[at..kept]);
+        if end < bytes.len() {
+            let line_end = if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
+                end + 2
+            } else {
+                end + 1
+            };
+            bounds.push(end);
+            out.push('\n');
+            at = line_end;
+        } else {
+            at = end;
+        }
+    }
+    bounds.push(bytes.len());
+    (out, bounds)
+}
+
+/// The places `old` is in `content` once [`normalized`]: each as the byte span of `content` the
+/// match covers. `None` when nothing matches, or when `old` is only blanks (which would match
+/// everywhere).
+fn normalized_places(content: &str, old: &str) -> Option<Vec<(usize, usize)>> {
+    let (needle, _) = normalized(old);
+    if needle.is_empty() {
+        return None;
+    }
+    let (haystack, bounds) = normalized(content);
+    let places: Vec<(usize, usize)> = haystack
+        .match_indices(needle.as_str())
+        .map(|(at, _)| (bounds[at], bounds[at + needle.len()]))
+        .collect();
+    (!places.is_empty()).then_some(places)
+}
+
+/// `content` with each byte span of `places` (in order, not overlapping) replaced by `new`.
+fn replace_spans(content: &str, places: &[(usize, usize)], new: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut at = 0;
+    for (start, end) in places {
+        out.push_str(&content[at..*start]);
+        out.push_str(new);
+        at = *end;
+    }
+    out.push_str(&content[at..]);
+    out
 }
 
 /// `lines 3, 9, 14` (the first [`MAX_PLACES`], then how many more).
@@ -1335,11 +1418,6 @@ fn not_found(shown: &str, content: &str, old: &str) -> String {
     let content_lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old.lines().collect();
     let mut message = format!("`old` was not found in `{shown}`, and nothing was changed.");
-    if content.contains("\r\n") && !old.contains('\r') {
-        message.push_str(
-            " The file uses CRLF line endings, which a multi-line `old` must have as well.",
-        );
-    }
     let Some(start) =
         closest_window(&content_lines, &old_lines).filter(|s| *s < content_lines.len())
     else {
@@ -1404,13 +1482,15 @@ fn not_found(shown: &str, content: &str, old: &str) -> String {
 
 /// Replace exact text in a file of your worktree: every character of `old`, blanks and line breaks
 /// included, is replaced by `new`. It is the way to make a small change without writing a diff:
-/// read the file, copy the lines you mean to change as `old`, write what they become as `new`. It
-/// refuses, and changes nothing, when `old` is not in the file (the error shows the closest region
-/// with line numbers, so you can copy it right) or when `old` is in the file more than once and
-/// `replace_all` is not set (the error lists the lines: add more of the text around it to make it
-/// unique). The path is relative to the root of the worktree; nothing inside `.git` and nothing
-/// through a symlink can be edited. The file must be text of at most 1 MiB. To create a file or
-/// replace it whole use write_file, for several files at once apply_patch.
+/// read the file, copy the lines you mean to change as `old`, write what they become as `new`. The
+/// exact match is tried first; when it fails, line endings and trailing blanks are tolerated;
+/// leading whitespace is not. It refuses, and changes nothing, when `old` is not in the file (the
+/// error shows the closest region with line numbers, so you can copy it right) or when `old` is in
+/// the file more than once and `replace_all` is not set (the error lists the lines: add more of the
+/// text around it to make it unique). The path is relative to the root of the worktree; nothing
+/// inside `.git` and nothing through a symlink can be edited. The file must be text of at most
+/// 1 MiB. To create a file or replace it whole use write_file, for several files at once
+/// apply_patch.
 #[tool(
     label = "Edit a file",
     icon = "edit",
@@ -1422,7 +1502,7 @@ pub async fn edit_file(
     ctx: &ToolCtx,
     /// Path of the file, relative to the root of the worktree
     path: String,
-    /// The exact text to replace, copied from the file (blanks and line breaks too). Must be in the file; and once, unless replace_all is set.
+    /// The text to replace, copied from the file (blanks and line breaks too). Must be in the file; and once, unless replace_all is set.
     old: String,
     /// What it becomes. May be empty, to delete the text.
     new: String,
@@ -2728,14 +2808,188 @@ mod tests {
     }
 
     #[test]
-    fn a_text_nothing_is_like_says_so_and_a_crlf_file_is_noticed() {
+    fn a_text_nothing_is_like_says_so() {
         let dir = with_main();
         let why = edit(dir.path(), "zzzzzzzz qqqqqqqq", "x", false).unwrap_err();
         assert!(why.contains("Nothing in the file is like it"), "{why}");
-        fs::write(dir.path().join("src/crlf.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
-        let why = edit_in(dir.path(), "src/crlf.txt", "one\ntwo", "x", false).unwrap_err();
-        assert!(why.contains("CRLF"), "{why}");
-        assert!(why.contains("closest region is lines 1-2"), "{why}");
+    }
+
+    /// The tolerance: a line ending or trailing blanks that differ are not a miss. The edit is
+    /// applied to the original bytes at the matched span, so the lines around it keep their own
+    /// endings and blanks.
+    #[test]
+    fn a_crlf_file_is_edited_by_an_old_with_lf_and_keeps_its_other_endings() {
+        let dir = root();
+        fs::write(dir.path().join("mixed.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let done = edit_in(dir.path(), "mixed.txt", "beta\ngamma", "BETA\nGAMMA", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("mixed.txt")).unwrap(),
+            "alpha\r\nBETA\nGAMMA\r\n",
+            "the replaced span has new's bytes, the rest keeps CRLF"
+        );
+    }
+
+    #[test]
+    fn trailing_blanks_on_a_line_do_not_hide_it() {
+        let dir = root();
+        fs::write(dir.path().join("blanks.txt"), "one\ntwo   \nthree\n").unwrap();
+        let done = edit_in(dir.path(), "blanks.txt", "two\nthree", "2\n3", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("blanks.txt")).unwrap(),
+            "one\n2\n3\n"
+        );
+    }
+
+    /// The tolerance is on both sides: an `old` copied with CRLF endings or with trailing blanks
+    /// the file does not have is normalized too.
+    #[test]
+    fn an_old_with_crlf_or_trailing_blanks_is_normalized_too() {
+        let dir = root();
+        fs::write(dir.path().join("old.txt"), "one\ntwo\nthree\n").unwrap();
+        let done = edit_in(dir.path(), "old.txt", "one\r\ntwo  ", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("old.txt")).unwrap(),
+            "1\n2\nthree\n"
+        );
+    }
+
+    #[test]
+    fn a_normalized_match_in_two_places_is_refused_as_a_miss_and_changes_nothing() {
+        let dir = root();
+        let body = "foo   \nbar\nfoo\t\n";
+        fs::write(dir.path().join("twice.txt"), body).unwrap();
+        let why = edit_in(dir.path(), "twice.txt", "foo\n", "x\n", false).unwrap_err();
+        assert!(
+            why.contains("was not found") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(why.contains("closest region is lines "), "{why}");
+        assert!(
+            why.contains(">     1\t") || why.contains(">     3\t"),
+            "the region is numbered: {why}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("twice.txt")).unwrap(),
+            body,
+            "nothing changed"
+        );
+        // `replace_all` takes every normalized place, each at its own span.
+        let done = edit_in(dir.path(), "twice.txt", "foo\n", "x\n", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("twice.txt")).unwrap(),
+            "x\nbar\nx\n"
+        );
+    }
+
+    #[test]
+    fn a_leading_indentation_that_differs_is_still_a_miss() {
+        let dir = root();
+        let body = "fn main() {\n    let a = 1;\n}\n";
+        fs::write(dir.path().join("indent.rs"), body).unwrap();
+        let why = edit_in(
+            dir.path(),
+            "indent.rs",
+            "fn main() {\n  let a = 1;\n}\n",
+            "x",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("was not found") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(
+            why.contains("First difference, at line 2: only the blanks differ"),
+            "{why}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("indent.rs")).unwrap(),
+            body,
+            "leading whitespace is not guessed"
+        );
+    }
+
+    /// The exact match is tried first: `foo\n` is in the file once exactly and twice once the
+    /// trailing blanks are ignored. The exact place is the one replaced.
+    #[test]
+    fn an_exact_match_is_taken_before_the_tolerant_one() {
+        let dir = root();
+        fs::write(dir.path().join("exact.txt"), "foo  \nbar\nfoo\n").unwrap();
+        let done = edit_in(dir.path(), "exact.txt", "foo\n", "bar\n", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("exact.txt")).unwrap(),
+            "foo  \nbar\nbar\n",
+            "the trailing blanks of the first line are untouched"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_edit_changes_only_its_span_among_mixed_endings() {
+        let dir = root();
+        fs::write(dir.path().join("mixed.txt"), "a\r\nb   \nc\r\nd\r\n").unwrap();
+        let done = edit_in(dir.path(), "mixed.txt", "b\nc", "B\nC", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("mixed.txt")).unwrap(),
+            "a\r\nB\nC\r\nd\r\n"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_alone_is_a_line_ending_too() {
+        let dir = root();
+        fs::write(dir.path().join("cr.txt"), "one\rtwo\r").unwrap();
+        let done = edit_in(dir.path(), "cr.txt", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("cr.txt")).unwrap(),
+            "1\n2\r"
+        );
+    }
+
+    #[test]
+    fn an_old_of_blanks_only_does_not_match_everywhere() {
+        let dir = root();
+        let body = "abc\n";
+        fs::write(dir.path().join("blank.txt"), body).unwrap();
+        for old in ["   ", "\t", " \t "] {
+            for all in [false, true] {
+                let why = edit_in(dir.path(), "blank.txt", old, "x", all).unwrap_err();
+                assert!(why.contains("was not found"), "{old:?}, all={all}: {why}");
+                assert_eq!(
+                    fs::read_to_string(dir.path().join("blank.txt")).unwrap(),
+                    body
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_blanks_at_the_end_of_the_file_are_tolerated() {
+        let dir = root();
+        fs::write(dir.path().join("eof.txt"), "one  \ntwo   ").unwrap();
+        let done = edit_in(dir.path(), "eof.txt", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("eof.txt")).unwrap(),
+            "1\n2"
+        );
+    }
+
+    #[test]
+    fn the_tolerance_keeps_multibyte_characters_whole() {
+        let dir = root();
+        fs::write(dir.path().join("utf8.txt"), "héllo  \nwörld\n").unwrap();
+        edit_in(dir.path(), "utf8.txt", "héllo\nwörld", "x", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("utf8.txt")).unwrap(),
+            "x\n"
+        );
     }
 
     #[test]

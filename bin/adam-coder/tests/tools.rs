@@ -5826,6 +5826,49 @@ async fn edit_file_refuses_two_places_without_replace_all_and_says_where() {
     );
 }
 
+/// A model that copies the text with the other line ending, or without the trailing blanks the
+/// file has, is not sent back: the edit applies at the matched span, the rest of the file keeps its
+/// bytes, and leading whitespace is still semantic.
+#[tokio::test]
+async fn edit_file_tolerates_line_endings_and_trailing_blanks() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    std::fs::write(dir.join("a.txt"), "one\r\ntwo   \r\nthree\r\n").unwrap();
+    let out = EditFile
+        .call(
+            &rig.ctx,
+            json!({"path": "a.txt", "old": "two\nthree", "new": "2\n3"}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("replaced 1 place (line 2)"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "one\r\n2\n3\r\n"
+    );
+
+    let before = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+    let out = EditFile
+        .call(
+            &rig.ctx,
+            json!({"path": "a.txt", "old": "  three", "new": "x"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.is_error && out.content.contains("was not found"),
+        "leading whitespace is not guessed: {}",
+        out.content
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), before);
+}
+
 /// The rules of `write_file` hold for it: nothing outside the worktree, nothing in `.git`, no
 /// symlink, and the files it cannot edit are said.
 #[tokio::test]
