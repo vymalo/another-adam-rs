@@ -37,8 +37,10 @@ credentials as the client gave them) and `<prefix>meta`. Claiming is
 `FOR UPDATE SKIP LOCKED`, and it leaves out the runs the caller says it is stepping (`AND id <> ALL($busy)`,
 see [`adam-core`](../adam-core/README.md#runs-the-caller-is-stepping)); one open run per conversation is a partial unique
 index. No transaction is held open while agent code runs. `JSONB` cannot hold
-`\u0000`: such state is rejected with `StoreError::InvalidInput`. The guarantee
-table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
+`\u0000`: the adapter replaces it with U+FFFD before it writes
+(`adam_core::storable`), as every adapter does, so a state or a journal payload is
+the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
+The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
 ## Schema version 3: the push table
 
@@ -87,8 +89,7 @@ and this adapter's choice of class:
 
 A poisoned row is therefore `Corrupt`, not retryable and alerting, so the
 runtime fails that run instead of re-leasing it for ever. The adapter's own
-checks are `InvalidInput` (a NUL in `JSONB`, an integer above `i64::MAX`, a bad
-table prefix) and `Corrupt` (an unknown status, a negative version or `seq`, a
+checks are `InvalidInput` (an integer above `i64::MAX`, a bad table prefix) and `Corrupt` (an unknown status, a negative version or `seq`, a
 journal entry that vanished). *Unverified:* the SQLSTATE codes are from the
 PostgreSQL manual's error-code appendix, recalled from memory, not re-checked.
 

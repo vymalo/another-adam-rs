@@ -490,6 +490,13 @@ directory, so the export (`opencode session export --standalone <session>`) can 
 was killed at the time limit. The export is kept as raw JSON, with the run's token taken out of every kept file.
 `--standalone` gives the run a private server: no background service is left in the container.
 
+**An isolated home.** `HOME` and the three XDG directories (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`) are the
+run's own, under its output directory, and the run and the export both set them. The image's global skill directories,
+`/.claude` and `/.opencode`, are hidden with an empty read-only directory mounted over each, so the clone's upward search
+finds nothing there; only a skill directory inside the clone, which is the repository's own text, is read. *Verified
+2026-11-18* in the smoke test: with `HOME=/`, OpenCode read the image's global `/.claude/skills` and every model call
+carried about 2.85k tokens more.
+
 ### OpenCode V2
 
 The owner chose OpenCode V2 (`@opencode/cli` 2.x) for the benchmark. Every fact of the plan's recommendation 3 was

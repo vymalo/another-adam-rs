@@ -68,6 +68,16 @@ a question (`stop_as_question`) unless the run failed.
    fails when `old` is in the file more than once and `replace_all` is not set, and says how many times and at which lines.
    `apply_patch` stays, for several changes at once.
 
+   *Amended 2026-11-18 (the coder stops paying a turn for a copied line ending or a trailing blank):* the
+   exact match is still tried first and still decides when it finds `old` (once, or once per `replace_all`).
+   When it finds nothing, the file and `old` are compared again with `\r\n` and `\r` read as `\n` and the
+   spaces and tabs at the end of each line ignored, and a match is applied to the original bytes at its
+   span, so the rest of the file keeps its own endings and blanks. Leading whitespace is never ignored: an
+   indentation that differs is still a miss, and an `old` of blanks only is a miss (it would match
+   everywhere). A tolerant match in more than one place without `replace_all` is a miss too, not a guess.
+   The error no longer says a multi-line `old` must have the file's CRLF endings, because it no longer must.
+   (Epic "adam: a faster coder", vymalo/another-agentic-system#345.)
+
 4. **Scratch work that shared a result completes without a pull request** (owner decision 2). When the model stops (a turn
    without a tool call) and there is no pull request, the run **completes** if all of these hold, each of them written by a
    tool and none of them said by the model:

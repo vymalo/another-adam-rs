@@ -1,12 +1,34 @@
 {
   "name": "commit_and_push",
-  "description": "Commit every change in the worktree with the given message and push the branch. Use a Conventional Commit message (feat(scope): ..., fix: ...). Make small, focused commits: call it after each coherent piece of work. With several repositories in the workspace, say which with `repo`. In a scratch project it only commits, locally: nothing is pushed.",
+  "description": "Commit every change in the worktree with the given message and push the branch. Use a Conventional Commit message (feat(scope): ..., fix: ...). Make small, focused commits: call it after each coherent piece of work. When the work is done, pass `pull_request` to open (or update) the pull request in this same call, after the same check `open_pull_request` requires; leave it out to commit only, or to open the pull request later with `open_pull_request`. With several repositories in the workspace, say which with `repo`. In a scratch project it only commits, locally: nothing is pushed.",
   "parameters": {
     "type": "object",
     "properties": {
       "message": {
         "type": "string",
         "description": "Commit message"
+      },
+      "pull_request": {
+        "type": "object",
+        "description": "The pull request to open (or update) after the push, in this same call. Leave it out to commit only.",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Conventional Commit style title"
+          },
+          "body": {
+            "type": "string",
+            "description": "Markdown: summary, then verification"
+          },
+          "accept_red_checks": {
+            "type": "boolean",
+            "description": "Set true ONLY when the user explicitly said, in this conversation, that a pull request with failing (or no) checks is acceptable. Never set it on your own judgement."
+          }
+        },
+        "required": [
+          "title",
+          "body"
+        ]
       },
       "repo": {
         "type": "string",

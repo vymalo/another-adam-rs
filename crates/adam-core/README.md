@@ -25,6 +25,7 @@ database driver.
 | `RunQuery`, `ConversationScope` | what `list_runs` and `count_runs` select: always scoped (`Prefix` of an owner's conversations, or `Exact`), optionally by run statuses and last update, one page after a `(updated_at, id)` position |
 | `NewPushConfig`, `PushRecord`, `PushProgress`, `PushState` | an A2A push-notification configuration and how far its delivery got; `PushState` (`Active`, `Done`, `GaveUp`) is closed on purpose |
 | `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
+| `storable` | the one rule every adapter applies before it writes a JSON value: a NUL in a string or a key becomes U+FFFD, so a state or a journal payload is the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)) |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
 
@@ -123,8 +124,8 @@ never from the variant (see [`adam-error`](../adam-error/README.md)).
 | `InvalidInput` | `Invalid` |
 | `Backend { class, source }` | the `class` the adapter chose |
 
-`InvalidInput` is data the store cannot hold (a NUL in a `JSONB` string, an
-integer above `i64::MAX`, a bad table prefix); `Corrupt` is data read back that
+`InvalidInput` is data the store cannot hold (an integer above `i64::MAX`, a
+bad table prefix); `Corrupt` is data read back that
 breaks an invariant (an unknown status, a negative version, a vanished journal
 entry). `Backend` keeps the driver's error as its `source` (a `BoxError`, so no
 driver type is in this crate) and its message does not repeat it. An adapter

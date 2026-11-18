@@ -1,9 +1,10 @@
-//! `commit_and_push { message, repo? }` and `open_pull_request { title, body, accept_red_checks?, repo? }`.
+//! `commit_and_push { message, pull_request?, repo? }` and
+//! `open_pull_request { title, body, accept_red_checks?, repo? }`.
 
 use adam::Artifact;
 use adam::prelude::*;
 use adam_llm_agent::TRUNCATION_MARKER_PREFIX;
-use adam_workspace::{NewPullRequest, WorkspaceError};
+use adam_workspace::{NewPullRequest, Slot, WorkspaceError};
 use serde_json::json;
 
 use super::checks::ChecksReport;
@@ -51,17 +52,34 @@ pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
 // of the run's notes, the SHA and its tree, so the second run of a step emits the same
 // artifact, with the same content-derived id.
 
+/// The pull request a [`commit_and_push`] opens (or updates) in the same call, after the commit and
+/// the push: the arguments of [`open_pull_request`], whose gate and path it runs.
+#[derive(serde::Deserialize, adam::__private::schemars::JsonSchema)]
+#[schemars(crate = "adam::__private::schemars")]
+pub struct PullRequestArgs {
+    /// Conventional Commit style title
+    pub title: String,
+    /// Markdown: summary, then verification
+    pub body: String,
+    /// Set true ONLY when the user explicitly said, in this conversation, that a pull request with failing (or no) checks is acceptable. Never set it on your own judgement.
+    pub accept_red_checks: Option<bool>,
+}
+
 /// Commit every change in the worktree with the given message and push the
 /// branch. Use a Conventional Commit message (feat(scope): ..., fix: ...).
-/// Make small, focused commits: call it after each coherent piece of work. With several
-/// repositories in the workspace, say which with `repo`. In a scratch project it only commits,
-/// locally: nothing is pushed.
+/// Make small, focused commits: call it after each coherent piece of work. When the work is done,
+/// pass `pull_request` to open (or update) the pull request in this same call, after the same check
+/// `open_pull_request` requires; leave it out to commit only, or to open the pull request later with
+/// `open_pull_request`. With several repositories in the workspace, say which with `repo`. In a
+/// scratch project it only commits, locally: nothing is pushed.
 #[tool(label = "Commit and push", icon = "git", parallel = "exclusive")]
 pub async fn commit_and_push(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
     /// Commit message
     message: String,
+    /// The pull request to open (or update) after the push, in this same call. Leave it out to commit only.
+    pull_request: Option<PullRequestArgs>,
     /// The slot to commit and push: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
 ) -> Outcome {
@@ -87,9 +105,10 @@ pub async fn commit_and_push(
         ));
     }
     // A scratch project has no remote: the commit is local, and nothing else happens (no push,
-    // no `branch`, no verdict bound to a pushed commit).
+    // no `branch`, no verdict bound to a pushed commit). A `pull_request` in the same call is
+    // refused as `open_pull_request` refuses one there.
     let Some(wt) = slot.worktree().cloned() else {
-        return match slot.scratch() {
+        let committed = match slot.scratch() {
             Some(scratch) => {
                 scratch::commit_locally(&slot, scratch, message, &env.settings.identity).await
             }
@@ -98,6 +117,7 @@ pub async fn commit_and_push(
                 slot.dir()
             ))),
         };
+        return with_pull_request(&env, ctx, slot, committed, pull_request).await;
     };
 
     let committed = match wt.commit_all(message, &env.settings.identity).await {
@@ -160,25 +180,75 @@ pub async fn commit_and_push(
     };
     if let Some(line) = wt.continues() {
         summary.push_str(&format!(
-            "\nThis run continues {line}, which has not been changed: open_pull_request moves it \
-             to this commit (and so updates its pull request) once the checks have passed on \
+            "\nThis run continues {line}, which has not been changed: the pull request (in this \
+             call, or open_pull_request) moves it to this commit once the checks have passed on \
              exactly this code."
         ));
     }
-    // What a later task of this conversation may continue, as the last two lines (see
-    // `pushed_in`): the line of work, not necessarily the branch that was just pushed.
-    let summary = format!(
-        "{summary}\nrepository: {}\nbranch: {}",
-        wt.repo().url,
-        wt.branch()
-    );
-    Ok(ToolOutput::text(summary)
+    // What a later task of this conversation may continue: the line of work, not necessarily the
+    // branch that was just pushed. It is the last two lines of the result (see `pushed_in`), after
+    // the pull request's text when the same call opened one.
+    let trailer = format!("\nrepository: {}\nbranch: {}", wt.repo().url, wt.branch());
+    let out = ToolOutput::text(summary)
         .with_artifact(checks)
         .with_artifact(Artifact::new(
             "branch",
             Some("application/json".into()),
             branch_data(wt.repo().url.as_str(), &wt, base, &sha),
-        )))
+        ));
+    let mut out = with_pull_request(&env, ctx, slot, Ok(out), pull_request).await?;
+    if !out.is_error {
+        out.content.push_str(&trailer);
+    }
+    Ok(out)
+}
+
+/// What a [`commit_and_push`] that carried a `pull_request` does after the commit and the push:
+/// the pull request's own result, appended to the commit's, through the gate and the path of
+/// [`open_pull_request`] (the commit already resolved the slot, so the gate is not repeated here).
+///
+/// A refusal is the commit's result marked as an error, with the pull request's words after the
+/// commit's: the commit and the push stand, as they do when the second call of the two-call flow is
+/// refused. A commit that was itself refused opens nothing.
+async fn with_pull_request(
+    env: &ToolEnv,
+    ctx: &ToolCtx,
+    slot: Slot,
+    commit: Outcome,
+    pull_request: Option<PullRequestArgs>,
+) -> Outcome {
+    let Some(pull_request) = pull_request else {
+        return commit;
+    };
+    let mut out = commit?;
+    if out.is_error {
+        return Ok(out);
+    }
+    if ctx.is_cancelled() {
+        return Err(cancelled("no pull request was opened"));
+    }
+    let opened = match (
+        non_empty(&pull_request.title),
+        non_empty(&pull_request.body),
+    ) {
+        (Some(title), Some(body)) => {
+            open_in(
+                env,
+                ctx,
+                slot,
+                title,
+                body,
+                pull_request.accept_red_checks.unwrap_or(false),
+            )
+            .await?
+        }
+        _ => ToolOutput::error("title and body are required"),
+    };
+    out.content.push('\n');
+    out.content.push_str(&opened.content);
+    out.artifacts.extend(opened.artifacts);
+    out.is_error = opened.is_error;
+    Ok(out)
 }
 
 /// The data of the `branch` artifact: the branch the commit was pushed to (the run's own), and,
@@ -246,7 +316,8 @@ fn checks_for_pushed(
     }
 }
 
-// Opens the pull request for the pushed branch.
+// Opens the pull request for the pushed branch. A `commit_and_push` that carries a `pull_request`
+// runs this same gate and path in the same call, after its commit and push (`open_in`).
 //
 // Refuses unless the branch's `HEAD` was pushed by `commit_and_push` and the
 // most recent check run on **exactly the code the pull request contains** (the
@@ -293,6 +364,20 @@ pub async fn open_pull_request(
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
+    open_in(&env, ctx, slot, title, body, accept_red).await
+}
+
+/// The gate, the fast-forward and the pull request itself, once the slot is resolved: what
+/// [`open_pull_request`] runs, and what the `pull_request` of [`commit_and_push`] runs after its
+/// commit and push, so there is one gate and one path. `title` and `body` are not empty.
+async fn open_in(
+    env: &ToolEnv,
+    ctx: &ToolCtx,
+    slot: Slot,
+    title: &str,
+    body: &str,
+    accept_red: bool,
+) -> Outcome {
     let Some(wt) = slot.worktree().cloned() else {
         return Ok(ToolOutput::error(format!(
             "`{}` is a scratch project: it has no remote, so nothing is pushed from it and there \
