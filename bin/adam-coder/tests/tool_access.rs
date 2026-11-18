@@ -316,7 +316,11 @@ async fn a_read_and_a_write_of_the_same_path_do_not_overlap_and_other_paths_do()
                 "edit_file",
                 json!({"path": "src/a.rs", "old": "a", "new": "b"}),
             ),
-            call("c3", "read_file", json!({"path": "src/other.rs"})),
+            call(
+                "c3",
+                "write_file",
+                json!({"path": "src/other.rs", "content": "x"}),
+            ),
         ],
         10,
     )
@@ -327,8 +331,8 @@ async fn a_read_and_a_write_of_the_same_path_do_not_overlap_and_other_paths_do()
         "the model's order is kept"
     );
     assert!(
-        t.overlapped("c2", "c3"),
-        "a read of another file runs beside the edit: {:?}",
+        t.overlapped("c1", "c3"),
+        "a write of another file starts beside the read: {:?}",
         t.events.lock()
     );
 }
