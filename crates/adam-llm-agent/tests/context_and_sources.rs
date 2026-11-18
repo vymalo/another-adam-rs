@@ -11,7 +11,7 @@ use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY, Conversation, LlmAgent, LlmAgentBuilder,
     MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS, PendingQuestion, PendingWait,
-    SourceCtx, Tool, ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
+    SourceCtx, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
 };
 use adam_model::{DynModel, Message, MockModel, ToolCall, ToolSpec};
 use adam_runtime::{Inbound, ManualClock, RetryPolicy, RunView, Runtime};
@@ -205,6 +205,69 @@ async fn the_context_of_the_start_message_reaches_a_tool() {
     assert_eq!(
         h.mock.requests()[1].messages[2],
         Message::tool_result("c1", r#"{"width":3}"#)
+    );
+}
+
+/// Records where the `catalog` of the context it was given lives: two calls of one turn that share
+/// the map read the same address, and calls that each clone it read different ones.
+struct ReadsCatalog {
+    seen: Arc<Mutex<Vec<usize>>>,
+}
+
+#[async_trait]
+impl Tool for ReadsCatalog {
+    fn spec(&self) -> ToolSpec {
+        spec("who")
+    }
+    fn access(&self, _args: &Value) -> ToolAccess {
+        ToolAccess::Independent
+    }
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        let at = ctx
+            .context("catalog")
+            .map(|value| std::ptr::from_ref(value) as usize);
+        self.seen.lock().unwrap().push(at.unwrap_or(0));
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+/// Five calls of one turn read one map: the step builds the run's context once and every `ToolCtx`
+/// shares it, instead of each call deep-cloning the context (up to 64 KiB of it) into an `Arc`.
+#[tokio::test]
+async fn the_calls_of_a_turn_share_one_context_map() {
+    let h = Harness::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let agent = h
+        .agent()
+        .max_parallel(5)
+        .tool(ReadsCatalog { seen: seen.clone() })
+        .build();
+    let calls = (0..5)
+        .map(|n| call(&format!("c{n}"), "who", json!({"x": format!("{n}")})))
+        .collect();
+    h.mock.push_tool_calls(calls).push_text("done");
+    let rt = h.runtime(&agent);
+    let catalog = "c".repeat(64 * 1024);
+    let run = rt
+        .start("llm", message_with("hi", json!({"catalog": catalog})), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 5, "{seen:?}");
+    assert!(
+        seen.iter().all(|at| *at == seen[0]),
+        "the five calls of the turn read one map: {seen:?}"
+    );
+    assert_eq!(
+        conversation(&view).context["catalog"]
+            .as_str()
+            .unwrap()
+            .len(),
+        catalog.len()
     );
 }
 
