@@ -228,3 +228,9 @@ test('the README and ADR 0048 show every replaced or dropped phrase, so the owne
     for (const [from, to] of Object.entries(NAMES)) assert.ok(doc.includes(`| \`${from}\` | \`${to}\` |`) || doc.includes(`\`${from}\``), `${from} is shown`);
   }
 });
+
+test("the shared prompt builds from adam's instructions as they are in this checkout, so a change to them fails here before the pin moves", () => {
+  const instructions = fs.readFileSync(path.join(REPO, INSTRUCTIONS_PATH), 'utf8');
+  const shared = sharedPrompt(instructions);
+  assert.ok(shared.text.length > 0);
+});

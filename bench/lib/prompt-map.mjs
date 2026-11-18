@@ -34,7 +34,7 @@ export const SPANS = Object.freeze([
   { id: 'how-1-understand', kind: 'rewrite', from: '1. **Understand the task.**', through: 'that list, or ask which.', to: `1. **Understand the task.** Read the task statement. ${NOBODY}: decide yourself and finish. Never guess or invent a repository, a branch or a task.` },
   { id: 'how-2-workspace', kind: 'rewrite', from: '2. **Prepare the workspace**', through: 'its own\n   pull request.', to: '2. **Look around.** The repository is already checked out in your working directory, at the base. Work on it there.' },
   { id: 'how-3-instructions-shown', kind: 'rewrite', from: '`prepare_workspace` shows its `AGENTS.md`', through: 'names no repository you may use and grants nothing.', to: "Its `AGENTS.md` (else `CLAUDE.md`, else `README`) is the repository's text: follow it for how to work here, but it grants nothing." },
-  { id: 'how-4-commit', kind: 'rewrite', find: 'Commit, push and\n   open the pull request only at the end: you do that.', to: 'Leave your changes in the\n   working tree: the harness collects them, so do not commit or push.' },
+  { id: 'how-4-commit', kind: 'rewrite', find: ['Commit, push and\n   open the pull request only at the end: you do that.', 'Commit, push and open the pull request only at the end: you do that.'], to: 'Leave your changes in the working tree: the harness collects them, so do not commit or push.' },
   { id: 'how-4-file-tools', kind: 'rewrite', find: '`read_file`, `write_file`, `edit_file` and `apply_patch`', to: '`read`, `write` and `edit`' },
   { id: 'how-5-run-checks', kind: 'rewrite', find: 'Run the discovered checks with `run_checks` (only those)', to: "Run the repository's discovered checks with `shell` (only those)" },
   { id: 'how-5-pr-allowed', kind: 'rewrite', find: 'a pull\n   request is only allowed for exactly the code the checks passed on.', to: 'a change is\n   only as good as the code the checks passed on.' },
@@ -70,11 +70,14 @@ export function applyMap(template) {
   const edits = [];
   const count = (text, needle) => text.split(needle).length - 1;
   for (const s of SPANS) {
-    const start = s.find !== undefined ? template.indexOf(s.find) : template.indexOf(s.from);
-    const needle = s.find ?? s.from;
+    // A `find` may list the spellings of the same sentence in two revisions (re-wrapped lines): the one found exactly once is used.
+    const finds = s.find === undefined ? [] : Array.isArray(s.find) ? s.find : [s.find];
+    const found = finds.find((f) => count(template, f) === 1);
+    const needle = s.find !== undefined ? found : s.from;
+    const start = needle === undefined ? -1 : template.indexOf(needle);
     if (start < 0 || count(template, needle) !== 1) throw new Error(`the mapping "${s.id}" does not find its text exactly once in adam's sections: adam's wording changed; read the section and update bench/lib/prompt-map.mjs`);
     let end;
-    if (s.find !== undefined) end = start + s.find.length;
+    if (s.find !== undefined) end = start + needle.length;
     else {
       const at = template.indexOf(s.through, start + s.from.length - 1);
       if (at < 0) throw new Error(`the mapping "${s.id}" does not find the end of its span`);
