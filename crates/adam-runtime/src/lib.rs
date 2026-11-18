@@ -109,7 +109,8 @@ pub use ctx::{Ctx, Emitter, ReservedStep};
 pub use events::{
     Artifact, ArtifactFile, ArtifactFileError, BroadcastSink, CollectingSink, DynEventSink,
     EventSink, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_FILENAME_BYTES, MAX_RUN_FILE_BYTES, NoopSink,
-    REPLAY_EVENTS_PER_RUN, REPLAY_MAX_AGE, REPLAY_MAX_RUNS, RunEvent, RunSubscription, SinkEvent,
+    REPLAY_EVENTS_PER_RUN, REPLAY_MAX_AGE, REPLAY_MAX_BYTES, REPLAY_MAX_RUNS, RunEvent,
+    RunSubscription, SinkEvent,
 };
 pub use file::{
     MAX_FILES_PER_RESULT, ReceivedFiles, checked_media_type, extension_of, human_size, image_size,
