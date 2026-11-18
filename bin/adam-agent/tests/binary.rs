@@ -667,6 +667,51 @@ async fn a_chat_folder_answers_in_role_over_a2a_and_an_edit_changes_it_after_a_r
     db.finish().await;
 }
 
+/// `MAX_PARALLEL_TOOL_CALLS` reaches the agent the process serves: at 1 the model is told nothing
+/// about `after_previous` (no property in a schema, no sentence in the instructions), and at 2 every
+/// schema has the property and the instructions end with the sentence.
+#[tokio::test]
+async fn max_parallel_tool_calls_reaches_the_agent_the_process_serves() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let agent = chat();
+    for (value, told) in [("1", false), ("2", true)] {
+        let (model, seen) = mount_persona_model().await;
+        let mut env = valid_env(&db.url(), agent.path());
+        env.retain(|(k, _)| k != "MODEL_BASE_URL");
+        env.push(pair("MODEL_BASE_URL", model.uri()));
+        env.push(pair("MAX_PARALLEL_TOOL_CALLS", value));
+        let mut p = Proc::spawn(&env);
+        let addr = p.ready().await;
+        let (state, said) = talk(addr, "hi").await;
+        assert_eq!(state, TaskState::Completed, "{said}\n{}", p.logs());
+        {
+            let seen = seen.lock().unwrap();
+            let request = &seen[0];
+            let tools = request["tools"].as_array().unwrap();
+            assert!(!tools.is_empty());
+            for tool in tools {
+                assert_eq!(
+                    tool["function"]["parameters"]["properties"]
+                        .get(adam_llm_agent::AFTER_PREVIOUS)
+                        .is_some(),
+                    told,
+                    "{value}: {tool}"
+                );
+            }
+            let system = request["messages"][0]["content"].as_str().unwrap();
+            assert_eq!(
+                system.ends_with(adam_llm_agent::AFTER_PREVIOUS_INSTRUCTION),
+                told,
+                "{value}: {system}"
+            );
+        }
+        p.stop_cleanly().await;
+    }
+    db.finish().await;
+}
+
 /// A control plane serves the card of the folder and starts runs with no model, no MCP flag and
 /// nothing else a worker needs; a worker in another process steps the run, serves only `/healthz`,
 /// and needs no front variable. They meet in the database.

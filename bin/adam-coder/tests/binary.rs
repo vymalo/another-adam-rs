@@ -540,6 +540,96 @@ async fn serves_card_and_healthz_then_stops_cleanly_on_sigterm() {
     db.finish().await;
 }
 
+/// Answers every `POST /chat/completions` with a text, and keeps the requests it got.
+struct Recording {
+    seen: Arc<Mutex<Vec<Value>>>,
+}
+
+impl Respond for Recording {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        self.seen.lock().unwrap().push(body);
+        chat_response(request, &text_reply("Hello."))
+    }
+}
+
+/// `MAX_PARALLEL_TOOL_CALLS` reaches the coder's agent: at 1 the model is told nothing about
+/// `after_previous` (no property in a schema, no sentence in the instructions), and at 2 every
+/// schema has the property and the system prompt has the sentence.
+#[tokio::test]
+async fn max_parallel_tool_calls_reaches_the_coders_agent() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    for (value, told) in [("1", false), ("2", true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(Recording { seen: seen.clone() })
+            .mount(&model)
+            .await;
+        let mut env = valid_env(&db.url(), tmp.path());
+        env.retain(|(k, _)| k != "MODEL_BASE_URL");
+        env.push(("MODEL_BASE_URL".to_owned(), model.uri()));
+        env.push(("MAX_PARALLEL_TOOL_CALLS".to_owned(), value.to_owned()));
+        let mut p = Proc::spawn(&env);
+        let addr = p.ready().await;
+        let client = common::a2a_client(addr, A2A_TOKEN).await;
+        let mut stream = client
+            .send_streaming_message(&SendMessageRequest {
+                message: Message::new(Role::User, vec![Part::text("hi")]),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let state = match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(Ok(StreamResponse::Task(task)))) => task.status.state,
+                Ok(Some(Ok(StreamResponse::StatusUpdate(u)))) => u.status.state,
+                Ok(Some(Ok(_))) => continue,
+                other => panic!(
+                    "the stream ended before the task did: {other:?}\n{}",
+                    p.logs()
+                ),
+            };
+            if state.is_terminal() {
+                assert_eq!(state, TaskState::Completed, "{}", p.logs());
+                break;
+            }
+        }
+        {
+            let seen = seen.lock().unwrap();
+            let request = &seen[0];
+            let tools = request["tools"].as_array().unwrap();
+            assert!(!tools.is_empty());
+            for tool in tools {
+                assert_eq!(
+                    tool["function"]["parameters"]["properties"]
+                        .get(adam_llm_agent::AFTER_PREVIOUS)
+                        .is_some(),
+                    told,
+                    "{value}: {tool}"
+                );
+            }
+            let system = request["messages"][0]["content"].as_str().unwrap();
+            assert_eq!(
+                system.contains(adam_llm_agent::AFTER_PREVIOUS_INSTRUCTION),
+                told,
+                "{value}"
+            );
+        }
+        p.sigterm().await;
+        let status = p.exit_within(Duration::from_secs(15)).await;
+        assert_eq!(status.code(), Some(0), "{}", p.logs());
+    }
+    db.finish().await;
+}
+
 /// A worker serves no A2A: its listener answers `/healthz` (so probes work) and nothing else, it
 /// starts without `A2A_BEARER_TOKENS` and `PUBLIC_URL`, it creates its workspace root, and it
 /// stops on SIGTERM with exit code 0.
