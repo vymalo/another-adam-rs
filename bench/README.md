@@ -428,7 +428,7 @@ them equal.
 
 | Pin | Value | |
 |---|---|---|
-| coder image | `ghcr.io/vymalo/another-adam-rs/coder:sha-2d5d0b3@sha256:3476…ac91`, revision `2d5d0b3926cb…` | *verified 2026-11-17*: the digest by an anonymous manifest request to `ghcr.io` for the tag `deploy/coder/values.yaml` names, the revision from the image's `org.opencontainers.image.revision` label |
+| coder image | `ghcr.io/vymalo/another-adam-rs/coder:sha-3f668c3@sha256:dad8…c72b`, revision `3f668c3b207b…` | *verified 2026-11-18*: the digest by an anonymous manifest request to `ghcr.io` for the tag the `coder` workflow pushed for main `3f668c3`, the revision from the image's `org.opencontainers.image.revision` label |
 | OpenCode V2 | `@opencode/cli` 2.3.0, platform package `@opencode/cli-linux-x64`, integrity `sha512-8T3K…FFg==` | *verified 2026-11-17* on `registry.npmjs.org`: the newest 2.x at least three days old (2.3.0 was published 2026-11-13, the platform package at 08:43 UTC, `@opencode/cli` at 08:54); the integrity is of the exact tarball that is mounted and was computed again from the download; the tarball holds `package/bin/opencode`, a 250 MB native executable (`@opencode/cli` itself has only a `postinstall` that picks a platform package and a launcher; nothing is installed at run time) |
 
 |  | adam-coder | OpenCode |

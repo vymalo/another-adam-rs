@@ -42,7 +42,7 @@ x-wiremock: &wiremock
     retries: 30
     start_period: 5s
 
-x-image: &image ghcr.io/vymalo/another-adam-rs/coder:sha-2d5d0b3@sha256:347664483a175b96b89fad2e6f42de1c1f9c0d7f4feac0d271eff6316562ac91
+x-image: &image ghcr.io/vymalo/another-adam-rs/coder:sha-3f668c3@sha256:dad89fc8f89f176cd4884d2370bc7de73bb8a884c067867ec1d2344586d8c72b
 
 x-podman: &podman
   build:
