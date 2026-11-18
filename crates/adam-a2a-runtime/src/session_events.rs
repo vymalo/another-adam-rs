@@ -259,8 +259,7 @@ impl SessionsTracker {
             // read how, so its report is not lost.
             let mut chain = Vec::new();
             if let Some(prev) = &prev
-                && now.round > prev.round
-                && prev.state.report().is_none_or(|r| r == Report::Blocked)
+                && ended_unseen(prev, &now)
                 && let Some(settled) = backend.settled(prev).await
             {
                 chain.push(settled);
@@ -335,16 +334,27 @@ impl RuntimeTaskBackend {
     /// How `prev`'s round ended, read from its run: `prev` as it stood when that round was over.
     async fn settled(&self, prev: &Seen) -> Option<Seen> {
         let view = self.runtime.view(prev.task).await.ok()??;
-        let state = RoundState::of_task(&task_state(&view));
-        if state.report().is_none() || state == RoundState::Blocked {
-            return None;
-        }
-        let mut settled = prev.clone();
-        settled.state = state;
-        // A session that is not kept open closes with its round.
-        settled.closed = prev.closed || !prev.keep_open;
-        Some(settled)
+        settle(prev, RoundState::of_task(&task_state(&view)))
     }
+}
+
+/// Whether the round `prev` saw may have ended before `now` was listed: a newer round started
+/// while it worked or waited for the person.
+fn ended_unseen(prev: &Seen, now: &Seen) -> bool {
+    now.round > prev.round && prev.state.report().is_none_or(|r| r == Report::Blocked)
+}
+
+/// `prev` as it stood when its round ended in `state`; `None` while that round still works or
+/// waits.
+fn settle(prev: &Seen, state: RoundState) -> Option<Seen> {
+    if state.report().is_none() || state == RoundState::Blocked {
+        return None;
+    }
+    let mut settled = prev.clone();
+    settled.state = state;
+    // A session that is not kept open closes with its round.
+    settled.closed = prev.closed || !prev.keep_open;
+    Some(settled)
 }
 
 #[cfg(test)]
@@ -511,5 +521,73 @@ mod tests {
         assert!(closed.get("round").is_none() && closed.get("report").is_none());
         let opened = now.event_object(Event::Opened);
         assert!(opened.get("round").is_some() && opened.get("report").is_none());
+    }
+
+    #[test]
+    fn a_round_state_maps_to_its_report_and_its_task_state() {
+        for (state, report, task) in [
+            (Working, None, TaskState::Working),
+            (Blocked, Some(Report::Blocked), TaskState::InputRequired),
+            (Done, Some(Report::Done), TaskState::Completed),
+            (Failed, Some(Report::Failed), TaskState::Failed),
+            (Canceled, Some(Report::Canceled), TaskState::Canceled),
+        ] {
+            assert_eq!(state.report(), report);
+            assert_eq!(state.task_state(), task);
+        }
+        let now = seen(1, Blocked, false);
+        assert_eq!(
+            now.event_object(Event::Reported(Report::Blocked))["round"]["state"],
+            "TASK_STATE_INPUT_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn a_task_state_and_an_outcome_map_to_a_round_state() {
+        for (task, want) in [
+            (TaskState::InputRequired, Blocked),
+            (TaskState::AuthRequired, Blocked),
+            (TaskState::Completed, Done),
+            (TaskState::Failed, Failed),
+            (TaskState::Rejected, Failed),
+            (TaskState::Canceled, Canceled),
+            (TaskState::Submitted, Working),
+            (TaskState::Working, Working),
+        ] {
+            assert_eq!(RoundState::of_task(&task), want, "{task:?}");
+        }
+        for (outcome, want) in [
+            (Some(RoundOutcome::Done), Done),
+            (Some(RoundOutcome::Failed), Failed),
+            (Some(RoundOutcome::Cancelled), Canceled),
+            (None, Failed),
+        ] {
+            assert_eq!(RoundState::of_outcome(outcome), want, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_round_that_worked_or_waited_can_have_ended_unseen() {
+        let unseen = |prev: Seen, round: u32| ended_unseen(&prev, &seen(round, Working, false));
+        assert!(unseen(seen(1, Working, false), 2));
+        assert!(unseen(seen(1, Blocked, false), 2));
+        assert!(!unseen(seen(1, Done, false), 2));
+        assert!(!unseen(seen(1, Failed, false), 2));
+        assert!(!unseen(seen(1, Working, false), 1));
+    }
+
+    #[test]
+    fn a_settled_round_closes_a_session_that_is_not_kept_open() {
+        let prev = Seen {
+            keep_open: false,
+            ..seen(1, Working, false)
+        };
+        let settled = settle(&prev, Done).unwrap();
+        assert!(settled.closed && settled.state == Done);
+        let kept = seen(1, Working, false);
+        assert!(!settle(&kept, Failed).unwrap().closed);
+        assert!(settle(&seen(1, Working, true), Canceled).unwrap().closed);
+        assert!(settle(&kept, Working).is_none());
+        assert!(settle(&kept, Blocked).is_none());
     }
 }
