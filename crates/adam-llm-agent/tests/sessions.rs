@@ -1329,6 +1329,43 @@ mod cases {
         assert!(result_of(&results, "c4").1.contains("queue done"));
     }
 
+    /// A send the round already read (the call is made again) reports how the round took it the
+    /// first time: `queued` for a round that keeps messages, not `steered`.
+    pub async fn a_replayed_send_to_a_round_that_queues_says_queued(store: DynStore) {
+        let rig = Rig::new();
+        let (parent_agent, queues) = (rig.parent(), Queues(rig.child_name.clone()));
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent)
+            .agent(queues)
+            .build();
+        let parent = rig.start(&rt, &conv_id()).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![send_call("c2", session, "hold on")])
+            .push_tool_calls(vec![send_call("c2", session, "hold on")])
+            .push_tool_calls(vec![send_call("c3", session, "finish")])
+            .push_tool_calls(vec![read_call("c4", session, true)])
+            .push_text("sent twice");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let state = state_of(&rt, parent).await;
+        let deliveries: Vec<String> = tool_results(&state)
+            .iter()
+            .filter(|(id, ..)| id == "c2")
+            .map(|(_, text, _)| {
+                as_json(text)["delivered"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert!(!deliveries.is_empty(), "{state:#?}");
+        assert!(deliveries.iter().all(|d| d == "queued"), "{deliveries:?}");
+    }
+
     /// A later call of the same turn fails the try, and the model is asked again with other call
     /// ids: the session the first try started is the one the history names, and nothing else starts.
     pub async fn a_failed_try_later_in_the_turn_starts_no_second_session(store: DynStore) {
@@ -2893,6 +2930,7 @@ macro_rules! session_suite {
                 a_session_that_is_not_ours_is_refused_in_words,
                 a_remote_subagent_starts_a_round_of_its_registered_agent,
                 a_send_to_a_round_that_queues_says_queued,
+                a_replayed_send_to_a_round_that_queues_says_queued,
                 a_retried_try_starts_nothing_twice,
                 a_closed_session_reports_the_round_that_worked,
                 a_run_that_cannot_wait_cancels_its_rounds,

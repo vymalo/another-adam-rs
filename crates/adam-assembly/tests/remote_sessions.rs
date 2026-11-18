@@ -22,7 +22,7 @@ use adam_assembly::{AgentDef, Assembly};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{FnTool, ToolError, ToolOutput, ToolSet, user_message};
 use adam_model::{Message as ModelMessage, MockModel, ModelRequest, ToolCall};
-use adam_runtime::{RetryPolicy, Runtime, child_run_id};
+use adam_runtime::{Agent, RetryPolicy, Runtime, child_run_id};
 use async_trait::async_trait;
 use common::{def, instructions, spawn_worker, wait_done, wait_for};
 use futures::stream::BoxStream;
@@ -296,6 +296,8 @@ impl TaskBackend for Remote {
 /// An A2A server on a local port behind bearer authentication.
 struct Server {
     addr: SocketAddr,
+    /// How many times the agent card was fetched.
+    card_hits: Arc<AtomicUsize>,
 }
 
 impl Server {
@@ -312,11 +314,24 @@ impl Server {
             card = card.with_extension(ExtensionConfig::steer());
         }
         let auth = AuthConfig::BearerTokens(vec![TOKEN.to_owned().into()]);
-        let app = A2aServer::router(card, Arc::new(backend), auth);
+        let card_hits = Arc::new(AtomicUsize::new(0));
+        let counter = card_hits.clone();
+        let app =
+            A2aServer::router(card, Arc::new(backend), auth).layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let counter = counter.clone();
+                    async move {
+                        if request.uri().path().ends_with("agent-card.json") {
+                            counter.fetch_add(1, SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        Self { addr }
+        Self { addr, card_hits }
     }
 
     fn card_url(&self) -> String {
@@ -1137,4 +1152,88 @@ async fn a_round_started_without_a_limit_gives_up_at_the_remote_timeout() {
         worker.stop().await;
         assert!(view.error.unwrap().contains("time limit"), "{backend}");
     }
+}
+
+// --- the endpoint and the cancel hook, asked directly ---------------------------------------
+
+fn round_agent(rig: &Rig) -> adam_assembly::RemoteRoundAgent {
+    let assembly = rig.assemble(None);
+    assert_eq!(assembly.remote_round_agents().len(), 1);
+    assembly.remote_round_agents()[0].clone()
+}
+
+fn probe_request(text: &str) -> Value {
+    serde_json::to_value(a2a::SendMessageRequest {
+        message: Message::new(Role::User, vec![Part::text(text)]),
+        configuration: Some(a2a::SendMessageConfiguration {
+            accepted_output_modes: None,
+            task_push_notification_config: None,
+            history_length: Some(0),
+            return_immediately: Some(true),
+        }),
+        metadata: None,
+        tenant: None,
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_round_fetches_the_card_once_and_then_reuses_the_client() {
+    let rig = Rig::new(1, false).await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = rig.runtime(&store, None);
+    let parent = rig
+        .start(&rt, |model, session| {
+            model
+                .push_tool_calls(vec![start("invoice 7", false)])
+                .push_tool_calls(vec![read("c2", session)])
+                .push_text("done");
+        })
+        .await;
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, parent).await;
+    worker.stop().await;
+    assert!(text_of(&results(&rig.model), "c2").contains("done: invoice 7"));
+    assert_eq!(
+        rig.server.card_hits.load(SeqCst),
+        1,
+        "the card is read for the round, and the client it made serves the send and the looks"
+    );
+}
+
+#[tokio::test]
+async fn callers_that_arrive_together_dial_the_card_once() {
+    let rig = Rig::new(usize::MAX, false).await;
+    let agent = round_agent(&rig);
+    // Each cancel asks the endpoint for its client, and the task it names is unknown to the remote.
+    let state = json!({ "prior_open_task": "no-such-task" });
+    futures::future::join_all((0..6).map(|_| agent.on_cancelled(RunId::new(), state.clone())))
+        .await;
+    assert_eq!(
+        rig.remote.cancel_attempts(),
+        6,
+        "the prior task is cancelled by a cancelled round"
+    );
+    assert_eq!(rig.server.card_hits.load(SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_cancelled_round_repeats_a_send_only_when_it_does_not_know_the_task() {
+    let rig = Rig::new(usize::MAX, false).await;
+    let agent = round_agent(&rig);
+    // The task is known: it is cancelled and the send is not repeated.
+    let known = json!({ "task": "t-known", "sending": probe_request("p") });
+    agent.on_cancelled(RunId::new(), known).await;
+    assert_eq!(rig.remote.cancel_attempts(), 1);
+    assert!(
+        rig.remote.submits().is_empty(),
+        "{:?}",
+        rig.remote.submits()
+    );
+    // The task is not known: the send is repeated to find it, and what it made is cancelled.
+    let lost = json!({ "sending": probe_request("p") });
+    agent.on_cancelled(RunId::new(), lost).await;
+    assert_eq!(rig.remote.submits().len(), 1);
+    assert_eq!(rig.remote.made().len(), 1);
+    assert_eq!(rig.remote.cancels(), [rig.remote.made()[0].0.clone()]);
 }

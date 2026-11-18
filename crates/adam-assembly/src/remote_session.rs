@@ -281,6 +281,20 @@ impl RoundState {
         }
     }
 
+    /// A send went through: drop the messages it carried (not those that joined the queue since it
+    /// was committed) and take what the remote said.
+    fn sent_ok(&mut self, seen: Seen) {
+        self.sent += 1;
+        let taken = self.sending_count.min(self.queued.len());
+        self.queued.drain(..taken);
+        self.sending = None;
+        self.sending_count = 0;
+        self.answer_task = None;
+        self.question = None;
+        self.looks = 0;
+        self.record(seen);
+    }
+
     /// What the round reports when nothing is left to do.
     fn finish(&mut self) -> Result<String, String> {
         if let Some(failure) = &self.failure {
@@ -546,15 +560,7 @@ impl RemoteRoundAgent {
             Ok(seen) => seen,
             Err(text) => return Ok(Some(text)),
         };
-        st.sent += 1;
-        let taken = st.sending_count.min(st.queued.len());
-        st.queued.drain(..taken);
-        st.sending = None;
-        st.sending_count = 0;
-        st.answer_task = None;
-        st.question = None;
-        st.looks = 0;
-        st.record(seen);
+        st.sent_ok(seen);
         Ok(None)
     }
 
@@ -615,9 +621,7 @@ impl RemoteRoundAgent {
         ctx: &mut Ctx,
         looks: u32,
     ) -> Result<chrono::DateTime<chrono::Utc>, AgentError> {
-        let wait = FIRST_LOOK
-            .saturating_mul(1_u32 << looks.min(10))
-            .min(self.wait_poll);
+        let wait = look_delay(looks, self.wait_poll);
         let now = ctx.now_journaled().await?;
         Ok(now + ChronoDuration::from_std(wait).unwrap_or(ChronoDuration::seconds(60)))
     }
@@ -677,6 +681,11 @@ impl RemoteRoundAgent {
             None => Transition::Continue(st),
         })
     }
+}
+
+/// The wait before look number `looks` (from 0): [`FIRST_LOOK`], doubled by each look, up to `cap`.
+fn look_delay(looks: u32, cap: Duration) -> Duration {
+    FIRST_LOOK.saturating_mul(1_u32 << looks.min(10)).min(cap)
 }
 
 /// Whether a round that first stepped at `started` has worked `max_wait`.
@@ -1083,6 +1092,114 @@ mod tests {
             texts,
             ["invoice 7", "next"],
             "what was never sent goes first"
+        );
+    }
+
+    fn round_agent() -> RemoteRoundAgent {
+        use crate::error::Origin;
+        use crate::remote::{RemoteEndpoint, RemoteSettings};
+        use adam_agent_fs::RemoteAgent;
+        let agent = RemoteAgent {
+            name: "billing".into(),
+            description: "d".into(),
+            url: "https://billing.example.com/card".into(),
+            auth: None,
+            files: false,
+            note: String::new(),
+            path: "agent/subagents/billing.md".into(),
+        };
+        let endpoint = RemoteEndpoint::bind(
+            &Origin::new("coder/billing", "billing.md"),
+            &agent,
+            &RemoteSettings::default(),
+        )
+        .unwrap();
+        RemoteRoundAgent::new(
+            "coder/billing".into(),
+            Arc::new(endpoint),
+            DEFAULT_WAIT_POLL,
+        )
+    }
+
+    #[test]
+    fn what_waited_goes_first_in_the_order_it_was_taken_and_what_may_have_been_sent_is_carried() {
+        let round = round_agent();
+        let mut before = round
+            .start(&Inbound::new("start", json!({"text": "ignored"})))
+            .unwrap();
+        before.queued = vec![Queued {
+            id: "q".into(),
+            text: "queued".into(),
+        }];
+        before.unhandled = vec![Queued {
+            id: "u".into(),
+            text: "unhandled".into(),
+        }];
+        let next = round
+            .carry(&Inbound::new("start", json!({"text": "next"})), &before)
+            .unwrap();
+        let texts: Vec<&str> = next.queued.iter().map(|q| q.text.as_str()).collect();
+        assert_eq!(texts, ["unhandled", "queued", "next"]);
+
+        // A send the round before may have made, and one it inherited, are not lost by a round that
+        // never got to cancel them.
+        let probe = request_of(Message::new(Role::User, vec![Part::text("p")]));
+        let mut third = round
+            .start(&Inbound::new("start", json!({"text": "x"})))
+            .unwrap();
+        third.prior_sending = Some(probe);
+        let fourth = round
+            .carry(&Inbound::new("start", json!({"text": "y"})), &third)
+            .unwrap();
+        assert!(
+            fourth.prior_sending.is_some(),
+            "an inherited probe is carried on"
+        );
+    }
+
+    #[test]
+    fn a_reply_with_no_task_keeps_the_task_the_round_followed() {
+        let mut state = started();
+        state.last_task = Some("t1".into());
+        state.record(Seen {
+            task: None,
+            context: None,
+            stage: Stage::Completed,
+            text: "plain reply".into(),
+        });
+        assert_eq!(state.last_task.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn a_send_that_went_through_drops_only_the_messages_it_carried() {
+        let mut state = started();
+        state.sending = Some(request_of(Message::new(
+            Role::User,
+            vec![Part::text("first")],
+        )));
+        state.sending_count = 1;
+        // A message joined the queue after the request was committed.
+        state.queued.push(Queued {
+            id: "late".into(),
+            text: "late".into(),
+        });
+        state.sent_ok(seen(Stage::Working, "t1", ""));
+        let left: Vec<&str> = state.queued.iter().map(|q| q.text.as_str()).collect();
+        assert_eq!(left, ["late"]);
+        assert!(state.sending.is_none());
+        assert_eq!(state.sent, 1);
+    }
+
+    #[test]
+    fn the_wait_between_looks_doubles_up_to_the_cap() {
+        let cap = Duration::from_secs(60);
+        assert_eq!(look_delay(0, cap), FIRST_LOOK);
+        assert_eq!(look_delay(1, cap), FIRST_LOOK * 2);
+        assert_eq!(look_delay(3, cap), FIRST_LOOK * 8);
+        assert_eq!(look_delay(10, cap), cap);
+        assert_eq!(
+            look_delay(2, Duration::from_secs(5)),
+            Duration::from_secs(5)
         );
     }
 }
