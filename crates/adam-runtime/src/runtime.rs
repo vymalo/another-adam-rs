@@ -359,12 +359,15 @@ impl Inner {
             let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(committed) => {
+                    // First, and on a task of its own: firing the token below lets the step end,
+                    // and the worker then drops the cancel watch that may be running this very
+                    // call, so anything awaited after it can be cut short.
+                    self.run_cancel_hook(run, &rec.agent, env.agent);
                     self.fire_cancel(run);
                     self.announce_finished(run).await;
                     self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
                         .await;
                     self.notify_parent(&committed).await;
-                    self.run_cancel_hook(run, &rec.agent, env.agent);
                     return Ok(());
                 }
                 Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,

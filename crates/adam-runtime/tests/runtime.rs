@@ -4452,6 +4452,8 @@ mod cases {
         wait_until("the hook", || agent.hook_calls().len() == 1).await;
         assert_eq!(agent.hook_calls(), vec![(run, json!({"task": "t-1"}))]);
         rt.cancel(run, "again").await.expect("cancel twice");
+        // A negative check: the hook is spawned, so "never called again" can only be shown by
+        // waiting a while; the first call was awaited above.
         tokio::time::sleep(Duration::from_millis(150)).await;
         worker.stop().await;
         assert_eq!(agent.hook_calls().len(), 1, "once per cancel commit");
@@ -4466,6 +4468,7 @@ mod cases {
         let worker = spawn_worker(&rt);
         wait_done(&rt, run).await;
         rt.cancel(run, "too late").await.expect("cancel");
+        // A negative check, as above: nothing to wait for, so a short wait.
         tokio::time::sleep(Duration::from_millis(150)).await;
         worker.stop().await;
         assert!(agent.hook_calls().is_empty());
@@ -4490,6 +4493,7 @@ mod cases {
         wait_waiting(&full, first).await;
         wait_waiting(&full, second).await;
         front.cancel(first, "from the front").await.expect("cancel");
+        // A negative check, as above; the second cancel below proves the hook path works.
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(agent.hook_calls().is_empty(), "the front has no agent");
         full.cancel(second, "from the worker")
