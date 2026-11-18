@@ -124,7 +124,12 @@ fn created_text(created: &CreatedRepo) -> String {
 /// with the same arguments and it creates the repository; if it was a no, do not ask again and do not
 /// look for another way. The new repository is empty: put a scratch project in it with
 /// publish_scratch. It needs the auto access tier or above.
-#[tool(asks_user, label = "Create a repository", icon = "git")]
+#[tool(
+    asks_user,
+    label = "Create a repository",
+    icon = "git",
+    parallel = "exclusive"
+)]
 pub async fn create_repository(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -372,25 +377,23 @@ async fn note_intent(
     full_name: &str,
     private: bool,
 ) -> Result<(), ToolError> {
-    let mut notes: RunNotes = env.notes.load(run).await.map_err(|e| notes_error(&e))?;
-    if notes.begin_creating(full_name, private) {
-        env.notes
-            .save(run, &notes)
-            .await
-            .map_err(|e| notes_error(&e))?;
-    }
+    env.notes
+        .update(run, |notes| {
+            notes.begin_creating(full_name, private);
+        })
+        .await
+        .map_err(|e| notes_error(&e))?;
     Ok(())
 }
 
 /// The host definitely did not make `full_name` for this run: forget the intent.
 async fn settle(env: &ToolEnv, run: &str, full_name: &str) -> Result<(), ToolError> {
-    let mut notes: RunNotes = env.notes.load(run).await.map_err(|e| notes_error(&e))?;
-    if notes.settle_creating(full_name) {
-        env.notes
-            .save(run, &notes)
-            .await
-            .map_err(|e| notes_error(&e))?;
-    }
+    env.notes
+        .update(run, |notes| {
+            notes.settle_creating(full_name);
+        })
+        .await
+        .map_err(|e| notes_error(&e))?;
     Ok(())
 }
 
@@ -432,18 +435,18 @@ async fn owner_kind(
 /// Write the repository into the run's notes: recorded, and granted. A repeat of the call finds it
 /// there and creates nothing.
 async fn remember(env: &ToolEnv, run: &str, record: &CreatedRepo) -> Result<(), ToolError> {
-    let mut notes: RunNotes = env.notes.load(run).await.map_err(|e| notes_error(&e))?;
-    if !notes
-        .created_repos
-        .iter()
-        .any(|c| c.full_name == record.full_name)
-    {
-        notes.created_repos.push(record.clone());
-    }
-    notes.name_repos([record.key.clone()]);
-    notes.settle_creating(&record.full_name);
     env.notes
-        .save(run, &notes)
+        .update(run, |notes| {
+            if !notes
+                .created_repos
+                .iter()
+                .any(|c| c.full_name == record.full_name)
+            {
+                notes.created_repos.push(record.clone());
+            }
+            notes.name_repos([record.key.clone()]);
+            notes.settle_creating(&record.full_name);
+        })
         .await
         .map_err(|e| notes_error(&e))
 }

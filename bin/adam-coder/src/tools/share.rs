@@ -82,7 +82,12 @@ struct Shared {
 /// share at most 6 MiB in all. Nothing inside `.git`, and nothing that a symlink leads out of the
 /// worktree to, can be shared. Share a file again after you change it. Example: {"path":
 /// "out/latency.svg", "name": "Latency by release"}.
-#[tool(label = "Share a file", icon = "file")]
+#[tool(
+    label = "Share a file",
+    icon = "file",
+    parallel = "read",
+    path = "path"
+)]
 pub async fn share_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -131,12 +136,13 @@ pub async fn share_file(
     // run that shares, not of its root: a subagent's file stays on the subagent's run and the
     // person never gets it, so it delivers nothing for the root.
     let run = ctx.run_id().to_string();
-    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     // Only what is shared from a slot the run works in is a result of its own: a file of a reference
-    // is somebody else's, however it reaches the person.
-    if slot.writable() && notes.record_shared(&format!("{}/{}", slot.dir(), path)) {
+    // is somebody else's, however it reaches the person. Through `update`: `share_file` runs beside
+    // other calls of its turn that write the notes.
+    if slot.writable() {
+        let shared = format!("{}/{}", slot.dir(), path);
         env.notes
-            .save(&run, &notes)
+            .update(&run, |notes| notes.record_shared(&shared))
             .await
             .map_err(|e| notes_error(&e))?;
     }

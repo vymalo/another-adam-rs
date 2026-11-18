@@ -436,13 +436,12 @@ pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value, what: &str) -
     // A question that goes out as text (the screen cannot draw the form) may be answered in words,
     // and only such a question: the agent reads the call's id from the notes to tell the two apart.
     if let Err(ToolError::NeedsInput { ui: None, .. }) = &asked {
-        let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-        if notes.note_text_question(ctx.call_id()) {
-            env.notes
-                .save(&run, &notes)
-                .await
-                .map_err(|e| notes_error(&e))?;
-        }
+        env.notes
+            .update(&run, |notes| {
+                notes.note_text_question(ctx.call_id());
+            })
+            .await
+            .map_err(|e| notes_error(&e))?;
     }
     asked
 }
@@ -455,7 +454,12 @@ pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value, what: &str) -
 /// repository you prepared lists as a reference (its result says so), pass that reference's name as
 /// `reference` and its address as `repo_url`: a yes lets you read it with the file tools, passing the
 /// name as `repo`, and never lets you change it.
-#[tool(asks_user, label = "Ask to use a repository", icon = "think")]
+#[tool(
+    asks_user,
+    label = "Ask to use a repository",
+    icon = "think",
+    parallel = "exclusive"
+)]
 pub async fn request_repository(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

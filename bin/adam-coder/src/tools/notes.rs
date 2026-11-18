@@ -11,10 +11,11 @@
 //! rename). Counting is keyed by tool call id, so replaying a call never counts
 //! a failure twice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use adam_a2a::AccessTier;
 use serde::{Deserialize, Serialize};
@@ -1062,6 +1063,9 @@ impl RunNotes {
 #[derive(Debug, Clone)]
 pub struct NotesStore {
     dir: PathBuf,
+    /// One lock per run, shared by every clone of the store: what makes [`update`](Self::update) one
+    /// step for the calls of a turn that run at the same time.
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl NotesStore {
@@ -1069,6 +1073,7 @@ impl NotesStore {
     pub fn new(workspace_root: &std::path::Path) -> Self {
         Self {
             dir: workspace_root.join("coder"),
+            locks: Arc::default(),
         }
     }
 
@@ -1111,6 +1116,44 @@ impl NotesStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Change the notes of `run` in one step: load, `change`, save when `change` changed them.
+    ///
+    /// Calls of one turn run at the same time (ADR 0049), so a `load` and a later `save` of two
+    /// calls could interleave and the second save would drop the first call's change. Every
+    /// read-change-write goes through here instead: a lock per run in this process makes the three
+    /// steps one, and the save stays atomic ([`save`](Self::save)). A tool that must do slow work
+    /// between reading and writing does the work first and puts only the change in `change`.
+    /// Across processes, the workers and sessions of one run, ADR 0037 decision 16 holds.
+    ///
+    /// The gates that run alone (`run_checks`, `commit_and_push`, `open_pull_request`) still hold the
+    /// notes across their work and save them once: no other call of their turn runs beside them.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors, or a file that is not valid notes; `change` is not run then.
+    pub async fn update<R>(
+        &self,
+        run: &str,
+        change: impl FnOnce(&mut RunNotes) -> R,
+    ) -> io::Result<R> {
+        self.path(run)?;
+        let lock = {
+            let mut locks = self
+                .locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.entry(run.to_owned()).or_default().clone()
+        };
+        let _held = lock.lock().await;
+        let mut notes = self.load(run).await?;
+        let before = notes.clone();
+        let result = change(&mut notes);
+        if notes != before {
+            self.save(run, &notes).await?;
+        }
+        Ok(result)
     }
 
     /// Replace the notes of `run`, atomically.
@@ -1453,6 +1496,64 @@ mod tests {
         assert!(store.load("../etc/passwd").await.is_err());
         assert!(store.save("a/b", &RunNotes::default()).await.is_err());
         assert!(store.load("").await.is_err());
+    }
+
+    /// Two calls of one turn that note something at the same time both keep their note: the
+    /// read-change-write of each is one step ([`NotesStore::update`]), where a `load` and a `save`
+    /// of two calls could interleave and the second save would drop the first call's change.
+    #[tokio::test]
+    async fn concurrent_updates_of_one_run_keep_every_change() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NotesStore::new(root.path());
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let (store, start) = (store.clone(), start.clone());
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                store
+                    .update("run-1", |notes| {
+                        notes
+                            .reference_commits
+                            .insert(format!("ref-{i}"), "c".into());
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let notes = store.load("run-1").await.unwrap();
+        assert_eq!(
+            notes.reference_commits.len(),
+            16,
+            "{:?}",
+            notes.reference_commits
+        );
+    }
+
+    /// A change that changes nothing writes nothing, the runs are independent, and a hostile run id
+    /// is refused as it is by `load`.
+    #[tokio::test]
+    async fn an_update_that_changes_nothing_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NotesStore::new(root.path());
+        let seen = store
+            .update("run-1", |notes| notes.pushed_sha.is_none())
+            .await
+            .unwrap();
+        assert!(seen);
+        assert!(store.load_existing("run-1").await.unwrap().is_none());
+        store
+            .update("run-2", |notes| notes.pushed_sha = Some("a".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load("run-2").await.unwrap().pushed_sha.as_deref(),
+            Some("a")
+        );
+        assert!(store.update("../x", |_| ()).await.is_err());
     }
 
     #[test]

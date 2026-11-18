@@ -120,7 +120,7 @@ impl RepoSkills {
     ) -> Result<Option<String>, ToolError> {
         let run = ctx.run_id().to_string();
         let key = slot.dir().to_owned();
-        let mut notes = self
+        let notes = self
             .env
             .notes
             .load(&run)
@@ -139,10 +139,11 @@ impl RepoSkills {
         // A slot with nothing to list is recorded too (an empty note), so that `load_skill` can tell
         // a prepared slot from one that was never prepared; nothing is rendered for it.
         let note = fit(&key, shape(ctx, ctx.call_id(), found));
-        notes.repo_skills.insert(key.clone(), note.clone());
         self.env
             .notes
-            .save(&run, &notes)
+            .update(&run, |notes| {
+                notes.repo_skills.insert(key.clone(), note.clone());
+            })
             .await
             .map_err(|e| notes_error(&e))?;
         Ok((!is_empty(&note)).then(|| render(&key, &note)))

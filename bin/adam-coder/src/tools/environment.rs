@@ -26,7 +26,11 @@ use super::{Outcome, ToolEnv, cancelled, environment_error, notes_error};
 /// Without `use_default` the environment is built again from the repository's file as it is now (after
 /// the person fixed it, or after the file was changed to add a tool). Your files are not touched. It
 /// builds the environment before it returns, which can take minutes.
-#[tool(label = "Rebuild the environment", icon = "execute")]
+#[tool(
+    label = "Rebuild the environment",
+    icon = "execute",
+    parallel = "exclusive"
+)]
 pub async fn rebuild_environment(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -58,10 +62,12 @@ pub async fn rebuild_environment(
         ));
     }
     // What the rebuilt environment will be asked again, and what the person chose.
-    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    notes.environment.use_default |= use_default;
-    env.notes
-        .save(&run, &notes)
+    let notes = env
+        .notes
+        .update(&run, |notes| {
+            notes.environment.use_default |= use_default;
+            notes.clone()
+        })
         .await
         .map_err(|e| notes_error(&e))?;
 
