@@ -7046,8 +7046,8 @@ mod cases {
     }
 
     /// A few MiB of transcript, carried through two commits: the state a commit lands is exactly
-    /// the one the agent returned, and the turns before it are untouched. The size is what makes a
-    /// copy per commit (or a state that does not survive the store) show up.
+    /// the one the agent returned, and the turns before it are untouched. A store that truncates,
+    /// or a decode that loses a member, fails here; the copy count is the benchmark's business.
     pub async fn a_large_state_lands_unchanged(store: DynStore) {
         const MESSAGES: usize = 48;
         const TEXT: usize = 64 * 1024;
@@ -7118,6 +7118,69 @@ mod cases {
         );
         assert_eq!(&messages[MESSAGES..], appended.as_slice());
         assert_eq!(view.output, Some(json!("finished")));
+    }
+
+    /// A permanent failure commits the state the run already had. The step took the agent state
+    /// by move, so this is the path that reads it back from the record instead of a drained
+    /// envelope: a regression here writes `"agent": null` over the run's state.
+    pub async fn a_permanent_failure_keeps_the_agents_state(store: DynStore) {
+        let name = uniq("perm-state");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, _state| {
+                async move { Err(AgentError::permanent("no such customer")) }.boxed()
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let run = rt
+            .start(&name, Inbound::new("start", json!({"k": 1})), None)
+            .await
+            .expect("start");
+        let worker = spawn_worker(&rt);
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(
+            failed.state,
+            json!({"k": 1}),
+            "the failure kept the agent's state"
+        );
+    }
+
+    /// The same holds when the retries run out: the last failure commits the state the run had,
+    /// not `null` from the envelope the step drained.
+    pub async fn exhausted_retries_keep_the_agents_state(store: DynStore) {
+        let name = uniq("retry-state");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, _state| {
+                async move { Err(AgentError::transient("still limited")) }.boxed()
+            }),
+        );
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .clock(clock.clone())
+            .retry(RetryPolicy {
+                max_attempts: 2,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(50),
+                multiplier: 2.0,
+            })
+            .build();
+        let run = rt
+            .start(&name, Inbound::new("start", json!({"k": 2})), None)
+            .await
+            .expect("start");
+        let worker = spawn_worker(&rt);
+        // The first failure schedules a retry; nothing steps before the test moves the clock.
+        wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
+        clock.advance(Duration::from_secs(1));
+        let failed = wait_failed(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(
+            failed.state,
+            json!({"k": 2}),
+            "the exhausted retry kept the agent's state"
+        );
     }
 }
 
@@ -7236,6 +7299,8 @@ macro_rules! runtime_suite {
                 a_session_listing_says_how_the_round_ended,
                 a_report_that_lands_while_a_run_finishes_does_not_reopen_it,
                 a_large_state_lands_unchanged,
+                a_permanent_failure_keeps_the_agents_state,
+                exhausted_retries_keep_the_agents_state,
                 a_round_that_is_its_own_parent_is_listed_reads_as_started_outside_and_is_never_cancelled_with_a_parent,
                 a_cancel_runs_the_agents_hook_once_with_its_last_state,
                 a_finished_run_runs_no_hook,

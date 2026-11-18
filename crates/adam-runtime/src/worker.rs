@@ -508,7 +508,7 @@ async fn transition(
     let mut env = match decoded {
         Ok(env) => env,
         Err(e) => {
-            tracing::error!(error = %e, "failing run with unreadable state");
+            tracing::error!(run = %run, error = %e, "failing run with unreadable state");
             // The state is unreadable, so it is stored as it is: the record's own value is moved.
             let update = RunUpdate::new(RunStatus::Failed, rec.state);
             if let Ok(committed) = inner.store.commit_run(run, rec.version, update).await {
@@ -553,7 +553,7 @@ async fn transition(
         .get(&rec.agent)
         .and_then(|r| r.agent().cloned())
     else {
-        tracing::error!(agent = %rec.agent, "claimed a run of an unregistered agent");
+        tracing::error!(run = %run, agent = %rec.agent, "claimed a run of an unregistered agent");
         return true;
     };
 
@@ -584,8 +584,9 @@ async fn transition(
     let outcome = ctx.into_outcome();
 
     // The step consumed the agent state. A failure commits the state the run already had, which is
-    // the record's own `agent` member: read, and copied, only then.
-    let plan = plan(inner, &env, rec.state.get("agent"), outcome, result);
+    // the record's own `agent` member: read, and copied, only then. `agent` is required by
+    // `Envelope` (it has no serde default), so a record that lacks it never decodes to here.
+    let plan = plan(inner, run, &env, rec.state.get("agent"), outcome, result);
     let Plan::Commit(mut next) = plan else {
         return false;
     };
@@ -608,12 +609,13 @@ async fn transition(
         }
         Ok(None) => {
             tracing::info!(
+                run = %run,
                 "commit rejected (run advanced or cancelled elsewhere); dropping result"
             );
             true
         }
         Err(e) => {
-            tracing::error!(error = %report(&e), "commit failed; the run will be retried when its lease expires");
+            tracing::error!(run = %run, error = %report(&e), "commit failed; the run will be retried when its lease expires");
             false
         }
     }
@@ -645,6 +647,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 /// move, so the paths that commit the state untouched read it from the record instead.
 fn plan(
     inner: &Inner,
+    run: RunId,
     base: &Envelope,
     base_agent: Option<&Value>,
     out: CtxOutcome,
@@ -770,6 +773,7 @@ fn plan(
             // would loop for ever, so the run ends.
             ErrorClass::Corrupt | ErrorClass::Invalid => {
                 tracing::error!(
+                    run = %run,
                     error = %report(&e),
                     "the store cannot read or accept this run's data; failing the run"
                 );
@@ -778,6 +782,7 @@ fn plan(
             // Anything else (an unreachable store, a bug): leave the run to its lease.
             class => {
                 tracing::error!(
+                    run = %run,
                     error = %report(&e),
                     class = ?class,
                     alert = class.should_alert(),
@@ -819,6 +824,9 @@ async fn park_again(inner: &Inner, rec: RunRecord, env: &Envelope, now: DateTime
 }
 
 /// The record to write, built on the freshest envelope.
+///
+/// `cur` is the claim's envelope on the first attempt, or a freshly decoded retry. A stepped
+/// envelope is drained (`cur.agent` is `Null`), so nothing here may read that member.
 fn build_update(
     next: &Next,
     cur: &Envelope,

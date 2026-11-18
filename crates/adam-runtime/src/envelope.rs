@@ -19,6 +19,10 @@ pub(crate) struct Envelope {
     /// Layout version.
     pub v: u32,
     /// The agent's own state.
+    ///
+    /// `transition` takes this by move before stepping, leaving `Null` in the envelope it still
+    /// holds. That envelope is never encoded (a commit builds a fresh one from `Next`), and a
+    /// reader of a stepped envelope must not treat `Null` as the agent's state.
     pub agent: Value,
     /// Delivered, not yet consumed messages, oldest first.
     #[serde(default)]
