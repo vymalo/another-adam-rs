@@ -21,7 +21,7 @@ use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionHeader, SessionState,
-    SessionView,
+    SessionSummary, SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -271,6 +271,20 @@ fn one_line(text: &str) -> String {
         .join(" ")
 }
 
+/// Whether the report of the latest round of `session` is **due** to the model of the run `me`
+/// ([ADR 0045], slice 3): the round has ended, it is not one that only closes its session (it
+/// reports nothing), its report was not given before (`reported`), and either this run started it
+/// or a person did. A round an earlier task's run started is not due: that run waited for it or
+/// cancelled it.
+///
+/// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+pub(crate) fn is_due(session: &SessionSummary, me: RunId, reported: &[RunId]) -> bool {
+    session.state != SessionState::Working
+        && !session.closing
+        && !reported.contains(&session.latest_run)
+        && (session.started_by == Some(me) || session.started_outside_a_run())
+}
+
 fn header_json(header: &SessionHeader) -> Value {
     serde_json::to_value(header).unwrap_or(Value::Null)
 }
@@ -300,8 +314,15 @@ fn read_output(
         Ok(window) => window,
         Err(why) => return ToolOutput::error(why),
     };
+    // A person's round says so: the model reads a report of something it did not ask for. The
+    // person's words are not in it.
+    let by = if view.started_outside_a_run() {
+        ", started by the person"
+    } else {
+        ""
+    };
     let head = format!(
-        "session {} ({}, \"{}\"): round {}, {}",
+        "session {} ({}, \"{}\"): round {}{by}, {}",
         view.id,
         roster.name_of(&view.agent),
         escape_text(description_of(view).as_bytes()),
@@ -1094,5 +1115,86 @@ impl Tool for List {
             out.push_str(&end_line(shown.total as u64, "sessions", &[]));
         }
         Ok(ToolOutput::text(out))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use adam_runtime::RoundOutcome;
+
+    fn ended(me: RunId, by: Option<RunId>) -> SessionSummary {
+        let latest = RunId::new();
+        SessionSummary {
+            id: RunId::new(),
+            agent: "helper".into(),
+            conversation_id: "c".into(),
+            latest_run: latest,
+            round: 1,
+            state: SessionState::Idle,
+            outcome: Some(RoundOutcome::Done),
+            updated_at: chrono::Utc::now(),
+            description: String::new(),
+            keep_open: true,
+            closed: false,
+            closing: false,
+            started_by: by.or(Some(me)),
+        }
+    }
+
+    #[test]
+    fn a_round_this_run_started_and_that_ended_is_due() {
+        let me = RunId::new();
+        let session = ended(me, None);
+        assert!(is_due(&session, me, &[]));
+        // A session that was not kept open is closed once its round ends, and is still due.
+        let mut closed = ended(me, None);
+        closed.state = SessionState::Closed;
+        assert!(is_due(&closed, me, &[]));
+    }
+
+    #[test]
+    fn a_round_that_works_is_not_due() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        session.state = SessionState::Working;
+        session.outcome = None;
+        assert!(!is_due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_round_that_only_closes_the_session_is_not_due() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        session.closing = true;
+        assert!(!is_due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_round_of_another_run_is_not_due() {
+        let me = RunId::new();
+        let session = ended(me, Some(RunId::new()));
+        assert!(!is_due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_round_a_person_started_is_due() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        session.started_by = Some(session.latest_run);
+        assert!(session.started_outside_a_run());
+        assert!(is_due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_round_already_reported_is_not_due_and_a_later_one_is() {
+        let me = RunId::new();
+        let session = ended(me, None);
+        assert!(!is_due(&session, me, &[RunId::new(), session.latest_run]));
+        // The session's next round is another run.
+        let mut next = session.clone();
+        next.latest_run = RunId::new();
+        assert!(is_due(&next, me, &[session.latest_run]));
     }
 }

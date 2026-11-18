@@ -592,7 +592,28 @@ pub struct Conversation {
     /// written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_calls: Vec<String>,
+    /// The rounds of sessions whose report the model has been given ([ADR 0045], slice 3), in the
+    /// order it was, the last [`MAX_REPORTED_ROUNDS`]: by a read of its own or by the loop, which
+    /// tells the model of a round that ended while it worked. A round in it is not reported
+    /// again. **Carried** by [`continued`](Self::continued), so a later task of the conversation
+    /// does not repeat a report. Absent from state written before it existed, and not written
+    /// while empty.
+    ///
+    /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reported_rounds: Vec<RunId>,
+    /// Whether a round of a session of this conversation may still end and be reported: the last
+    /// listing saw a session that is not closed, or a call has started or sent to one since. While
+    /// it is set the loop lists the sessions before every model call; while it is not, only before
+    /// the first of a run. Not carried to a later task. Absent from state written before it
+    /// existed, and not written while `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sessions_open: bool,
 }
+
+/// How many rounds a run remembers having reported ([`Conversation::reported_rounds`]): the oldest
+/// is given up, so a round a hundred and twenty-nine reports ago may be reported once more.
+pub const MAX_REPORTED_ROUNDS: usize = 128;
 
 /// How many message ids a run remembers having read ([`Conversation::read_ids`]). A person does not
 /// steer a task a hundred times, and the oldest id is the one given up, so a retry of an old message
@@ -1020,6 +1041,21 @@ impl Conversation {
         self.continued_within(text, from, MAX_CARRIED_BYTES)
     }
 
+    /// The model has been given the reports of `rounds`: remember them, each once, the oldest
+    /// given up past [`MAX_REPORTED_ROUNDS`].
+    pub(crate) fn note_reported(&mut self, rounds: &[RunId]) {
+        for round in rounds {
+            if !self.reported_rounds.contains(round) {
+                self.reported_rounds.push(*round);
+            }
+        }
+        let over = self
+            .reported_rounds
+            .len()
+            .saturating_sub(MAX_REPORTED_ROUNDS);
+        self.reported_rounds.drain(..over);
+    }
+
     /// Keep what a call asked the run to keep, if it fits the room the run has: the call was told
     /// its room ([`ToolCtx::kept_left`](crate::ToolCtx::kept_left)), so a result over it was never
     /// offered. An error result's is never offered either.
@@ -1173,6 +1209,7 @@ impl Conversation {
                 .into_iter()
                 .collect(),
             pinned_calls: self.pinned_calls.clone(),
+            reported_rounds: self.reported_rounds.clone(),
             images: Arc::clone(&self.images),
             sent_images: self.sent_images.clone(),
             ..Self::default()

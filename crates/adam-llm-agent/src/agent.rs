@@ -12,10 +12,10 @@ use adam_model::{
     ToolChoice, ToolSpec,
 };
 use adam_runtime::{
-    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, ChildStatus, Ctx,
-    Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE, RUN_FINISHED_KIND, ReservedStep,
-    RunEvent, SESSION_CLOSE_KIND, SandboxUsage, SessionState, SessionSummary, StepEvent, StepIcon,
-    StepKind, StepState, Transition, UsageEvent, UsageTotals, child_run_id,
+    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, ChildStarter,
+    ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE, RUN_FINISHED_KIND,
+    ReservedStep, RunEvent, SESSION_CLOSE_KIND, SandboxUsage, SessionState, SessionSummary,
+    StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent, UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -47,7 +47,7 @@ use crate::order;
 use crate::paging::backstop;
 use crate::plan::Plan;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
-use crate::sessions::{SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START};
+use crate::sessions::{SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, is_due};
 
 /// Whether the history holds a call that started a session or sent to one.
 fn has_started_session(state: &Conversation) -> bool {
@@ -399,6 +399,131 @@ struct Recorded {
     /// ([`order`]). Absent when none, and in journals written before it existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     own_order: Vec<String>,
+    /// The reports of sessions the request was given before the call ([`RoundReport`], ADR 0045
+    /// slice 3), in the order they were appended to it. Absent when there were none, and in
+    /// journals written before they existed, which read as none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reports: Vec<RoundReport>,
+    /// What the listing made for the reports saw: whether a session of the conversation is not
+    /// closed. `None` when the call made no listing (or it failed), and in journals written before
+    /// it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sessions_open: Option<bool>,
+}
+
+/// The report of one round, read for a model call that did not ask for it: the result of a
+/// `subagent_read` the loop made itself. Journaled in the record of the call, so a replay tells
+/// the model the same words.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RoundReport {
+    /// The session.
+    session: RunId,
+    /// The round the report is of: the id of the call that carries it is made from it.
+    round: RunId,
+    /// What the read of the session answered.
+    output: ToolOutput,
+}
+
+/// The id of the call the loop makes for the report of `round`: `report_` and its id's 32 hex
+/// digits, which every provider accepts and which no model call of ours ever has.
+fn report_call_id(round: RunId) -> String {
+    format!("report_{}", round.0.simple())
+}
+
+/// What a request is given for `reports`: one assistant message that calls `subagent_read` once
+/// for each, then the results, in the same order. Pure: the request and the history are given the
+/// same bytes. `paged` is the tool's ([`Tool::paged`]).
+fn report_messages(reports: &[RoundReport], paged: bool) -> Vec<Message> {
+    if reports.is_empty() {
+        return Vec::new();
+    }
+    let calls: Vec<ToolCall> = reports
+        .iter()
+        .map(|r| {
+            ToolCall::new(
+                report_call_id(r.round),
+                SUBAGENT_READ,
+                json!({ "session": r.session.to_string() }),
+            )
+        })
+        .collect();
+    let mut messages = vec![Message::Assistant {
+        content: Vec::new(),
+        tool_calls: calls.clone(),
+        reasoning: None,
+    }];
+    messages.extend(reports.iter().zip(&calls).map(|(r, call)| Message::Tool {
+        call_id: call.id.clone(),
+        content: backstop(&r.output.content, SUBAGENT_READ, paged).into_owned(),
+        is_error: false,
+        images: Vec::new(),
+    }));
+    messages
+}
+
+/// What a model call needs to tell the model the reports of sessions that ended: read inside the
+/// step of the call, from the store.
+struct ReportPlan {
+    /// The `subagent_read` tool: its `poll_remote` is the read of a report that has ended.
+    tool: DynTool,
+    tool_ctx: ToolCtx,
+    paged: bool,
+    starter: ChildStarter,
+    me: RunId,
+    agents: Arc<[String]>,
+    /// The rounds already reported ([`Conversation::reported_rounds`]).
+    reported: Vec<RunId>,
+}
+
+impl ReportPlan {
+    /// List the sessions, read the report of each round that is due ([`is_due`]) and append them
+    /// to `request` as the calls and results of reads. A listing or a read that fails is skipped,
+    /// with a warning: the next call lists again. Returns the reports, and whether a session is
+    /// still open (`None` when the listing failed).
+    async fn tell(self, request: &mut ModelRequest) -> (Vec<RoundReport>, Option<bool>) {
+        let names: Vec<&str> = self.agents.iter().map(String::as_str).collect();
+        let list = match self.starter.sessions(&names, 0, MAX_SESSION_PAGE).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %report(&e), "listing the sessions to report failed; the next call lists again");
+                return (Vec::new(), None);
+            }
+        };
+        let open = list
+            .sessions
+            .iter()
+            .any(|s| s.state != SessionState::Closed);
+        let mut reports = Vec::new();
+        for session in list
+            .sessions
+            .iter()
+            .filter(|s| is_due(s, self.me, &self.reported))
+        {
+            match self
+                .tool
+                .poll_remote(&self.tool_ctx, &session.id.to_string())
+                .await
+            {
+                Ok(RemotePoll::Ready(output)) if !output.is_error => {
+                    if let Some(round) = output.reported.first().copied() {
+                        reports.push(RoundReport {
+                            session: session.id,
+                            round,
+                            output,
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(session = %session.id, error = %e, "reading a report failed; the next call looks again");
+                }
+            }
+        }
+        request
+            .messages
+            .extend(report_messages(&reports, self.paged));
+        (reports, Some(open))
+    }
 }
 
 /// The id of the stream of the words of turn `turn` of `run`: unique within the task, because the
@@ -475,6 +600,7 @@ pub struct LlmAgentBuilder {
     stream_text: bool,
     step_io: StepIo,
     session_agents: Vec<String>,
+    session_reports: bool,
     max_parallel: usize,
 }
 
@@ -622,6 +748,16 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// Build the agent as one that predates the reports a model is told during a turn: it never
+    /// lists the sessions before a model call, so a journal it writes has none of their records.
+    /// For the test that proves such a journal still replays.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_session_reports(mut self) -> Self {
+        self.session_reports = false;
+        self
+    }
+
     /// The most tool calls of one model turn that run at the same time: `10` by default, and
     /// `n` clamped to `1..=32`. The calls of a turn run together as far as their
     /// [`Tool::access`] allows (a tool that declares nothing runs alone), the ones over the limit wait
@@ -751,6 +887,7 @@ impl LlmAgentBuilder {
             stream_text: self.stream_text,
             step_io: self.step_io,
             session_agents: self.session_agents.into(),
+            session_reports: self.session_reports,
             max_parallel: self.max_parallel,
         }
     }
@@ -913,6 +1050,8 @@ pub struct LlmAgent {
     step_io: StepIo,
     /// The registered names of the subagents whose sessions the turn-end wait looks at.
     session_agents: Arc<[String]>,
+    /// Whether a report of a session that ended reaches the model without a read of its own.
+    session_reports: bool,
     /// The most tool calls of a turn that run at the same time.
     max_parallel: usize,
 }
@@ -1000,6 +1139,7 @@ impl LlmAgent {
             stream_text: true,
             step_io: StepIo::default(),
             session_agents: Vec::new(),
+            session_reports: true,
             max_parallel: DEFAULT_MAX_PARALLEL,
         }
     }
@@ -1425,6 +1565,11 @@ impl LlmAgent {
             &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
         );
         let images_state = Arc::clone(&state.images);
+        // A report is told to the model before its first call of a run, and before every call
+        // while a session of the conversation may still end.
+        let report_plan = (self.session_reports && !closing && (turn == 0 || state.sessions_open))
+            .then(|| self.report_plan(ctx, state))
+            .flatten();
         let recorded: Result<Recorded, ModelFailure> = ctx
             .step(&format!("model:{turn}"), move || async move {
                 if !named.is_empty() {
@@ -1441,6 +1586,12 @@ impl LlmAgent {
                 // tools it was given.
                 let (notes, own_order) =
                     apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
+                // The reports are appended last: after the history, which is what the request
+                // before this one started with.
+                let (reports, sessions_open) = match report_plan {
+                    Some(plan) => plan.tell(&mut request).await,
+                    None => (Vec::new(), None),
+                };
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
@@ -1456,6 +1607,8 @@ impl LlmAgent {
                         seen: Some(seen),
                         call: Some(call_id(run, turn)),
                         own_order,
+                        reports,
+                        sessions_open,
                     });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
@@ -1478,6 +1631,8 @@ impl LlmAgent {
                     seen: Some(seen),
                     call: Some(call_id(run, turn)),
                     own_order,
+                    reports,
+                    sessions_open,
                 })
             })
             .await?;
@@ -1500,7 +1655,7 @@ impl LlmAgent {
             return Ok(Flow::Fail(CANCELLED.into()));
         }
         let answered_stale: bool;
-        let seen_at: usize;
+        let mut seen_at: usize;
         let own_order: Vec<String>;
         let (response, stream) = match recorded {
             Ok(Recorded {
@@ -1510,15 +1665,26 @@ impl LlmAgent {
                 seen,
                 call: _,
                 own_order: own,
+                reports,
+                sessions_open,
             }) => {
                 seen_at = seen.unwrap_or(state.messages.len());
                 own_order = own;
+                if let Some(open) = sessions_open {
+                    state.sessions_open = open;
+                }
                 // The provider took every image this request carried.
                 state.note_images_sent(sent);
                 // The calls this turn asks for are the ones its listing described.
                 state.source_notes = notes;
                 // An answer recorded before a message that this transition read did not read it.
                 answered_stale = seen.is_some_and(|seen| seen < state.messages.len());
+                // What the model was told goes into the history in front of its answer. An answer
+                // that did not read a message that arrived is not the last word, and nor is its
+                // listing: the reports are left for the next call, which finds them again.
+                if !answered_stale {
+                    seen_at += self.told(ctx, state, &reports).await?;
+                }
                 (response, stream)
             }
             // A recorded error is replayed forever on crash-replay, but a
@@ -2056,10 +2222,81 @@ impl LlmAgent {
         Ok(())
     }
 
-    /// The session, if any, that this run started in this task and whose round still works, read
+    /// What the model call needs to be told the reports of ended rounds, if this agent has session
+    /// tools to read them with.
+    fn report_plan(&self, ctx: &Ctx, state: &Conversation) -> Option<ReportPlan> {
+        if self.session_agents.is_empty() {
+            return None;
+        }
+        let tool = self.tool(SUBAGENT_READ)?.clone();
+        let tool_ctx = self.tool_ctx(
+            ctx,
+            &state.context,
+            (
+                state.root_run,
+                state.root_step.as_deref(),
+                state.plan.as_ref(),
+            ),
+            &state.source_notes,
+            "report",
+            SUBAGENT_READ,
+        );
+        Some(ReportPlan {
+            paged: tool.paged(),
+            tool,
+            tool_ctx,
+            starter: ctx.child_starter(),
+            me: ctx.run_id(),
+            agents: Arc::clone(&self.session_agents),
+            reported: state.reported_rounds.clone(),
+        })
+    }
+
+    /// Put the reports a model call was given into the history, in front of the answer: the call
+    /// and result of each read, as a request carried them, said as steps. The model has been told
+    /// them, so they are not told again, and the tokens of their rounds are counted as a read
+    /// counts them. Returns how many messages it added.
+    async fn told(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        reports: &[RoundReport],
+    ) -> Result<usize, AgentError> {
+        if reports.is_empty() {
+            return Ok(0);
+        }
+        let messages = report_messages(reports, self.pages(SUBAGENT_READ));
+        let added = messages.len();
+        for report in reports {
+            let id = report_call_id(report.round);
+            ctx.emit(self.step_event(SUBAGENT_READ, &id, StepState::Running, &[]))
+                .await;
+            let content = backstop(
+                &report.output.content,
+                SUBAGENT_READ,
+                self.pages(SUBAGENT_READ),
+            );
+            ctx.emit(self.step_end(
+                SUBAGENT_READ,
+                &id,
+                StepState::Completed,
+                Some((&content, false)),
+                &[],
+            ))
+            .await;
+        }
+        state.messages.extend(messages);
+        let rounds: Vec<RunId> = reports.iter().map(|r| r.round).collect();
+        state.note_reported(&rounds);
+        Self::count_rounds(ctx, state, false).await?;
+        Ok(added)
+    }
+
+    /// The session, if any, that this run started in this task and whose round still works, or
+    /// whose round ended and was not reported (a round a person started included), read
     /// from the store in a journaled step so that a replay and a takeover decide the same: the
-    /// model has answered, and the run may not end while this one works. `None` for an agent that
-    /// has no session tools. A failure to list is a retry when the store says so, and no wait
+    /// model has answered, and the run may not end while this one works, nor before its report
+    /// is read. `None` for an agent that has no session tools. A failure to list is a retry when the store says so, and no wait
     /// otherwise.
     async fn session_to_wait_for(
         &self,
@@ -2072,13 +2309,17 @@ impl LlmAgent {
         }
         // A round this run started is the result of a call to one of these two, so a history
         // without such a call has nothing to wait for and the store is not asked: a run that never
-        // uses sessions journals what it always did.
-        if !has_started_session(state) {
+        // uses sessions journals what it always did. A listing that saw a session open
+        // ([`Conversation::sessions_open`]) is a reason to ask too: a round may end that a person
+        // started.
+        if !has_started_session(state) && !state.sessions_open {
             return Ok(None);
         }
         let starter = ctx.child_starter();
         let me = ctx.run_id();
         let agents = self.session_agents.clone();
+        let reports = self.session_reports;
+        let reported = state.reported_rounds.clone();
         let found: Result<Option<RunId>, (bool, String)> = ctx
             .step(&format!("sessions:{turn}"), move || async move {
                 let names: Vec<&str> = agents.iter().map(String::as_str).collect();
@@ -2089,7 +2330,10 @@ impl LlmAgent {
                 Ok(list
                     .sessions
                     .into_iter()
-                    .find(|s| does_work(s) && s.started_by == Some(me))
+                    .find(|s| {
+                        (does_work(s) && s.started_by == Some(me))
+                            || (reports && is_due(s, me, &reported))
+                    })
                     .map(|s| s.id))
             })
             .await?;
@@ -2314,6 +2558,11 @@ impl LlmAgent {
             {
                 state.rounds_started.push(call.id.clone());
             }
+            // A round may now end and be reported to the model.
+            if self.session_reports && matches!(call.name.as_str(), SUBAGENT_START | SUBAGENT_SEND)
+            {
+                state.sessions_open = true;
+            }
             let used = files_kept(&state.artifacts);
             let (result, reported) = self
                 .run_tool(
@@ -2363,6 +2612,7 @@ impl LlmAgent {
                     state.keep_output(kept);
                     state.keep_tool_images(kept_images);
                     if !reported.is_empty() {
+                        state.note_reported(&reported);
                         Self::count_rounds(ctx, state, false).await?;
                     }
                     (message, artifacts)
@@ -2742,6 +2992,7 @@ impl LlmAgent {
             state.keep_output(kept);
             state.keep_tool_images(kept_images);
             if !reported.is_empty() {
+                state.note_reported(&reported);
                 Self::count_rounds(ctx, state, false).await?;
             }
             state.messages.push(message);
@@ -3462,6 +3713,7 @@ impl LlmAgent {
                     state.pinned_calls.push(wait.call_id.clone());
                 }
                 if !reported.is_empty() {
+                    state.note_reported(&reported);
                     Self::count_rounds(ctx, state, false).await?;
                 }
                 let used = files_kept(&state.artifacts);
@@ -4480,6 +4732,8 @@ mod failure_tests {
             seen: None,
             call: None,
             own_order: Vec::new(),
+            reports: Vec::new(),
+            sessions_open: None,
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -4500,6 +4754,8 @@ mod failure_tests {
             seen: None,
             call: None,
             own_order: Vec::new(),
+            reports: Vec::new(),
+            sessions_open: None,
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -4512,6 +4768,8 @@ mod failure_tests {
             seen: None,
             call: None,
             own_order: Vec::new(),
+            reports: Vec::new(),
+            sessions_open: None,
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(
@@ -4531,11 +4789,80 @@ mod failure_tests {
             seen: None,
             call: Some("run-c0-a1b2c3d4".into()),
             own_order: Vec::new(),
+            reports: Vec::new(),
+            sessions_open: None,
         };
         let json = serde_json::to_value(&reported).unwrap();
         assert_eq!(json["call"], "run-c0-a1b2c3d4");
         let back: Recorded = serde_json::from_value(json).unwrap();
         assert_eq!(back.call.as_deref(), Some("run-c0-a1b2c3d4"));
+
+        // The reports a request was given (ADR 0045, slice 3) are beside the response, and a record
+        // without them, which every journal from before slice 3 is, reads as none.
+        assert!(old.reports.is_empty());
+        assert_eq!(old.sessions_open, None);
+        assert!(!plain_json_has_reports(&reported));
+        let round = RunId::new();
+        let told = Recorded {
+            response: ModelResponse::text("hi"),
+            stream: None,
+            notes: Vec::new(),
+            seen: Some(4),
+            call: None,
+            own_order: Vec::new(),
+            reports: vec![RoundReport {
+                session: RunId::new(),
+                round,
+                output: ToolOutput::text("session s: round 1\nreport: done\n"),
+            }],
+            sessions_open: Some(true),
+        };
+        let json = serde_json::to_value(&told).unwrap();
+        assert_eq!(json["sessions_open"], true);
+        let back: Recorded = serde_json::from_value(json).unwrap();
+        assert_eq!(back.reports.len(), 1);
+        assert_eq!(back.reports[0].round, round);
+        assert_eq!(back.sessions_open, Some(true));
+    }
+
+    fn plain_json_has_reports(record: &Recorded) -> bool {
+        let json = serde_json::to_value(record).unwrap();
+        json.get("reports").is_some() || json.get("sessions_open").is_some()
+    }
+
+    /// The report of a round is appended as a call and its result, the same bytes to the request
+    /// and to the history, under an id made from the round.
+    #[test]
+    fn a_report_is_a_read_call_and_its_result() {
+        let (session, round) = (RunId::new(), RunId::new());
+        let reports = vec![RoundReport {
+            session,
+            round,
+            output: ToolOutput::text("the words"),
+        }];
+        let messages = report_messages(&reports, true);
+        assert_eq!(messages.len(), 2);
+        let id = report_call_id(round);
+        assert!(id.starts_with("report_") && id.len() == 7 + 32, "{id}");
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        match &messages[0] {
+            Message::Assistant { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].name, SUBAGENT_READ);
+                assert_eq!(tool_calls[0].id, id);
+                assert_eq!(tool_calls[0].arguments["session"], session.to_string());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            &messages[1],
+            Message::Tool { call_id, content, is_error: false, .. }
+                if *call_id == id && content == "the words"
+        ));
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            serde_json::to_string(&report_messages(&reports, true)).unwrap()
+        );
     }
 
     #[test]
