@@ -28,6 +28,7 @@ export function createScriptedModel(initial = {}) {
     holdBeforeDoneMs: 0, // the usage chunk is sent, then this long passes before `[DONE]` (a client that aborts in it aborts before the end)
     toolCalls: 0, // an answer that asks for this many tool calls at once (a number above 0), whatever the script says
     splitToolCalls: false, // a stream sends each tool call in a chunk of its own and the rest of its arguments in another, as OpenAI does
+    sameIndexToolCalls: false, // a stream gives every tool call the index 0 and tells them apart by their ids, as some gateways do
     okBody: null, // a 200 plain answer with exactly this body (a string), not a completion
     holdAfterDoneMs: 0, // a stream ends this long after `[DONE]` (a client that closes at `[DONE]` closes first)
     ...initial,
@@ -94,15 +95,16 @@ export function createScriptedModel(initial = {}) {
         const chunk = (choice) => ({ ...base, object: 'chat.completion.chunk', choices: [{ index: 0, ...choice }], usage: null });
         const toolCallFrames = (calls) =>
           behavior.splitToolCalls
-            ? calls.flatMap((c, index) => {
+            ? calls.flatMap((c, n) => {
+                const index = behavior.sameIndexToolCalls ? 0 : n;
                 const args = c.function.arguments;
                 const half = Math.ceil(args.length / 2);
                 return [
-                  chunk({ delta: { ...(index === 0 ? { role: 'assistant' } : {}), tool_calls: [{ index, id: c.id, type: c.type, function: { name: c.function.name, arguments: args.slice(0, half) } }] } }),
+                  chunk({ delta: { ...(n === 0 ? { role: 'assistant' } : {}), tool_calls: [{ index, id: c.id, type: c.type, function: { name: c.function.name, arguments: args.slice(0, half) } }] } }),
                   chunk({ delta: { tool_calls: [{ index, function: { arguments: args.slice(half) } }] } }),
                 ];
               })
-            : [chunk({ delta: { role: 'assistant', tool_calls: calls.map((c, index) => ({ index, ...c })) } })];
+            : [chunk({ delta: { role: 'assistant', tool_calls: calls.map((c, n) => ({ index: behavior.sameIndexToolCalls ? 0 : n, ...c })) } })];
         const frames = toolCall
           ? [...toolCallFrames(toolCall), chunk({ delta: {}, finish_reason: 'tool_calls' })]
           : turn

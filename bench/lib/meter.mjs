@@ -124,9 +124,16 @@ class UsageSniffer {
     this.decoder = new StringDecoder('utf8');
     this.partial = '';
     this.usage = null;
-    this.toolCalls = 0; // the most tool calls any choice of the stream has begun (the highest `index` seen, plus one)
+    this.callIds = new Map(); // the ids each tool call `index` of the stream has carried: a call is an index, or an id when a gateway gives every call the same index
     this.done = false; // the stream said `[DONE]`: it is over, and the usage it carried is the whole of it
     this.gaveUp = false;
+  }
+
+  /** The tool calls the stream has begun: for each index the distinct ids it carried (a later fragment has none), or one when it carried none. */
+  get toolCalls() {
+    let n = 0;
+    for (const ids of this.callIds.values()) n += Math.max(1, ids.size);
+    return n;
   }
 
   push(chunk) {
@@ -161,7 +168,12 @@ class UsageSniffer {
       for (const choice of Array.isArray(chunk?.choices) ? chunk.choices : []) {
         const calls = choice?.delta?.tool_calls;
         if (!Array.isArray(calls)) continue;
-        for (const c of calls) if (Number.isInteger(c?.index) && c.index >= 0) this.toolCalls = Math.max(this.toolCalls, c.index + 1);
+        for (const c of calls) {
+          if (!Number.isInteger(c?.index) || c.index < 0) continue;
+          const ids = this.callIds.get(c.index) ?? new Set();
+          if (typeof c.id === 'string' && c.id !== '') ids.add(c.id);
+          this.callIds.set(c.index, ids);
+        }
       }
     } catch {
       // not JSON: ignored

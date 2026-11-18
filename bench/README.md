@@ -178,10 +178,10 @@ price + output * output price`, rounded up to a micro-dollar; reasoning is insid
 anything.
 
 **Calls per model turn.** The meter also counts the tool calls each answer asks for (a plain answer's `tool_calls`; a
-stream's highest `index`, plus one) and writes it as `toolCalls` on the settled record, a count of the answer and no
+stream's distinct tool call `index` and `id` pairs, so a gateway that gives every call the index 0 is counted right) and writes it as `toolCalls` on the settled record, a count of the answer and no
 text of it. The report shows, for each agent and arm, the turns counted, the calls asked, the calls per turn, the
 turns that asked for several and the most in one turn: whether the model asks for calls together, and so what a
-limit on parallel tool calls (ADR 0049) can save. A ledger from before the count has none, and the report says `n/a`.
+limit on parallel tool calls (ADR 0049) can save. Every answer the meter relays is a turn, the agent's own requests for a title or a summary too: such an answer counts as a turn with 0 calls. A ledger from before the count has none, and the report says `n/a`.
 
 **The cap.** A run reserves its budget before it starts, and starts only if what is spent plus what is reserved plus
 this reservation fits the cap (exactly at the cap fits; one micro-dollar over does not). Each call's worst case (the

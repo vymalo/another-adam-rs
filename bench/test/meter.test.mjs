@@ -608,6 +608,16 @@ test('a stream that sends its tool calls one by one, each in fragments, is count
   assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.toolCalls), [3]);
 });
 
+test('a stream whose tool calls all say index 0 is counted by the ids that tell them apart', async (t) => {
+  for (const splitToolCalls of [false, true]) {
+    const s = await setup(t, { behavior: { toolCalls: 3, splitToolCalls, sameIndexToolCalls: true } });
+    const { baseUrl } = s.open(`r-${splitToolCalls}`);
+    const text = await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+    assert.ok(!/"index":1/.test(text) && !/"index":2/.test(text), 'every call has the index 0');
+    assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.toolCalls), [3], `split: ${splitToolCalls}`);
+  }
+});
+
 test('a client that closes the stream right after [DONE] keeps the tool call count of its answer', async (t) => {
   const s = await setup(t, { behavior: { toolCalls: 2, holdAfterDoneMs: 400 } });
   const { baseUrl } = s.open();
