@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use a2a::{
-    Message, Part, Role, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
+    Message, Part, Role, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
+    TaskStatusUpdateEvent,
 };
 use adam_a2a::{
     AccessTier, BackendError, CHILD_SESSIONS_EXTENSION, Caller, STEPS_EXTENSION,
@@ -22,7 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::child_sessions::{ContextKind, Round, kind_of};
 use crate::convert::{
-    StatusKey, artifact_of, artifact_slot, status_key, status_of, task_from_view,
+    ArtifactIds, StatusKey, artifact_of_with, artifact_slot, status_key, status_of, task_from_view,
 };
 use crate::session_events::{SessionsTracker, quiet, read_due};
 use crate::steps::step_message;
@@ -59,12 +60,22 @@ pub(crate) fn subscribe(
     ReceiverStream::new(rx).boxed()
 }
 
+/// What a poll compares to know the run has not changed since the last one: the store version
+/// (bumped by every commit), whether a worker holds the run (a lease changes without a commit) and
+/// when it was last committed.
+type RunStamp = (u64, bool, chrono::DateTime<chrono::Utc>);
+
 /// What the subscriber has been told so far.
 struct Tracker {
     task_id: String,
     context_id: String,
     /// What this subscriber was last sent, by slot (see `artifact_slot`).
     seen_artifacts: HashMap<String, String>,
+    /// The artifacts of the run as this subscriber maps them, so a poll derives only the ones the
+    /// run added or replaced.
+    ids: ArtifactIds,
+    /// The run as the last sync read it: a poll that reads the same has nothing to say.
+    seen: Option<RunStamp>,
     last: StatusKey,
     /// The request activated `steps/v1`: a step goes out with its report, at most one update a
     /// second. Without it a step is a line of text, and every line goes out, as progress always did.
@@ -106,15 +117,52 @@ fn waits(state: &TaskState) -> bool {
 }
 
 impl Tracker {
+    /// A tracker for `view`, which the snapshot of `task` was built from: the artifacts it holds
+    /// are mapped once, and a poll that reads the same run again has nothing to do.
+    fn new(
+        task: &Task,
+        context_id: String,
+        view: &RunView,
+        caller: &Caller,
+        tier: Option<AccessTier>,
+    ) -> Self {
+        let mut ids = ArtifactIds::default();
+        let seen_artifacts = view
+            .artifacts
+            .iter()
+            .enumerate()
+            .map(|(at, artifact)| {
+                let said = ids.mapped(at, artifact);
+                (said.id, said.content)
+            })
+            .collect();
+        Self {
+            task_id: task.id.clone(),
+            context_id,
+            seen_artifacts,
+            ids,
+            seen: Some((view.version, view.claimed, view.updated_at)),
+            last: status_key(&task.status),
+            steps: caller.has_extension(STEPS_EXTENSION),
+            reported: HashMap::new(),
+            text_stream: caller.has_extension(TEXT_STREAM_EXTENSION),
+            usage: caller.has_extension(USAGE_EXTENSION),
+            tier,
+            open_status: quiet(&task.status),
+        }
+    }
+
     /// Events for whatever the durable `view` says that the subscriber does
     /// not know yet: new artifacts first, then a changed status.
     fn sync(&mut self, view: &RunView, backend: &RuntimeTaskBackend) -> Vec<TaskEvent> {
-        let mut events = Vec::new();
-        for artifact in &view.artifacts {
-            if self.admit(artifact) {
-                events.push(self.artifact_event(artifact));
-            }
+        // A poll that reads the run it already read has nothing to say, and says it without
+        // hashing or serialising an artifact and without building a status.
+        let stamp = (view.version, view.claimed, view.updated_at);
+        if self.seen == Some(stamp) {
+            return Vec::new();
         }
+        self.seen = Some(stamp);
+        let mut events = self.artifacts(&view.artifacts);
         let status = status_of(view, &backend.prompt);
         let key = status_key(&status);
         if !waits(&status.state) {
@@ -141,18 +189,35 @@ impl Tracker {
         events
     }
 
-    /// Whether `artifact` is news to this subscriber, and now known to it: its slot last held other
-    /// content (or nothing).
-    fn admit(&mut self, artifact: &adam_runtime::Artifact) -> bool {
-        let (slot, content) = artifact_slot(artifact);
-        self.seen_artifacts.insert(slot, content.clone()) != Some(content)
+    /// Events for the artifacts this subscriber has not been sent, each mapped from the entry of
+    /// the last poll when it is the same artifact.
+    fn artifacts(&mut self, artifacts: &[adam_runtime::Artifact]) -> Vec<TaskEvent> {
+        let mut events = Vec::new();
+        for (at, artifact) in artifacts.iter().enumerate() {
+            let said = self.ids.mapped(at, artifact);
+            let told = self
+                .seen_artifacts
+                .insert(said.id.clone(), said.content.clone());
+            if told != Some(said.content) {
+                events.push(self.artifact_event(artifact, said.id));
+            }
+        }
+        events
     }
 
-    fn artifact_event(&self, artifact: &adam_runtime::Artifact) -> TaskEvent {
+    /// The slot of `artifact` when it is news to this subscriber, and now known to it: its slot
+    /// last held other content (or nothing).
+    fn admit(&mut self, artifact: &adam_runtime::Artifact) -> Option<String> {
+        let (slot, content) = artifact_slot(artifact);
+        let told = self.seen_artifacts.insert(slot.clone(), content.clone());
+        (told != Some(content)).then_some(slot)
+    }
+
+    fn artifact_event(&self, artifact: &adam_runtime::Artifact, id: String) -> TaskEvent {
         TaskEvent::Artifact(TaskArtifactUpdateEvent {
             task_id: self.task_id.clone(),
             context_id: self.context_id.clone(),
-            artifact: artifact_of(artifact),
+            artifact: artifact_of_with(artifact, id),
             append: None,
             last_chunk: Some(true),
             metadata: None,
@@ -256,10 +321,9 @@ impl Tracker {
                 let mut artifact = adam_runtime::Artifact::new(name, mime_type, data);
                 artifact.file = file;
                 artifact.id = id;
-                if self.admit(&artifact) {
-                    vec![self.artifact_event(&artifact)]
-                } else {
-                    Vec::new()
+                match self.admit(&artifact) {
+                    Some(id) => vec![self.artifact_event(&artifact, id)],
+                    None => Vec::new(),
                 }
             }
             RunEvent::Usage(call) => {
@@ -373,18 +437,7 @@ async fn pump(
             version: view.version,
         });
     }
-    let mut tracker = Tracker {
-        task_id: task.id.clone(),
-        context_id,
-        seen_artifacts: view.artifacts.iter().map(artifact_slot).collect(),
-        last: status_key(&task.status),
-        steps: caller.has_extension(STEPS_EXTENSION),
-        reported: HashMap::new(),
-        text_stream: caller.has_extension(TEXT_STREAM_EXTENSION),
-        usage: caller.has_extension(USAGE_EXTENSION),
-        tier: told,
-        open_status: quiet(&task.status),
-    };
+    let mut tracker = Tracker::new(&task, context_id, &view, caller, told);
     let ends = task.status.state.is_terminal()
         || matches!(
             task.status.state,
@@ -511,9 +564,12 @@ async fn pump(
 
 #[cfg(test)]
 mod tests {
-    use adam_runtime::StepKind;
+    use adam_core::{DynStore, MemoryStore, RunStatus};
+    use adam_runtime::{Artifact as RunArtifact, BroadcastSink, Runtime, StepKind};
+    use serde_json::json;
 
     use super::*;
+    use crate::convert::{artifact_id, work};
 
     fn step(id: &str, state: StepState) -> StepEvent {
         StepEvent::new(id, StepKind::Command, "npm test", state)
@@ -579,5 +635,174 @@ mod tests {
             t0
         ));
         assert_eq!(reported.len(), 1);
+    }
+
+    /// A backend over an in-memory store: `sync` reads nothing but its `prompt` and its tiers.
+    fn backend() -> RuntimeTaskBackend {
+        let store: DynStore = std::sync::Arc::new(MemoryStore::new());
+        RuntimeTaskBackend::new(Runtime::builder(store).build(), BroadcastSink::new(8), "a")
+    }
+
+    fn view(version: u64, artifacts: Vec<RunArtifact>) -> RunView {
+        RunView {
+            id: adam_core::RunId::new(),
+            agent: "a".into(),
+            conversation_id: Some("s:c".into()),
+            status: RunStatus::Runnable,
+            wake_at: None,
+            waiting: false,
+            claimed: false,
+            output: None,
+            error: None,
+            attempt: 0,
+            pending_inbox: 0,
+            artifacts,
+            state: json!({}),
+            version,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn tracker(view: &RunView, backend: &RuntimeTaskBackend) -> Tracker {
+        let task = task_from_view(view, "ctx", &backend.prompt);
+        Tracker::new(&task, "ctx".into(), view, &Caller::new("t"), None)
+    }
+
+    /// The ids of the artifacts a sync said.
+    fn said(events: &[TaskEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                TaskEvent::Artifact(update) => Some(update.artifact.artifact_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A poll that reads the run it already read does no artifact work at all: no digest, no
+    /// serialisation. The first sync of a changed run does both, so a counter that never counted
+    /// cannot make the negative assertion green.
+    #[test]
+    fn a_poll_of_an_unchanged_run_derives_nothing() {
+        let backend = backend();
+        let first = view(
+            2,
+            vec![
+                RunArtifact::file("logo", "image/svg+xml", "logo.svg", vec![7u8; 4096]).unwrap(),
+                RunArtifact::new("plan", Some("application/json".into()), json!({"v": 1}))
+                    .with_id("plan-x"),
+            ],
+        );
+        let mut tracker = tracker(&view(1, Vec::new()), &backend);
+
+        let before = work::counts();
+        let events = tracker.sync(&first, &backend);
+        let after = work::counts();
+        assert!(
+            after.0 > before.0 && after.1 > before.1,
+            "the first sync derives the artifacts: {before:?} -> {after:?}"
+        );
+        assert_eq!(said(&events).len(), 2, "{events:?}");
+
+        // The same read again: nothing is asked about, nothing is derived and nothing is said.
+        let asked = work::artifacts_asked();
+        let events = tracker.sync(&first, &backend);
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(work::counts(), after, "an unchanged poll derives nothing");
+        assert_eq!(
+            work::artifacts_asked(),
+            asked,
+            "an unchanged poll asks about no artifact"
+        );
+
+        // A run that moved (another turn committed) whose artifacts are what they were: every
+        // artifact is asked about, and none is derived again.
+        let mut later = first.clone();
+        later.version = 3;
+        let asked = work::artifacts_asked();
+        let events = tracker.sync(&later, &backend);
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(
+            work::artifacts_asked() - asked,
+            2,
+            "both artifacts are asked about"
+        );
+        assert_eq!(
+            work::counts(),
+            after,
+            "no artifact changed, so none is derived"
+        );
+    }
+
+    /// A changed run derives only the artifacts it added or replaced, never the ones the last poll
+    /// already mapped.
+    #[test]
+    fn a_changed_run_derives_only_what_it_added_or_replaced() {
+        let backend = backend();
+        let first = view(
+            2,
+            vec![
+                RunArtifact::file("logo", "image/svg+xml", "logo.svg", vec![7u8; 4096]).unwrap(),
+                RunArtifact::new("plan", None, json!({"v": 1})).with_id("plan-x"),
+            ],
+        );
+        let mut tracker = tracker(&first, &backend);
+
+        // One artifact appended: it alone is derived.
+        let mut more = first.clone();
+        more.version = 3;
+        more.artifacts
+            .push(RunArtifact::new("report", None, json!({"done": true})));
+        let before = work::counts();
+        let events = tracker.sync(&more, &backend);
+        let after = work::counts();
+        assert_eq!(
+            after.0 - before.0,
+            1,
+            "one digest for the one artifact added"
+        );
+        assert_eq!(after.1 - before.1, 1, "one serialisation for it");
+        assert_eq!(said(&events), vec![artifact_id(&more.artifacts[2])]);
+
+        // One artifact replaced where it stands: it alone is derived again.
+        let mut replaced = more.clone();
+        replaced.version = 4;
+        replaced.artifacts[1] = RunArtifact::new("plan", None, json!({"v": 2})).with_id("plan-x");
+        let before = work::counts();
+        let events = tracker.sync(&replaced, &backend);
+        let after = work::counts();
+        assert_eq!(
+            after.0 - before.0,
+            1,
+            "one digest for the one artifact replaced"
+        );
+        assert_eq!(after.1 - before.1, 1, "one serialisation for it");
+        assert_eq!(said(&events), vec!["plan-x".to_owned()]);
+    }
+
+    /// An artifact the run changed is derived again: one without an id gets a new content-derived
+    /// id, and one with an id is said again under that id.
+    #[test]
+    fn a_changed_artifact_gets_a_new_id() {
+        let backend = backend();
+        let report = RunArtifact::new("report", None, json!({"v": 1}));
+        let plan = RunArtifact::new("plan", None, json!({"v": 1})).with_id("plan-x");
+        let first = view(2, vec![report.clone(), plan]);
+        let was = artifact_id(&report);
+        let mut tracker = tracker(&first, &backend);
+
+        let mut changed = first.clone();
+        changed.version = 3;
+        changed.artifacts[0] = RunArtifact::new("report", None, json!({"v": 2}));
+        changed.artifacts[1] = RunArtifact::new("plan", None, json!({"v": 2})).with_id("plan-x");
+        let events = tracker.sync(&changed, &backend);
+
+        assert_eq!(
+            said(&events),
+            vec![artifact_id(&changed.artifacts[0]), "plan-x".to_owned()],
+            "both changed, both said: {events:?}"
+        );
+        assert_ne!(said(&events)[0], was, "new content, a new id");
     }
 }
