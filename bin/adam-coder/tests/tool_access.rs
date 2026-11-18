@@ -50,6 +50,11 @@ fn table() -> BTreeMap<&'static str, Cases> {
             (json!({"path": "./src/./a.rs"}), scope("files/src/a.rs")),
             (json!({"path": "../a.rs"}), scope("files")),
             (json!({"path": "/etc/a"}), scope("files")),
+            // The slot is not part of the scope: two spellings can name one slot.
+            (
+                json!({"path": "src/a.rs", "repo": "other"}),
+                scope("files/src/a.rs"),
+            ),
         ]
     };
     let optional_path = |mut cases: Cases| -> Cases {
@@ -68,7 +73,10 @@ fn table() -> BTreeMap<&'static str, Cases> {
     t.insert("edit_file", by_path(false));
     t.insert(
         "apply_patch",
-        vec![(json!({"patch": "x"}), writes("files"))],
+        vec![
+            (json!({"patch": "x"}), writes("files")),
+            (json!({"patch": "x", "repo": "main"}), writes("files")),
+        ],
     );
 
     // Commands: one at a time, beside reads. A command that makes files also writes them.
