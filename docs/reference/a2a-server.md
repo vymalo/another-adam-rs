@@ -233,7 +233,8 @@ stateDiagram-v2
 
 Events are live and best effort. A streaming send submits the run and subscribes afterwards, so
 `BroadcastSink` keeps a small replay of each run's recent events (the newest 64, none older than 30 s, no
-`Status` or `Artifact`, dropped at every status change) and `subscribe_run` delivers it before the live ones,
+`Status` or `Artifact`, dropped at every status change, and at most 16 MiB across every run, the oldest
+events going first) and `subscribe_run` delivers it before the live ones,
 with no gap and no duplicate: a step that started before the subscriber attached keeps its `input`. A
 resubscribe within 30 s may repeat a step (a snapshot by id) or a text piece (it carries its `offset`). A
 process with no event sink replays nothing and sees only the durable record
