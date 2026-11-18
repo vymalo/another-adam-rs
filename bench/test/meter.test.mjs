@@ -600,6 +600,44 @@ test('a failed call has no tool call count', async (t) => {
   for (const r of done) assert.equal(r.toolCalls, undefined);
 });
 
+test('a stream that sends its tool calls one by one, each in fragments, is counted by call and not by chunk', async (t) => {
+  const s = await setup(t, { behavior: { toolCalls: 3, splitToolCalls: true } });
+  const { baseUrl } = s.open();
+  const text = await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+  assert.equal((text.match(/"tool_calls":\[/g) ?? []).length, 6, 'each call is a chunk of its own and a fragment of its arguments');
+  assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.toolCalls), [3]);
+});
+
+test('a client that closes the stream right after [DONE] keeps the tool call count of its answer', async (t) => {
+  const s = await setup(t, { behavior: { toolCalls: 2, holdAfterDoneMs: 400 } });
+  const { baseUrl } = s.open();
+  const res = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true, stream_options: { include_usage: true } }) });
+  const reader = res.body.getReader();
+  let text = '';
+  const decoder = new TextDecoder();
+  while (!text.includes('[DONE]')) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value);
+  }
+  await reader.cancel(); // adam closes at [DONE]
+  await until(() => callRecords(s.ledger, 'settled').length === 1, 'the call was settled');
+  const settled = callRecords(s.ledger, 'settled')[0];
+  assert.equal(settled.costMicro, SCRIPTED_COST, 'settled on the usage it saw');
+  assert.equal(settled.toolCalls, 2);
+});
+
+test('a 200 answer that is not a completion has no tool call count', async (t) => {
+  const s = await setup(t, { behavior: { okBody: 'not json' } });
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
+  s.model.behavior.okBody = JSON.stringify({ object: 'chat.completion' });
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }] })).text();
+  const settled = callRecords(s.ledger, 'settled');
+  assert.equal(settled.length, 2);
+  for (const r of settled) assert.equal(r.toolCalls, undefined);
+});
+
 test('S1: a client that closes the stream right after [DONE] is charged the usage the meter already saw, not the worst case', async (t) => {
   const s = await setup(t, { behavior: { holdAfterDoneMs: 400 } });
   const { baseUrl } = s.open();
