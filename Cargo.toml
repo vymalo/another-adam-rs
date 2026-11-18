@@ -73,6 +73,8 @@ jsonschema = { version = "0.58", default-features = false }
 k8s-openapi = { version = "0.28", default-features = false, features = ["v1_32"] }
 kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "aws-lc-rs", "ws"] }
 libc = "0.2"
+# Finds line ends in the SSE parser (adam-model-openai); already in the tree under regex.
+memchr = "2"
 notify = "8"
 proc-macro2 = "1"
 proptest = "1"

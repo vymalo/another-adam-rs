@@ -24,14 +24,21 @@ impl SseParser {
     /// Feed bytes; returns the payload of every event completed by them.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<String> {
         let mut events = Vec::new();
-        for &b in bytes {
-            if b == b'\n' {
+        let mut rest = bytes;
+        while let Some(end) = memchr::memchr(b'\n', rest) {
+            let (segment, after) = rest.split_at(end);
+            // A whole line in this chunk is handled where it lies: only a line cut by a chunk
+            // boundary is carried in `self.line`.
+            if self.line.is_empty() {
+                self.handle_line(segment, &mut events);
+            } else {
+                self.line.extend_from_slice(segment);
                 let line = std::mem::take(&mut self.line);
                 self.handle_line(&line, &mut events);
-            } else {
-                self.line.push(b);
             }
+            rest = &after[1..];
         }
+        self.line.extend_from_slice(rest);
         events
     }
 
@@ -207,6 +214,167 @@ mod tests {
         let mut out = p.push(input.as_bytes());
         out.extend(p.finish());
         out
+    }
+
+    /// The parser as it was before the bulk scan — one byte at a time — kept as the oracle.
+    mod oracle {
+        #[derive(Default)]
+        pub(super) struct ByteAtATime {
+            line: Vec<u8>,
+            data: Vec<String>,
+        }
+
+        impl ByteAtATime {
+            pub(super) fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+                let mut events = Vec::new();
+                for &b in bytes {
+                    if b == b'\n' {
+                        let line = std::mem::take(&mut self.line);
+                        self.handle_line(&line, &mut events);
+                    } else {
+                        self.line.push(b);
+                    }
+                }
+                events
+            }
+
+            pub(super) fn finish(&mut self) -> Vec<String> {
+                let mut events = Vec::new();
+                if !self.line.is_empty() {
+                    let line = std::mem::take(&mut self.line);
+                    self.handle_line(&line, &mut events);
+                }
+                self.dispatch(&mut events);
+                events
+            }
+
+            fn handle_line(&mut self, line: &[u8], events: &mut Vec<String>) {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                if line.is_empty() {
+                    self.dispatch(events);
+                    return;
+                }
+                if line[0] == b':' {
+                    return;
+                }
+                let (field, value) = match line.iter().position(|&b| b == b':') {
+                    Some(i) => {
+                        let value = &line[i + 1..];
+                        (&line[..i], value.strip_prefix(b" ").unwrap_or(value))
+                    }
+                    None => (line, &b""[..]),
+                };
+                if field == b"data" {
+                    self.data.push(String::from_utf8_lossy(value).into_owned());
+                }
+            }
+
+            fn dispatch(&mut self, events: &mut Vec<String>) {
+                if !self.data.is_empty() {
+                    events.push(self.data.join("\n"));
+                    self.data.clear();
+                }
+            }
+        }
+
+        /// The oracle fed one byte at a time.
+        pub(super) fn events(input: &[u8]) -> Vec<String> {
+            let mut parser = ByteAtATime::default();
+            let mut out = Vec::new();
+            for &b in input {
+                out.extend(parser.push(&[b]));
+            }
+            out.extend(parser.finish());
+            out
+        }
+    }
+
+    /// Feed `input` split at `cuts`, then close the stream.
+    fn events_at_cuts(input: &[u8], cuts: &[usize]) -> Vec<String> {
+        let mut parser = SseParser::default();
+        let mut out = Vec::new();
+        let mut from = 0;
+        for &cut in cuts {
+            let cut = cut.min(input.len());
+            if cut > from {
+                out.extend(parser.push(&input[from..cut]));
+                from = cut;
+            }
+        }
+        out.extend(parser.push(&input[from..]));
+        out.extend(parser.finish());
+        out
+    }
+
+    /// Over 256 KiB of events, with multi-byte characters and an unterminated tail.
+    fn large_stream() -> Vec<u8> {
+        let mut body = String::new();
+        let mut i = 0;
+        while body.len() < 256 * 1024 {
+            body.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"event {i}: h\u{e9}llo \u{1f600}\"}}}}]}}\n\n"
+            ));
+            i += 1;
+        }
+        body.push_str("data: tail \u{e9}");
+        body.into_bytes()
+    }
+
+    #[test]
+    fn a_large_stream_in_awkward_chunks_matches_the_byte_at_a_time_parser() {
+        let input = large_stream();
+        assert!(input.len() >= 256 * 1024, "{} bytes", input.len());
+        let expected = oracle::events(&input);
+        assert!(expected.len() > 1000, "{} events", expected.len());
+        assert!(expected[0].contains("event 0: h\u{e9}llo \u{1f600}"));
+        assert_eq!(expected.last().map(String::as_str), Some("tail \u{e9}"));
+
+        // Sizes that straddle lines and characters, including one larger than most events.
+        let sizes = [1usize, 2, 3, 5, 7, 11, 13, 17, 31, 257, 4093];
+        let mut cuts = Vec::new();
+        let mut at = 0;
+        let mut i = 0;
+        while at < input.len() {
+            at = (at + sizes[i % sizes.len()]).min(input.len());
+            cuts.push(at);
+            i += 1;
+        }
+        // And one boundary inside a multi-byte character, which no size cycle guarantees.
+        let inside = input
+            .iter()
+            .position(|&b| b >= 0x80)
+            .expect("a multi-byte character")
+            + 1;
+        assert!(
+            std::str::from_utf8(&input[..inside]).is_err(),
+            "cut {inside} is inside a multi-byte character"
+        );
+        cuts.push(inside);
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        assert_eq!(events_at_cuts(&input, &cuts), expected);
+        assert_eq!(events_at_cuts(&input, &[input.len()]), expected);
+    }
+
+    #[test]
+    fn a_chunk_ending_on_cr_completes_the_line_on_the_next() {
+        let mut p = SseParser::default();
+        assert!(p.push(b"data: a\r").is_empty());
+        assert!(p.push(b"\n\r").is_empty());
+        assert_eq!(p.push(b"\n"), ["a"]);
+
+        // CRLF everywhere, cut between every `\r` and `\n` and elsewhere.
+        let input = b"data: a\r\n\r\ndata: b\r\n\r\ndata: c";
+        let expected = oracle::events(input);
+        assert_eq!(expected, ["a", "b", "c"]);
+        for cuts in [
+            vec![8, 9, 10, 19, 20, 21],
+            vec![7, 8, 9, 18, 19, 20],
+            (0..input.len()).collect::<Vec<_>>(),
+        ] {
+            assert_eq!(events_at_cuts(input, &cuts), expected, "cuts {cuts:?}");
+        }
     }
 
     #[test]
@@ -424,6 +592,9 @@ mod tests {
                 // And byte by byte, the finest split there is.
                 let every: Vec<usize> = (0..input.len()).collect();
                 prop_assert_eq!(events_in_chunks(&input, &every), events_in_chunks(&input, &[]));
+                // Whatever the split, the events are the old parser's.
+                prop_assert_eq!(events_in_chunks(&input, &cuts), oracle::events(&input));
+                prop_assert_eq!(events_in_chunks(&input, &every), oracle::events(&input));
             }
         }
     }

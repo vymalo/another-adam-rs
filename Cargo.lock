@@ -546,6 +546,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "httpdate",
+ "memchr",
  "proptest",
  "reqwest",
  "secrecy",
