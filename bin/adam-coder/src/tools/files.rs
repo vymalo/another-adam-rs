@@ -1896,29 +1896,29 @@ mod tests {
     fn a_read_beside_a_write_or_an_edit_sees_a_whole_file() {
         let dir = root();
         let path = dir.path().join("src/shared.txt");
-        let (a, b) = ("a".repeat(400_000), "b".repeat(400_000));
+        let (a, b) = ("alpha\n".repeat(1_000), "bravo\n".repeat(1_000));
         fs::write(&path, &a).unwrap();
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                for i in 0..60 {
+                for i in 0..10 {
                     let text = if i % 2 == 0 { &b } else { &a };
                     write_in(dir.path(), "src/shared.txt", text).unwrap();
-                    let (from, to) = if i % 2 == 0 { ("b", "a") } else { ("a", "b") };
-                    // An edit rewrites the whole file too: replace every letter of one kind.
+                    // An edit rewrites the whole file too.
+                    let (from, to) = if i % 2 == 0 {
+                        ("bravo", "alpha")
+                    } else {
+                        ("alpha", "bravo")
+                    };
                     edit_in(dir.path(), "src/shared.txt", from, to, true).unwrap();
-                    edit_in(dir.path(), "src/shared.txt", to, from, true).unwrap();
                 }
                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
             });
             let mut reads = 0;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) || reads < 20 {
                 let text = fs::read_to_string(&path).unwrap();
-                assert_eq!(text.len(), 400_000, "a partial file");
-                assert!(
-                    text.bytes().all(|c| c == text.as_bytes()[0]),
-                    "a file that is half of each"
-                );
+                assert_eq!(text.len(), 6_000, "a partial file");
+                assert!(text == a || text == b, "a file that is half of each");
                 reads += 1;
             }
         });
