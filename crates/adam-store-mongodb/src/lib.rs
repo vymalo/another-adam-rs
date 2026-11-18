@@ -44,7 +44,9 @@ pub mod codec;
 
 use std::time::Duration;
 
-use adam_core::store::{add_ttl, now, open_conversation_key, sched_at, storable, truncate_ms};
+use adam_core::store::{
+    add_ttl, now, open_conversation_key, sched_at, storable, storable_owned, truncate_ms,
+};
 use adam_core::{
     ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
     PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
@@ -479,18 +481,28 @@ impl Store for MongoStore {
 
     async fn create_run(&self, new: NewRun) -> StoreResult<RunRecord> {
         let t = now();
-        let wake_at = new.wake_at.map(truncate_ms);
+        let NewRun {
+            id,
+            agent,
+            conversation_id,
+            parent_id,
+            status,
+            state,
+            wake_at,
+        } = new;
+        let wake_at = wake_at.map(truncate_ms);
+        let state = storable_owned(state);
         let doc = doc! {
-            "_id": uuid(new.id),
-            "agent": &new.agent,
-            "conversation_id": new.conversation_id.as_deref().map(Bson::from).unwrap_or(Bson::Null),
-            "parent_id": new.parent_id.map(uuid).unwrap_or(Bson::Null),
-            "status": new.status.as_str(),
-            "state": json_to_bson(storable(&new.state).as_ref())?,
+            "_id": uuid(id),
+            "agent": &agent,
+            "conversation_id": conversation_id.as_deref().map(Bson::from).unwrap_or(Bson::Null),
+            "parent_id": parent_id.map(uuid).unwrap_or(Bson::Null),
+            "status": status.as_str(),
+            "state": json_to_bson(&state)?,
             "wake_at": opt_date(wake_at),
-            "sched_at": opt_date(sched_at(new.status, wake_at, t)),
+            "sched_at": opt_date(sched_at(status, wake_at, t)),
             "version": 1_i64,
-            "open_key": open_key(new.id, &new.agent, new.conversation_id.as_deref(), new.status),
+            "open_key": open_key(id, &agent, conversation_id.as_deref(), status),
             "lease_owner": Bson::Null,
             "lease_until": Bson::Null,
             "lease_token": Bson::Null,
@@ -499,7 +511,18 @@ impl Store for MongoStore {
             "updated_at": date(t),
         };
         match self.runs.insert_one(&doc).await {
-            Ok(_) => run_from_doc(&doc),
+            Ok(_) => Ok(RunRecord {
+                id,
+                agent,
+                conversation_id,
+                parent_id,
+                status,
+                state,
+                wake_at,
+                version: 1,
+                created_at: t,
+                updated_at: t,
+            }),
             Err(err) if is_duplicate_key(&err) => {
                 // The server names the violated index in the message; fall back
                 // to a lookup for servers that word it differently.
@@ -509,14 +532,14 @@ impl Store for MongoStore {
                 } else if msg.contains("_id_") {
                     false
                 } else {
-                    !self.run_exists(new.id).await?
+                    !self.run_exists(id).await?
                 };
                 if !busy {
-                    Err(StoreError::AlreadyExists(new.id))
+                    Err(StoreError::AlreadyExists(id))
                 } else {
                     Err(StoreError::ConversationBusy {
-                        agent: new.agent,
-                        conversation_id: new.conversation_id.unwrap_or_default(),
+                        agent,
+                        conversation_id: conversation_id.unwrap_or_default(),
                     })
                 }
             }
@@ -551,13 +574,19 @@ impl Store for MongoStore {
             });
         }
         let t = now();
-        let wake_at = update.wake_at.map(truncate_ms);
+        let RunUpdate {
+            status,
+            state,
+            wake_at,
+        } = update;
+        let wake_at = wake_at.map(truncate_ms);
+        let state = storable_owned(state);
         let set = doc! {
-            "status": update.status.as_str(),
-            "state": json_to_bson(storable(&update.state).as_ref())?,
+            "status": status.as_str(),
+            "state": json_to_bson(&state)?,
             "wake_at": opt_date(wake_at),
-            "sched_at": opt_date(sched_at(update.status, wake_at, t)),
-            "open_key": open_key(id, &current.agent, current.conversation_id.as_deref(), update.status),
+            "sched_at": opt_date(sched_at(status, wake_at, t)),
+            "open_key": open_key(id, &current.agent, current.conversation_id.as_deref(), status),
             "updated_at": date(t),
         };
         let result = self
@@ -571,10 +600,22 @@ impl Store for MongoStore {
                 },
                 doc! { "$set": set, "$inc": { "version": 1_i64 } },
             )
+            .projection(doc! { "_id": 1 })
             .return_document(ReturnDocument::After)
             .await;
         match result {
-            Ok(Some(doc)) => run_from_doc(&doc),
+            Ok(Some(_)) => Ok(RunRecord {
+                id,
+                agent: current.agent,
+                conversation_id: current.conversation_id,
+                parent_id: current.parent_id,
+                status,
+                state,
+                wake_at,
+                version: expected + 1,
+                created_at: current.created_at,
+                updated_at: t,
+            }),
             Ok(None) => match self.load_live(id).await? {
                 None => Err(StoreError::NotFound(id)),
                 Some(run) => Err(StoreError::Conflict {
@@ -609,21 +650,34 @@ impl Store for MongoStore {
     }
 
     async fn journal_put(&self, run: RunId, entry: JournalEntry) -> StoreResult<JournalEntry> {
+        let JournalEntry {
+            seq,
+            name,
+            ok,
+            payload,
+            recorded_at,
+        } = entry;
+        let entry = JournalEntry {
+            seq,
+            name,
+            ok,
+            payload: storable_owned(payload),
+            recorded_at: truncate_ms(recorded_at),
+        };
         if let Some(existing) = self.find_journal(run, entry.seq).await? {
             return check_same_step(run, existing, entry);
         }
         if !self.run_exists(run).await? {
             return Err(StoreError::NotFound(run));
         }
-        let recorded_at = truncate_ms(entry.recorded_at);
         let doc = doc! {
             "_id": journal_id(run, entry.seq),
             "run_id": uuid(run),
             "seq": to_i64(entry.seq, "journal seq")?,
             "name": &entry.name,
             "ok": entry.ok,
-            "payload": json_to_bson(storable(&entry.payload).as_ref())?,
-            "recorded_at": date(recorded_at),
+            "payload": json_to_bson(&entry.payload)?,
+            "recorded_at": date(entry.recorded_at),
         };
         match self.journal.insert_one(&doc).await {
             Ok(_) => {
@@ -637,7 +691,7 @@ impl Store for MongoStore {
                         .map_err(classify)?;
                     return Err(StoreError::NotFound(run));
                 }
-                entry_from_doc(&doc)
+                Ok(entry)
             }
             Err(err) if is_duplicate_key(&err) => {
                 let existing = self.find_journal(run, entry.seq).await?.ok_or_else(|| {
@@ -1111,6 +1165,25 @@ fn check_same_step(
 }
 
 #[cfg(test)]
+mod conversion_counter {
+    use std::cell::Cell;
+
+    // Thread-local: a write test that asserts no conversion must not see the codec's unit
+    // tests, which run in parallel on their own threads.
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn bump() {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+
+    pub fn calls() -> usize {
+        CALLS.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
 mod classify_tests {
     use super::*;
     use adam_error::Classify;
@@ -1140,5 +1213,161 @@ mod classify_tests {
         let e = classify(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
         assert!(e.is_retryable());
         assert!(std::error::Error::source(&e).is_some_and(|s| s.is::<mongodb::error::Error>()));
+    }
+}
+
+#[cfg(test)]
+mod returned_value_tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn store() -> Option<MongoStore> {
+        let uri = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI")?;
+        let db = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
+        let store = MongoStore::connect(&uri, &db).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        Some(store)
+    }
+
+    fn agent() -> String {
+        format!("returned-{}", Uuid::now_v7().simple())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_returns_the_cleaned_value_it_stored() {
+        let Some(store) = store().await else { return };
+        let agent = agent();
+
+        let created = store
+            .create_run(NewRun::new(
+                &agent,
+                json!({"nested": {"k\u{0}ey": ["a\u{0}b", {"deep": [1, 2, {"text": "x\u{0}y"}]}]}}),
+            ))
+            .await
+            .unwrap();
+        let want = json!({
+            "nested": {"k\u{FFFD}ey": ["a\u{FFFD}b", {"deep": [1, 2, {"text": "x\u{FFFD}y"}]}]},
+        });
+        assert_eq!(created.state, want, "create_run returns what it stored");
+        assert_eq!(
+            store.load_run(created.id).await.unwrap().unwrap().state,
+            want
+        );
+
+        let committed = store
+            .commit_run(
+                created.id,
+                created.version,
+                RunUpdate::new(
+                    RunStatus::Parked,
+                    json!({"turn": 2, "log": ["ok", "bad\u{0}byte"]}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.state,
+            json!({"turn": 2, "log": ["ok", "bad\u{FFFD}byte"]})
+        );
+        assert_eq!(
+            committed,
+            store.load_run(created.id).await.unwrap().unwrap(),
+            "every field of the returned record is the stored one"
+        );
+
+        let entry = store
+            .journal_put(
+                created.id,
+                JournalEntry::ok(
+                    0,
+                    "tool",
+                    json!({"out": "a\u{0}b", "nested": {"k\u{0}ey": [1, {"x": "y"}]}}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entry.payload,
+            json!({"out": "a\u{FFFD}b", "nested": {"k\u{FFFD}ey": [1, {"x": "y"}]}})
+        );
+        assert_eq!(
+            entry,
+            store.journal_get(created.id, 0).await.unwrap().unwrap(),
+            "the returned entry is the stored one"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_returns_a_large_value_without_converting_it_back() {
+        let Some(store) = store().await else { return };
+        let agent = agent();
+
+        let big = json!({"blob": "x".repeat(1024 * 1024), "nested": {"turn": 1}});
+        let before = conversion_counter::calls();
+        let created = store
+            .create_run(NewRun::new(&agent, big.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            conversion_counter::calls() - before,
+            0,
+            "create_run converts nothing back"
+        );
+        assert_eq!(created.state, big);
+
+        // A read does convert, so a counter that never moved would fail here.
+        let before = conversion_counter::calls();
+        let loaded = store.load_run(created.id).await.unwrap().unwrap();
+        assert_eq!(
+            conversion_counter::calls() - before,
+            1,
+            "load_run converts the stored state once"
+        );
+        assert_eq!(loaded.state, big);
+
+        let next = json!({"blob": "y".repeat(1024 * 1024), "nested": {"turn": 2}});
+        let before = conversion_counter::calls();
+        let committed = store
+            .commit_run(
+                created.id,
+                created.version,
+                RunUpdate::new(RunStatus::Runnable, next.clone()),
+            )
+            .await
+            .unwrap();
+        // The one conversion is the current document `commit_run` reads for `agent` and
+        // `conversation_id` before the CAS; the record it returns adds none.
+        assert_eq!(
+            conversion_counter::calls() - before,
+            1,
+            "commit_run converts the old state once, never the new one"
+        );
+        assert_eq!(committed.state, next);
+        assert_eq!(
+            committed,
+            store.load_run(created.id).await.unwrap().unwrap()
+        );
+
+        let payload = json!({"content": "z".repeat(1024 * 1024)});
+        let before = conversion_counter::calls();
+        let entry = store
+            .journal_put(created.id, JournalEntry::ok(0, "tool", payload.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            conversion_counter::calls() - before,
+            0,
+            "journal_put converts nothing back"
+        );
+        assert_eq!(entry.payload, payload);
+
+        let before = conversion_counter::calls();
+        let got = store.journal_get(created.id, 0).await.unwrap().unwrap();
+        assert_eq!(
+            conversion_counter::calls() - before,
+            1,
+            "journal_get converts the stored payload once"
+        );
+        assert_eq!(got, entry);
     }
 }
