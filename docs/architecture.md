@@ -1197,7 +1197,7 @@ sequenceDiagram
     participant R as read_output
     M->>L: call run_command
     L->>T: journaled step tool:CALL_ID
-    Note over T: the output is captured from the pipes (the first 16 MiB and 64 KiB, and the tail)
+    Note over T: the output is captured from the pipes (the first 4 MiB and 64 KiB, and the tail)
     Note over K: scrubbed, a cut capture's end cut back at a place no secret straddles
     T->>K: keep(run, id, the captured output, omitted)
     K-->>T: lines kept
@@ -1216,8 +1216,8 @@ stateDiagram-v2
     [*] --> Kept: it does not
     Short --> [*]: shown whole, nothing kept
     Kept --> Kept: read_output reads a page
-    Kept --> Cut: over 16 MiB
-    Cut --> Kept: the first 16 MiB are kept, and the view and the last page say so
+    Kept --> Cut: over 4 MiB
+    Cut --> Kept: the first 4 MiB are kept, and the view and the last page say so
     Kept --> Refused: the run's 64 MiB, or a link in the way
     Refused --> [*]: head and tail only, the result says so
     Kept --> [*]: the janitor removes it with the run
