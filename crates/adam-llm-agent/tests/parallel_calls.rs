@@ -2386,3 +2386,115 @@ fn of_two_calls_that_read_the_same_room_only_one_keeps_a_file_that_fits_once() {
     );
     assert_eq!(ctx.files_left(), 2 << 20);
 }
+
+/// Every `after_previous: true` of a turn is a barrier, not only the first: the second waits for the
+/// calls between the two, and the calls after it wait for it.
+#[tokio::test(start_paused = true)]
+async fn every_after_previous_of_a_turn_is_a_barrier() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![
+        call(
+            "c1",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 1}),
+        ),
+        call(
+            "c2",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 2, "after_previous": true}),
+        ),
+        call(
+            "c3",
+            "probe",
+            json!({"ms": 300, "use": "independent", "tag": 3}),
+        ),
+        call(
+            "c4",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 4, "after_previous": true}),
+        ),
+        call(
+            "c5",
+            "probe",
+            json!({"ms": 10, "use": "independent", "tag": 5}),
+        ),
+    ]);
+    h.mock.push_text("done");
+    let (_, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    let events = || log.events.lock().unwrap().clone();
+    assert!(
+        end_position(&log, "c3") < start_position(&log, "c4"),
+        "the second barrier waited for the call before it: {:?}",
+        events()
+    );
+    assert!(
+        end_position(&log, "c4") < start_position(&log, "c5"),
+        "nothing after the second barrier started before it was done: {:?}",
+        events()
+    );
+}
+
+/// The answer to a call whose `after_previous` is not a boolean quotes the value the model gave.
+#[tokio::test]
+async fn a_bad_after_previous_is_quoted_in_the_answer() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    h.mock.push_tool_calls(vec![call(
+        "c1",
+        "probe",
+        json!({"use": "independent", "tag": 1, "after_previous": "yes"}),
+    )]);
+    h.mock.push_text("done");
+    let (_, view) = h.run(10, "go", &log).await;
+    assert_eq!(view.status, RunStatus::Done);
+    let answers = tool_answers(&view);
+    assert_eq!(
+        answers[0],
+        (
+            "`after_previous` of `probe` must be true or false, not \"yes\". The call did not run."
+                .to_owned(),
+            true
+        )
+    );
+}
+
+/// The line that refuses a file says how much the run had shared before the call: here the 4 MiB the
+/// first call took.
+#[test]
+fn a_refused_file_says_how_much_the_run_has_shared() {
+    let file = || {
+        ToolOutput::text("made").with_artifact(
+            Artifact::file("f", "application/octet-stream", "f.bin", vec![7; 4 << 20])
+                .expect("a file within the cap"),
+        )
+    };
+    let ctx = ToolCtx::detached("t", "c1", Arc::new(adam_runtime::NoopSink));
+    let (mut a, mut b) = (file(), file());
+    ctx.spend_files_of(&mut a);
+    ctx.spend_files_of(&mut b);
+    assert_eq!(
+        b.content,
+        "made\nNot shared: f. A run may share at most 6 MiB of files in all, and it has shared \
+         4096 KiB so far."
+    );
+}
+
+/// The reserved name is refused at every limit above one, not only at the default.
+#[test]
+fn an_own_after_previous_is_a_build_error_at_every_limit_above_one() {
+    for limit in [2usize, 32] {
+        let log = Arc::new(Log::default());
+        let model = Arc::new(MockModel::new());
+        let err = LlmAgent::builder("a", model, "m")
+            .max_parallel(limit)
+            .tool(Owner { log })
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(&err, adam_llm_agent::BuildError::ReservedArgument { tool, .. } if tool == "owner"),
+            "{limit}: {err:?}"
+        );
+    }
+}
