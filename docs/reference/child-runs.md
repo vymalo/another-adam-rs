@@ -189,7 +189,7 @@ the next step read `take_inbox()` for messages of kind `adam.run.finished` (`Chi
 already in the inbox when a step starts is not "arrived during the step", so an agent that parks without
 reading it sleeps until its timer.
 
-## Sessions (ADR 0045, slices 1 to 3)
+## Sessions (ADR 0045, slices 1 to 4)
 
 [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) lets a subagent run in the
 background as a session that is sent more messages. The runtime half (slice 1) is in `crates/adam-runtime`; the five tools
@@ -361,11 +361,39 @@ is read from the store, the notice is only a wake-up).
 | S14 | A person's round ended | It is reported at the next listing, in this task while a session is open or at the first call of a task that continues this one, once (a task that does not continue another is not told of a round that ended before it began); the header says "started by the person" and the person's words are not in it | `a_persons_round_is_reported_as_the_persons`, `a_persons_round_is_reported_in_a_later_task`, `a_fresh_task_tells_only_the_persons_rounds_that_ended_after_it_began` |
 | S15 | The model read the report itself, or the run has no session | A report the model read is not appended again; a run that never opens a session lists once, at its first call | `a_report_read_by_the_model_is_not_appended_again`, `a_run_without_sessions_lists_only_at_its_first_model_call` |
 | S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale | `a_journal_from_before_reports_replays_to_the_same_history`, `a_replay_appends_the_same_reports`, `a_replay_of_a_stale_answer_counts_each_round_once` |
+| S17 | A session has sat idle for `idle_ttl` | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once | `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once` |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start is refused.
 
-**Not built yet** (slices 4 to 8): the limits as settings
-(`idle_ttl`, `max_working`), the coder's kept-open helpers, a child that asks the person.
+**Limits and idle sessions (slice 4).** Three limits and one time, all settings of the deployment (`docs/reference/environment.md`):
+
+| Limit | Default | Refuses | Words |
+|---|---|---|---|
+| `max_open` (`SESSION_MAX_OPEN`) | 16 | a start; the card's `maxOpen` | "this conversation already has N open sessions" |
+| `max_working` (`SESSION_MAX_WORKING`) | 4 | a start **and a send that would start a round** (a steer into a working round is not one); in the A2A front, a person's start or new round too (`UnsupportedOperation`) | "N subagent rounds are already working" |
+| `max_rounds` (`SESSION_MAX_ROUNDS`) | 20 | a send, never a close | "has had N rounds" |
+| `idle_ttl` (`SESSION_IDLE_DAYS`) | 7 days | nothing is refused by it directly: a session idle that long **reads closed** | "is closed ... sat idle for longer than this deployment keeps a session open" |
+
+The root agent's `limits.max_open_sessions`, `max_working_sessions` and `max_session_rounds` may only lower them (a larger value is lowered with a
+warning; a subagent's are ignored with a warning); `idle_ttl` is the deployment's alone and the same for every role. The time limit of one round is
+the subagent's `limits.max_minutes` (or a remote round's `remote_timeout`), not a session setting. Each limit is checked before the thing it limits,
+so requests that race may exceed it by the number racing.
+
+**`idle_ttl` is read, not written.** `Runtime::list_sessions` and `session_view` say `Closed` (`idle_expired`) for a session whose latest round ended at
+least `idle_ttl` ago and that would otherwise stay open, including one with no header; nothing is stored, so a longer TTL reopens what a shorter one
+closed. A working round never expires. An expired session frees its place under `max_open` and refuses a send like any closed session.
+**Its report is not lost:** whether a report is due depends on the round (it ended, was not told, was started by this run or a person), not on the
+session's state, so the report of a round nobody has been told of is **told once**, by the next task's first model call, even if the session has
+expired by then (`an_expired_sessions_report_is_still_told_once`), and not again.
+
+**Retention.** `Store::purge_finished(before)` must be older than `idle_ttl` (and longer than a round's time limit plus its retries): a purged latest
+round makes the session read as the round before it, or not at all.
+
+**Cancel.** Built by ADR 0044 slice 10 (the cascade: a parent that fails, a cancel included, fails its open rounds) and slice 5 (a remote round sends
+`CancelTask`). A cancelled or failed parent frees its working slots for the next task (`a_cancel_frees_the_working_slots_for_the_next_task`,
+`a_parent_that_fails_stops_its_rounds`). A person's round is its own parent and is not stopped by a parent's cancel.
+
+**Not built yet** (slices 5 to 8): the coder's kept-open helpers, a child that asks the person.
 
 **A person's round.** The A2A front (`adam-a2a-runtime`, *Child sessions*) lets a person start a session and send rounds with no run
 of an agent behind them. Such a round is **its own parent** (`start_child_continuing(id, id, ..)`): `parent_id` is its own id, so

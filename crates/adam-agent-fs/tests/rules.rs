@@ -303,6 +303,78 @@ fn cases() -> Vec<Case> {
             "`limits.max_parallel` is from 1 to 32",
         ),
         (
+            "max_open_sessions of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_open_sessions: 0 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_open_sessions` is from 1 to 100",
+        ),
+        (
+            "max_open_sessions of 101",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_open_sessions: 101 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_open_sessions` is from 1 to 100",
+        ),
+        (
+            "max_working_sessions of 0",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_working_sessions: 0 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_working_sessions` is from 1 to 32",
+        ),
+        (
+            "max_working_sessions of 33",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_working_sessions: 33 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_working_sessions` is from 1 to 32",
+        ),
+        (
+            "max_session_rounds of 1",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_session_rounds: 1 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_session_rounds` is from 2 to 200",
+        ),
+        (
+            "max_session_rounds of 201",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_session_rounds: 201 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_session_rounds` is from 2 to 200",
+        ),
+        (
+            "more working sessions than open ones",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { max_open_sessions: 2, max_working_sessions: 3 }\n---\nHi.\n",
+            )],
+            Error,
+            "`limits.max_working_sessions` is 3, more than `limits.max_open_sessions` (2)",
+        ),
+        with_root(
+            "session limits on a subagent",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nlimits: { max_open_sessions: 2, maxSessionRounds: 5 }\n---\nBody.\n",
+            )],
+            Warning,
+            "the session limits (`limits.max_open_sessions`, `limits.max_session_rounds`) are the root agent's",
+        ),
+        (
             "unknown card key",
             vec![(
                 "agent/instructions.md",
@@ -1398,6 +1470,28 @@ fn max_parallel_from_1_to_32_is_read_and_is_no_diagnostic() {
         let package = report.into_package(Strictness::Strict).unwrap();
         let limits = package.agents[0].frontmatter.limits.as_ref().unwrap();
         assert_eq!(limits.max_parallel, Some(n));
+    }
+}
+
+#[test]
+fn session_limits_are_read_in_both_spellings_and_are_no_diagnostic() {
+    for text in [
+        "---\nname: root\nlimits: { max_open_sessions: 8, max_working_sessions: 2, max_session_rounds: 10 }\n---\nHi.\n",
+        "---\nname: root\nlimits: { maxOpenSessions: 8, maxWorkingSessions: 2, maxSessionRounds: 10 }\n---\nHi.\n",
+    ] {
+        let dir = write(&[("agent/instructions.md", text)]);
+        let report = load(dir.path());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let package = report.into_package(Strictness::Strict).unwrap();
+        let limits = package.agents[0].frontmatter.limits.as_ref().unwrap();
+        assert_eq!(
+            (
+                limits.max_open_sessions,
+                limits.max_working_sessions,
+                limits.max_session_rounds
+            ),
+            (Some(8), Some(2), Some(10))
+        );
     }
 }
 

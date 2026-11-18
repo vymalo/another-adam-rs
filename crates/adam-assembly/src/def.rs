@@ -11,6 +11,7 @@ use adam_agent_fs::{
     ManifestSource, McpConfig, ModelRef, SkillSelection, Strictness, Subagent, ToolList,
 };
 use adam_llm_agent::{DynTool, Limits, SESSION_TOOLS, SessionAgent, SessionTools, ToolSet};
+use adam_runtime::SessionLimits;
 use secrecy::SecretString;
 
 use crate::assembly::BoundDef;
@@ -111,6 +112,9 @@ pub struct AgentDef {
     mcp: McpBinding,
     /// The skills the root's run finds on the way ([`run_skills`](Self::run_skills)).
     run_skills: Option<RunSkillsHandle>,
+    /// What the deployment allows of the sessions of one conversation
+    /// ([`session_limits`](Self::session_limits)).
+    session_limits: SessionLimits,
 }
 
 impl AgentDef {
@@ -129,6 +133,7 @@ impl AgentDef {
             remote: RemoteSettings::default(),
             mcp: McpBinding::default(),
             run_skills: None,
+            session_limits: SessionLimits::default(),
         })
     }
 
@@ -307,6 +312,29 @@ impl AgentDef {
         self
     }
 
+    /// What the deployment allows of the sessions of one conversation (ADR 0045 decision 5): the
+    /// most open, the most working and the most rounds a session may have (default 16, 4 and 20).
+    /// The root's file may **lower** each with `limits.max_open_sessions`,
+    /// `limits.max_working_sessions` and `limits.max_session_rounds`, never raise it: a larger
+    /// value is the deployment's, with a warning. A subagent's file has no say.
+    #[must_use]
+    pub fn session_limits(mut self, limits: SessionLimits) -> Self {
+        self.session_limits = limits;
+        self
+    }
+
+    /// The limits the sessions of the root agent run under: the deployment's
+    /// ([`session_limits`](Self::session_limits)) lowered by the root's file. Pure, and the same
+    /// on every process role, so a control plane that serves the card without binding the agent
+    /// (its `maxOpen`) reads what the workers that run it enforce.
+    pub fn effective_session_limits(&self) -> SessionLimits {
+        lowered_by_file(
+            self.session_limits,
+            self.manifest.frontmatter.limits.as_ref(),
+            None,
+        )
+    }
+
     /// How long a parent waits for the task of a remote subagent before the call is answered with
     /// an error result (default one hour; the remote task is left where it is). A zero is raised to
     /// one millisecond.
@@ -474,11 +502,21 @@ impl AgentDef {
             remote: &self.remote,
             mcp: &self.mcp,
             run_skills: self.run_skills.as_ref(),
+            session_limits: lowered_by_file(
+                self.session_limits,
+                self.manifest.frontmatter.limits.as_ref(),
+                Some(&self.manifest.name),
+            ),
             nodes: Vec::new(),
             remotes: Vec::new(),
         };
         walk.agent(&self.manifest, self.manifest.name.clone(), None)?;
-        let Walk { nodes, remotes, .. } = walk;
+        let Walk {
+            nodes,
+            remotes,
+            session_limits,
+            ..
+        } = walk;
 
         let known: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
         for agent in self.values.keys() {
@@ -491,7 +529,7 @@ impl AgentDef {
             }
         }
         let root = self.manifest.name.clone();
-        let bound = BoundDef::new(self.manifest, nodes, remotes);
+        let bound = BoundDef::new(self.manifest, nodes, remotes, session_limits);
         #[cfg(feature = "mcp")]
         let bound = bound.with_prompt_commands(
             self.mcp
@@ -584,6 +622,8 @@ struct Walk<'a> {
     mcp: &'a McpBinding,
     /// What the root's run finds ([`AgentDef::run_skills`]); a subagent has none.
     run_skills: Option<&'a RunSkillsHandle>,
+    /// What the root's sessions run under: the deployment's, lowered by the root's file.
+    session_limits: SessionLimits,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -648,7 +688,7 @@ impl Walk<'_> {
             },
             self.remote,
             &mut tools,
-            parent.is_none(),
+            parent.is_none().then_some(self.session_limits),
         )?;
         let index = self.nodes.len();
         self.nodes.push(Node {
@@ -823,8 +863,9 @@ fn add_subagent_tools(
     taken: &Taken<'_>,
     remote: &RemoteSettings,
     tools: &mut Vec<(String, DynTool)>,
-    sessions: bool,
+    session_limits: Option<SessionLimits>,
 ) -> Result<(Vec<String>, Vec<RemoteRoundAgent>), Error> {
+    let sessions = session_limits.is_some();
     // The subagent tools added so far, by name, with the file of the subagent that owns each.
     let mut subagents: Vec<(&str, &std::path::Path)> = Vec::new();
     let mut rounds: Vec<RemoteRoundAgent> = Vec::new();
@@ -911,7 +952,7 @@ fn add_subagent_tools(
             },
         })
         .collect();
-    let session_tools = SessionTools::new(roster);
+    let session_tools = SessionTools::new(roster).with_limits(session_limits.unwrap_or_default());
     for name in SESSION_TOOLS {
         if tools.iter().any(|(n, _)| n == name) {
             let clash = manifest
@@ -935,6 +976,56 @@ fn add_subagent_tools(
         tools.push((tool.spec().name, tool));
     }
     Ok((session_tools.session_agents(), rounds))
+}
+
+/// The deployment's session limits lowered by the root's file: each value of the file that is
+/// larger than the deployment's is the deployment's, and with `warn_for` (the agent's name) it
+/// says so once. `max_working` stays at most `max_open`.
+fn lowered_by_file(
+    deployment: SessionLimits,
+    file: Option<&FileLimits>,
+    warn_for: Option<&str>,
+) -> SessionLimits {
+    let Some(file) = file else {
+        return deployment;
+    };
+    if let Some(agent) = warn_for {
+        for (key, setting, asked, allowed) in [
+            (
+                "max_open_sessions",
+                "SESSION_MAX_OPEN",
+                file.max_open_sessions,
+                deployment.max_open,
+            ),
+            (
+                "max_working_sessions",
+                "SESSION_MAX_WORKING",
+                file.max_working_sessions,
+                deployment.max_working,
+            ),
+            (
+                "max_session_rounds",
+                "SESSION_MAX_ROUNDS",
+                file.max_session_rounds,
+                deployment.max_rounds,
+            ),
+        ] {
+            if let Some(asked) = asked.filter(|asked| *asked > allowed) {
+                tracing::warn!(
+                    agent,
+                    asked,
+                    allowed,
+                    "`limits.{key}` is more than the deployment allows ({setting}): \
+                     the sessions run under {allowed}"
+                );
+            }
+        }
+    }
+    deployment.lowered_by(
+        file.max_open_sessions,
+        file.max_working_sessions,
+        file.max_session_rounds,
+    )
 }
 
 /// The time limit of a subagent's run: `limits.max_minutes` of its file, 30 minutes when it says

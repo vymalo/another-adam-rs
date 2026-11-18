@@ -391,6 +391,11 @@ pub async fn serve(
         sink: Arc::new(notify.event_sink()),
         notifier: Some(Arc::new(notify.notifier())),
     };
+    // The deployment's idle limit is the environment's, the same on every role.
+    let options = RuntimeOptions {
+        session_idle_ttl: config.sessions.idle_ttl,
+        ..options
+    };
     let workers = role.runs_workers().then_some(options.concurrency);
     let worker_id = options.worker_id.clone();
     let component_store = store.clone();

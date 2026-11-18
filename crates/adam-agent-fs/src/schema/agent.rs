@@ -123,6 +123,15 @@ pub const MAX_MINUTES_LIMIT: u32 = 1_440;
 /// The most `limits.max_parallel` may say: the bound of `MAX_PARALLEL_TOOL_CALLS`.
 pub const MAX_PARALLEL_LIMIT: u32 = 32;
 
+/// The largest `limits.max_open_sessions`: the page of one session listing.
+pub const MAX_OPEN_SESSIONS_LIMIT: u32 = 100;
+
+/// The largest `limits.max_working_sessions`.
+pub const MAX_WORKING_SESSIONS_LIMIT: u32 = 32;
+
+/// The smallest and largest `limits.max_session_rounds`.
+pub const MAX_SESSION_ROUNDS_LIMIT: (u32, u32) = (2, 200);
+
 /// The limits of the agent loop (`adam_llm_agent::Limits`). Absent fields keep the loop's
 /// default. Claude Code's top-level `maxTurns` is read as `max_turns`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -151,6 +160,21 @@ pub struct Limits {
     /// deployment's value. Not a field of `adam_llm_agent::Limits` (ADR 0049).
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxParallel")]
     pub max_parallel: Option<u32>,
+    /// The most sessions of a conversation open at once (ADR 0045), 1 to
+    /// [`MAX_OPEN_SESSIONS_LIMIT`]. **Root agent only**, and it only lowers the deployment's
+    /// `SESSION_MAX_OPEN` (a larger value is lowered with a warning at startup); ignored on a
+    /// subagent with a warning. Absent: the deployment's value.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "maxOpenSessions")]
+    pub max_open_sessions: Option<u32>,
+    /// The most rounds of a conversation working at once, 1 to [`MAX_WORKING_SESSIONS_LIMIT`] and
+    /// at most `max_open_sessions` when both are given. Root agent only; lowers
+    /// `SESSION_MAX_WORKING`.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "maxWorkingSessions")]
+    pub max_working_sessions: Option<u32>,
+    /// The most rounds one session may have, a close included, 2 to 200. Root agent only; lowers
+    /// `SESSION_MAX_ROUNDS`.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "maxSessionRounds")]
+    pub max_session_rounds: Option<u32>,
     /// Keys this schema does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

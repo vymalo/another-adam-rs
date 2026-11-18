@@ -332,9 +332,10 @@ stateDiagram-v2
 * **Requests.** Without activation every request about `K` or a round is `InvalidParams` (`TaskNotFound` for another caller's
   round) before anything is written. Activated: a `start` on a message to `C` (no `taskId`) makes round 1 and no turn of the
   parent; a message to `K` is delivered into a working round, starts the next round of an idle session, or is
-  `UnsupportedOperation` for a closed one; a `close` closes an idle session by a round that calls no model and a working one when
+  `UnsupportedOperation` for a closed one (a session idle for `SESSION_IDLE_DAYS` reads closed, and the words say so); a `close` closes an idle session by a round that calls no model and a working one when
   its round ends (`cancel` stops the round first); `taskId` of a round follows the rules of any task (`steer/v1`);
   `ListTasks {contextId: K}` lists the rounds, an unknown or foreign `K` is an empty page.
+  **Limits.** The card's `maxOpen` is the deployment's `SESSION_MAX_OPEN` (`ChildSessions::with_limits`). A person's `start`, and a message to an idle session that would start a round, past `SESSION_MAX_WORKING` working rounds is `UnsupportedOperation` with words ("N rounds are already working in this context"), as a start past `maxOpen` is; a steer into a working round and a close are never refused by it. *This adds a refusal case to the `child-sessions/v1` contract that the clients must handle.*
 * **A person's round is its own parent**, so no run's end cancels it and no run waits for it; its tasks say `by: person`.
 * **What a task says.** The parent's tasks: `metadata[URI].sessions`, open first then the 16 most recently closed. A round:
   `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}`. The snapshot of a stream, `GetTask`, `ListTasks` and the answers carry them. **Events.** On the stream of a parent task, an

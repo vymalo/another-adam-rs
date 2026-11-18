@@ -23,8 +23,8 @@ use chrono::{DateTime, Utc};
 use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
-    Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionHeader, SessionState,
-    SessionSummary, SessionView,
+    Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionHeader, SessionLimits,
+    SessionState, SessionSummary, SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -64,17 +64,16 @@ pub const MAX_DESCRIPTION_CHARS: usize = 80;
 /// The most characters of a `prompt` or a `message`.
 pub const MAX_TEXT_CHARS: usize = 20_000;
 
-/// The most rounds of one conversation that may work at once: a start or a send that would make
-/// another is refused. ADR 0045 decision 5 calls it `max_working` (4); a constant until slice 4.
+/// The default of [`SessionLimits::max_working`]: the most rounds of one conversation that may
+/// work at once. A start, or a send that would start a round, past it is refused.
 pub const MAX_WORKING_ROUNDS: usize = 4;
 
-/// The most sessions of one conversation that may be open at once (not closed): a start past it is
-/// refused. ADR 0045 decision 5 calls it `max_open`; it is a constant until its slice makes it a
-/// setting.
+/// The default of [`SessionLimits::max_open`]: the most sessions of one conversation that may be
+/// open at once (not closed). A start past it is refused.
 pub const MAX_OPEN_SESSIONS: usize = 16;
 
-/// The most rounds one session may have, a close included: a send past it is refused. ADR 0045
-/// decision 5 calls it `max_rounds`; a constant until its slice makes it a setting.
+/// The default of [`SessionLimits::max_rounds`]: the most rounds one session may have, a close
+/// included. A send past it is refused.
 pub const MAX_SESSION_ROUNDS: u32 = 20;
 
 /// The time limit each session tool declares ([`Tool::time_limit`]). None of them does long work:
@@ -113,6 +112,7 @@ pub struct SessionTools {
 struct Roster {
     /// Sorted by name.
     agents: Vec<SessionAgent>,
+    limits: SessionLimits,
 }
 
 impl Roster {
@@ -141,7 +141,22 @@ impl SessionTools {
         let mut agents: Vec<SessionAgent> = agents.into_iter().collect();
         agents.sort_by(|a, b| a.name.cmp(&b.name));
         Self {
-            roster: Arc::new(Roster { agents }),
+            roster: Arc::new(Roster {
+                agents,
+                limits: SessionLimits::default(),
+            }),
+        }
+    }
+
+    /// These tools under `limits` instead of the defaults (16 open, 4 working, 20 rounds). The
+    /// specs do not mention the limits, so they are the same bytes under any.
+    #[must_use]
+    pub fn with_limits(self, limits: SessionLimits) -> Self {
+        Self {
+            roster: Arc::new(Roster {
+                agents: self.roster.agents.clone(),
+                limits,
+            }),
         }
     }
 
@@ -239,9 +254,14 @@ fn no_such_session(session: RunId) -> String {
     )
 }
 
-fn closed_words(session: RunId) -> String {
+fn closed_words(session: RunId, idle_expired: bool) -> String {
+    let why = if idle_expired {
+        " (it sat idle for longer than this deployment keeps a session open)"
+    } else {
+        ""
+    };
     format!(
-        "session `{session}` is closed and takes no more messages (a closed session is never \
+        "session `{session}` is closed and takes no more messages{why} (a closed session is never \
          reopened). Start a new one with `{SUBAGENT_START}`, and put what it needs in `prompt`: it \
          does not see the closed session's conversation."
     )
@@ -255,6 +275,14 @@ fn state_word(view: &SessionView) -> &'static str {
         (SessionState::Idle, _) => "idle",
         (SessionState::Closed, _) => "closed",
     }
+}
+
+fn working_words(limits: SessionLimits) -> String {
+    format!(
+        "{} subagent rounds are already working: read a report with `{SUBAGENT_READ}` \
+         (wait: true) before starting another",
+        limits.max_working
+    )
 }
 
 fn description_of(view: &SessionView) -> String {
@@ -565,18 +593,17 @@ impl Tool for Start {
             .iter()
             .filter(|s| s.state == SessionState::Working)
             .count();
-        if working >= MAX_WORKING_ROUNDS {
-            return refuse(format!(
-                "{MAX_WORKING_ROUNDS} subagent rounds are already working: read a report with \
-                 `{SUBAGENT_READ}` (wait: true) before starting another"
-            ));
+        let limits = self.roster.limits;
+        if working >= limits.max_working as usize {
+            return refuse(working_words(limits));
         }
-        if open >= MAX_OPEN_SESSIONS
+        if open >= limits.max_open as usize
             || (listed.total > MAX_SESSION_PAGE && open >= MAX_SESSION_PAGE)
         {
             return refuse(format!(
-                "this conversation already has {MAX_OPEN_SESSIONS} open sessions: close one with \
-                 `{SUBAGENT_CLOSE}` (`{SUBAGENT_LIST}` shows them) before starting another"
+                "this conversation already has {} open sessions: close one with \
+                 `{SUBAGENT_CLOSE}` (`{SUBAGENT_LIST}` shows them) before starting another",
+                limits.max_open
             ));
         }
         let header = SessionHeader {
@@ -685,7 +712,7 @@ impl Tool for Send {
                 return Ok(sent(session, view.round, delivery_of(&state)));
             }
             if view.closed {
-                return refuse(closed_words(session));
+                return refuse(closed_words(session, view.idle_expired));
             }
             let steered = || user_inbound(message, ctx.call_id());
             if view.state == SessionState::Working {
@@ -702,11 +729,35 @@ impl Tool for Send {
                     Err(e) => return Err(runtime_error(&e)),
                 }
             }
-            if view.round >= MAX_SESSION_ROUNDS {
+            let limits = self.roster.limits;
+            if view.round >= limits.max_rounds {
                 return refuse(format!(
-                    "session `{session}` has had {MAX_SESSION_ROUNDS} rounds, the most a session \
-                     may have: close it and start a new one with `{SUBAGENT_START}`"
+                    "session `{session}` has had {} rounds, the most a session may have: close \
+                     it and start a new one with `{SUBAGENT_START}`",
+                    limits.max_rounds
                 ));
+            }
+            // A message that starts a round makes another work, like a start does.
+            let listed = match starter
+                .sessions(&self.roster.registered(), 0, MAX_SESSION_PAGE)
+                .await
+            {
+                Ok(listed) => listed,
+                Err(RuntimeError::TooManyRounds { .. }) => {
+                    return refuse(
+                        "this conversation has too many rounds to list: no round can be \
+                         started in it; tell the person to continue in a new conversation",
+                    );
+                }
+                Err(e) => return Err(runtime_error(&e)),
+            };
+            let working = listed
+                .sessions
+                .iter()
+                .filter(|s| s.state == SessionState::Working)
+                .count();
+            if working >= limits.max_working as usize {
+                return refuse(working_words(limits));
             }
             let mut header = view.header.clone().unwrap_or_else(|| SessionHeader {
                 id: session,
@@ -1174,6 +1225,7 @@ mod tests {
             keep_open: true,
             closed: false,
             closing: false,
+            idle_expired: false,
             started_by: by.or(Some(me)),
             report: ReportRound {
                 run: latest,
@@ -1206,6 +1258,17 @@ mod tests {
         let mut closed = ended(me, None);
         closed.state = SessionState::Closed;
         assert!(due(&closed, me, &[]));
+    }
+
+    #[test]
+    fn a_session_that_expired_idle_still_owes_its_unreported_round() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        session.state = SessionState::Closed;
+        session.closed = true;
+        session.idle_expired = true;
+        assert!(due(&session, me, &[]));
+        assert!(!due(&session, me, &[session.report.run]), "told once");
     }
 
     #[test]

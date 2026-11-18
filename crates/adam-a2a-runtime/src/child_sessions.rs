@@ -45,7 +45,7 @@ use adam_a2a::{BackendError, CHILD_SESSIONS_EXTENSION, Caller, ChildSessionInfo,
 use adam_core::{RunId, RunRecord};
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RunView, RuntimeError, SESSION_CLOSE_KIND, SESSION_STATE_KEY,
-    SessionHeader, SessionState, SessionSummary, SessionView, closing_round_payload,
+    SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView, closing_round_payload,
     parse_session_conversation_id, session_conversation_id,
 };
 use serde_json::{Map, Value, json};
@@ -113,6 +113,7 @@ impl ChildSessionAgent {
 pub struct ChildSessions {
     agents: Vec<ChildSessionAgent>,
     max_open: u32,
+    max_working: u32,
     max_rounds: u32,
     listing_page: usize,
 }
@@ -150,6 +151,8 @@ impl ChildSessions {
         Ok(Self {
             agents,
             max_open,
+            // No limit of its own until `with_limits`: as many as may be open.
+            max_working: max_open,
             max_rounds: MAX_SESSION_ROUNDS,
             listing_page: MAX_SESSION_PAGE,
         })
@@ -168,6 +171,17 @@ impl ChildSessions {
     #[must_use]
     pub fn with_max_rounds(mut self, max_rounds: u32) -> Self {
         self.max_rounds = max_rounds.max(2);
+        self
+    }
+
+    /// The deployment's limits ([`SessionLimits`]): the card's `maxOpen`, the most rounds working
+    /// at once and the most rounds a session may have. A person's start, or a message that would
+    /// start a round, past `max_working` is refused with `UnsupportedOperation`.
+    #[must_use]
+    pub fn with_limits(mut self, limits: SessionLimits) -> Self {
+        self.max_open = limits.max_open;
+        self.max_working = limits.max_working;
+        self.max_rounds = limits.max_rounds;
         self
     }
 
@@ -841,9 +855,15 @@ impl RuntimeTaskBackend {
         // number racing, as the model's start tool does.
         let max_open = sessions.max_open as usize;
         let is_open = |s: &SessionSummary| !s.closed || s.state == SessionState::Working;
+        let max_working = sessions.max_working as usize;
         let enough = |all: &[SessionSummary]| {
             all.iter().filter(|s| is_open(s)).count() >= max_open
                 || all.iter().any(|s| s.state == SessionState::Closed)
+                || all
+                    .iter()
+                    .filter(|s| s.state == SessionState::Working)
+                    .count()
+                    >= max_working
         };
         let listed = self
             .list_pages(caller, &context, enough)
@@ -857,6 +877,11 @@ impl RuntimeTaskBackend {
         if listed.iter().filter(|s| is_open(s)).count() >= max_open {
             return Err(BackendError::UnsupportedOperation(format!(
                 "this context already has {max_open} sessions open; close one first"
+            )));
+        }
+        if working_in(&listed) >= max_working {
+            return Err(BackendError::UnsupportedOperation(working_words(
+                max_working,
             )));
         }
         let header = SessionHeader {
@@ -946,8 +971,13 @@ impl RuntimeTaskBackend {
                 }
             }
             if view.closed {
+                let why = if view.idle_expired {
+                    " (it sat idle for longer than this deployment keeps a session open)"
+                } else {
+                    ""
+                };
                 return Err(BackendError::UnsupportedOperation(format!(
-                    "session {session} is closed and takes no more messages"
+                    "session {session} is closed and takes no more messages{why}"
                 )));
             }
             let mut inbound = inbound
@@ -964,6 +994,21 @@ impl RuntimeTaskBackend {
                 return Err(BackendError::UnsupportedOperation(format!(
                     "session {session} has had {} rounds, the most it may have",
                     sessions.max_rounds
+                )));
+            }
+            // A message that starts a round makes another work, like a start does.
+            let max_working = sessions.max_working as usize;
+            let working_now = |all: &[SessionSummary]| {
+                all.iter().any(|s| s.state != SessionState::Working)
+                    || working_in(all) >= max_working
+            };
+            let listed = self
+                .list_pages(caller, context, working_now)
+                .await
+                .map_err(map_err)?;
+            if working_in(&listed) >= max_working {
+                return Err(BackendError::UnsupportedOperation(working_words(
+                    max_working,
                 )));
             }
             put_header(&mut inbound, &next_header(&view, session))
@@ -1048,6 +1093,16 @@ impl RuntimeTaskBackend {
         );
         task
     }
+}
+
+fn working_in(all: &[SessionSummary]) -> usize {
+    all.iter()
+        .filter(|s| s.state == SessionState::Working)
+        .count()
+}
+
+fn working_words(max_working: usize) -> String {
+    format!("{max_working} rounds are already working in this context; wait for one to finish")
 }
 
 fn not_activated() -> BackendError {
@@ -1294,6 +1349,7 @@ mod tests {
             keep_open: true,
             closed,
             closing,
+            idle_expired: false,
             started_by: None,
             report: adam_runtime::ReportRound {
                 run: RunId::new(),

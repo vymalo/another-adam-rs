@@ -55,6 +55,18 @@ pub async fn serve(
         tracing::info!(file = %file.display(), "extra MCP servers added to the folder's own");
         folder.def = def;
     }
+    // The deployment's session limits for every role (SESSION_*); the root's file may only lower them.
+    folder.def = folder.def.session_limits(config.service.sessions.limits);
+    if !folder.def.manifest().subagents.is_empty() {
+        let limits = folder.def.effective_session_limits();
+        tracing::info!(
+            max_open = limits.max_open,
+            max_working = limits.max_working,
+            max_rounds = limits.max_rounds,
+            idle_days = config.service.sessions.idle_ttl.as_secs() / 86_400,
+            "session limits"
+        );
+    }
     if let Some(worker) = &config.worker {
         folder.def = for_workers(folder.def, worker);
     }

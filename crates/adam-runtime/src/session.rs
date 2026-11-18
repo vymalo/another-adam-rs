@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use adam_core::{RunId, RunRecord, RunStatus};
 
@@ -141,7 +142,8 @@ pub fn closing_round_payload(header: &SessionHeader) -> Value {
 ///
 /// **The truth is the latest round's header** (nothing else stores a session). A session whose
 /// rounds carry no header, such as one an embedder made with `Runtime::start_child_continuing`, is
-/// kept open and never closes by itself.
+/// kept open: it closes only when nobody has written to it for the runtime's idle TTL
+/// ([`Runtime::session_idle_ttl`](crate::Runtime::session_idle_ttl), ADR 0045 slice 4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionHeader {
     /// The session: round 1's run id.
@@ -248,6 +250,9 @@ pub struct SessionSummary {
     /// Whether the latest round only closes the session: it calls no model and reports nothing
     /// new, so nobody needs to wait for it.
     pub closing: bool,
+    /// Whether the session reads closed only because its latest round ended at least the idle
+    /// TTL ago ([`closed`](Self::closed) is then also `true`). Its report is still there.
+    pub idle_expired: bool,
     /// The run that started the latest round: the parent run of that round.
     pub started_by: Option<RunId>,
     /// The round whose report the session has: the latest one that worked (a closing round has
@@ -313,17 +318,112 @@ pub const MAX_SESSION_PAGE: usize = 100;
 /// listing; more is [`RuntimeError::TooManyRounds`](crate::RuntimeError::TooManyRounds).
 pub const MAX_SESSION_ROUNDS_SCANNED: usize = 5000;
 
+/// How long a kept-open session may sit idle (its latest round ended, nobody wrote to it) before
+/// it reads closed: [`Runtime`](crate::Runtime)'s default, seven days
+/// ([`RuntimeBuilder::session_idle_ttl`](crate::RuntimeBuilder::session_idle_ttl)).
+pub const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// The limits on the sessions of one conversation (ADR 0045 decision 5, slice 4): what the
+/// session tools, the A2A front and the card's `maxOpen` share.
+///
+/// Each is checked before the thing it limits starts, so two requests that race may both pass and
+/// exceed it by the number racing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionLimits {
+    /// The most sessions open at once (not closed; one that is closing and still works counts):
+    /// a start past it is refused. 1 to [`MAX_SESSION_PAGE`].
+    pub max_open: u32,
+    /// The most rounds working at once: a start, or a send that would start a round, past it is
+    /// refused. 1 to 32, and at most `max_open`.
+    pub max_working: u32,
+    /// The most rounds one session may have, a close included: a send past it is refused. 2 to 200.
+    pub max_rounds: u32,
+}
+
+impl Default for SessionLimits {
+    /// 16 open, 4 working, 20 rounds.
+    fn default() -> Self {
+        Self {
+            max_open: 16,
+            max_working: 4,
+            max_rounds: 20,
+        }
+    }
+}
+
+impl SessionLimits {
+    /// The largest `max_working`.
+    pub const MAX_WORKING_BOUND: u32 = 32;
+    /// The smallest and largest `max_rounds`.
+    pub const MAX_ROUNDS_BOUNDS: (u32, u32) = (2, 200);
+
+    /// Limits within their bounds.
+    ///
+    /// # Errors
+    ///
+    /// The sentence that says which value is out of bounds.
+    pub fn new(max_open: u32, max_working: u32, max_rounds: u32) -> Result<Self, String> {
+        let page = u32::try_from(MAX_SESSION_PAGE).unwrap_or(100);
+        if !(1..=page).contains(&max_open) {
+            return Err(format!("max_open is {max_open}; it must be 1 to {page}"));
+        }
+        if !(1..=Self::MAX_WORKING_BOUND).contains(&max_working) {
+            return Err(format!(
+                "max_working is {max_working}; it must be 1 to {}",
+                Self::MAX_WORKING_BOUND
+            ));
+        }
+        if max_working > max_open {
+            return Err(format!(
+                "max_working is {max_working}, more than max_open ({max_open})"
+            ));
+        }
+        let (low, high) = Self::MAX_ROUNDS_BOUNDS;
+        if !(low..=high).contains(&max_rounds) {
+            return Err(format!(
+                "max_rounds is {max_rounds}; it must be {low} to {high}"
+            ));
+        }
+        Ok(Self {
+            max_open,
+            max_working,
+            max_rounds,
+        })
+    }
+
+    /// These limits, each lowered to the value `open`, `working` or `rounds` gives (a larger one
+    /// changes nothing: a file may only lower what the deployment set). `max_working` stays at
+    /// most `max_open`.
+    #[must_use]
+    pub fn lowered_by(self, open: Option<u32>, working: Option<u32>, rounds: Option<u32>) -> Self {
+        let max_open = open.map_or(self.max_open, |v| v.min(self.max_open));
+        let max_working = working
+            .map_or(self.max_working, |v| v.min(self.max_working))
+            .min(max_open);
+        let max_rounds = rounds.map_or(self.max_rounds, |v| v.min(self.max_rounds));
+        Self {
+            max_open,
+            max_working,
+            max_rounds,
+        }
+    }
+}
+
 /// The newest round of a session, read: what both a listing and a single session's view say.
 pub(crate) struct Latest {
     pub state: SessionState,
     pub outcome: Option<RoundOutcome>,
     pub header: Option<SessionHeader>,
     pub closed: bool,
+    pub idle_expired: bool,
     pub status: ChildStatus,
 }
 
-/// Read `latest`, the newest round of a session.
-pub(crate) fn read_latest(latest: &RunRecord) -> Latest {
+/// Read `latest`, the newest round of a session, at `now`: a round that ended at least `idle_ttl`
+/// ago in a session that would otherwise stay open reads closed (and `idle_expired`). A round that
+/// works never expires, and the report of an expired session is the round's, unchanged.
+pub(crate) fn read_latest(latest: &RunRecord, now: DateTime<Utc>, idle_ttl: Duration) -> Latest {
     let open = latest.status.is_open();
     let (header, close_asked) = match Envelope::decode(latest.id, &latest.state) {
         Ok(env) => {
@@ -334,7 +434,12 @@ pub(crate) fn read_latest(latest: &RunRecord) -> Latest {
         Err(_) => (None, true),
     };
     let keep_open = header.as_ref().is_none_or(|h| h.keep_open);
-    let closed = close_asked || header.as_ref().is_some_and(|h| h.closed) || (!open && !keep_open);
+    let closed_already =
+        close_asked || header.as_ref().is_some_and(|h| h.closed) || (!open && !keep_open);
+    let idle_expired = !open
+        && !closed_already
+        && chrono::Duration::from_std(idle_ttl).is_ok_and(|ttl| now - latest.updated_at >= ttl);
+    let closed = closed_already || idle_expired;
     let status = ChildStatus::from_record(latest);
     let (state, outcome) = if open {
         (SessionState::Working, None)
@@ -356,6 +461,7 @@ pub(crate) fn read_latest(latest: &RunRecord) -> Latest {
         outcome,
         header,
         closed,
+        idle_expired,
         status,
     }
 }
@@ -374,6 +480,8 @@ pub(crate) fn page_of_sessions(
     rounds: HashMap<(String, String), Vec<RunRecord>>,
     offset: usize,
     limit: usize,
+    now: DateTime<Utc>,
+    idle_ttl: Duration,
 ) -> SessionList {
     let mut sessions: Vec<SessionSummary> = rounds
         .into_iter()
@@ -390,7 +498,7 @@ pub(crate) fn page_of_sessions(
                 .rev()
                 .find(|(_, h)| !h.as_ref().is_some_and(|h| h.closing))
                 .map_or(&latest, |(r, _)| r);
-            let read = read_latest(&latest);
+            let read = read_latest(&latest, now, idle_ttl);
             let report = if read.header.as_ref().is_some_and(|h| h.closing) {
                 ReportRound::of(worked)
             } else {
@@ -413,6 +521,7 @@ pub(crate) fn page_of_sessions(
                 keep_open: read.header.as_ref().is_none_or(|h| h.keep_open),
                 closed: read.closed,
                 closing: read.header.as_ref().is_some_and(|h| h.closing),
+                idle_expired: read.idle_expired,
                 started_by: latest.parent_id,
                 report,
             })
@@ -458,6 +567,9 @@ pub struct SessionView {
     pub outcome: Option<RoundOutcome>,
     /// Whether the session takes no more messages (it may still be finishing a round).
     pub closed: bool,
+    /// Whether it reads closed only because its latest round ended at least the idle TTL ago
+    /// ([`closed`](Self::closed) is then also `true`).
+    pub idle_expired: bool,
     /// The report: the last round **that did work** (a round that only closed the session has none),
     /// as a parent reads a child: its status and output.
     pub latest: ChildStatus,
@@ -474,7 +586,12 @@ impl SessionView {
         self.started_by == Some(self.latest_run)
     }
 
-    pub(crate) fn from_rounds(session: RunId, runs: Vec<RunRecord>) -> Option<Self> {
+    pub(crate) fn from_rounds(
+        session: RunId,
+        runs: Vec<RunRecord>,
+        now: DateTime<Utc>,
+        idle_ttl: Duration,
+    ) -> Option<Self> {
         let runs = ordered(runs);
         let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
         let (latest, _) = runs.last()?.clone();
@@ -483,7 +600,7 @@ impl SessionView {
             .rev()
             .find(|(_, h)| !h.as_ref().is_some_and(|h| h.closing))
             .map_or_else(|| latest.clone(), |(r, _)| r.clone());
-        let mut read = read_latest(&latest);
+        let mut read = read_latest(&latest, now, idle_ttl);
         read.status = ChildStatus::from_record(&worked);
         Some(Self {
             id: session,
@@ -495,6 +612,7 @@ impl SessionView {
             state: read.state,
             outcome: read.outcome,
             closed: read.closed,
+            idle_expired: read.idle_expired,
             latest: read.status,
             report_run: worked.id,
             started_by: latest.parent_id,
@@ -617,7 +735,7 @@ mod tests {
             })
             .collect();
         ids.sort_by_key(|i| i.0);
-        let list = page_of_sessions("p", rounds(runs), 0, 10);
+        let list = page_of_sessions("p", rounds(runs), 0, 10, t0(), idle_ttl());
         assert_eq!(list.sessions.iter().map(|s| s.id).collect::<Vec<_>>(), ids);
     }
 
@@ -656,6 +774,8 @@ mod tests {
             ]),
             0,
             10,
+            t0(),
+            idle_ttl(),
         );
         assert_eq!(
             list.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
@@ -686,6 +806,8 @@ mod tests {
             ]),
             0,
             10,
+            t0(),
+            idle_ttl(),
         );
         assert_eq!(
             list.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
@@ -734,7 +856,7 @@ mod tests {
         let state = |h: Option<SessionHeader>, status, inbox| {
             let id = h.as_ref().map_or_else(RunId::new, |h| h.id);
             let rec = with_header(id, h, status, inbox);
-            let read = read_latest(&rec);
+            let read = read_latest(&rec, rec.updated_at, idle_ttl());
             (read.state, read.closed)
         };
         let id = RunId::new();
@@ -801,7 +923,7 @@ mod tests {
             mk(ids[0], 1, false, RunStatus::Done, None),
             mk(ids[1], 2, false, RunStatus::Failed, Some("cancelled: stop")),
         ];
-        let view = SessionView::from_rounds(first, runs).unwrap();
+        let view = SessionView::from_rounds(first, runs, t0(), idle_ttl()).unwrap();
         assert_eq!(
             view.latest_run, ids[2],
             "the highest round number is the latest"
@@ -820,7 +942,7 @@ mod tests {
         let id = RunId::new();
         let mut rec = with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]);
         rec.state = serde_json::json!("garbage");
-        let read = read_latest(&rec);
+        let read = read_latest(&rec, rec.updated_at, idle_ttl());
         assert!(read.closed);
         assert_eq!(read.state, SessionState::Closed);
     }
@@ -843,6 +965,8 @@ mod tests {
             ]),
             0,
             10,
+            t0(),
+            idle_ttl(),
         );
         assert_eq!(
             list.sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
@@ -872,9 +996,115 @@ mod tests {
                 rounds(vec![record(s, &conv(s), Some(parent), status, error, 1)]),
                 0,
                 10,
+                t0(),
+                idle_ttl(),
             );
             assert_eq!(list.sessions[0].outcome, Some(want));
             assert_eq!(list.sessions[0].state, SessionState::Idle);
         }
+    }
+
+    fn idle_ttl() -> Duration {
+        Duration::from_secs(3600)
+    }
+
+    /// The instant the test records are made at.
+    fn t0() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    fn after(rec: &RunRecord, secs: i64) -> DateTime<Utc> {
+        rec.updated_at + chrono::Duration::seconds(secs)
+    }
+
+    #[test]
+    fn a_session_idle_for_the_ttl_reads_closed_and_not_a_moment_before() {
+        let id = RunId::new();
+        let rec = with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]);
+        let before = read_latest(&rec, after(&rec, 3599), idle_ttl());
+        assert_eq!((before.state, before.closed), (SessionState::Idle, false));
+        assert!(!before.idle_expired);
+        let at = read_latest(&rec, after(&rec, 3600), idle_ttl());
+        assert_eq!((at.state, at.closed), (SessionState::Closed, true));
+        assert!(at.idle_expired);
+        assert_eq!(at.outcome, Some(RoundOutcome::Done));
+    }
+
+    #[test]
+    fn a_session_with_no_header_expires_too_and_a_failed_round_is_idle_like_any() {
+        let id = RunId::new();
+        for status in [RunStatus::Done, RunStatus::Failed] {
+            let rec = with_header(id, None, status, vec![]);
+            let read = read_latest(&rec, after(&rec, 7200), idle_ttl());
+            assert!(read.idle_expired && read.closed, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_working_round_never_expires() {
+        let id = RunId::new();
+        for status in [RunStatus::Runnable, RunStatus::Parked] {
+            let rec = with_header(id, Some(header(id, true, false)), status, vec![]);
+            let read = read_latest(&rec, after(&rec, 10 * 24 * 3600), idle_ttl());
+            assert_eq!((read.state, read.closed), (SessionState::Working, false));
+            assert!(!read.idle_expired);
+        }
+    }
+
+    #[test]
+    fn a_session_closed_another_way_is_not_said_to_have_expired() {
+        let id = RunId::new();
+        let long = 30 * 24 * 3600;
+        // Not kept open: closed by its round's end.
+        let once = with_header(id, Some(header(id, false, false)), RunStatus::Done, vec![]);
+        assert!(!read_latest(&once, after(&once, long), idle_ttl()).idle_expired);
+        // Closed by its header.
+        let closed = with_header(id, Some(header(id, true, true)), RunStatus::Done, vec![]);
+        assert!(!read_latest(&closed, after(&closed, long), idle_ttl()).idle_expired);
+        // A state nobody can read.
+        let mut broken = with_header(id, None, RunStatus::Done, vec![]);
+        broken.state = serde_json::json!("garbage");
+        assert!(!read_latest(&broken, after(&broken, long), idle_ttl()).idle_expired);
+    }
+
+    #[test]
+    fn the_defaults_are_the_documented_limits() {
+        let d = SessionLimits::default();
+        assert_eq!((d.max_open, d.max_working, d.max_rounds), (16, 4, 20));
+        assert_eq!(DEFAULT_SESSION_IDLE_TTL, Duration::from_secs(7 * 24 * 3600));
+    }
+
+    #[test]
+    fn limits_are_checked_against_their_bounds() {
+        assert!(SessionLimits::new(1, 1, 2).is_ok());
+        assert!(SessionLimits::new(100, 32, 200).is_ok());
+        for (open, working, rounds, word) in [
+            (0, 1, 2, "max_open"),
+            (101, 4, 20, "max_open"),
+            (16, 0, 20, "max_working"),
+            (64, 33, 20, "max_working"),
+            (16, 4, 1, "max_rounds"),
+            (16, 4, 201, "max_rounds"),
+            (3, 4, 20, "max_working"),
+        ] {
+            let why = SessionLimits::new(open, working, rounds).expect_err(word);
+            assert!(why.contains(word), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_file_only_lowers_the_limits() {
+        let d = SessionLimits::default();
+        let lowered = d.lowered_by(Some(8), Some(2), Some(10));
+        assert_eq!(
+            (lowered.max_open, lowered.max_working, lowered.max_rounds),
+            (8, 2, 10)
+        );
+        let raised = d.lowered_by(Some(50), Some(30), Some(100));
+        assert_eq!(raised, d, "a larger value changes nothing");
+        assert_eq!(d.lowered_by(None, None, None), d);
+        // Working never exceeds open, even when the file lowers open alone.
+        let narrow = d.lowered_by(Some(2), None, None);
+        assert_eq!((narrow.max_open, narrow.max_working), (2, 2));
     }
 }

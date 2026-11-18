@@ -959,3 +959,97 @@ fn a_subagent_tool_can_be_made_by_hand() {
     );
     assert_eq!(tool.with_run_limit(None).run_limit(), None);
 }
+
+// --- session limits (ADR 0045, slice 4) -------------------------------------------------------
+
+/// A root and one child, each with the `limits:` line given (empty for none).
+fn limits_family(root_limits: &str, child_limits: &str) -> AgentDef {
+    let line = |limits: &str| {
+        if limits.is_empty() {
+            String::new()
+        } else {
+            format!("\nlimits: {{ {limits} }}")
+        }
+    };
+    def(&[
+        (
+            "agent/instructions.md",
+            &instructions(&format!("name: coder{}", line(root_limits)), "Root."),
+        ),
+        (
+            "agent/subagents/child.md",
+            &instructions(
+                &format!("description: Child.{}", line(child_limits)),
+                "Child.",
+            ),
+        ),
+    ])
+}
+
+fn limits_of(def: AgentDef, deployment: Option<adam_runtime::SessionLimits>) -> [u32; 3] {
+    let def = match deployment {
+        Some(limits) => def.session_limits(limits),
+        None => def,
+    };
+    let pure = def.effective_session_limits();
+    let assembly = def
+        .bind(tools(&[]))
+        .unwrap()
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = assembly.session_limits();
+    assert_eq!(pure, bound, "the card's limits are the tools' limits");
+    [bound.max_open, bound.max_working, bound.max_rounds]
+}
+
+#[test]
+fn the_deployments_session_limits_are_lowered_by_the_roots_file_and_never_raised() {
+    use adam_runtime::SessionLimits;
+    // Nothing said: the defaults.
+    assert_eq!(limits_of(limits_family("", ""), None), [16, 4, 20]);
+    // The deployment's own.
+    let deployment = SessionLimits::new(8, 3, 10).unwrap();
+    assert_eq!(
+        limits_of(limits_family("", ""), Some(deployment)),
+        [8, 3, 10]
+    );
+    // The root's file lowers each, alone or together.
+    assert_eq!(
+        limits_of(
+            limits_family("max_open_sessions: 4, max_session_rounds: 5", ""),
+            Some(deployment)
+        ),
+        [4, 3, 5]
+    );
+    // And never raises: the deployment's values stand.
+    assert_eq!(
+        limits_of(
+            limits_family(
+                "max_open_sessions: 50, max_working_sessions: 30, max_session_rounds: 100",
+                ""
+            ),
+            Some(deployment)
+        ),
+        [8, 3, 10]
+    );
+    // Lowering open lowers working with it.
+    assert_eq!(
+        limits_of(limits_family("max_open_sessions: 2", ""), Some(deployment)),
+        [2, 2, 10]
+    );
+}
+
+#[test]
+fn a_subagents_session_limits_are_ignored() {
+    assert_eq!(
+        limits_of(
+            limits_family(
+                "",
+                "max_open_sessions: 1, max_working_sessions: 1, max_session_rounds: 2"
+            ),
+            None
+        ),
+        [16, 4, 20],
+        "only the root's file sets the limits of the sessions it starts"
+    );
+}

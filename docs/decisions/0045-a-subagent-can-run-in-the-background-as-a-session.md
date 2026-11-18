@@ -42,8 +42,8 @@ decisions above, each for a reason found while building:
 * **The turn-end wait** appends a `subagent_read` call (id `wait_<turn>`) to the model's own message and waits for one session at
   a time, in the order the listing gives; it is skipped when the history has no `subagent_start` or `subagent_send` call, so a run
   that never uses sessions journals what it always did.
-* **Two bounds of slice 4 are constants here** because a missing one is unsafe: 16 open sessions per conversation and 20 rounds
-  per session (a close counts as a round). `idle_ttl`, `max_working` and the settings are slice 4.
+* **Two bounds of slice 4 were constants here** because a missing one is unsafe: 16 open sessions per conversation and 20 rounds
+  per session (a close counts as a round). *Built 2026-11-18, slice 4: they are the defaults of settings; see the note below.*
 * **`subagent_start` lists remote subagents in the enum** and refuses them in words (slice 5 builds them); a session tool is given
   only to a root with at least one local subagent. (*Amended 2026-11-18:* slice 5 built them: no refusal, and a root with any subagent has the five.)
 * **The coder's tier**: the five are `plan` tier, like the helpers they run.
@@ -91,6 +91,16 @@ in `agent.rs`. Three existing cases that count the tokens of a round **nobody re
 (a hidden builder method that makes the agent as a build from before), because the loop now reads such a round at its next model call. **Unverified
 risks:** the appended assistant message carries no reasoning (a model with `echo_reasoning`); two assistant messages in a row can happen; the listing
 runs inside `model:<turn>` before the call with no time limit of its own; the step events of the appended reads are emitted after the answer has streamed.
+
+*Built 2026-11-18:* slice 4 (limits as settings, `idle_ttl`; `crates/adam-runtime/src/session.rs`, `adam-llm-agent/src/sessions.rs`, `adam-agent-fs`, `adam-assembly/src/def.rs`, `adam-service/src/config.rs`, `adam-a2a-runtime/src/child_sessions.rs`). Departures and decisions:
+* **Where the settings live.** The environment, read by every role (the control plane's A2A front checks starts and reads sessions): `SESSION_MAX_OPEN` (1-100, 16), `SESSION_MAX_WORKING` (1-32, at most open, 4), `SESSION_MAX_ROUNDS` (2-200, 20), `SESSION_IDLE_DAYS` (1-365, 7); a bad value is exit 78. The root's file may only lower the three limits (`limits.max_open_sessions`, `max_working_sessions`, `max_session_rounds`; a larger value is lowered with a warning, a subagent's keys are ignored with a warning). `idle_ttl` is deployment-only and runtime-wide, not a file key.
+* **The time limit per round** is the subagent's `limits.max_minutes` or a remote round's `remote_timeout` (built before), not a session setting.
+* **`idle_ttl` is read, not written**, when a session is listed or viewed, including a session with no header: a round that ended at least `idle_ttl` ago in a session that would stay open reads `Closed` (`idle_expired`). This amends the "never closes by itself" sentence of `SessionHeader`. A working round never expires; an expired session frees its place under `max_open`; the tools and the A2A front refuse a send in words.
+* **An expired session's report is still told once.** The due rule reads the round, not the session's state, so a report nobody was told of is given at the next task's first model call even if the session has expired, and not again.
+* **`max_working` also refuses a person's rounds** in the A2A front (`UnsupportedOperation`, in words): a start, and a message that would start a round. This adds a refusal case to the `child-sessions/v1` contract (the clients' repository changes with it). **`subagent_send` now checks `max_working` before it starts a round** (before, only a start did); a steer into a working round is not a new round.
+* **Cancel (decision 6)** was built by ADR 0044 slice 10 and slice 5; slice 4 adds the proofs (`a_parent_that_fails_stops_its_rounds`, `a_cancel_frees_the_working_slots_for_the_next_task`).
+* **Retention** is documented, not enforced: `purge_finished(before)` must be older than `idle_ttl` plus a round's time limit and retries.
+* The coder sets the limits from `bin/adam-coder/src/serve.rs` only; no chart change (`config.extraEnv` sets the variables).
 
 *Built 2026-11-18:* slice 6 part a (the A2A front, `crates/adam-a2a-runtime/src/child_sessions.rs`, the card entry in `crates/adam-a2a`, two
 readers and `closing_round_payload` in `crates/adam-runtime`): a client that activates `child-sessions/v1` sees the sessions of a parent
@@ -157,7 +167,7 @@ round agents' starters on the A2A front; a reload of `LiveAssembly` keeps the ro
   (`SessionView::started_outside_a_run`) and the A2A front derives `by: person` from it. A round the model starts is unchanged.
 * **Decision 7**: a person's round reports to no parent; the report of a person's round to the parent run waits for slice 3. (*Built 2026-11-18, slice 3:* the parent reads it from the store at its next listing; see the note above.)
 * **Decision 9**: a round a person starts always has a tier written (the one its message names, else the agent's default).
-* **Decision 5**: the card's `maxOpen` is the value the deployment passes to `ChildSessions::new`, which must equal the model tools' constant (16) until slice 4 makes it a setting. It is checked before a start, so concurrent starts may exceed it by the number racing, as the tools' check may.
+* **Decision 5**: the card's `maxOpen` is the value the deployment passes to `ChildSessions::new`, which must equal the model tools' limit (16 by default). *Built 2026-11-18, slice 4: `ChildSessions::with_limits` takes the deployment's `SessionLimits`, so `maxOpen` follows `SESSION_MAX_OPEN`.* It is checked before a start, so concurrent starts may exceed it by the number racing, as the tools' check may.
 * **Not built here:** the live usage of a model round stays on the parent until the loop is free to change; push configs on round
   tasks are unsupported.
 
