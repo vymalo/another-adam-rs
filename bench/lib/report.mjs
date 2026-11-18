@@ -33,8 +33,8 @@ const interval = (w) => (w ? `${pct(w.low)} to ${pct(w.high)}` : 'n/a');
 const num = (n) => (n === null || n === undefined ? 'n/a' : Number.isInteger(n) ? String(n) : n.toFixed(1));
 const sum = (xs) => xs.reduce((s, x) => s + x, 0);
 
-/** A table cell on one line, its pipes escaped: nothing a run carries can break a table. */
-const cell = (c) => String(c).replace(/\r\n|\r|\n/g, ' ').replace(/\|/g, '\\|');
+/** A table cell on one line, its pipes escaped: nothing a run carries can break a table. A backslash is escaped first, so a name that is `a\|b` cannot end the cell. */
+const cell = (c) => String(c).replace(/\\/g, '\\\\').replace(/\r\n|\r|\n/g, ' ').replace(/\|/g, '\\|');
 
 function table(header, rows) {
   if (rows.length === 0) return '_none_\n';
@@ -226,6 +226,8 @@ export function buildReport(foldedOrRecords, opts = {}) {
   out.push('Every figure of this section sums all attempts of a run (an interrupted attempt that was run again is in it), and counts only Done runs.\n\n');
   const costRows = [];
   const timeRows = [];
+  const turnRows = [];
+  const byTool = [];
   for (const [cell, rs] of group(counted, cellKey)) {
     const solved = rs.filter(passed).length;
     const cost = sum(rs.map((v) => v.spentMicro));
@@ -260,10 +262,48 @@ export function buildReport(foldedOrRecords, opts = {}) {
       sum(rs.map((v) => v.calls.refused)),
       sum(rs.map((v) => v.calls.usageMissing)),
     ]);
+    // What the meter read in the answers: how many tool calls each model turn asked for.
+    const turns = sum(rs.map((v) => v.toolCalls.turns));
+    const asked = sum(rs.map((v) => v.toolCalls.calls));
+    turnRows.push([
+      rs[0].agent,
+      rs[0].arm,
+      turns,
+      asked,
+      turns > 0 ? (asked / turns).toFixed(2) : 'n/a',
+      turns > 0 ? sum(rs.map((v) => v.toolCalls.multiTurns)) : 'n/a',
+      turns > 0 ? Math.max(...rs.map((v) => v.toolCalls.maxInTurn)) : 'n/a',
+    ]);
+    // Which tools those calls asked for: the meter keeps the name each call gave. A Map, for the
+    // same reason the fold's is one: a name is the model's text.
+    const names = new Map();
+    for (const v of rs) for (const [name, n] of v.toolCalls.byName) names.set(name, (names.get(name) ?? 0) + n);
+    byTool.push({ cell, names, named: sum(rs.map((v) => v.toolCalls.named)), calls: asked });
   }
   out.push(table(['Agent', 'Arm', 'Cost', 'Cost per solved task', 'Input', 'Cached', 'Cache write', 'Output', 'Reasoning (in output)', 'Median per run: input / output / reasoning', 'Cost per run', 'Cache-hit rate (cached / input, all attempts)', 'Spend on unsolved runs', 'Spend per solved task, every run of the cell'], costRows));
   out.push('\n');
   out.push(table(['Agent', 'Arm', 'Wall median', 'Wall p90', 'Model calls (median)', 'Refused calls', 'Calls with no usage (charged worst case)'], timeRows));
+  out.push('\n\nTool calls per model turn, read from the model\'s answers (a turn with a count of its own; a run recorded before the count has none):\n\n');
+  out.push(table(['Agent', 'Arm', 'Model turns counted', 'Tool calls asked', 'Tool calls per turn', 'Turns with several calls', 'Most calls in one turn'], turnRows));
+
+  const named = byTool.filter((t) => t.named > 0);
+  if (named.length === 0) {
+    out.push('\n\nTool calls by tool: n/a (no record of this ledger carries the names; a run made before the meter read them has none).\n');
+  } else {
+    const totals = new Map();
+    for (const t of named) {
+      for (const [name, n] of t.names) totals.set(name, (totals.get(name) ?? 0) + n);
+    }
+    const sorted = [...totals].sort(([a, na], [b, nb]) => nb - na || a.localeCompare(b));
+    const shown = sorted.slice(0, 30);
+    const rows = shown.map(([name]) => [name, ...byTool.map((t) => t.names.get(name) ?? 0)]);
+    const rest = sorted.slice(30);
+    if (rest.length > 0) rows.push([`other (${rest.length} tools)`, ...byTool.map((t) => sum(rest.map(([name]) => t.names.get(name) ?? 0)))]);
+    const unnamed = byTool.map((t) => t.calls - t.named);
+    if (unnamed.some((n) => n > 0)) rows.push(['(no name)', ...unnamed]);
+    out.push('\n\nTool calls by tool, read from the model\'s answers (the tool each call named; a cell whose calls are not all named says how many in the row "(no name)"):\n\n');
+    out.push(table(['Tool', ...byTool.map((t) => t.cell)], rows));
+  }
 
   h('Infrastructure failures');
   out.push('A run that failed in the infrastructure (the environment, the model endpoint, a container that would not stop) is tried again at most twice and is never a fail. Left out of the rates when it never finished.\n\n');

@@ -44,7 +44,7 @@ pub mod codec;
 
 use std::time::Duration;
 
-use adam_core::store::{add_ttl, now, open_conversation_key, sched_at, truncate_ms};
+use adam_core::store::{add_ttl, now, open_conversation_key, sched_at, storable, truncate_ms};
 use adam_core::{
     ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
     PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
@@ -486,7 +486,7 @@ impl Store for MongoStore {
             "conversation_id": new.conversation_id.as_deref().map(Bson::from).unwrap_or(Bson::Null),
             "parent_id": new.parent_id.map(uuid).unwrap_or(Bson::Null),
             "status": new.status.as_str(),
-            "state": json_to_bson(&new.state)?,
+            "state": json_to_bson(storable(&new.state).as_ref())?,
             "wake_at": opt_date(wake_at),
             "sched_at": opt_date(sched_at(new.status, wake_at, t)),
             "version": 1_i64,
@@ -554,7 +554,7 @@ impl Store for MongoStore {
         let wake_at = update.wake_at.map(truncate_ms);
         let set = doc! {
             "status": update.status.as_str(),
-            "state": json_to_bson(&update.state)?,
+            "state": json_to_bson(storable(&update.state).as_ref())?,
             "wake_at": opt_date(wake_at),
             "sched_at": opt_date(sched_at(update.status, wake_at, t)),
             "open_key": open_key(id, &current.agent, current.conversation_id.as_deref(), update.status),
@@ -622,7 +622,7 @@ impl Store for MongoStore {
             "seq": to_i64(entry.seq, "journal seq")?,
             "name": &entry.name,
             "ok": entry.ok,
-            "payload": json_to_bson(&entry.payload)?,
+            "payload": json_to_bson(storable(&entry.payload).as_ref())?,
             "recorded_at": date(recorded_at),
         };
         match self.journal.insert_one(&doc).await {
@@ -845,8 +845,8 @@ impl Store for MongoStore {
         let fresh = doc! {
             "agent": &new.agent,
             "owner": &new.owner,
-            "config": json_to_bson(&new.config)?,
-            "cursor": json_to_bson(&new.cursor)?,
+            "config": json_to_bson(storable(&new.config).as_ref())?,
+            "cursor": json_to_bson(storable(&new.cursor).as_ref())?,
             "state": PushState::Active.as_str(),
             "attempts": 0_i64,
             "last_error": Bson::Null,
@@ -977,7 +977,7 @@ impl Store for MongoStore {
         let key = push_key(run, id);
         let set = doc! {
             "state": progress.state.as_str(),
-            "cursor": json_to_bson(&progress.cursor)?,
+            "cursor": json_to_bson(storable(&progress.cursor).as_ref())?,
             "attempts": i64::from(progress.attempts),
             "last_error": progress.last_error.as_deref().map(Bson::from).unwrap_or(Bson::Null),
             "next_attempt_at": date(truncate_ms(progress.next_attempt_at)),

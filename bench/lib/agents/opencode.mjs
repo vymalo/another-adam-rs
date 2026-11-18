@@ -164,6 +164,11 @@ export class OpenCodeAgent {
     return ctx.stack.slotDir(ctx.slot);
   }
 
+  /** An empty directory of the harness's own, mounted read-only over the image's global skill directories. */
+  #globals(ctx) {
+    return path.join(this.slotDir(ctx), 'no-globals');
+  }
+
   async prepare(ctx) {
     this.binary ??= await this.fetchBinary({ pin: this.pins.opencode, dir: path.join(this.home, 'opencode', this.pins.opencode.version) });
     const names = this.#names(ctx);
@@ -178,6 +183,12 @@ export class OpenCodeAgent {
       fs.copyFileSync(this.binary.path, target);
       fs.chmodSync(target, 0o555);
     }
+    // The image's global skill directories are hidden from the clone's upward search: the run mounts this empty
+    // directory, read-only, over `/.claude` and `/.opencode`. A repository's own `.claude/skills` inside the clone is
+    // its own text and stays visible.
+    const globals = this.#globals(ctx);
+    fs.rmSync(globals, { recursive: true, force: true });
+    fs.mkdirSync(globals, { recursive: true, mode: 0o755 });
     fs.rmSync(names.inDir, { recursive: true, force: true });
     fs.mkdirSync(names.inDir, { recursive: true, mode: 0o755 });
     fs.writeFileSync(path.join(names.inDir, 'instruction.md'), ctx.task.instruction, { mode: 0o644 });
@@ -211,8 +222,11 @@ export class OpenCodeAgent {
     const names = this.#names(ctx);
     const config = opencodeConfig({ baseUrl: ctx.meter.baseUrl, contextWindow: this.contextWindow, steps: ctx.limits.steps, instructions: this.sharedPrompt ? [`/bench/in/${SHARED_PROMPT_FILE}`] : [] });
     const input = opencodeInput({ config });
+    const globals = this.#globals(ctx);
     const mounts = [
       { source: path.join(this.slotDir(ctx), 'bin', 'opencode'), target: '/opt/bench/opencode', readOnly: true },
+      { source: globals, target: '/.claude', readOnly: true },
+      { source: globals, target: '/.opencode', readOnly: true },
       { source: names.inDir, target: '/bench/in', readOnly: true },
       { source: names.out, target: '/bench/out' },
       { source: names.parent, target: names.parent },

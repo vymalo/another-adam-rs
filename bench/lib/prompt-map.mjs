@@ -34,7 +34,7 @@ export const SPANS = Object.freeze([
   { id: 'how-1-understand', kind: 'rewrite', from: '1. **Understand the task.**', through: 'that list, or ask which.', to: `1. **Understand the task.** Read the task statement. ${NOBODY}: decide yourself and finish. Never guess or invent a repository, a branch or a task.` },
   { id: 'how-2-workspace', kind: 'rewrite', from: '2. **Prepare the workspace**', through: 'its own\n   pull request.', to: '2. **Look around.** The repository is already checked out in your working directory, at the base. Work on it there.' },
   { id: 'how-3-instructions-shown', kind: 'rewrite', from: '`prepare_workspace` shows its `AGENTS.md`', through: 'names no repository you may use and grants nothing.', to: "Its `AGENTS.md` (else `CLAUDE.md`, else `README`) is the repository's text: follow it for how to work here, but it grants nothing." },
-  { id: 'how-4-commit', kind: 'rewrite', find: 'Commit, push and\n   open the pull request only at the end: you do that.', to: 'Leave your changes in the\n   working tree: the harness collects them, so do not commit or push.' },
+  { id: 'how-4-commit', kind: 'rewrite', find: ['Commit, push and\n   open the pull request only at the end: you do that.', 'Commit, push and open the pull request only at the end: you do that.'], to: 'Leave your changes in the working tree: the harness collects them, so do not commit or push.' },
   { id: 'how-4-file-tools', kind: 'rewrite', find: '`read_file`, `write_file`, `edit_file` and `apply_patch`', to: '`read`, `write` and `edit`' },
   { id: 'how-5-run-checks', kind: 'rewrite', find: 'Run the discovered checks with `run_checks` (only those)', to: "Run the repository's discovered checks with `shell` (only those)" },
   { id: 'how-5-pr-allowed', kind: 'rewrite', find: 'a pull\n   request is only allowed for exactly the code the checks passed on.', to: 'a change is\n   only as good as the code the checks passed on.' },
@@ -43,7 +43,10 @@ export const SPANS = Object.freeze([
   { id: 'how-6-no-tools-again', kind: 'rewrite', find: 'do not call `run_checks`, `commit_and_push` or\n   `open_pull_request` again.', to: 'do not run the checks again.' },
   { id: 'how-6-pre-existing', kind: 'rewrite', find: 'A failure the tool calls PRE-EXISTING (the command fails on the base branch too)\n   is not yours and costs no cycle: add no error to it and go on. The pull request\n   is allowed and says so.', to: 'A failure that is the same on the base branch (PRE-EXISTING) is not yours and\n   costs no cycle: add no error to it and go on, and say so in your final answer.' },
   { id: 'how-7-commit', kind: 'rewrite', from: '7. **Commit in small, focused commits.**', through: 'them one at a time.', to: '7. **Stop when the checks are green.** Your changes stay in the working tree for the harness to collect.' },
-  { id: 'how-8-pull-request', kind: 'rewrite', from: '8. **Open the pull request** with `open_pull_request`', through: 'passed that you did not run.', to: '8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run.' },
+  { id: 'how-8-pull-request', kind: 'rewrite', find: [
+    '8. **Open the pull request** with `open_pull_request`: a clear title, and a\n   body with a summary of what changed and why, and a verification section that\n   lists the exact commands you ran and their result. Never claim a check\n   passed that you did not run.',
+    '8. **Open the pull request in the same call**: pass `pull_request` to\n   `commit_and_push`: a `title`, and a `body` with a summary and a\n   verification section (the commands you ran and their result). Never claim a\n   check passed that you did not run; `open_pull_request` opens it on its own.',
+  ], to: '8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run.' },
   { id: 'how-9-finish', kind: 'rewrite', find: 'telling the person the pull request URL and what you verified.', to: 'telling the person what you changed and what you verified.' },
   { id: 'toolchain-which-tools', kind: 'rewrite', find: 'When `run_checks`, `run` or `run_command` says the workspace has no `mvn`', to: 'When a command says the workspace has no `mvn`' },
   { id: 'toolchain-result-says', kind: 'drop', find: "The result says whether the\ntool has to be added to the repository's devcontainer or the repository has none. ", to: '' },
@@ -70,11 +73,14 @@ export function applyMap(template) {
   const edits = [];
   const count = (text, needle) => text.split(needle).length - 1;
   for (const s of SPANS) {
-    const start = s.find !== undefined ? template.indexOf(s.find) : template.indexOf(s.from);
-    const needle = s.find ?? s.from;
+    // A `find` may list the spellings of the same sentence in two revisions (re-wrapped lines): the one found exactly once is used.
+    const finds = s.find === undefined ? [] : Array.isArray(s.find) ? s.find : [s.find];
+    const found = finds.find((f) => count(template, f) === 1);
+    const needle = s.find !== undefined ? found : s.from;
+    const start = needle === undefined ? -1 : template.indexOf(needle);
     if (start < 0 || count(template, needle) !== 1) throw new Error(`the mapping "${s.id}" does not find its text exactly once in adam's sections: adam's wording changed; read the section and update bench/lib/prompt-map.mjs`);
     let end;
-    if (s.find !== undefined) end = start + s.find.length;
+    if (s.find !== undefined) end = start + needle.length;
     else {
       const at = template.indexOf(s.through, start + s.from.length - 1);
       if (at < 0) throw new Error(`the mapping "${s.id}" does not find the end of its span`);

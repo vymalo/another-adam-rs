@@ -37,7 +37,7 @@ sequenceDiagram
     R->>W: prepare_workspace / read_file, write_file, apply_patch / run_checks
     R-->>O: progress (status updates)
   end
-  R->>G: commit_and_push, open_pull_request
+  R->>G: commit_and_push (with pull_request), or open_pull_request
   R-->>O: artifacts (checks, branch, pull_request) then completed
 ```
 
@@ -61,12 +61,12 @@ sequenceDiagram
 | `search_files { pattern, path?, include?, literal?, offset?, limit?, repo? }` | the lines of the files below `path` that match a regular expression (`literal: true`: plain text), as `path:line:text`, sorted by path and line; `include` is a glob over the paths. Page of 100 lines. Tier `plan` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` | Refused in a reference.
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` | Refused in a reference.
-| `edit_file { path, old, new, replace_all?, repo? }` | replaces **exact text** in a file of the worktree, confined like `write_file` ([below](#reading-and-changing-files-itself)): `old` (blanks and line breaks included) must be in the file, once unless `replace_all`. A file that is not there, a directory, binary or non-UTF-8 content, one over 1 MiB, an empty `old`, and `old == new` are results that say so. **When `old` is not found it changes nothing and shows the closest region**: its line numbers, two lines of context around it, the first line where it and `old` differ, and a hint when only blanks differ or the file has CRLF endings. **When `old` is in the file several times and `replace_all` is not set** it says how many times and at which lines. Written like `write_file` (a new file renamed over the old, the mode kept). Progress line: `edited <path> (<slot>)` | Refused in a reference.
+| `edit_file { path, old, new, replace_all?, repo? }` | replaces **exact text** in a file of the worktree, confined like `write_file` ([below](#reading-and-changing-files-itself)): `old` (blanks and line breaks included) must be in the file, once unless `replace_all`. **The exact match is tried first; when it fails, line endings and trailing spaces or tabs on a line are tolerated (leading whitespace is not), and the edit replaces the original bytes at the matched span, so the rest of the file keeps its own endings and blanks.** A file that is not there, a directory, binary or non-UTF-8 content, one over 1 MiB, an empty `old`, and `old == new` are results that say so. **When `old` is not found it changes nothing and shows the closest region**: its line numbers, two lines of context around it, the first line where it and `old` differ, and a hint when only blanks differ. A tolerant match in several places without `replace_all` is refused as a miss too. **When `old` is in the file several times and `replace_all` is not set** it says how many times and at which lines. Written like `write_file` (a new file renamed over the old, the mode kept). Progress line: `edited <path> (<slot>)` | Refused in a reference.
 | `share_file { path, repo?, name? }` | shows the person **a file of the workspace**: the file is read in this process (confined like `read_file`: relative to the slot, no `..`, nothing inside `.git`, a symlink only while it stays inside the worktree), must be a regular file of at most 4 MiB, and comes back as a **file artifact** with its media type and filename; the model's result is one line, `Shared chart.svg (1.2 KiB, image/svg+xml). To show it in your answer, write ![description](chart.svg).` (the second sentence for an image only; a third gives its SHA-256, `To use it as the picture of an \`ask_user\` option, pass image {sha256: "<hash>", alt}.`), never the bytes. It works on what a command made inside the repository's devcontainer too (the workspace is one directory). See [Sharing a file](#sharing-a-file) and [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md). Progress line: `sharing <path> (<slot>)` |
 | `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check; a failure the base commit has too is **pre-existing** (below), not a cycle |
 | `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
-| `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
-| `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
+| `commit_and_push { message, pull_request?, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository), and a `pull_request` in the call is refused as `open_pull_request` refuses one. In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. With `pull_request` (`title`, `body`, `accept_red_checks?`) it then opens (or updates) the pull request **in the same call**, through exactly the gate and the path of `open_pull_request` ([below](#the-rules-in-code)): artifact `pull_request` after `branch`, and a refusal leaves the commit and the push standing. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
+| `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link). The `pull_request` of `commit_and_push` is this path, called with the slot it already resolved: one gate, one implementation |
 | `merge_pull_request { repo, number, method?, delete_branch? }` | merges a pull request, with `squash` (the default), `merge` or `rebase`: one **this conversation pushed** whose checks passed, at once; **any other**, or a red-checks override, only on the person's yes to a **form this tool draws itself** ("Merge owner/name#N into base?", "Merge it" or "Not now"; at `bypass` nothing is asked; in a run another agent started nobody is, and the tool refuses, [below](#when-another-agent-asks-nobody-to-agree)). The tool is `asks_user`, so a subagent has no `merge_pull_request`. The code host reads the pull request first and merges the head it read (`sha`), so a head that moved is refused; a pull request merged already is reported as it is; `delete_branch: true` deletes the head branch only when it is a branch of that very repository and not the base, and a branch GitHub will not delete is a note, never an error. **GitHub's own rules decide at every tier** (branch protection, required checks and reviews, conflicts, the App's permissions): a refusal is the tool's error result **in GitHub's words** with the class of the error (`rejected` for a merge the rules refuse, `unauthenticated` for a permission), and the model tells the person. Needs the `auto` tier ([below](#access-tiers-what-the-person-lets-it-do-alone)). `src/tools/admin.rs` |
 | `rename_repository { repo, new_name }`, `delete_repository { repo, confirm }` | rename a repository, or delete it for good, **only a repository the person named** (their words, a yes to `request_repository`, or a repository this run created: a bare name is never enough for an act that cannot be taken back). `confirm` must be exactly the repository's `owner/name` (without regard to case), checked before the host is asked, so that a slip of the model deletes nothing. A rename grants the new address; both are noted in the run's notes once the host answered, so a repeat is the same answer. Same refusals as the merge. Need the `bypass` tier. `src/tools/admin.rs` |
 | `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions as one form: a title, why the coder asks, radio buttons, checkboxes, a searchable list, a deck of pictures or a typed answer, each option with a label and a description) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). The instructions say the coder MUST ask with `choices` whenever it offers options, never as a list in prose. It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
@@ -250,8 +250,8 @@ subscriber sees it once. The exception is a file the coder shares with `share_fi
 | Name | From | Data |
 |---|---|---|
 | `checks` | every `run_checks` call that ran its command, and `commit_and_push` (bound, below) | `passed`, `commit`, `tree?`, `summary?`, `findings?` (below) |
-| `branch` | `commit_and_push`, after its bound `checks` | `repository`, `branch` (the branch the commit was pushed to: the run's own), `base_branch`, `commit`, and `continues` when the run continues another branch that the commit has not been published to yet (it is, by `open_pull_request`, after the gate) |
-| `pull_request` | `open_pull_request` | `url`, `number` (a string), `branch`, `repository`, then an A2A `url` part |
+| `branch` | `commit_and_push`, after its bound `checks` | `repository`, `branch` (the branch the commit was pushed to: the run's own), `base_branch`, `commit`, and `continues` when the run continues another branch that the commit has not been published to yet (it is, by the pull request, after the gate) |
+| `pull_request` | `open_pull_request`, or the `pull_request` of `commit_and_push` | `url`, `number` (a string), `branch`, `repository`, then an A2A `url` part |
 | the file's own name (or the `name` the model gave) | `share_file` | no data: one `raw` part, the bytes, with `mediaType` and `filename` ([below](#sharing-a-file)) |
 
 **`checks`** is what an orchestrator gates on. Its data part:
@@ -331,17 +331,19 @@ make them hold:
   project, which is built from nothing and spends tries on its own assumptions. The budget a call spends, and the one it is
   refused by, is that of its slot (`CheckRecord::scratch`, `ChecksNotes::scratch_failures`); each is judged by the last run
   of its own kind; the end of a run uses whichever is spent. `run` and `run_command` never spend one.
-* **No PR on red checks.** `open_pull_request` opens a pull request only if the
+* **No PR on red checks.** `open_pull_request` — and the `pull_request` of `commit_and_push`, which
+  runs the same gate in the same call — opens a pull request only if the
   most recent check run **on exactly the code the pull request contains** (the
   tree of the pushed `HEAD`, compared with the tree the check ran on, in whichever slot it ran) passed, and the
-  branch is pushed. The single override is `accept_red_checks: true`, which the
+  branch is pushed. The single override is `accept_red_checks: true` (in either tool), which the
   prompt reserves for explicit user consent obtained with `ask_user`; a pull
   request opened that way says so in its body, and one that was already open says
   so in a comment (its body is not ours to rewrite). It never overrides an exhausted
   cycle budget (a deliberate hardening: after the limit the run must stop).
 * **A continued branch is reached only through the gate.** A run that continues a branch
   (`prepare_workspace`'s `branch`) pushes its commits to the run's own `agent/<run>`, never to
-  that branch: `commit_and_push` cannot move it. Only `open_pull_request`, after the check
+  that branch: `commit_and_push` cannot move it. Only the pull request — the `pull_request` of
+  `commit_and_push`, or `open_pull_request` — after the check
   above has passed (or been accepted), moves it to the pushed commit, as a fast-forward
   that is never forced. So a pull request that is open for the branch never carries commits that
   nobody verified, and a rework whose checks stay red leaves the branch and its pull request
@@ -526,13 +528,16 @@ model. The line counts of a hunk header are written by a model, which counts bad
 written gets a second reading with `--recount` (not the first: `--recount` takes the `--- ` line of the next file for a
 removed line when no `diff --git` line separates them); the policy refusals are the same under both. `edit_file` is the exact-replace counterpart, added because a model's first `apply_patch` often fails on counts and
 context (the owner's chat of 2026-10-02 had two). It takes the path through the rule for writing, reads the file (UTF-8 text
-without NUL, at most 1 MiB), counts the places `old` is in, and writes through `write_file`'s own function. A miss does
-not guess: it shows the **closest region** by letting every line of `old` that is in the file (ignoring blanks at its ends)
-vote for the window it would sit in, and when no line matches by taking the most alike pair of one of the longest lines of
-`old` and a line of the file (Sorensen-Dice over character pairs, at least 0.5); two or more places without `replace_all`
-are refused with their line numbers. The tools change files and never touch git: `commit_and_push`
-commits what the files say, a change made by these tools changes the worktree's tree like any change, so the commit
-that follows is bound to a check only after a new `run_checks` (the gate is unchanged).
+without NUL, at most 1 MiB), counts the places `old` is in, and writes through `write_file`'s own function. The exact match
+is tried first; when it fails, the file and `old` are compared again with `\r\n` and `\r` read as `\n` and the spaces and
+tabs at the end of each line ignored, and a match is applied to the original bytes at its span (leading whitespace is never
+ignored, and an `old` of blanks only is a miss because it would match everywhere). A miss does not guess: it shows the
+**closest region** by letting every line of `old` that is in the file (ignoring blanks at its ends) vote for the window it
+would sit in, and when no line matches by taking the most alike pair of one of the longest lines of `old` and a line of the
+file (Sorensen-Dice over character pairs, at least 0.5); two or more exact places without `replace_all` are refused with
+their line numbers, and a tolerant match in several places is refused as a miss. The tools change files and never touch
+git: `commit_and_push` commits what the files say, a change made by these tools changes the worktree's tree like any
+change, so the commit that follows is bound to a check only after a new `run_checks` (the gate is unchanged).
 
 ```mermaid
 sequenceDiagram
@@ -1885,7 +1890,9 @@ middle of a run) for a `{{placeholder}}` the frontmatter does not declare, a var
 uses, or a `tools:` name the coder does not register. Then update `tests/fixtures/agent/prompt.txt` (the
 **instruction snapshot**: the body of `instructions.md`, placeholders as written) and `card.json` in the same commit:
 a change of what the model is told is a reviewed diff of those files, a change of behaviour to decide on and not
-a refactor (see [Tests](#tests)). The limit in the prompt follows
+a refactor (see [Tests](#tests)). The rendered body is under the loader's 30,000 characters by about 250 (the count
+varies a few characters with the check limits): a sentence added needs an equal length cut, and
+`the_prompt_names_no_opencode_and_stays_under_30000_chars` says when it does not. The limit in the prompt follows
 `MAX_CHECK_CYCLES` and `SCRATCH_CHECK_CYCLES`: the process passes `CoderSettings::max_check_cycles` and
 `scratch_check_cycles` as the vars, so the file's defaults only apply to a caller that does not.
 
@@ -2062,6 +2069,18 @@ shipped files stay in the binary and cannot disagree with it.
     a run's code is *given* on purpose (a file the model reads) is as exposed as that act.
 * Tests: `tests/environment.rs` (`a_variable_a_mcp_json_names_is_*`, `the_names_the_coders_own_processes_need_*`), `src/config.rs`, `src/redact.rs`, `src/harden.rs`, `src/tools/gitcli.rs` (a malicious filter);
   `adam-assembly/tests/extra_mcp.rs`, `adam-mcp/tests/http.rs` (`an_optional_server_*`).
+
+### Calls at the same time
+
+The calls of one model reply run at the same time (`MAX_PARALLEL_TOOL_CALLS`, 10 by default). Each tool declares what
+its call shares with the others: `tools/access.rs` names the scopes (`files`, `commands`, `lsp`) and the classes with
+two uses, and `#[tool(parallel = "read" | "write" | "exclusive", path = "path")]` the rest. The list, and why the gates
+run alone, is in [the reference](../../docs/reference/coder-agent.md#calls-at-the-same-time); `tests/tool_access.rs`
+holds it. `NotesStore::update` is how a call changes the run's notes (a lock per run around load, change and save);
+`run_checks`, `commit_and_push` and `open_pull_request` run alone and read the notes once and write them once.
+`write_file` and `edit_file` rename a new file over the old, so a read beside them sees one whole file.
+Tests: `tests/tool_access.rs`, `concurrent_updates_of_one_run_keep_every_change` in `src/tools/notes.rs`,
+`a_read_beside_a_write_or_an_edit_sees_a_whole_file` in `src/tools/files.rs`.
 
 ### Retry safety
 

@@ -389,7 +389,12 @@ fn merge_form(
 /// protection, required reviews, conflicts): if it refuses you get its words, and you tell the
 /// person; do not look for another way. It needs the auto access tier or above; at bypass nothing
 /// is asked.
-#[tool(asks_user, label = "Merge a pull request", icon = "git")]
+#[tool(
+    asks_user,
+    label = "Merge a pull request",
+    icon = "git",
+    parallel = "exclusive"
+)]
 pub async fn merge_pull_request(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -511,7 +516,7 @@ pub async fn merge_pull_request(
 /// Rename a repository the person named, to `new_name` (the same owner). GitHub keeps redirecting the
 /// old address. It needs the bypass access tier, and GitHub's own rules and the permissions of your
 /// credentials decide whether it happens: if it refuses you get its words, and you tell the person.
-#[tool(label = "Rename a repository", icon = "git")]
+#[tool(label = "Rename a repository", icon = "git", parallel = "exclusive")]
 pub async fn rename_repository(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -569,14 +574,14 @@ pub async fn rename_repository(
         full_name: renamed.full_name,
         html_url: renamed.html_url,
     };
-    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    if !record.to.is_empty() {
-        notes.name_repos([record.to.clone()]);
-    }
     let text = renamed_text(&record);
-    notes.renamed_repos.push(record);
     env.notes
-        .save(&run, &notes)
+        .update(&run, |notes| {
+            if !record.to.is_empty() {
+                notes.name_repos([record.to.clone()]);
+            }
+            notes.renamed_repos.push(record);
+        })
         .await
         .map_err(|e| notes_error(&e))?;
     Ok(ToolOutput::text(text))
@@ -593,7 +598,7 @@ fn renamed_text(record: &RenamedRepo) -> String {
 /// must be the repository's `owner/name` exactly (a guard against a slip: nothing is deleted when
 /// it differs). GitHub's own rules and the permissions of your credentials decide whether it
 /// happens: if it refuses you get its words, and you tell the person.
-#[tool(label = "Delete a repository", icon = "delete")]
+#[tool(label = "Delete a repository", icon = "delete", parallel = "exclusive")]
 pub async fn delete_repository(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -633,10 +638,8 @@ pub async fn delete_repository(
     if let Err(e) = env.code_host.delete_repository(&target.repo).await {
         return refused(&what, ADMIN_PERMISSION, &e);
     }
-    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    notes.deleted_repos.push(lowered);
     env.notes
-        .save(&run, &notes)
+        .update(&run, |notes| notes.deleted_repos.push(lowered))
         .await
         .map_err(|e| notes_error(&e))?;
     Ok(ToolOutput::text(deleted_text(&target.full_name)))

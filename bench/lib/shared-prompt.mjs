@@ -27,7 +27,7 @@ export const SECTIONS = Object.freeze({
   Tools: { shared: false, why: "the guide to adam's own tools, by name" },
   Helpers: { shared: false, why: "adam's explorer and reviewer subagents" },
   'Access tiers': { shared: false, why: "adam's access tiers (plan, edits, auto, bypass), which the benchmark does not set" },
-  'How to work': { shared: true, owner: true, why: 'how to do the task: discover the checks, small steps, verify, fix, commit, open the pull request' },
+  'How to work': { shared: true, owner: true, why: 'how to do the task: discover the checks, small steps, verify, fix, commit and open the pull request in one call' },
   'Starting without a repository': { shared: false, why: "adam's scratch projects, publish_scratch and repository creation: the benchmark always names a repository" },
   'The work environment': { shared: false, why: "adam's devcontainer environment, rebuild_environment and the obscura browser; OpenCode runs in the task's own container" },
   'A missing toolchain': { shared: true, owner: true, why: 'what to do when the environment lacks a toolchain, and when a project tool only needs its dependencies installed' },

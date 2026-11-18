@@ -40,7 +40,7 @@ use super::{Outcome, ToolEnv, non_empty, output, run_error};
 /// worktree with a command, use run; to change code, write_file, edit_file or
 /// apply_patch). Use it to look; use run_checks only for the project's real checks. Long output is
 /// kept: you get its head and tail and an id to read the rest with read_output.
-#[tool(label = "Run a command", icon = "execute")]
+#[tool(label = "Run a command", icon = "execute", access = super::access::runs_a_command)]
 pub async fn run_command(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

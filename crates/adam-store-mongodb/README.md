@@ -27,9 +27,13 @@ accept the poll latency.
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
 * `MongoStore::database()`, `SCHEMA_VERSION` (3).
 * `codec::{json_to_bson, bson_to_json, encode_key, decode_key}`: the reversible key escaping
-  (`$ref`, dotted, empty keys, NUL) applied to run state. Ordinary keys are
-  stored verbatim, so `state.messages.0.role` is still a valid query path.
-* The `Store` implementation: call `migrate()` once at boot.
+  (`$ref`, dotted, empty keys, NUL). Ordinary keys are stored verbatim, so
+  `state.messages.0.role` is still a valid query path. The store replaces a NUL with U+FFFD before
+  the codec (`adam_core::storable`), so the NUL escape is for data written before ADR 0051 and for
+  direct users of the codec.
+* The `Store` implementation: call `migrate()` once at boot. It replaces a NUL
+  with U+FFFD before the codec (`adam_core::storable`), as every adapter does
+  ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
 
 ```rust
 use std::sync::Arc;
@@ -42,7 +46,9 @@ let store: DynStore = Arc::new(store);
 
 Every operation is a single-document atomic write, so a standalone `mongod`
 is enough (no multi-document transactions). Integers above `i64::MAX` are
-rejected with `StoreError::InvalidInput`. Time is truncated to milliseconds.
+rejected with `StoreError::InvalidInput`. A NUL in a string or a key is stored
+as U+FFFD (`adam_core::storable`), as in every adapter. Time is truncated to
+milliseconds.
 The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
 *Unverified:* the "MongoDB 5.0+" floor is the oldest server CI runs against

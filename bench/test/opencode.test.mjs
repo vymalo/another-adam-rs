@@ -69,6 +69,15 @@ test('the command: the config from stdin, OpenCode in the background under a TER
   assert.doesNotMatch(script, /--dir|echo \$\? >|\/exit\b/);
 });
 
+test('the run and the export give OpenCode a home of the run\'s own: HOME and the three XDG directories', () => {
+  const scripts = [opencodeRunScript(paths), opencodeExportScript({ bin: paths.bin, out: paths.out, sessionId: 'ses_abc123XYZ' })];
+  for (const script of scripts) {
+    assert.match(script, /export HOME=\/bench\/out\/home XDG_DATA_HOME=\/bench\/out\/home\/data XDG_CONFIG_HOME=\/bench\/out\/home\/config XDG_CACHE_HOME=\/bench\/out\/home\/cache/);
+    assert.match(script, /mkdir -p "\$HOME" "\$XDG_DATA_HOME" "\$XDG_CONFIG_HOME" "\$XDG_CACHE_HOME"/);
+    assert.doesNotMatch(script, /HOME=\/(?:\s|$)/, 'HOME is never the image\'s /');
+  }
+});
+
 test('the command takes only plain paths and a plain run id', () => {
   assert.throws(() => opencodeRunScript({ ...paths, run: "x'; rm -rf /; '" }), /plain/);
   assert.throws(() => opencodeRunScript({ ...paths, dir: '/work; rm' }), /plain/);
@@ -108,7 +117,7 @@ function setup(t, { runResult = { exitCode: 0 }, outFiles = null, refused = [], 
   const stackCalls = [];
   const out = { files: new Map(outFiles ?? [['events.jsonl', Buffer.from(jsonl(EVENTS))], ['stderr.txt', Buffer.from(`warn ${URL}\n`)], ['export.json', Buffer.from(JSON.stringify({ info: { id: 'ses_abc123XYZ', url: URL } }))]]), refused };
   const containers = new FakeContainers({ onRun: (spec) => (spec.script.includes(' run --standalone ') ? runResult : { exitCode: 0 }) });
-  const slotDir = path.join(tmp(t), 'slots', '2');
+  const slotDir = path.join(home, 'slots', '2'); // as Stack.slotDir: a directory of the harness's own home
   const stack = {
     slotDir: () => slotDir,
     workDir: async (slot, dir, o) => stackCalls.push(['workDir', slot, dir, Boolean(o?.remove)]),
@@ -234,6 +243,47 @@ test('run: the container of the task image by digest, the binary read-only, the 
   assert.match(exp.script, /session export --standalone 'ses_abc123XYZ'/);
   assert.equal(exp.network, 'none');
   assert.equal(JSON.parse(exp.input).provider.bench.options.baseURL, URL);
+});
+
+test('run: the image\'s global skill directories are hidden from the clone by an empty read-only directory of the harness\'s own', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  await agent.prepare(ctx);
+  await agent.run(ctx);
+  const spec = containers.runs.find((s) => s.script.includes(' run --standalone '));
+  const mounts = Object.fromEntries(spec.mounts.map((m) => [m.target, m]));
+  for (const target of ['/.claude', '/.opencode']) {
+    const m = mounts[target];
+    assert.ok(m, `${target} is mounted`);
+    assert.equal(m.readOnly, true, `${target} is read-only`);
+    assert.ok(m.source.startsWith(`${agent.home}${path.sep}`), `${target}'s source is the harness's own (${m.source})`);
+    assert.ok(fs.statSync(m.source).isDirectory(), `${target}'s source is a directory`);
+    assert.deepEqual(fs.readdirSync(m.source), [], `${target}'s source is empty`);
+  }
+  assert.ok(!spec.mounts.some((m) => m.target.startsWith('/work/workspaces/oc-r1-a1/demo-1-aaaaaa/')), 'nothing inside the clone is hidden: its own .claude/skills is the repository\'s text');
+});
+
+test('the export container hides the image\'s global skill directories too, and gives OpenCode the run\'s home', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  await agent.prepare(ctx);
+  await agent.run(ctx);
+  const exp = containers.runs.find((s) => s.script.includes('session export'));
+  const mounts = Object.fromEntries(exp.mounts.map((m) => [m.target, m]));
+  for (const target of ['/.claude', '/.opencode']) {
+    assert.ok(mounts[target], `${target} is mounted in the export container`);
+    assert.equal(mounts[target].readOnly, true, `${target} is read-only in the export container`);
+    assert.deepEqual(fs.readdirSync(mounts[target].source), [], `${target}'s source is empty`);
+  }
+  assert.match(exp.script, /export HOME=\/bench\/out\/home XDG_DATA_HOME=\/bench\/out\/home\/data XDG_CONFIG_HOME=\/bench\/out\/home\/config XDG_CACHE_HOME=\/bench\/out\/home\/cache/);
+});
+
+test('prepare: the empty directory mounted over the image\'s globals is made empty again for each attempt', async (t) => {
+  const { agent, ctx, containers } = setup(t);
+  await agent.prepare(ctx);
+  await agent.run(ctx);
+  const source = containers.runs.find((s) => s.script.includes(' run --standalone ')).mounts.find((m) => m.target === '/.claude').source;
+  fs.writeFileSync(path.join(source, 'stale'), 'a killed attempt left this\n');
+  await agent.prepare(ctx);
+  assert.deepEqual(fs.readdirSync(source), [], 'nothing of a previous attempt is left in the directory the run mounts');
 });
 
 test('run: the output is read through the stream reader with named files only, and kept as raw JSON without the run token', async (t) => {

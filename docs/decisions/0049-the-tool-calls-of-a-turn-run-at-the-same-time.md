@@ -191,10 +191,14 @@ stateDiagram-v2
 
 * **Additive:** `Tool::access`, `ToolSource::access`, `ToolAccess`, `Use`, `UseMode`, the `#[tool]` options,
   `FnTool::with_access`, `Ctx::reserve_steps`, `ReservedStep`, `Ctx::step_all`, `LlmAgentBuilder::max_parallel`
-  (slice P4), and later `NotesStore::update`.
+  (slice P4), `NotesStore::update` (slice P8: a lock per run around load, change and save; the coder's read-change-write sites moved to it, and the gates that run alone keep one `load` and one `save`).
 * **Not additive, built in P5 to P7:** `adam_agent_fs::Limits` gained `max_parallel` and `McpSettings` gained `parallel`; `adam_service::WorkerSettings`, `adam_agent::WorkerParts` (and `assemble_with` now delegates to `assemble_limited`) and adam-coder's `WorkerConfig` and `CoderSettings` gained a field; `BuildError` gained the variant `ReservedArgument`; `Conversation` gained `ordered_calls` (emptied once the turn's calls are answered); `Tool` gained the provided method `schema_is_foreign` (an MCP tool's schema is its server's, so a property `after_previous` in it is kept and is no build error; a wrapper must forward it); `ToolCtx::spend_files_of` takes the room for a result's files by compare-and-swap and drops a file that does not fit; the chart renders `MAX_PARALLEL_TOOL_CALLS` only when `config.maxParallelToolCalls` is set; the prompt prefix changed once (the schemas and one sentence of the instructions). **Folder agents:** the MCP calls of one model reply now overlap (`"parallel": false` per server opts out).
 * **Slices P1 to P4 change no behaviour in production:** every first-party tool is `Alone` until its class is declared, so
   the loop runs one call at a time as before. Tests of the loop with declared test tools prove the rest.
+* **A scope is a path as written.** A read through a symlink inside a slot and a write of its target do not conflict,
+  so the order of a model's read-then-edit is not kept across an alias; the read sees one whole file (a write renames
+  a new file over the old) and `after_previous` orders what the model needs ordered. Accepted: resolving every path
+  against the slot would put a file system call in the scheduler.
 * The plan for hooks becomes ADR 0050.
 
 ## Slices
@@ -209,8 +213,8 @@ stateDiagram-v2
 | P5 | `MAX_PARALLEL_TOOL_CALLS`, `limits.max_parallel`, the chart key | built |
 | P6 | `after_previous` | built |
 | P7 | classes of the library tools: MCP, UI, assembly, `read_output` | built (`"parallel": false` per server in `mcp.json`; the thread-tools source stays `Alone`; folder agents' MCP calls now overlap) |
-| P8 | the coder: `NotesStore::update`, the class table, atomic writes | not built |
-| P9 | the batching sentence, the bench pin, calls per turn in the bench | not built |
+| P8 | the coder: `NotesStore::update`, the class table, atomic writes | built (`tests/tool_access.rs` pins the table; `write_file` and `edit_file` were already atomic) |
+| P9 | the batching sentence, the bench pin, calls per turn in the bench | built, except the pin: `bench/pins.json` moves to the coder image of the merge, which does not exist yet |
 | P10 | ADR 0037 decision 4 (`waits`, `held`) so subagent and remote calls join segments | later |
 
 *Unverified:* that GitHub tag `v2.3.0` is byte for byte the published binaries; that a provider requires tool results in call

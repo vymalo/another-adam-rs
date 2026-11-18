@@ -3449,6 +3449,54 @@ async fn a_calls_step_carries_neither_when_the_agent_turns_them_off() {
     );
 }
 
+/// A NUL a tool printed is stored and shown as U+FFFD, in the journaled step and in the model's
+/// message, so a replay shows exactly what the live run showed (ADR 0051).
+#[tokio::test]
+async fn a_nul_in_a_tools_output_is_the_replacement_character_in_the_journal_and_the_message() {
+    let h = Harness::new();
+    let agent = h.agent().tool(Said("search")).build();
+    h.mock
+        .push_tool_calls(vec![call(
+            "c1",
+            "search",
+            json!({"answer": "before\u{0}after"}),
+        )])
+        .push_text("ok");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let state = conversation(&view);
+    let said = state.messages.iter().find_map(|m| match m {
+        Message::Tool { content, .. } => Some(content.as_str()),
+        _ => None,
+    });
+    assert_eq!(said, Some("before\u{FFFD}after"));
+    assert!(
+        !view.state.to_string().contains("\\u0000"),
+        "no NUL in the state: {}",
+        view.state
+    );
+
+    let entry = h
+        .store
+        .journal_get(run, 1)
+        .await
+        .unwrap()
+        .expect("the tool step is journaled");
+    let payload = entry.payload.to_string();
+    assert!(payload.contains("before\u{FFFD}after"), "{payload}");
+    assert!(
+        !payload.contains("\\u0000"),
+        "no NUL in the journal: {payload}"
+    );
+}
+
 /// A tool that says what it is called is labelled so in its step; the model still knows it by its name.
 #[tokio::test]
 async fn a_tools_own_label_is_the_label_of_its_step() {

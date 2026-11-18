@@ -447,7 +447,7 @@ pub(super) async fn at_prepare(
     }
     let run = ctx.root_run_id().to_string();
     let key = slot.dir().to_owned();
-    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     if let Some(note) = notes.repo_references.get(&key) {
         // The call that listed them lists them again, from the record.
         return Ok((note.call_id == ctx.call_id() && !is_empty(note)).then(|| render(&key, note)));
@@ -492,9 +492,10 @@ pub(super) async fn at_prepare(
         },
     };
     let note = fit(&key, note);
-    notes.repo_references.insert(key.clone(), note.clone());
     env.notes
-        .save(&run, &notes)
+        .update(&run, |notes| {
+            notes.repo_references.insert(key.clone(), note.clone());
+        })
         .await
         .map_err(|e| notes_error(&e))?;
     Ok((!is_empty(&note)).then(|| render(&key, &note)))
@@ -884,10 +885,12 @@ pub(super) async fn check_out(
     let commit = match (&pinned, slot.reference()) {
         (Some(pinned), _) => Some(pinned.clone()),
         (None, Some(wt)) => match wt.head_commit().await {
-            Ok(commit) => {
-                record_commit(env, &run, &def.name, &commit).await;
-                Some(commit)
-            }
+            // Of two calls that make the reference at the same time, the first one recorded tells
+            // the commit; the other says nothing, and the commit that stands is the first's.
+            Ok(commit) => match record_commit(env, &run, &def.name, &commit).await {
+                Recorded::Mine | Recorded::Failed => Some(commit),
+                Recorded::Another => None,
+            },
             Err(e) => {
                 tracing::warn!(run, reference = %def.name, error = %e, "cannot read the commit a reference was checked out at");
                 None
@@ -913,19 +916,40 @@ pub(super) async fn check_out(
     Ok(Some(slot))
 }
 
-/// Keep the commit the reference `name` was first read at in the run's notes. A failure is logged and
-/// the reference is read anyway: it is made again at the branch's tip then.
-async fn record_commit(env: &ToolEnv, run: &str, name: &str, commit: &str) {
-    let recorded = async {
-        let mut notes = env.notes.load(run).await?;
-        notes
-            .reference_commits
-            .insert(name.to_owned(), commit.to_owned());
-        env.notes.save(run, &notes).await
-    }
-    .await;
-    if let Err(e) = recorded {
-        tracing::warn!(run, reference = name, error = %e, "cannot record the commit a reference was read at");
+/// Whose commit the notes hold for a reference after [`record_commit`].
+enum Recorded {
+    /// This call's: it is the first read of the reference.
+    Mine,
+    /// Another call's, recorded first: that call tells it.
+    Another,
+    /// The notes could not be written: the reference is read anyway.
+    Failed,
+}
+
+/// Keep the commit the reference `name` was first read at in the run's notes: **the first one
+/// recorded stands**. A failure is logged and the reference is read anyway: it is made again at the
+/// branch's tip then.
+async fn record_commit(env: &ToolEnv, run: &str, name: &str, commit: &str) -> Recorded {
+    let recorded = env
+        .notes
+        .update(run, |notes| {
+            if notes.reference_commits.contains_key(name) {
+                false
+            } else {
+                notes
+                    .reference_commits
+                    .insert(name.to_owned(), commit.to_owned());
+                true
+            }
+        })
+        .await;
+    match recorded {
+        Ok(true) => Recorded::Mine,
+        Ok(false) => Recorded::Another,
+        Err(e) => {
+            tracing::warn!(run, reference = name, error = %e, "cannot record the commit a reference was read at");
+            Recorded::Failed
+        }
     }
 }
 

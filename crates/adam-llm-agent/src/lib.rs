@@ -167,9 +167,10 @@ pub use agent::{
 pub use compaction::{COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize};
 pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, Conversation, LimitHit, LimitKind,
-    MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MESSAGE_KIND,
-    OMITTED_MARKER_PREFIX, PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun,
-    PendingSession, PendingWait, Repeats, STOPPED_BY_THE_PERSON, user_message,
+    MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS,
+    MAX_REPORTED_ROUNDS, MESSAGE_KIND, OMITTED_MARKER_PREFIX, PROTECTED_CONTEXT_KEYS,
+    PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait, Repeats,
+    STOPPED_BY_THE_PERSON, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]

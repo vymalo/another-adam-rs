@@ -60,7 +60,11 @@ const MAX_LISTED: usize = 20;
 /// goes after days with no task in the conversation. Nothing in it reaches a repository unless it
 /// is published to one the person names, with publish_scratch. Tell the person so. Calling it again
 /// with the same name returns the project and what it holds.
-#[tool(label = "Start a scratch project", icon = "file")]
+#[tool(
+    label = "Start a scratch project",
+    icon = "file",
+    parallel = "exclusive"
+)]
 pub async fn start_scratch(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -154,7 +158,11 @@ pub async fn start_scratch(
 /// result says whether the checks you ran on the project still hold for the code in the
 /// repository: if not, run them again in the new slot, then commit_and_push and
 /// open_pull_request with `repo` set to that slot.
-#[tool(label = "Publish a scratch project", icon = "git")]
+#[tool(
+    label = "Publish a scratch project",
+    icon = "git",
+    parallel = "exclusive"
+)]
 pub async fn publish_scratch(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

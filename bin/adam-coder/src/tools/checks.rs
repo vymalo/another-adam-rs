@@ -422,10 +422,11 @@ pub(crate) async fn missing_tool_answer(
     environment: &EnvKind,
 ) -> Result<String, ToolError> {
     let run = ctx.root_run_id().to_string();
-    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    let earlier = notes.record_missing_tool(&ToolEnv::call_key(ctx), &missing.name);
-    env.notes
-        .save(&run, &notes)
+    // Through `update`: `run_command` answers a missing tool here beside the other calls of its turn.
+    let key = ToolEnv::call_key(ctx);
+    let earlier = env
+        .notes
+        .update(&run, |notes| notes.record_missing_tool(&key, &missing.name))
         .await
         .map_err(|e| notes_error(&e))?;
     let install = if earlier == 0 {
@@ -546,7 +547,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 /// check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A
 /// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
 /// cycle, and is for the person to decide.
-#[tool(label = "Run the checks", icon = "execute")]
+#[tool(label = "Run the checks", icon = "execute", parallel = "exclusive")]
 pub async fn run_checks(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -563,6 +564,8 @@ pub async fn run_checks(
         return Ok(ToolOutput::error("command is required"));
     };
     let run = ctx.root_run_id().to_string();
+    // `run_checks` runs alone (ADR 0049): no other call of its turn changes the notes while it holds
+    // them across the whole check, so it reads them once and writes them once.
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
 
     // A repository's worktree or a scratch project: the checks run on either.

@@ -118,14 +118,50 @@ function drainThenCut(req) {
   req.once('close', () => clearTimeout(t));
 }
 
+/** Longest tool name kept, in characters: a name is the upstream's text, and the ledger is not a place for it whole. */
+const MAX_TOOL_NAME = 64;
+
+/** Most tool names kept for one answer: the count is the whole of it, and a name is only for the calls seen first. */
+const MAX_TOOL_NAMES = 64;
+
+/** The tool name of a streamed or plain call, as the ledger keeps it: control and format characters dropped, cut to [`MAX_TOOL_NAME`]. */
+export function toolName(name) {
+  if (typeof name !== 'string') return null;
+  const clean = name.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '').trim();
+  if (clean === '') return null;
+  return clean.length > MAX_TOOL_NAME ? clean.slice(0, MAX_TOOL_NAME) : clean;
+}
+
 /** Reads `data:` lines of an SSE stream and keeps the last non-null `usage`, never the stream. */
 class UsageSniffer {
   constructor() {
     this.decoder = new StringDecoder('utf8');
     this.partial = '';
     this.usage = null;
+    this.callIds = new Map(); // the ids each tool call `index` of the stream has carried: a call is an index, or an id when a gateway gives every call the same index
+    this.callNames = new Map(); // `index:id` (or `index:` when the call carried no id) -> its tool name, when the stream gave one
     this.done = false; // the stream said `[DONE]`: it is over, and the usage it carried is the whole of it
     this.gaveUp = false;
+  }
+
+  /** The tool calls the stream has begun: for each index the distinct ids it carried (a later fragment has none), or one when it carried none. */
+  get toolCalls() {
+    let n = 0;
+    for (const ids of this.callIds.values()) n += Math.max(1, ids.size);
+    return n;
+  }
+
+  /** The names of those calls, in the stream's order, when the stream gave them: one per call. `callNames` is capped at [`MAX_TOOL_NAMES`], so this is too. */
+  get toolNames() {
+    const names = [];
+    for (const [index, ids] of this.callIds) {
+      const keys = ids.size === 0 ? [`${index}:`] : [...ids].map((id) => `${index}:${id}`);
+      for (const key of keys) {
+        const name = this.callNames.get(key);
+        if (name) names.push(name);
+      }
+    }
+    return names;
   }
 
   push(chunk) {
@@ -157,6 +193,30 @@ class UsageSniffer {
     try {
       const chunk = JSON.parse(data);
       if (isObject(chunk) && isObject(chunk.usage)) this.usage = chunk.usage;
+      for (const choice of Array.isArray(chunk?.choices) ? chunk.choices : []) {
+        const calls = choice?.delta?.tool_calls;
+        if (!Array.isArray(calls)) continue;
+        for (const c of calls) {
+          if (!Number.isInteger(c?.index) || c.index < 0) continue;
+          const ids = this.callIds.get(c.index) ?? new Set();
+          const id = typeof c.id === 'string' && c.id !== '' ? c.id : null;
+          if (id) ids.add(id);
+          this.callIds.set(c.index, ids);
+          const name = toolName(c?.function?.name);
+          if (name && this.callNames.size < MAX_TOOL_NAMES) {
+            // A later fragment carries no id: its name (when it repeats one) belongs to the last id of that index.
+            const known = id ?? [...ids].at(-1) ?? '';
+            this.callNames.set(`${c.index}:${known}`, name);
+          }
+          if (id && this.callNames.size < MAX_TOOL_NAMES) {
+            // A name can come before the id it belongs to (a gateway that opens the call, then names it).
+            const pending = this.callNames.get(`${c.index}:`);
+            if (pending && !this.callNames.has(`${c.index}:${id}`)) {
+              this.callNames.set(`${c.index}:${id}`, pending);
+            }
+          }
+        }
+      }
     } catch {
       // not JSON: ignored
     }
@@ -253,7 +313,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
   /** One settlement per call: write the actual cost, free the worst case. `sent` says the request left. */
   function makeSettler({ run, base, worstMicro }) {
     const call = { done: false, sent: false, worstMicro, base, run };
-    call.settle = ({ rawUsage, status, reason, free = false }) => {
+    call.settle = ({ rawUsage, status, reason, free = false, toolCalls, toolNames }) => {
       if (call.done) return false;
       call.done = true;
       let outcome;
@@ -268,6 +328,10 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
           usageMissing: outcome.usageMissing,
           ...(status === undefined ? {} : { status }),
           ...(reason ? { reason } : {}),
+          // How many tool calls the answer asked for (calls per model turn): only when the answer was read.
+          ...(!free && Number.isInteger(toolCalls) ? { toolCalls } : {}),
+          // And their names, for the calls by tool: only the ones the answer named.
+          ...(!free && Array.isArray(toolNames) && toolNames.length > 0 ? { toolNames } : {}),
         });
       } catch {
         // The truth cannot be written: stop serving rather than spend unrecorded.
@@ -314,7 +378,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
         clientGone = true;
         upstreamReq?.destroy();
         sniffer?.end();
-        if (sniffer?.done && sniffer.usage) settle({ rawUsage: sniffer.usage, status: 200 });
+        if (sniffer?.done && sniffer.usage) settle({ rawUsage: sniffer.usage, status: 200, toolCalls: sniffer.toolCalls, toolNames: sniffer.toolNames });
         else settle({ rawUsage: null, reason: 'client_abort' });
         resolve();
       });
@@ -389,7 +453,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
             ur.on('end', () => {
               sniffer.end();
               if (clientGone) return resolve();
-              settle({ rawUsage: sniffer.usage, status });
+              settle({ rawUsage: sniffer.usage, status, toolCalls: sniffer.toolCalls, toolNames: sniffer.toolNames });
               res.end();
               resolve();
             });
@@ -404,13 +468,22 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
             if (clientGone || call.done) return resolve();
             const body = Buffer.concat(chunks);
             let usage = null;
+            let toolCalls;
+            let toolNames;
             try {
               const parsedBody = JSON.parse(body.toString('utf8'));
               if (isObject(parsedBody) && isObject(parsedBody.usage)) usage = parsedBody.usage;
+              const choice = Array.isArray(parsedBody?.choices) ? parsedBody.choices[0] : null;
+              if (isObject(choice?.message) && Array.isArray(choice.message.tool_calls)) {
+                toolCalls = choice.message.tool_calls.length;
+                toolNames = choice.message.tool_calls.map((c) => toolName(c?.function?.name)).filter((n) => n !== null).slice(0, MAX_TOOL_NAMES);
+              } else if (isObject(choice?.message)) {
+                toolCalls = 0;
+              }
             } catch {
               // not JSON: usage stays missing
             }
-            settle({ rawUsage: usage, status });
+            settle({ rawUsage: usage, status, toolCalls, toolNames });
             res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
             res.end(body);
             resolve();

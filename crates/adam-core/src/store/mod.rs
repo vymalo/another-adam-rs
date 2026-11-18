@@ -44,6 +44,7 @@ pub mod memory;
 pub mod push;
 pub mod query;
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -336,8 +337,9 @@ pub enum StoreError {
         /// The step name the code asked for.
         requested: String,
     },
-    /// The caller passed data the store cannot hold (a bad table prefix, a NUL in a JSONB
-    /// string, a number beyond the column). The same input never succeeds.
+    /// The caller passed data the store cannot hold (a bad table prefix, a number beyond the
+    /// column). The same input never succeeds. A NUL is not such data: every adapter replaces it
+    /// with U+FFFD before it writes ([`storable`]).
     #[error("invalid input: {0}")]
     InvalidInput(String),
     /// Data read back from the store breaks an invariant (an unknown status, a negative
@@ -401,6 +403,10 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// Implementations must be safe to share between many workers, processes and
 /// machines pointing at the same database. The `adam-store-testkit` crate
 /// provides a conformance suite every implementation should pass.
+///
+/// Every JSON value a method writes is passed through [`storable`] first (a NUL in a string or a
+/// key becomes U+FFFD), and the method returns the value it stored, so the same run reads the same
+/// bytes on every backend and a tool that printed a NUL does not fail it.
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
     /// Create tables/collections and indexes. Idempotent and safe to call
@@ -453,6 +459,10 @@ pub trait Store: Send + Sync + 'static {
     /// `now + ttl`, earliest `sched_at` first. A run is claimable when it is
     /// due (`sched_at <= now`) and has no unexpired lease. Concurrent callers
     /// never receive the same run while its lease is valid.
+    ///
+    /// The record returned may be read after the lease was set, so it can be newer than what
+    /// the claim matched, terminal included ([`Store::commit_run`] does not touch the lease).
+    /// A caller must not step a returned run that is not open.
     ///
     /// `scope` decides whose runs are claimable (see [`ClaimScope`]): with
     /// [`ClaimScope::Pinned`] a run that another worker owns is skipped, and
@@ -600,6 +610,85 @@ pub fn now() -> DateTime<Utc> {
     truncate_ms(Utc::now())
 }
 
+/// A JSON value as **every** store keeps it: the NUL character (`\u{0}`) in a string or an object
+/// key becomes U+FFFD, the replacement character.
+///
+/// PostgreSQL's `JSONB` cannot hold a NUL at all, and a value that one backend kept while another
+/// refused it would make a run's bytes depend on the store behind it. Every adapter applies this
+/// one rule before it writes a state, a journal payload or a push configuration, and returns what
+/// it stored, so a tool that printed a NUL (a command's output, an MCP result) neither fails the
+/// run nor replays differently ([ADR 0051](../../../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
+/// Borrowed when there is nothing to replace, so the common path copies nothing.
+pub fn storable(value: &Value) -> Cow<'_, Value> {
+    if !holds_a_nul(value) {
+        return Cow::Borrowed(value);
+    }
+    let mut owned = value.clone();
+    replace_nul(&mut owned);
+    Cow::Owned(owned)
+}
+
+/// [`storable`]'s rule for a single string: a NUL becomes U+FFFD, borrowed when there is none.
+pub fn storable_text(text: &str) -> Cow<'_, str> {
+    if text.contains('\u{0}') {
+        Cow::Owned(text.replace('\u{0}', "\u{FFFD}"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// [`storable`] for a value the caller already owns: the same rule, with no clone on either path
+/// (a clean value is returned as it is; a dirty one is changed in place).
+pub fn storable_owned(mut value: Value) -> Value {
+    if holds_a_nul(&value) {
+        replace_nul(&mut value);
+    }
+    value
+}
+
+/// Whether `value` holds a NUL in a string or a key, at any depth.
+fn holds_a_nul(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains('\u{0}'),
+        Value::Array(items) => items.iter().any(holds_a_nul),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key.contains('\u{0}') || holds_a_nul(value)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// Replace every NUL of `value` with U+FFFD, in strings and in keys.
+fn replace_nul(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            if let Cow::Owned(clean) = storable_text(text) {
+                *text = clean;
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(replace_nul),
+        Value::Object(map) => {
+            if map.keys().any(|key| key.contains('\u{0}')) {
+                let old = std::mem::take(map);
+                let mut new = serde_json::Map::with_capacity(old.len());
+                for (key, mut value) in old {
+                    replace_nul(&mut value);
+                    let key = if key.contains('\u{0}') {
+                        key.replace('\u{0}', "\u{FFFD}")
+                    } else {
+                        key
+                    };
+                    new.insert(key, value);
+                }
+                *map = new;
+            } else {
+                map.values_mut().for_each(replace_nul);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 /// `now + ttl`, truncated to milliseconds.
 pub fn add_ttl(now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
     let ttl = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX);
@@ -619,6 +708,7 @@ pub fn open_conversation_key(agent: &str, conversation_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn run() -> RunId {
         RunId(Uuid::nil())
@@ -695,6 +785,32 @@ mod tests {
                 false, false, true, false, false, false, false, true, false, false
             ]
         );
+    }
+
+    #[test]
+    fn a_value_without_a_nul_is_borrowed_and_unchanged() {
+        let value = json!({"text": "a\u{1}b", "nested": [1, true, null]});
+        assert!(matches!(storable(&value), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(storable(&value).as_ref(), &value);
+    }
+
+    #[test]
+    fn every_nul_in_a_string_a_key_and_at_any_depth_becomes_the_replacement_character() {
+        let value = json!({
+            "text": "a\u{0}b",
+            "nested": [{"deep": "x\u{0}\u{0}y"}],
+            "k\u{0}ey": 1,
+            "\u{0}": "\u{0}",
+            "number": 1,
+        });
+        let want = json!({
+            "text": "a\u{FFFD}b",
+            "nested": [{"deep": "x\u{FFFD}\u{FFFD}y"}],
+            "k\u{FFFD}ey": 1,
+            "\u{FFFD}": "\u{FFFD}",
+            "number": 1,
+        });
+        assert_eq!(storable(&value).into_owned(), want);
     }
 
     #[test]

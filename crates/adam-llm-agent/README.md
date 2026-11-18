@@ -459,7 +459,7 @@ parks the run and returns.
 | Tool | Arguments | Result |
 |---|---|---|
 | `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working |
-| `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered"}`; an error result when the session is closed |
+| `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered" \| "queued"}` (`queued`: the round's agent says in its state, `queues_messages: true`, that it keeps the message until its remote can take it); an error result when the session is closed |
 | `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line, `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works |
 | `subagent_close` | `session`, `cancel` (default `false`) | `{"session", "state": "closed"}` |
 | `subagent_list` | `offset`, `limit` | one line per session, working then idle then closed, paged |
@@ -472,19 +472,43 @@ parks the run and returns.
   `subagent_send`, whose round **continues the session's conversation** (round 2 sees round 1). Closing an idle session starts a
   round that calls no model and ends with the last answer again; closing a working one leaves the round to finish (the
   session takes no more messages) unless `cancel: true`, which stops it. A closed session is never reopened. A remote
-  (`a2a:`) subagent is refused in words (use its own tool).
+  (`a2a:`) subagent works like any other: `SessionAgent::remote` only says it is one, and its rounds are runs of the agent
+  registered under `SessionAgent::agent`, which `adam-assembly` makes (`RemoteRoundAgent`). `subagent_send` reads
+  `queues_messages` from such a round's state to say `queued` instead of `steered`.
 * **Waiting.** `subagent_read` with `wait: true` and a working round returns `ToolError::AwaitSession`: the loop parks with a
   `PendingWait::Session` and the `wait_poll` timer. The round's end wakes the run (a notice), and what it does on waking is
   ask the tool how the session stands (`Tool::poll_remote`, the session id as the `task`) in a journaled step `poll:<call id>`,
   so the report comes from the store (Rule 5), and a lost or duplicated notice changes nothing. The description tells the model
   to wait instead of polling: three reads without `wait` that all say "working" meet the repeated-call rule on the third.
-* **The turn-end wait.** When the model answers with no tool call while a session this run started still works, the run does not
-  end: a journaled step `sessions:<turn>` (only when the history holds a `subagent_start` or `subagent_send` call) finds it,
+* **The turn-end wait.** When the model answers with no tool call while a session this run started still works, or a round ended
+  and was not reported, the run does not
+  end: a journaled step `sessions:<turn>` (only when the history holds a `subagent_start` or `subagent_send` call, or a listing
+  saw a session open: `Conversation::sessions_open`) finds it,
   and the turn goes on with a call to `subagent_read` with `wait: true`, id `wait_<turn>` (every id the loop invents matches `^[a-zA-Z0-9_-]{1,64}$`), appended to the model's own message
   (its words stay). The report then reaches the model, which is called again. **A round that only closes a session is not
   work** (`SessionSummary::closing`): it calls no model and reports nothing new, so the run neither waits for it here (it would
   read the last report again and ask the model once more) nor cancels it when it ends. Not done at a limit turn, or at
   `max_tool_calls`.
+* **Reports during a turn (slice 3).** A round that ended while the model worked is told to it by its next call, with no read of
+  its own. Inside the journaled step `model:<turn>` (no new step) the loop lists the sessions (`ChildStarter::sessions`) and reads
+  each **due** round through the read tool's `poll_remote`. A session's report is of **the latest round that worked** (`SessionSummary::report`:
+  a closing round that follows does not hide it, and a round a later round replaced before the parent looked is not reported on its own, and a round cancelled by the close that follows it is not reported: whoever closed the session knows). It is
+  due when that round has ended, is not in `Conversation::reported_rounds` (the last `MAX_REPORTED_ROUNDS` = 128, carried by
+  `Conversation::continued`) and its call id `report_<32 hex>` is not already in the history (a round the cap gave up is not told twice), and
+  either this run started it or a person did **after the chain of tasks began** (`Conversation::chain_started`, set at the run's first model call and
+  carried: a task that does not continue another does not re-tell a person's old round). A person's report says "started by the person" in
+  its header and holds none of the person's words. The request ends with one assistant message of `subagent_read` calls and their results; the
+  record of the call holds them (`Recorded::reports`, with `sessions_open`, both absent when empty), so a replay gives the model the
+  same words and every request starts with the one before it. The loop lists at the first model call of a run and, while
+  `Conversation::sessions_open` is set, before every call; it stays set while a due report was not appended (a failed or erroring read, a
+  stale answer). The tokens of the rounds are counted (`usage:<call>`) whenever a record holds reports, **whether or not the history takes them**
+  (an answer that predates a message is dropped with its reports, which the next call finds again), so the steps of a replay do not depend on it. The appended reads are
+  not calls of the model: they do not count toward `max_tool_calls` or `doom_loop` and are added only when no result is owed, never
+  inside a segment. A notice stays a wake-up (a lost one costs at most one turn, a copy matches nothing). `LlmAgentBuilder::without_session_reports`
+  (hidden) builds the agent as one from before, for the tests that replay such a journal and count a round nobody read. **Unverified risks:**
+  the appended assistant message carries no reasoning (a model with `echo_reasoning` may expect it); a history can hold two assistant messages in a
+  row (the turn-end read is attached to the answer, but a report appended after an unsent answer is not); the listing runs inside `model:<turn>` before
+  the call with no time limit of its own; the step events of the appended reads are emitted after the answer has streamed.
 * **Tokens.** Every round a run started or sent to is counted **once** in its `usage_totals`, whether its report is read once,
   twice or never. `Conversation::rounds_started` lists the call ids (`subagent_start`, `subagent_send`) whose round is not yet
   counted; the round of a call is `child_run_id(run, call id)`. The read of a round's state is the journaled step
@@ -496,8 +520,8 @@ parks the run and returns.
 * **Limits (until their slice makes them settings).** At most `MAX_OPEN_SESSIONS` (16) sessions that are not closed per
   conversation and `MAX_SESSION_ROUNDS` (20) rounds per session, a close included: the smallest hard bounds that keep a model
   from starting rounds without end.
-* **Not here yet** (slices 3 to 8): a report that reaches the model in the middle of a turn without a read, the session limits as
-  settings, remote sessions, the A2A extension, the coder's kept-open helpers, a child that asks the person.
+* **Not here yet** (slices 4 to 8): the session limits as
+  settings, the A2A extension, the coder's kept-open helpers, a child that asks the person.
 
 * **Effects are committed first.** A turn that calls `subagent_start`, `_send` or `_close` is committed before the call runs, and
   each such call is its own transition, so a failed try never asks the model again (new call ids would start a second session)
@@ -512,6 +536,13 @@ parks the run and returns.
   `prompt` and `message` are at most `MAX_TEXT_CHARS`.
 * **Retention.** A session lives as its rounds: `purge_finished` must outlast a session's idle life, and a purged first round makes the
   session vanish ("no session").
+
+**Breaking (slice 3):** `Conversation` has `reported_rounds`, `sessions_open` and `chain_started`: a struct literal of it without
+`..Default::default()` stops compiling; `adam_runtime::SessionSummary` has a `report` field (type `ReportRound`), so a literal of it does too. No
+`Store` or trait method is added and no step changes name. A journal that is **committed** from before slice 3 replays as it was. **No mixed
+versions**, as for slice 2: a transition in flight when a worker of the other revision takes the run can replay differently (the steps taken
+follow the build that replays), so stop every worker of the old revision before a run uses sessions; an old build ignores the new members of
+`model:<turn>` and of the state and replays without the reports.
 
 **Breaking:** `PendingWait` has a new variant (`Session`; a `match` with no wildcard stops compiling), `ToolOutput` has a field
 (`reported`: build it with its constructors), `Conversation` has `rounds_started` and the journal has the steps `sessions:<turn>` and `sessions_end:<turn>` for a run that
@@ -731,6 +762,11 @@ failure reported under another id, and only the kept try's call in the totals. `
 that reported nothing writes no `sandbox_usage` and a state from before it loads; a call that ended in a `Permanent` error is counted; a
 call that failed transiently is not counted twice; **a call whose result the journal holds is not made again and counts what its record
 says**; and a subagent's commands are added to its parent's.
+
+`tests/sessions.rs` is the child-session suite (the five tools, the turn-end wait and, since slice 3, the reports told to the model
+during a turn: a report mid-turn, during the final call, with a lost or a repeated notice, a person's round, a replay and a journal
+from before), run against the same three stores and without fixed sleeps. `src/agent.rs` pins the record's `reports` and
+`sessions_open`; `src/sessions.rs` pins the rule that makes a round due.
 
 `tests/child_runs.rs` is the child-run suite (one case per failure interleaving, see *Child runs*), run against
 `MemoryStore` always, against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set and against MongoDB when

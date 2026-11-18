@@ -1534,7 +1534,7 @@ async fn view_after(
 /// outside the run; the person cannot reach it, and nothing is published. Without a pod, all runs of
 /// the worker share one network, so pick an unusual port. For a command that ends by itself use run;
 /// for the project's checks, run_checks. Example: {"command":"npm run dev","wait_for":"ready"}
-#[tool(label = "Start a command that keeps running", icon = "execute")]
+#[tool(label = "Start a command that keeps running", icon = "execute", access = super::access::makes_files_with_a_command)]
 pub async fn start_command(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -1764,7 +1764,7 @@ pub async fn start_command(
 /// ended and the last 4 KiB of its output, and the id still reads the rest with read_output. It is
 /// safe to call again: for a command that has ended it says how it ended. Example:
 /// {"id":"o-3f9c2a17b0d4e8a1"}
-#[tool(label = "Stop a command", icon = "execute")]
+#[tool(label = "Stop a command", icon = "execute", access = super::access::stops_a_command)]
 pub async fn stop_command(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -1948,7 +1948,7 @@ async fn remote_view(env: &ToolEnv, run: &str, id: &str, record: &Record) -> Str
 /// List the commands this task started with start_command, in the order they started: each one's
 /// id, whether it runs or how it ended, the lines of output it has, its slot and the command. Read
 /// the output of one with read_output.
-#[tool(label = "List the commands", icon = "execute")]
+#[tool(label = "List the commands", icon = "execute", access = super::access::lists_the_commands)]
 pub async fn list_commands(env: State<ToolEnv>, ctx: &ToolCtx) -> Outcome {
     let run = ctx.root_run_id().to_string();
     let stale = stale_after(env.settings.background_sweep);

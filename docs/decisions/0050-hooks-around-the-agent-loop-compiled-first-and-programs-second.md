@@ -398,3 +398,9 @@ step that part changes. Hooks are tested with concurrent tool calls from H1 on.
 
 `permission.ask`, a deciding point on the `ask` of ADR 0039's rules, comes with those rules (ADR 0039 slice 5) and is
 added here by a dated note when they are built.
+
+*Amended 2026-11-18 (ADR 0045 slice 3, which reports to the model a session round that ended, is built; no hook is):* the reports a model call is given are
+appended **inside the step `model:<turn>`** and recorded in its record, so `model:<turn>` holds what decision 9 puts there for `message.received` and the
+reports of ADR 0045. When both exist, the message verdict is applied first, then the reports. A report is not a message, so `message.received` is not asked
+about it. A report that keeps a turn going is a read of `wait_<turn>` made after `sessions:<turn>`, so `end:<turn>` comes after `sessions:<turn>` and is not
+taken when a report keeps the turn going: a hook never sees an end that is taken back. No step name changes.

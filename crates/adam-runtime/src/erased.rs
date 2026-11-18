@@ -29,6 +29,7 @@ pub(crate) trait ErasedStarter: Send + Sync {
 #[async_trait]
 pub(crate) trait ErasedAgent: ErasedStarter {
     async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError>;
+    async fn on_cancelled(&self, run: RunId, state: Value);
 }
 
 pub(crate) struct Erased<A>(pub A);
@@ -134,6 +135,10 @@ impl<A: Agent> ErasedAgent for Erased<A> {
                 error,
             },
         })
+    }
+
+    async fn on_cancelled(&self, run: RunId, state: Value) {
+        self.0.on_cancelled(run, state).await;
     }
 }
 

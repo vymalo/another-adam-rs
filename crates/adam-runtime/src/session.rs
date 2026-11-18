@@ -250,6 +250,43 @@ pub struct SessionSummary {
     pub closing: bool,
     /// The run that started the latest round: the parent run of that round.
     pub started_by: Option<RunId>,
+    /// The round whose report the session has: the latest one that worked (a closing round has
+    /// none), which is the latest round itself unless a closing round follows it.
+    pub report: ReportRound,
+}
+
+/// The round a session's report is of ([`SessionSummary::report`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportRound {
+    /// Its run: what a report names it by ([`SessionView::report_run`]).
+    pub run: RunId,
+    /// Whether it has ended.
+    pub ended: bool,
+    /// Whether it was cancelled (`Runtime::cancel`, or a close with cancel).
+    pub cancelled: bool,
+    /// The run that started it: its parent run.
+    pub started_by: Option<RunId>,
+    /// When it was last updated.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ReportRound {
+    fn of(run: &RunRecord) -> Self {
+        Self {
+            run: run.id,
+            ended: !run.status.is_open(),
+            cancelled: ChildStatus::from_record(run)
+                .error
+                .is_some_and(|e| e.starts_with("cancelled:")),
+            started_by: run.parent_id,
+            updated_at: run.updated_at,
+        }
+    }
+
+    /// Whether a person started it and not a run of an agent: a round that is its own parent.
+    pub fn started_outside_a_run(&self) -> bool {
+        self.started_by == Some(self.run)
+    }
 }
 
 impl SessionSummary {
@@ -344,10 +381,21 @@ pub(crate) fn page_of_sessions(
             let id = session_of(parent_conversation, &conversation_id)?;
             // Round 1 is the run whose id is the session id, started as a child.
             runs.iter().find(|r| r.id == id && r.parent_id.is_some())?;
-            let mut runs: Vec<RunRecord> = ordered(runs).into_iter().map(|(r, _)| r).collect();
+            let mut runs = ordered(runs);
             let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
-            let latest = runs.pop()?;
+            let (latest, _) = runs.pop()?;
+            // The report is of the newest round that worked: all of them but a closing one.
+            let worked = runs
+                .iter()
+                .rev()
+                .find(|(_, h)| !h.as_ref().is_some_and(|h| h.closing))
+                .map_or(&latest, |(r, _)| r);
             let read = read_latest(&latest);
+            let report = if read.header.as_ref().is_some_and(|h| h.closing) {
+                ReportRound::of(worked)
+            } else {
+                ReportRound::of(&latest)
+            };
             Some(SessionSummary {
                 id,
                 agent,
@@ -366,6 +414,7 @@ pub(crate) fn page_of_sessions(
                 closed: read.closed,
                 closing: read.header.as_ref().is_some_and(|h| h.closing),
                 started_by: latest.parent_id,
+                report,
             })
         })
         .collect();

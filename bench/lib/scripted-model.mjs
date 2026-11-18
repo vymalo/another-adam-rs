@@ -26,6 +26,13 @@ export function createScriptedModel(initial = {}) {
     endlessChunkBytes: 100,
     endlessEveryMs: 5,
     holdBeforeDoneMs: 0, // the usage chunk is sent, then this long passes before `[DONE]` (a client that aborts in it aborts before the end)
+    toolCalls: 0, // an answer that asks for this many tool calls at once (a number above 0), whatever the script says
+    toolNames: null, // the names those calls carry, in order (cycled when shorter than `toolCalls`); `probe` when absent
+    splitToolCalls: false, // a stream sends each tool call in a chunk of its own and the rest of its arguments in another, as OpenAI does
+    sameIndexToolCalls: false, // a stream gives every tool call the index 0 and tells them apart by their ids, as some gateways do
+    noToolCallIds: false, // a stream's tool calls carry no `id`, only their index
+    nameBeforeId: false, // a stream opens each tool call with its name, then sends its id and arguments
+    okBody: null, // a 200 plain answer with exactly this body (a string), not a completion
     holdAfterDoneMs: 0, // a stream ends this long after `[DONE]` (a client that closes at `[DONE]` closes first)
     ...initial,
   };
@@ -70,9 +77,14 @@ export function createScriptedModel(initial = {}) {
           res.writeHead(behavior.status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text), ...behavior.errorHeaders });
           return res.end(text);
         }
+        if (typeof behavior.okBody === 'string' && body?.stream !== true) {
+          res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(behavior.okBody) });
+          return res.end(behavior.okBody);
+        }
         const base = { id: 'chatcmpl-scripted', object: 'chat.completion', created: 1, model: body?.model ?? 'unknown' };
         const turn = behavior.script === 'agents' ? nextTurn(body) : null;
-        const toolCall = turn?.tool ? [{ id: turn.tool.id, type: 'function', function: { name: turn.tool.name, arguments: JSON.stringify(turn.tool.args) } }] : null;
+        const several = behavior.toolCalls > 0 ? Array.from({ length: behavior.toolCalls }, (_, i) => ({ id: `call-${i + 1}`, type: 'function', function: { name: behavior.toolNames?.[i % behavior.toolNames.length] ?? 'probe', arguments: JSON.stringify({ n: i + 1 }) } })) : null;
+        const toolCall = turn?.tool ? [{ id: turn.tool.id, type: 'function', function: { name: turn.tool.name, arguments: JSON.stringify(turn.tool.args) } }] : several;
         if (body?.stream !== true) {
           const message = toolCall ? { role: 'assistant', content: null, tool_calls: toolCall } : { role: 'assistant', content: turn ? turn.text : 'done'.padEnd(behavior.padBytes, 'x') };
           const out = { ...base, choices: [{ index: 0, message, finish_reason: toolCall ? 'tool_calls' : 'stop' }] };
@@ -84,8 +96,32 @@ export function createScriptedModel(initial = {}) {
           if (!res.writableFinished) stats.aborted += 1;
         });
         const chunk = (choice) => ({ ...base, object: 'chat.completion.chunk', choices: [{ index: 0, ...choice }], usage: null });
+        const toolCallFrames = (given) => {
+          const calls = behavior.noToolCallIds ? given.map(({ id, ...c }) => c) : given;
+          if (behavior.nameBeforeId) {
+            // A gateway that opens the call with its name, then sends its id and arguments.
+            return calls.flatMap((c, n) => {
+              const index = behavior.sameIndexToolCalls ? 0 : n;
+              return [
+                chunk({ delta: { ...(n === 0 ? { role: 'assistant' } : {}), tool_calls: [{ index, function: { name: c.function.name } }] } }),
+                chunk({ delta: { tool_calls: [{ index, id: c.id, type: c.type, function: { arguments: c.function.arguments } }] } }),
+              ];
+            });
+          }
+          return behavior.splitToolCalls
+            ? calls.flatMap((c, n) => {
+                const index = behavior.sameIndexToolCalls ? 0 : n;
+                const args = c.function.arguments;
+                const half = Math.ceil(args.length / 2);
+                return [
+                  chunk({ delta: { ...(n === 0 ? { role: 'assistant' } : {}), tool_calls: [{ index, id: c.id, type: c.type, function: { name: c.function.name, arguments: args.slice(0, half) } }] } }),
+                  chunk({ delta: { tool_calls: [{ index, function: { arguments: args.slice(half) } }] } }),
+                ];
+              })
+            : [chunk({ delta: { role: 'assistant', tool_calls: calls.map((c, n) => ({ index: behavior.sameIndexToolCalls ? 0 : n, ...c })) } })];
+        };
         const frames = toolCall
-          ? [chunk({ delta: { role: 'assistant', tool_calls: toolCall.map((c, index) => ({ index, ...c })) } }), chunk({ delta: {}, finish_reason: 'tool_calls' })]
+          ? [...toolCallFrames(toolCall), chunk({ delta: {}, finish_reason: 'tool_calls' })]
           : turn
             ? [chunk({ delta: { role: 'assistant', content: turn.text } }), chunk({ delta: {}, finish_reason: 'stop' })]
             : [chunk({ delta: { role: 'assistant', content: 'do' } }), chunk({ delta: { content: 'ne' }, finish_reason: 'stop' })];

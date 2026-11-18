@@ -270,7 +270,9 @@ pub(super) async fn at_prepare(
 ) -> Result<Option<String>, ToolError> {
     let run = ctx.run_id().to_string();
     let key = slot.dir().to_owned();
-    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    // `prepare_workspace` runs alone, so nothing changes the notes while this reads them; the write
+    // below still goes through `update`, as every write of the notes that a tool makes does.
+    let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     if !notes.may_show_instructions(&key, ctx.call_id()) {
         return Ok(None);
     }
@@ -283,13 +285,34 @@ pub(super) async fn at_prepare(
     }
     // Scrubbed before it is cut: a secret cut in half would escape the layer that scrubs the result.
     let text = found.text.as_deref().map(|t| ctx.scrub(t));
-    if notes.record_instructions_shown(&key, ctx.call_id()) {
-        env.notes
-            .save(&run, &notes)
-            .await
-            .map_err(|e| notes_error(&e))?;
+    // Claimed in one step: of two calls of one turn that read in this repository at the same time,
+    // the one that gets here first shows the text, and the other shows nothing.
+    let call = ctx.call_id();
+    let mine = env
+        .notes
+        .update(&run, |notes| {
+            let mine = notes.may_show_instructions(&key, call);
+            if mine {
+                notes.record_instructions_shown(&key, call);
+            }
+            mine
+        })
+        .await
+        .map_err(|e| notes_error(&e))?;
+    if !mine {
+        return Ok(None);
     }
     Ok(Some(render(found, text, "", slot.dir(), ROOT_CAP)))
+}
+
+/// What a call may do with the instruction file below a directory: see [`nested`].
+enum Claim {
+    /// Show the file; it is recorded as shown by this call.
+    Show,
+    /// The cap of shown files is reached: say so (this call is the one that says it).
+    CapLine,
+    /// Another call has it, or the cap line is another call's.
+    Nothing,
 }
 
 /// What the path of a read call names.
@@ -386,7 +409,7 @@ async fn nested(
         return Ok(None);
     }
     let run = ctx.run_id().to_string();
-    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     let call = ctx.call_id();
     let candidates: Vec<PathBuf> = dirs
         .into_iter()
@@ -410,31 +433,38 @@ async fn nested(
     let key = format!("{}/{dir}", slot.dir());
     // A run is shown a few files below the roots, not every one a repository has: past the cap
     // one line says so, once, and the files stay readable.
-    if !notes.instructions_shown.contains_key(&key) && notes.nested_cap_reached() {
-        if notes
-            .instructions_cap_noted
-            .as_deref()
-            .is_some_and(|c| c != call)
-        {
-            return Ok(None);
+    // Decided and recorded in one step, so that calls of one turn that read below the same directory
+    // at the same time show its file once, and the cap holds.
+    let claim = env
+        .notes
+        .update(&run, |notes| {
+            if !notes.instructions_shown.contains_key(&key) && notes.nested_cap_reached() {
+                match notes.instructions_cap_noted.as_deref() {
+                    Some(c) if c != call => Claim::Nothing,
+                    Some(_) => Claim::CapLine,
+                    None => {
+                        notes.instructions_cap_noted = Some(call.to_owned());
+                        Claim::CapLine
+                    }
+                }
+            } else if notes.may_show_instructions(&key, call) {
+                notes.record_instructions_shown(&key, call);
+                Claim::Show
+            } else {
+                Claim::Nothing
+            }
+        })
+        .await
+        .map_err(|e| notes_error(&e))?;
+    match claim {
+        Claim::Nothing => return Ok(None),
+        Claim::CapLine => {
+            return Ok(Some(format!(
+                "Further project instruction files exist below the root and are not shown (a run is \
+                 shown {MAX_NESTED_INSTRUCTIONS}): read them with read_file."
+            )));
         }
-        if notes.instructions_cap_noted.is_none() {
-            notes.instructions_cap_noted = Some(call.to_owned());
-            env.notes
-                .save(&run, &notes)
-                .await
-                .map_err(|e| notes_error(&e))?;
-        }
-        return Ok(Some(format!(
-            "Further project instruction files exist below the root and are not shown (a run is \
-             shown {MAX_NESTED_INSTRUCTIONS}): read them with read_file."
-        )));
-    }
-    if notes.record_instructions_shown(&key, call) {
-        env.notes
-            .save(&run, &notes)
-            .await
-            .map_err(|e| notes_error(&e))?;
+        Claim::Show => {}
     }
     // A very long path would be written three times into the result: the file is left to be read.
     if paging::escape_name(format!("{dir}/{}", found.name).as_bytes()).len() > MAX_PATH_BYTES {

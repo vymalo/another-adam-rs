@@ -15,7 +15,7 @@ a2a = ["dep:adam-a2a"]
 # Dev reload: watch the agent directory and swap the agents when a file changes (`LiveAssembly`).
 # Off by default, so a release build cannot watch and reload prompts unless it opts in (reading a
 # folder once, at startup, needs no feature: `AgentFolder`). The only feature that brings `notify`.
-dev = ["dep:notify", "dep:adam-core"]
+dev = ["dep:notify"]
 # `mcp.json` tools (`AgentDef::connect_mcp`): connect to the MCP servers an agent's files name and
 # give the agent their tools. Off by default: it brings the MCP client and can start processes.
 mcp = ["dep:adam-mcp"]
@@ -27,19 +27,21 @@ a2a-client-lf.workspace = true
 a2a-lf.workspace = true
 adam-a2a = { path = "../adam-a2a", version = "0.1.0", optional = true }
 adam-agent-fs.workspace = true
-adam-core = { workspace = true, optional = true }
+adam-core.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true
 adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 notify = { workspace = true, optional = true }
 reqwest.workspace = true
 secrecy.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 url.workspace = true
 
@@ -49,7 +51,6 @@ url.workspace = true
 adam-agent-fixture = { path = "../adam-agent-fixture" }
 # The in-process A2A server the remote-subagent tests talk to.
 adam-a2a = { path = "../adam-a2a", version = "0.1.0", features = ["test-util"] }
-adam-core.workspace = true
 adam-error.workspace = true
 # The MCP server the tests talk to (over HTTP: another package's binary is not available here).
 adam-mcp-testkit = { path = "../adam-mcp-testkit" }

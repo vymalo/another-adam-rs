@@ -129,14 +129,14 @@ impl ToolAccess {
     }
 }
 
-/// The scope of a path argument under `base`: `base/<path>` with the path normalised lexically (a
-/// leading `./`, a `.` or an empty component, and a trailing `/` are dropped), and `base` itself
+/// The scope of a path argument under `base`: `base/<path>` with the path trimmed (the tools trim it
+/// before they open it) and normalised lexically (a leading `./`, a `.` or an empty component, and a trailing `/` are dropped), and `base` itself
 /// when there is no path, when it names nothing but the root, when it is absolute, or when it has a
 /// `..` component (it may leave the place the scope names, so it widens to all of `base`).
 ///
 /// What `#[tool(parallel = "read", path = "path")]` uses.
 pub fn path_scope(base: &str, path: Option<&str>) -> String {
-    let Some(path) = path else {
+    let Some(path) = path.map(str::trim) else {
         return base.to_owned();
     };
     if path.starts_with('/') {
@@ -211,5 +211,20 @@ mod tests {
         assert_eq!(path_scope("files", Some("/etc/passwd")), "files");
         assert_eq!(path_scope("files", Some("../a.rs")), "files");
         assert_eq!(path_scope("files", Some("src/../a.rs")), "files");
+    }
+
+    /// The tools trim the path they are given, so `" src/a.rs"` is the file `src/a.rs`: the scope
+    /// must name it too, or a write of one spelling would not wait for a read of the other.
+    #[test]
+    fn a_path_is_trimmed_before_it_names_a_scope() {
+        let plain = ToolAccess::writes_path("files", Some("src/a.rs"));
+        for spelled in [" src/a.rs", "src/a.rs ", "\tsrc/a.rs\n", "  ./src/a.rs  "] {
+            let read = ToolAccess::reads_path("files", Some(spelled));
+            assert_eq!(read, ToolAccess::reads("files/src/a.rs"), "{spelled:?}");
+            assert!(plain.conflicts(&read), "{spelled:?}");
+        }
+        // A blank path names nothing, and an absolute one widens, trimmed or not.
+        assert_eq!(path_scope("files", Some("   ")), "files");
+        assert_eq!(path_scope("files", Some(" /etc/passwd")), "files");
     }
 }

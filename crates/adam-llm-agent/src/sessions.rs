@@ -14,14 +14,17 @@
 //! [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
 
 use crate::access::ToolAccess;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 
 use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionHeader, SessionState,
-    SessionView,
+    SessionSummary, SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -92,8 +95,11 @@ pub struct SessionAgent {
     pub description: String,
     /// The time limit of each of its rounds (`None`: none).
     pub within: Option<Duration>,
-    /// Whether it runs on another system (an A2A agent). A session cannot be started on one yet:
-    /// the call is refused in words that point to the subagent's own tool.
+    /// Whether it runs on another system (an A2A agent). A session on it is started like any
+    /// other: its rounds are runs of the agent registered as [`agent`](Self::agent), which talks
+    /// to the remote. What differs is the answer to a message sent while a round works: such an
+    /// agent says in its round state (`queues_messages`) whether the remote takes the message at
+    /// once (`steered`) or only after its current task (`queued`).
     pub remote: bool,
 }
 
@@ -115,11 +121,7 @@ impl Roster {
     }
 
     fn registered(&self) -> Vec<&str> {
-        self.agents
-            .iter()
-            .filter(|a| !a.remote)
-            .map(|a| a.agent.as_str())
-            .collect()
+        self.agents.iter().map(|a| a.agent.as_str()).collect()
     }
 
     fn by_registered(&self, agent: &str) -> Option<&SessionAgent> {
@@ -165,7 +167,7 @@ impl SessionTools {
         ]
     }
 
-    /// The registration names of the subagents a session can be started on (the local ones):
+    /// The registration names of the subagents a session can be started on:
     /// what [`LlmAgentBuilder::session_agents`](crate::LlmAgentBuilder::session_agents) takes.
     pub fn session_agents(&self) -> Vec<String> {
         self.roster
@@ -272,6 +274,52 @@ fn one_line(text: &str) -> String {
         .join(" ")
 }
 
+/// The id of the call the loop makes for the report of `round`: `report_` and its id's 32 hex
+/// digits, which every provider accepts and which no model call of ours ever has.
+pub(crate) fn report_call_id(round: RunId) -> String {
+    format!("report_{}", round.0.simple())
+}
+
+/// What decides whether a report is due, besides the session ([`is_due`]).
+pub(crate) struct DueFacts<'a> {
+    /// The run the model belongs to.
+    pub me: RunId,
+    /// The rounds already reported ([`Conversation::reported_rounds`](crate::Conversation)).
+    pub reported: &'a [RunId],
+    /// The ids of the report calls the history already holds: a round the cap gave up is still
+    /// not due while its call is there, or the history would hold the id twice.
+    pub in_history: &'a HashSet<String>,
+    /// When the chain of tasks began: a person's round that ended before it is not due.
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// Whether the report of `session` is **due** to the model of the run `facts.me` ([ADR 0045],
+/// slice 3). The report is of the latest round that worked (a closing round has none, so one that
+/// follows does not hide it): it has ended, it was not given before, and either this run started
+/// it or a person did after the chain of tasks began. A round an earlier task's run started is not
+/// due: that run waited for it or cancelled it. A round that a later round of the same session
+/// replaced before the parent looked is not reported on its own, and a round cancelled by the close
+/// that follows it is not either.
+///
+/// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+pub(crate) fn is_due(session: &SessionSummary, facts: &DueFacts) -> bool {
+    let round = &session.report;
+    // A session of nothing but a closing round has nothing to report.
+    if session.closing && round.run == session.latest_run {
+        return false;
+    }
+    // A round that was cancelled and then closed was cancelled by whoever closed the session, who
+    // knows it.
+    if round.cancelled && session.closing && round.run != session.latest_run {
+        return false;
+    }
+    round.ended
+        && !facts.reported.contains(&round.run)
+        && !facts.in_history.contains(&report_call_id(round.run))
+        && (round.started_by == Some(facts.me)
+            || (round.started_outside_a_run() && facts.since.is_none_or(|t| round.updated_at >= t)))
+}
+
 fn header_json(header: &SessionHeader) -> Value {
     serde_json::to_value(header).unwrap_or(Value::Null)
 }
@@ -301,8 +349,15 @@ fn read_output(
         Ok(window) => window,
         Err(why) => return ToolOutput::error(why),
     };
+    // A person's round says so: the model reads a report of something it did not ask for. The
+    // person's words are not in it.
+    let by = if view.started_outside_a_run() {
+        ", started by the person"
+    } else {
+        ""
+    };
     let head = format!(
-        "session {} ({}, \"{}\"): round {}, {}",
+        "session {} ({}, \"{}\"): round {}{by}, {}",
         view.id,
         roster.name_of(&view.agent),
         escape_text(description_of(view).as_bytes()),
@@ -437,13 +492,6 @@ impl Tool for Start {
                 self.roster.names().join(", ")
             ));
         };
-        if agent.remote {
-            return refuse(format!(
-                "`{}` runs on another system, and a session cannot be started on it yet: call the \
-                 `{}` tool for a synchronous ask",
-                agent.name, agent.name
-            ));
-        }
         let description = match text_arg(&args, "description") {
             Some(text) => one_line(text),
             None => {
@@ -634,7 +682,7 @@ impl Tool for Send {
                     .and_then(Value::as_array)
                     .is_some_and(|ids| ids.iter().any(|id| id == ctx.call_id()))
             {
-                return Ok(sent(session, view.round, "steered"));
+                return Ok(sent(session, view.round, delivery_of(&state)));
             }
             if view.closed {
                 return refuse(closed_words(session));
@@ -642,7 +690,14 @@ impl Tool for Send {
             let steered = || user_inbound(message, ctx.call_id());
             if view.state == SessionState::Working {
                 match starter.steer(&view, steered()).await {
-                    Ok(()) => return Ok(sent(session, view.round, "steered")),
+                    Ok(()) => {
+                        let state = starter.round_state(view.latest_run).await;
+                        let how = state
+                            .ok()
+                            .flatten()
+                            .map_or("steered", |state| delivery_of(&state));
+                        return Ok(sent(session, view.round, how));
+                    }
                     Err(e) if is_busy_or_finished(&e) => continue,
                     Err(e) => return Err(runtime_error(&e)),
                 }
@@ -687,6 +742,15 @@ impl Tool for Send {
         Err(ToolError::Transient(format!(
             "session `{session}` kept changing while the message was sent"
         )))
+    }
+}
+
+/// How a message that reached a working round was taken: `queued` when the round's agent says it
+/// keeps messages until its remote can take them (`queues_messages` in its state), else `steered`.
+fn delivery_of(round_state: &Value) -> &'static str {
+    match round_state.get("queues_messages") {
+        Some(Value::Bool(true)) => "queued",
+        _ => "steered",
     }
 }
 
@@ -1086,5 +1150,175 @@ impl Tool for List {
             out.push_str(&end_line(shown.total as u64, "sessions", &[]));
         }
         Ok(ToolOutput::text(out))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use adam_runtime::{ReportRound, RoundOutcome};
+
+    fn ended(me: RunId, by: Option<RunId>) -> SessionSummary {
+        let latest = RunId::new();
+        SessionSummary {
+            id: RunId::new(),
+            agent: "helper".into(),
+            conversation_id: "c".into(),
+            latest_run: latest,
+            round: 1,
+            state: SessionState::Idle,
+            outcome: Some(RoundOutcome::Done),
+            updated_at: Utc::now(),
+            description: String::new(),
+            keep_open: true,
+            closed: false,
+            closing: false,
+            started_by: by.or(Some(me)),
+            report: ReportRound {
+                run: latest,
+                ended: true,
+                cancelled: false,
+                started_by: by.or(Some(me)),
+                updated_at: Utc::now(),
+            },
+        }
+    }
+
+    fn due(session: &SessionSummary, me: RunId, reported: &[RunId]) -> bool {
+        is_due(
+            session,
+            &DueFacts {
+                me,
+                reported,
+                in_history: &HashSet::new(),
+                since: None,
+            },
+        )
+    }
+
+    #[test]
+    fn a_round_this_run_started_and_that_ended_is_due() {
+        let me = RunId::new();
+        let session = ended(me, None);
+        assert!(due(&session, me, &[]));
+        // A session that was not kept open is closed once its round ends, and is still due.
+        let mut closed = ended(me, None);
+        closed.state = SessionState::Closed;
+        assert!(due(&closed, me, &[]));
+    }
+
+    #[test]
+    fn a_round_that_works_is_not_due() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        session.state = SessionState::Working;
+        session.outcome = None;
+        session.report.ended = false;
+        assert!(!due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_closing_round_after_the_round_that_worked_does_not_hide_it() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        // The closing round is the latest and still works; the report is of the round before.
+        session.latest_run = RunId::new();
+        session.closing = true;
+        session.state = SessionState::Working;
+        assert!(due(&session, me, &[]));
+        // A session whose only round is a closing one reports nothing.
+        session.report.run = session.latest_run;
+        assert!(!due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_round_cancelled_by_the_close_that_follows_is_not_news() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        session.latest_run = RunId::new();
+        session.closing = true;
+        session.report.cancelled = true;
+        assert!(!due(&session, me, &[]));
+        // Cancelled with no close after it (a person stopped it): it is news.
+        session.closing = false;
+        session.latest_run = session.report.run;
+        assert!(due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_round_that_a_later_round_replaced_is_not_reported_on_its_own() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        // Round 2 works: the report is of round 2, which has not ended.
+        session.latest_run = RunId::new();
+        session.state = SessionState::Working;
+        session.report = ReportRound {
+            run: session.latest_run,
+            ended: false,
+            cancelled: false,
+            started_by: Some(me),
+            updated_at: Utc::now(),
+        };
+        assert!(!due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_round_of_another_run_is_not_due() {
+        let me = RunId::new();
+        let session = ended(me, Some(RunId::new()));
+        assert!(!due(&session, me, &[]));
+    }
+
+    #[test]
+    fn a_round_a_person_started_is_due_only_if_it_ended_after_the_chain_began() {
+        let me = RunId::new();
+        let mut session = ended(me, None);
+        session.started_by = Some(session.latest_run);
+        session.report.started_by = Some(session.latest_run);
+        assert!(session.report.started_outside_a_run());
+        assert!(due(&session, me, &[]));
+        let none = HashSet::new();
+        let facts = |since| DueFacts {
+            me,
+            reported: &[],
+            in_history: &none,
+            since,
+        };
+        let at = session.report.updated_at;
+        assert!(is_due(
+            &session,
+            &facts(Some(at - chrono::Duration::seconds(1)))
+        ));
+        assert!(is_due(&session, &facts(Some(at))));
+        assert!(!is_due(
+            &session,
+            &facts(Some(at + chrono::Duration::seconds(1)))
+        ));
+    }
+
+    #[test]
+    fn a_round_already_reported_is_not_due_and_a_later_one_is() {
+        let me = RunId::new();
+        let session = ended(me, None);
+        assert!(!due(&session, me, &[RunId::new(), session.report.run]));
+        let mut next = session.clone();
+        next.report.run = RunId::new();
+        assert!(due(&next, me, &[session.report.run]));
+    }
+
+    #[test]
+    fn a_round_given_up_by_the_cap_is_not_due_while_its_call_is_in_the_history() {
+        let me = RunId::new();
+        let session = ended(me, None);
+        let in_history: HashSet<String> = [report_call_id(session.report.run)].into();
+        let facts = |in_history| DueFacts {
+            me,
+            reported: &[],
+            in_history,
+            since: None,
+        };
+        assert!(!is_due(&session, &facts(&in_history)));
+        assert!(is_due(&session, &facts(&HashSet::new())));
     }
 }

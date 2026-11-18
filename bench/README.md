@@ -177,6 +177,20 @@ price + output * output price`, rounded up to a micro-dollar; reasoning is insid
 `usage` is charged its worst case and flagged. The agents' own counts are shown beside the meter's and never decide
 anything.
 
+**Calls per model turn.** The meter also counts the tool calls each answer asks for (a plain answer's `tool_calls`; a
+stream's distinct tool call `index` and `id` pairs, so a gateway that gives every call the index 0 is counted right) and writes it as `toolCalls` on the settled record, a count of the answer and no
+text of it. The report shows, for each agent and arm, the turns counted, the calls asked, the calls per turn, the
+turns that asked for several and the most in one turn: whether the model asks for calls together, and so what a
+limit on parallel tool calls (ADR 0049) can save. Every answer the meter relays is a turn, the agent's own requests for a title or a summary too: such an answer counts as a turn with 0 calls. A ledger from before the count has none, and the report says `n/a`.
+
+**Calls by tool.** The meter also keeps the name of each of those calls (`toolNames` on the same settled record: one
+name per call, in the answer's order, a name cut to 64 characters and control characters dropped; at most 64 names
+per answer). The fold counts them per tool, per run, and the report prints one table of the calls of each tool per
+agent and arm, so the reader sees where the calls go and not only how many there are: on the tasks both agents
+finish, the tool whose count differs most is the next slice. A call the answer did not name (or one beyond the 64-name cap) is
+counted in the calls and shown in a `(no name)` row, never guessed from the arguments; a ledger from before the names says `n/a`. The
+names are the model's own text: they are shown in a report and never used for a decision of the harness.
+
 **The cap.** A run reserves its budget before it starts, and starts only if what is spent plus what is reserved plus
 this reservation fits the cap (exactly at the cap fits; one micro-dollar over does not). Each call's worst case (the
 input at one token per three bytes, the clamped output) must fit what is left of the run's reservation, else the
@@ -475,6 +489,13 @@ with `OPENCODE_DISABLE_MODELS_FETCH=true` and `OPENCODE_DISABLE_AUTOUPDATE=1`. I
 directory, so the export (`opencode session export --standalone <session>`) can run in a second container after a run that
 was killed at the time limit. The export is kept as raw JSON, with the run's token taken out of every kept file.
 `--standalone` gives the run a private server: no background service is left in the container.
+
+**An isolated home.** `HOME` and the three XDG directories (`XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`) are the
+run's own, under its output directory, and the run and the export both set them. The image's global skill directories,
+`/.claude` and `/.opencode`, are hidden with an empty read-only directory mounted over each, so the clone's upward search
+finds nothing there; only a skill directory inside the clone, which is the repository's own text, is read. *Verified
+2026-11-18* in the smoke test: with `HOME=/`, OpenCode read the image's global `/.claude/skills` and every model call
+carried about 2.85k tokens more.
 
 ### OpenCode V2
 

@@ -31,6 +31,7 @@ use crate::error::Error;
 use crate::folder::{agent_dir, project_root};
 #[cfg(feature = "mcp")]
 use crate::mcp::McpBinding;
+use crate::remote_session::RemoteRoundAgent;
 
 /// How long the files must be quiet before a watched change is loaded (an editor writes a file in
 /// several steps).
@@ -57,6 +58,15 @@ struct Recipe {
 }
 
 /// One agent of a load, ready to install.
+/// What one load made.
+struct Built {
+    loaded: Vec<Loaded>,
+    /// The agents of the sessions on remote subagents: they are registered as they were at
+    /// startup, a reload does not replace them.
+    rounds: Vec<RemoteRoundAgent>,
+    warnings: Vec<Diagnostic>,
+}
+
 struct Loaded {
     name: String,
     agent: Arc<LlmAgent>,
@@ -75,12 +85,13 @@ impl Recipe {
 
     /// Load, bind and build: the whole pipeline, from the files. The warnings of a load that
     /// succeeds are returned.
-    fn build(&self) -> Result<(Vec<Loaded>, Vec<Diagnostic>), Error> {
+    fn build(&self) -> Result<Built, Error> {
         let dir = self.dir();
         let report = dir.load()?;
         let warnings: Vec<Diagnostic> = report.warnings().cloned().collect();
         let package = report.into_package(self.strictness)?;
         let mut loaded = Vec::new();
+        let mut rounds = Vec::new();
         for manifest in package.agents {
             let mut def = AgentDef::from_manifest(manifest)?.resources_from(&dir)?;
             for hook in &self.defs {
@@ -96,6 +107,7 @@ impl Recipe {
                 bound = hook(bound);
             }
             let assembly = bound.model(Arc::clone(&self.model), self.alias.clone())?;
+            rounds.extend(assembly.remote_round_agents().iter().cloned());
             for (agent, info) in assembly.agents().iter().zip(assembly.info()) {
                 loaded.push(Loaded {
                     name: info.name.clone(),
@@ -105,7 +117,11 @@ impl Recipe {
                 });
             }
         }
-        Ok((loaded, warnings))
+        Ok(Built {
+            loaded,
+            rounds,
+            warnings,
+        })
     }
 
     /// What a watcher watches: `agent/` or `agents/`, recursively.
@@ -285,6 +301,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Shared {
     recipe: Recipe,
+    /// The round agents of the first load.
+    rounds: Vec<RemoteRoundAgent>,
     registry: Mutex<Registry>,
     /// One reload at a time, so two triggers cannot install out of order.
     serial: Mutex<()>,
@@ -496,7 +514,11 @@ impl LiveBuilder {
     ///
     /// Whatever [`AgentDef::from_source`], [`AgentDef::bind`] and [`BoundDef::model`] refuse.
     pub fn load(self) -> Result<LiveAssembly, Error> {
-        let (loaded, warnings) = self.recipe.build()?;
+        let Built {
+            loaded,
+            rounds,
+            warnings,
+        } = self.recipe.build()?;
         for warning in &warnings {
             tracing::warn!(%warning, "agent file warning");
         }
@@ -519,6 +541,7 @@ impl LiveBuilder {
         Ok(LiveAssembly {
             shared: Arc::new(Shared {
                 recipe: self.recipe,
+                rounds,
                 registry: Mutex::new(Registry {
                     slots,
                     generation: 1,
@@ -644,12 +667,18 @@ impl LiveAssembly {
     /// that takes the current version at each step.
     pub fn register(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
         let names: Vec<String> = lock(&self.shared.registry).slots.keys().cloned().collect();
-        names.into_iter().fold(builder, |builder, name| {
+        let builder = names.into_iter().fold(builder, |builder, name| {
             builder.agent(LiveAgent {
                 name,
                 shared: Arc::clone(&self.shared),
             })
-        })
+        });
+        // The agents of the sessions on remote subagents are the ones of the first load: a
+        // reload that changes where a remote subagent lives needs a restart.
+        self.shared
+            .rounds
+            .iter()
+            .fold(builder, |builder, round| builder.agent(round.clone()))
     }
 
     /// Load the files again now, exactly as a watched change does: on success the versions are
@@ -662,7 +691,9 @@ impl LiveAssembly {
     pub fn reload(&self) -> Result<Reloaded, Arc<ReloadError>> {
         let _serial = lock(&self.shared.serial);
         let outcome = match self.shared.recipe.build() {
-            Ok((loaded, warnings)) => {
+            Ok(Built {
+                loaded, warnings, ..
+            }) => {
                 for warning in &warnings {
                     tracing::warn!(%warning, "agent file warning");
                 }

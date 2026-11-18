@@ -148,6 +148,7 @@ mod error;
 mod folder;
 mod mcp;
 mod remote;
+mod remote_session;
 mod scrub;
 mod skills;
 mod subagent;
@@ -168,6 +169,7 @@ pub use folder::{
     AGENT_DIR_ENV, AgentFolder, EXTRA_MCP_FILE_ENV, agent_dir, agent_dir_from_env,
     extra_mcp_file_from_env,
 };
+pub use remote_session::RemoteRoundAgent;
 pub use skills::{
     LOAD_SKILL, READ_SKILL_FILE, RunSkills, SkillError, SkillFiles, run_skills_conformance,
 };

@@ -378,7 +378,7 @@ fn select_listed(listed: Vec<SessionSummary>) -> Vec<SessionSummary> {
     open
 }
 
-fn a2a_state_word(state: &TaskState) -> Value {
+pub(crate) fn a2a_state_word(state: &TaskState) -> Value {
     serde_json::to_value(state).unwrap_or(Value::Null)
 }
 
@@ -547,6 +547,26 @@ impl RuntimeTaskBackend {
     /// The sessions of the parent context `context`, open first, then the most recently closed.
     /// `None` when they could not be listed: a task then says nothing, never "no sessions".
     pub(crate) async fn sessions_object(&self, caller: &Caller, context: &str) -> Option<Value> {
+        let listed = match self.listed_sessions(caller, context).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::warn!(error = %e, "the sessions of a context could not be listed");
+                return None;
+            }
+        };
+        let mut out = Vec::new();
+        for s in &listed {
+            out.push(self.summary_object(context, s).await);
+        }
+        Some(json!({ "sessions": out }))
+    }
+
+    /// The sessions a parent object lists: open first, then the most recently closed.
+    pub(crate) async fn listed_sessions(
+        &self,
+        caller: &Caller,
+        context: &str,
+    ) -> Result<Vec<SessionSummary>, RuntimeError> {
         // The listing ranks working, then idle, then closed sessions (newest first within each),
         // so reading pages until 16 closed ones are in hand has every open session and the 16
         // most recently closed: only closed sessions are ever left unread.
@@ -556,18 +576,25 @@ impl RuntimeTaskBackend {
                 .count()
                 >= CLOSED_LISTED
         };
-        let listed = match self.list_pages(caller, context, enough).await {
-            Ok(listed) => listed,
-            Err(e) => {
-                tracing::warn!(error = %e, "the sessions of a context could not be listed");
-                return None;
-            }
-        };
-        let mut out = Vec::new();
-        for s in &select_listed(listed) {
-            out.push(self.summary_object(context, s).await);
-        }
-        Some(json!({ "sessions": out }))
+        let listed = self.list_pages(caller, context, enough).await?;
+        Ok(select_listed(listed))
+    }
+
+    /// The name a client knows the helper `agent` by (its card name).
+    pub(crate) fn session_agent_name(&self, agent: &str) -> String {
+        self.child_sessions
+            .as_ref()
+            .and_then(|c| c.by_registered(agent))
+            .map_or_else(|| agent.to_owned(), |a| a.name.clone())
+    }
+
+    /// What the session of `round` says now, as on a task of it. `None` when it cannot be read.
+    pub(crate) async fn round_status(&self, caller: &Caller, round: &Round) -> Option<Value> {
+        let view = self
+            .session_of(caller, &round.parent_context, round.session)
+            .await
+            .ok()??;
+        Some(self.round_object(&view, round))
     }
 
     /// The sessions of `context` page by page, until `enough` says what is read will do or none
@@ -1268,6 +1295,13 @@ mod tests {
             closed,
             closing,
             started_by: None,
+            report: adam_runtime::ReportRound {
+                run: RunId::new(),
+                ended: state != SessionState::Working,
+                cancelled: false,
+                started_by: None,
+                updated_at: chrono::Utc::now(),
+            },
         }
     }
 

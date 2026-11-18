@@ -45,7 +45,7 @@ use super::{Outcome, ToolEnv, non_empty, notes_error, workspace_error};
 /// you ask the person which one with ask_user. To carry on with work an earlier
 /// task of this conversation pushed (a rework, a follow-up), pass that branch as
 /// `branch`: the worktree starts from it and open_pull_request updates its pull request.
-#[tool(label = "Prepare the workspace", icon = "git")]
+#[tool(label = "Prepare the workspace", icon = "git", parallel = "exclusive")]
 pub async fn prepare_workspace(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -174,14 +174,14 @@ pub async fn prepare_workspace(
     let sealed = env.seal(ctx, &workspace).await;
     if let Some(line) = wt.continues() {
         // What the verdict of a run that ends without a pull request says was not updated.
-        let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-        if notes.continues.as_deref() != Some(line) {
-            notes.continues = Some(line.to_owned());
-            env.notes
-                .save(&run, &notes)
-                .await
-                .map_err(|e| notes_error(&e))?;
-        }
+        env.notes
+            .update(&run, |notes| {
+                if notes.continues.as_deref() != Some(line) {
+                    notes.continues = Some(line.to_owned());
+                }
+            })
+            .await
+            .map_err(|e| notes_error(&e))?;
     }
     let mut text = format!(
         "Worktree ready.\nrepository: {url}\nslot: {}\nbase branch: {base}\nbranch: {}\npath: {}",

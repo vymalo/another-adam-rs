@@ -324,3 +324,14 @@ Renames outside those spans: `read_file` 1 time, `edit_file` 1 time.
 The hash of the mapped text is part of the ledger's configuration fingerprint. *Verified 2026-11-17*: that the configuration schema of OpenCode 2.3.0 has an agent `prompt` and an
 `instructions` list. *Unverified*: the effect of `instructions` with the pinned binary, which a gated test checks (`BENCH_TEST_OPENCODE_BIN`).
 
+## Amended 2026-11-18: the calls by tool
+
+The meter keeps the tool name of each call an answer asks for, beside the count: `toolNames` on the settled record,
+one name per call in the answer's order, a name cut to 64 characters with control characters dropped, at most 64
+names per answer. The fold counts them per tool and per run, and the report prints one table of the calls of each
+tool per agent and arm. It is the measurement the "a faster coder" epic
+(https://github.com/vymalo/another-agentic-system/issues/345) needs to say *where* the calls go: the count alone says
+that adam makes about 1.8 times the calls of OpenCode on the tasks both finish, not which tool each extra turn belongs
+to. A call the answer did not name (or one beyond the 64-name cap) is counted in the calls and shown in a `(no name)`
+row, never guessed from the arguments; a ledger written before this says `n/a`. No decision above changes: it is an addition to the ledger's
+records and to the report.

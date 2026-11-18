@@ -395,6 +395,27 @@ async fn the_prompt_says_there_is_no_repository_creation_when_none_is_allowed() 
     );
 }
 
+/// ADR 0049 slice P9: the prompt asks for independent calls together, since the calls of a reply run
+/// at the same time, and names only tools the coder offers.
+#[tokio::test]
+async fn the_prompt_asks_for_independent_calls_together() {
+    let (_fx, agent) = coder(3).await;
+    let text = prompt_of(&agent)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains(
+            "Ask for independent calls together in one reply (several `read_file`, `search_files` or \
+             `list_files`, a look at one file while you edit another): they may run at the same time."
+        ),
+        "{text}"
+    );
+    for tool in ["read_file", "search_files", "list_files"] {
+        assert!(TOOLS.contains(&tool), "{tool}");
+    }
+}
+
 #[tokio::test]
 async fn the_limit_is_templated_in_from_the_settings() {
     let (_fx, agent) = coder(7).await;

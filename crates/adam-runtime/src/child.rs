@@ -37,8 +37,8 @@ pub const CHILD_REPORTED_KIND: &str = "adam.child.reported";
 
 /// How many of the messages in `inbox` after its first `base` a run that is finishing has to read:
 /// all of them but the [`RUN_FINISHED_KIND`] notices, the [`CHILD_REPORTED_KIND`] ones (a report
-/// is read from the store by a tool, and slice 3 will make one reopen a turn on purpose) and the
-/// [`SESSION_CLOSE_KIND`] requests (a round finishes its work and says so in its header; one that
+/// is read from the store, by a tool or by the agent loop; a turn that a report keeps going is
+/// decided from the store at its end, not from a notice) and the [`SESSION_CLOSE_KIND`] requests (a round finishes its work and says so in its header; one that
 /// lands while the round finishes stays in its inbox, where a reader of the session finds it). A notice only saves a waiting parent its
 /// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
 /// store), and the same notice delivered just after its commit is refused, so one that lands during
