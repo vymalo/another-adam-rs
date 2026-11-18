@@ -19,6 +19,17 @@
 //! report on a tree to the commit it pushes when that commit has the same tree, whichever slot ran
 //! the check (see [`ChecksReport::bound_to`] and `RunNotes::checked`), and otherwise says the commit
 //! was not checked ([`ChecksReport::unchecked`]).
+//!
+//! # A failed check is not run again on the same tree
+//!
+//! When the notes hold a **failed** record for the same command, directory and slot on exactly the
+//! tree the command is about to run on, made at the current `ChecksNotes::epoch` (`run` and
+//! `rebuild_environment` bump it; `write_file`, `edit_file` and `apply_patch` change the tree), the
+//! command is not run: the result quotes that run's findings, names the call that made them, spends
+//! no check cycle and emits no `checks` artifact (the earlier run's is the verdict on this tree).
+//! It is still a failure, so the gate refuses a pull request on the tree. A passing record is never
+//! reused (the model may be confirming it, and the environment may have changed), and neither is a
+//! pre-existing failure (it spends no cycle and the model is told the failure is the repository's).
 
 use adam::Artifact;
 use adam::prelude::*;
@@ -532,6 +543,33 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
     text
 }
 
+/// What the model is told when a failed check is not run again: the code and everything a check
+/// reads are as they were when `record` ran, so the command would fail the same way. It quotes the
+/// findings, names the call that made them, says the tree is unchanged, that no cycle was spent and
+/// no `checks` artifact was emitted (the earlier run's is the verdict on this tree), and that the
+/// gate still refuses a pull request on it.
+fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, max: u32) -> String {
+    let tree = record.tree.as_deref().unwrap_or_default();
+    let short = &tree[..tree.len().min(10)];
+    let code = super::notes::exit_phrase(record.exit_code);
+    let tail = record.tail.trim();
+    let findings = if tail.is_empty() {
+        format!("({code}, and the command printed nothing)")
+    } else {
+        format!("{code}:\n{tail}")
+    };
+    format!(
+        "The worktree is unchanged since `{command}` failed on tree {short}, and nothing a check \
+         reads has changed since (no `run` has run since and the environment was not rebuilt): the \
+         command was not run again, because it would fail the same way. This call cost no check \
+         cycle ({failures} of {max} used so far), and it emits no new `checks` artifact: the one the \
+         earlier run reported is the verdict on this tree. This is still a failure, not a green: a \
+         pull request on this tree is refused. What call `{}` found:\n{findings}\nChange the code, \
+         then run the check again.",
+        record.call_id
+    )
+}
+
 // Runs a command in the worktree and reports how it went.
 //
 // * `bash -lc <command>` (`sh -lc` without bash), cwd inside the worktree (`cwd`, if given, must stay
@@ -608,6 +646,40 @@ pub async fn run_checks(
     // failed run's findings. The command line is shown scrubbed too.
     let redactor = &env.redactor;
     let shown = redactor.scrub(command).into_owned();
+
+    // The code the command is about to run on, computed before it runs: it says whether a failure
+    // already seen on exactly this code can be answered instead of running the command again. The
+    // report below is bound to the tree the command leaves (it may write a file), as it always was.
+    let at = super::gitcli::GitAt::slot(&slot);
+    let tree_before = super::gitcli::working_tree_id(&at).await;
+    let cwd_key = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && *c != ".")
+        .unwrap_or("");
+
+    // A failure on this exact tree, from this exact command in this directory and slot, with the
+    // run's files and environment unchanged since (`ChecksNotes::epoch`): the command would fail the
+    // same way, so it is not run again. It spends no cycle and emits no `checks` artifact (the
+    // earlier run's is the verdict on this tree); the gate still refuses the pull request.
+    let epoch = notes.checks.epoch;
+    let earlier = match tree_before.as_deref() {
+        Some(tree) => notes.failed_check_on(tree, &shown, cwd_key, slot.dir(), epoch),
+        None => None,
+    };
+    if let Some(earlier) = earlier {
+        let failures = notes.failures_in(scratch);
+        ctx.emit_progress(format!("checks not run again (unchanged tree): {shown}"))
+            .await;
+        return Ok(
+            ToolOutput::error(unchanged_failure_text(earlier, &shown, failures, max))
+                .with_repeat_key(format!(
+                    "unchanged:{}",
+                    earlier.tree.as_deref().unwrap_or_default()
+                )),
+        );
+    }
+
     ctx.emit_progress(format!("running checks: {shown}")).await;
     let environment = env.session(ctx).await?;
     let mut outcome = env
@@ -668,7 +740,8 @@ pub async fn run_checks(
     };
 
     // The code the command just ran on, so a pull request can be tied to
-    // the exact tree that was verified.
+    // the exact tree that was verified. (A check may write a file: the report is bound to the tree
+    // it leaves, which is what `commit_and_push` will commit.)
     let at = super::gitcli::GitAt::slot(&slot);
     let tree = super::gitcli::working_tree_id(&at).await;
     let head = super::gitcli::head_sha(&at).await;
@@ -699,6 +772,8 @@ pub async fn run_checks(
         exit_code: outcome.exit_code,
         tail: outcome.tail.clone(),
         tree,
+        cwd: cwd_key.to_owned(),
+        epoch,
         report: Some(report),
         slot: Some(slot.dir().to_owned()),
         scratch,

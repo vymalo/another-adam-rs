@@ -61,11 +61,14 @@ pub async fn rebuild_environment(
              environment to rebuild. Go on with the task.",
         ));
     }
-    // What the rebuilt environment will be asked again, and what the person chose.
+    // What the rebuilt environment will be asked again, and what the person chose. The check epoch
+    // is bumped too: a failed check record from before the rebuild is not reused, since the
+    // environment it ran in is gone (`ChecksNotes::epoch`).
     let notes = env
         .notes
         .update(&run, |notes| {
             notes.environment.use_default |= use_default;
+            notes.checks.epoch = notes.checks.epoch.saturating_add(1);
             notes.clone()
         })
         .await

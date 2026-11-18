@@ -39,6 +39,17 @@ pub struct CheckRecord {
     /// `gitcli::working_tree_id`); `None` if it could not be determined.
     #[serde(default)]
     pub tree: Option<String>,
+    /// The directory the command ran in, relative to the worktree (`""` for its root): the same
+    /// command in another directory is another check. Absent (empty) in notes written before it
+    /// existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    /// The `ChecksNotes::epoch` the command ran at: a failed record is reused only while the run's
+    /// files and environment are still at that epoch ([`RunNotes::failed_check_on`]). A record
+    /// written before the field existed loads as [`LEGACY_EPOCH`], which no live epoch has, so it is
+    /// never reused.
+    #[serde(default = "legacy_epoch")]
+    pub epoch: u64,
     /// What the run reported as its `checks` artifact, so `commit_and_push` can bind it to the
     /// commit it makes when the tree is the same.
     #[serde(default)]
@@ -70,6 +81,15 @@ pub fn exit_phrase(code: Option<i32>) -> String {
         Some(code) => format!("exit code {code}"),
         None => "no exit code (killed or timed out)".to_owned(),
     }
+}
+
+/// The epoch of a [`CheckRecord`] written before the field existed: no live epoch has it, so the
+/// record is never reused.
+pub const LEGACY_EPOCH: u64 = u64::MAX;
+
+/// The serde default of [`CheckRecord::epoch`] for notes written before it existed.
+fn legacy_epoch() -> u64 {
+    LEGACY_EPOCH
 }
 
 /// Most check runs [`ChecksNotes::history`] keeps.
@@ -123,9 +143,19 @@ pub struct ChecksNotes {
     /// the base is run once per command, directory and base commit ([`RunNotes::base_result`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base: Vec<BaseResult>,
+    /// How many times files a check reads may have changed without the tree id changing: bumped by
+    /// `run` (which keeps files, ignored ones included) and by `rebuild_environment`. A failed
+    /// record is reused only while this is the epoch it ran at
+    /// ([`RunNotes::failed_check_on`]).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub epoch: u64,
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -626,6 +656,40 @@ impl RunNotes {
     pub fn verified_tree(&self, tree: Option<&str>) -> bool {
         tree.and_then(|tree| self.checked(tree))
             .is_some_and(|record| record.passed)
+    }
+
+    /// The most recent **failed** run of `command` in `cwd` and `slot` on exactly the code with tree
+    /// id `tree`, made while the run's files and environment were at `epoch`
+    /// ([`ChecksNotes::epoch`]): what `run_checks` answers with instead of running the command
+    /// again, since the code, the command and everything a check reads are as they were.
+    ///
+    /// A passing run is never reused (the model may be confirming it, and the environment may have
+    /// changed under it), and neither is a pre-existing failure: it spends no cycle already, and the
+    /// model is told the failure is the repository's, so it is run again and answered as such. The
+    /// most recent run of the check on the tree decides: a pass after a failure means the command
+    /// runs again, not that the older failure is the answer. Records written before this one existed
+    /// have no `cwd` or `epoch`, and are not reused.
+    pub fn failed_check_on(
+        &self,
+        tree: &str,
+        command: &str,
+        cwd: &str,
+        slot: &str,
+        epoch: u64,
+    ) -> Option<&CheckRecord> {
+        // The most recent run of this check on this tree decides: a pass after a failure means the
+        // command must run again, not that the older failure is the answer.
+        self.checks
+            .history
+            .iter()
+            .rev()
+            .find(|record| {
+                record.tree.as_deref() == Some(tree)
+                    && record.command == command
+                    && record.cwd == cwd
+                    && record.slot.as_deref() == Some(slot)
+            })
+            .filter(|record| !record.passed && !record.preexisting && record.epoch == epoch)
     }
 
     /// Remember the repositories `keys` names; returns whether anything was new.
@@ -1191,6 +1255,8 @@ mod tests {
             exit_code: Some(i32::from(!passed)),
             tail: "out".into(),
             tree: Some("t1".into()),
+            cwd: String::new(),
+            epoch: 0,
             report: None,
             slot: None,
             scratch: false,
@@ -1313,6 +1379,84 @@ mod tests {
         assert!(!notes.last_check_failed());
         assert!(!notes.cycles_exhausted(false, 2), "green now");
         assert_eq!(notes.checks.failures, 2, "cumulative");
+    }
+
+    /// The reuse is exact: the tree, the command, the directory, the slot and the epoch all have to
+    /// be the record's, and the most recent run of the check decides (a pass, a pre-existing
+    /// failure or a moved epoch is not reused).
+    #[test]
+    fn a_failed_record_is_reused_only_for_its_tree_command_directory_slot_and_epoch() {
+        let mut notes = RunNotes::default();
+        let mut red = record("c1", false);
+        red.tree = Some("t1".into());
+        red.cwd = "web".into();
+        red.slot = Some("app".into());
+        red.epoch = 4;
+        notes.record_check(red);
+
+        fn find<'a>(
+            notes: &'a RunNotes,
+            tree: &str,
+            command: &str,
+            cwd: &str,
+            slot: &str,
+            epoch: u64,
+        ) -> Option<&'a str> {
+            notes
+                .failed_check_on(tree, command, cwd, slot, epoch)
+                .map(|r| r.call_id.as_str())
+        }
+        assert_eq!(
+            find(&notes, "t1", "cargo test", "web", "app", 4),
+            Some("c1")
+        );
+        assert_eq!(find(&notes, "t2", "cargo test", "web", "app", 4), None);
+        assert_eq!(find(&notes, "t1", "cargo build", "web", "app", 4), None);
+        assert_eq!(find(&notes, "t1", "cargo test", "", "app", 4), None);
+        assert_eq!(find(&notes, "t1", "cargo test", "web", "other", 4), None);
+        assert_eq!(
+            find(&notes, "t1", "cargo test", "web", "app", 5),
+            None,
+            "the epoch moved"
+        );
+
+        // A pass after the failure is the latest run of the check: it is not reused, and the older
+        // failure does not stand in for it.
+        let mut green = record("c2", true);
+        green.tree = Some("t1".into());
+        green.cwd = "web".into();
+        green.slot = Some("app".into());
+        green.epoch = 4;
+        notes.record_check(green);
+        assert_eq!(find(&notes, "t1", "cargo test", "web", "app", 4), None);
+
+        // Nor is a pre-existing failure.
+        let mut old = record("c3", false);
+        old.tree = Some("t1".into());
+        old.cwd = "web".into();
+        old.slot = Some("app".into());
+        old.epoch = 4;
+        old.preexisting = true;
+        notes.record_check(old);
+        assert_eq!(find(&notes, "t1", "cargo test", "web", "app", 4), None);
+
+        // A record written before the epoch existed loads with `LEGACY_EPOCH`, which no live epoch
+        // has: it is not reused, even on a run that has not moved its epoch yet.
+        let legacy: CheckRecord = serde_json::from_value(serde_json::json!({
+            "call_id": "old",
+            "command": "cargo test",
+            "passed": false,
+            "exit_code": 1,
+            "tail": "red",
+            "tree": "t1",
+            "cwd": "web",
+            "slot": "app"
+        }))
+        .unwrap();
+        assert_eq!(legacy.epoch, LEGACY_EPOCH);
+        let mut notes = RunNotes::default();
+        notes.record_check(legacy);
+        assert_eq!(find(&notes, "t1", "cargo test", "web", "app", 0), None);
     }
 
     fn scratch(call: &str, passed: bool) -> CheckRecord {

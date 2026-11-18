@@ -11,7 +11,7 @@
 //! | `start_command { command, cwd?, repo?, wait?, wait_for? }`, `stop_command { id }`, `list_commands {}`: a command that keeps running (a development server), read with `read_output`, gone with its run | [`background`] |
 //! | `read_output { id, offset?, limit? }`: a kept output (a command's, or a long MCP result), paged | `adam_llm_agent::ReadOutput`, kept by [`kept`](crate::kept) |
 //! | `list_files { path?, offset?, limit? }`, `find_files { pattern, path?, offset?, limit? }`, `search_files { pattern, path?, include?, literal?, offset?, limit? }`: paged, git-aware looking around | [`find`] |
-//! | `read_file { path, offset?, limit? }` (paged; `start_line` and `end_line` are aliases), `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
+//! | `read_file { path, offset?, limit? }` (paged; `start_line` and `end_line` are aliases), `read_files { paths }` (1 to 16 files in one call), `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
 //! | `file_diagnostics { path, repo?, wait?, offset?, limit? }`, `find_definition { path, line, symbol, occurrence?, repo?, wait? }`, `find_references { path, line, symbol, occurrence?, include_declaration?, repo?, wait?, offset?, limit? }`: what a language server says about a file; read only, kept between calls | [`lsp`] |
 //! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
 //! | `run_checks { command }` | [`checks`] |
@@ -1000,6 +1000,7 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         background::StopCommand,
         background::ListCommands,
         files::ReadFile,
+        files::ReadFiles,
         find::ListFiles,
         find::FindFiles,
         find::SearchFiles,
@@ -1208,9 +1209,8 @@ fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
         "stop_command" => environment + Duration::from_secs(60),
         // The environment is asked for its session, and the records are read.
         "list_commands" => environment + find::DEADLINE,
-        "read_file" | "list_files" | "find_files" | "search_files" | "read_output" => {
-            find::DEADLINE
-        }
+        "read_file" | "read_files" | "list_files" | "find_files" | "search_files"
+        | "read_output" => find::DEADLINE,
         // The environment is made ready, and the call waits for a server up to `wait` (120 s),
         // `initialize` (60 s) and the probe and the sync (60 s).
         "file_diagnostics" | "find_definition" | "find_references" => {

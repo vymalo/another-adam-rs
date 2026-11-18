@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 
 /// The tools of the coder in the order they are offered, with the two subagents, as the model is
 /// shown them at the highest tier.
-const ALL: [&str; 44] = [
+const ALL: [&str; 45] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -50,6 +50,7 @@ const ALL: [&str; 44] = [
     "stop_command",
     "list_commands",
     "read_file",
+    "read_files",
     "list_files",
     "find_files",
     "search_files",
@@ -183,6 +184,7 @@ async fn the_model_is_shown_only_the_tools_the_tier_of_the_message_allows() {
         "stop_command",
         "list_commands",
         "read_file",
+        "read_files",
         "list_files",
         "find_files",
         "search_files",

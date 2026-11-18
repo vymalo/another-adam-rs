@@ -65,6 +65,17 @@ fn table() -> BTreeMap<&'static str, Cases> {
 
     // Files: a path names the scope; reads share it, a write is alone with whatever overlaps it.
     t.insert("read_file", by_path(true));
+    // Several paths in one call read the whole of `files`: a write of any path conflicts with it.
+    t.insert(
+        "read_files",
+        vec![
+            (json!({"paths": ["src/a.rs"]}), reads("files")),
+            (
+                json!({"paths": ["src/a.rs"], "repo": "other"}),
+                reads("files"),
+            ),
+        ],
+    );
     t.insert("share_file", by_path(true));
     t.insert("list_files", optional_path(by_path(true)));
     t.insert("find_files", optional_path(by_path(true)));
@@ -345,6 +356,46 @@ async fn a_read_and_a_write_of_the_same_path_do_not_overlap_and_other_paths_do()
     assert!(
         t.overlapped("c1", "c3"),
         "a write of another file starts beside the read: {:?}",
+        t.events.lock()
+    );
+}
+
+#[tokio::test]
+async fn read_files_reads_the_whole_files_scope_so_every_write_waits() {
+    // It names several paths, so its class is the whole `files` scope: a write of any file waits
+    // for it, in the model's order, and two reads of the scope still overlap.
+    let t = run_turn(
+        vec![
+            call("c1", "read_files", json!({"paths": ["src/a.rs"]})),
+            call(
+                "c2",
+                "write_file",
+                json!({"path": "src/b.rs", "content": "x"}),
+            ),
+        ],
+        10,
+    )
+    .await;
+    assert!(
+        !t.overlapped("c1", "c2"),
+        "a write of another path waits for read_files: {:?}",
+        t.events.lock()
+    );
+    assert!(
+        t.at("end:c1") < t.at("start:c2"),
+        "the model's order is kept"
+    );
+    let t = run_turn(
+        vec![
+            call("c1", "read_files", json!({"paths": ["src/a.rs"]})),
+            call("c2", "read_file", json!({"path": "src/b.rs"})),
+        ],
+        10,
+    )
+    .await;
+    assert!(
+        t.overlapped("c1", "c2"),
+        "two reads of the scope overlap: {:?}",
         t.events.lock()
     );
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use adam_coder::ToolEnv;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::create::CreateRepository;
-use adam_coder::tools::files::{ApplyPatch, EditFile, ReadFile, WriteFile};
+use adam_coder::tools::files::{ApplyPatch, EditFile, ReadFile, ReadFiles, WriteFile};
 use adam_coder::tools::find::{FindFiles, ListFiles, SearchFiles};
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::make::Run;
@@ -675,18 +675,281 @@ async fn a_replayed_failing_check_counts_one_cycle() {
     let rig = Rig::new().await;
     rig.prepare().await;
     let tool = RunChecks;
-    for _ in 0..3 {
+    for n in 0..3 {
         let out = tool
             .call(&rig.ctx, json!({"command": common::red("exit 2")}))
             .await
             .unwrap();
         assert!(out.is_error);
-        assert!(
-            out.content.contains("failed check run 1 of 3"),
-            "the same call id never costs a second cycle: {}",
-            out.content
-        );
+        if n == 0 {
+            assert!(
+                out.content.contains("failed check run 1 of 3"),
+                "{}",
+                out.content
+            );
+        } else {
+            assert!(
+                out.content.contains("not run again")
+                    && out.content.contains("no check cycle")
+                    && out.content.contains("1 of 3 used so far"),
+                "the same call id never costs a second cycle: {}",
+                out.content
+            );
+        }
     }
+    assert_eq!(notes_of(&rig).await.checks.failures, 1);
+}
+
+/// A failed check on a tree is not run again on the same tree: the same command, in the same slot,
+/// on the same code, with nothing a check reads changed since, is answered from the notes, with the
+/// same findings and the call that made them, and spends no cycle. It is still a failure: no
+/// `checks` artifact, and the gate refuses the pull request.
+#[tokio::test]
+async fn a_failed_check_is_not_run_again_on_the_same_tree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let message = dir.path().join("message");
+    std::fs::write(&message, "the same failure\n").unwrap();
+    let command = format!(
+        "echo x >> {}; cat {}; test ! -f broken.flag",
+        counter.display(),
+        message.display()
+    );
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 2, "in the worktree, then on the base");
+    assert_eq!(checks_of(&first)["passed"], false);
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert_eq!(runs_of(&counter), 2, "the same tree: it is not run again");
+    assert!(
+        again.artifacts.is_empty(),
+        "a reused failure emits no new artifact: {:?}",
+        again.artifacts
+    );
+    assert!(
+        again.content.contains("not run again")
+            && again.content.contains("unchanged")
+            && again.content.contains("the same failure")
+            && again.content.contains("call-1")
+            && again
+                .content
+                .contains("Change the code, then run the check again"),
+        "{}",
+        again.content
+    );
+    assert!(
+        again.content.contains("no check cycle") && again.content.contains("not a green"),
+        "{}",
+        again.content
+    );
+    let notes = notes_of(&rig).await;
+    assert_eq!(
+        notes.checks.failures, 1,
+        "the first run spent the only cycle"
+    );
+    assert_eq!(notes.checks.history.len(), 1, "the reuse records nothing");
+    assert_eq!(notes.checks.counted, ["call-1"]);
+}
+
+/// The reuse is for exactly the code: a file written after the failure changes the tree, so the
+/// same command runs again.
+#[tokio::test]
+async fn a_failed_check_runs_again_after_the_tree_changes() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; test ! -f broken.flag", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 2, "in the worktree, then on the base");
+
+    WriteFile
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"path": "a.txt", "content": "a\n"}),
+        )
+        .await
+        .unwrap();
+    let again = RunChecks
+        .call(&another_call(&rig, "call-3"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert_eq!(
+        runs_of(&counter),
+        3,
+        "the tree changed: it ran again (the base result is cached)"
+    );
+    assert!(
+        again.content.contains("failed check run 2 of 3"),
+        "{}",
+        again.content
+    );
+    assert_eq!(checks_of(&again)["passed"], false);
+    assert_eq!(notes_of(&rig).await.checks.failures, 2);
+}
+
+/// `run` keeps files a check reads that the tree does not show (an ignored `target/`, a
+/// `node_modules/`): the epoch it bumps makes a failed record on the same tree run again.
+#[tokio::test]
+async fn a_failed_check_runs_again_after_run_kept_files_the_tree_does_not_show() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; test ! -f broken.flag", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 2, "in the worktree, then on the base");
+
+    let made = Run
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"command": "mkdir -p target && echo x > target/dependency"}),
+        )
+        .await
+        .unwrap();
+    assert!(!made.is_error, "{}", made.content);
+    assert!(
+        made.content.contains("git sees no change"),
+        "the ignored file is not in the tree: {}",
+        made.content
+    );
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-3"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert_eq!(
+        runs_of(&counter),
+        3,
+        "`run` may have changed what the check reads: it runs again"
+    );
+    assert!(
+        again.content.contains("failed check run 2 of 3"),
+        "{}",
+        again.content
+    );
+}
+
+/// A passing run is never reused: the model may be confirming it, and the environment may have
+/// changed under it, so the command runs again.
+#[tokio::test]
+async fn a_passing_check_runs_again_on_the_same_tree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; true", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 1);
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(runs_of(&counter), 2, "a pass is never reused");
+    assert_eq!(checks_of(&again)["passed"], true);
+}
+
+/// The gate is unchanged by the reuse: a pull request on a tree whose only check failed is refused,
+/// and one after a real green run on the pushed tree opens.
+#[tokio::test]
+async fn a_reused_failure_still_refuses_the_pull_request_and_a_real_green_opens_it() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let command = "test ! -f broken.flag";
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    let reused = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(reused.is_error, "{}", reused.content);
+    assert!(
+        reused.content.contains("not run again"),
+        "{}",
+        reused.content
+    );
+
+    // The tree is the one the failure was seen on: commit and push it, and the gate refuses.
+    CommitAndPush
+        .call(
+            &another_call(&rig, "call-3"),
+            json!({"message": "feat: add a"}),
+        )
+        .await
+        .unwrap();
+    let args = json!({"title": "feat: a", "body": "Adds a.\n\n## Verification\n- `test ! -f broken.flag` fails"});
+    let refused = OpenPullRequest
+        .call(&another_call(&rig, "call-4"), args.clone())
+        .await;
+    assert!(is_error(&refused), "{refused:?}");
+    let said = text(refused);
+    assert!(said.contains("Refusing"), "the gate still refuses: {said}");
+    assert!(rig.fx.created_pulls().await.is_empty());
+
+    // The code changes, the same command runs and passes, and the pull request opens.
+    std::fs::remove_file(rig.worktree().join("broken.flag")).unwrap();
+    let green = RunChecks
+        .call(&another_call(&rig, "call-5"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!green.is_error, "{}", green.content);
+    assert_eq!(checks_of(&green)["passed"], true);
+    CommitAndPush
+        .call(
+            &another_call(&rig, "call-6"),
+            json!({"message": "fix: drop the flag"}),
+        )
+        .await
+        .unwrap();
+    let opened = OpenPullRequest
+        .call(
+            &another_call(&rig, "call-7"),
+            json!({"title": "feat: a", "body": "Adds a.\n\n## Verification\n- `test ! -f broken.flag` passes"}),
+        )
+        .await
+        .unwrap();
+    assert!(!opened.is_error, "{}", opened.content);
+    assert_eq!(rig.fx.created_pulls().await.len(), 1);
 }
 
 /// The tail of a long output that the base commit's run keeps (and the notes and the model read) is
@@ -859,6 +1122,8 @@ async fn a_failure_the_change_caused_costs_a_cycle_and_says_the_base_passes() {
     assert!(!notes.checks.last.as_ref().unwrap().preexisting);
     assert!(!notes.checks.base[0].failed);
 
+    // The code changes: the same command runs again, and the base result is not run again.
+    std::fs::write(rig.worktree().join("changed.txt"), "x\n").unwrap();
     let again = RunChecks
         .call(&another_call(&rig, "call-2"), json!({"command": command}))
         .await
@@ -1018,6 +1283,32 @@ async fn a_passing_check_emits_a_passing_checks_artifact_for_head() {
     // Nothing changed: the tree checked is the tree of HEAD.
     let tree = common::git(&rig.worktree(), &["rev-parse", "HEAD^{tree}"]);
     assert_eq!(data["tree"], tree.as_str());
+}
+
+/// The report is bound to the code the command leaves, not only the code it started from: a check
+/// that writes the file it verifies passes for the tree `commit_and_push` will commit.
+#[tokio::test]
+async fn a_check_that_writes_a_file_is_bound_to_the_tree_it_leaves() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let before = common::git(&rig.worktree(), &["rev-parse", "HEAD^{tree}"]);
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": "echo x > made.txt; true"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let data = checks_of(&out);
+    assert_eq!(data["passed"], true);
+    assert_ne!(data["tree"], before.as_str(), "the check made a file");
+    let pushed = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: make a file"}))
+        .await
+        .unwrap();
+    let (bound, _) = commit_artifacts(&pushed);
+    assert_eq!(
+        bound["passed"], true,
+        "the check ran on the tree that was committed: {bound}"
+    );
 }
 
 #[tokio::test]
@@ -3296,6 +3587,702 @@ async fn read_file_pages_a_big_file_and_says_where_the_next_page_starts() {
         tail.content,
         "  4999\tline 4999\n  5000\tline 5000\n[end: 5000 lines]"
     );
+}
+
+// ------------------------------------------------------------------ read_files
+
+/// The section `read_files` gives a file whose page it shows: the line that names it, its rows and
+/// the line that says what is left (or that it is the end).
+fn read_files_section(path: &str, rows: &str, last: &str) -> String {
+    format!("== {path} ==\n{rows}\n{last}")
+}
+
+#[tokio::test]
+async fn read_files_reads_three_files_in_order_and_says_which_is_missing() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(wt.join("b.txt"), "bee\n").unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["a.txt", "nope.txt", "b.txt"]}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.len() <= 32 * 1024,
+        "the whole result is at most 32 KiB: {} bytes",
+        content.len()
+    );
+    let a = content.find("== a.txt ==").unwrap();
+    let missing = content.find("nope.txt: does not exist").unwrap();
+    let b = content.find("== b.txt ==").unwrap();
+    assert!(a < missing && missing < b, "in the order given: {content}");
+    assert_eq!(
+        &content[a..missing],
+        format!(
+            "{}\n\n",
+            read_files_section("a.txt", "     1\tone\n     2\ttwo", "[end: 2 lines]")
+        ),
+        "{content}"
+    );
+    assert_eq!(
+        &content[b..],
+        read_files_section("b.txt", "     1\tbee", "[end: 1 lines]"),
+        "{content}"
+    );
+    assert!(
+        rig.progress().contains(&"read 3 files (remote)".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+}
+
+#[tokio::test]
+async fn read_files_pages_a_file_at_400_lines_and_names_the_single_file_tool() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let big: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(rig.worktree().join("big.txt"), &big).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["big.txt"]}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.starts_with("== big.txt ==\n     1\tline 1\n"),
+        "{content}"
+    );
+    assert!(
+        content.contains("\n   400\tline 400\n"),
+        "the page holds 400 lines"
+    );
+    assert!(!content.contains("\n   401\t"), "{content}");
+    assert!(
+        content.ends_with("[more: 100 lines left; next page: read_file path=big.txt offset=401]"),
+        "{}",
+        &content[content.len() - 100..]
+    );
+    // The next page is the single-file tool's, and it holds what the line said.
+    let next = ReadFile
+        .call(&rig.ctx, json!({"path": "big.txt", "offset": 401}))
+        .await
+        .unwrap();
+    assert!(
+        next.content.starts_with("   401\tline 401\n"),
+        "{}",
+        next.content
+    );
+    // A page also stops at 8 KiB, and then the next page starts at the first line not shown.
+    let wide: String = (1..=100)
+        .map(|i| format!("{i:03} {}\n", "x".repeat(150)))
+        .collect();
+    std::fs::write(rig.worktree().join("wide.txt"), &wide).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["wide.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert!(content.len() <= 8 * 1024 + 400, "{} bytes", content.len());
+    let last = content.lines().last().unwrap();
+    assert!(
+        last.starts_with("[more: ") && last.contains("next page: read_file path=wide.txt offset="),
+        "{last}"
+    );
+    let offset: i64 = last
+        .rsplit_once("offset=")
+        .unwrap()
+        .1
+        .trim_end_matches(']')
+        .parse()
+        .unwrap();
+    assert!(offset > 1 && offset <= 101, "{offset}");
+    let shown = content.lines().count() - 2;
+    assert_eq!(
+        offset as usize,
+        shown + 1,
+        "the next page starts at the first line not shown"
+    );
+}
+
+#[tokio::test]
+async fn read_files_stops_at_32_kib_and_says_which_files_it_did_not_show() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // 100 bytes a row, 81 rows a page: four pages nearly fill the 32 KiB, so the lines of the
+    // files after the last page are what the room is kept for.
+    let body: String = (1..=120)
+        .map(|i| format!("line {i:03} {}\n", "x".repeat(83)))
+        .collect();
+    let paths: Vec<String> = (0..16).map(|i| format!("f{i:02}.txt")).collect();
+    for path in &paths {
+        std::fs::write(wt.join(path), &body).unwrap();
+    }
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": paths}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.len() <= 32 * 1024,
+        "the whole result is at most 32 KiB: {} bytes",
+        content.len()
+    );
+    // Every file is named once: as a page, or as the one line of a file that did not fit.
+    for path in &paths {
+        let shown = content.matches(&format!("== {path} ==")).count();
+        let cut = content
+            .matches(&format!(
+                "[not shown: read it alone with read_file path={path}]"
+            ))
+            .count();
+        assert_eq!(shown + cut, 1, "{path}: {content}");
+    }
+    let first_not_shown = content
+        .find("[not shown: read it alone with read_file path=")
+        .expect("some files do not fit in 32 KiB");
+    assert!(
+        content[first_not_shown..].contains("path=f15.txt]"),
+        "the last file is one of them: {}",
+        &content[first_not_shown..]
+    );
+    assert!(first_not_shown > 0, "some pages came first");
+    // Everything after the first not-shown line is a one-line answer, never a page.
+    assert!(
+        !content[first_not_shown..].contains("== "),
+        "{}",
+        &content[first_not_shown..]
+    );
+}
+
+#[tokio::test]
+async fn read_files_says_why_a_binary_or_a_non_utf8_file_is_not_shown() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("data.bin"), b"\x00\x01\x02 binary").unwrap();
+    std::fs::write(wt.join("latin1.txt"), b"caf\xe9 au lait\n").unwrap();
+    // A character split by the reader's own buffer (8 KiB) is still one character, and a file
+    // that ends in the middle of one is not text.
+    let mut split = vec![b'a'; 8191];
+    split.extend_from_slice("€\n".as_bytes());
+    std::fs::write(wt.join("split.txt"), &split).unwrap();
+    std::fs::write(wt.join("cut.txt"), b"text\xe2").unwrap();
+    std::fs::write(wt.join("ok.txt"), "fine\n").unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["data.bin", "latin1.txt", "split.txt", "cut.txt", "ok.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.contains("data.bin: is a binary file, 10 bytes, not shown"),
+        "{content}"
+    );
+    assert!(
+        content.contains("latin1.txt: is not UTF-8 text, not shown"),
+        "{content}"
+    );
+    assert!(
+        content.contains("cut.txt: is not UTF-8 text, not shown"),
+        "a sequence the file ends in the middle of is not text: {content}"
+    );
+    assert!(
+        content.contains("== split.txt =="),
+        "a character split by the reader is not refused: {content}"
+    );
+    assert!(
+        content.contains("[line cut: 8192 chars]"),
+        "and it is one character, counted: {content}"
+    );
+    assert!(
+        content.ends_with(&read_files_section(
+            "ok.txt",
+            "     1\tfine",
+            "[end: 1 lines]"
+        )),
+        "the other files are still shown: {content}"
+    );
+    // A directory and a path that leaves the worktree are one line each too.
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["src", "../outside.txt", "ok.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.contains("src: is a directory: list it with list_files"),
+        "{content}"
+    );
+    assert!(content.contains("goes up with `..`"), "{content}");
+    assert!(content.contains("     1\tfine"), "{content}");
+}
+
+#[tokio::test]
+async fn read_files_shows_a_line_of_any_length_and_escapes_a_path() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // A line over the page's 8 KiB, five times: the page stops at a whole row and says where the
+    // next one starts, and a long line is cut as read_file cuts one.
+    let long: String = (0..5)
+        .map(|i| format!("{i} {}\n", "x".repeat(3000)))
+        .collect();
+    std::fs::write(wt.join("long.txt"), &long).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["long.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert!(
+        content.starts_with("== long.txt ==\n     1\t0 x"),
+        "{content}"
+    );
+    assert!(content.contains("… [line cut: 3002 chars]"), "{content}");
+    assert!(
+        content.ends_with("[more: 1 lines left; next page: read_file path=long.txt offset=5]"),
+        "{}",
+        &content[content.len() - 80..]
+    );
+    assert!(
+        content.contains("\n     4\t3 x"),
+        "four rows fit 8 KiB: {content}"
+    );
+    // A path that is not one line is shown escaped, so the header cannot add a line.
+    std::fs::write(wt.join("two\nlines.txt"), "a\n").unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["two\nlines.txt"]}))
+        .await
+        .unwrap();
+    assert!(
+        out.content.starts_with("== two\\nlines.txt ==\n"),
+        "{:?}",
+        out.content
+    );
+    assert_eq!(
+        out.content.lines().count(),
+        3,
+        "header, one row, the end: {:?}",
+        out.content
+    );
+    // A path that is not there is escaped the same way: the reason is one line too.
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["no\nsuch.txt", "two\nlines.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.content
+            .starts_with("no\\nsuch.txt: does not exist\n\n== two\\nlines.txt ==\n"),
+        "{:?}",
+        out.content
+    );
+    assert_eq!(out.content.lines().count(), 5, "{:?}", out.content);
+}
+
+#[tokio::test]
+async fn read_files_pages_contiguously_when_a_row_does_not_fit() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // Four rows of a cut 2,100-character line fill the page; the fifth does not fit and the
+    // sixth (a short one) does. A page that skipped the fifth and showed the sixth would lose a
+    // line and point the next page at one it had already shown.
+    let mut body = String::new();
+    for _ in 0..5 {
+        body.push_str(&format!("{}\n", "x".repeat(2100)));
+    }
+    body.push_str("tiny\n");
+    std::fs::write(wt.join("contig.txt"), &body).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["contig.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert!(
+        !content.contains("\n     6\t"),
+        "a row after one that did not fit is not shown: {content}"
+    );
+    assert!(
+        content.ends_with("[more: 2 lines left; next page: read_file path=contig.txt offset=5]"),
+        "{content}"
+    );
+    // The next page starts at the first line not shown, and no line is lost.
+    let next = ReadFile
+        .call(&rig.ctx, json!({"path": "contig.txt", "offset": 5}))
+        .await
+        .unwrap();
+    assert!(next.content.starts_with("     5\t"), "{}", next.content);
+    assert!(next.content.contains("\n     6\ttiny"), "{}", next.content);
+}
+
+#[tokio::test]
+async fn read_files_keeps_each_refusal_on_one_line_whatever_the_path() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("ok.txt"), "tiny\n").unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["../x\n== y.txt ==", "[end: 9 lines]: not a file", "ok.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert_eq!(
+        content
+            .lines()
+            .filter(|line| line.starts_with("== "))
+            .collect::<Vec<_>>(),
+        vec!["== ok.txt =="],
+        "a path cannot add a section: {content}"
+    );
+    assert!(
+        content.contains("\\x0a== y.txt =="),
+        "the newline of a path is escaped: {content}"
+    );
+    assert!(
+        content.contains("\\x5bend: 9 lines]"),
+        "a leading [ of a path is escaped: {content}"
+    );
+    assert_eq!(
+        content.lines().count(),
+        7,
+        "each refusal is one line: {content}"
+    );
+}
+
+#[tokio::test]
+async fn read_files_says_when_a_file_has_no_newline_at_the_end() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("no_end.txt"), "one\ntwo").unwrap();
+    std::fs::write(wt.join("blank_end.txt"), "one\n\n").unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["no_end.txt", "blank_end.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert!(
+        content.contains(
+            "== no_end.txt ==\n     1\tone\n     2\ttwo\n[end: 2 lines; no newline at the end of the file]"
+        ),
+        "{content}"
+    );
+    assert!(
+        content.contains("== blank_end.txt ==\n     1\tone\n     2\t\n[end: 2 lines]"),
+        "an empty last line is a line: {content}"
+    );
+}
+
+#[tokio::test]
+async fn read_files_pages_at_exactly_four_hundred_lines_and_at_the_eighth_kibibyte() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // 400 lines: the whole file. 401: the first page, and the line that says where the next is.
+    let exact: String = (1..=400).map(|i| format!("l{i}\n")).collect();
+    std::fs::write(wt.join("four_hundred.txt"), &exact).unwrap();
+    let more: String = (1..=401).map(|i| format!("l{i}\n")).collect();
+    std::fs::write(wt.join("four_oh_one.txt"), &more).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["four_hundred.txt", "four_oh_one.txt"]}),
+        )
+        .await
+        .unwrap();
+    let content = &out.content;
+    let four = content.split("== four_oh_one.txt ==").next().unwrap();
+    assert!(four.contains("[end: 400 lines]"), "{four}");
+    assert!(!four.contains("[more:"), "{four}");
+    assert_eq!(
+        four.lines().filter(|line| line.contains('\t')).count(),
+        400,
+        "{four}"
+    );
+    let one = &content[content.find("== four_oh_one.txt ==").unwrap()..];
+    assert!(
+        one.ends_with("[more: 1 lines left; next page: read_file path=four_oh_one.txt offset=401]"),
+        "{one}"
+    );
+    assert_eq!(
+        one.lines().filter(|line| line.contains('\t')).count(),
+        400,
+        "{one}"
+    );
+    let next = ReadFile
+        .call(&rig.ctx, json!({"path": "four_oh_one.txt", "offset": 401}))
+        .await
+        .unwrap();
+    assert!(
+        next.content.starts_with("   401\tl401\n"),
+        "{}",
+        next.content
+    );
+
+    // A page stops at 8 KiB exactly: four 2,048-byte rows fit, a fifth does not. A row of 2,048
+    // bytes is 1,020 two-byte characters behind the number and a tab, under the 2,000-character
+    // line cap, so the page is measured in whole rows.
+    let mut eight = String::new();
+    for _ in 0..5 {
+        eight.push_str(&format!("{}\n", "é".repeat(1020)));
+    }
+    std::fs::write(wt.join("eight.txt"), &eight).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["eight.txt"]}))
+        .await
+        .unwrap();
+    let page = out
+        .content
+        .strip_prefix("== eight.txt ==\n")
+        .unwrap()
+        .strip_suffix("[more: 1 lines left; next page: read_file path=eight.txt offset=5]")
+        .unwrap();
+    assert_eq!(
+        page.len(),
+        8 * 1024,
+        "four rows of 2,048 bytes: {}",
+        page.len()
+    );
+    // One byte more on the fourth row and it does not fit: the page stops before it.
+    let mut over = String::new();
+    for _ in 0..3 {
+        over.push_str(&format!("{}\n", "é".repeat(1020)));
+    }
+    over.push_str(&format!("{}y\n", "é".repeat(1020)));
+    over.push_str("tiny\n");
+    std::fs::write(wt.join("over.txt"), &over).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["over.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    let page = content
+        .strip_prefix("== over.txt ==\n")
+        .unwrap()
+        .strip_suffix("[more: 2 lines left; next page: read_file path=over.txt offset=4]")
+        .unwrap();
+    assert_eq!(
+        page.len(),
+        3 * 2048,
+        "the fourth row is one byte over: {}",
+        page.len()
+    );
+    assert!(
+        !content.contains("\n     5\t"),
+        "no row after the one that did not fit: {content}"
+    );
+}
+
+#[tokio::test]
+async fn read_files_never_exceeds_32_kib_with_full_pages_and_long_paths() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // Paths near the 8 KiB budget and a page of nearly 8 KiB each: the result must still fit,
+    // and every path must be named once, as a page or as the line that says it did not fit.
+    let body: String = (0..4).map(|_| format!("{}\n", "z".repeat(2100))).collect();
+    let mut paths = Vec::new();
+    for i in 0..16 {
+        let dir = format!("d{i:02}");
+        let inner = "n".repeat(240);
+        let name = format!("{dir}/{inner}/{}.txt", "f".repeat(200));
+        std::fs::create_dir_all(wt.join(&dir).join(&inner)).unwrap();
+        std::fs::write(wt.join(&name), &body).unwrap();
+        paths.push(name);
+    }
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": paths}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(content.len() <= 32 * 1024, "{} bytes", content.len());
+    let mut pages = 0;
+    for path in &paths {
+        let page = content.matches(&format!("== {path} ==")).count();
+        let cut = content
+            .matches(&format!(
+                "[not shown: read it alone with read_file path={path}]"
+            ))
+            .count();
+        assert_eq!(page + cut, 1, "{path} is named once");
+        pages += page;
+    }
+    assert!(pages > 0, "some pages fit: {content}");
+    assert!(pages < paths.len(), "not all of them fit");
+}
+
+#[tokio::test]
+async fn read_files_refuses_a_path_that_leaves_or_names_no_regular_file() {
+    let rig = Rig::new().await;
+    rig.fx.commit_to_main("plain.txt", "plain\n");
+    let outside = rig.fx.tmp.path().join("outside.txt");
+    std::fs::write(&outside, "secret\n").unwrap();
+    commit_link(&rig.fx, "outside", "escape.txt", outside.to_str().unwrap());
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::process::Command::new("mkfifo")
+        .arg(wt.join("pipe"))
+        .status()
+        .expect("mkfifo");
+    let over = std::fs::File::create(wt.join("huge.bin")).unwrap();
+    over.set_len(512 * 1024 * 1024 + 1).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": [
+                "/etc/hostname",
+                "escape.txt",
+                "pipe",
+                "huge.bin",
+                "",
+                "plain.txt",
+                "plain.txt"
+            ]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(content.contains("is an absolute path"), "{content}");
+    assert!(
+        content.contains("escape.txt: leads outside the worktree (through a symlink): refused"),
+        "{content}"
+    );
+    assert!(content.contains("pipe: is not a regular file"), "{content}");
+    assert!(
+        content.contains("huge.bin: is 536870913 bytes, over the 536870912 a read opens"),
+        "{content}"
+    );
+    assert!(content.contains("path is required"), "{content}");
+    assert_eq!(
+        content.matches("== plain.txt ==").count(),
+        2,
+        "the same path twice is two sections: {content}"
+    );
+    assert_eq!(content.matches("     1\tplain").count(), 2, "{content}");
+}
+
+#[tokio::test]
+async fn read_files_fills_exactly_32_kib_and_falls_back_one_byte_over() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // A row of `bytes` is the number (6), a tab, the text and the line end. Two-byte characters
+    // keep a row of nearly 2 KiB under the 2,000-character line cap.
+    let row = |bytes: usize| -> String {
+        let text = bytes - 8;
+        let pairs = text / 2;
+        format!("{}{}\n", "é".repeat(pairs), "y".repeat(text - 2 * pairs))
+    };
+    let full: String = (0..4).map(|_| row(2048)).collect();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(wt.join(name), &full).unwrap();
+    }
+    let last = |tail: usize| -> String {
+        let mut body: String = (0..3).map(|_| row(2048)).collect();
+        body.push_str(&row(tail));
+        body
+    };
+    // Three pages and a fourth section of exactly the room that is left: 32 KiB less the one
+    // line end the result does not keep.
+    std::fs::write(wt.join("d.txt"), last(1937)).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["a.txt", "b.txt", "c.txt", "d.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.content.len(),
+        32 * 1024 - 1,
+        "the exact cap is allowed, less the final line end: {}",
+        out.content.len()
+    );
+    assert!(!out.content.contains("[not shown"), "{}", out.content);
+    // One byte more on the fourth section and it does not fit: the one line instead.
+    std::fs::write(wt.join("d.txt"), last(1938)).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["a.txt", "b.txt", "c.txt", "d.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.content.len() <= 32 * 1024,
+        "{} bytes",
+        out.content.len()
+    );
+    assert!(
+        out.content
+            .contains("[not shown: read it alone with read_file path=d.txt]"),
+        "{}",
+        out.content
+    );
+    assert!(!out.content.contains("== d.txt =="), "{}", out.content);
+}
+
+#[tokio::test]
+async fn read_files_bounds_its_arguments() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let empty = ReadFiles
+        .call(&rig.ctx, json!({"paths": []}))
+        .await
+        .unwrap();
+    assert!(empty.is_error, "{}", empty.content);
+    assert!(empty.content.contains("1 to 16"), "{}", empty.content);
+    let too_many: Vec<String> = (0..17).map(|i| format!("f{i}.txt")).collect();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": too_many}))
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(out.content.contains("1 to 16"), "{}", out.content);
+    // The paths of one call are bounded too, so the lines for the files it does not show fit.
+    let long: Vec<String> = (0..16)
+        .map(|i| format!("{i}-{}", "d/".repeat(400)))
+        .collect();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": long}))
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("split it into two calls"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn read_files_is_the_same_bytes_for_the_same_call() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "one\ntwo\n").unwrap();
+    let args = json!({"paths": ["a.txt", "README.md"]});
+    let first = ReadFiles.call(&rig.ctx, args.clone()).await.unwrap();
+    let again = ReadFiles.call(&rig.ctx, args).await.unwrap();
+    assert_eq!(first.content, again.content);
 }
 
 #[tokio::test]
@@ -5762,8 +6749,9 @@ async fn notes_of(rig: &Rig) -> adam_coder::tools::notes::RunNotes {
         .unwrap()
 }
 
-/// `run` keeps what a command makes, and is never a check: no artifact, no cycle, nothing in the
-/// notes for the gate to read, and the files it changed make the earlier checks stale.
+/// `run` keeps what a command makes, and is never a check: no artifact, no cycle, no check record in
+/// the notes for the gate to read (it moves the epoch, so an earlier failure is not reused), and the
+/// files it changed make the earlier checks stale.
 #[tokio::test]
 async fn run_keeps_what_a_command_makes_and_is_never_a_check() {
     let rig = Rig::new().await;
@@ -5804,6 +6792,7 @@ async fn run_keeps_what_a_command_makes_and_is_never_a_check() {
     let notes = notes_of(&rig).await;
     assert_eq!(notes.checks.failures, 0);
     assert!(notes.checks.last.is_none() && notes.checks.history.is_empty());
+    assert_eq!(notes.checks.epoch, 1, "`run` moved the check epoch");
     // A failing command is an answer too, and costs nothing, however often.
     for _ in 0..(rig.fx.env.settings.max_check_cycles + 2) {
         let out = Run
@@ -6348,6 +7337,8 @@ fn failed(call: &str, scratch: bool) -> CheckRecord {
         exit_code: Some(1),
         tail: "red".into(),
         tree: None,
+        cwd: String::new(),
+        epoch: 0,
         report: None,
         slot: None,
         scratch,
@@ -6567,6 +7558,7 @@ async fn a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run() {
 
 /// Call ids are unique only within the run that made them: a subagent's call `call-1` is not the
 /// root's `call-1`, so its failed check is a cycle of its own on the root's budget, not a replay.
+/// (Its command is its own too, so the reuse of a failure on an unchanged tree does not apply.)
 #[tokio::test]
 async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
     let rig = Rig::new().await;
@@ -6583,7 +7575,7 @@ async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
         .with_root_run(root);
     assert_eq!(child.call_id(), rig.ctx.call_id());
     let again = RunChecks
-        .call(&child, json!({"command": common::red("false")}))
+        .call(&child, json!({"command": common::red("exit 3")}))
         .await
         .unwrap();
     assert!(again.is_error, "{}", again.content);
@@ -7311,6 +8303,112 @@ async fn a_nested_agents_md_is_shown_once_before_the_page() {
 }
 
 #[tokio::test]
+async fn read_files_shows_a_nested_file_once_before_the_first_file_of_its_directory() {
+    let rig = Rig::new().await;
+    rig.fx.commit_to_main("sub/AGENTS.md", "sub rules\n");
+    rig.fx.commit_to_main("sub/a.txt", "a\n");
+    rig.fx.commit_to_main("sub/b.txt", "b\n");
+    rig.fx.commit_to_main("plain/c.txt", "c\n");
+    rig.prepare().await;
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["plain/c.txt", "sub/a.txt", "sub/b.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    let block = format!(
+        "{}\n\n",
+        instructions_block("sub/AGENTS.md", &["sub rules"])
+    );
+    assert_eq!(
+        content.matches("Project instructions from").count(),
+        1,
+        "shown once, not once per file: {content}"
+    );
+    let at = content.find(&block).expect("the block comes with a.txt");
+    let a = content.find("== sub/a.txt ==").unwrap();
+    let b = content.find("== sub/b.txt ==").unwrap();
+    assert_eq!(
+        at + block.len(),
+        a,
+        "before the first file of the directory"
+    );
+    assert!(a < b, "{content}");
+    assert!(
+        !content[a..b].contains("Project instructions"),
+        "not again before the second file: {content}"
+    );
+    let plain = content.find("== plain/c.txt ==").unwrap();
+    assert!(
+        !content[..plain].contains("Project instructions"),
+        "nothing for a directory without one: {content}"
+    );
+    // A later call of the run shows none of it again.
+    let later = later_call(&rig, "call-2").await;
+    let again = ReadFiles
+        .call(&later, json!({"paths": ["sub/a.txt", "sub/b.txt"]}))
+        .await
+        .unwrap();
+    assert!(
+        !again.content.contains("Project instructions"),
+        "{}",
+        again.content
+    );
+}
+
+#[tokio::test]
+async fn read_files_shows_each_directorys_instructions_once_and_a_retry_the_same() {
+    let rig = Rig::new().await;
+    rig.fx.commit_to_main("one/AGENTS.md", "one rules\n");
+    rig.fx.commit_to_main("one/a.txt", "a\n");
+    rig.fx.commit_to_main("two/CLAUDE.md", "two rules\n");
+    rig.fx.commit_to_main("two/b.txt", "b\n");
+    rig.prepare().await;
+    // An earlier read_file of one directory already showed its file: read_files must not.
+    let read = ReadFile
+        .call(&rig.ctx, json!({"path": "one/a.txt"}))
+        .await
+        .unwrap();
+    assert!(
+        read.content
+            .contains("Project instructions from one/AGENTS.md"),
+        "{}",
+        read.content
+    );
+    let later = later_call(&rig, "call-2").await;
+    let out = ReadFiles
+        .call(&later, json!({"paths": ["one/a.txt", "two/b.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert_eq!(
+        content.matches("Project instructions from").count(),
+        1,
+        "only the directory not shown yet: {content}"
+    );
+    assert!(
+        content.contains("Project instructions from two/CLAUDE.md"),
+        "{content}"
+    );
+    // A retry of the same call renders the same bytes, the block included.
+    let again = ReadFiles
+        .call(&later, json!({"paths": ["one/a.txt", "two/b.txt"]}))
+        .await
+        .unwrap();
+    assert_eq!(content, &again.content);
+    assert_eq!(
+        content
+            .matches("Project instructions from two/CLAUDE.md")
+            .count(),
+        1,
+        "once, not once per file or per retry: {content}"
+    );
+}
+
+#[tokio::test]
 async fn every_read_tool_shows_a_nested_file_before_its_page() {
     for (tool, args) in [
         ("list_files", json!({"path": "sub"})),
@@ -7321,6 +8419,7 @@ async fn every_read_tool_shows_a_nested_file_before_its_page() {
             json!({"pattern": "deep", "path": "sub/deep/f.txt"}),
         ),
         ("read_file", json!({"path": "sub/deep/f.txt"})),
+        ("read_files", json!({"paths": ["sub/deep/f.txt"]})),
     ] {
         let rig = Rig::new().await;
         rig.fx.commit_to_main("sub/CLAUDE.md", "claude sub rules\n");
@@ -7330,6 +8429,7 @@ async fn every_read_tool_shows_a_nested_file_before_its_page() {
             "list_files" => ListFiles.call(&rig.ctx, args.clone()).await,
             "find_files" => FindFiles.call(&rig.ctx, args.clone()).await,
             "search_files" => SearchFiles.call(&rig.ctx, args.clone()).await,
+            "read_files" => ReadFiles.call(&rig.ctx, args.clone()).await,
             _ => ReadFile.call(&rig.ctx, args.clone()).await,
         }
         .unwrap();

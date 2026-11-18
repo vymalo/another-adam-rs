@@ -47,16 +47,16 @@ earlier one in this list wins.
 
 ## 3. Where each ecosystem declares its checks
 
-| Ecosystem | Look at | Typical checks (use the project's flags, not these) |
-|---|---|---|
-| Rust | `Cargo.toml` (workspace, features), `rust-toolchain.toml`, `clippy.toml`, `rustfmt.toml`, `deny.toml` | `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` |
-| Node, TypeScript | `package.json` `scripts` (`lint`, `typecheck`, `test`, `build`), the lockfile (`pnpm-lock.yaml`, `yarn.lock`, `package-lock.json`) and `packageManager` for the tool | `pnpm lint`, `pnpm typecheck`, `pnpm test`: the script, not the tool behind it |
-| Python | `pyproject.toml` (`[tool.ruff]`, `[tool.pytest]`, `[tool.mypy]`), `tox.ini`, `noxfile.py`, `setup.cfg` | `ruff check`, `ruff format --check`, `mypy`, `pytest` |
-| Go | `go.mod`, `.golangci.yml`, `Makefile` | `go vet ./...`, `go test ./...`, `golangci-lint run` when a config exists |
-| Java, Kotlin | `pom.xml`, `build.gradle(.kts)`, `gradlew` | `mvn -B verify`, `./gradlew check` (the wrapper, not a global Gradle) |
-| Dart, Flutter | `pubspec.yaml`, `analysis_options.yaml` | `dart format --output=none --set-exit-if-changed .`, `dart analyze` or `flutter analyze`, `flutter test` |
-| Shell | `*.sh`, `.shellcheckrc` | `shellcheck` on the scripts you changed, plus the syntax check CI runs |
-| Docs | `mkdocs.yml`, `.markdownlint*`, a docs checker in `tools/` | the checker CI runs |
+| Ecosystem | Look at | Typical checks (use the project's flags, not these) | Narrow run, while iterating |
+|---|---|---|---|
+| Rust | `Cargo.toml` (workspace, features), `rust-toolchain.toml`, `clippy.toml`, `rustfmt.toml`, `deny.toml` | `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` | `cargo test <name>`, `cargo test -p <crate>` |
+| Node, TypeScript | `package.json` `scripts` (`lint`, `typecheck`, `test`, `build`), the lockfile (`pnpm-lock.yaml`, `yarn.lock`, `package-lock.json`) and `packageManager` for the tool | `pnpm lint`, `pnpm typecheck`, `pnpm test`: the script, not the tool behind it | `pnpm test <file>` / `npm test -- <file>`, or the runner's own file argument when the script passes one |
+| Python | `pyproject.toml` (`[tool.ruff]`, `[tool.pytest]`, `[tool.mypy]`), `tox.ini`, `noxfile.py`, `setup.cfg` | `ruff check`, `ruff format --check`, `mypy`, `pytest` | `pytest <file>`, `pytest <file>::<test>` |
+| Go | `go.mod`, `.golangci.yml`, `Makefile` | `go vet ./...`, `go test ./...`, `golangci-lint run` when a config exists | `go test ./pkg -run TestX` |
+| Java, Kotlin | `pom.xml`, `build.gradle(.kts)`, `gradlew` | `mvn -B verify`, `./gradlew check` (the wrapper, not a global Gradle) | `mvn -Dtest=<Class> test` / `./gradlew test --tests <class>` |
+| Dart, Flutter | `pubspec.yaml`, `analysis_options.yaml` | `dart format --output=none --set-exit-if-changed .`, `dart analyze` or `flutter analyze`, `flutter test` | `flutter test test/<file>`, `dart test <file>` |
+| Shell | `*.sh`, `.shellcheckrc` | `shellcheck` on the scripts you changed, plus the syntax check CI runs | `shellcheck <file>` |
+| Docs | `mkdocs.yml`, `.markdownlint*`, a docs checker in `tools/` | the checker CI runs | the checker on the one page, when it takes a path |
 
 A monorepo has one set per package: read the manifest of the package you change, and any root
 checks that cover it.
@@ -66,8 +66,11 @@ checks that cover it.
 * Prefer **exactly the commands CI runs**, in CI's order (format, lint, types, tests, build).
   One command per `run_checks` call.
 * Run only what the repository requires. Not an extra linter you like, not a broader test run
-  than CI's. If CI runs the whole workspace and the change touches one package, the narrow run
-  helps you iterate, but the last green run must be the one CI would do.
+  than CI's.
+* **While you iterate, run the narrowest check that covers the change** (one test file, one test,
+  one package: the table's narrow run). It tells you sooner and saves the full suite for when it
+  matters. **A narrow run never stands in for the full set**: before the pull request, run the
+  full set CI runs, after your last change. The last green run is the full set.
 * A command that only looks around (`ls`, `git log`) or makes a file is not a check: use
   `run_command` or `run` for those.
 * If the repository declares no check at all, say so to the person with `ask_user`; do not make

@@ -18,6 +18,10 @@
 //!   generated file), by `run` ([`run`](super::make)), which keeps the files it changes and is held
 //!   to the same guard for everything else.
 //!
+//! It does **not** bump the check epoch (`ChecksNotes::epoch`): its guard compares the tree and
+//! undoes what a look changed, but it does not cover ignored files (`target/`, `node_modules/`), and
+//! it is documented as looking only. `run` keeps files, ignored ones included, and does bump it.
+//!
 //! A command the shell cannot find is reported as a missing toolchain, as for `run_checks` (see
 //! [`missing_tool`]).
 
@@ -105,6 +109,9 @@ pub async fn run_command(
         .await
         .map_err(|e| run_error(redactor, &e))?;
     output::settle(&env, ctx, &mut outcome).await;
+
+    // No bump of `ChecksNotes::epoch` here (see the module): this tool is for looking, and its
+    // guard does not cover ignored files; `run` is the tool that keeps what it changes.
 
     // Did it change anything it should not have?
     let after = Snapshot::of_slot(&slot).await;

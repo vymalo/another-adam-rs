@@ -155,7 +155,7 @@ test('OpenCode\'s shared text names no adam-only tool, and none of adam\'s produ
   if (!file) return;
   const { text } = sharedPrompt(file);
   assert.deepEqual(namedTools(text, adamToolNames(file)), []);
-  for (const word of ['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository', 'apply_patch', 'run_command', 'read_file', 'write_file', 'edit_file', 'accept_red_checks', 'obscura', 'scratch']) {
+  for (const word of ['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository', 'apply_patch', 'run_command', 'read_file', 'read_files', 'write_file', 'edit_file', 'accept_red_checks', 'obscura', 'scratch']) {
     assert.ok(!text.includes(word), `${word} is not in OpenCode's text`);
   }
   for (const own of ['`shell`', '`read`', '`write`', '`edit`']) assert.ok(text.includes(own), `${own} is named`);
