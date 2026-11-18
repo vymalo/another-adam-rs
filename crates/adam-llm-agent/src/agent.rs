@@ -726,25 +726,34 @@ impl LlmAgentBuilder {
                 }
             }
         }
+        // Above a limit of one the model is told what `after_previous` means.
+        let instructions = if self.max_parallel > 1 {
+            Some(match self.instructions {
+                Some(own) if !own.trim().is_empty() => {
+                    format!("{own}\n\n{}", order::INSTRUCTION)
+                }
+                _ => order::INSTRUCTION.to_owned(),
+            })
+        } else {
+            self.instructions
+        };
+        // The toolset never changes after the build, so what a request holds besides the history
+        // (the instructions and the specs as the request shows them) is counted once, here, and
+        // never cloned or serialised again to answer `fixed_chars`.
+        let mut shown = specs.clone();
+        order::prepare(&mut shown, self.max_parallel > 1);
+        let fixed_chars = instructions.as_deref().map_or(0, |s| s.chars().count())
+            + serde_json::to_string(&shown).map_or(0, |s| s.chars().count());
         LlmAgent {
             name: self.name,
             model: self.model,
             model_alias: self.model_alias,
-            // Above a limit of one the model is told what `after_previous` means.
-            instructions: if self.max_parallel > 1 {
-                Some(match self.instructions {
-                    Some(own) if !own.trim().is_empty() => {
-                        format!("{own}\n\n{}", order::INSTRUCTION)
-                    }
-                    _ => order::INSTRUCTION.to_owned(),
-                })
-            } else {
-                self.instructions
-            },
+            instructions,
             tools,
             sources: self.sources,
             index,
             specs,
+            fixed_chars,
             limits: self.limits,
             extensions: Arc::new(self.extensions),
             wait_poll: self.wait_poll,
@@ -906,6 +915,9 @@ pub struct LlmAgent {
     sources: Vec<DynToolSource>,
     index: HashMap<String, usize>,
     specs: Vec<ToolSpec>,
+    /// The characters of the instructions and the specs as a request shows them: what a request
+    /// holds besides the history. Counted once at build; the toolset never changes after it.
+    fixed_chars: usize,
     limits: Limits,
     extensions: Arc<Extensions>,
     wait_poll: Duration,
@@ -1713,17 +1725,7 @@ impl LlmAgent {
 
     /// Characters a request holds besides the history: the instructions and the tools.
     fn fixed_chars(&self) -> usize {
-        self.instructions
-            .as_deref()
-            .map_or(0, |s| s.chars().count())
-            + serde_json::to_string(&self.shown_specs()).map_or(0, |s| s.chars().count())
-    }
-
-    /// The agent's own specs as a request shows them: with `after_previous` above a limit of one.
-    fn shown_specs(&self) -> Vec<ToolSpec> {
-        let mut specs = self.specs.clone();
-        order::prepare(&mut specs, self.max_parallel > 1);
-        specs
+        self.fixed_chars
     }
 
     /// The estimate of the next request, in tokens.
@@ -4645,23 +4647,25 @@ mod compaction_gate_tests {
             .build()
     }
 
+    /// An agent with one tool and a sentence of instructions, at a limit of `limit` calls.
+    fn built(limit: usize) -> LlmAgent {
+        let model: DynModel = Arc::new(MockModel::new());
+        LlmAgent::builder("t", model, "m")
+            .instructions("be brief")
+            .max_parallel(limit)
+            .tool(crate::FnTool::raw(
+                "a",
+                "a",
+                json!({"type": "object", "properties": {}}),
+                |_ctx, _args| async { Ok::<_, crate::ToolError>(crate::ToolOutput::text("a")) },
+            ))
+            .build()
+    }
+
     /// The budget of a request counts what the loop adds above a limit of one: the property in each
     /// schema and the sentence of the instructions.
     #[test]
     fn the_fixed_part_of_a_request_counts_the_injected_order() {
-        let built = |limit: usize| {
-            let model: DynModel = Arc::new(MockModel::new());
-            LlmAgent::builder("t", model, "m")
-                .instructions("be brief")
-                .max_parallel(limit)
-                .tool(crate::FnTool::raw(
-                    "a",
-                    "a",
-                    json!({"type": "object", "properties": {}}),
-                    |_ctx, _args| async { Ok::<_, crate::ToolError>(crate::ToolOutput::text("a")) },
-                ))
-                .build()
-        };
         let one = built(1).fixed_chars();
         let ten = built(10).fixed_chars();
         let mut specs = built(10).specs.clone();
@@ -4677,6 +4681,22 @@ mod compaction_gate_tests {
             injected + order::INSTRUCTION.chars().count() + 2,
             "the property and the sentence (after a blank line) are counted"
         );
+    }
+
+    /// The count a request's fixed part costs is made once, at build: asking again gives the same
+    /// value a recompute from the agent's specs gives.
+    #[test]
+    fn the_fixed_part_is_cached_at_build() {
+        let agent = built(10);
+        let mut shown = agent.specs.clone();
+        order::prepare(&mut shown, true);
+        let want = agent
+            .instructions
+            .as_deref()
+            .map_or(0, |s| s.chars().count())
+            + serde_json::to_string(&shown).unwrap().chars().count();
+        assert_eq!(agent.fixed_chars(), want);
+        assert_eq!(agent.fixed_chars(), want);
     }
 
     /// A history of `turns` turns whose results are `size` letters, and `turns` model turns made.
