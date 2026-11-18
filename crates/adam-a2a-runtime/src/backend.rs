@@ -253,6 +253,8 @@ impl RuntimeTaskBackend {
 
     /// Where the question of an `input-required` task comes from (default:
     /// [`default_prompt`](crate::default_prompt)).
+    ///
+    /// Called only when the run changed, not on every poll: it must be a function of the view.
     #[must_use]
     pub fn with_prompt(
         mut self,
