@@ -1,10 +1,11 @@
 //! Replayable subscriptions: durable polling merged with live events.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use a2a::{
-    Message, Part, Role, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
+    Artifact, Message, Part, Role, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
     TaskStatusUpdateEvent,
 };
 use adam_a2a::{
@@ -16,7 +17,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -34,8 +35,15 @@ use crate::usage;
 /// Consecutive failed reads of the durable run before a subscription gives up.
 const MAX_READ_FAILURES: u32 = 20;
 
-/// Buffered events between the pump and a slow HTTP client.
+/// Buffered events between the pump and a slow HTTP client: at most this many, and at most
+/// [`CHANNEL_BYTES`] of payload.
 const CHANNEL_CAPACITY: usize = 64;
+
+/// The most bytes of event payload one subscription holds for a client that does not read: without
+/// it, 64 events of a 4 MiB file artifact would be 256 MiB per subscriber. Past it, artifact events
+/// are dropped for that subscriber (the stream is resumable and `GetTask` is the truth); a snapshot
+/// and a status are never dropped, because they carry the state that ends the stream.
+const CHANNEL_BYTES: usize = 8 * 1024 * 1024;
 
 /// How often a step reports the same state again to a client that activated `steps/v1`: the
 /// contract asks agents for at most one update per step per second, and the orchestration layer
@@ -51,13 +59,185 @@ pub(crate) fn subscribe(
     caller: Caller,
     task_id: String,
 ) -> BoxStream<'static, Result<TaskEvent, BackendError>> {
-    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (queue, rx) = Queue::new();
     tokio::spawn(async move {
-        if let Err(e) = pump(&backend, &caller, &task_id, &tx).await {
-            let _ = tx.send(Err(e)).await;
+        if let Err(e) = pump(&backend, &caller, &task_id, &queue).await {
+            let _ = queue.push(Err(e)).await;
         }
     });
-    ReceiverStream::new(rx).boxed()
+    ReceiverStream::new(rx).map(|(item, _permit)| item).boxed()
+}
+
+/// One queued event and the byte budget it holds, released when the subscriber takes it (or when
+/// the queue is dropped).
+type Queued = (
+    Result<TaskEvent, BackendError>,
+    Option<OwnedSemaphorePermit>,
+);
+
+/// The queue between the pump and one subscriber: bounded by [`CHANNEL_CAPACITY`] events and by
+/// [`CHANNEL_BYTES`] of payload.
+struct Queue {
+    tx: mpsc::Sender<Queued>,
+    budget: Arc<Semaphore>,
+}
+
+impl Queue {
+    fn new() -> (Self, mpsc::Receiver<Queued>) {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        (
+            Self {
+                tx,
+                budget: Arc::new(Semaphore::new(CHANNEL_BYTES)),
+            },
+            rx,
+        )
+    }
+
+    /// Queue `events`, in order. `None` when the subscriber is gone, else whether the stream ends.
+    async fn send(&self, events: Vec<TaskEvent>) -> Option<bool> {
+        let mut ends = false;
+        for event in events {
+            ends |= event.ends_stream();
+            if !self.push(Ok(event)).await {
+                return None;
+            }
+        }
+        Some(ends)
+    }
+
+    /// Queue one item; `false` when the subscriber is gone. An artifact that does not fit the byte
+    /// budget is dropped (its subscriber reads the task with `GetTask`, or resubscribes for a fresh
+    /// snapshot); a snapshot, a status or an error waits for room instead.
+    async fn push(&self, item: Result<TaskEvent, BackendError>) -> bool {
+        let bytes = item_bytes(&item);
+        let want = u32::try_from(bytes.min(CHANNEL_BYTES)).unwrap_or(u32::MAX);
+        let permit = match self.budget.clone().try_acquire_many_owned(want) {
+            Ok(permit) => Some(permit),
+            Err(_) if droppable(&item) => {
+                tracing::debug!(bytes, "dropping an artifact event for a slow subscriber");
+                return true;
+            }
+            Err(_) => {
+                // What ends the stream is never dropped: wait for the client to read, or leave
+                // when it went away.
+                tokio::select! {
+                    permit = self.budget.clone().acquire_many_owned(want) => match permit {
+                        Ok(permit) => Some(permit),
+                        Err(_) => return false,
+                    },
+                    () = self.tx.closed() => return false,
+                }
+            }
+        };
+        self.tx.send((item, permit)).await.is_ok()
+    }
+
+    /// The bytes of payload queued for this subscriber, for the test of the bound.
+    #[cfg(test)]
+    fn queued_bytes(&self) -> usize {
+        CHANNEL_BYTES - self.budget.available_permits()
+    }
+}
+
+/// Whether an item may be dropped for a subscriber that does not read: an artifact is in the
+/// durable task too (a `GetTask`, or the next subscription's snapshot), a snapshot and a status are
+/// the state itself.
+fn droppable(item: &Result<TaskEvent, BackendError>) -> bool {
+    matches!(item, Ok(TaskEvent::Artifact(_)))
+}
+
+/// The bytes of payload an item holds, for the queue bound: the parts of its artifact or message (a
+/// file's bytes themselves) and the metadata around them, with a fixed cost for the event's own
+/// fields. A bound on what the queue holds, not a measurement of it.
+fn item_bytes(item: &Result<TaskEvent, BackendError>) -> usize {
+    let event = match item {
+        Ok(TaskEvent::Snapshot(task)) => task_bytes(task),
+        Ok(TaskEvent::Status(update)) => {
+            message_bytes(update.status.message.as_ref()) + metadata_bytes(update.metadata.as_ref())
+        }
+        Ok(TaskEvent::Artifact(update)) => {
+            artifact_bytes(&update.artifact) + metadata_bytes(update.metadata.as_ref())
+        }
+        Err(_) => 0,
+    };
+    // An event is never free: what it holds is bounded by the count of events as well, and a
+    // status of no message still takes a slot.
+    64 + event
+}
+
+fn task_bytes(task: &Task) -> usize {
+    let mut bytes = 128 + task.id.len() + task.context_id.len();
+    for artifact in task.artifacts.iter().flatten() {
+        bytes += artifact_bytes(artifact);
+    }
+    for message in task.history.iter().flatten() {
+        bytes += message_bytes(Some(message));
+    }
+    bytes + metadata_bytes(task.metadata.as_ref())
+}
+
+fn artifact_bytes(artifact: &Artifact) -> usize {
+    let mut bytes = 128
+        + artifact.artifact_id.len()
+        + artifact.name.as_deref().map_or(0, str::len)
+        + artifact.description.as_deref().map_or(0, str::len);
+    for part in &artifact.parts {
+        bytes += part_bytes(part);
+    }
+    for extension in artifact.extensions.iter().flatten() {
+        bytes += extension.len();
+    }
+    bytes + metadata_bytes(artifact.metadata.as_ref())
+}
+
+fn message_bytes(message: Option<&Message>) -> usize {
+    let Some(message) = message else {
+        return 0;
+    };
+    let mut bytes = 128 + message.message_id.len();
+    for part in &message.parts {
+        bytes += part_bytes(part);
+    }
+    bytes + metadata_bytes(message.metadata.as_ref())
+}
+
+fn part_bytes(part: &Part) -> usize {
+    128 + match &part.content {
+        a2a::PartContent::Text(text) => text.len(),
+        a2a::PartContent::Raw(bytes) => bytes.len(),
+        a2a::PartContent::Url(url) => url.len(),
+        a2a::PartContent::Data(value) => value_bytes(value),
+    } + part.filename.as_deref().map_or(0, str::len)
+        + part.media_type.as_deref().map_or(0, str::len)
+        + metadata_bytes(part.metadata.as_ref())
+}
+
+fn metadata_bytes(metadata: Option<&HashMap<String, Value>>) -> usize {
+    let Some(metadata) = metadata else {
+        return 0;
+    };
+    metadata
+        .iter()
+        .map(|(key, value)| key.len() + value_bytes(value))
+        .sum()
+}
+
+/// The bytes a JSON value holds, counted without serialising it: a bound on its memory, not on its
+/// text (a string of 1 MiB is at least 1 MiB, and a node is more than its content).
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) => 16,
+        Value::Number(_) => 24,
+        Value::String(text) => 32 + text.len(),
+        Value::Array(items) => 24 + items.iter().map(value_bytes).sum::<usize>(),
+        Value::Object(map) => {
+            24 + map
+                .iter()
+                .map(|(key, value)| 32 + key.len() + value_bytes(value))
+                .sum::<usize>()
+        }
+    }
 }
 
 /// What a poll compares to know the run has not changed since the last one: the store version
@@ -363,25 +543,13 @@ fn admit(
     true
 }
 
-async fn send(
-    tx: &mpsc::Sender<Result<TaskEvent, BackendError>>,
-    events: Vec<TaskEvent>,
-) -> Option<bool> {
-    let mut ends = false;
-    for event in events {
-        ends |= event.ends_stream();
-        tx.send(Ok(event)).await.ok()?;
-    }
-    Some(ends)
-}
-
 /// The subscription: snapshot, then live events and polls until the task ends
 /// or waits for its caller. `Ok(())` also when the client went away.
 async fn pump(
     backend: &RuntimeTaskBackend,
     caller: &Caller,
     task_id: &str,
-    tx: &mpsc::Sender<Result<TaskEvent, BackendError>>,
+    queue: &Queue,
 ) -> Result<(), BackendError> {
     // Attach to live events first, so nothing that happens between the
     // snapshot and the first poll is missed by both. The subscription also starts
@@ -444,7 +612,7 @@ async fn pump(
             task.status.state,
             TaskState::InputRequired | TaskState::AuthRequired
         );
-    if send(tx, vec![TaskEvent::Snapshot(task)]).await.is_none() || ends {
+    if queue.send(vec![TaskEvent::Snapshot(task)]).await.is_none() || ends {
         return Ok(());
     }
 
@@ -454,7 +622,7 @@ async fn pump(
     loop {
         let mut poll = false;
         tokio::select! {
-            () = tx.closed() => return Ok(()),
+            () = queue.tx.closed() => return Ok(()),
             _ = ticker.tick() => poll = true,
             event = async {
                 match live.as_mut() {
@@ -465,7 +633,7 @@ async fn pump(
                 Some(RunEvent::Status { .. }) => poll = true,
                 Some(event) => {
                     let events = tracker.live(event);
-                    if send(tx, events).await.is_none() {
+                    if queue.send(events).await.is_none() {
                         return Ok(());
                     }
                 }
@@ -556,7 +724,7 @@ async fn pump(
             queued.append(&mut events);
             events = queued;
         }
-        match send(tx, events).await {
+        match queue.send(events).await {
             None | Some(true) => return Ok(()),
             Some(false) => {}
         }
@@ -818,5 +986,124 @@ mod tests {
             "both changed, both said: {events:?}"
         );
         assert_ne!(said(&events)[0], was, "new content, a new id");
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    //! The queue between the pump and one subscriber: bounded by events and by payload bytes, and
+    //! what a slow subscriber loses (an artifact, never the state that ends the stream).
+    use futures::FutureExt as _;
+
+    use super::*;
+
+    fn artifact(id: &str, bytes: usize) -> TaskEvent {
+        TaskEvent::Artifact(TaskArtifactUpdateEvent {
+            task_id: "t".into(),
+            context_id: "c".into(),
+            artifact: Artifact {
+                artifact_id: id.into(),
+                name: Some("file".into()),
+                description: None,
+                parts: vec![Part::raw(vec![7; bytes])],
+                metadata: None,
+                extensions: None,
+            },
+            append: None,
+            last_chunk: Some(true),
+            metadata: None,
+        })
+    }
+
+    fn completed() -> TaskEvent {
+        TaskEvent::Status(TaskStatusUpdateEvent {
+            task_id: "t".into(),
+            context_id: "c".into(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        })
+    }
+
+    /// A subscriber that stops reading while 64 artifacts of 1 MiB are emitted holds at most
+    /// [`CHANNEL_BYTES`] of them, and still hears the status that ends the stream.
+    #[tokio::test]
+    async fn a_subscriber_that_does_not_read_holds_at_most_the_byte_bound() {
+        let (queue, mut rx) = Queue::new();
+        for n in 0..64 {
+            assert!(
+                queue
+                    .send(vec![artifact(&format!("a{n}"), 1024 * 1024)])
+                    .await
+                    .is_some()
+            );
+        }
+        let held = queue.queued_bytes();
+        assert!(held <= CHANNEL_BYTES, "{held} bytes queued");
+        let mut queued = Vec::new();
+        while let Ok((item, _permit)) = rx.try_recv() {
+            queued.push(item.expect("an event"));
+        }
+        // The queue is used (an artifact was kept) and bounded (not all 64 were).
+        assert!(queued.len() >= 6, "{} artifacts queued", queued.len());
+        assert!(queued.len() < 64, "{} of 64 artifacts queued", queued.len());
+        assert!(
+            queued
+                .iter()
+                .all(|event| matches!(event, TaskEvent::Artifact(_)))
+        );
+        // What ends the stream is not dropped, even when artifacts were.
+        assert!(queue.send(vec![completed()]).await.is_some());
+        let (last, _permit) = rx.try_recv().expect("the status is queued");
+        assert!(matches!(last, Ok(TaskEvent::Status(_))));
+    }
+
+    /// A subscriber that reads gets every artifact, in order.
+    #[tokio::test]
+    async fn a_reading_subscriber_receives_every_artifact_in_order() {
+        let (queue, mut rx) = Queue::new();
+        for n in 0..64 {
+            assert!(
+                queue
+                    .send(vec![artifact(&format!("a{n}"), 4 * 1024)])
+                    .await
+                    .is_some()
+            );
+        }
+        let mut ids = Vec::new();
+        while let Ok((item, _permit)) = rx.try_recv() {
+            match item.expect("an event") {
+                TaskEvent::Artifact(update) => ids.push(update.artifact.artifact_id),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let expected: Vec<String> = (0..64).map(|n| format!("a{n}")).collect();
+        assert_eq!(ids, expected);
+    }
+
+    /// The state that ends the stream waits for room rather than being dropped.
+    #[tokio::test]
+    async fn what_ends_the_stream_waits_for_room_instead_of_being_dropped() {
+        let (queue, mut rx) = Queue::new();
+        // One artifact of the whole budget: nothing is left for the status behind it.
+        assert!(
+            queue
+                .send(vec![artifact("big", CHANNEL_BYTES)])
+                .await
+                .is_some()
+        );
+        assert_eq!(queue.queued_bytes(), CHANNEL_BYTES);
+        let mut status = Box::pin(queue.send(vec![completed()]));
+        assert!(
+            status.as_mut().now_or_never().is_none(),
+            "the status waits for room"
+        );
+        let _ = rx.recv().await.expect("the artifact");
+        assert!(status.await.is_some(), "then it is queued");
+        let (last, _permit) = rx.recv().await.expect("the status");
+        assert!(matches!(last, Ok(TaskEvent::Status(_))));
     }
 }
