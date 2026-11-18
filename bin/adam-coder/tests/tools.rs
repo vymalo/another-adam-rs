@@ -7143,6 +7143,12 @@ async fn a_run_is_shown_at_most_32_nested_files_and_is_told_once() {
         "Further project instruction files exist below the root and are not shown (a run is shown \
          32): read them with read_file.\n\n     1\tf\n[end: 1 lines]"
     );
+    // The same call again (a retry): the same line.
+    let retry = ReadFile
+        .call(&rig.ctx, json!({"path": "d32/f.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(retry.content, note.content);
     // Another call says nothing more.
     let later = later_call(&rig, "call-2").await;
     let out = ReadFile

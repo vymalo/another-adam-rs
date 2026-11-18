@@ -1022,3 +1022,56 @@ async fn the_prepare_result_survives_a_compaction() {
     // The cache's head did not move.
     assert_eq!(head(&requests[2]), head(&requests[4]));
 }
+
+/// The read calls of one turn run at the same time (ADR 0049): of the ten calls of a reply that read
+/// below one directory, exactly one shows its `AGENTS.md`, and the notes name that call. Each call
+/// claims the directory in one step (`NotesStore::update`), so the others, which looked before it
+/// claimed it, show only their page. Three turns, one directory each, so that the calls overlap
+/// however the worker schedules them.
+#[tokio::test]
+async fn reads_of_one_turn_below_one_directory_show_its_file_once() {
+    let fx = Fixture::new().await;
+    let dirs = ["one", "two", "three"];
+    let files: Vec<String> = (0..10).map(|n| format!("f{n}")).collect();
+    for dir in dirs {
+        fx.commit_to_main(&format!("{dir}/AGENTS.md"), &format!("{dir} rules\n"));
+        for file in &files {
+            fx.commit_to_main(&format!("{dir}/{file}.txt"), &format!("{file}\n"));
+        }
+    }
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![prepare("c1", &fx)]);
+    for dir in dirs {
+        mock.push_tool_calls(
+            files
+                .iter()
+                .map(|file| read(&format!("{dir}-{file}"), &format!("{dir}/{file}.txt")))
+                .collect(),
+        );
+    }
+    mock.push_text("read");
+    let coder = coder_with(&fx, &mock, Arc::new(MemoryStore::new()));
+    let (_, run) = submit(&coder, &format!("look at {}", fx.remote_url())).await;
+    let worker = spawn_worker(&coder);
+    let view = settled(&coder, run).await;
+    worker.stop().await;
+    assert_ne!(view.status, RunStatus::Failed, "{view:#?}");
+
+    let last = mock.requests().pop().unwrap();
+    let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
+    for dir in dirs {
+        let block = instructions_block(&format!("{dir}/AGENTS.md"), &[&format!("{dir} rules")]);
+        let mut shown = Vec::new();
+        for file in &files {
+            let id = format!("{dir}-{file}");
+            let page = format!("     1\t{file}\n[end: 1 lines]");
+            let result = result_of(&last, &id);
+            if result != page {
+                assert_eq!(result, format!("{block}\n\n{page}"), "{id}");
+                shown.push(id);
+            }
+        }
+        assert_eq!(shown.len(), 1, "{dir} shown by {shown:?}");
+        assert_eq!(notes.instructions_shown[&format!("remote/{dir}")], shown[0]);
+    }
+}
