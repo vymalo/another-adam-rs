@@ -99,6 +99,7 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "request_repository"
         | "run_command"
         | "read_file"
+        | "read_files"
         | "list_files"
         | "find_files"
         | "search_files"

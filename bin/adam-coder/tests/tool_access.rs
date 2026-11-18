@@ -65,6 +65,17 @@ fn table() -> BTreeMap<&'static str, Cases> {
 
     // Files: a path names the scope; reads share it, a write is alone with whatever overlaps it.
     t.insert("read_file", by_path(true));
+    // Several paths in one call read the whole of `files`: a write of any path conflicts with it.
+    t.insert(
+        "read_files",
+        vec![
+            (json!({"paths": ["src/a.rs"]}), reads("files")),
+            (
+                json!({"paths": ["src/a.rs"], "repo": "other"}),
+                reads("files"),
+            ),
+        ],
+    );
     t.insert("share_file", by_path(true));
     t.insert("list_files", optional_path(by_path(true)));
     t.insert("find_files", optional_path(by_path(true)));

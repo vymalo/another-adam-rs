@@ -152,7 +152,7 @@ stateDiagram-v2
     Removed --> [*]
 ```
 
-* **Reading.** `read_file`, `list_files`, `find_files`, `search_files` and `share_file` take the reference's name as
+* **Reading.** `read_file`, `read_files`, `list_files`, `find_files`, `search_files` and `share_file` take the reference's name as
   `repo`; the first read checks it out, under the lowest access tier (`plan`), through the coder's own git (its
   sandbox, when there is one) and never in a run pod. A run with one repository and one reference still defaults to the
   repository for a write and for a read that names no slot. The repository's address reaches the reference too, until

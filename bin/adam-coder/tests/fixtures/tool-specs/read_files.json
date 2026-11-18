@@ -1,0 +1,23 @@
+{
+  "name": "read_files",
+  "description": "Read several text files of your worktree in one call: 1 to 16 paths, relative to the root, in the order you give them. Each file comes behind a line that names it, then its numbered lines (the numbers of `read_file`): its first page, at most 400 lines or 8 KiB. A page that was cut ends with `[more: N lines left; next page: read_file path=<path> offset=K]`: read on with read_file. The whole result is at most 32 KiB: a file that did not fit is one line, `[not shown: read it alone with read_file path=<path>]`. A file that is not there, is binary or is not UTF-8 is one line that says why, and the other files are still shown. Read the manifest, the CI file and the other small files of a repository together with it. Example: {\"paths\":[\"Cargo.toml\",\"justfile\"]}",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "paths": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Paths relative to the worktree root, in the order to show them (1 to 16)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to read in: its name, or the repository's address. Leave out when the workspace has one."
+      }
+    },
+    "required": [
+      "paths"
+    ]
+  }
+}

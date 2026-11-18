@@ -1,4 +1,4 @@
-//! `read_file`, `write_file`, `edit_file` and `apply_patch`: the coder edits small, well-located things itself.
+//! `read_file`, `read_files`, `write_file`, `edit_file` and `apply_patch`: the coder edits small, well-located things itself.
 //!
 //! These tools read and change files of the
 //! worktree directly, in the coder's own process, and are **confined to it**: the model chooses
@@ -990,6 +990,341 @@ pub async fn read_file(
         }
         Err(reason) => ToolOutput::error(reason),
     })
+}
+
+// ------------------------------------------------------------------ read_files
+
+/// Most paths one `read_files` call accepts.
+pub const READ_FILES_MAX: usize = 16;
+/// Most lines of one file's page in a `read_files` result.
+pub const READ_FILES_LINES: u32 = 400;
+/// Most bytes of one file's page in a `read_files` result.
+pub const READ_FILES_PAGE_BYTES: usize = 8 * 1024;
+/// Most bytes of the whole `read_files` result.
+pub const READ_FILES_TOTAL_BYTES: usize = 32 * 1024;
+/// Most bytes the escaped paths of one call may take together: they bound what the lines for the
+/// files a result does not show cost, so the whole result stays under [`READ_FILES_TOTAL_BYTES`].
+const READ_FILES_PATHS_BYTES: usize = 8 * 1024;
+/// The room a nested project-instructions block may take (its own cap and its frame), reserved
+/// before a file's page is shown so that a block that was claimed is always shown.
+const BLOCK_ROOM: usize = super::project::NESTED_CAP + 4 * 1024;
+
+/// Why one file of a `read_files` call is not shown.
+enum Unreadable {
+    /// A NUL byte in it.
+    Binary,
+    /// Bytes that are not UTF-8 (where `read_file` shows the replacement character).
+    NotUtf8,
+    /// It could not be read.
+    Io(io::Error),
+}
+
+/// One file of a `read_files` call: its numbered rows, how many lines it has, the first line not
+/// shown, and whether its last line has no line end.
+struct Paged {
+    rows: String,
+    total: u64,
+    next: Option<u64>,
+    no_final_newline: bool,
+}
+
+/// Push the row of the line just read, when the page has room for it, and count it as shown.
+fn push_row(rows: &mut String, shown: &mut u64, line: &[u8], chars: u64, number: u64) {
+    if *shown >= u64::from(READ_FILES_LINES) {
+        return;
+    }
+    let text: String = String::from_utf8_lossy(line)
+        .chars()
+        .take(paging::MAX_LINE_CHARS)
+        .collect();
+    let mut row = format!("{number:>6}\t{text}");
+    if chars > paging::MAX_LINE_CHARS as u64 {
+        row.push_str(&format!("… [line cut: {chars} chars]"));
+    }
+    row.push('\n');
+    // The first row is always shown, as a page of `read_file` always has a line.
+    if *shown > 0 && rows.len() + row.len() > READ_FILES_PAGE_BYTES {
+        return;
+    }
+    rows.push_str(&row);
+    *shown += 1;
+}
+
+/// The page of `reader`: the first [`READ_FILES_LINES`] lines (at most [`READ_FILES_PAGE_BYTES`]
+/// of rows) behind the numbers and tabs `read_file` uses, and how many lines the file has.
+///
+/// The whole stream is read, to count its lines, and every byte of it is checked: a NUL is
+/// [`Unreadable::Binary`] and a byte that is not UTF-8 is [`Unreadable::NotUtf8`]. A line over
+/// [`paging::MAX_LINE_CHARS`] characters is cut and says how long it was, as `read_file` cuts one.
+fn page_in(mut reader: impl io::BufRead, stop: &AtomicBool) -> Result<Paged, Unreadable> {
+    let mut rows = String::new();
+    let mut total: u64 = 0;
+    let mut shown: u64 = 0;
+    let mut line: Vec<u8> = Vec::new();
+    let mut chars: u64 = 0;
+    let mut ends_with_newline = true;
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Unreadable::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "out of time",
+            )));
+        }
+        let buf = reader.fill_buf().map_err(Unreadable::Io)?;
+        if buf.is_empty() {
+            break;
+        }
+        // UTF-8 across the chunks: the bytes of a sequence the end of a chunk split wait in
+        // `carry` for the next one.
+        let mut whole = std::mem::take(&mut carry);
+        whole.extend_from_slice(buf);
+        match std::str::from_utf8(&whole) {
+            Ok(_) => {}
+            Err(e) if e.error_len().is_none() => carry = whole[e.valid_up_to()..].to_vec(),
+            Err(_) => return Err(Unreadable::NotUtf8),
+        }
+        if buf.contains(&0) {
+            return Err(Unreadable::Binary);
+        }
+        for &byte in buf {
+            if byte == b'\n' {
+                total += 1;
+                ends_with_newline = true;
+                push_row(&mut rows, &mut shown, &line, chars, total);
+                line.clear();
+                chars = 0;
+            } else {
+                chars += u64::from(byte & 0xC0 != 0x80);
+                if line.len() < paging::MAX_LINE_CHARS * 4 {
+                    line.push(byte);
+                }
+            }
+        }
+        let used = buf.len();
+        reader.consume(used);
+    }
+    if !carry.is_empty() {
+        return Err(Unreadable::NotUtf8);
+    }
+    if !line.is_empty() || chars > 0 {
+        total += 1;
+        ends_with_newline = false;
+        push_row(&mut rows, &mut shown, &line, chars, total);
+    }
+    Ok(Paged {
+        rows,
+        total,
+        next: (shown < total).then(|| shown + 1),
+        no_final_newline: total > 0 && !ends_with_newline,
+    })
+}
+
+/// Why a path could not be resolved for a `read_files` call, as a phrase that follows the path.
+fn why_not(e: BeneathError) -> String {
+    match e {
+        BeneathError::Escapes => {
+            "leads outside the worktree (through a symlink): refused".to_owned()
+        }
+        BeneathError::Avoided(_) => "leads into .git (through a symlink): refused".to_owned(),
+        BeneathError::TooManyLinks => {
+            "cannot be resolved: too many levels of symbolic links".to_owned()
+        }
+        BeneathError::Changed => {
+            "changed while it was opened (a symlink is on its way now): refused".to_owned()
+        }
+        BeneathError::Io(e) if e.kind() == io::ErrorKind::NotFound => "does not exist".to_owned(),
+        BeneathError::Io(e) => format!("cannot be resolved: {e}"),
+    }
+}
+
+/// One path of a `read_files` call.
+enum One {
+    /// Its page.
+    Page(Paged),
+    /// The one line the result gives for it.
+    Refused(String),
+}
+
+/// Read `rel` of the slot `root` for a `read_files` call: its page, or the one line that says why
+/// it is not shown (a path that is not there, is not text, is over the read cap or leaves the
+/// slot: never a failure of the whole call).
+fn read_one(root: &SlotDir, rel: &str, stop: &AtomicBool) -> One {
+    let shown = rel.trim();
+    let name = paging::escape_name(shown.as_bytes());
+    let parts = match parts_of(rel) {
+        Ok(parts) => parts,
+        // The message names the path already (`\`../a\` goes up with `..`).
+        Err(line) => return One::Refused(line),
+    };
+    let path: PathBuf = parts.iter().collect();
+    let (file, meta) = match root.open_following(&path, &is_dot_git) {
+        Ok(opened) => opened,
+        Err(e) => return One::Refused(format!("{name}: {}", why_not(e))),
+    };
+    if meta.is_dir() {
+        return One::Refused(format!("{name}: is a directory: list it with list_files"));
+    }
+    if !meta.is_file() {
+        return One::Refused(format!("{name}: is not a regular file"));
+    }
+    if meta.size() > READ_MAX_FILE {
+        return One::Refused(format!(
+            "{name}: is {} bytes, over the {READ_MAX_FILE} a read opens: search it with search_files",
+            meta.size()
+        ));
+    }
+    let reader = io::BufReader::new(StopRead { inner: file, stop });
+    match page_in(reader, stop) {
+        Ok(page) => One::Page(page),
+        Err(Unreadable::Binary) => One::Refused(format!(
+            "{name}: is a binary file, {} bytes, not shown",
+            meta.size()
+        )),
+        Err(Unreadable::NotUtf8) => One::Refused(format!("{name}: is not UTF-8 text, not shown")),
+        Err(Unreadable::Io(e)) => One::Refused(format!("{name}: cannot be read: {e}")),
+    }
+}
+
+/// The section of one file in a `read_files` result: the line that names it, its rows, and the line
+/// that says what is left (or that it is the end). It ends with one line end.
+fn section(name: &str, page: &Paged) -> String {
+    let mut out = format!("== {name} ==\n");
+    out.push_str(&page.rows);
+    match page.next {
+        Some(next) => out.push_str(&format!(
+            "[more: {} lines left; next page: read_file path={name} offset={next}]\n",
+            page.total - next + 1
+        )),
+        None if page.total == 0 => out.push_str("[end: 0 lines]\n"),
+        None if page.no_final_newline => out.push_str(&format!(
+            "[end: {} lines; no newline at the end of the file]\n",
+            page.total
+        )),
+        None => out.push_str(&format!("[end: {} lines]\n", page.total)),
+    }
+    out
+}
+
+/// Read several text files of your worktree in one call: 1 to 16 paths, relative to the root, in
+/// the order you give them. Each file comes behind a line that names it, then its numbered lines
+/// (the numbers of `read_file`): its first page, at most 400 lines or 8 KiB. A page that was cut
+/// ends with `[more: N lines left; next page: read_file path=<path> offset=K]`: read on with
+/// read_file. The whole result is at most 32 KiB: a file that did not fit is one line, `[not
+/// shown: read it alone with read_file path=<path>]`. A file that is not there, is binary or is
+/// not UTF-8 is one line that says why, and the other files are still shown. Read the manifest,
+/// the CI file and the other small files of a repository together with it. Example:
+/// {"paths":["Cargo.toml","justfile"]}
+#[tool(label = "Read files", icon = "read", parallel = "read")]
+pub async fn read_files(
+    env: State<ToolEnv>,
+    ctx: &ToolCtx,
+    /// Paths relative to the worktree root, in the order to show them (1 to 16)
+    paths: Vec<String>,
+    /// The slot to read in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
+) -> Outcome {
+    if paths.is_empty() || paths.len() > READ_FILES_MAX {
+        return Ok(ToolOutput::error(format!(
+            "paths must be 1 to {READ_FILES_MAX} paths: give the files to read in one call"
+        )));
+    }
+    let escaped: Vec<String> = paths
+        .iter()
+        .map(|path| paging::escape_name(path.trim().as_bytes()))
+        .collect();
+    let named: usize = escaped.iter().map(|path| path.len() + 1).sum();
+    if named > READ_FILES_PATHS_BYTES {
+        return Ok(ToolOutput::error(format!(
+            "the paths are {named} bytes together, over the {READ_FILES_PATHS_BYTES} one call may \
+             name: split it into two calls"
+        )));
+    }
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
+        Err(outcome) => return outcome,
+    };
+    ctx.emit_progress(format!("read {} files ({})", paths.len(), slot.dir()))
+        .await;
+    let root = Arc::clone(slot.root());
+    let wanted: Vec<String> = paths.iter().map(|path| path.trim().to_owned()).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&stop);
+    let reading = wanted.clone();
+    let work = async {
+        tokio::task::spawn_blocking(move || {
+            reading
+                .iter()
+                .map(|path| read_one(&root, path, &seen))
+                .collect::<Vec<One>>()
+        })
+        .await
+        .map_err(|e| format!("the read was interrupted: {e}"))
+    };
+    let read = match super::find::within(super::find::DEADLINE, &stop, work).await {
+        Ok(read) => read,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
+    };
+    // The one line a result that has no room for a file gives for it.
+    let fallback = |at: usize| -> String {
+        match &read[at] {
+            One::Refused(line) => format!("{line}\n"),
+            One::Page(_) => format!(
+                "[not shown: read it alone with read_file path={}]\n",
+                escaped[at]
+            ),
+        }
+    };
+    let mut out = String::new();
+    // The blocks shown by this call: the same call id shows a directory's file again (a retry),
+    // and a call that reads two files of one directory asks for it twice.
+    let mut shown: Vec<String> = Vec::new();
+    for at in 0..read.len() {
+        // What the files after this one cost when the result has no room for them.
+        let rest: usize = (at + 1..read.len()).map(|i| fallback(i).len() + 1).sum();
+        let alone = fallback(at);
+        let mut piece = String::new();
+        match &read[at] {
+            One::Refused(_) => piece.push_str(&alone),
+            One::Page(page) => {
+                let page = section(&escaped[at], page);
+                let gap = out.len() + usize::from(!out.is_empty());
+                let room = READ_FILES_TOTAL_BYTES.saturating_sub(gap + rest);
+                if page.len() + BLOCK_ROOM <= room {
+                    // Room for a block: claim it. A block that was claimed is always shown.
+                    match super::project::nested(
+                        &env,
+                        ctx,
+                        &slot,
+                        Some(&wanted[at]),
+                        super::project::Target::File,
+                    )
+                    .await?
+                    {
+                        Some(block) if !shown.contains(&block) => {
+                            shown.push(block.clone());
+                            piece.push_str(&block);
+                            piece.push_str("\n\n");
+                            piece.push_str(&page);
+                        }
+                        _ => piece.push_str(&page),
+                    }
+                } else if page.len() <= room {
+                    piece.push_str(&page);
+                } else {
+                    piece.push_str(&alone);
+                }
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&piece);
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    Ok(ToolOutput::text(out))
 }
 
 /// Create a file, or replace one, with exactly `content`. Parent directories are created. The

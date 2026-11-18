@@ -475,6 +475,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "stop_command",
             "list_commands",
             "read_file",
+            "read_files",
             "list_files",
             "find_files",
             "search_files",

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use adam_coder::ToolEnv;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::create::CreateRepository;
-use adam_coder::tools::files::{ApplyPatch, EditFile, ReadFile, WriteFile};
+use adam_coder::tools::files::{ApplyPatch, EditFile, ReadFile, ReadFiles, WriteFile};
 use adam_coder::tools::find::{FindFiles, ListFiles, SearchFiles};
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::make::Run;
@@ -2927,6 +2927,354 @@ async fn read_file_pages_a_big_file_and_says_where_the_next_page_starts() {
         tail.content,
         "  4999\tline 4999\n  5000\tline 5000\n[end: 5000 lines]"
     );
+}
+
+// ------------------------------------------------------------------ read_files
+
+/// The section `read_files` gives a file whose page it shows: the line that names it, its rows and
+/// the line that says what is left (or that it is the end).
+fn read_files_section(path: &str, rows: &str, last: &str) -> String {
+    format!("== {path} ==\n{rows}\n{last}")
+}
+
+#[tokio::test]
+async fn read_files_reads_three_files_in_order_and_says_which_is_missing() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(wt.join("b.txt"), "bee\n").unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["a.txt", "nope.txt", "b.txt"]}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.len() <= 32 * 1024,
+        "the whole result is at most 32 KiB: {} bytes",
+        content.len()
+    );
+    let a = content.find("== a.txt ==").unwrap();
+    let missing = content.find("nope.txt: does not exist").unwrap();
+    let b = content.find("== b.txt ==").unwrap();
+    assert!(a < missing && missing < b, "in the order given: {content}");
+    assert_eq!(
+        &content[a..missing],
+        format!(
+            "{}\n\n",
+            read_files_section("a.txt", "     1\tone\n     2\ttwo", "[end: 2 lines]")
+        ),
+        "{content}"
+    );
+    assert_eq!(
+        &content[b..],
+        read_files_section("b.txt", "     1\tbee", "[end: 1 lines]"),
+        "{content}"
+    );
+    assert!(
+        rig.progress().contains(&"read 3 files (remote)".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+}
+
+#[tokio::test]
+async fn read_files_pages_a_file_at_400_lines_and_names_the_single_file_tool() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let big: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(rig.worktree().join("big.txt"), &big).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["big.txt"]}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.starts_with("== big.txt ==\n     1\tline 1\n"),
+        "{content}"
+    );
+    assert!(
+        content.contains("\n   400\tline 400\n"),
+        "the page holds 400 lines"
+    );
+    assert!(!content.contains("\n   401\t"), "{content}");
+    assert!(
+        content.ends_with("[more: 100 lines left; next page: read_file path=big.txt offset=401]"),
+        "{}",
+        &content[content.len() - 100..]
+    );
+    // The next page is the single-file tool's, and it holds what the line said.
+    let next = ReadFile
+        .call(&rig.ctx, json!({"path": "big.txt", "offset": 401}))
+        .await
+        .unwrap();
+    assert!(
+        next.content.starts_with("   401\tline 401\n"),
+        "{}",
+        next.content
+    );
+    // A page also stops at 8 KiB, and then the next page starts at the first line not shown.
+    let wide: String = (1..=100)
+        .map(|i| format!("{i:03} {}\n", "x".repeat(150)))
+        .collect();
+    std::fs::write(rig.worktree().join("wide.txt"), &wide).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["wide.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert!(content.len() <= 8 * 1024 + 400, "{} bytes", content.len());
+    let last = content.lines().last().unwrap();
+    assert!(
+        last.starts_with("[more: ") && last.contains("next page: read_file path=wide.txt offset="),
+        "{last}"
+    );
+    let offset: i64 = last
+        .rsplit_once("offset=")
+        .unwrap()
+        .1
+        .trim_end_matches(']')
+        .parse()
+        .unwrap();
+    assert!(offset > 1 && offset <= 101, "{offset}");
+    let shown = content.lines().count() - 2;
+    assert_eq!(
+        offset as usize,
+        shown + 1,
+        "the next page starts at the first line not shown"
+    );
+}
+
+#[tokio::test]
+async fn read_files_stops_at_32_kib_and_says_which_files_it_did_not_show() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // 100 bytes a row, 81 rows a page: four pages nearly fill the 32 KiB, so the lines of the
+    // files after the last page are what the room is kept for.
+    let body: String = (1..=120)
+        .map(|i| format!("line {i:03} {}\n", "x".repeat(83)))
+        .collect();
+    let paths: Vec<String> = (0..16).map(|i| format!("f{i:02}.txt")).collect();
+    for path in &paths {
+        std::fs::write(wt.join(path), &body).unwrap();
+    }
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": paths}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.len() <= 32 * 1024,
+        "the whole result is at most 32 KiB: {} bytes",
+        content.len()
+    );
+    // Every file is named once: as a page, or as the one line of a file that did not fit.
+    for path in &paths {
+        let shown = content.matches(&format!("== {path} ==")).count();
+        let cut = content
+            .matches(&format!(
+                "[not shown: read it alone with read_file path={path}]"
+            ))
+            .count();
+        assert_eq!(shown + cut, 1, "{path}: {content}");
+    }
+    let first_not_shown = content
+        .find("[not shown: read it alone with read_file path=")
+        .expect("some files do not fit in 32 KiB");
+    assert!(
+        content[first_not_shown..].contains("path=f15.txt]"),
+        "the last file is one of them: {}",
+        &content[first_not_shown..]
+    );
+    assert!(first_not_shown > 0, "some pages came first");
+    // Everything after the first not-shown line is a one-line answer, never a page.
+    assert!(
+        !content[first_not_shown..].contains("== "),
+        "{}",
+        &content[first_not_shown..]
+    );
+}
+
+#[tokio::test]
+async fn read_files_says_why_a_binary_or_a_non_utf8_file_is_not_shown() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("data.bin"), b"\x00\x01\x02 binary").unwrap();
+    std::fs::write(wt.join("latin1.txt"), b"caf\xe9 au lait\n").unwrap();
+    // A character split by the reader's own buffer (8 KiB) is still one character, and a file
+    // that ends in the middle of one is not text.
+    let mut split = vec![b'a'; 8191];
+    split.extend_from_slice("€\n".as_bytes());
+    std::fs::write(wt.join("split.txt"), &split).unwrap();
+    std::fs::write(wt.join("cut.txt"), b"text\xe2").unwrap();
+    std::fs::write(wt.join("ok.txt"), "fine\n").unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["data.bin", "latin1.txt", "split.txt", "cut.txt", "ok.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.contains("data.bin: is a binary file, 10 bytes, not shown"),
+        "{content}"
+    );
+    assert!(
+        content.contains("latin1.txt: is not UTF-8 text, not shown"),
+        "{content}"
+    );
+    assert!(
+        content.contains("cut.txt: is not UTF-8 text, not shown"),
+        "a sequence the file ends in the middle of is not text: {content}"
+    );
+    assert!(
+        content.contains("== split.txt =="),
+        "a character split by the reader is not refused: {content}"
+    );
+    assert!(
+        content.contains("[line cut: 8192 chars]"),
+        "and it is one character, counted: {content}"
+    );
+    assert!(
+        content.ends_with(&read_files_section(
+            "ok.txt",
+            "     1\tfine",
+            "[end: 1 lines]"
+        )),
+        "the other files are still shown: {content}"
+    );
+    // A directory and a path that leaves the worktree are one line each too.
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["src", "../outside.txt", "ok.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(
+        content.contains("src: is a directory: list it with list_files"),
+        "{content}"
+    );
+    assert!(content.contains("goes up with `..`"), "{content}");
+    assert!(content.contains("     1\tfine"), "{content}");
+}
+
+#[tokio::test]
+async fn read_files_shows_a_line_of_any_length_and_escapes_a_path() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // A line over the page's 8 KiB, five times: the page stops at a whole row and says where the
+    // next one starts, and a long line is cut as read_file cuts one.
+    let long: String = (0..5)
+        .map(|i| format!("{i} {}\n", "x".repeat(3000)))
+        .collect();
+    std::fs::write(wt.join("long.txt"), &long).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["long.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert!(
+        content.starts_with("== long.txt ==\n     1\t0 x"),
+        "{content}"
+    );
+    assert!(content.contains("… [line cut: 3002 chars]"), "{content}");
+    assert!(
+        content.ends_with("[more: 1 lines left; next page: read_file path=long.txt offset=5]"),
+        "{}",
+        &content[content.len() - 80..]
+    );
+    assert!(
+        content.contains("\n     4\t3 x"),
+        "four rows fit 8 KiB: {content}"
+    );
+    // A path that is not one line is shown escaped, so the header cannot add a line.
+    std::fs::write(wt.join("two\nlines.txt"), "a\n").unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["two\nlines.txt"]}))
+        .await
+        .unwrap();
+    assert!(
+        out.content.starts_with("== two\\nlines.txt ==\n"),
+        "{:?}",
+        out.content
+    );
+    assert_eq!(
+        out.content.lines().count(),
+        3,
+        "header, one row, the end: {:?}",
+        out.content
+    );
+    // A path that is not there is escaped the same way: the reason is one line too.
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["no\nsuch.txt", "two\nlines.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.content
+            .starts_with("no\\nsuch.txt: does not exist\n\n== two\\nlines.txt ==\n"),
+        "{:?}",
+        out.content
+    );
+    assert_eq!(out.content.lines().count(), 5, "{:?}", out.content);
+}
+
+#[tokio::test]
+async fn read_files_bounds_its_arguments() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let empty = ReadFiles
+        .call(&rig.ctx, json!({"paths": []}))
+        .await
+        .unwrap();
+    assert!(empty.is_error, "{}", empty.content);
+    assert!(empty.content.contains("1 to 16"), "{}", empty.content);
+    let too_many: Vec<String> = (0..17).map(|i| format!("f{i}.txt")).collect();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": too_many}))
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(out.content.contains("1 to 16"), "{}", out.content);
+    // The paths of one call are bounded too, so the lines for the files it does not show fit.
+    let long: Vec<String> = (0..16)
+        .map(|i| format!("{i}-{}", "d/".repeat(400)))
+        .collect();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": long}))
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("split it into two calls"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn read_files_is_the_same_bytes_for_the_same_call() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "one\ntwo\n").unwrap();
+    let args = json!({"paths": ["a.txt", "README.md"]});
+    let first = ReadFiles.call(&rig.ctx, args.clone()).await.unwrap();
+    let again = ReadFiles.call(&rig.ctx, args).await.unwrap();
+    assert_eq!(first.content, again.content);
 }
 
 #[tokio::test]
@@ -6878,6 +7226,63 @@ async fn a_nested_agents_md_is_shown_once_before_the_page() {
 }
 
 #[tokio::test]
+async fn read_files_shows_a_nested_file_once_before_the_first_file_of_its_directory() {
+    let rig = Rig::new().await;
+    rig.fx.commit_to_main("sub/AGENTS.md", "sub rules\n");
+    rig.fx.commit_to_main("sub/a.txt", "a\n");
+    rig.fx.commit_to_main("sub/b.txt", "b\n");
+    rig.fx.commit_to_main("plain/c.txt", "c\n");
+    rig.prepare().await;
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["plain/c.txt", "sub/a.txt", "sub/b.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    let block = format!(
+        "{}\n\n",
+        instructions_block("sub/AGENTS.md", &["sub rules"])
+    );
+    assert_eq!(
+        content.matches("Project instructions from").count(),
+        1,
+        "shown once, not once per file: {content}"
+    );
+    let at = content.find(&block).expect("the block comes with a.txt");
+    let a = content.find("== sub/a.txt ==").unwrap();
+    let b = content.find("== sub/b.txt ==").unwrap();
+    assert_eq!(
+        at + block.len(),
+        a,
+        "before the first file of the directory"
+    );
+    assert!(a < b, "{content}");
+    assert!(
+        !content[a..b].contains("Project instructions"),
+        "not again before the second file: {content}"
+    );
+    let plain = content.find("== plain/c.txt ==").unwrap();
+    assert!(
+        !content[..plain].contains("Project instructions"),
+        "nothing for a directory without one: {content}"
+    );
+    // A later call of the run shows none of it again.
+    let later = later_call(&rig, "call-2").await;
+    let again = ReadFiles
+        .call(&later, json!({"paths": ["sub/a.txt", "sub/b.txt"]}))
+        .await
+        .unwrap();
+    assert!(
+        !again.content.contains("Project instructions"),
+        "{}",
+        again.content
+    );
+}
+
+#[tokio::test]
 async fn every_read_tool_shows_a_nested_file_before_its_page() {
     for (tool, args) in [
         ("list_files", json!({"path": "sub"})),
@@ -6888,6 +7293,7 @@ async fn every_read_tool_shows_a_nested_file_before_its_page() {
             json!({"pattern": "deep", "path": "sub/deep/f.txt"}),
         ),
         ("read_file", json!({"path": "sub/deep/f.txt"})),
+        ("read_files", json!({"paths": ["sub/deep/f.txt"]})),
     ] {
         let rig = Rig::new().await;
         rig.fx.commit_to_main("sub/CLAUDE.md", "claude sub rules\n");
@@ -6897,6 +7303,7 @@ async fn every_read_tool_shows_a_nested_file_before_its_page() {
             "list_files" => ListFiles.call(&rig.ctx, args.clone()).await,
             "find_files" => FindFiles.call(&rig.ctx, args.clone()).await,
             "search_files" => SearchFiles.call(&rig.ctx, args.clone()).await,
+            "read_files" => ReadFiles.call(&rig.ctx, args.clone()).await,
             _ => ReadFile.call(&rig.ctx, args.clone()).await,
         }
         .unwrap();
