@@ -121,7 +121,9 @@ impl Envelope {
             source: Some(Box::new(e)),
         });
         #[cfg(test)]
-        decodes::bump();
+        if decoded.is_ok() {
+            decodes::bump();
+        }
         decoded
     }
 

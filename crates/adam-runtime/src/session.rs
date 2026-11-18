@@ -226,10 +226,10 @@ impl RoundFacts {
         if rec.state.get("v").and_then(Value::as_u64) != Some(u64::from(crate::envelope::VERSION)) {
             return None;
         }
-        // `agent` is required, and `artifacts` must be the array the envelope says: a listing keeps
-        // neither, and a state whose artifacts are malformed is as unreadable as one without them.
+        // `agent` is required, and `artifacts`, when present, must be the array the envelope says:
+        // a missing one is the envelope's default and is read; a listing keeps neither.
         let agent = rec.state.get("agent")?;
-        if !rec.state.get("artifacts").is_none_or(Value::is_array) {
+        if rec.state.get("artifacts").is_some_and(|a| !a.is_array()) {
             return None;
         }
         let state = ListedState::deserialize(&rec.state).ok()?;
@@ -868,9 +868,11 @@ mod tests {
         }
     }
 
-    /// A state the envelope would refuse stays unreadable to the listing — another version, a
-    /// missing one, malformed artifacts, an inbox message without its kind — so its session closes,
-    /// as it did when the listing built the envelope.
+    /// The members the listing reads are validated to the envelope's shape — the version, `agent`,
+    /// `artifacts` when present, and an inbox message's `kind` — so a state wrong in one of them
+    /// closes its session, as it did when the listing built the envelope. Members the listing does
+    /// not read (a malformed `seq`, an artifact element) are not checked here: the run's next step
+    /// refuses them, and no reported value depends on them.
     #[test]
     fn a_state_the_envelope_would_refuse_closes_its_session() {
         let id = RunId::new();
@@ -888,6 +890,10 @@ mod tests {
             assert_eq!(read.state, SessionState::Closed);
         };
         let base = || with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]).state;
+        // A positive control: the unmodified state is read, so a `read` that always refused could
+        // not make the cases below pass.
+        let control = with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]);
+        assert!(RoundFacts::read(&control).is_some(), "the base is read");
 
         unreadable(base(), |state| state["v"] = serde_json::json!(2));
         unreadable(base(), |state| {
@@ -946,9 +952,9 @@ mod tests {
         let _ = crate::envelope::decodes::take();
         let view = SessionView::from_rounds(session, runs.clone()).expect("a session");
         let decodes = crate::envelope::decodes::take();
-        assert!(
-            decodes <= 1,
-            "{decodes} envelopes decoded for 20 rounds: the report reads the latest once"
+        assert_eq!(
+            decodes, 1,
+            "the report reads the latest round once, whatever the number of rounds"
         );
         assert_eq!(view.round, 20);
         assert_eq!(view.header.as_ref().map(|h| h.round), Some(20));
