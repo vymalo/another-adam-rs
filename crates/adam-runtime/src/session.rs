@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use adam_core::{RunId, RunRecord, RunStatus};
 
 use crate::child::ChildStatus;
-use crate::envelope::Envelope;
 
 /// The separator between the (escaped) parent conversation id and the session id.
 const SESSION_SEGMENT: &str = "/s/";
@@ -172,23 +171,94 @@ pub(crate) fn header_of(agent_state: &Value) -> Option<SessionHeader> {
     serde_json::from_value(agent_state.get(SESSION_STATE_KEY)?.clone()).ok()
 }
 
-fn header_of_record(rec: &RunRecord) -> Option<SessionHeader> {
-    Envelope::decode(rec.id, &rec.state)
-        .ok()
-        .and_then(|e| header_of(&e.agent))
+/// What a listing reads from a round's record: what its state says about its session, and how the
+/// round ended. The envelope is **not** built: its `agent` member is the agent's whole state (for
+/// `LlmAgent`, the transcript), and a listing never needs it.
+struct RoundFacts {
+    /// The header the round's agent keeps under `agent.session`.
+    header: Option<SessionHeader>,
+    /// A close request waits in the round's inbox.
+    close_asked: bool,
+    /// How the round ended, as a parent reads it: `Failed` when its state cannot be read.
+    status: RunStatus,
+    /// Why it failed, when it did.
+    error: Option<String>,
+}
+
+/// The members of a round's state a listing reads by name. Every other member — `agent` above all —
+/// is skipped, so a round's transcript is never materialised.
+#[derive(Deserialize)]
+struct ListedState {
+    #[serde(default)]
+    inbox: Vec<ListedInbound>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// The one member of an inbox message a listing reads. Required, as it is in [`Inbound`]: a message
+/// without one is not a state the runtime wrote.
+///
+/// [`Inbound`]: crate::agent::Inbound
+#[derive(Deserialize)]
+struct ListedInbound {
+    kind: String,
+}
+
+impl RoundFacts {
+    fn of(rec: &RunRecord) -> Self {
+        Self::read(rec).unwrap_or_else(|| Self {
+            // A round whose state cannot be read is a session nobody can continue: closed, not open
+            // for ever.
+            header: None,
+            close_asked: true,
+            status: if rec.status.is_open() {
+                rec.status
+            } else {
+                RunStatus::Failed
+            },
+            error: None,
+        })
+    }
+
+    fn read(rec: &RunRecord) -> Option<Self> {
+        // The envelope's version gate, without the envelope: a state another version wrote is not
+        // read here, exactly as `Envelope::decode` refuses it.
+        if rec.state.get("v").and_then(Value::as_u64) != Some(u64::from(crate::envelope::VERSION)) {
+            return None;
+        }
+        // `agent` is required, and `artifacts`, when present, must be the array the envelope says:
+        // a missing one is the envelope's default and is read; a listing keeps neither.
+        let agent = rec.state.get("agent")?;
+        if rec.state.get("artifacts").is_some_and(|a| !a.is_array()) {
+            return None;
+        }
+        let state = ListedState::deserialize(&rec.state).ok()?;
+        Some(Self {
+            header: header_of(agent),
+            close_asked: state.inbox.iter().any(|i| i.kind == SESSION_CLOSE_KIND),
+            status: rec.status,
+            error: state.error,
+        })
+    }
 }
 
 /// The rounds of a session in the order they ran: by the round number the header carries, then
-/// by creation time and id. Each with its header.
-fn ordered(runs: Vec<RunRecord>) -> Vec<(RunRecord, Option<SessionHeader>)> {
-    let mut keyed: Vec<(RunRecord, Option<SessionHeader>)> = runs
+/// by creation time and id. Each with what a listing reads of it.
+fn ordered(runs: Vec<RunRecord>) -> Vec<(RunRecord, RoundFacts)> {
+    let mut keyed: Vec<(RunRecord, RoundFacts)> = runs
         .into_iter()
         .map(|r| {
-            let h = header_of_record(&r);
-            (r, h)
+            let facts = RoundFacts::of(&r);
+            (r, facts)
         })
         .collect();
-    keyed.sort_by_key(|(r, h)| (h.as_ref().map_or(0, |h| h.round), r.created_at, r.id.0));
+    keyed.sort_by_key(|(r, f)| {
+        (
+            f.header.as_ref().map_or(0, |h| h.round),
+            r.created_at,
+            r.id.0,
+        )
+    });
     keyed
 }
 
@@ -282,27 +352,19 @@ pub(crate) struct Latest {
     pub outcome: Option<RoundOutcome>,
     pub header: Option<SessionHeader>,
     pub closed: bool,
-    pub status: ChildStatus,
 }
 
-/// Read `latest`, the newest round of a session.
-pub(crate) fn read_latest(latest: &RunRecord) -> Latest {
+/// Read `latest`, the newest round of a session, from the facts a listing already read of it.
+fn read_latest(latest: &RunRecord, facts: &RoundFacts) -> Latest {
     let open = latest.status.is_open();
-    let (header, close_asked) = match Envelope::decode(latest.id, &latest.state) {
-        Ok(env) => {
-            let asked = env.inbox.iter().any(|i| i.kind == SESSION_CLOSE_KIND);
-            (header_of(&env.agent), asked)
-        }
-        // A round whose state cannot be read is a session nobody can continue: closed, not open for ever.
-        Err(_) => (None, true),
-    };
-    let keep_open = header.as_ref().is_none_or(|h| h.keep_open);
-    let closed = close_asked || header.as_ref().is_some_and(|h| h.closed) || (!open && !keep_open);
-    let status = ChildStatus::from_record(latest);
+    let keep_open = facts.header.as_ref().is_none_or(|h| h.keep_open);
+    let closed = facts.close_asked
+        || facts.header.as_ref().is_some_and(|h| h.closed)
+        || (!open && !keep_open);
     let (state, outcome) = if open {
         (SessionState::Working, None)
     } else {
-        let outcome = match (status.status, status.error.as_deref()) {
+        let outcome = match (facts.status, facts.error.as_deref()) {
             (RunStatus::Done, _) => RoundOutcome::Done,
             (_, Some(e)) if e.starts_with("cancelled:") => RoundOutcome::Cancelled,
             _ => RoundOutcome::Failed,
@@ -317,9 +379,8 @@ pub(crate) fn read_latest(latest: &RunRecord) -> Latest {
     Latest {
         state,
         outcome,
-        header,
+        header: facts.header.clone(),
         closed,
-        status,
     }
 }
 
@@ -344,10 +405,10 @@ pub(crate) fn page_of_sessions(
             let id = session_of(parent_conversation, &conversation_id)?;
             // Round 1 is the run whose id is the session id, started as a child.
             runs.iter().find(|r| r.id == id && r.parent_id.is_some())?;
-            let mut runs: Vec<RunRecord> = ordered(runs).into_iter().map(|(r, _)| r).collect();
+            let mut runs = ordered(runs);
             let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
-            let latest = runs.pop()?;
-            let read = read_latest(&latest);
+            let (latest, facts) = runs.pop()?;
+            let read = read_latest(&latest, &facts);
             Some(SessionSummary {
                 id,
                 agent,
@@ -428,14 +489,14 @@ impl SessionView {
     pub(crate) fn from_rounds(session: RunId, runs: Vec<RunRecord>) -> Option<Self> {
         let runs = ordered(runs);
         let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
-        let (latest, _) = runs.last()?.clone();
+        let last = runs.len().checked_sub(1)?;
+        // The report is the last round that did work: a round that only closes the session has none.
         let worked = runs
             .iter()
-            .rev()
-            .find(|(_, h)| !h.as_ref().is_some_and(|h| h.closing))
-            .map_or_else(|| latest.clone(), |(r, _)| r.clone());
-        let mut read = read_latest(&latest);
-        read.status = ChildStatus::from_record(&worked);
+            .rposition(|(_, f)| !f.header.as_ref().is_some_and(|h| h.closing))
+            .unwrap_or(last);
+        let (latest, facts) = &runs[last];
+        let read = read_latest(latest, facts);
         Some(Self {
             id: session,
             agent: latest.agent.clone(),
@@ -446,8 +507,8 @@ impl SessionView {
             state: read.state,
             outcome: read.outcome,
             closed: read.closed,
-            latest: read.status,
-            report_run: worked.id,
+            latest: ChildStatus::from_record(&runs[worked].0),
+            report_run: runs[worked].0.id,
             started_by: latest.parent_id,
         })
     }
@@ -685,7 +746,7 @@ mod tests {
         let state = |h: Option<SessionHeader>, status, inbox| {
             let id = h.as_ref().map_or_else(RunId::new, |h| h.id);
             let rec = with_header(id, h, status, inbox);
-            let read = read_latest(&rec);
+            let read = read_latest(&rec, &RoundFacts::of(&rec));
             (read.state, read.closed)
         };
         let id = RunId::new();
@@ -771,9 +832,150 @@ mod tests {
         let id = RunId::new();
         let mut rec = with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]);
         rec.state = serde_json::json!("garbage");
-        let read = read_latest(&rec);
+        let read = read_latest(&rec, &RoundFacts::of(&rec));
         assert!(read.closed);
         assert_eq!(read.state, SessionState::Closed);
+    }
+
+    /// A round as an `LlmAgent` commits one: a valid envelope whose `agent` holds the round's header
+    /// and a transcript of about `bytes` bytes under `messages`.
+    fn round_with_a_transcript(id: RunId, header: SessionHeader, bytes: usize) -> RunRecord {
+        let messages: Vec<Value> = (0..bytes / 128)
+            .map(|n| {
+                serde_json::json!({"role": "assistant", "text": format!("m{n} {}", "x".repeat(100))})
+            })
+            .collect();
+        let mut agent = serde_json::Map::new();
+        agent.insert(
+            SESSION_STATE_KEY.to_owned(),
+            serde_json::to_value(&header).expect("a header"),
+        );
+        agent.insert("messages".to_owned(), Value::Array(messages));
+        let t = DateTime::from_timestamp(1_700_000_000, 0).expect("a fixed instant");
+        RunRecord {
+            id,
+            agent: "a".into(),
+            conversation_id: Some(session_conversation_id("p", id)),
+            parent_id: Some(RunId::new()),
+            status: RunStatus::Done,
+            state: crate::envelope::Envelope::new(Value::Object(agent))
+                .encode()
+                .expect("an envelope"),
+            wake_at: None,
+            version: 2,
+            created_at: t,
+            updated_at: t,
+        }
+    }
+
+    /// The members the listing reads are validated to the envelope's shape — the version, `agent`,
+    /// `artifacts` when present, and an inbox message's `kind` — so a state wrong in one of them
+    /// closes its session, as it did when the listing built the envelope. Members the listing does
+    /// not read (a malformed `seq`, an artifact element) are not checked here: the run's next step
+    /// refuses them, and no reported value depends on them.
+    #[test]
+    fn a_state_the_envelope_would_refuse_closes_its_session() {
+        let id = RunId::new();
+        let unreadable = |mut state: Value, break_it: fn(&mut Value)| {
+            break_it(&mut state);
+            let mut rec = with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]);
+            rec.state = state;
+            let facts = RoundFacts::of(&rec);
+            assert!(
+                facts.header.is_none() && facts.close_asked,
+                "the state is not read"
+            );
+            let read = read_latest(&rec, &facts);
+            assert!(read.closed);
+            assert_eq!(read.state, SessionState::Closed);
+        };
+        let base = || with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]).state;
+        // A positive control: the unmodified state is read, so a `read` that always refused could
+        // not make the cases below pass.
+        let control = with_header(id, Some(header(id, true, false)), RunStatus::Done, vec![]);
+        assert!(RoundFacts::read(&control).is_some(), "the base is read");
+
+        unreadable(base(), |state| state["v"] = serde_json::json!(2));
+        unreadable(base(), |state| {
+            state.as_object_mut().expect("an envelope").remove("v");
+        });
+        unreadable(base(), |state| state["artifacts"] = serde_json::json!("x"));
+        unreadable(
+            with_header(
+                id,
+                Some(header(id, true, false)),
+                RunStatus::Done,
+                vec![crate::agent::Inbound::new(
+                    SESSION_CLOSE_KIND,
+                    serde_json::json!({}),
+                )],
+            )
+            .state,
+            |state| {
+                state["inbox"][0]
+                    .as_object_mut()
+                    .expect("a message")
+                    .remove("kind");
+            },
+        );
+    }
+
+    /// A listing reads each round's header from the raw state and never builds the envelope, whose
+    /// `agent` member is the whole transcript: 20 rounds of a 100 KiB transcript cost no decode. The
+    /// one place that reads a report, `ChildStatus::from_record`, reads the latest round once,
+    /// whatever the number of rounds.
+    #[test]
+    fn a_listing_reads_headers_without_building_the_envelope() {
+        let parent = RunId::new();
+        let session = RunId::new();
+        let conversation = session_conversation_id("p", session);
+        let mut runs = Vec::new();
+        let mut last = session;
+        for round in 1..=20 {
+            let id = if round == 1 { session } else { RunId::new() };
+            let mut h = header(session, true, false);
+            h.round = round;
+            let mut rec = round_with_a_transcript(id, h, 100 * 1024);
+            rec.conversation_id = Some(conversation.clone());
+            rec.parent_id = Some(parent);
+            runs.push(rec);
+            last = id;
+        }
+        // The transcripts really are large, and the states really are envelopes.
+        let transcript = serde_json::to_vec(&runs[0].state["agent"]["messages"])
+            .expect("a transcript")
+            .len();
+        assert!(transcript >= 100 * 1024, "{transcript}");
+        assert!(crate::envelope::Envelope::decode(runs[0].id, &runs[0].state).is_ok());
+
+        // A session view reads one report, so at most one decode, however many rounds it ordered.
+        let _ = crate::envelope::decodes::take();
+        let view = SessionView::from_rounds(session, runs.clone()).expect("a session");
+        let decodes = crate::envelope::decodes::take();
+        assert_eq!(
+            decodes, 1,
+            "the report reads the latest round once, whatever the number of rounds"
+        );
+        assert_eq!(view.round, 20);
+        assert_eq!(view.header.as_ref().map(|h| h.round), Some(20));
+        assert!(!view.closed);
+        assert_eq!(view.latest.status, RunStatus::Done);
+
+        // A listing builds no envelope at all.
+        let _ = crate::envelope::decodes::take();
+        let list = page_of_sessions("p", rounds(runs), 0, 10);
+        assert_eq!(
+            crate::envelope::decodes::count(),
+            0,
+            "a listing decodes no envelope"
+        );
+        assert_eq!(list.sessions.len(), 1);
+        let summary = &list.sessions[0];
+        assert_eq!(summary.round, 20);
+        assert_eq!(summary.latest_run, last);
+        assert_eq!(summary.description, "look", "the header was read");
+        assert!(summary.keep_open && !summary.closed);
+        assert_eq!(summary.outcome, Some(RoundOutcome::Done));
     }
 
     #[test]

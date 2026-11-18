@@ -7,6 +7,8 @@
 
 use crate::events::{Artifact, MAX_ARTIFACT_FILE_BYTES, MAX_RUN_FILE_BYTES};
 
+use sha2::{Digest as _, Sha256};
+
 /// What a file is when nothing better can be said of it: bytes to download, never a picture.
 const OCTETS: &str = "application/octet-stream";
 
@@ -297,6 +299,18 @@ impl Artifact {
     /// `mcp.json` with `files: true` and a remote subagent with `files: true`. A JSON artifact is
     /// `Shared <name>.`
     pub fn shared_line(&self) -> String {
+        let sha256 = self
+            .mime_type
+            .as_deref()
+            .is_some_and(|m| m.starts_with("image/"))
+            .then(|| self.file_sha256())
+            .flatten();
+        self.shared_line_with(sha256.as_deref())
+    }
+
+    /// [`shared_line`](Self::shared_line) with the SHA-256 of the file's bytes already computed: a
+    /// file that was just hashed for its name is not hashed again for its line.
+    fn shared_line_with(&self, sha256: Option<&str>) -> String {
         let Some(file) = &self.file else {
             return format!("Shared {}.", self.name);
         };
@@ -311,7 +325,7 @@ impl Artifact {
                 " To show it in your answer, write ![description]({}).",
                 link_destination(&file.filename)
             ));
-            if let Some(hash) = self.file_sha256() {
+            if let Some(hash) = sha256 {
                 line.push_str(&format!(
                     " To use it as the picture of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}. \
                      In a `show` block, an `Image` names it: {{component: \"Image\", artifact: \"{hash}\", alt}}."
@@ -446,12 +460,14 @@ impl ReceivedFiles {
             return line;
         }
         let media_type = checked_media_type(claimed, &bytes);
+        // One digest for both the name and the line.
+        let digest = digest_of(&bytes);
         let filename = format!(
             "{}-{}.{}",
             filename
                 .and_then(base_of)
                 .unwrap_or_else(|| self.stem.clone()),
-            short_hash(&bytes),
+            short_hex(&digest),
             extension_of(&media_type)
         );
         let name = name
@@ -462,7 +478,12 @@ impl ReceivedFiles {
         match Artifact::file(name, media_type, filename, bytes) {
             Ok(artifact) => {
                 self.used += len;
-                let line = artifact.shared_line();
+                let sha256 = artifact
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("image/"))
+                    .then(|| hex_of(&digest));
+                let line = artifact.shared_line_with(sha256.as_deref());
                 self.artifacts.push(artifact);
                 line
             }
@@ -531,14 +552,54 @@ fn is_invisible_format(c: char) -> bool {
     matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
 }
 
-/// The first 8 hexadecimal digits of the SHA-256 of `bytes`.
-fn short_hash(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    sha2::Sha256::digest(bytes)
-        .iter()
-        .take(4)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+/// The SHA-256 of `bytes`, as 64 lower-case hexadecimal digits.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex_of(&digest_of(bytes))
+}
+
+/// The SHA-256 of `bytes`. Every hash of a shared file goes through here, so a test can count them.
+fn digest_of(bytes: &[u8]) -> sha2::digest::Output<Sha256> {
+    #[cfg(test)]
+    hashes::bump();
+    Sha256::digest(bytes)
+}
+
+/// The first 8 hexadecimal digits of `digest`.
+fn short_hex(digest: &[u8]) -> String {
+    hex_of(&digest[..digest.len().min(4)])
+}
+
+/// `bytes` as lower-case hexadecimal, in one allocation.
+fn hex_of(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+    }
+    out
+}
+
+/// How many hashes a thread took, in tests.
+#[cfg(test)]
+mod hashes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn count() -> usize {
+        COUNT.with(Cell::get)
+    }
+
+    pub(super) fn reset() {
+        COUNT.with(|count| count.set(0));
+    }
 }
 
 /// `1234` bytes as `1.2 KiB`.
@@ -557,6 +618,17 @@ pub fn human_size(len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The short hash as it was first written — one `format!("{b:02x}")` per byte — kept as an
+    /// oracle that shares no code with the implementation under test.
+    fn short_hash(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
     const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>";
@@ -728,6 +800,48 @@ mod tests {
         // An artifact name is one line of at most 120 characters.
         assert_eq!(clean_name(&"n".repeat(500)).chars().count(), MAX_NAME_CHARS);
         assert_eq!(clean_name("report\u{202E}gnp.exe\u{200B}"), "reportgnp.exe");
+    }
+
+    /// Sharing a file hashes it once: the name's 8 hexadecimal digits and the line's 64 come from
+    /// one digest, where a 1 MiB file used to be hashed twice.
+    #[test]
+    fn sharing_a_large_file_hashes_it_once_and_keeps_its_name() {
+        let mut bytes = PNG.to_vec();
+        bytes.resize(1024 * 1024, 0);
+        hashes::reset();
+        let mut files = ReceivedFiles::new("browser_png", RUN);
+        let line = files.share(Some("image/png"), Some("shot.png"), None, bytes.clone());
+        assert_eq!(hashes::count(), 1, "one digest for the name and the line");
+        let short = short_hash(&bytes);
+        let (artifacts, refused) = files.into_parts();
+        assert!(!refused);
+        let artifact = &artifacts[0];
+        assert_eq!(
+            artifact.file.as_ref().expect("a file").filename,
+            format!("shot-{short}.png")
+        );
+        assert!(
+            line.starts_with(&format!("Shared shot-{short}.png (1.0 MiB, image/png).")),
+            "{line}"
+        );
+        let hash = artifact.file_sha256().expect("a file");
+        assert_eq!(hash.len(), 64);
+        assert!(line.contains(&format!("sha256: \"{hash}\"")), "{line}");
+        assert!(line.contains(&format!("artifact: \"{hash}\"")), "{line}");
+    }
+
+    #[test]
+    fn a_digest_is_written_as_64_lower_case_hex_digits() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(short_hex(&digest_of(b"abc")), "ba7816bf");
+        assert_eq!(short_hash(b"abc"), "ba7816bf", "the oracle agrees");
     }
 
     /// The same bytes are the same name, so a replay names a file as the first run did; two files

@@ -203,13 +203,9 @@ impl Artifact {
     /// screen keeps the file under, and what a form's picture of it (`ask_user`'s `image.sha256`)
     /// refers to. `None` for a JSON artifact.
     pub fn file_sha256(&self) -> Option<String> {
-        use sha2::Digest as _;
-        self.file.as_ref().map(|f| {
-            sha2::Sha256::digest(&f.bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
-        })
+        self.file
+            .as_ref()
+            .map(|f| crate::file::sha256_hex(&f.bytes))
     }
 }
 
