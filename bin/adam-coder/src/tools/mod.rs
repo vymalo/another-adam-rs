@@ -1120,7 +1120,7 @@ impl Tool for Gated {
             let tier = self
                 .env
                 .notes
-                .load_existing(&run)
+                .load_shared(&run)
                 .await
                 .map_err(|e| notes_error(&e))?
                 .map_or(AccessTier::Plan, |notes| self.env.tier_of(&notes));
