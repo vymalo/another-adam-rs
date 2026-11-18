@@ -43,6 +43,18 @@ use common::{Fixture, edit_instructions, plain_folder as folder};
 use futures::stream::BoxStream;
 use serde_json::json;
 
+/// The system prompt of a request without the sentence the loop appends about `after_previous`
+/// (ADR 0049): the agent's own words, as the test wrote them.
+fn plain(system: &Option<String>) -> Option<String> {
+    system.as_ref().map(|s| {
+        s.replacen(
+            &format!("\n\n{}", adam_llm_agent::AFTER_PREVIOUS_INSTRUCTION),
+            "",
+            1,
+        )
+    })
+}
+
 /// The instruction snapshot: the body of `agent/instructions.md`, with `{{max_check_cycles}}`
 /// where the limit goes and `{{display_name}}` where the name goes.
 const SNAPSHOT: &str = include_str!("fixtures/agent/prompt.txt");
@@ -549,7 +561,10 @@ async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
     assert_eq!(requests.len(), 2);
     let first = &requests[0];
     assert_eq!(first.model, "test-model");
-    assert_eq!(first.system.as_deref(), Some(expected_prompt(3).as_str()));
+    assert_eq!(
+        plain(&first.system).as_deref(),
+        Some(expected_prompt(3).as_str())
+    );
     assert_eq!(first.max_output_tokens, Some(8192));
     // No message named a tier, so the run works under the default, `auto`: the model is not shown the
     // two tools that need `bypass`. Every other tool is, in the same order.
@@ -679,7 +694,7 @@ async fn editing_the_folder_changes_what_the_model_is_sent() {
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
     run_to_a_stop(&coder, "hi").await;
 
-    let system = mock.requests()[0].system.clone().unwrap();
+    let system = plain(&mock.requests()[0].system).unwrap();
     assert!(
         system.contains("\n\nAlways answer in French.\n\n"),
         "{system}"
@@ -951,7 +966,10 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
         |r: &ModelRequest| -> Vec<String> { r.tools.iter().map(|t| t.name.clone()).collect() };
     assert!(offered(&requests[0]).contains(&"summariser".to_owned()));
     // The child: its own prompt and the one tool it picked from the coder's.
-    assert_eq!(requests[1].system.as_deref(), Some("You summarise diffs."));
+    assert_eq!(
+        plain(&requests[1].system).as_deref(),
+        Some("You summarise diffs.")
+    );
     assert_eq!(offered(&requests[1]), ["run_command"]);
     // The coder goes on with what the child said.
     match requests[2].messages.last().unwrap() {

@@ -1,7 +1,7 @@
 //! What each tool of the screen shares with the other calls of a turn (ADR 0049).
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
-use adam_llm_agent::{Tool, ToolAccess};
+use adam_llm_agent::ToolAccess;
 use adam_mcp::McpPolicy;
 use adam_ui::Ui;
 use serde_json::json;
