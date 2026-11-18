@@ -7,7 +7,10 @@
 //! one costs a weaker result and nothing else. `tests/real_language_servers.rs` is a gated suite for the
 //! real servers (`ADAM_TEST_LANGUAGE_SERVERS=1`): `rust-analyzer` and `pyright` were run on
 //! 2026-11-17 and reported an error at its line, a definition and references; the other two were not
-//! installed there.
+//! installed there. `dart language-server` takes `--protocol=lsp` (*verified* 2026-11-18 in
+//! dart-lang/sdk at tag 3.12.2, `pkg/dartdev/lib/src/commands/language_server.dart`); the Dart
+//! server is told no setting, and its run of the suite is the pull request author's report
+//! (*unverified* here).
 
 use serde_json::{Value, json};
 
