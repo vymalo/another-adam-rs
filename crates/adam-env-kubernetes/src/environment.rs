@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,8 @@ pub(crate) struct Inner {
     pub(crate) pods: Api<Pod>,
     pub(crate) exec: Arc<dyn PodExec>,
     pub(crate) counter: AtomicU64,
+    /// Whether a watch that could not be kept has been reported at `warn` already.
+    watch_warned: AtomicBool,
     /// Makes the ids of commands unique across restarts of the coder.
     pub(crate) epoch: String,
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -110,6 +112,17 @@ impl Inner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(run);
+    }
+
+    /// Say that the watch of the run pod cannot be kept: the first one at `warn`, so a missing
+    /// `watch` RBAC (or an API that refuses watches) is visible in the logs, the rest at `debug`
+    /// (a pod that takes minutes to come up would otherwise repeat it every few seconds).
+    fn note_watch_problem(&self, pod: &str, detail: &str) {
+        if self.watch_warned.swap(true, Ordering::Relaxed) {
+            tracing::debug!(pod = %pod, %detail, "the watch of the run pod cannot be kept; polling it instead");
+        } else {
+            tracing::warn!(pod = %pod, %detail, "the watch of the run pod cannot be kept; polling it instead");
+        }
     }
 
     /// How long the pod of `run` has not been used, counting from now when it was never seen.
@@ -262,6 +275,7 @@ impl KubeEnvironment {
                 pods,
                 exec,
                 counter: AtomicU64::new(1),
+                watch_warned: AtomicBool::new(false),
                 epoch,
                 locks: StdMutex::default(),
                 used: StdMutex::default(),
@@ -307,6 +321,9 @@ impl KubeEnvironment {
         let settings = &inner.settings;
         let mut reporter = Reporter::new(progress);
         let deadline = Instant::now() + settings.ready_timeout;
+        // The pod's `resourceVersion` as of the last read (or create): the watch resumes from it,
+        // so it delivers the *next* change and not the state this loop already has.
+        let mut resource_version: Option<String> = None;
         loop {
             let found = inner
                 .pods
@@ -315,6 +332,7 @@ impl KubeEnvironment {
                 .map_err(|e| env_error(&e, "looking for the run pod"))?;
             match found {
                 Some(pod) => {
+                    resource_version = pod.metadata.resource_version.clone();
                     if annotation(&pod, RUN_ID_ANNOTATION) != Some(run) {
                         return Err(EnvError::Refused(format!(
                             "the pod {name} belongs to another run (the names of two runs collided); release it first"
@@ -367,7 +385,9 @@ impl KubeEnvironment {
                         mounts,
                     );
                     match inner.pods.create(&PostParams::default(), &wanted).await {
-                        Ok(_) => {}
+                        Ok(created) => {
+                            resource_version = created.metadata.resource_version.clone();
+                        }
                         // Another worker, or an earlier call whose future was dropped, made it.
                         Err(e) if is_already_exists(&e) => {}
                         Err(e) => {
@@ -386,20 +406,27 @@ impl KubeEnvironment {
                     secs: settings.ready_timeout.as_secs(),
                 });
             }
-            match self.wait_for_change(name, deadline).await {
-                Woke::Changed | Woke::Deadline => {}
-                // The API refused the watch, or closed it: the poll is the fallback it always was.
-                Woke::Closed => tokio::time::sleep(settings.ready_poll).await,
+            // A watch resumes from the version the read returned. Without one (`0`, or nothing)
+            // the API would begin with the pod as it is now, which is what this loop already has:
+            // every event would be this state again, and the loop would spin on it.
+            match resource_version.as_deref().filter(|rv| !rv.is_empty()) {
+                Some(rv) => match self.wait_for_change(name, rv, deadline).await {
+                    Woke::Changed | Woke::Deadline => {}
+                    // The API refused the watch, or closed it: the poll is the fallback it always was.
+                    Woke::Closed => tokio::time::sleep(settings.ready_poll).await,
+                },
+                None => tokio::time::sleep(settings.ready_poll).await,
             }
         }
     }
 
     /// Wait until the pod `name` changes, the deadline passes, or the watch cannot be kept: one
-    /// watch on the pod (`metadata.name`), not a read per [`Settings::ready_poll`].
+    /// watch on the pod (`metadata.name`) from `rv`, not a read per [`Settings::ready_poll`].
     ///
-    /// The caller reads the pod again after any change: a watch event says that something moved
-    /// (a status, the deletion), and the read decides what to do with it, as it does today.
-    async fn wait_for_change(&self, name: &str, deadline: Instant) -> Woke {
+    /// `rv` is the `resourceVersion` of the last read: the watch then sends what happened after
+    /// it, never the state the caller already has. The caller reads the pod again after any event
+    /// and decides what to do with it, as it does today.
+    async fn wait_for_change(&self, name: &str, rv: &str, deadline: Instant) -> Woke {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Woke::Deadline;
@@ -411,14 +438,19 @@ impl KubeEnvironment {
         let params = WatchParams::default()
             .fields(&format!("metadata.name={name}"))
             .timeout(secs);
-        // `0` asks for the pod as it is now, then the changes: no listing, no resource version to
-        // resume from, so an expired or dropped watch costs one more watch and never a stale read.
-        let stream = match self.inner.pods.watch(&params, "0").await {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::debug!(pod = %name, error = %adam_error::report(&e), "cannot watch the run pod; polling it instead");
+        // An API that never answers must not outlive `ready_timeout`.
+        let stream = match tokio::time::timeout_at(
+            deadline.into(),
+            self.inner.pods.watch(&params, rv),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                self.inner.note_watch_problem(name, &adam_error::report(&e));
                 return Woke::Closed;
             }
+            Err(_) => return Woke::Deadline,
         };
         tokio::pin!(stream);
         let until = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
@@ -430,12 +462,27 @@ impl KubeEnvironment {
                     Ok(Some(
                         WatchEvent::Added(_) | WatchEvent::Modified(_) | WatchEvent::Deleted(_),
                     )) => return Woke::Changed,
-                    // A bookmark only says the watch is alive, and an error object is the API's
-                    // own: the next event, or the end of the stream, decides.
-                    Ok(Some(WatchEvent::Bookmark(_) | WatchEvent::Error(_))) => continue,
+                    // A bookmark only says the watch is alive.
+                    Ok(Some(WatchEvent::Bookmark(_))) => continue,
+                    // A 410 (the version is gone) or a 5xx: the next read takes a fresh version.
+                    Ok(Some(WatchEvent::Error(status))) => {
+                        self.inner.note_watch_problem(
+                            name,
+                            &format!(
+                                "the API's watch reported {}: {}",
+                                if status.reason.is_empty() {
+                                    "an error"
+                                } else {
+                                    status.reason.as_str()
+                                },
+                                status.message
+                            ),
+                        );
+                        return Woke::Closed;
+                    }
                     Ok(None) => return Woke::Closed,
                     Err(e) => {
-                        tracing::debug!(pod = %name, error = %adam_error::report(&e), "the watch of the run pod ended; polling it instead");
+                        self.inner.note_watch_problem(name, &adam_error::report(&e));
                         return Woke::Closed;
                     }
                 },

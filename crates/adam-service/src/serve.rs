@@ -504,8 +504,11 @@ pub async fn serve(
 mod tests {
     use super::*;
 
-    /// The connection the server accepts writes at once: `TCP_NODELAY` is on it, so a small
-    /// response head or an SSE frame is not held behind the previous write's acknowledgement.
+    /// The connection the helper accepts writes at once: `TCP_NODELAY` is on it.
+    ///
+    /// This proves the helper, not that [`serve`] uses it: the server's own socket is not
+    /// reachable from a test, so that wiring is the one `no_delay(listener)` call in `serve`,
+    /// reviewed by eye.
     #[tokio::test]
     async fn an_accepted_connection_has_nagle_off() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
