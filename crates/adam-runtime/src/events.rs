@@ -456,7 +456,7 @@ pub const REPLAY_MAX_AGE: Duration = Duration::from_secs(30);
 pub const REPLAY_MAX_RUNS: usize = 64;
 
 /// The most bytes the replay of a [`BroadcastSink`] keeps for every run together: 16 MiB, a per
-/// process cap, as an estimate of the heap the events hold ([`event_bytes`]). The count bounds
+/// process cap, as an estimate of the heap the events hold (`event_bytes`). The count bounds
 /// alone leave the worst case near 50 MiB (64 runs of 64 events, each a step end with its input
 /// and output); one run's tool results of megabytes would pin it. Past the bound the globally
 /// oldest events go first, so every retained run keeps its newest events, and an event larger than
