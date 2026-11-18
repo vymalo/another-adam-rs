@@ -3676,6 +3676,30 @@ async fn read_files_keeps_each_refusal_on_one_line_whatever_the_path() {
 }
 
 #[tokio::test]
+async fn read_files_says_when_a_file_has_no_newline_at_the_end() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("no_end.txt"), "one\ntwo").unwrap();
+    std::fs::write(wt.join("blank_end.txt"), "one\n\n").unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["no_end.txt", "blank_end.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert!(
+        content.contains(
+            "== no_end.txt ==\n     1\tone\n     2\ttwo\n[end: 2 lines; no newline at the end of the file]"
+        ),
+        "{content}"
+    );
+    assert!(
+        content.contains("== blank_end.txt ==\n     1\tone\n     2\t\n[end: 2 lines]"),
+        "an empty last line is a line: {content}"
+    );
+}
+
+#[tokio::test]
 async fn read_files_pages_at_exactly_four_hundred_lines_and_at_the_eighth_kibibyte() {
     let rig = Rig::new().await;
     rig.prepare().await;
