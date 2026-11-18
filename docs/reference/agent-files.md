@@ -638,7 +638,7 @@ sees the parent's history. The sequence and the states of the wait are in
 
 A root with a subagent, local or remote, also gets five tools that run a subagent **in the background** as a session
 (`subagent_start`, `subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`; [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md),
-[child runs](child-runs.md#sessions-adr-0045-slices-1-and-2)). No file declares them: they follow the folder's subagents,
+[child runs](child-runs.md#sessions-adr-0045-slices-1-to-3)). No file declares them: they follow the folder's subagents,
 whose names are the enum of `agent`, and they are not given to a subagent. A subagent file needs nothing for them, and a remote
 (`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the five is refused at
 bind. A root whose subagents are all remote gets the five tools as well.

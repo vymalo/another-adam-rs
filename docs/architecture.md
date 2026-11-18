@@ -1050,7 +1050,7 @@ A subagent is a child run: an agent started by a tool of another agent, with its
 limits, whose final answer is the result of that tool call. The runtime supplies `start_child`, the
 `adam.run.finished` message, `Ctx::child_status` and `ToolError::AwaitRun`; no scheduler. A child with a
 conversation (a session round, ADR 0045) reports with `adam.child.reported` instead, and
-`start_child_continuing` starts it ([Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-and-2)).
+`start_child_continuing` starts it ([Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-3)).
 
 ```mermaid
 sequenceDiagram
@@ -1103,7 +1103,8 @@ The failure interleavings, their tests and what the design refuses are in
 A subagent can also run in the background as a **session** ([ADR 0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)):
 a conversation of child runs ("rounds") in the parent's own conversation, started, read, sent to and closed by five tools
 that return at once. The parent parks only when a read asks to wait, or when its model answers while a session it started
-still works. The sequence, the states and the interleavings are in [Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-and-2).
+still works or a round ended and was not yet reported. A round that ends meanwhile is told to the model by its next call: the
+journaled step `model:<turn>` lists the sessions first and records the reports it appended (`reports`, no new step). The sequence, the states and the interleavings are in [Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-3).
 
 ## Errors
 

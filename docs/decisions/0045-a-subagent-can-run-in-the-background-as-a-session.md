@@ -3,7 +3,7 @@
 Status: **Accepted** (2026-11-14), the owner's decision: *"we need to add the capability that opencode has to create child
 session, and exchange messages with it. At creation, there should be a button to auto-close after work is done, so that the
 child session can further be reused."* The six defaults under [What was put to the owner](#what-was-put-to-the-owner) are
-recommendations the owner was told the work proceeds with. Slices 1 and 2 are built (below). Reverses "one-shot child runs" and "no
+recommendations the owner was told the work proceeds with. Slices 1, 2 and 3 are built (below). Reverses "one-shot child runs" and "no
 resume" of [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md); amends
 [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md), [ADR 0003](0003-a-new-task-continues-the-task-it-references.md),
 [ADR 0016](0016-a-message-sent-to-a-working-task-is-steered-into-it.md) and
@@ -54,6 +54,35 @@ decisions above, each for a reason found while building:
   a read of a closed session gives the last round that worked; a close request survives `Runtime::cancel`, and a round whose state
   cannot be read closes its session; a call that acts on a session is committed before it runs; a run that ends cancels rounds it
   could not wait for; at most 4 rounds work at once (`max_working` as a constant); retention must outlast a session's idle life.
+
+*Built 2026-11-18:* slice 3 (reports during a turn, `crates/adam-llm-agent/src/{agent,sessions,conversation}.rs`). The rounds that ended reach
+the model without a read of its own; the design departs from the slice's text in these ways, each to leave old journals and rollbacks
+replaying and to move no step's seq (as ADR 0050 decision 9 does for messages):
+
+1. **No `children:<turn>` or `report:<round id>` steps.** The listing and the reads are made inside the step `model:<turn>` and recorded in
+   its record (`reports`, `sessions_open`, both absent when empty), so a journal from before replays as it was and a build from before
+   ignores the members. At the end of a turn the existing step `sessions:<turn>` and the read `wait_<turn>` are used.
+2. **Reports are read through `ChildStarter::session` and the read tool's `poll_remote`**, not `Ctx::child_status`, which refuses the rounds of
+   other parents, a person's round included. The appended calls are `subagent_read` calls with ids `report_<32 hex of the round id>`.
+3. **`Ctx::arrived` does not count reports.** The turn that a report keeps going is decided from the store at the end of the turn (a round that
+   ended during the final model call is read with `wait_<turn>`), which needs no notice: every round this run started has either ended or is
+   waited for, and a person's round never notifies a parent. A notice stays a wake-up; a lost one costs at most one turn, a duplicate matches nothing.
+4. **A report is of the session's latest round that worked** and is due once: the round has ended, is not a closing round, is not in
+   `Conversation::reported_rounds` (the last 128, carried to a later task) and was started by this run or by a person. A round an earlier task's run
+   started is not reported: that run waited for it or cancelled it. A round of mine that another round followed before the parent looked is folded
+   into the session's next report.
+5. **When the loop lists:** at the first model call of each run, and before every call while `Conversation::sessions_open` is set (a session that is not
+   closed was seen, or a call started or sent to one since). A person's session that starts while none is open is reported at the parent's next task:
+   decision 7's "now or in a later task".
+6. **Appended reports are not calls of the model.** They do not count toward `max_tool_calls` or `doom_loop`, carry no `after_previous` and are added
+   only when no result is owed, so never inside an ADR 0049 segment. The report at the end of a turn is a real call (`wait_<turn>`), as in slice 2.
+   A record whose answer predates a message the run has read leaves its reports for the next call.
+7. **A person's round** is reported with its header marked "started by the person"; the person's words are not in the report, and it is a tool result,
+   never a user message. Decision 7 as amended for slice 6 part a ("waits for slice 3") is built.
+
+Proof: eleven cases in `crates/adam-llm-agent/tests/sessions.rs` (memory, PostgreSQL, MongoDB), the due rule in `sessions.rs` and the record in
+`agent.rs`. Three older cases that count the tokens of a round **nobody read** run on `LlmAgentBuilder::without_session_reports` (a hidden builder method
+that makes the agent as a build from before), because the loop now reads such a round at its next model call.
 
 *Built 2026-11-18:* slice 6 part a (the A2A front, `crates/adam-a2a-runtime/src/child_sessions.rs`, the card entry in `crates/adam-a2a`, two
 readers and `closing_round_payload` in `crates/adam-runtime`): a client that activates `child-sessions/v1` sees the sessions of a parent
@@ -118,7 +147,7 @@ round agents' starters on the A2A front; a reload of `LiveAssembly` keeps the ro
 * **Decision 1, a person's round is its own parent.** A round a person starts has no run of an agent behind it, so it is started with
   its own id as parent: no run's end cancels it and no run waits for it. The runtime says it
   (`SessionView::started_outside_a_run`) and the A2A front derives `by: person` from it. A round the model starts is unchanged.
-* **Decision 7**: a person's round reports to no parent; the report of a person's round to the parent run waits for slice 3.
+* **Decision 7**: a person's round reports to no parent; the report of a person's round to the parent run waits for slice 3. (*Built 2026-11-18, slice 3:* the parent reads it from the store at its next listing; see the note above.)
 * **Decision 9**: a round a person starts always has a tier written (the one its message names, else the agent's default).
 * **Decision 5**: the card's `maxOpen` is the value the deployment passes to `ChildSessions::new`, which must equal the model tools' constant (16) until slice 4 makes it a setting. It is checked before a start, so concurrent starts may exceed it by the number racing, as the tools' check may.
 * **Not built here:** the live usage of a model round stays on the parent until the loop is free to change; push configs on round
