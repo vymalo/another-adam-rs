@@ -96,12 +96,15 @@ struct Rig {
     hidden_mock: Arc<MockModel>,
     hidden: String,
     gate: Arc<Gate>,
+    /// Holds the parent's model, when `hold_parent_on` says.
+    parent_gate: Arc<Gate>,
     helper: String,
     worker: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
 }
 
 struct Options {
     hold_helper_on: Option<usize>,
+    hold_parent_on: Option<usize>,
     max_open: u32,
     tiers: bool,
     listing_page: usize,
@@ -112,6 +115,7 @@ impl Options {
     fn new() -> Self {
         Self {
             hold_helper_on: None,
+            hold_parent_on: None,
             max_open: 16,
             tiers: false,
             listing_page: 100,
@@ -133,6 +137,13 @@ impl Rig {
         let hidden = uniq("hidden");
         let hidden_mock = Arc::new(MockModel::new());
         let gate = Arc::new(Gate::default());
+        let parent_gate = Arc::new(Gate::default());
+        let parent_model: DynModel = Arc::new(GateModel {
+            inner: parent_mock.clone(),
+            calls: AtomicUsize::new(0),
+            hold_on: options.hold_parent_on,
+            gate: parent_gate.clone(),
+        });
         let helper_model: DynModel = Arc::new(GateModel {
             inner: helper_mock.clone(),
             calls: AtomicUsize::new(0),
@@ -156,7 +167,7 @@ impl Rig {
                 remote: false,
             },
         ]);
-        let mut parent_agent = LlmAgent::builder(&parent, parent_mock.clone() as DynModel, "m")
+        let mut parent_agent = LlmAgent::builder(&parent, parent_model, "m")
             .session_agents([helper.clone(), hidden.clone()]);
         for tool in tools.tools() {
             parent_agent = parent_agent.dyn_tool(tool);
@@ -202,6 +213,7 @@ impl Rig {
             hidden_mock,
             hidden,
             gate,
+            parent_gate,
             helper,
             worker: Some((stop, handle)),
         }
@@ -1180,6 +1192,555 @@ async fn a_subscription_snapshot_says_the_sessions() {
         let mut events = rig.backend.subscribe(&alice(), &one.id);
         let task = snapshot(events.next().await);
         assert_eq!(object(&task)["session"], one.id);
+        rig.stop().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Events (slice 6, part b)
+// ---------------------------------------------------------------------------
+
+/// The stream of `id`, read up to its snapshot: what the subscription knows is then fixed.
+async fn subscribed(
+    rig: &Rig,
+    caller: &Caller,
+    id: &str,
+) -> BoxStream<'static, Result<adam_a2a::TaskEvent, BackendError>> {
+    let mut events = rig.backend.subscribe(caller, id);
+    match events.next().await {
+        Some(Ok(adam_a2a::TaskEvent::Snapshot(_))) => events,
+        other => panic!("expected a snapshot, got {other:?}"),
+    }
+}
+
+/// What a stream said under the extension's URI, in order: for each status update that carries
+/// it, the object. Reads until the stream ends, or `until` says it has enough, or 20 s pass.
+async fn said_on(
+    events: &mut BoxStream<'static, Result<adam_a2a::TaskEvent, BackendError>>,
+    until: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut out = Vec::new();
+    while Instant::now() < deadline && !until(&out) {
+        let Ok(next) = tokio::time::timeout(Duration::from_millis(200), events.next()).await else {
+            continue;
+        };
+        match next {
+            None => break,
+            Some(Err(e)) => panic!("the stream failed: {e}"),
+            Some(Ok(adam_a2a::TaskEvent::Status(update))) => {
+                if let Some(o) = update
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get(CHILD_SESSIONS_EXTENSION))
+                {
+                    if o.get("event").is_some() {
+                        assert!(
+                            update.status.message.is_none(),
+                            "an event of a session carries no message: {update:?}"
+                        );
+                    }
+                    out.push(o.clone());
+                }
+            }
+            Some(Ok(_)) => {}
+        }
+    }
+    out
+}
+
+/// [`said_on`] in a task of its own, for a test that acts while the stream is read.
+fn spawn_said(
+    mut events: BoxStream<'static, Result<adam_a2a::TaskEvent, BackendError>>,
+    until: impl Fn(&[Value]) -> bool + Send + 'static,
+) -> tokio::task::JoinHandle<Vec<Value>> {
+    tokio::spawn(async move { said_on(&mut events, until).await })
+}
+
+fn names(said: &[Value]) -> Vec<String> {
+    said.iter()
+        .map(|o| match o["report"].as_str() {
+            Some(report) => format!("{}:{report}", o["event"].as_str().unwrap_or("?")),
+            None => o["event"].as_str().unwrap_or("?").to_owned(),
+        })
+        .collect()
+}
+
+fn event_count(n: usize) -> impl Fn(&[Value]) -> bool {
+    move |said| said.len() >= n
+}
+
+/// A parent task that has a session its model starts says `opened`, `reported` and `closed` of it, in
+/// that order, each as a status update of the parent with the members the contract lists.
+#[tokio::test]
+async fn an_activated_parent_stream_reports_opened_reported_and_closed_for_a_session_its_model_starts()
+ {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                hold_helper_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("planned");
+        rig.parent_mock
+            .push_tool_calls(vec![ToolCall::new(
+                "c1",
+                "subagent_start",
+                json!({"agent": "helper", "description": "look", "prompt": "go", "keep_open": false}),
+            )])
+            .push_text("started")
+            .push_text("digested");
+        let parent = rig
+            .submit(&alice(), said("start a helper", Some("ctx-e")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let mut events = subscribed(&rig, &alice(), &parent.id).await;
+        rig.parent_gate.release.notify_one();
+        rig.gate.reached.notified().await;
+        // The round is held at the gate until `opened` is read: it says the round works.
+        let mut said = said_on(&mut events, event_count(1)).await;
+        rig.gate.release.notify_one();
+        said.extend(
+            said_on(&mut events, |more| {
+                more.iter().any(|o| o["event"] == "closed")
+            })
+            .await,
+        );
+        assert_eq!(
+            names(&said),
+            ["opened", "reported:done", "closed"],
+            "{said:?}"
+        );
+
+        let opened = &said[0];
+        assert_eq!(opened["agent"], "planner");
+        assert_eq!(opened["description"], "look");
+        assert_eq!(opened["keepOpen"], false);
+        assert_eq!(opened["by"], "agent");
+        assert_eq!(opened["round"]["number"], 1);
+        assert_eq!(opened["round"]["state"], "TASK_STATE_WORKING");
+        assert_eq!(opened["session"], opened["round"]["taskId"]);
+        assert_eq!(
+            opened["contextId"],
+            adam_runtime::session_conversation_id(
+                "ctx-e",
+                RunId(opened["session"].as_str().unwrap().parse().unwrap())
+            )
+        );
+        assert_eq!(said[1]["round"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(said[1]["session"], opened["session"]);
+        assert!(
+            said[2].get("round").is_none() && said[2].get("report").is_none(),
+            "{:?}",
+            said[2]
+        );
+        for o in &said {
+            for member in [
+                "session",
+                "contextId",
+                "agent",
+                "description",
+                "keepOpen",
+                "by",
+            ] {
+                assert!(o.get(member).is_some(), "{member} missing in {o}");
+            }
+        }
+        rig.until(&alice(), &parent.id, TaskState::Completed).await;
+        rig.stop().await;
+    }
+}
+
+/// A person who starts a session while the parent task runs is told to the parent's stream as
+/// `opened` with `by: person`, and its round's end is `reported`.
+#[tokio::test]
+async fn a_persons_start_is_reported_opened_by_person_on_a_running_parent() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        rig.parent_mock.push_text("parent done");
+        let parent = rig
+            .submit(&alice(), said("work", Some("ctx-p")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let events = subscribed(&rig, &alice(), &parent.id).await;
+        let reader = spawn_said(events, event_count(2));
+        let start = rig.start(&alice(), Some("ctx-p"), "plan it", true).await;
+        let said = reader.await.unwrap();
+        assert_eq!(names(&said), ["opened", "reported:done"], "{said:?}");
+        assert_eq!(said[0]["by"], "person");
+        assert_eq!(said[0]["session"], start.id);
+        assert_eq!(said[0]["contextId"], start.context_id);
+        assert_eq!(said[0]["keepOpen"], true);
+        rig.parent_gate.release.notify_one();
+        rig.until(&alice(), &parent.id, TaskState::Completed).await;
+        rig.stop().await;
+    }
+}
+
+/// A message to an idle session starts a round that is not the first: `round`, then its `reported`.
+#[tokio::test]
+async fn a_round_two_by_the_person_is_reported_as_round() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("one").push_text("two");
+        rig.parent_mock.push_text("parent done");
+        let parent = rig
+            .submit(&alice(), said("work", Some("ctx-r")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let mut events = subscribed(&rig, &alice(), &parent.id).await;
+        let one = rig.start(&alice(), Some("ctx-r"), "plan it", true).await;
+        // Round 1 is told before round 2 starts: a session first seen at round 2 is `opened`.
+        let mut told = said_on(&mut events, event_count(2)).await;
+        let two = rig
+            .submit(&alice(), said("again", Some(&one.context_id)), None)
+            .await
+            .unwrap();
+        told.extend(said_on(&mut events, |more| more.len() >= 2).await);
+        let round_events: Vec<_> = told.iter().filter(|o| o["event"] == "round").collect();
+        assert_eq!(
+            names(&told),
+            ["opened", "reported:done", "round", "reported:done"],
+            "{told:?}"
+        );
+        assert_eq!(round_events[0]["round"]["number"], 2);
+        assert_eq!(round_events[0]["round"]["taskId"], two.id);
+        assert_eq!(round_events[0]["by"], "person");
+        rig.parent_gate.release.notify_one();
+        rig.stop().await;
+    }
+}
+
+/// Without the extension the stream says nothing of sessions, though they happen.
+#[tokio::test]
+async fn an_unactivated_parent_stream_carries_no_event() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        rig.parent_mock.push_text("parent done");
+        let parent = rig
+            .submit(&plain("alice"), said("work", Some("ctx-q")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let events = subscribed(&rig, &plain("alice"), &parent.id).await;
+        let reader = spawn_said(events, |_| false);
+        let start = rig.start(&alice(), Some("ctx-q"), "plan it", true).await;
+        rig.until(&alice(), &start.id, TaskState::Completed).await;
+        // The stream is read to its end, the parent's, and says nothing of the session.
+        rig.parent_gate.release.notify_one();
+        let said = reader.await.unwrap();
+        assert!(said.is_empty(), "{said:?}");
+        rig.stop().await;
+    }
+}
+
+/// The stream of a round says the session on the update that ends it: `idle` for a kept-open
+/// session, `closed` for another.
+#[tokio::test]
+async fn a_round_stream_ends_with_the_session_idle_or_closed() {
+    for (keep_open, state) in [(true, "idle"), (false, "closed")] {
+        for store in stores().await {
+            let rig = Rig::with(
+                &store,
+                Options {
+                    hold_helper_on: Some(0),
+                    ..Options::new()
+                },
+            );
+            rig.helper_mock.push_text("a plan");
+            let start = rig.start(&alice(), None, "plan it", keep_open).await;
+            rig.gate.reached.notified().await;
+            let events = subscribed(&rig, &alice(), &start.id).await;
+            let reader = spawn_said(events, |_| false);
+            rig.gate.release.notify_one();
+            let said = reader.await.unwrap();
+            let last = said.last().unwrap_or_else(|| panic!("nothing said"));
+            assert_eq!(last["state"], state, "{said:?}");
+            assert_eq!(last["closing"], false);
+            assert_eq!(last["round"], 1);
+            assert_eq!(last["session"], start.id);
+            rig.stop().await;
+        }
+    }
+}
+
+/// A close asked of a working session turns `closing` on, and the stream of its round says so
+/// before the round ends.
+#[tokio::test]
+async fn a_close_request_marks_the_round_stream_closing() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_helper_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        let start = rig.start(&alice(), None, "plan it", true).await;
+        rig.gate.reached.notified().await;
+        let events = subscribed(&rig, &alice(), &start.id).await;
+        let reader = spawn_said(events, |said| said.iter().any(|o| o["closing"] == true));
+        let asked = rig
+            .submit(&alice(), close_message(&start.context_id, false), None)
+            .await
+            .unwrap();
+        assert_eq!(object(&asked)["closing"], true);
+        let said = reader.await.unwrap();
+        let closing = said.last().unwrap_or_else(|| panic!("nothing said"));
+        assert_eq!(closing["closing"], true, "{said:?}");
+        assert_eq!(closing["state"], "working");
+        rig.gate.release.notify_one();
+        let done = rig.until(&alice(), &start.id, TaskState::Completed).await;
+        assert_eq!(object(&done)["state"], "closed");
+        rig.stop().await;
+    }
+}
+
+/// A round that is cancelled is reported `canceled`, not `done`.
+#[tokio::test]
+async fn a_cancelled_round_is_reported_canceled() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                hold_helper_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("never read");
+        rig.parent_mock.push_text("parent done");
+        let parent = rig
+            .submit(&alice(), said("work", Some("ctx-c")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let events = subscribed(&rig, &alice(), &parent.id).await;
+        let reader = spawn_said(events, event_count(2));
+        let start = rig.start(&alice(), Some("ctx-c"), "plan it", true).await;
+        rig.gate.reached.notified().await;
+        rig.backend.cancel(&alice(), &start.id).await.unwrap();
+        let said = reader.await.unwrap();
+        assert_eq!(names(&said), ["opened", "reported:canceled"], "{said:?}");
+        assert_eq!(said[1]["round"]["state"], "TASK_STATE_CANCELED");
+        rig.gate.release.notify_one();
+        rig.parent_gate.release.notify_one();
+        rig.stop().await;
+    }
+}
+
+/// What a session's change says reaches the parent's stream before the update that ends it, even
+/// when the change was not listed yet when the parent ended.
+#[tokio::test]
+async fn the_sessions_are_told_before_the_parent_stream_ends() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        rig.parent_mock.push_text("parent done");
+        let parent = rig
+            .submit(&alice(), said("work", Some("ctx-o")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let mut events = subscribed(&rig, &alice(), &parent.id).await;
+        let start = rig.start(&alice(), Some("ctx-o"), "plan it", true).await;
+        rig.until(&alice(), &start.id, TaskState::Completed).await;
+        rig.parent_gate.release.notify_one();
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let Ok(next) = tokio::time::timeout(Duration::from_millis(200), events.next()).await
+            else {
+                continue;
+            };
+            match next {
+                None => break,
+                Some(Ok(event)) => seen.push(event),
+                Some(Err(e)) => panic!("the stream failed: {e}"),
+            }
+        }
+        let carries = |e: &adam_a2a::TaskEvent| {
+            matches!(e, adam_a2a::TaskEvent::Status(u)
+                if u.metadata.as_ref().is_some_and(|m| m.contains_key(CHILD_SESSIONS_EXTENSION)))
+        };
+        let end = seen
+            .iter()
+            .position(adam_a2a::TaskEvent::ends_stream)
+            .expect("the stream ends");
+        let told: Vec<usize> = (0..seen.len()).filter(|i| carries(&seen[*i])).collect();
+        assert_eq!(told.len(), 2, "{seen:?}");
+        assert!(told.iter().all(|i| *i < end), "{told:?} after {end}");
+        rig.stop().await;
+    }
+}
+
+/// A round stream opened on a session that is already closing does not say `closing` again.
+#[tokio::test]
+async fn a_round_stream_opened_on_a_closing_session_does_not_tell_it_again() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_helper_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        let start = rig.start(&alice(), None, "plan it", true).await;
+        rig.gate.reached.notified().await;
+        let asked = rig
+            .submit(&alice(), close_message(&start.context_id, false), None)
+            .await
+            .unwrap();
+        assert_eq!(object(&asked)["closing"], true);
+        let events = subscribed(&rig, &alice(), &start.id).await;
+        let reader = spawn_said(events, |_| false);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        rig.gate.release.notify_one();
+        let said = reader.await.unwrap();
+        assert!(
+            said.iter().all(|o| o["closing"] == false),
+            "closing said again: {said:?}"
+        );
+        assert_eq!(
+            said.last().map(|o| o["state"].clone()),
+            Some(json!("closed"))
+        );
+        rig.stop().await;
+    }
+}
+
+/// Another caller's parent task is not found, activated or not: its stream says nothing.
+#[tokio::test]
+async fn another_callers_parent_stream_gets_no_event() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.parent_mock.push_text("parent done");
+        let parent = rig
+            .submit(&alice(), said("work", Some("ctx-o")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let mut events = rig.backend.subscribe(&activated("bob"), &parent.id);
+        assert!(matches!(
+            events.next().await,
+            Some(Err(BackendError::TaskNotFound(_)))
+        ));
+        rig.start(&alice(), Some("ctx-o"), "plan it", true).await;
+        assert!(events.next().await.is_none());
+        rig.parent_gate.release.notify_one();
+        rig.stop().await;
+    }
+}
+
+/// A close of an idle session is a round that reports nothing: the parent's stream says `closed`
+/// and nothing else of it.
+#[tokio::test]
+async fn a_closing_only_round_is_told_as_closed_and_nothing_else() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        rig.parent_mock.push_text("parent done");
+        let parent = rig
+            .submit(&alice(), said("work", Some("ctx-k")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let mut events = subscribed(&rig, &alice(), &parent.id).await;
+        let one = rig.start(&alice(), Some("ctx-k"), "plan it", true).await;
+        let mut told = said_on(&mut events, event_count(2)).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        rig.submit(&alice(), close_message(&one.context_id, false), None)
+            .await
+            .unwrap();
+        told.extend(said_on(&mut events, event_count(1)).await);
+        assert_eq!(
+            names(&told),
+            ["opened", "reported:done", "closed"],
+            "{told:?}"
+        );
+        rig.parent_gate.release.notify_one();
+        rig.stop().await;
+    }
+}
+
+/// A round that fails is `reported` as `failed`, and its session closes when it is not kept open.
+#[tokio::test]
+async fn a_failed_round_is_reported_failed() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_parent_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock
+            .push_error(adam_model::ModelError::Auth("revoked".into()));
+        rig.parent_mock.push_text("parent done");
+        let parent = rig
+            .submit(&alice(), said("work", Some("ctx-f")), None)
+            .await
+            .unwrap();
+        rig.parent_gate.reached.notified().await;
+        let mut events = subscribed(&rig, &alice(), &parent.id).await;
+        rig.start(&alice(), Some("ctx-f"), "plan it", false).await;
+        let told = said_on(&mut events, |said| {
+            said.iter().any(|o| o["event"] == "closed")
+        })
+        .await;
+        assert_eq!(
+            names(&told),
+            ["opened", "reported:failed", "closed"],
+            "{told:?}"
+        );
+        assert_eq!(told[1]["round"]["state"], "TASK_STATE_FAILED");
+        rig.parent_gate.release.notify_one();
         rig.stop().await;
     }
 }

@@ -58,9 +58,17 @@ decisions above, each for a reason found while building:
 *Built 2026-11-18:* slice 6 part a (the A2A front, `crates/adam-a2a-runtime/src/child_sessions.rs`, the card entry in `crates/adam-a2a`, two
 readers and `closing_round_payload` in `crates/adam-runtime`): a client that activates `child-sessions/v1` sees the sessions of a parent
 context on the parent task, follows each round as a task of a child context, and starts, talks to, stops and closes a session;
-`RuntimeTaskBackend::with_child_sessions`, `ChildSessions`, `ExtensionConfig::child_sessions`. Not built: the stream events of the
-contract (slice 6 part b) and the wiring into `adam-assembly`, `adam-service` and `adam-coder` (part c), so no shipped agent lists the
+`RuntimeTaskBackend::with_child_sessions`, `ChildSessions`, `ExtensionConfig::child_sessions`. Not built (then): the stream events of the
+contract (slice 6 part b, below) and the wiring into `adam-assembly`, `adam-service` and `adam-coder` (part c), so no shipped agent lists the
 card yet.
+
+*Built 2026-11-18:* slice 6 part b (the events, `crates/adam-a2a-runtime/src/session_events.rs` and `subscribe.rs`): the stream of a parent
+task, for a request that activated `child-sessions/v1`, says `opened`, `round`, `reported` and `closed` as status updates of the parent
+(a tracker seeded from the snapshot's listing, listing again when the parent's record changes and at least every second, once more before
+the final event; the diff per session is a pure function in the contract's order, filling steps missed between listings), and the stream
+of a round carries the session object on the update that ends the round and on the one where `closing` turns true. `round.state` is the
+A2A JSON spelling (`TASK_STATE_COMPLETED`), as in the sessions object. A round that only closes the session reports nothing. Not built: the
+wiring into `adam-assembly`, `adam-service` and `adam-coder` (part c).
 
 *Amended 2026-11-18* (slice 6 part a; each is a departure found while building, and the contract is
 `docs/api/child-sessions-v1.md` of `vymalo/another-agentic-system`):
