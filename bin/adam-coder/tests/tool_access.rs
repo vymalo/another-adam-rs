@@ -361,6 +361,46 @@ async fn a_read_and_a_write_of_the_same_path_do_not_overlap_and_other_paths_do()
 }
 
 #[tokio::test]
+async fn read_files_reads_the_whole_files_scope_so_every_write_waits() {
+    // It names several paths, so its class is the whole `files` scope: a write of any file waits
+    // for it, in the model's order, and two reads of the scope still overlap.
+    let t = run_turn(
+        vec![
+            call("c1", "read_files", json!({"paths": ["src/a.rs"]})),
+            call(
+                "c2",
+                "write_file",
+                json!({"path": "src/b.rs", "content": "x"}),
+            ),
+        ],
+        10,
+    )
+    .await;
+    assert!(
+        !t.overlapped("c1", "c2"),
+        "a write of another path waits for read_files: {:?}",
+        t.events.lock()
+    );
+    assert!(
+        t.at("end:c1") < t.at("start:c2"),
+        "the model's order is kept"
+    );
+    let t = run_turn(
+        vec![
+            call("c1", "read_files", json!({"paths": ["src/a.rs"]})),
+            call("c2", "read_file", json!({"path": "src/b.rs"})),
+        ],
+        10,
+    )
+    .await;
+    assert!(
+        t.overlapped("c1", "c2"),
+        "two reads of the scope overlap: {:?}",
+        t.events.lock()
+    );
+}
+
+#[tokio::test]
 async fn run_command_waits_for_a_write_and_runs_beside_reads() {
     let t = run_turn(
         vec![

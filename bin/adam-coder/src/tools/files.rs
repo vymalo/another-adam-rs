@@ -1029,8 +1029,21 @@ struct Paged {
 }
 
 /// Push the row of the line just read, when the page has room for it, and count it as shown.
-fn push_row(rows: &mut String, shown: &mut u64, line: &[u8], chars: u64, number: u64) {
+/// Once a row does not fit, `full` is set and every later row is skipped: a page is contiguous, so
+/// the line after the last one shown is the line the next page starts at.
+fn push_row(
+    rows: &mut String,
+    shown: &mut u64,
+    full: &mut bool,
+    line: &[u8],
+    chars: u64,
+    number: u64,
+) {
+    if *full {
+        return;
+    }
     if *shown >= u64::from(READ_FILES_LINES) {
+        *full = true;
         return;
     }
     let text: String = String::from_utf8_lossy(line)
@@ -1044,6 +1057,7 @@ fn push_row(rows: &mut String, shown: &mut u64, line: &[u8], chars: u64, number:
     row.push('\n');
     // The first row is always shown, as a page of `read_file` always has a line.
     if *shown > 0 && rows.len() + row.len() > READ_FILES_PAGE_BYTES {
+        *full = true;
         return;
     }
     rows.push_str(&row);
@@ -1060,6 +1074,7 @@ fn page_in(mut reader: impl io::BufRead, stop: &AtomicBool) -> Result<Paged, Unr
     let mut rows = String::new();
     let mut total: u64 = 0;
     let mut shown: u64 = 0;
+    let mut full = false;
     let mut line: Vec<u8> = Vec::new();
     let mut chars: u64 = 0;
     let mut ends_with_newline = true;
@@ -1091,7 +1106,7 @@ fn page_in(mut reader: impl io::BufRead, stop: &AtomicBool) -> Result<Paged, Unr
             if byte == b'\n' {
                 total += 1;
                 ends_with_newline = true;
-                push_row(&mut rows, &mut shown, &line, chars, total);
+                push_row(&mut rows, &mut shown, &mut full, &line, chars, total);
                 line.clear();
                 chars = 0;
             } else {
@@ -1110,7 +1125,7 @@ fn page_in(mut reader: impl io::BufRead, stop: &AtomicBool) -> Result<Paged, Unr
     if !line.is_empty() || chars > 0 {
         total += 1;
         ends_with_newline = false;
-        push_row(&mut rows, &mut shown, &line, chars, total);
+        push_row(&mut rows, &mut shown, &mut full, &line, chars, total);
     }
     Ok(Paged {
         rows,
@@ -1151,11 +1166,13 @@ enum One {
 /// slot: never a failure of the whole call).
 fn read_one(root: &SlotDir, rel: &str, stop: &AtomicBool) -> One {
     let shown = rel.trim();
-    let name = paging::escape_name(shown.as_bytes());
+    // The name starts the one line a refused path gets, so a leading `[` is escaped too.
+    let name = paging::escape_item_name(shown.as_bytes());
     let parts = match parts_of(rel) {
         Ok(parts) => parts,
-        // The message names the path already (`\`../a\` goes up with `..`).
-        Err(line) => return One::Refused(line),
+        // The message names the path already (`\`../a\` goes up with `..`), and the path is the
+        // model's: its control characters are escaped so the refusal stays one line.
+        Err(line) => return One::Refused(paging::escape_text(line.as_bytes())),
     };
     let path: PathBuf = parts.iter().collect();
     let (file, meta) = match root.open_following(&path, &is_dot_git) {

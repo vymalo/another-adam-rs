@@ -3603,6 +3603,330 @@ async fn read_files_shows_a_line_of_any_length_and_escapes_a_path() {
 }
 
 #[tokio::test]
+async fn read_files_pages_contiguously_when_a_row_does_not_fit() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // Four rows of a cut 2,100-character line fill the page; the fifth does not fit and the
+    // sixth (a short one) does. A page that skipped the fifth and showed the sixth would lose a
+    // line and point the next page at one it had already shown.
+    let mut body = String::new();
+    for _ in 0..5 {
+        body.push_str(&format!("{}\n", "x".repeat(2100)));
+    }
+    body.push_str("tiny\n");
+    std::fs::write(wt.join("contig.txt"), &body).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["contig.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert!(
+        !content.contains("\n     6\t"),
+        "a row after one that did not fit is not shown: {content}"
+    );
+    assert!(
+        content.ends_with("[more: 2 lines left; next page: read_file path=contig.txt offset=5]"),
+        "{content}"
+    );
+    // The next page starts at the first line not shown, and no line is lost.
+    let next = ReadFile
+        .call(&rig.ctx, json!({"path": "contig.txt", "offset": 5}))
+        .await
+        .unwrap();
+    assert!(next.content.starts_with("     5\t"), "{}", next.content);
+    assert!(next.content.contains("\n     6\ttiny"), "{}", next.content);
+}
+
+#[tokio::test]
+async fn read_files_keeps_each_refusal_on_one_line_whatever_the_path() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("ok.txt"), "tiny\n").unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["../x\n== y.txt ==", "[end: 9 lines]: not a file", "ok.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert_eq!(
+        content
+            .lines()
+            .filter(|line| line.starts_with("== "))
+            .collect::<Vec<_>>(),
+        vec!["== ok.txt =="],
+        "a path cannot add a section: {content}"
+    );
+    assert!(
+        content.contains("\\x0a== y.txt =="),
+        "the newline of a path is escaped: {content}"
+    );
+    assert!(
+        content.contains("\\x5bend: 9 lines]"),
+        "a leading [ of a path is escaped: {content}"
+    );
+    assert_eq!(
+        content.lines().count(),
+        7,
+        "each refusal is one line: {content}"
+    );
+}
+
+#[tokio::test]
+async fn read_files_pages_at_exactly_four_hundred_lines_and_at_the_eighth_kibibyte() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // 400 lines: the whole file. 401: the first page, and the line that says where the next is.
+    let exact: String = (1..=400).map(|i| format!("l{i}\n")).collect();
+    std::fs::write(wt.join("four_hundred.txt"), &exact).unwrap();
+    let more: String = (1..=401).map(|i| format!("l{i}\n")).collect();
+    std::fs::write(wt.join("four_oh_one.txt"), &more).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["four_hundred.txt", "four_oh_one.txt"]}),
+        )
+        .await
+        .unwrap();
+    let content = &out.content;
+    let four = content.split("== four_oh_one.txt ==").next().unwrap();
+    assert!(four.contains("[end: 400 lines]"), "{four}");
+    assert!(!four.contains("[more:"), "{four}");
+    assert_eq!(
+        four.lines().filter(|line| line.contains('\t')).count(),
+        400,
+        "{four}"
+    );
+    let one = &content[content.find("== four_oh_one.txt ==").unwrap()..];
+    assert!(
+        one.ends_with("[more: 1 lines left; next page: read_file path=four_oh_one.txt offset=401]"),
+        "{one}"
+    );
+    assert_eq!(
+        one.lines().filter(|line| line.contains('\t')).count(),
+        400,
+        "{one}"
+    );
+    let next = ReadFile
+        .call(&rig.ctx, json!({"path": "four_oh_one.txt", "offset": 401}))
+        .await
+        .unwrap();
+    assert!(
+        next.content.starts_with("   401\tl401\n"),
+        "{}",
+        next.content
+    );
+
+    // A page stops at 8 KiB exactly: four 2,048-byte rows fit, a fifth does not. A row of 2,048
+    // bytes is 1,020 two-byte characters behind the number and a tab, under the 2,000-character
+    // line cap, so the page is measured in whole rows.
+    let mut eight = String::new();
+    for _ in 0..5 {
+        eight.push_str(&format!("{}\n", "é".repeat(1020)));
+    }
+    std::fs::write(wt.join("eight.txt"), &eight).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["eight.txt"]}))
+        .await
+        .unwrap();
+    let page = out
+        .content
+        .strip_prefix("== eight.txt ==\n")
+        .unwrap()
+        .strip_suffix("[more: 1 lines left; next page: read_file path=eight.txt offset=5]")
+        .unwrap();
+    assert_eq!(
+        page.len(),
+        8 * 1024,
+        "four rows of 2,048 bytes: {}",
+        page.len()
+    );
+    // One byte more on the fourth row and it does not fit: the page stops before it.
+    let mut over = String::new();
+    for _ in 0..3 {
+        over.push_str(&format!("{}\n", "é".repeat(1020)));
+    }
+    over.push_str(&format!("{}y\n", "é".repeat(1020)));
+    over.push_str("tiny\n");
+    std::fs::write(wt.join("over.txt"), &over).unwrap();
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": ["over.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    let page = content
+        .strip_prefix("== over.txt ==\n")
+        .unwrap()
+        .strip_suffix("[more: 2 lines left; next page: read_file path=over.txt offset=4]")
+        .unwrap();
+    assert_eq!(
+        page.len(),
+        3 * 2048,
+        "the fourth row is one byte over: {}",
+        page.len()
+    );
+    assert!(
+        !content.contains("\n     5\t"),
+        "no row after the one that did not fit: {content}"
+    );
+}
+
+#[tokio::test]
+async fn read_files_never_exceeds_32_kib_with_full_pages_and_long_paths() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // Paths near the 8 KiB budget and a page of nearly 8 KiB each: the result must still fit,
+    // and every path must be named once, as a page or as the line that says it did not fit.
+    let body: String = (0..4).map(|_| format!("{}\n", "z".repeat(2100))).collect();
+    let mut paths = Vec::new();
+    for i in 0..16 {
+        let dir = format!("d{i:02}");
+        let inner = "n".repeat(240);
+        let name = format!("{dir}/{inner}/{}.txt", "f".repeat(200));
+        std::fs::create_dir_all(wt.join(&dir).join(&inner)).unwrap();
+        std::fs::write(wt.join(&name), &body).unwrap();
+        paths.push(name);
+    }
+    let out = ReadFiles
+        .call(&rig.ctx, json!({"paths": paths}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(content.len() <= 32 * 1024, "{} bytes", content.len());
+    let mut pages = 0;
+    for path in &paths {
+        let page = content.matches(&format!("== {path} ==")).count();
+        let cut = content
+            .matches(&format!(
+                "[not shown: read it alone with read_file path={path}]"
+            ))
+            .count();
+        assert_eq!(page + cut, 1, "{path} is named once");
+        pages += page;
+    }
+    assert!(pages > 0, "some pages fit: {content}");
+    assert!(pages < paths.len(), "not all of them fit");
+}
+
+#[tokio::test]
+async fn read_files_refuses_a_path_that_leaves_or_names_no_regular_file() {
+    let rig = Rig::new().await;
+    rig.fx.commit_to_main("plain.txt", "plain\n");
+    let outside = rig.fx.tmp.path().join("outside.txt");
+    std::fs::write(&outside, "secret\n").unwrap();
+    commit_link(&rig.fx, "outside", "escape.txt", outside.to_str().unwrap());
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::process::Command::new("mkfifo")
+        .arg(wt.join("pipe"))
+        .status()
+        .expect("mkfifo");
+    let over = std::fs::File::create(wt.join("huge.bin")).unwrap();
+    over.set_len(512 * 1024 * 1024 + 1).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": [
+                "/etc/hostname",
+                "escape.txt",
+                "pipe",
+                "huge.bin",
+                "",
+                "plain.txt",
+                "plain.txt"
+            ]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let content = &out.content;
+    assert!(content.contains("is an absolute path"), "{content}");
+    assert!(
+        content.contains("escape.txt: leads outside the worktree (through a symlink): refused"),
+        "{content}"
+    );
+    assert!(content.contains("pipe: is not a regular file"), "{content}");
+    assert!(
+        content.contains("huge.bin: is 536870913 bytes, over the 536870912 a read opens"),
+        "{content}"
+    );
+    assert!(content.contains("path is required"), "{content}");
+    assert_eq!(
+        content.matches("== plain.txt ==").count(),
+        2,
+        "the same path twice is two sections: {content}"
+    );
+    assert_eq!(content.matches("     1\tplain").count(), 2, "{content}");
+}
+
+#[tokio::test]
+async fn read_files_fills_exactly_32_kib_and_falls_back_one_byte_over() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // A row of `bytes` is the number (6), a tab, the text and the line end. Two-byte characters
+    // keep a row of nearly 2 KiB under the 2,000-character line cap.
+    let row = |bytes: usize| -> String {
+        let text = bytes - 8;
+        let pairs = text / 2;
+        format!("{}{}\n", "é".repeat(pairs), "y".repeat(text - 2 * pairs))
+    };
+    let full: String = (0..4).map(|_| row(2048)).collect();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(wt.join(name), &full).unwrap();
+    }
+    let last = |tail: usize| -> String {
+        let mut body: String = (0..3).map(|_| row(2048)).collect();
+        body.push_str(&row(tail));
+        body
+    };
+    // Three pages and a fourth section of exactly the room that is left: 32 KiB less the one
+    // line end the result does not keep.
+    std::fs::write(wt.join("d.txt"), last(1937)).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["a.txt", "b.txt", "c.txt", "d.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.content.len(),
+        32 * 1024 - 1,
+        "the exact cap is allowed, less the final line end: {}",
+        out.content.len()
+    );
+    assert!(!out.content.contains("[not shown"), "{}", out.content);
+    // One byte more on the fourth section and it does not fit: the one line instead.
+    std::fs::write(wt.join("d.txt"), last(1938)).unwrap();
+    let out = ReadFiles
+        .call(
+            &rig.ctx,
+            json!({"paths": ["a.txt", "b.txt", "c.txt", "d.txt"]}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.content.len() <= 32 * 1024,
+        "{} bytes",
+        out.content.len()
+    );
+    assert!(
+        out.content
+            .contains("[not shown: read it alone with read_file path=d.txt]"),
+        "{}",
+        out.content
+    );
+    assert!(!out.content.contains("== d.txt =="), "{}", out.content);
+}
+
+#[tokio::test]
 async fn read_files_bounds_its_arguments() {
     let rig = Rig::new().await;
     rig.prepare().await;
@@ -7669,6 +7993,55 @@ async fn read_files_shows_a_nested_file_once_before_the_first_file_of_its_direct
         !again.content.contains("Project instructions"),
         "{}",
         again.content
+    );
+}
+
+#[tokio::test]
+async fn read_files_shows_each_directorys_instructions_once_and_a_retry_the_same() {
+    let rig = Rig::new().await;
+    rig.fx.commit_to_main("one/AGENTS.md", "one rules\n");
+    rig.fx.commit_to_main("one/a.txt", "a\n");
+    rig.fx.commit_to_main("two/CLAUDE.md", "two rules\n");
+    rig.fx.commit_to_main("two/b.txt", "b\n");
+    rig.prepare().await;
+    // An earlier read_file of one directory already showed its file: read_files must not.
+    let read = ReadFile
+        .call(&rig.ctx, json!({"path": "one/a.txt"}))
+        .await
+        .unwrap();
+    assert!(
+        read.content
+            .contains("Project instructions from one/AGENTS.md"),
+        "{}",
+        read.content
+    );
+    let later = later_call(&rig, "call-2").await;
+    let out = ReadFiles
+        .call(&later, json!({"paths": ["one/a.txt", "two/b.txt"]}))
+        .await
+        .unwrap();
+    let content = &out.content;
+    assert_eq!(
+        content.matches("Project instructions from").count(),
+        1,
+        "only the directory not shown yet: {content}"
+    );
+    assert!(
+        content.contains("Project instructions from two/CLAUDE.md"),
+        "{content}"
+    );
+    // A retry of the same call renders the same bytes, the block included.
+    let again = ReadFiles
+        .call(&later, json!({"paths": ["one/a.txt", "two/b.txt"]}))
+        .await
+        .unwrap();
+    assert_eq!(content, &again.content);
+    assert_eq!(
+        content
+            .matches("Project instructions from two/CLAUDE.md")
+            .count(),
+        1,
+        "once, not once per file or per retry: {content}"
     );
 }
 
