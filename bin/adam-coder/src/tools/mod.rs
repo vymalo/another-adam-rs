@@ -1860,4 +1860,49 @@ mod access_forwarding_tests {
             ToolAccess::reads("files/src/a.rs")
         );
     }
+
+    /// An MCP server's tool, whose schema is the server's.
+    struct Foreign;
+
+    #[async_trait::async_trait]
+    impl Tool for Foreign {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "browse".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"after_previous": {"type": "string"}}
+                }),
+            }
+        }
+
+        fn schema_is_foreign(&self) -> bool {
+            true
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+    }
+
+    /// Both layers say what the tool says about its schema: a layer that did not would make an MCP
+    /// tool with its own `after_previous` a build error of the coder (ADR 0049).
+    #[test]
+    fn gated_and_redacting_forward_a_foreign_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let workspaces = Workspaces::new(
+            root.path().join("work"),
+            Arc::new(ScopedToken::new("github.com", "t")),
+        );
+        let env = Arc::new(ToolEnv::new(
+            workspaces,
+            Arc::new(MemoryCodeHost::new()),
+            CoderSettings::new(),
+        ));
+        let gated = Gated::layer(env)(Arc::new(Foreign));
+        assert!(gated.schema_is_foreign(), "Gated");
+        let redacting = Redacting::layer(Redactor::new(["secret-value-0123456789"]))(gated);
+        assert!(redacting.schema_is_foreign(), "Redacting over Gated");
+    }
 }
