@@ -295,6 +295,13 @@ impl ReportRound {
 }
 
 impl SessionSummary {
+    /// Whether the latest round is doing work somebody will want to read: it is open and not a
+    /// round that only closes the session (that one calls no model and ends by itself). What the
+    /// working limit counts.
+    pub fn does_work(&self) -> bool {
+        self.state == SessionState::Working && !self.closing
+    }
+
     /// Whether the latest round was started by a person and not by a run of an agent: a round
     /// that is its own parent (ADR 0045, decision 1, as amended for a person's rounds).
     pub fn started_outside_a_run(&self) -> bool {
@@ -327,18 +334,13 @@ pub const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_secs(7 * 24 * 3600
 /// session tools, the A2A front and the card's `maxOpen` share.
 ///
 /// Each is checked before the thing it limits starts, so two requests that race may both pass and
-/// exceed it by the number racing.
+/// exceed it by the number racing. The fields are private: every value is within its bounds
+/// ([`new`](Self::new), [`lowered_by`](Self::lowered_by)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct SessionLimits {
-    /// The most sessions open at once (not closed; one that is closing and still works counts):
-    /// a start past it is refused. 1 to [`MAX_SESSION_PAGE`].
-    pub max_open: u32,
-    /// The most rounds working at once: a start, or a send that would start a round, past it is
-    /// refused. 1 to 32, and at most `max_open`.
-    pub max_working: u32,
-    /// The most rounds one session may have, a close included: a send past it is refused. 2 to 200.
-    pub max_rounds: u32,
+    max_open: u32,
+    max_working: u32,
+    max_rounds: u32,
 }
 
 impl Default for SessionLimits {
@@ -353,6 +355,25 @@ impl Default for SessionLimits {
 }
 
 impl SessionLimits {
+    /// The most sessions open at once (not closed; one that is closing and still works counts): a
+    /// start past it is refused. 1 to [`MAX_SESSION_PAGE`].
+    pub fn max_open(&self) -> u32 {
+        self.max_open
+    }
+
+    /// The most rounds working at once (a round that only closes a session does not count): a
+    /// start, or a send that would start a round, past it is refused. 1 to 32, and at most
+    /// `max_open`.
+    pub fn max_working(&self) -> u32 {
+        self.max_working
+    }
+
+    /// The most rounds a send may reach: a send past it is refused, but a close is always
+    /// allowed, so a session can have `max_rounds + 1` rounds counting the closing one. 2 to 200.
+    pub fn max_rounds(&self) -> u32 {
+        self.max_rounds
+    }
+
     /// The largest `max_working`.
     pub const MAX_WORKING_BOUND: u32 = 32;
     /// The smallest and largest `max_rounds`.
@@ -393,15 +414,21 @@ impl SessionLimits {
     }
 
     /// These limits, each lowered to the value `open`, `working` or `rounds` gives (a larger one
-    /// changes nothing: a file may only lower what the deployment set). `max_working` stays at
-    /// most `max_open`.
+    /// changes nothing: a file may only lower what the deployment set; a `0` is read as the
+    /// smallest legal value, so no limit is ever below its bound). `max_working` stays at most
+    /// `max_open`.
     #[must_use]
     pub fn lowered_by(self, open: Option<u32>, working: Option<u32>, rounds: Option<u32>) -> Self {
-        let max_open = open.map_or(self.max_open, |v| v.min(self.max_open));
+        let max_open = open.map_or(self.max_open, |v| v.clamp(1, self.max_open));
         let max_working = working
-            .map_or(self.max_working, |v| v.min(self.max_working))
+            .map_or(self.max_working, |v| v.clamp(1, self.max_working))
             .min(max_open);
-        let max_rounds = rounds.map_or(self.max_rounds, |v| v.min(self.max_rounds));
+        let max_rounds = rounds.map_or(self.max_rounds, |v| {
+            v.clamp(
+                Self::MAX_ROUNDS_BOUNDS.0.min(self.max_rounds),
+                self.max_rounds,
+            )
+        });
         Self {
             max_open,
             max_working,
@@ -1068,9 +1095,26 @@ mod tests {
     }
 
     #[test]
+    fn a_closing_round_does_not_work_for_anyone() {
+        let id = RunId::new();
+        let mut closing = header(id, true, true);
+        closing.closing = true;
+        for (h, status, works) in [
+            (Some(header(id, true, false)), RunStatus::Runnable, true),
+            (Some(header(id, true, false)), RunStatus::Parked, true),
+            (Some(closing.clone()), RunStatus::Runnable, false),
+            (Some(header(id, true, false)), RunStatus::Done, false),
+        ] {
+            let rec = with_header(id, h, status, vec![]);
+            let list = page_of_sessions("p", rounds(vec![rec]), 0, 10, t0(), idle_ttl());
+            assert_eq!(list.sessions[0].does_work(), works, "{status:?}");
+        }
+    }
+
+    #[test]
     fn the_defaults_are_the_documented_limits() {
         let d = SessionLimits::default();
-        assert_eq!((d.max_open, d.max_working, d.max_rounds), (16, 4, 20));
+        assert_eq!((d.max_open(), d.max_working(), d.max_rounds()), (16, 4, 20));
         assert_eq!(DEFAULT_SESSION_IDLE_TTL, Duration::from_secs(7 * 24 * 3600));
     }
 
@@ -1103,8 +1147,14 @@ mod tests {
         let raised = d.lowered_by(Some(50), Some(30), Some(100));
         assert_eq!(raised, d, "a larger value changes nothing");
         assert_eq!(d.lowered_by(None, None, None), d);
+        // A zero is never a limit.
+        let zero = d.lowered_by(Some(0), Some(0), Some(0));
+        assert_eq!(
+            (zero.max_open(), zero.max_working(), zero.max_rounds()),
+            (1, 1, 2)
+        );
         // Working never exceeds open, even when the file lowers open alone.
         let narrow = d.lowered_by(Some(2), None, None);
-        assert_eq!((narrow.max_open, narrow.max_working), (2, 2));
+        assert_eq!((narrow.max_open(), narrow.max_working()), (2, 2));
     }
 }

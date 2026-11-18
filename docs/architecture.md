@@ -1106,7 +1106,7 @@ that return at once. The parent parks only when a read asks to wait, or when its
 still works or a round ended and was not yet reported. A round that ends meanwhile is told to the model by its next call: the
 journaled step `model:<turn>` lists the sessions first and records the reports it appended (`reports`, no new step). A round that ended during the final call is read at the end of the turn with `wait_<turn>`, which answers at once and does not park. The sequence, the states and the interleavings are in [Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-4).
 
-The sessions of a conversation are limited by `SESSION_MAX_OPEN`, `SESSION_MAX_WORKING` and `SESSION_MAX_ROUNDS` (the root's file may lower them), and a kept-open session idle for `SESSION_IDLE_DAYS` reads closed: the runtime computes it when it lists or reads, nothing is written. Every role reads the settings, so the control plane's A2A front and the workers' tools agree ([child runs](reference/child-runs.md)).
+The sessions of a conversation are limited by `SESSION_MAX_OPEN`, `SESSION_MAX_WORKING` and `SESSION_MAX_ROUNDS` (the root's file may lower them), and a kept-open session idle for `SESSION_IDLE_DAYS` reads closed: the runtime computes it when it lists or reads, nothing is written. Every role reads the settings. The workers' tools use them today; the A2A front takes them through `ChildSessions::with_limits`, which nothing calls yet (slice 6 part c wires it, with the root's effective limits) ([child runs](reference/child-runs.md)).
 
 ## Errors
 

@@ -151,8 +151,8 @@ impl ChildSessions {
         Ok(Self {
             agents,
             max_open,
-            // No limit of its own until `with_limits`: as many as may be open.
-            max_working: max_open,
+            // The tools' default until `with_limits`, so the two agree; never more than may be open.
+            max_working: max_open.min(SessionLimits::default().max_working()),
             max_rounds: MAX_SESSION_ROUNDS,
             listing_page: MAX_SESSION_PAGE,
         })
@@ -176,12 +176,19 @@ impl ChildSessions {
 
     /// The deployment's limits ([`SessionLimits`]): the card's `maxOpen`, the most rounds working
     /// at once and the most rounds a session may have. A person's start, or a message that would
-    /// start a round, past `max_working` is refused with `UnsupportedOperation`.
+    /// start a round, past `max_working` is refused with `UnsupportedOperation`. Without it the
+    /// front uses the tools' defaults (16 open, 4 working, 20 rounds), with `max_working` at most
+    /// `max_open`.
+    ///
+    /// **Nothing in this repository calls it yet** (slice 6 part c wires the front). When it does,
+    /// pass the root's *effective* limits (`Assembly::session_limits()` or
+    /// `AgentDef::effective_session_limits()`), which the file may have lowered, so that the card
+    /// and the tools agree, and not the deployment's `SessionSettings::limits`.
     #[must_use]
     pub fn with_limits(mut self, limits: SessionLimits) -> Self {
-        self.max_open = limits.max_open;
-        self.max_working = limits.max_working;
-        self.max_rounds = limits.max_rounds;
+        self.max_open = limits.max_open();
+        self.max_working = limits.max_working();
+        self.max_rounds = limits.max_rounds();
         self
     }
 
@@ -859,21 +866,12 @@ impl RuntimeTaskBackend {
         let enough = |all: &[SessionSummary]| {
             all.iter().filter(|s| is_open(s)).count() >= max_open
                 || all.iter().any(|s| s.state == SessionState::Closed)
-                || all
-                    .iter()
-                    .filter(|s| s.state == SessionState::Working)
-                    .count()
-                    >= max_working
+                || working_in(all) >= max_working
         };
         let listed = self
             .list_pages(caller, &context, enough)
             .await
-            .map_err(|e| match e {
-                RuntimeError::TooManyRounds { .. } => BackendError::UnsupportedOperation(
-                    "this context has too many rounds to take another session".into(),
-                ),
-                other => map_err(other),
-            })?;
+            .map_err(listing_error)?;
         if listed.iter().filter(|s| is_open(s)).count() >= max_open {
             return Err(BackendError::UnsupportedOperation(format!(
                 "this context already has {max_open} sessions open; close one first"
@@ -1005,7 +1003,7 @@ impl RuntimeTaskBackend {
             let listed = self
                 .list_pages(caller, context, working_now)
                 .await
-                .map_err(map_err)?;
+                .map_err(listing_error)?;
             if working_in(&listed) >= max_working {
                 return Err(BackendError::UnsupportedOperation(working_words(
                     max_working,
@@ -1095,10 +1093,20 @@ impl RuntimeTaskBackend {
     }
 }
 
+/// The rounds that work: a round that only closes a session does not count.
 fn working_in(all: &[SessionSummary]) -> usize {
-    all.iter()
-        .filter(|s| s.state == SessionState::Working)
-        .count()
+    all.iter().filter(|s| s.does_work()).count()
+}
+
+/// A listing that read too many rounds is a refusal to start another, in words; any other error
+/// is the usual mapping.
+fn listing_error(e: RuntimeError) -> BackendError {
+    match e {
+        RuntimeError::TooManyRounds { .. } => BackendError::UnsupportedOperation(
+            "this context has too many rounds to take another session or round".into(),
+        ),
+        other => map_err(other),
+    }
 }
 
 fn working_words(max_working: usize) -> String {
@@ -1223,6 +1231,25 @@ mod tests {
         assert_eq!(card.params["maxOpen"], 16);
         assert_eq!(card.params["agents"][1]["name"], "researcher");
         assert_eq!(sessions().with_max_rounds(0).max_rounds, 2);
+    }
+
+    #[test]
+    fn a_closing_round_is_not_counted_as_working() {
+        let mut closing = summary(SessionState::Working, true, true, 1);
+        closing.closing = true;
+        let working = summary(SessionState::Working, false, false, 1);
+        let idle = summary(SessionState::Idle, false, false, 1);
+        assert_eq!(working_in(&[closing, working, idle]), 1);
+    }
+
+    #[test]
+    fn the_default_max_working_is_the_tools_default_capped_at_max_open() {
+        let one = || vec![ChildSessionAgent::new("a", "x/a", "A.")];
+        let working = |open| ChildSessions::new(one(), open).unwrap().max_working;
+        assert_eq!(working(16), 4, "the tools' default, not max_open");
+        assert_eq!(working(100), 4);
+        assert_eq!(working(3), 3, "capped at max_open");
+        assert_eq!(working(1), 1);
     }
 
     #[test]

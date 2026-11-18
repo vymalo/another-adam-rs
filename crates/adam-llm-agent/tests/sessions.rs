@@ -3051,6 +3051,59 @@ mod cases {
         );
     }
 
+    /// A round that only closes a session works for no one: it calls no model and ends by itself, so
+    /// it does not count against `max_working`. The child's worker is stopped after round 1, so the
+    /// closing round stays open and the test does not race its claim.
+    async fn a_closing_round_is_not_counted_as_working(store: DynStore, then_start: bool) {
+        let (mut rig, gate) = Rig::new().holding_parent(4);
+        rig.limits = Some(SessionLimits::new(4, 1, 20).unwrap());
+        rig.child_mock.push_text("a0").push_text("a1");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let (front, back) = (
+            rig.front(&store, &parent_agent),
+            rig.back(&store, &child_agent),
+        );
+        let parent = rig.start(&front, &conv_id()).await;
+        let (s0, s1) = (child_run_id(parent, "c0"), child_run_id(parent, "c1"));
+        for calls in [
+            vec![start_call("c0", true)],
+            vec![read_call("r0", s0, true)],
+            vec![start_call("c1", true)],
+            vec![read_call("r1", s1, true)],
+            vec![close_call("x0", s0, false)],
+            vec![if then_start {
+                start_call("next", true)
+            } else {
+                send_call("next", s1, "more")
+            }],
+        ] {
+            rig.parent_mock.push_tool_calls(calls);
+        }
+        rig.parent_mock.push_text("done").push_text("done again");
+        let (front_worker, back_worker) = (spawn_worker(&front), spawn_worker(&back));
+        reached(&gate.reached, "the parent's call before the close").await;
+        back_worker.stop().await;
+        gate.release.notify_one();
+        wait_waiting_on_a_session(&front, parent).await;
+        let results = tool_results(&state_of(&front, parent).await);
+        let (_, text, is_error) = result_of(&results, "x0");
+        assert!(!*is_error, "{text}");
+        let (_, text, is_error) = result_of(&results, "next");
+        assert!(
+            !*is_error,
+            "the closing round of the session just closed is no working round: {text}"
+        );
+        front_worker.stop().await;
+    }
+
+    pub async fn a_close_then_a_start_is_not_refused_by_the_closing_round(store: DynStore) {
+        a_closing_round_is_not_counted_as_working(store, true).await;
+    }
+
+    pub async fn a_close_then_a_send_is_not_refused_by_the_closing_round(store: DynStore) {
+        a_closing_round_is_not_counted_as_working(store, false).await;
+    }
+
     /// A kept-open session nobody has written to for the idle TTL reads closed: a send is refused
     /// as to a closed session and says why, and the session no longer counts toward `max_open`.
     pub async fn an_idle_expired_session_refuses_a_send_as_closed(store: DynStore) {
@@ -3774,7 +3827,15 @@ mod cases {
         wait_done(&rt, first).await;
         let old = start_persons_round(&rt, &rig, &conv, "an old one").await;
         wait_done(&rt, old).await;
-        // The second task begins after the old round ended (the runtime's clock is the wall clock).
+        // The second task must begin strictly after the old round ended: a round that ends in the
+        // same instant as the chain starts is told (the rule is `ended >= chain_started`), and on
+        // the memory store both can fall in one clock tick. Wait for the runtime's clock to pass
+        // the round's last update; no fixed sleep, and no clock advance (the new round's end must
+        // stay after the chain's start).
+        let ended = store.load_run(old).await.unwrap().unwrap().updated_at;
+        while adam_runtime::Clock::now(&rig.clock) <= ended {
+            tokio::task::yield_now().await;
+        }
 
         rig.parent_mock
             .push_tool_calls(vec![start_call("c1", false)])
@@ -4269,8 +4330,6 @@ mod cases {
     }
 }
 
-/// The five specs, as the model sees them, pinned: a spec is the model's contract, so a change is
-/// deliberate. Regenerate with `ADAM_UPDATE_SNAPSHOTS=1 cargo test -p adam-llm-agent --test sessions`.
 #[test]
 fn limits_do_not_change_the_specs() {
     let agents = || {
@@ -4293,6 +4352,8 @@ fn limits_do_not_change_the_specs() {
     );
 }
 
+/// The five specs, as the model sees them, pinned: a spec is the model's contract, so a change is
+/// deliberate. Regenerate with `ADAM_UPDATE_SNAPSHOTS=1 cargo test -p adam-llm-agent --test sessions`.
 #[test]
 fn the_five_specs_are_pinned() {
     let roster = SessionTools::new([
@@ -4403,6 +4464,8 @@ macro_rules! session_suite {
                 a_send_turns_the_listing_on,
                 a_closing_round_does_not_hide_the_newest_round_that_worked,
                 each_limit_refuses_in_words,
+                a_close_then_a_start_is_not_refused_by_the_closing_round,
+                a_close_then_a_send_is_not_refused_by_the_closing_round,
                 an_idle_expired_session_refuses_a_send_as_closed,
                 an_expired_sessions_report_is_still_told_once,
                 a_parent_that_fails_stops_its_rounds,

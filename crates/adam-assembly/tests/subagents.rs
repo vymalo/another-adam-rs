@@ -999,7 +999,7 @@ fn limits_of(def: AgentDef, deployment: Option<adam_runtime::SessionLimits>) -> 
         .unwrap();
     let bound = assembly.session_limits();
     assert_eq!(pure, bound, "the card's limits are the tools' limits");
-    [bound.max_open, bound.max_working, bound.max_rounds]
+    [bound.max_open(), bound.max_working(), bound.max_rounds()]
 }
 
 #[test]

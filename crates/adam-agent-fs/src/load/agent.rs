@@ -95,7 +95,7 @@ pub(crate) fn parse_agent_file(
     }
     let name = resolve_name(sink, &split, &fm, kind, path_name)?;
     check_keys(sink, &split, &fm);
-    check_values(sink, &split, &fm);
+    check_values(sink, &split, &fm, kind);
 
     if kind != FileKind::Sub
         && fm
@@ -363,7 +363,7 @@ fn check_keys(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
     }
 }
 
-fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
+fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter, kind: FileKind) {
     if let Some(ModelRef::Alias(alias)) = &fm.model
         && alias.contains("://")
     {
@@ -414,7 +414,9 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
             ),
         );
     }
-    if let Some(limits) = fm.limits.as_ref() {
+    // The session limits are the root's: a subagent's are ignored (with a warning), so they are
+    // not range-checked there.
+    if let Some(limits) = fm.limits.as_ref().filter(|_| kind != FileKind::Sub) {
         let (low, high) = MAX_SESSION_ROUNDS_LIMIT;
         let ranges = [
             (

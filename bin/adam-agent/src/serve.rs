@@ -60,9 +60,9 @@ pub async fn serve(
     if !folder.def.manifest().subagents.is_empty() {
         let limits = folder.def.effective_session_limits();
         tracing::info!(
-            max_open = limits.max_open,
-            max_working = limits.max_working,
-            max_rounds = limits.max_rounds,
+            max_open = limits.max_open(),
+            max_working = limits.max_working(),
+            max_rounds = limits.max_rounds(),
             idle_days = config.service.sessions.idle_ttl.as_secs() / 86_400,
             "session limits"
         );

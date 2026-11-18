@@ -367,28 +367,37 @@ impl Default for SessionSettings {
 
 impl SessionSettings {
     /// Read the four variables, each the default when unset or blank; a value out of its range,
-    /// and a `SESSION_MAX_WORKING` above `SESSION_MAX_OPEN`, are problems (and the default).
+    /// and a `SESSION_MAX_WORKING` that is set and above `SESSION_MAX_OPEN`, are problems (and the
+    /// default). A `SESSION_MAX_WORKING` that is not set is cut down to `SESSION_MAX_OPEN`, so
+    /// setting a small `SESSION_MAX_OPEN` alone is not an error.
     pub fn parse(lookup: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Self {
         let get = |name: &str| not_blank(lookup, name);
         let default = Self::default();
+        // The value, and whether it is usable: a bad one is a problem and the default.
         let mut bounded = |name: &str, default: u32, low: u32, high: u32| {
+            let before = problems.len();
             let n = parse_or(&get, name, default, problems);
+            if problems.len() != before {
+                return (default, false);
+            }
             if (low..=high).contains(&n) {
-                return n;
+                return (n, true);
             }
             problems.push(format!("{name} must be between {low} and {high}, got {n}"));
-            default
+            (default, false)
         };
         let page = u32::try_from(adam_runtime::MAX_SESSION_PAGE).unwrap_or(100);
-        let max_open = bounded("SESSION_MAX_OPEN", default.limits.max_open, 1, page);
-        let max_working = bounded(
+        let (max_open, open_ok) = bounded("SESSION_MAX_OPEN", default.limits.max_open(), 1, page);
+        let working_set = get("SESSION_MAX_WORKING").is_some();
+        let (max_working, working_ok) = bounded(
             "SESSION_MAX_WORKING",
-            default.limits.max_working,
+            // Unset: the default, never more than may be open.
+            default.limits.max_working().min(max_open),
             1,
             SessionLimits::MAX_WORKING_BOUND,
         );
         let (low, high) = SessionLimits::MAX_ROUNDS_BOUNDS;
-        let max_rounds = bounded("SESSION_MAX_ROUNDS", default.limits.max_rounds, low, high);
+        let (max_rounds, _) = bounded("SESSION_MAX_ROUNDS", default.limits.max_rounds(), low, high);
         let days = parse_or(
             &get,
             "SESSION_IDLE_DAYS",
@@ -403,15 +412,14 @@ impl SessionSettings {
             ));
             DEFAULT_SESSION_IDLE_DAYS
         };
-        let limits = match SessionLimits::new(max_open, max_working, max_rounds) {
-            Ok(limits) => limits,
-            Err(_) => {
-                problems.push(format!(
-                    "SESSION_MAX_WORKING ({max_working}) is more than SESSION_MAX_OPEN ({max_open})"
-                ));
-                default.limits
-            }
-        };
+        // Only two values that are each fine can conflict; a bad one is already a problem.
+        if open_ok && working_ok && working_set && max_working > max_open {
+            problems.push(format!(
+                "SESSION_MAX_WORKING ({max_working}) is more than SESSION_MAX_OPEN ({max_open})"
+            ));
+        }
+        let limits =
+            SessionLimits::new(max_open, max_working, max_rounds).unwrap_or(default.limits);
         Self {
             limits,
             idle_ttl: Duration::from_secs(days * 24 * 3600),
@@ -1289,7 +1297,11 @@ mod tests {
         let d = sessions(&[]).unwrap();
         assert_eq!(d, SessionSettings::default());
         assert_eq!(
-            (d.limits.max_open, d.limits.max_working, d.limits.max_rounds),
+            (
+                d.limits.max_open(),
+                d.limits.max_working(),
+                d.limits.max_rounds()
+            ),
             (16, 4, 20)
         );
         assert_eq!(d.idle_ttl, Duration::from_secs(7 * 24 * 3600));
@@ -1308,9 +1320,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             (
-                set.limits.max_open,
-                set.limits.max_working,
-                set.limits.max_rounds
+                set.limits.max_open(),
+                set.limits.max_working(),
+                set.limits.max_rounds()
             ),
             (100, 32, 200)
         );
@@ -1348,8 +1360,31 @@ mod tests {
             mentions(&problems, "SESSION_MAX_WORKING") && problems[0].contains("SESSION_MAX_OPEN"),
             "{problems:?}"
         );
-        // Lowering open alone below the default working is that same problem.
-        assert!(sessions(&[("SESSION_MAX_OPEN", "2")]).is_err());
+        // The default working is cut to open when only open is set: no variable is blamed that the
+        // operator never set.
+        for open in ["2", "3"] {
+            let c = sessions(&[("SESSION_MAX_OPEN", open)]).unwrap();
+            let open: u32 = open.parse().unwrap();
+            assert_eq!(
+                (c.limits.max_open(), c.limits.max_working()),
+                (open, open.min(4)),
+                "SESSION_MAX_OPEN={open}"
+            );
+        }
+        assert_eq!(
+            sessions(&[("SESSION_MAX_OPEN", "9")])
+                .unwrap()
+                .limits
+                .max_working(),
+            4,
+            "the default stands when open is larger"
+        );
+        // A bad open value is one problem, and says nothing of working.
+        for bad in ["0", "101"] {
+            let problems = sessions(&[("SESSION_MAX_OPEN", bad)]).unwrap_err().problems;
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert!(mentions(&problems, "SESSION_MAX_OPEN"), "{problems:?}");
+        }
     }
 
     #[test]
@@ -1363,7 +1398,11 @@ mod tests {
             vars.insert("SESSION_IDLE_DAYS", "3");
             let c = parse(&vars).unwrap().sessions;
             assert_eq!(
-                (c.limits.max_open, c.limits.max_working, c.limits.max_rounds),
+                (
+                    c.limits.max_open(),
+                    c.limits.max_working(),
+                    c.limits.max_rounds()
+                ),
                 (5, 2, 9),
                 "{role}"
             );

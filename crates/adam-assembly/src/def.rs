@@ -995,19 +995,19 @@ fn lowered_by_file(
                 "max_open_sessions",
                 "SESSION_MAX_OPEN",
                 file.max_open_sessions,
-                deployment.max_open,
+                deployment.max_open(),
             ),
             (
                 "max_working_sessions",
                 "SESSION_MAX_WORKING",
                 file.max_working_sessions,
-                deployment.max_working,
+                deployment.max_working(),
             ),
             (
                 "max_session_rounds",
                 "SESSION_MAX_ROUNDS",
                 file.max_session_rounds,
-                deployment.max_rounds,
+                deployment.max_rounds(),
             ),
         ] {
             if let Some(asked) = asked.filter(|asked| *asked > allowed) {

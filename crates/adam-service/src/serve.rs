@@ -285,6 +285,15 @@ async fn run_push_delivery(
     }
 }
 
+/// The runtime options [`serve`] builds the runtime with: the binary's, with the deployment's idle
+/// limit (`SESSION_IDLE_DAYS`), which is the environment's and the same on every role.
+pub(crate) fn options_for(config: &ServiceConfig, options: RuntimeOptions) -> RuntimeOptions {
+    RuntimeOptions {
+        session_idle_ttl: config.sessions.idle_ttl,
+        ..options
+    }
+}
+
 /// What the deployment turned on in the A2A server: the options of the router, and the delivery
 /// loop of push notifications (which runs beside the server, in the control plane).
 fn a2a_features(
@@ -391,11 +400,7 @@ pub async fn serve(
         sink: Arc::new(notify.event_sink()),
         notifier: Some(Arc::new(notify.notifier())),
     };
-    // The deployment's idle limit is the environment's, the same on every role.
-    let options = RuntimeOptions {
-        session_idle_ttl: config.sessions.idle_ttl,
-        ..options
-    };
+    let options = options_for(config, options);
     let workers = role.runs_workers().then_some(options.concurrency);
     let worker_id = options.worker_id.clone();
     let component_store = store.clone();
@@ -516,5 +521,37 @@ mod tests {
         assert_eq!(bind.to_string(), "binding 127.0.0.1:1");
         assert!(std::error::Error::source(&bind).is_some());
         assert!(std::error::Error::source(&ServeError::NoCard).is_none());
+    }
+    use std::time::Duration;
+
+    #[test]
+    fn serve_builds_the_runtime_with_the_configured_idle_limit() {
+        let vars = |name: &str| match name {
+            "DATABASE_URL" => Some("postgres://u:p@db/adam".to_owned()),
+            "A2A_BEARER_TOKENS" => Some("t".to_owned()),
+            "PUBLIC_URL" => Some("http://agent.svc:8080/".to_owned()),
+            "SESSION_IDLE_DAYS" => Some("3".to_owned()),
+            _ => None,
+        };
+        let mut problems = Vec::new();
+        let config = ServiceConfig::parse(&vars, &mut problems);
+        assert!(problems.is_empty(), "{problems:?}");
+        // Whatever the binary's own options say, the environment's value wins.
+        let own = RuntimeOptions {
+            session_idle_ttl: Duration::from_secs(60),
+            ..RuntimeOptions::default()
+        };
+        let options = options_for(&config, own);
+        assert_eq!(options.session_idle_ttl, Duration::from_secs(3 * 24 * 3600));
+        let runtime = Service::new(
+            adam_runtime::Runtime::builder(std::sync::Arc::new(adam_core::MemoryStore::new())),
+            "x",
+            &options,
+        )
+        .runtime;
+        assert_eq!(
+            runtime.session_idle_ttl(),
+            Duration::from_secs(3 * 24 * 3600)
+        );
     }
 }

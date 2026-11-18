@@ -72,8 +72,8 @@ pub const MAX_WORKING_ROUNDS: usize = 4;
 /// open at once (not closed). A start past it is refused.
 pub const MAX_OPEN_SESSIONS: usize = 16;
 
-/// The default of [`SessionLimits::max_rounds`]: the most rounds one session may have, a close
-/// included. A send past it is refused.
+/// The default of [`SessionLimits::max_rounds`]: a send past it is refused (a close never is, so a
+/// session can have one more round, the closing one).
 pub const MAX_SESSION_ROUNDS: u32 = 20;
 
 /// The time limit each session tool declares ([`Tool::time_limit`]). None of them does long work:
@@ -281,7 +281,7 @@ fn working_words(limits: SessionLimits) -> String {
     format!(
         "{} subagent rounds are already working: read a report with `{SUBAGENT_READ}` \
          (wait: true) before starting another",
-        limits.max_working
+        limits.max_working()
     )
 }
 
@@ -325,7 +325,9 @@ pub(crate) struct DueFacts<'a> {
 /// slice 3). The report is of the latest round that worked (a closing round has none, so one that
 /// follows does not hide it): it has ended, it was not given before, and either this run started
 /// it or a person did after the chain of tasks began. A round an earlier task's run started is not
-/// due: that run waited for it or cancelled it. A round that a later round of the same session
+/// due: that run waited for it or cancelled it. A person's round that ends **in the same instant as
+/// the chain starts is told** (`ended >= chain_started`): telling an old round once to a fresh task,
+/// which has no history, is harmless, and losing a new one is not. A round that a later round of the same session
 /// replaced before the parent looked is not reported on its own, and a round cancelled by the close
 /// that follows it is not either.
 ///
@@ -588,22 +590,18 @@ impl Tool for Start {
             .iter()
             .filter(|s| !s.closed || s.state == SessionState::Working)
             .count();
-        let working = listed
-            .sessions
-            .iter()
-            .filter(|s| s.state == SessionState::Working)
-            .count();
+        let working = listed.sessions.iter().filter(|s| s.does_work()).count();
         let limits = self.roster.limits;
-        if working >= limits.max_working as usize {
+        if working >= limits.max_working() as usize {
             return refuse(working_words(limits));
         }
-        if open >= limits.max_open as usize
+        if open >= limits.max_open() as usize
             || (listed.total > MAX_SESSION_PAGE && open >= MAX_SESSION_PAGE)
         {
             return refuse(format!(
                 "this conversation already has {} open sessions: close one with \
                  `{SUBAGENT_CLOSE}` (`{SUBAGENT_LIST}` shows them) before starting another",
-                limits.max_open
+                limits.max_open()
             ));
         }
         let header = SessionHeader {
@@ -730,11 +728,11 @@ impl Tool for Send {
                 }
             }
             let limits = self.roster.limits;
-            if view.round >= limits.max_rounds {
+            if view.round >= limits.max_rounds() {
                 return refuse(format!(
                     "session `{session}` has had {} rounds, the most a session may have: close \
                      it and start a new one with `{SUBAGENT_START}`",
-                    limits.max_rounds
+                    limits.max_rounds()
                 ));
             }
             // A message that starts a round makes another work, like a start does.
@@ -751,12 +749,8 @@ impl Tool for Send {
                 }
                 Err(e) => return Err(runtime_error(&e)),
             };
-            let working = listed
-                .sessions
-                .iter()
-                .filter(|s| s.state == SessionState::Working)
-                .count();
-            if working >= limits.max_working as usize {
+            let working = listed.sessions.iter().filter(|s| s.does_work()).count();
+            if working >= limits.max_working() as usize {
                 return refuse(working_words(limits));
             }
             let mut header = view.header.clone().unwrap_or_else(|| SessionHeader {

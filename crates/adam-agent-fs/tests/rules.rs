@@ -366,6 +366,15 @@ fn cases() -> Vec<Case> {
             "`limits.max_working_sessions` is 3, more than `limits.max_open_sessions` (2)",
         ),
         with_root(
+            "an out-of-range session limit on a subagent is only ignored",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nlimits: { max_open_sessions: 0 }\n---\nBody.\n",
+            )],
+            Warning,
+            "the session limits (`limits.max_open_sessions`) are the root agent's",
+        ),
+        with_root(
             "session limits on a subagent",
             vec![(
                 "agent/subagents/x.md",

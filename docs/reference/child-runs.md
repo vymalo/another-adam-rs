@@ -268,6 +268,7 @@ stateDiagram-v2
     Working --> Working: the closing round of an idle session runs (header closing, no model, no report)
     Idle --> Working: subagent_send starts the next round
     Idle --> Closed: subagent_close starts a round that calls no model
+    Idle --> Closed: idle for idle_ttl (read, not written)
     Closed --> [*]
 ```
 
@@ -363,15 +364,15 @@ is read from the store, the notice is only a wake-up).
 | S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale | `a_journal_from_before_reports_replays_to_the_same_history`, `a_replay_appends_the_same_reports`, `a_replay_of_a_stale_answer_counts_each_round_once` |
 | S17 | A session has sat idle for `idle_ttl` | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once | `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once` |
 
-**Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start is refused.
+**Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start **and a send** are refused.
 
 **Limits and idle sessions (slice 4).** Three limits and one time, all settings of the deployment (`docs/reference/environment.md`):
 
 | Limit | Default | Refuses | Words |
 |---|---|---|---|
 | `max_open` (`SESSION_MAX_OPEN`) | 16 | a start; the card's `maxOpen` | "this conversation already has N open sessions" |
-| `max_working` (`SESSION_MAX_WORKING`) | 4 | a start **and a send that would start a round** (a steer into a working round is not one); in the A2A front, a person's start or new round too (`UnsupportedOperation`) | "N subagent rounds are already working" |
-| `max_rounds` (`SESSION_MAX_ROUNDS`) | 20 | a send, never a close | "has had N rounds" |
+| `max_working` (`SESSION_MAX_WORKING`) | 4 | a start **and a send that would start a round** (a round that only closes a session is not counted) (a steer into a working round is not one); in the A2A front, a person's start or new round too (`UnsupportedOperation`) | "N subagent rounds are already working" |
+| `max_rounds` (`SESSION_MAX_ROUNDS`) | 20 | a send, never a close: a session can have `max_rounds + 1` rounds counting the closing one | "has had N rounds" |
 | `idle_ttl` (`SESSION_IDLE_DAYS`) | 7 days | nothing is refused by it directly: a session idle that long **reads closed** | "is closed ... sat idle for longer than this deployment keeps a session open" |
 
 The root agent's `limits.max_open_sessions`, `max_working_sessions` and `max_session_rounds` may only lower them (a larger value is lowered with a
@@ -385,6 +386,12 @@ closed. A working round never expires. An expired session frees its place under 
 **Its report is not lost:** whether a report is due depends on the round (it ended, was not told, was started by this run or a person), not on the
 session's state, so the report of a round nobody has been told of is **told once**, by the next task's first model call, even if the session has
 expired by then (`an_expired_sessions_report_is_still_told_once`), and not again.
+
+**Known limits of slice 4.** An expired session's due report can fall off a listing of more than 100 sessions (the listing is one page of the
+newest and the open ones), and then it is not told. A remote session's leftover task is not cancelled when the session expires (expiry is read,
+nothing runs). The A2A front's paged listings read the clock once per page, so a session that expires between two pages can be counted twice or
+missed once. A person's round that ends **in the same instant as a task's chain starts is told** (`ended >= chain_started`): telling an old
+round once to a fresh task, which has no history, is harmless, and losing a new one is not.
 
 **Retention.** `Store::purge_finished(before)` must be older than `idle_ttl` (and longer than a round's time limit plus its retries): a purged latest
 round makes the session read as the round before it, or not at all.
