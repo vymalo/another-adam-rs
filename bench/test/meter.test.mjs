@@ -647,6 +647,7 @@ test('the names survive the fragments, a shared index and a missing id', async (
     { noToolCallIds: true },
     { splitToolCalls: true, sameIndexToolCalls: true },
     { splitToolCalls: true, noToolCallIds: true },
+    { nameBeforeId: true },
   ];
   for (const [i, variant] of variants.entries()) {
     const s = await setup(t, { behavior: { toolCalls: 2, toolNames: ['read_file', 'run_checks'], ...variant } });
@@ -678,7 +679,7 @@ test('a tool name is text: control characters dropped, cut to 64, a non-string n
 });
 
 test('a client that closes the stream right after [DONE] keeps the tool call count of its answer', async (t) => {
-  const s = await setup(t, { behavior: { toolCalls: 2, holdAfterDoneMs: 400 } });
+  const s = await setup(t, { behavior: { toolCalls: 2, toolNames: ['read_file', 'run_checks'], holdAfterDoneMs: 400 } });
   const { baseUrl } = s.open();
   const res = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true, stream_options: { include_usage: true } }) });
   const reader = res.body.getReader();
@@ -694,6 +695,18 @@ test('a client that closes the stream right after [DONE] keeps the tool call cou
   const settled = callRecords(s.ledger, 'settled')[0];
   assert.equal(settled.costMicro, SCRIPTED_COST, 'settled on the usage it saw');
   assert.equal(settled.toolCalls, 2);
+  assert.deepEqual(settled.toolNames, ['read_file', 'run_checks'], 'the names of a call cut at [DONE] are kept too');
+});
+
+test('an answer that asks for more than 64 calls keeps the first 64 names and the whole count', async (t) => {
+  const s = await setup(t, { behavior: { toolCalls: 70, toolNames: ['read_file', 'run_checks'] } });
+  const { baseUrl } = s.open();
+  await (await chat(baseUrl, { messages: [{ role: 'user', content: 'x' }], stream: true })).text();
+  const [record] = callRecords(s.ledger, 'settled');
+  assert.equal(record.toolCalls, 70);
+  assert.equal(record.toolNames.length, 64);
+  assert.equal(record.toolNames[0], 'read_file');
+  assert.equal(record.toolNames[63], 'run_checks');
 });
 
 test('a 200 answer that is not a completion has no tool call count', async (t) => {

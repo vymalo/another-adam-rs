@@ -151,7 +151,7 @@ class UsageSniffer {
     return n;
   }
 
-  /** The names of those calls, in the stream's order, when the stream gave them: one per call, up to [`MAX_TOOL_NAMES`]. */
+  /** The names of those calls, in the stream's order, when the stream gave them: one per call. `callNames` is capped at [`MAX_TOOL_NAMES`], so this is too. */
   get toolNames() {
     const names = [];
     for (const [index, ids] of this.callIds) {
@@ -159,7 +159,6 @@ class UsageSniffer {
       for (const key of keys) {
         const name = this.callNames.get(key);
         if (name) names.push(name);
-        if (names.length >= MAX_TOOL_NAMES) return names;
       }
     }
     return names;
@@ -204,10 +203,17 @@ class UsageSniffer {
           if (id) ids.add(id);
           this.callIds.set(c.index, ids);
           const name = toolName(c?.function?.name);
-          if (name) {
+          if (name && this.callNames.size < MAX_TOOL_NAMES) {
             // A later fragment carries no id: its name (when it repeats one) belongs to the last id of that index.
             const known = id ?? [...ids].at(-1) ?? '';
             this.callNames.set(`${c.index}:${known}`, name);
+          }
+          if (id && this.callNames.size < MAX_TOOL_NAMES) {
+            // A name can come before the id it belongs to (a gateway that opens the call, then names it).
+            const pending = this.callNames.get(`${c.index}:`);
+            if (pending && !this.callNames.has(`${c.index}:${id}`)) {
+              this.callNames.set(`${c.index}:${id}`, pending);
+            }
           }
         }
       }
@@ -325,7 +331,7 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
           // How many tool calls the answer asked for (calls per model turn): only when the answer was read.
           ...(!free && Number.isInteger(toolCalls) ? { toolCalls } : {}),
           // And their names, for the calls by tool: only the ones the answer named.
-          ...(!free && Array.isArray(toolNames) && toolNames.length > 0 ? { toolNames: toolNames.slice(0, MAX_TOOL_NAMES) } : {}),
+          ...(!free && Array.isArray(toolNames) && toolNames.length > 0 ? { toolNames } : {}),
         });
       } catch {
         // The truth cannot be written: stop serving rather than spend unrecorded.

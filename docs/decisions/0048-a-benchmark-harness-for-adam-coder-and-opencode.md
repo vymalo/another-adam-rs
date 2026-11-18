@@ -332,6 +332,6 @@ names per answer. The fold counts them per tool and per run, and the report prin
 tool per agent and arm. It is the measurement the "a faster coder" epic
 (https://github.com/vymalo/another-agentic-system/issues/345) needs to say *where* the calls go: the count alone says
 that adam makes about 1.8 times the calls of OpenCode on the tasks both finish, not which tool each extra turn belongs
-to. A call the answer did not name is counted in the calls and shown in a `(no name)` row, never guessed from the
-arguments; a ledger written before this says `n/a`. No decision above changes: it is an addition to the ledger's
+to. A call the answer did not name (or one beyond the 64-name cap) is counted in the calls and shown in a `(no name)`
+row, never guessed from the arguments; a ledger written before this says `n/a`. No decision above changes: it is an addition to the ledger's
 records and to the report.

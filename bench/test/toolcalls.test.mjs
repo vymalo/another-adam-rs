@@ -116,6 +116,11 @@ test('a tool name that is an object key of JavaScript is a name like any other',
   assert.match(text, /\| __proto__ \| 1 \|/);
 });
 
+test('a tool name with a pipe or a backslash cannot break the table', () => {
+  const text = buildReport(run('r1', 't1', 'max', [[1, ['a|b\\c']]]));
+  assert.ok(text.includes('| a\\|b\\\\c | 1 |'), 'the cell holds the escaped name');
+});
+
 test('the "(no name)" row is there only when some calls of a cell were not named', () => {
   const named = buildReport(run('t1.max', 't1', 'max', [[2, ['read_file', 'read_file']]]));
   assert.doesNotMatch(named, /\| \(no name\) \|/);

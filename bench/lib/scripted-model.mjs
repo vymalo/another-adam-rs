@@ -31,6 +31,7 @@ export function createScriptedModel(initial = {}) {
     splitToolCalls: false, // a stream sends each tool call in a chunk of its own and the rest of its arguments in another, as OpenAI does
     sameIndexToolCalls: false, // a stream gives every tool call the index 0 and tells them apart by their ids, as some gateways do
     noToolCallIds: false, // a stream's tool calls carry no `id`, only their index
+    nameBeforeId: false, // a stream opens each tool call with its name, then sends its id and arguments
     okBody: null, // a 200 plain answer with exactly this body (a string), not a completion
     holdAfterDoneMs: 0, // a stream ends this long after `[DONE]` (a client that closes at `[DONE]` closes first)
     ...initial,
@@ -97,6 +98,16 @@ export function createScriptedModel(initial = {}) {
         const chunk = (choice) => ({ ...base, object: 'chat.completion.chunk', choices: [{ index: 0, ...choice }], usage: null });
         const toolCallFrames = (given) => {
           const calls = behavior.noToolCallIds ? given.map(({ id, ...c }) => c) : given;
+          if (behavior.nameBeforeId) {
+            // A gateway that opens the call with its name, then sends its id and arguments.
+            return calls.flatMap((c, n) => {
+              const index = behavior.sameIndexToolCalls ? 0 : n;
+              return [
+                chunk({ delta: { ...(n === 0 ? { role: 'assistant' } : {}), tool_calls: [{ index, function: { name: c.function.name } }] } }),
+                chunk({ delta: { tool_calls: [{ index, id: c.id, type: c.type, function: { arguments: c.function.arguments } }] } }),
+              ];
+            });
+          }
           return behavior.splitToolCalls
             ? calls.flatMap((c, n) => {
                 const index = behavior.sameIndexToolCalls ? 0 : n;

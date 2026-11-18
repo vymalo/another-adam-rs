@@ -33,8 +33,8 @@ const interval = (w) => (w ? `${pct(w.low)} to ${pct(w.high)}` : 'n/a');
 const num = (n) => (n === null || n === undefined ? 'n/a' : Number.isInteger(n) ? String(n) : n.toFixed(1));
 const sum = (xs) => xs.reduce((s, x) => s + x, 0);
 
-/** A table cell on one line, its pipes escaped: nothing a run carries can break a table. */
-const cell = (c) => String(c).replace(/\r\n|\r|\n/g, ' ').replace(/\|/g, '\\|');
+/** A table cell on one line, its pipes escaped: nothing a run carries can break a table. A backslash is escaped first, so a name that is `a\|b` cannot end the cell. */
+const cell = (c) => String(c).replace(/\\/g, '\\\\').replace(/\r\n|\r|\n/g, ' ').replace(/\|/g, '\\|');
 
 function table(header, rows) {
   if (rows.length === 0) return '_none_\n';
