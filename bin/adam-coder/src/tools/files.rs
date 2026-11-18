@@ -1174,11 +1174,9 @@ fn edit_in(
         if places.len() > 1 && !replace_all {
             return Err(not_found(shown, &content, old));
         }
-        let lines: Vec<usize> = places
-            .iter()
-            .map(|(at, _)| line_of(&content, *at))
-            .collect();
-        (replace_spans(&content, &places, new), lines)
+        let lines: Vec<usize> = places.iter().map(|(_, _, line)| *line).collect();
+        let spans: Vec<(usize, usize)> = places.iter().map(|(at, end, _)| (*at, *end)).collect();
+        (replace_spans(&content, &spans, new), lines)
     } else {
         let lines: Vec<usize> = exact.iter().map(|at| line_of(&content, *at)).collect();
         match exact.len() {
@@ -1214,13 +1212,13 @@ fn line_of(text: &str, at: usize) -> usize {
 }
 
 /// `text` with `\r\n` and `\r` read as `\n`, and the spaces and tabs at the end of every line
-/// dropped, and where each byte of the result came from: `bounds[i]` is the byte of `text` the
-/// result's byte `i` starts at, and `bounds[result.len()]` is the end of `text` (so a match that
-/// runs to the end of the result takes the blanks ignored at the end of the last line too).
-fn normalized(text: &str) -> (String, Vec<usize>) {
+/// dropped, and where each byte of the result came from: `spans[i]` is the byte range of `text`
+/// the result's byte `i` covers, one byte or one line ending. The blanks dropped at the end of a
+/// line are in no range, so a match that stops at the last character of a line leaves them.
+fn normalized(text: &str) -> (String, Vec<(usize, usize)>) {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let mut bounds = Vec::with_capacity(bytes.len() + 1);
+    let mut spans = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
         let mut end = at;
@@ -1231,7 +1229,7 @@ fn normalized(text: &str) -> (String, Vec<usize>) {
         while kept > at && (bytes[kept - 1] == b' ' || bytes[kept - 1] == b'\t') {
             kept -= 1;
         }
-        bounds.extend(at..kept);
+        spans.extend((at..kept).map(|byte| (byte, byte + 1)));
         out.push_str(&text[at..kept]);
         if end < bytes.len() {
             let line_end = if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
@@ -1239,29 +1237,32 @@ fn normalized(text: &str) -> (String, Vec<usize>) {
             } else {
                 end + 1
             };
-            bounds.push(end);
+            spans.push((end, line_end));
             out.push('\n');
             at = line_end;
         } else {
             at = end;
         }
     }
-    bounds.push(bytes.len());
-    (out, bounds)
+    (out, spans)
 }
 
 /// The places `old` is in `content` once [`normalized`]: each as the byte span of `content` the
-/// match covers. `None` when nothing matches, or when `old` is only blanks (which would match
-/// everywhere).
-fn normalized_places(content: &str, old: &str) -> Option<Vec<(usize, usize)>> {
+/// match covers and the 1-based line of the normalized text it starts on. `None` when nothing
+/// matches, or when `old` is only blanks (which would match everywhere).
+fn normalized_places(content: &str, old: &str) -> Option<Vec<(usize, usize, usize)>> {
     let (needle, _) = normalized(old);
     if needle.is_empty() {
         return None;
     }
-    let (haystack, bounds) = normalized(content);
-    let places: Vec<(usize, usize)> = haystack
+    let (haystack, spans) = normalized(content);
+    let places: Vec<(usize, usize, usize)> = haystack
         .match_indices(needle.as_str())
-        .map(|(at, _)| (bounds[at], bounds[at + needle.len()]))
+        .map(|(at, _)| {
+            let (start, _) = spans[at];
+            let (_, end) = spans[at + needle.len() - 1];
+            (start, end, line_of(&haystack, at))
+        })
         .collect();
     (!places.is_empty()).then_some(places)
 }
@@ -2977,7 +2978,8 @@ mod tests {
         assert_eq!((done.replaced, done.lines), (1, vec![1]));
         assert_eq!(
             fs::read_to_string(dir.path().join("eof.txt")).unwrap(),
-            "1\n2"
+            "1\n2   ",
+            "the blanks after the last byte the model matched stay"
         );
     }
 
@@ -2989,6 +2991,197 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("utf8.txt")).unwrap(),
             "x\n"
+        );
+    }
+
+    /// The blanks after the last byte of a match are not the edit's: the two spaces of a Markdown
+    /// hard break survive an edit that stops at the last character of the line.
+    #[test]
+    fn trailing_blanks_after_the_matched_text_are_kept() {
+        let dir = root();
+        fs::write(dir.path().join("hard.md"), "one  \ntwo  \nthree\n").unwrap();
+        let done = edit_in(dir.path(), "hard.md", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hard.md")).unwrap(),
+            "1\n2  \nthree\n",
+            "the hard break after `two` is outside the match"
+        );
+    }
+
+    #[test]
+    fn replace_all_keeps_the_blanks_of_every_line_it_does_not_match() {
+        let dir = root();
+        fs::write(dir.path().join("all.txt"), "x  \ny  \nx  \ny  \n").unwrap();
+        let done = edit_in(dir.path(), "all.txt", "x\ny", "X\nY", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("all.txt")).unwrap(),
+            "X\nY  \nX\nY  \n"
+        );
+    }
+
+    /// `new` is inserted once and never read back as more places to replace.
+    #[test]
+    fn a_new_that_contains_the_needle_is_inserted_once() {
+        let dir = root();
+        fs::write(dir.path().join("grow.txt"), "a  \nb  \n").unwrap();
+        let done = edit_in(dir.path(), "grow.txt", "a\nb", "a\nb\nc", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("grow.txt")).unwrap(),
+            "a\nb\nc  \n"
+        );
+    }
+
+    /// Every span is the bytes the match covers: it starts and ends on a character boundary, its
+    /// text normalizes to `old`, and it ends at the last byte matched.
+    #[test]
+    fn a_tolerant_span_covers_exactly_the_matched_bytes() {
+        for (content, old) in [
+            ("ab  \ncd", "ab"),
+            ("ab\t\r\ncd", "ab"),
+            ("ab  ", "ab"),
+            ("ab", "ab"),
+            ("ab\t\ncd", "ab  \ncd"),
+            ("a  \nb\n", "a\nb"),
+            ("a\r\nb  \r\nc\r\n", "a\nb"),
+            ("a\r\nb\nc\rd", "b\nc"),
+            ("a\r\nb\n", "\nb"),
+            ("héllo  \nwörld\n", "héllo\nwörld"),
+            ("cafe\u{301}  \nx\n", "cafe\u{301}"),
+            ("😀  \nx\n", "😀"),
+            ("one\rtwo\r", "two"),
+            ("a\n   \nb\n", "a\n\nb"),
+        ] {
+            let (needle, _) = normalized(old);
+            let places = normalized_places(content, old)
+                .unwrap_or_else(|| panic!("{content:?} has no tolerant match for {old:?}"));
+            let mut before = 0;
+            for (start, end, _) in places {
+                assert!(
+                    content.is_char_boundary(start) && content.is_char_boundary(end),
+                    "{content:?} {old:?}: {start}..{end} is not on character boundaries"
+                );
+                assert!(
+                    before <= start && start < end,
+                    "{content:?} {old:?}: {start}..{end}"
+                );
+                assert_eq!(
+                    normalized(&content[start..end]).0,
+                    needle,
+                    "{content:?} {old:?}: the span is not the match"
+                );
+                let last = content.as_bytes()[end - 1];
+                assert!(
+                    last != b' ' && last != b'\t',
+                    "{content:?} {old:?}: the span ends in a blank the match ignored"
+                );
+                assert_eq!(
+                    replace_spans(content, &[(start, end)], "N"),
+                    format!("{}N{}", &content[..start], &content[end..]),
+                    "the bytes outside the span are untouched"
+                );
+                before = end;
+            }
+        }
+    }
+
+    /// The map [`normalized`] returns says, for every byte it kept, which byte of the original it
+    /// is: one byte copied, or one line ending, and nothing overlaps.
+    #[test]
+    fn normalized_maps_every_byte_back_to_the_original() {
+        for text in [
+            "",
+            "abc",
+            "a  \n b\t\r\nc\r",
+            "héllo  \n😀\t\n",
+            "\n\n",
+            "   ",
+            "a\r\r\nb",
+        ] {
+            let (out, spans) = normalized(text);
+            assert_eq!(spans.len(), out.len(), "{text:?}");
+            for (i, (start, end)) in spans.iter().enumerate() {
+                assert!(start < end, "{text:?} byte {i}: {start}..{end}");
+                assert!(*end <= text.len(), "{text:?} byte {i}: {start}..{end}");
+                let source = &text.as_bytes()[*start..*end];
+                assert!(
+                    (source.len() == 1 && source[0] == out.as_bytes()[i])
+                        || matches!(source, [b'\n'] | [b'\r'] | [b'\r', b'\n']),
+                    "{text:?} byte {i}: {source:?} for {:?}",
+                    out.as_bytes()[i] as char
+                );
+                if i > 0 {
+                    assert!(
+                        spans[i - 1].1 <= *start,
+                        "{text:?} byte {i}: {}..{} overlaps the one before",
+                        start,
+                        end
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_old_of_only_a_line_ending_matches_one_place_or_is_refused() {
+        let dir = root();
+        fs::write(dir.path().join("nl.txt"), "a\rb\r").unwrap();
+        let why = edit_in(dir.path(), "nl.txt", "\n", "x", false).unwrap_err();
+        assert!(why.contains("was not found"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("nl.txt")).unwrap(),
+            "a\rb\r"
+        );
+        let done = edit_in(dir.path(), "nl.txt", "\n", "x", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("nl.txt")).unwrap(),
+            "axbx"
+        );
+    }
+
+    /// The exact match decides even when it is ambiguous: the tolerance does not turn an error the
+    /// model must fix into an edit of some other place.
+    #[test]
+    fn an_exact_match_that_is_ambiguous_is_not_rescued_by_the_tolerance() {
+        let dir = root();
+        let body = "foo\nbar\nfoo\nbaz\nfoo  \n";
+        fs::write(dir.path().join("exact2.txt"), body).unwrap();
+        let why = edit_in(dir.path(), "exact2.txt", "foo\n", "x\n", false).unwrap_err();
+        assert!(why.contains("2 times (starting at lines 1, 3)"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("exact2.txt")).unwrap(),
+            body,
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_and_a_file_of_blanks_are_clean_misses() {
+        let dir = root();
+        for (name, body) in [("empty.txt", ""), ("blanks.txt", "   \n\t\n")] {
+            fs::write(dir.path().join(name), body).unwrap();
+            for all in [false, true] {
+                let why = edit_in(dir.path(), name, "a", "b", all).unwrap_err();
+                assert!(
+                    why.contains("was not found") && why.contains("nothing was changed"),
+                    "{name}, all={all}: {why}"
+                );
+                assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), body);
+            }
+        }
+    }
+
+    #[test]
+    fn an_edit_of_a_file_over_the_cap_is_refused() {
+        let dir = root();
+        fs::write(dir.path().join("big.txt"), "x".repeat(WRITE_CAP + 1)).unwrap();
+        let why = edit_in(dir.path(), "big.txt", "x", "y", false).unwrap_err();
+        assert!(
+            why.contains("over the") && why.contains("edit_file works on"),
+            "{why}"
         );
     }
 
