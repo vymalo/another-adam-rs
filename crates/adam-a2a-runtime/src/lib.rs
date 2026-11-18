@@ -41,6 +41,7 @@ mod ids;
 mod list;
 mod person;
 mod push;
+mod session_events;
 mod steps;
 mod subscribe;
 mod text_stream;

@@ -7,21 +7,24 @@ use a2a::{
     Message, Part, Role, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
 use adam_a2a::{
-    AccessTier, BackendError, Caller, STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TaskEvent,
-    USAGE_EXTENSION,
+    AccessTier, BackendError, CHILD_SESSIONS_EXTENSION, Caller, STEPS_EXTENSION,
+    TEXT_STREAM_EXTENSION, TaskEvent, USAGE_EXTENSION,
 };
 use adam_runtime::{AGENT_TEXT_KIND, RunEvent, RunSubscription, RunView, StepEvent, StepState};
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use serde_json::Value;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
+use crate::child_sessions::{ContextKind, Round, kind_of};
 use crate::convert::{
     StatusKey, artifact_of, artifact_slot, status_key, status_of, task_from_view,
 };
+use crate::session_events::{SESSIONS_POLL, SessionsTracker};
 use crate::steps::step_message;
 use crate::text_stream;
 use crate::tier;
@@ -78,6 +81,28 @@ struct Tracker {
     /// The request activated `access-tier/v1`: the tier the subscriber was last told, which a status
     /// update says again when the run's tier changes. `None` when it did not activate it.
     tier: Option<AccessTier>,
+    /// The latest status that did not end the stream: what an event of a session says the task's
+    /// state is.
+    open_status: TaskStatus,
+}
+
+/// The stream of a round of a session, told what its session says (contract section 5).
+struct RoundStream {
+    round: Round,
+    /// The last read said the session is closing, so it has been told.
+    closing_told: bool,
+    checked_at: Instant,
+    version: u64,
+}
+
+impl RoundStream {
+    fn due(&self, version: u64) -> bool {
+        version != self.version || self.checked_at.elapsed() >= SESSIONS_POLL
+    }
+}
+
+fn waits(state: &TaskState) -> bool {
+    state.is_terminal() || matches!(state, TaskState::InputRequired | TaskState::AuthRequired)
 }
 
 impl Tracker {
@@ -92,6 +117,9 @@ impl Tracker {
         }
         let status = status_of(view, &backend.prompt);
         let key = status_key(&status);
+        if !waits(&status.state) {
+            self.open_status = status.clone();
+        }
         // A tier that changed is said once, on the status update that carries it: the one of a
         // change of state, or one of its own with the state as it is.
         let tier = match (self.tier, backend.tier_of(view)) {
@@ -309,7 +337,35 @@ async fn pump(
         &view,
         task_from_view(&view, &context_id, &backend.prompt),
     );
+    // The sessions are read before the task says them, so one that starts in between is told twice
+    // (here and as an event) and never missed.
+    let kind = kind_of(&task.context_id);
+    let mut sessions = None;
+    if backend.sessions_activated(caller)
+        && matches!(kind, ContextKind::Root)
+        && !waits(&task.status.state)
+    {
+        sessions = SessionsTracker::seed(backend, caller, &task.context_id, view.version).await;
+    }
     let task = backend.with_sessions(caller, task).await?;
+    let mut round_stream = None;
+    if backend.sessions_activated(caller)
+        && matches!(kind, ContextKind::Child(..))
+        && !waits(&task.status.state)
+        && let Some(round) = backend.round_of(caller, task_id).await?
+    {
+        let closing = task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(CHILD_SESSIONS_EXTENSION))
+            .is_some_and(|o| o["closing"] == Value::Bool(true));
+        round_stream = Some(RoundStream {
+            round,
+            closing_told: closing,
+            checked_at: Instant::now(),
+            version: view.version,
+        });
+    }
     let mut tracker = Tracker {
         task_id: task.id.clone(),
         context_id,
@@ -320,6 +376,7 @@ async fn pump(
         text_stream: caller.has_extension(TEXT_STREAM_EXTENSION),
         usage: caller.has_extension(USAGE_EXTENSION),
         tier: told,
+        open_status: task.status.clone(),
     };
     let ends = task.status.state.is_terminal()
         || matches!(
@@ -374,7 +431,59 @@ async fn pump(
             }
         };
         let mut events = tracker.sync(&view, backend);
-        if events.iter().any(TaskEvent::ends_stream) {
+        let ends = events.iter().any(TaskEvent::ends_stream);
+        // The sessions are listed once more before the final event, so nothing that happened
+        // since the last listing is left unsaid.
+        if let Some(sessions) = sessions.as_mut()
+            && (ends || sessions.due(view.version))
+        {
+            let mut said = sessions
+                .refresh(
+                    backend,
+                    caller,
+                    &tracker.task_id,
+                    &tracker.context_id,
+                    view.version,
+                    &tracker.open_status,
+                )
+                .await;
+            said.append(&mut events);
+            events = said;
+        }
+        if let Some(stream) = round_stream.as_mut()
+            && (ends || stream.due(view.version))
+        {
+            stream.checked_at = Instant::now();
+            stream.version = view.version;
+            if let Some(object) = backend.round_status(caller, &stream.round).await {
+                let closing = object["closing"] == Value::Bool(true);
+                let turned = closing && !stream.closing_told;
+                stream.closing_told = closing;
+                if ends {
+                    let last = events.iter_mut().rev().find_map(|e| match e {
+                        TaskEvent::Status(update) if waits(&update.status.state) => Some(update),
+                        _ => None,
+                    });
+                    if let Some(update) = last {
+                        update
+                            .metadata
+                            .get_or_insert_with(HashMap::new)
+                            .insert(CHILD_SESSIONS_EXTENSION.to_owned(), object);
+                    }
+                } else if turned {
+                    events.push(TaskEvent::Status(TaskStatusUpdateEvent {
+                        task_id: tracker.task_id.clone(),
+                        context_id: tracker.context_id.clone(),
+                        status: tracker.open_status.clone(),
+                        metadata: Some(HashMap::from([(
+                            CHILD_SESSIONS_EXTENSION.to_owned(),
+                            object,
+                        )])),
+                    }));
+                }
+            }
+        }
+        if ends {
             // Progress that was queued before the final commit still belongs
             // before the end of the stream.
             let mut queued = Vec::new();
