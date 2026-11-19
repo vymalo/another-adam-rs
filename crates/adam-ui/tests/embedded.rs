@@ -115,24 +115,36 @@ async fn an_embedded_ui_never_asks_an_endpoint_even_when_a_message_names_one() {
         out.content
     );
     assert!(
+        out.content.contains("could not be read; answer in text"),
+        "the unreadable case, not the no-catalog one: {}",
+        out.content
+    );
+    assert!(
         server.catalog_requests().is_empty(),
         "the endpoint was asked"
     );
     // Its thread-tools source, which a build with thread tools still has, offers and calls nothing.
-    let source = ui.source();
-    let sctx = SourceCtx::detached(ref_context(&c, &server.url("t1")));
-    assert!(source.specs(&sctx).await.is_empty());
-    assert!(
-        source
-            .call(
-                &ctx("anything", ref_context(&c, &server.url("t1"))),
-                "anything",
-                json!({})
-            )
-            .await
-            .is_none()
-    );
+    #[cfg(feature = "thread-tools")]
+    {
+        let source = ui.source();
+        let sctx = SourceCtx::detached(ref_context(&c, &server.url("t1")));
+        assert!(source.specs(&sctx).await.is_empty());
+        assert!(
+            source
+                .call(
+                    &ctx("anything", ref_context(&c, &server.url("t1"))),
+                    "anything",
+                    json!({})
+                )
+                .await
+                .is_none()
+        );
+    }
     assert!(server.catalog_requests().is_empty());
+    assert!(
+        server.requests().is_empty(),
+        "nothing at all reached the endpoint"
+    );
 }
 
 #[tokio::test]

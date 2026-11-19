@@ -70,7 +70,6 @@ use sha2::{Digest, Sha256};
 use crate::catalog::Claimed;
 use crate::mentions::mentioned_agents;
 use crate::resolve::UiState;
-use crate::show::{SHOW, describe_show};
 
 /// The key of the thread-tools extension in a tool's `_meta` and in a request's `_meta`.
 pub const META_KEY: &str = "thread-tools/v1";
@@ -620,17 +619,8 @@ impl ToolSource for ThreadTools {
     }
 
     async fn refine(&self, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
-        let Some(ui) = &self.ui else {
-            return;
-        };
-        let Some(show) = specs.iter_mut().find(|spec| spec.name == SHOW) else {
-            return;
-        };
-        // Only the conversation's own catalog describes it, and only one this process holds: a model
-        // turn asks nobody for it. With none (or before a tool has read it) the description stays as
-        // the tool made it, which says to call `ui_catalog`, and that call holds it from then on.
-        if let Some(catalog) = ui.current_if_held(ctx.context_map()) {
-            show.description = describe_show(&catalog);
+        if let Some(ui) = &self.ui {
+            crate::screen::describe_show_in(ui, ctx, specs);
         }
     }
 

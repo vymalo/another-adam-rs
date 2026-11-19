@@ -219,3 +219,34 @@ impl UiState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A message that names the current catalog without carrying it, and an endpoint that has it.
+    fn named_only() -> Map<String, Value> {
+        let context = json!({
+            CONTEXT_UI_REF: {"catalogId": "https://example.test/catalog", "version": 2, "digest": "sha256:00"},
+            adam_a2a_runtime::CONTEXT_THREAD_TOOLS: {
+                "url": "http://127.0.0.1:9/thread-tools", "token": "tok", "expiresAt": "2999-01-01T00:00:00Z"
+            },
+        });
+        context.as_object().cloned().unwrap_or_default()
+    }
+
+    /// Without thread tools nothing is read again, in a build with the feature (a `Ui::embedded`)
+    /// and in one without it, and the reason says so.
+    #[tokio::test]
+    async fn without_thread_tools_a_catalog_is_never_read_again() {
+        let state = UiState::without_thread_tools();
+        match state.resolve(&named_only()).await {
+            Resolved::Unreadable(reason) => assert_eq!(reason, NO_THREAD_TOOLS),
+            Resolved::Found(_) => panic!("a catalog was found with nothing to read it from"),
+            Resolved::NoCatalog => panic!("the message names a catalog"),
+        }
+        assert_eq!(state.cache.len(), 0);
+    }
+}

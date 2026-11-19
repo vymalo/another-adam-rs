@@ -41,5 +41,58 @@ adam-mcp-testkit.workspace = true
 adam-store-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
+# These tests need the thread-tools client: an embedded build (no default features) leaves them out.
+[[test]]
+name = "ask_v5"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "cards"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "relay"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "access"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "ask_v7"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "plan"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "turn_output"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "ask_answers"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "ask_v8"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "plan_run"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "tools"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "agent"
+required-features = ["thread-tools"]
+
+[[test]]
+name = "duplicate_tools"
+required-features = ["thread-tools"]
+
 [lints]
 workspace = true

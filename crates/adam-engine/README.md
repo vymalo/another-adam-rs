@@ -24,13 +24,18 @@ reads no key.
 
 `tools/embedded-deps/check.sh` (CI job `embedded`, part of the required `lint`):
 
-* builds `adam-a2a`, `adam-a2a-runtime` and `adam-ui` with their defaults off and with each feature alone, and this
-  crate, under `clippy -D warnings`;
-* fails when this crate's tree (`cargo tree -e normal`) holds any of: `axum`, `hyper`, `reqwest`, `tower-http`,
-  `a2a-server-lf`, `a2a-client-lf`, `utoipa-swagger-ui`, `sqlx`, `tokio-postgres`, `postgres`, `mongodb`, `rusqlite`,
-  `libsqlite3-sys`, `kube`, `k8s-openapi`, `rustls`, `aws-lc-rs`, `ring`, `openssl`, `native-tls`, `rmcp`;
+* builds `adam-a2a`, `adam-a2a-runtime` and `adam-ui` with their defaults off and with each feature alone, tests
+  included, and this crate, under `clippy --all-targets -D warnings`;
+* fails when this crate's tree (`cargo tree -e normal --target all`, so a Windows- or macOS-only dependency is seen
+  from Linux too) holds any of: `axum`, `hyper`, `h2`, `reqwest`, `ureq`, `curl`, `curl-sys`, `tower-http`, `warp`,
+  `actix-web`, `tonic`, `tokio-tungstenite`, `a2a-server-lf`, `a2a-client-lf`, `utoipa-swagger-ui`, `sqlx`,
+  `sqlx-core`, `tokio-postgres`, `postgres`, `mongodb`, `rusqlite`, `libsqlite3-sys`, `diesel`, `redis`, `kube`,
+  `k8s-openapi`, `rustls`, `aws-lc-rs`, `aws-lc-sys`, `ring`, `openssl`, `openssl-sys`, `native-tls`, `rmcp`. Not
+  `mio`: tokio's process support needs it, and the tools (slice 6) run commands;
+* runs the split crates' unit and integration tests with their defaults off, and their docs under `-D warnings`;
 * `self-test` proves it: it plants `axum`, then `rustls`, in this crate's manifest (in the working tree, put back after),
-  and turns `adam-ui/thread-tools` and `adam-a2a-runtime/push` back on; each must fail the check and be named.
+  and turns `adam-ui/thread-tools` and `adam-a2a-runtime/push` back on; each must fail the check and be named. The
+  files are put back on any exit, a failure or an interrupt included.
 
 ## Features and environment
 

@@ -394,7 +394,7 @@ stateDiagram-v2
 
 | Feature | Default | Effect |
 |---|---|---|
-| `thread-tools` | **yes** | `thread-tools/v1`: `Ui::new`, `Ui::with_client`, `Ui::source`, `ThreadTools`, `ThreadToolsClient` and the reading of a catalog again, over `adam-mcp` (`rmcp`). Without it ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), the embedded set) the crate is the screen's tools over the catalog a message carries, `Ui::embedded` and `Ui::screen`; `adam-a2a` and `adam-a2a-runtime` are dependencies with `default-features = false` |
+| `thread-tools` | **yes** | `thread-tools/v1`: `Ui::new`, `Ui::with_client`, `Ui::source`, `ThreadTools`, `ThreadToolsClient`, `Clock`, `GET_UI_CATALOG`, `LISTING_TTL`, `META_KEY`, `TURN_OUTPUT`, `TURN_OUTPUT_DELIVERED`, and the reading of a catalog again, over `adam-mcp` (`rmcp`). The tests that use them say `required-features = ["thread-tools"]`, so `cargo test --no-default-features` runs the rest (`tests/embedded.rs` and the unit tests). Without it ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), the embedded set) the crate is the screen's tools over the catalog a message carries, `Ui::embedded` and `Ui::screen`; `adam-a2a` and `adam-a2a-runtime` are dependencies with `default-features = false` |
 
 ## Tests
 

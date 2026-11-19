@@ -1,7 +1,7 @@
 //! The screen's own source, for an agent with no thread tools (an embedded agent, adam ADR 0047):
 //! it offers no tool, adds the "Mentioned agents" block a message asks for and describes `show` with
 //! the components of the screen's catalog this process holds. A build with thread tools does the
-//! same in [`ThreadTools`](crate::ThreadTools), so an agent registers one of the two, never both.
+//! same in `ThreadTools` (feature `thread-tools`), so an agent registers one of the two, never both.
 
 use std::sync::Arc;
 
@@ -33,6 +33,21 @@ impl ScreenSource {
     }
 }
 
+/// `show` described with the components of the screen's catalog, when this process holds it. Only
+/// the conversation's own catalog describes it: a model turn asks nobody for it. With none (or before
+/// a tool has read it) the description stays as the tool made it, which says to call `ui_catalog`,
+/// and that call holds it from then on. Shared by this source and [`ThreadTools`'s][tt].
+///
+/// [tt]: https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-ui/src/thread_tools.rs
+pub(crate) fn describe_show_in(ui: &UiState, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
+    let Some(show) = specs.iter_mut().find(|spec| spec.name == SHOW) else {
+        return;
+    };
+    if let Some(catalog) = ui.current_if_held(ctx.context_map()) {
+        show.description = describe_show(&catalog);
+    }
+}
+
 #[async_trait]
 impl ToolSource for ScreenSource {
     async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
@@ -44,12 +59,7 @@ impl ToolSource for ScreenSource {
     }
 
     async fn refine(&self, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
-        let Some(show) = specs.iter_mut().find(|spec| spec.name == SHOW) else {
-            return;
-        };
-        if let Some(catalog) = self.ui.current_if_held(ctx.context_map()) {
-            show.description = describe_show(&catalog);
-        }
+        describe_show_in(&self.ui, ctx, specs);
     }
 
     async fn call(

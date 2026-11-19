@@ -14,10 +14,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-FORBIDDEN='axum hyper reqwest tower-http a2a-server-lf a2a-client-lf utoipa-swagger-ui
-sqlx tokio-postgres postgres mongodb rusqlite libsqlite3-sys
+# `mio` is not in it: tokio's process support needs it, and the tools (slice 6) run commands.
+FORBIDDEN='axum hyper h2 reqwest ureq curl curl-sys tower-http warp actix-web tonic tokio-tungstenite
+a2a-server-lf a2a-client-lf utoipa-swagger-ui
+sqlx sqlx-core tokio-postgres postgres mongodb rusqlite libsqlite3-sys diesel redis
 kube k8s-openapi
-rustls aws-lc-rs ring openssl native-tls
+rustls aws-lc-rs aws-lc-sys ring openssl openssl-sys native-tls
 rmcp'
 
 # crate:feature lists; each crate is also built with no feature at all.
@@ -25,11 +27,12 @@ SPLIT='adam-a2a:server adam-a2a-runtime:push adam-ui:thread-tools'
 
 tree() {
   local package=$1 found=0 names
-  names=$(cargo tree "${@:2}" -p "$package" -e normal --prefix none | awk '{print $1}' | sort -u)
+  # Every target, so a platform-only dependency (Windows, macOS) is seen from Linux too.
+  names=$(cargo tree "${@:2}" -p "$package" -e normal --target all --prefix none | awk '{print $1}' | sort -u)
   for crate in $FORBIDDEN; do
     if grep -qx "$crate" <<<"$names"; then
       echo "embedded-deps: $package's tree holds $crate:" >&2
-      cargo tree "${@:2}" -p "$package" -e normal -i "$crate" >&2 || true
+      cargo tree "${@:2}" -p "$package" -e normal --target all -i "$crate" >&2 || true
       found=1
     fi
   done
@@ -37,23 +40,55 @@ tree() {
   return "$found"
 }
 
-features() {
+# Each gate is on by default: a server build must not change, and the tests that need a gate
+# (`required-features`) would be skipped, not failed, in a default build without it.
+defaults() {
+  local metadata
+  metadata=$(cargo metadata --locked --no-deps --format-version 1)
   for entry in $SPLIT; do
     local crate=${entry%%:*} feature=${entry#*:}
+    if ! jq -e --arg c "$crate" --arg f "$feature" \
+      '.packages[] | select(.name == $c) | .features.default | index($f)' <<<"$metadata" >/dev/null; then
+      echo "embedded-deps: $crate's default features do not include $feature" >&2
+      return 1
+    fi
+  done
+  echo "embedded-deps: every gate is on by default"
+}
+
+features() {
+  defaults
+  for entry in $SPLIT; do
+    local crate=${entry%%:*} feature=${entry#*:}
+    # Tests included: a test that needs the feature says so with `required-features`.
     echo "embedded-deps: $crate, no default feature"
-    cargo clippy --locked -q -p "$crate" --no-default-features -- -D warnings
+    cargo clippy --locked -q -p "$crate" --no-default-features --all-targets -- -D warnings
+    RUSTDOCFLAGS='-D warnings' cargo doc --locked -q -p "$crate" --no-deps --no-default-features
+    # Not the doctests: the crate docs show the server, and CI runs every doctest with the defaults.
+    cargo test --locked -q -p "$crate" --no-default-features --lib --tests
     echo "embedded-deps: $crate, only $feature"
-    cargo clippy --locked -q -p "$crate" --no-default-features --features "$feature" -- -D warnings
+    cargo clippy --locked -q -p "$crate" --no-default-features --features "$feature" --all-targets -- -D warnings
   done
   echo "embedded-deps: adam-engine"
   cargo clippy --locked -q -p adam-engine -- -D warnings
+}
+
+BACKUP=
+restore() {
+  [ -n "$BACKUP" ] || return 0
+  cp "$BACKUP/Cargo.toml" crates/adam-engine/Cargo.toml
+  cp "$BACKUP/Cargo.lock" Cargo.lock
+  rm -rf "$BACKUP"
+  BACKUP=
 }
 
 self_test() {
   local manifest=crates/adam-engine/Cargo.toml backup
   backup=$(mktemp -d)
   cp "$manifest" Cargo.lock "$backup/"
-  trap 'cp "$backup/Cargo.toml" "$manifest"; cp "$backup/Cargo.lock" Cargo.lock; rm -rf "$backup"' RETURN
+  # On any exit (a failed step under `set -e`, Ctrl-C), never leave a planted manifest behind.
+  BACKUP=$backup
+  trap restore EXIT INT TERM
   for planted in axum rustls; do
     # Under [dependencies], where a real one would be.
     awk -v dep="$planted.workspace = true" '{print} /^\[dependencies\]$/{print dep}' "$backup/Cargo.toml" >"$manifest"

@@ -100,6 +100,9 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// These docs describe the server; built without it (the embedded set, ADR 0047) their links to it have
+// no target. The documented build, with every feature, checks every link.
+#![cfg_attr(not(feature = "server"), allow(rustdoc::broken_intra_doc_links))]
 
 mod activation;
 #[cfg(feature = "server")]

@@ -39,6 +39,9 @@
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
+// These docs describe the thread tools; built without them (the embedded set, ADR 0047) their links to
+// them have no target. The documented build, with every feature, checks every link.
+#![cfg_attr(not(feature = "thread-tools"), allow(rustdoc::broken_intra_doc_links))]
 
 mod ask;
 mod cache;
@@ -161,7 +164,7 @@ impl Ui {
 
     /// The screen's source without thread tools: the mentioned agents and `show` described with the
     /// screen's components, no tool and nothing read from anywhere. Register it, **last** among an
-    /// agent's sources, on an agent that has no [`source`](Self::source) (an embedded one); never both.
+    /// agent's sources, on an agent that has no thread-tools source (an embedded one); never both.
     pub fn screen(&self) -> ScreenSource {
         ScreenSource::new(Arc::clone(&self.state))
     }

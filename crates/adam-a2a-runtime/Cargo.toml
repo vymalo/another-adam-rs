@@ -46,5 +46,22 @@ serde.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
 tracing-subscriber.workspace = true
 
+# These tests need the server parts: an embedded build (no default features) leaves them out.
+[[test]]
+name = "backend"
+required-features = ["push"]
+
+[[test]]
+name = "text_stream"
+required-features = ["push"]
+
+[[test]]
+name = "steer"
+required-features = ["push"]
+
+[[test]]
+name = "usage"
+required-features = ["push"]
+
 [lints]
 workspace = true

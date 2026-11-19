@@ -27,7 +27,7 @@ env:
   COVERAGE_IGNORE: '(adam-acp-fake-agent|adam-mcp-testkit|/tests/)'
 
 jobs:
-  # Formatting and the README rule that does not need a compiler. The five compiles are their own jobs below, and
+  # Formatting and the README rule that does not need a compiler. The six compiles are their own jobs below, and
   # `lint` is the required check that aggregates them.
   fmt:
     runs-on: ubuntu-latest
