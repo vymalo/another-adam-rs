@@ -249,19 +249,11 @@ impl McpServers {
     /// turn, so that the prompt a model sees does not change between two calls.
     pub fn instructions(&self) -> String {
         let mut out = String::new();
-        for server in &self.servers {
-            let Some(text) = &server.instructions else {
-                continue;
-            };
-            let heading = format!(
-                "## Instructions of the MCP server {} (text from the server, not the person)\n\n",
-                server.name
-            );
-            let section = format!("{heading}{text}");
+        for (name, section) in self.instructions_by_server() {
             let separator = if out.is_empty() { "" } else { "\n\n" };
             if out.len() + separator.len() + section.len() > MAX_INSTRUCTIONS_BYTES {
                 tracing::warn!(
-                    server = %server.name,
+                    server = %name,
                     "the MCP servers' instructions are over {MAX_INSTRUCTIONS_BYTES} bytes together: \
                      this server's and the next ones' are left out"
                 );
@@ -271,6 +263,28 @@ impl McpServers {
             out.push_str(&section);
         }
         out
+    }
+
+    /// What each server said about itself, one entry per server that said anything, in the order of
+    /// the servers' names: the name, then the section exactly as [`instructions`](Self::instructions)
+    /// writes it (heading, quote marks and cut included).
+    ///
+    /// For a host that loads a server's tools only sometimes (`when` in `mcp.json`): it appends the
+    /// sections of the servers a run loads, with the same bound as [`instructions`](Self::instructions),
+    /// so a server that is not loaded adds nothing to the prompt. The sections together are the
+    /// string `instructions` gives, and the order is the same.
+    pub fn instructions_by_server(&self) -> Vec<(String, String)> {
+        self.servers
+            .iter()
+            .filter_map(|server| {
+                let text = server.instructions.as_ref()?;
+                let heading = format!(
+                    "## Instructions of the MCP server {} (text from the server, not the person)\n\n",
+                    server.name
+                );
+                Some((server.name.clone(), format!("{heading}{text}")))
+            })
+            .collect()
     }
 
     /// The prompts of the servers as commands named `<server>__<prompt>`, in the order of the
@@ -759,6 +773,7 @@ mod tests {
             optional: false,
             files: false,
             settings,
+            when: None,
         }
     }
 
@@ -1004,6 +1019,7 @@ mod tests {
             optional: false,
             files: false,
             settings: Default::default(),
+            when: None,
         }
     }
 
@@ -1026,6 +1042,7 @@ mod tests {
             optional: false,
             files: false,
             settings: Default::default(),
+            when: None,
         };
         // The refusal is a plan error: nothing was started, and the command was never looked up.
         let error = plan_error(stdio, &McpPolicy::default());
@@ -1044,6 +1061,7 @@ mod tests {
             optional: false,
             files: false,
             settings: Default::default(),
+            when: None,
         };
         let env = Env::new()
             .var("MCP_TOKEN", "tok-4c1e9d7a")
@@ -1113,6 +1131,7 @@ mod tests {
             optional: false,
             files: false,
             settings: Default::default(),
+            when: None,
         };
         assert!(Plan::new("srv", &server, &env, &McpPolicy::default()).is_ok());
     }
@@ -1157,6 +1176,7 @@ mod tests {
             optional: false,
             files: false,
             settings: Default::default(),
+            when: None,
         };
         let error = plan_error(server, &McpPolicy::default());
         assert!(matches!(&error, Error::Header { header, .. } if header == "Authorization"));

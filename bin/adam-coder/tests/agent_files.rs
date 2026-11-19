@@ -1326,6 +1326,7 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
         optional,
         files,
         settings,
+        ..
     } = &config.servers["github"]
     else {
         panic!(
