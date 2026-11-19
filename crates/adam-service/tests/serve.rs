@@ -77,6 +77,35 @@ async fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// The helpers are checked before the database is: a misconfiguration is exit 78 even when no
+/// database answers, not the 69 of a store that cannot be reached.
+#[tokio::test]
+async fn an_unregistered_helper_is_78_before_the_database_is_asked() {
+    let name = unique("serve-sessions-early");
+    let dead = free_port().await;
+    let port = free_port().await;
+    let cfg = config(
+        &format!("postgres://nobody:nothing@127.0.0.1:{dead}/none"),
+        "all",
+        port,
+    );
+    let helper = format!("{name}/helper");
+    let agents = agents(&name, &cfg).child_sessions(sessions_for(&helper));
+    // A `serve` that did not stop would never return: the bound fails the test instead of hanging it.
+    let error = tokio::time::timeout(
+        Duration::from_secs(20),
+        adam_service::serve(&cfg, agents, std::future::pending()),
+    )
+    .await
+    .expect("serve stops at once for a helper nobody registered")
+    .unwrap_err();
+    assert!(
+        matches!(&error, ServeError::ChildSessions { agent } if *agent == helper),
+        "{error}"
+    );
+    assert_eq!(exit_code(&error), 78);
+}
+
 fn config(database: &str, role: &str, port: u16) -> ServiceConfig {
     config_with(database, role, port, &[])
 }
@@ -722,4 +751,126 @@ async fn serve_expands_the_commands_it_is_given_and_the_card_lists_them() {
         assert_eq!(answer.as_deref(), Some(wanted.as_str()), "served: {served}");
         running.finish().await;
     }
+}
+
+/// A runtime on the memory store with the agent `name` and the helpers registered as starters.
+fn service_with(name: &str, helpers: &[&str]) -> Service {
+    let mut builder = Runtime::builder(std::sync::Arc::new(adam_core::MemoryStore::new()))
+        .starter(EchoStarter(name.to_owned()));
+    for helper in helpers {
+        builder = builder.starter(EchoStarter((*helper).to_owned()));
+    }
+    Service::new(builder, name, &RuntimeOptions::default())
+}
+
+fn sessions_for(registered: &str) -> adam_a2a_runtime::ChildSessions {
+    use adam_a2a_runtime::{ChildSessionAgent, ChildSessions};
+    ChildSessions::new([ChildSessionAgent::new("helper", registered, "Helps.")], 8).unwrap()
+}
+
+/// `Service::with_child_sessions` hands the sessions to the backend only when every helper is
+/// registered on the runtime; `None` changes nothing.
+#[tokio::test]
+async fn a_service_serves_child_sessions_only_when_every_helper_is_registered() {
+    let name = unique("svc-sessions");
+    let helper = format!("{name}/helper");
+
+    let none = service_with(&name, &[&helper]).with_child_sessions(None);
+    assert!(none.child_sessions().is_none());
+
+    let served = service_with(&name, &[&helper]).with_child_sessions(Some(sessions_for(&helper)));
+    assert_eq!(served.child_sessions(), Some(&sessions_for(&helper)));
+
+    let missing = service_with(&name, &[]).with_child_sessions(Some(sessions_for(&helper)));
+    assert!(
+        missing.child_sessions().is_none(),
+        "a helper nobody registered"
+    );
+}
+
+/// The card lists `child-sessions/v1` exactly when `Agents::child_sessions` is given and served,
+/// with the limits' `maxOpen`; `serve` adds it, not the binary's card.
+#[tokio::test]
+async fn serve_lists_child_sessions_on_the_card_exactly_when_it_serves_them() {
+    use a2a_client::agent_card::AgentCardResolver;
+    use adam_a2a::CHILD_SESSIONS_EXTENSION;
+
+    let Some(url) = database() else { return };
+
+    for role in ["all", "control-plane"] {
+        for served in [true, false] {
+            let name = unique("serve-sessions");
+            let helper = format!("{name}/helper");
+            let port = free_port().await;
+            let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+            let cfg = config(&url, role, port);
+            let (n, h) = (name.clone(), helper.clone());
+            let register = cfg.role.runs_workers();
+            let mut agents = Agents::new(name.as_str(), move |b| {
+                if register {
+                    b.agent(Echo(n)).agent(Echo(h))
+                } else {
+                    b.starter(EchoStarter(n)).starter(EchoStarter(h))
+                }
+            })
+            .card(AgentCardConfig::new(
+                &name,
+                "A test agent.",
+                format!("http://{addr}/").parse().unwrap(),
+                "0.0.1",
+            ))
+            .options(RuntimeOptions {
+                poll_interval: Duration::from_millis(20),
+                ..RuntimeOptions::default()
+            });
+            if served {
+                agents = agents.child_sessions(sessions_for(&helper));
+            }
+            let running = Running::start(cfg, agents);
+            until_ok(addr, "/healthz", &running.handle).await;
+
+            let public = AgentCardResolver::new(None)
+                .resolve(&format!("http://{addr}"))
+                .await
+                .unwrap();
+            let entry = public
+                .capabilities
+                .extensions
+                .iter()
+                .flatten()
+                .find(|e| e.uri == CHILD_SESSIONS_EXTENSION);
+            assert_eq!(entry.is_some(), served, "{role}, served {served}");
+            if let Some(entry) = entry {
+                let params = entry.params.as_ref().unwrap();
+                assert_eq!(params["maxOpen"], 8, "{role}");
+                assert_eq!(
+                    params["agents"],
+                    json!([{"name": "helper", "description": "Helps."}]),
+                    "{role}"
+                );
+            }
+            running.finish().await;
+        }
+    }
+}
+
+/// A helper the process did not register is a fault of the binary, found at start: exit 78 and
+/// nothing served.
+#[tokio::test]
+async fn a_helper_that_is_not_registered_stops_serve_with_78() {
+    let Some(url) = database() else { return };
+    let name = unique("serve-sessions-missing");
+    let port = free_port().await;
+    let cfg = config(&url, "all", port);
+    let helper = format!("{name}/helper");
+    let agents = agents(&name, &cfg).child_sessions(sessions_for(&helper));
+    let error = adam_service::serve(&cfg, agents, std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, ServeError::ChildSessions { agent } if *agent == helper),
+        "{error}"
+    );
+    assert_eq!(exit_code(&error), 78);
+    assert!(!error.to_string().contains("postgres://"));
 }

@@ -180,8 +180,12 @@ pub async fn assemble_limited(
 ///
 /// * with `workers`, the whole agent (the root and its subagents, [`assemble`]d), registered on the
 ///   runtime;
-/// * without, the start-only half of the root (name and `init`), which a control plane registers:
-///   it starts, delivers to, cancels and views runs and needs no model, tools or MCP server.
+/// * without, the start-only half of the root (name and `init`) and of each of its helpers, which a
+///   control plane registers: it starts, delivers to, cancels and views runs and needs no model,
+///   tools or MCP server.
+///
+/// A root with a subagent lists `child-sessions/v1` on the card `serve` serves (the helpers and the
+/// effective session limits of `def`).
 ///
 /// `card` is what the A2A server serves; a role that serves A2A needs one.
 ///
@@ -196,6 +200,9 @@ pub async fn agents(
     let name = def.name().to_owned();
     // The commands the card lists (`commands/v1`): the backend expands a message that names one.
     let commands = adam_a2a_runtime::Commands::from_manifest(&def.manifest().commands);
+    // The helpers a person may start a session with (`child-sessions/v1`), from the folder alone and
+    // with the effective limits, so every role that serves A2A lists and serves the same.
+    let sessions = def.child_sessions();
     let (agents, commands, card) = match workers {
         Some(parts) => {
             let assembly = assemble_limited(
@@ -220,13 +227,18 @@ pub async fn agents(
         }
         None => {
             let starter = LlmStarter::new(&name);
+            let helpers = def.clone();
             // A control plane connects no MCP server, so it cannot expand a prompt: a message that
             // names the prompt of one of the folder's servers is refused, not sent to the model as
             // plain text.
             let commands =
                 adam_service::refuse_prompt_commands(commands, def.manifest().mcp.as_ref());
             (
-                Agents::new(name, move |builder| builder.starter(starter)),
+                // The helpers' starters too, so a person's session round can be started here and a
+                // worker steps it.
+                Agents::new(name, move |builder| {
+                    helpers.session_starters(builder.starter(starter))
+                }),
                 commands,
                 card,
             )
@@ -234,10 +246,14 @@ pub async fn agents(
     };
     // The person's screen is the sender: their answers through a form, and the catalog and the tools of
     // the conversation, reach the run (the extensions the card lists).
-    Ok(agents
+    let agents = agents
         .card_if(card)
         .inbound(adam_a2a_runtime::vymalo_inbound)
-        .commands(commands))
+        .commands(commands);
+    Ok(match sessions {
+        Some(sessions) => agents.child_sessions(sessions),
+        None => agents,
+    })
 }
 
 #[cfg(test)]

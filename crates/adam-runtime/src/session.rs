@@ -18,6 +18,9 @@ use crate::child::ChildStatus;
 /// The separator between the (escaped) parent conversation id and the session id.
 const SESSION_SEGMENT: &str = "/s/";
 
+/// The separator between the (escaped) parent conversation id and the id of a timer run.
+const TIMER_SEGMENT: &str = "/t/";
+
 /// The longest session conversation id, in bytes, that [`Runtime::start_child_continuing`]
 /// accepts. The conversation id is an indexed column (PostgreSQL: a b-tree on
 /// `(agent, conversation_id)`, whose entries are limited to about a third of a page, 2704 bytes
@@ -86,6 +89,24 @@ fn unescape(escaped: &str) -> Option<String> {
 /// ```
 pub fn session_conversation_id(parent_conversation: &str, session: RunId) -> String {
     format!("{}{SESSION_SEGMENT}{session}", escape(parent_conversation))
+}
+
+/// The conversation a timer run of a session lives in: its parent's, made unique by the timer's id,
+/// because a conversation holds one open run per agent and a timer stays parked until its session
+/// may have expired. A run in it speaks for the parent conversation
+/// ([`ChildStarter`](crate::ChildStarter)), and it is no session's conversation.
+pub(crate) fn timer_conversation_id(parent_conversation: &str, timer: RunId) -> String {
+    format!("{}{TIMER_SEGMENT}{timer}", escape(parent_conversation))
+}
+
+/// The parent conversation a timer conversation id names: the inverse of
+/// [`timer_conversation_id`], `None` for anything it cannot have produced.
+pub(crate) fn parse_timer_conversation_id(conversation_id: &str) -> Option<String> {
+    let (escaped, rest) = conversation_id.split_once('/')?;
+    let timer = rest.strip_prefix("t/")?;
+    let parsed = timer.parse::<uuid::Uuid>().ok()?;
+    (parsed.to_string() == timer).then_some(())?;
+    unescape(escaped)
 }
 
 /// The conversation-id prefix that covers the sessions of `parent_conversation` and nothing else:
@@ -372,6 +393,13 @@ impl ReportRound {
 }
 
 impl SessionSummary {
+    /// Whether the latest round ends the session: a closing round of a session that is closed. A
+    /// round that only cancels what the round before left running (`closing` with the session
+    /// still open) does not.
+    pub fn closes(&self) -> bool {
+        self.closing && self.closed
+    }
+
     /// Whether the latest round is doing work somebody will want to read: it is open and not a
     /// round that only closes the session (that one calls no model and ends by itself). What the
     /// working limit counts.
@@ -683,9 +711,17 @@ pub struct SessionView {
     pub report_run: RunId,
     /// The run that started the latest round.
     pub started_by: Option<RunId>,
+    /// How many of [`round`](Self::round) only cancel what the round before left running (a closing
+    /// round in a session that stays open): ours, not the person's, so no limit counts them.
+    pub cleanup_rounds: u32,
 }
 
 impl SessionView {
+    /// The rounds the person's limit counts: [`round`](Self::round) without the cleanup rounds.
+    pub fn countable_rounds(&self) -> u32 {
+        self.round.saturating_sub(self.cleanup_rounds)
+    }
+
     /// Whether the latest round was started by a person and not by a run of an agent: a round
     /// that is its own parent.
     pub fn started_outside_a_run(&self) -> bool {
@@ -726,6 +762,12 @@ impl SessionView {
             latest: read.status,
             report_run: runs[worked].0.id,
             started_by: latest.parent_id,
+            cleanup_rounds: u32::try_from(
+                runs.iter()
+                    .filter(|(_, f)| f.header.as_ref().is_some_and(|h| h.closing && !h.closed))
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
         })
     }
 }
@@ -754,6 +796,24 @@ mod tests {
                 prop_assert_eq!(session_conversation_id(&parent, session), s);
             }
         }
+    }
+
+    #[test]
+    fn a_timer_conversation_names_its_parent_and_is_no_session() {
+        let timer = RunId::new();
+        for parent in ["alice:ctx", "a:x/s/y", "%", "/", ""] {
+            let id = timer_conversation_id(parent, timer);
+            assert_eq!(parse_timer_conversation_id(&id), Some(parent.to_owned()));
+            assert_eq!(parse_session_conversation_id(&id), None, "{parent:?}");
+            assert!(!id.starts_with(&session_conversation_prefix(parent)));
+        }
+        let session = session_conversation_id("alice:ctx", timer);
+        assert_eq!(parse_timer_conversation_id(&session), None);
+        assert_ne!(
+            timer_conversation_id("alice:ctx", timer),
+            timer_conversation_id("alice:ctx", RunId::new()),
+            "one conversation for each timer"
+        );
     }
 
     #[test]
