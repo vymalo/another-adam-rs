@@ -95,6 +95,12 @@ workspace as it is.
    behind a `CodeWorkspace` trait. The coder implements it over its worktrees; a second implementation is **the person's
    own directory**, which a run never owns, cleans or restores: a command there reports what it changed and undoes
    nothing.
+   *Amended 2026-11-19 (slice 6, step 2b):* the port is two traits in `adam-code-tools`. `CodeWorkspace` serves the
+   file and search tools: the `Place` a tool works in (never a read-only one for a write), the redactor, the nested
+   project instructions and, with the file tools, a required hook after a write. The commands get a trait that
+   **extends** it and takes a `Place` from the same `place()`, so a command and a file tool find a place and refuse a
+   write the same way. Its guard (record what a command changed, undo it) is the workspace's: the person's directory
+   records and undoes nothing. The conformance cases are `adam-code-tools-testkit`.
 8. **Commands run as the person unless a sandbox says otherwise.** A local sandbox is an `Environment`: first a process
    tree that can be killed, then the operating system's own confinement where there is one. `describe` says what is not
    protected.
@@ -145,7 +151,8 @@ is still `Runnable`: at the next start the engine releases its own leases and th
 
 ## Consequences
 
-* **Rule 2.** Three new traits (`SecretSource`, `ApprovalPolicy`, `CodeWorkspace`), each with a default that keeps
+* **Rule 2.** Three new ports (`SecretSource`, `ApprovalPolicy`, `CodeWorkspace`, the last as two traits, amended
+  2026-11-19 under decision 7), each with a default that keeps
   today's behaviour, and each with a testkit. A consumer that sets `default-features = false` on the four split crates
   loses what the features gate; with the defaults nothing changes.
 * **Rule 3.** No closed enum changes.
