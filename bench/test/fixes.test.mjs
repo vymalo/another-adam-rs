@@ -6,7 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { ConfigError, normalizeConfig } from '../lib/config.mjs';
 import { FakeContainers, buildRunArgs } from '../lib/containers.mjs';
-import { checkTask } from '../lib/envcheck.mjs';
+import { CLONE_PATH, checkTask } from '../lib/envcheck.mjs';
 import * as G from '../lib/grade.mjs';
 
 const { collectPatch, gradeOnce, gradePatch } = G;
@@ -278,13 +278,13 @@ test('row 9: a task whose gold passes only in the clone path is dropped', async 
   const fake = new FakeContainers({ onRun: (spec) => {
     if (!spec.mounts) return { stdout: 'devcontainer=no\n' };
     const gold = spec.mounts.some((m) => m.target === '/patch/model.patch');
-    const real = !/git clone/.test(spec.script);
+    const real = !spec.script.includes(CLONE_PATH);
     fs.writeFileSync(path.join(REWARD(spec), 'reward.txt'), gold && !real ? '1\n' : '0\n');
     return {};
   } });
   const r = await checkTask({ containers: fake, task: loaded(t), workRoot: tmp(t) });
   assert.deepEqual([r.ok, r.reason], [false, 'gold-fails-at-app']);
-  assert.ok(fake.runs.some((s) => !/git clone/.test(s.script) && s.mounts?.some((m) => m.target === '/patch/model.patch')));
+  assert.ok(fake.runs.some((s) => !s.script.includes(CLONE_PATH) && s.mounts?.some((m) => m.target === '/patch/model.patch')));
 });
 
 // ---- row 10 ----

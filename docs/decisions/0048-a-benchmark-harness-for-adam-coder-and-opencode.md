@@ -442,3 +442,26 @@ workspace image or the coder uses) and resumes from `check.json`; `tasks select`
 order, so a partial check selects what a full one would. `--all` restores the full walk for audits. This changes which
 tasks a seed selects for the public source compared with the earlier equal-share draw over the checked tasks. The NodeBB
 gold-fails seen in the walk are under separate investigation and not addressed here.
+
+**Amended 2026-11-19:** the NodeBB gold-fails. In the public walk 11 of the first 15 tasks were dropped as `gold-fails`, all
+NodeBB; on the owner's host the gold of `04998908` passed three times at `/app` and failed (285 of 291) through the check's
+clone path, the six `test/user/emails.js` tests that send a validation e-mail failing. Two changes, neither to grading:
+
+* **The check's clone path is a copy of the image's tree, not a clone with links.** It linked the top-level ignored entries
+  to `/app`'s, so the slot shared `/app`'s mutable, code-bearing state: Node resolves a module under a linked `node_modules`
+  from its real path in `/app`, `npm install` removes a linked `node_modules` and installs afresh (*verified 2026-11-19* with
+  npm 10.9.9), and a test script's writes (NodeBB's `run_script.sh` writes `config.json` and `package.json`) land in `/app`.
+  The clone path now copies `/app` whole (`cp -a`, `.git`, untracked and ignored files) and keeps its purpose: `test.sh`
+  still runs with `/app` rewritten, so a task whose tests only work at `/app` is still dropped. Grading the agent's patch is
+  unchanged (applied at `/app` in a fresh container of the task image, as upstream does), and so is the agents' base, whose
+  ignored entries stay links (`bench/lib/base.mjs`). Rejected: `--preserve-symlinks` (Node only; npm and the writes stay),
+  copying `node_modules` alone (a virtualenv or a build directory has the same faults), and dropping the clone path (the
+  check would no longer say that a task's tests run where the agents work). A Node fixture in
+  `bench/test/clonepath.test.mjs` fails on the links and passes on the copy.
+* **A `public` verifier is probed before it is graded.** `adam-bench_egress` is a plain bridge network with the host's route
+  out (no relay, no allow-list), which is what upstream's `public` is, so the verifier already had the network the task
+  declares; but a host whose network did not route out would have graded every such task a fail. The grading container
+  now connects to `registry.npmjs.org`, `pypi.org` and `proxy.golang.org` on 443 before the patch is applied, and one that
+  fails is exit 98: `infra` in a check, `invalid` in a run, never a fail. No proxy and no key reach a verifier.
+
+*Unverified:* that the two NodeBB tasks (`04998908`, `05f22361`) are kept on the owner's host, and the time a copy adds.

@@ -311,21 +311,47 @@ export function verifierNetwork(task) {
 }
 
 /**
- * The shell of one grading run. Pristine: the patch is applied in the task's own working directory.
- * With `cloneTo` (the environment check): the base is cloned to the path the agents will use, the
- * top-level ignored entries are linked to the original's, the patch is applied there and the test
- * script runs with the working directory rewritten to the clone.
+ * What a `public` verifier must reach before it is graded: the package registries of the upstream set's languages
+ * (npm, PyPI, the Go module proxy), on 443. A TCP connection from the grading container itself, on its own network,
+ * before the patch is applied; one that fails is an infrastructure error (exit 98), so a network with no route out makes
+ * an attempt `infra` and a grade `invalid`, never a fail.
  */
-export function gradeScript({ workdir = '/app', cloneTo = null } = {}) {
+export const EGRESS_PROBE = ['registry.npmjs.org:443', 'pypi.org:443', 'proxy.golang.org:443'];
+
+const PROBE_ENTRY = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}:([1-9][0-9]{0,4})$/;
+
+/** The probe's shell: bash's /dev/tcp (every task image runs `bash /tests/test.sh`), 20 s a host when `timeout` exists. */
+function probeLines(probe) {
+  for (const hp of probe) {
+    const m = PROBE_ENTRY.exec(String(hp));
+    if (!m || Number(m[1]) > 65535) throw new Error(`a network probe entry is a plain host:port: ${JSON.stringify(hp)}`);
+  }
+  if (probe.length === 0) return [];
+  return [
+    "if command -v timeout >/dev/null 2>&1; then t='timeout 20'; else t=''; fi",
+    `for hp in ${probe.join(' ')}; do $t bash -c 'exec 3<>"/dev/tcp/\${1%:*}/\${1##*:}"' bench-probe "$hp" 2>/dev/null || { echo "bench: the verifier network does not reach $hp" >&2; exit 98; }; done`,
+  ];
+}
+
+/**
+ * The shell of one grading run. Pristine: the patch is applied in the task's own working directory.
+ * With `cloneTo` (the environment check): the image's whole working tree (tracked, untracked and ignored files, and
+ * `.git`) is copied to the path the agents will use, the patch is applied there and the test script runs with the
+ * working directory rewritten to the copy. A copy and not links: a linked `node_modules` makes Node resolve a module's
+ * own requires from the image's tree (its real path), `npm install` replaces the link, and a test script's writes land
+ * in the image's tree, so the clone path would not grade the tree the working directory grades.
+ * With `probe` (host:port entries): each must accept a connection first, or the run exits 98 (infrastructure).
+ */
+export function gradeScript({ workdir = '/app', cloneTo = null, probe = [] } = {}) {
   const apply = `if [ -s /patch/model.patch ]; then git apply --whitespace=nowarn /patch/model.patch || { echo 'bench: the patch does not apply' >&2; exit 97; }; fi`;
+  const head = ['mkdir -p /logs/verifier', ...probeLines(probe)];
   if (cloneTo === null) {
-    return ['mkdir -p /logs/verifier', `cd ${workdir} || exit 98`, apply, 'bash /tests/test.sh'].join('\n');
+    return [...head, `cd ${workdir} || exit 98`, apply, 'bash /tests/test.sh'].join('\n');
   }
   return [
-    'mkdir -p /logs/verifier',
-    `rm -rf ${cloneTo} && mkdir -p "$(dirname ${cloneTo})" || exit 98`,
-    `git clone -q --no-hardlinks ${workdir} ${cloneTo} || exit 98`,
-    `(cd ${workdir} && git status --porcelain --ignored | grep '^!! ' | cut -c4-) | while IFS= read -r p; do p=\${p%/}; case "$p" in */*) continue;; esac; ln -s ${workdir}/"$p" ${cloneTo}/"$p"; done`,
+    ...head,
+    `rm -rf ${cloneTo} && mkdir -p ${cloneTo} || exit 98`,
+    `cp -a ${workdir}/. ${cloneTo}/ || exit 98`,
     `cd ${cloneTo} || exit 98`,
     apply,
     `sed 's#${workdir}\\([^A-Za-z0-9_]\\|$\\)#${cloneTo}\\1#g' /tests/test.sh > /tmp/bench-test.sh`,
@@ -393,7 +419,7 @@ export async function gradeOnce({ containers, task, patchFile = null, cloneTo = 
     const startedMs = Date.now();
     const r = await containers.run({
       image: task.image.ref,
-      script: gradeScript({ workdir: task.workdir, cloneTo }),
+      script: gradeScript({ workdir: task.workdir, cloneTo, probe: verifierNetwork(task) === 'egress' ? EGRESS_PROBE : [] }),
       workdir: '/',
       mounts: staged.mounts,
       network: verifierNetwork(task),
