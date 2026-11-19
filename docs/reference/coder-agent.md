@@ -549,7 +549,9 @@ server that is **not** indexing and says so; one that is indexing is left to wor
 **Sync.** Before every request the coder sends what is on the disk now: a `didOpen` for the file, a `didChange` with its whole
 text (the next version) when its hash changed, a `didChange` for every other file the server holds open that changed, and one
 `workspace/didChangeWatchedFiles` for the files under the root that were created, changed (size or time) or deleted since the last
-call. No hook is in the write tools: `edit_file`, `run`, a build and the shell reach the server the same way.
+call, at most once a second. The coder's write tools (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`) mark the
+run's servers for a walk at the next call; a change made by anything else (a build, the shell, another process) is reported at
+the next walk, at most one interval later.
 
 **What a server may do: two modes, and what the guarantee covers.** The tools are tier `plan`, so they run at every tier, and the mode of
 the server depends on where it runs and on the tier of the run (the tier of the notes of the root run):
