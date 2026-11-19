@@ -418,6 +418,28 @@ async fn the_prompt_asks_for_independent_calls_together() {
     }
 }
 
+/// #184: `read_files` reads 1 to 16 files in one call, and the step that discovers the checks says
+/// so. Its batching sentence must name that tool, never the one-file `read_file`: the model reads
+/// both sentences in the same step.
+#[tokio::test]
+async fn the_prompt_asks_for_read_files_for_the_reads_of_a_step() {
+    let (_fx, agent) = coder(3).await;
+    let text = prompt_of(&agent);
+    assert!(
+        text.contains("together in one `read_files`"),
+        "the discovery step reads several files in one call: {text}"
+    );
+    assert!(
+        text.contains("several `read_files` calls"),
+        "the batching sentence names the tool for several files: {text}"
+    );
+    assert!(
+        !text.contains("several `read_file` calls"),
+        "the batching sentence does not send the model to the one-file tool: {text}"
+    );
+    assert!(TOOLS.contains(&"read_files"), "the tool is offered");
+}
+
 #[tokio::test]
 async fn the_limit_is_templated_in_from_the_settings() {
     let (_fx, agent) = coder(7).await;

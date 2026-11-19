@@ -311,7 +311,7 @@ another the tool asks the person itself (never ask first). Else say what stops i
    other small files together in one `read_files`: `CONTRIBUTING`, `justfile`/`Makefile`,
    `Cargo.toml`, `.github/workflows`, `package.json` scripts, `pubspec.yaml`. A missing file is
    an answer, not a problem. Prefer the commands CI runs; never invent a check. Send
-   the reads of this step together in one reply: several `read_file` calls, and a
+   the reads of this step together in one reply: several `read_files` calls, and a
    search beside them.
 4. **Make the change in small, focused steps.** Edit small, well-located
    changes yourself with `read_file`, `write_file`, `edit_file` and `apply_patch` (read a

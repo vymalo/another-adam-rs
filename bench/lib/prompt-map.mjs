@@ -16,6 +16,7 @@ export const NAMES = Object.freeze({
   run_command: 'shell',
   run: 'shell',
   read_file: 'read',
+  read_files: 'read', // a later revision than the pin: one call for 1 to 16 files, which OpenCode reads one file per call
   write_file: 'write',
   edit_file: 'edit',
   apply_patch: 'edit', // 2.3.0 has no `patch`: `edit` is its only edit tool
