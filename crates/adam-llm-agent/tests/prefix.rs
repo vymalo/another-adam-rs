@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store as _};
 use adam_llm_agent::{
     COMPACTION_TURN, Conversation, ImageStore, InboundImage, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, Tool, ToolCtx, ToolError, ToolOutput, ToolSource,
-    keep_image, user_message, user_message_with_images,
+    MAX_SOURCE_TOOLS, MemoryImages, ReadOutput, SourceCtx, Tool, ToolCtx, ToolError, ToolOutput,
+    ToolSource, Withheld, keep_image, user_message, user_message_with_images,
 };
 use adam_model::{
     DynModel, ImageLimits, ImageOrigin, InputModalities, Message, MockModel, ModelClient,
@@ -2158,4 +2158,64 @@ async fn the_summary_after_a_rejection_describes_images_and_sends_none() {
     assert!(described.contains("[image: me.png (png"), "{described}");
     // The request the provider rejected did carry them.
     assert!(!requests[at - 1].image_data.is_empty());
+}
+
+/// A source that decides once, from the run, what it offers: `big` is loaded only when the run's
+/// context says so, and the context does not change. The tools array is the same bytes at every
+/// request, so the prefix a provider cached still holds (ADR 0044, decision 1).
+struct TaskGate;
+
+#[async_trait]
+impl ToolSource for TaskGate {
+    async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
+        let loaded = ctx
+            .context("load")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if loaded {
+            return Vec::new();
+        }
+        tools
+            .iter()
+            .filter(|tool| **tool == "big")
+            .map(|tool| Withheld::new(*tool, "big is not loaded for this run"))
+            .collect()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+/// A tool a source holds back from the start stays held back: the head of every request is the
+/// same bytes, whatever the run does with the tools it was shown.
+#[tokio::test]
+async fn a_tool_a_source_holds_back_from_the_start_keeps_the_head_of_every_request() {
+    let rig = Rig::new(100_000, |b| b.tool_source(TaskGate));
+    rig.mock
+        .push_tool_calls(vec![call("c0", "handle", json!({}))])
+        .push_tool_calls(vec![call("c1", "handle", json!({}))])
+        .push_text("done");
+    let run = rig.start().await;
+    let (requests, _) = rig.finish(run).await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(breaks(&requests), Vec::<u32>::new());
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        ["handle"],
+        "the held-back tool is not shown, and the head does not move"
+    );
 }
