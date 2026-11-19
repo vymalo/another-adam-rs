@@ -277,6 +277,11 @@ name; the slice that changes the tools changes them too.
 
 ## For the owner to confirm
 
+*The owner's answers (2026-11-19):* O1, O2 and O5 are **decided as the defaults** below (a tag accepted with the
+pulled digest recorded; no allowed prefix by default; the bench's adam arm started from the task image), and the
+platform's `Engine` (AD-043) is **dropped**, as the Consequences say. O3, O4 and O6 stand at their defaults until the
+owner says otherwise.
+
 | Id | Topic | Default | Alternative |
 |---|---|---|---|
 | O1 | A repository image named by tag | accepted; the digest the node pulled is reported and recorded | digest only (`@sha256:` required) |
