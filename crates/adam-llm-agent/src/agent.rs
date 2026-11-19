@@ -321,6 +321,9 @@ pub(crate) struct Early<'a> {
     started: Vec<(usize, ToolCall)>,
     /// What each started call shares, while it runs: `None` once it has finished.
     accesses: Vec<Option<ToolAccess>>,
+    /// What each call the gate refused shares: it runs at the turn (when it runs at all), after
+    /// every early call, so a later call that conflicts with it cannot start early either.
+    waiting: Vec<ToolAccess>,
     /// Their work, by position in `started`.
     running: FuturesUnordered<BoxFuture<'static, (usize, Finished)>>,
     /// The results that came back while the stream went on, by position in `started`.
@@ -353,6 +356,7 @@ impl<'a> Early<'a> {
             own_order,
             started: Vec::new(),
             accesses: Vec::new(),
+            waiting: Vec::new(),
             running: FuturesUnordered::new(),
             done: Vec::new(),
             head: None,
@@ -403,6 +407,7 @@ impl<'a> Early<'a> {
             .accesses
             .iter()
             .flatten()
+            .chain(self.waiting.iter())
             .any(|running| running.conflicts(&access));
         let admitted = self.gate.admits(
             index,
@@ -417,6 +422,9 @@ impl<'a> Early<'a> {
             },
         );
         if !admitted {
+            // It runs at the turn, after every early call: a later call that conflicts with it
+            // must wait for it too.
+            self.waiting.push(access);
             return;
         }
         let silent = self
@@ -495,6 +503,7 @@ impl<'a> Early<'a> {
         let head = self.head.take();
         self.started.clear();
         self.accesses.clear();
+        self.waiting.clear();
         self.done.clear();
         matched.then_some((head, results))
     }
@@ -510,6 +519,7 @@ impl<'a> Early<'a> {
         };
         self.started.clear();
         self.accesses.clear();
+        self.waiting.clear();
         self.done.clear();
         self.head = None;
         taken
@@ -559,6 +569,7 @@ impl<'a> Early<'a> {
         self.finish_all().await;
         self.started.clear();
         self.accesses.clear();
+        self.waiting.clear();
         self.done.clear();
         self.head = None;
     }

@@ -10,8 +10,10 @@
 //!
 //! * the limit is above 1, and fewer calls than the limit are running
 //!   ([`LlmAgentBuilder::max_parallel`](crate::LlmAgentBuilder::max_parallel)), and the call does
-//!   not conflict with one that started early and is still running (ADR 0049 decision 1: two
-//!   conflicting calls never overlap);
+//!   not conflict with one that started early and is still running, nor with an earlier call of the
+//!   turn that did not start early (ADR 0049 decision 1: two conflicting calls never overlap, and
+//!   decision 5: a call waits for every earlier call it conflicts with, so an early call must not
+//!   run before one that will run at the turn);
 //! * the turn is not the closing one, and the run is not cancelled;
 //! * the call takes a step at all (not a shortcut: arguments that are not JSON, a tool nobody has);
 //! * the call is not a barrier: its [`Tool::access`](crate::Tool::access) is not
@@ -64,7 +66,8 @@ pub(crate) struct Candidate<'a> {
     pub(crate) doom_loop: bool,
     /// How many early calls are running now.
     pub(crate) running: usize,
-    /// The call conflicts with one that started early and is still running.
+    /// The call conflicts with one that started early and is still running, or with an earlier
+    /// call of the turn that did not start early (it runs at the turn, after this one).
     pub(crate) conflicts: bool,
 }
 

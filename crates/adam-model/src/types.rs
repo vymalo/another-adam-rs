@@ -667,7 +667,9 @@ pub enum ModelDelta {
     /// an object, and for every call it did not say it for, immediately before
     /// [`ModelDelta::Finished`]. Empty argument text is not complete on its own (it parses as
     /// `{}`): a provider that sends the id and the name first and the arguments after must not
-    /// announce `{}`. A call whose arguments never parse as JSON is announced with
+    /// announce `{}`. A call with no name yet is not a call: a client announces it when its name
+    /// arrives, and `Finished` refuses one that never has a name. A call whose arguments never
+    /// parse as JSON is announced with
     /// [`ToolCall::invalid_arguments`] set, and does not run. A model that does not stream says
     /// none of this.
     ToolCallComplete(ToolCall),

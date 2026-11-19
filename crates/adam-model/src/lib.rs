@@ -33,7 +33,8 @@
 //! call it did not say it for, immediately before [`ModelDelta::Finished`]. The call is the one the
 //! response holds (same id, name and arguments), so a caller may start it before the turn ends
 //! ([ADR 0049](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md),
-//! amended). Empty argument text is not complete on its own. [`ModelDelta`] is `#[non_exhaustive]`
+//! amended). Empty argument text is not complete on its own. A call with no name yet waits for its
+//! name. [`ModelDelta`] is `#[non_exhaustive]`
 //! since this variant: a `match` over it needs one more arm.
 //!
 //! # Images

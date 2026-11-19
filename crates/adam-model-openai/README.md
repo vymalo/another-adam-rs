@@ -60,7 +60,8 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   `Finished` ([ADR 0049](../../docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md), amended). A
   provider that sends the id and the name in one chunk and the arguments in later ones is announced when the arguments
   close, never as `{}`; a provider that sends a whole call in one chunk is announced in that chunk, after its
-  `ToolCallStarted`.
+  `ToolCallStarted`; and a provider that sends the arguments before the name is announced when the name arrives (a call
+  with no name is not a call: `finish` refuses it), never skipped.
 * A transport failure (timeout, connection error) is a `Transient` that keeps
   the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
   that keeps the parser's error. The message does not repeat the source.

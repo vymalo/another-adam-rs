@@ -288,3 +288,22 @@ call that runs in a segment of one (because the call after it is a barrier) is s
 `NeedsInput`, `Await*` and `reported` rounds (decision 11): a tool that asks or parks must declare `Alone`, and the gate
 never starts one.
 
+## Amended 2026-11-19: a conflict with a call that did not start early
+
+The gate's first condition above is incomplete. "It does not conflict with one that started early and is still running" is
+not enough to keep decision 5's order: a call the gate **refused** (because it conflicted with one already running) runs at
+the turn, after every early call, so a later call that conflicts with *that* call must wait for the turn too. Otherwise it
+starts early, before the refused call, and the model's order is reversed.
+
+The case that found it (`tests/early_calls.rs`, `a_call_that_conflicts_with_an_earlier_refused_call_waits_for_it`): c1
+reads `files/x` and is still running; c2 writes `files`, so the gate refuses it (it conflicts with c1); c3 writes
+`files/y`, which conflicts with c2 but not with c1, so it was admitted and ran before c2. c2's write then overwrote c3's:
+the model asked for c2 then c3 and got c3 then c2. `Early` now keeps the access of every call the gate refused (`waiting`)
+and a conflict with one is a refusal, so the condition is: does not conflict with one that started early and is still
+running, **or with an earlier call of the turn that did not start early**. The call's own access is what the turn's queue
+uses, so the two agree.
+
+The gate is otherwise unchanged: a refused call still waits for the turn, exactly as before, and the journal, the cancel
+and the at-least-once rules are the ones above. The empty-name fix of the same day is in `adam-model-openai`: a call whose
+arguments are whole before its name arrives is announced when the name arrives, not silently skipped.
+

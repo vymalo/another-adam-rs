@@ -196,7 +196,8 @@ impl Log {
 /// A tool whose arguments say what the call does: `ms` (how long it takes), `use`
 /// (`independent`, `r:<scope>`, `w:<scope>`; none means the tool declares nothing and runs alone),
 /// `out` (a fixed answer), `hang` (never returns), `ask` (asks although it declared nothing of the
-/// kind). It says when it began, on `started`.
+/// kind), `fast` (answers without awaiting anything), `fail: "transient"` (fails transiently, at
+/// once). It says when it began, on `started`.
 struct Probe {
     name: &'static str,
     log: Arc<Log>,
@@ -254,6 +255,23 @@ impl Tool for Probe {
             .entry(id.clone())
             .or_default() += 1;
         self.started.notify_one();
+        if args.get("fast").and_then(Value::as_bool) == Some(true) {
+            // A call that ends without awaiting anything: its future is ready on its first poll.
+            self.log.events.lock().unwrap().push(format!("end:{id}"));
+            *self.log.ends.lock().unwrap().entry(id.clone()).or_default() += 1;
+            return Ok(ToolOutput::text(
+                args.get("out")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| format!("ok:{id}"), str::to_owned),
+            ));
+        }
+        if args.get("fail").and_then(Value::as_str) == Some("transient") {
+            // The end is logged, then the failure, with no wait: the stream loop polls the call
+            // before the next delta, so a later call must see it.
+            self.log.events.lock().unwrap().push(format!("end:{id}"));
+            *self.log.ends.lock().unwrap().entry(id.clone()).or_default() += 1;
+            return Err(ToolError::Transient("the probe failed".into()));
+        }
         let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
         let sleep = tokio::time::sleep(Duration::from_millis(ms));
         let stopped = if self.heeds_cancel {
@@ -599,6 +617,52 @@ async fn a_call_that_repeats_the_one_before_it_does_not_start_early() {
     assert_waited_for_the_turn(&h, run, "c2");
 }
 
+/// The gate must not start a call before an earlier call of the turn it conflicts with, when that
+/// earlier call did not start early: the turn runs it, in the segment's order, and the early call
+/// would have run before it (ADR 0049 decisions 1 and 5, and the amendment's "starting it early
+/// cannot change what the turn would have done").
+///
+/// Here c1 reads `files/x` for long enough to still be running when the turn's calls arrive; c2
+/// writes `files` and conflicts with c1, so the gate refuses it; c3 writes `files/y`, which
+/// conflicts with c2 but not with c1, so the gate used to admit it — and it ran before c2, whose
+/// write the model ordered first.
+#[tokio::test]
+async fn a_call_that_conflicts_with_an_earlier_refused_call_waits_for_it() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    let began = Arc::new(Notify::new());
+    let c1 = call("c1", "probe", json!({"use": "r:files/x", "ms": 400}));
+    let c2 = call("c2", "probe", json!({"use": "w:files", "ms": 0}));
+    let c3 = call("c3", "probe", json!({"use": "w:files/y", "ms": 0}));
+    h.script(vec![
+        started("c1", "probe"),
+        complete(&c1),
+        started("c2", "probe"),
+        complete(&c2),
+        started("c3", "probe"),
+        complete(&c3),
+        text("working"),
+        finished(asks(vec![c1, c2, c3], "working")),
+    ]);
+    h.script(answer("done"));
+    let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
+    let (_, view) = h.run(agent, "go").await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    let events = log.events.lock().unwrap().clone();
+    let start = |id: &str| {
+        events
+            .iter()
+            .position(|e| e == &format!("start:{id}"))
+            .unwrap_or_else(|| panic!("{id} did not start: {events:?}"))
+    };
+    assert!(
+        start("c2") < start("c3"),
+        "c3 conflicts with c2 and must not run before it: {events:?}"
+    );
+    assert_eq!(log.starts("c2"), 1);
+    assert_eq!(log.starts("c3"), 1);
+}
+
 // ---------------------------------------------------------------------------
 // 3. A cancel mid-stream
 // ---------------------------------------------------------------------------
@@ -686,6 +750,157 @@ async fn a_cancel_drops_a_started_call_that_does_not_stop_after_the_grace() {
             && took < adam_llm_agent::TOOL_STOP_GRACE + Duration::from_secs(1),
         "the loop waits TOOL_STOP_GRACE for a call that ignores the cancel, not its time limit: {took:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 3c. A transient failure of an early call stops new starts
+// ---------------------------------------------------------------------------
+
+/// ADR 0049 decision 9: a transient failure of one call stops new starts. Here c1 starts early and
+/// fails transiently; c2 is announced after it, and must wait for the turn (the retry) rather than
+/// start beside it.
+#[tokio::test]
+async fn a_transient_failure_of_an_early_call_stops_new_starts() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    let began = Arc::new(Notify::new());
+    let c1 = call(
+        "c1",
+        "probe",
+        json!({"use": "independent", "ms": 0, "fail": "transient"}),
+    );
+    let c2 = call("c2", "probe", json!({"use": "independent", "ms": 0}));
+    h.script(vec![
+        started("c1", "probe"),
+        complete(&c1),
+        started("c2", "probe"),
+        complete(&c2),
+        text("working"),
+        finished(asks(vec![c1, c2.clone()], "working")),
+    ]);
+    // The retry asks again, with a call that succeeds.
+    let retry = call("c1b", "probe", json!({"use": "independent", "ms": 0}));
+    h.script(turn(vec![retry, c2.clone()]));
+    h.script(answer("done"));
+    let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
+    let (run, view) = h.run(agent, "go").await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    // c2 runs at the failed try's turn (the segment starts it beside the failed c1) and again on
+    // the retry; what matters is that it never started beside the stream, after c1's failure.
+    assert!(log.starts("c2") >= 1);
+    assert_waited_for_the_turn(&h, run, "c2");
+}
+
+// ---------------------------------------------------------------------------
+// 3d. The limit, and a busy stream
+// ---------------------------------------------------------------------------
+
+/// The limit bounds the calls that run beside the stream: with two running, a third waits for the
+/// turn even though it conflicts with neither.
+#[tokio::test]
+async fn the_limit_bounds_the_calls_that_start_beside_the_stream() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    let began = Arc::new(Notify::new());
+    let c1 = call(
+        "c1",
+        "probe",
+        json!({"use": "independent", "ms": 400, "tag": 1}),
+    );
+    let c2 = call(
+        "c2",
+        "probe",
+        json!({"use": "independent", "ms": 400, "tag": 2}),
+    );
+    let c3 = call(
+        "c3",
+        "probe",
+        json!({"use": "independent", "ms": 0, "tag": 3}),
+    );
+    h.script(vec![
+        started("c1", "probe"),
+        complete(&c1),
+        started("c2", "probe"),
+        complete(&c2),
+        started("c3", "probe"),
+        complete(&c3),
+        text("working"),
+        finished(asks(vec![c1, c2, c3], "working")),
+    ]);
+    h.script(answer("done"));
+    let agent = h.agent(2, |b| b.tool(Probe::new(&log, &began)));
+    let (run, view) = h.run(agent, "go").await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    let events = h.sink.events_for(run);
+    let words = events
+        .iter()
+        .position(|e| matches!(e, RunEvent::Custom { kind, .. } if kind == AGENT_TEXT_KIND))
+        .expect("the turn said its words");
+    let running = events
+        .iter()
+        .position(|e| {
+            matches!(e, RunEvent::Step(step) if step.id == "tool:c3" && step.state == StepState::Running)
+        })
+        .expect("c3 started");
+    assert!(
+        words < running,
+        "c3 waited for a slot and started at the turn: {events:#?}"
+    );
+}
+
+/// A stream that keeps producing deltas does not starve the calls beside it: a call that finishes
+/// during the burst is taken (its slot is free), so a later call still starts beside the stream.
+#[tokio::test]
+async fn a_busy_stream_still_takes_a_finished_call() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    let began = Arc::new(Notify::new());
+    let c1 = call(
+        "c1",
+        "probe",
+        json!({"use": "independent", "fast": true, "tag": 1}),
+    );
+    let c2 = call(
+        "c2",
+        "probe",
+        json!({"use": "independent", "fast": true, "tag": 2}),
+    );
+    let c3 = call(
+        "c3",
+        "probe",
+        json!({"use": "independent", "fast": true, "tag": 3}),
+    );
+    let mut steps = vec![started("c1", "probe"), complete(&c1)];
+    // A burst of ready text deltas: nothing in it waits for the runtime.
+    for _ in 0..500 {
+        steps.push(text("x"));
+    }
+    steps.push(started("c2", "probe"));
+    steps.push(complete(&c2));
+    steps.push(started("c3", "probe"));
+    steps.push(complete(&c3));
+    steps.push(finished(asks(vec![c1, c2, c3], &"x".repeat(500))));
+    h.script(steps);
+    h.script(answer("done"));
+    let agent = h.agent(2, |b| b.tool(Probe::new(&log, &began)));
+    let (run, view) = h.run(agent, "go").await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    let events = h.sink.events_for(run);
+    let words = events
+        .iter()
+        .position(|e| matches!(e, RunEvent::Custom { kind, .. } if kind == AGENT_TEXT_KIND))
+        .expect("the turn said its words");
+    let running = events
+        .iter()
+        .position(|e| {
+            matches!(e, RunEvent::Step(step) if step.id == "tool:c3" && step.state == StepState::Running)
+        })
+        .expect("c3 started");
+    assert!(
+        running < words,
+        "c3 started beside the stream, so c1's result was taken during the burst: {events:#?}"
+    );
+    assert_eq!(log.starts("c3"), 1);
 }
 
 // ---------------------------------------------------------------------------

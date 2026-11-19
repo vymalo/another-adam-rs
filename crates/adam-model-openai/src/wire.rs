@@ -759,8 +759,10 @@ impl Assembler {
                 name: call.name.clone(),
             });
         }
-        // The arguments are whole the first time they parse as an object: the call can start.
-        if !call.announced && call.arguments_are_complete() {
+        // The arguments are whole the first time they parse as an object: the call can start. A
+        // call with no name yet is not a call (`finish` refuses it): its arguments wait for the
+        // name, and the announcement is not lost.
+        if !call.announced && !call.name.is_empty() && call.arguments_are_complete() {
             call.announced = true;
             if let Ok(value) = call.value() {
                 out.push(ModelDelta::ToolCallComplete(value));
@@ -1389,6 +1391,82 @@ mod tests {
         assert_eq!(
             response.message.tool_calls(),
             [ToolCall::new("c1", "w", json!({"a": 1}))]
+        );
+    }
+
+    #[test]
+    fn arguments_that_arrive_before_the_name_are_announced_when_the_name_arrives() {
+        // The wire allows the function fields in any order. Arguments that are whole while the
+        // name is still empty are not a call yet (`finish` refuses a call with no name), so they
+        // wait for it: the announcement is not lost.
+        let mut asm = Assembler::default();
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(0, r#""function":{"arguments":"{\"a\":1}"}"#)],
+        );
+        assert!(deltas.is_empty(), "{deltas:?}");
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(0, r#""id":"c1","function":{"name":"w"}"#)],
+        );
+        assert_eq!(
+            deltas,
+            [
+                ModelDelta::ToolCallStarted {
+                    id: "c1".into(),
+                    name: "w".into()
+                },
+                ModelDelta::ToolCallComplete(ToolCall::new("c1", "w", json!({"a": 1}))),
+            ]
+        );
+        feed(&mut asm, &[FINISH]);
+        assert_eq!(
+            asm.finish().unwrap().message.tool_calls(),
+            [ToolCall::new("c1", "w", json!({"a": 1}))]
+        );
+    }
+
+    /// A prefix of a well-formed object cannot parse as an object: a nested object and a `}` inside
+    /// a string do not complete it, and the whitespace after the last brace is not a second
+    /// announcement. The call is said once, at the outer brace.
+    #[test]
+    fn a_nested_object_with_a_brace_in_a_string_completes_at_the_outer_brace() {
+        let mut asm = Assembler::default();
+        let mut deltas = Vec::new();
+        for (i, fragment) in [r#"{"a":"#, r#"{"b":"#, r#""}""#, "}", " "]
+            .into_iter()
+            .enumerate()
+        {
+            let arguments = serde_json::to_string(fragment).expect("a JSON string");
+            let body = if i == 0 {
+                format!(r#""id":"c1","function":{{"name":"w","arguments":{arguments}}}"#)
+            } else {
+                format!(r#""function":{{"arguments":{arguments}}}"#)
+            };
+            deltas.extend(feed(&mut asm, &[&call_chunk(0, &body)]));
+        }
+        assert!(
+            !deltas
+                .iter()
+                .any(|d| matches!(d, ModelDelta::ToolCallComplete(_))),
+            "not whole yet: {deltas:?}"
+        );
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(0, r#""function":{"arguments":"}"}"#)],
+        );
+        assert_eq!(
+            deltas,
+            [ModelDelta::ToolCallComplete(ToolCall::new(
+                "c1",
+                "w",
+                json!({"a": {"b": "}"}})
+            ))]
+        );
+        feed(&mut asm, &[FINISH]);
+        assert_eq!(
+            asm.finish().unwrap().message.tool_calls(),
+            [ToolCall::new("c1", "w", json!({"a": {"b": "}"}}))]
         );
     }
 

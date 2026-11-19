@@ -46,7 +46,8 @@ assert_eq!(resp.message.text(), "hello");
 start it before the turn ends ([ADR 0049](../../docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md),
 amended). A client says it **once per call**: the first time the accumulated text parses as an object, and for every call
 it did not say it for, immediately before `Finished`. Empty text is not complete on its own (it parses as `{}`), so a
-provider that sends the id and the name first and the arguments after is not announced as `{}`. A call whose text never
+provider that sends the id and the name first and the arguments after is not announced as `{}`; a call with no name yet
+waits for its name (it is not a call until it has one). A call whose text never
 parses as JSON is announced with `ToolCall::invalid_arguments` set (and does not run). A made-up id is fixed at the
 announcement, and the response keeps it. A model that does not stream says none of this.
 **Breaking:** `ModelDelta` is now `#[non_exhaustive]`, so a `match` outside this crate needs a wildcard arm, and every

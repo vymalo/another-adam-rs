@@ -661,7 +661,8 @@ sequenceDiagram
 * **A call starts while the model writes.** The model's client says `ModelDelta::ToolCallComplete` when a call's arguments
   are whole, and the loop starts that call beside the stream, before the turn is recorded (`src/early.rs` is the pure
   gate, `Early` in `src/agent.rs` the batch of started calls). Only a call in the first segment that is no barrier, does not
-  conflict with one already running, leaves room under `max_tool_calls` and is not a `doom_loop` refusal starts; every
+  conflict with one already running or with an earlier call of the turn that did not start early, leaves room under
+  `max_tool_calls` and is not a `doom_loop` refusal starts; every
   other call waits for the turn. The turn is still journaled first: `model:N` when the stream ends, then `tool:<call id>`
   at the seqs a sequential loop writes, so a crash mid-stream writes nothing and the replay asks the model again. A stream
   error waits for the started calls and retries the turn; a cancel waits `TOOL_STOP_GRACE` for them.
