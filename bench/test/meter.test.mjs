@@ -1,14 +1,19 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { CapBook } from '../lib/cap.mjs';
 import { normalizeConfig } from '../lib/config.mjs';
 import { Ledger, readLedger } from '../lib/ledger.mjs';
-import { LIMITS, MAX_OUTPUT_TOKENS, createMeter, deepMerge, prepareBody, toolName } from '../lib/meter.mjs';
+import { LIMITS, MAX_OUTPUT_TOKENS, createMeter, deepMerge, prepareBody, toolName, upstreamAgent } from '../lib/meter.mjs';
 import { createScriptedModel } from '../lib/scripted-model.mjs';
 import { MODEL_ID, TEST_KEY, rawConfig, tmp } from './helpers.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 // The scripted model reports: prompt 1000 (400 cached), completion 200 (50 of them reasoning).
 // With prices 3 / 0.3 / 3.75 / 15 USD per million tokens a call costs
@@ -786,4 +791,116 @@ test('the meter opens a connection for each call: a peer that closes an idle soc
   assert.equal((await chat(baseUrl, { model: 'whatever', messages: [{ role: 'user', content: 'two' }] })).status, 200);
   assert.equal(connections, 2, 'no keep-alive socket is reused');
   assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.usageMissing), [false, false]);
+});
+
+test('the meter does not reuse a socket a peer keeps open: agent: false is the belt, not only the request header', async (t) => {
+  // A peer that ignores `connection: close` and keeps its socket open (measured: Node's default agent reuses it even
+  // when the request says close) would put the next call on a socket the peer may close while idle, which is the dry
+  // run's failure. `agent: false` is what makes the connection fresh whatever the peer does.
+  const sockets = [];
+  const body = JSON.stringify({
+    id: 'x',
+    choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200, prompt_tokens_details: { cached_tokens: 400, cache_write_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 50 } },
+  });
+  const server = net.createServer((sock) => {
+    sockets.push(sock);
+    let buf = '';
+    sock.on('data', (c) => {
+      buf += c.toString('utf8');
+      for (;;) {
+        const end = buf.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const len = Number(/content-length:\s*(\d+)/i.exec(buf.slice(0, end))?.[1] ?? 0);
+        if (buf.length < end + 4 + len) return;
+        buf = buf.slice(end + 4 + len);
+        // No `connection: close` in the answer, and the socket is kept: only the client's agent decides to reuse it.
+        sock.write(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const dir = tmp(t);
+  const cfg = normalizeConfig(rawConfig({ endpoint: `http://127.0.0.1:${server.address().port}/v1` }));
+  const ledger = Ledger.open(path.join(dir, 'ledger.jsonl'));
+  const book = new CapBook(10_000_000);
+  const meter = createMeter({ config: cfg, ledger, book, env: { BENCH_MODEL_API_KEY: TEST_KEY }, log: () => {} });
+  await meter.listen();
+  t.after(async () => {
+    await meter.close();
+    ledger.close();
+    server.close();
+    for (const s of sockets) s.destroy();
+  });
+  assert.equal(book.reserve('r1', 3_000_000), true);
+  const { baseUrl } = meter.openRun({ run: 'r1', arm: 'max' });
+  assert.equal((await chat(baseUrl, { model: 'x', messages: [{ role: 'user', content: 'one' }] })).status, 200);
+  assert.equal((await chat(baseUrl, { model: 'x', messages: [{ role: 'user', content: 'two' }] })).status, 200);
+  assert.equal(sockets.length, 2, 'the peer kept its socket and the meter still opened a new connection');
+});
+
+test('the per-call connection keeps the proxy: agent: false only when no proxy is in use', () => {
+  // Node applies NODE_USE_ENV_PROXY to the default agent only, so `agent: false` bypasses a proxy. The choice is pure
+  // and named, so the proxy path cannot be lost again without a test failing.
+  assert.equal(upstreamAgent({}), false, 'no proxy: a fresh connection for each call');
+  assert.equal(upstreamAgent({ NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: 'http://proxy.test:3128' }), undefined, 'a proxy: the default agent, which carries it');
+  assert.equal(upstreamAgent({ NODE_USE_ENV_PROXY: '1', https_proxy: 'http://proxy.test:3128' }), undefined, 'the lower-case name too');
+  assert.equal(upstreamAgent({ NODE_USE_ENV_PROXY: '1' }), false, 'the flag without a proxy is no proxy');
+  assert.equal(upstreamAgent({ HTTPS_PROXY: 'http://proxy.test:3128' }), false, 'a proxy without the flag is not used by Node, so a fresh connection is right');
+});
+
+test('a proxy in the environment is used: the per-call connection never goes around it', async (t) => {
+  // The first version of the per-call connection (`agent: false`) bypassed Node's env proxy, measured: the proxy saw no
+  // CONNECT and the call failed at DNS. Node reads NODE_USE_ENV_PROXY at startup, so this runs in a child; the stub proxy
+  // records the CONNECT the meter's upstream request makes for an https endpoint.
+  const seen = [];
+  const proxy = net.createServer((s) => {
+    s.once('data', (b) => {
+      seen.push(b.toString('utf8').split('\r\n')[0]);
+      s.destroy();
+    });
+  });
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+  t.after(() => proxy.close());
+  const port = proxy.address().port;
+  const home = tmp(t);
+  const script = path.join(home, 'meter-proxy.mjs');
+  const lib = path.join(HERE, '..', 'lib');
+  fs.writeFileSync(
+    script,
+    `import http from 'node:http';
+import path from 'node:path';
+const B = ${JSON.stringify(lib)};
+const { createMeter } = await import(B + '/meter.mjs');
+const { CapBook } = await import(B + '/cap.mjs');
+const { Ledger } = await import(B + '/ledger.mjs');
+const { normalizeConfig } = await import(B + '/config.mjs');
+const config = normalizeConfig({ endpoint: 'https://example.test/v1', modelId: 'm', modelLabel: 'M', prices: { inputPerMTok: 1, cachedInputPerMTok: 1, cacheWritePerMTok: 1, outputPerMTok: 1 }, contextWindow: 4096, capUSD: 100, perRunBudgetUSD: 100, arms: { max: {} }, keyEnv: 'BENCH_MODEL_API_KEY' });
+const ledger = Ledger.open(path.join(process.env.BENCH_HOME, 'ledger.jsonl'));
+const book = new CapBook(config.capMicro);
+const meter = createMeter({ config, ledger, book, env: process.env, log: () => {} });
+const { port } = await meter.listen(0, '127.0.0.1');
+if (!book.reserve('r', 100_000_000)) throw new Error('the run was not reserved');
+const { token } = meter.openRun({ run: 'r', attempt: 1, arm: 'max' });
+const body = JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }] });
+await new Promise((resolve) => {
+  const req = http.request({ host: '127.0.0.1', port, path: '/r/' + token + '/v1/chat/completions', method: 'POST', agent: false, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => { res.resume(); res.on('end', resolve); });
+  req.on('error', resolve);
+  req.end(body);
+});
+await meter.close();
+ledger.close();
+`,
+  );
+  const child = spawn(process.execPath, [script], {
+    env: { ...process.env, NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: `http://127.0.0.1:${port}`, https_proxy: `http://127.0.0.1:${port}`, BENCH_HOME: home, BENCH_MODEL_API_KEY: 'proxy-test-key-0001-not-a-secret' },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let err = '';
+  child.stderr.on('data', (c) => {
+    err += c;
+  });
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(code, 0, err);
+  assert.ok(seen.some((l) => /^CONNECT example\.test:443 /.test(l)), `the proxy was not used: ${JSON.stringify(seen)}`);
 });
