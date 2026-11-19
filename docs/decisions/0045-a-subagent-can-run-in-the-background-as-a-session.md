@@ -11,6 +11,8 @@ resume" of [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-g
 [ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) decisions 1 and 2 for its
 tools. The orchestration layer's side is its own ADR in `vymalo/another-agentic-system`.
 
+*Amended 2026-11-19 ([ADR 0054](0054-a-child-session-can-be-configured-within-what-its-folder-allows.md), not built):* `subagent_start` and a person's start (`start.config`) take an optional `config` that only chooses within, or narrows, what the subagent's folder and the deployment allow; the effective config is in the header (decision 1 gains `config`, `spent`, `deleted` and `edits`) and kept by later rounds. A sixth tool, `subagent_edit`, changes a session's settings within the same bounds; `subagent_close` gains `delete`; the system prompt of an agent with these tools gains a fixed section on them. Decision 3's table and decision 11's close change accordingly; `subagent_send` stays for messages only.
+
 *Built 2026-11-14 ([ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) slice 10):* the runtime half of decision 6: a cancelled or failed parent fails the open round (`cancelled: the parent run ended`) and the session stays usable; `start_child_continuing_within` gives a round the same time limit. Remote sessions are not cancelled (slice 5: *amended 2026-11-18*, built: a round sends `CancelTask`, see below).
 
 *Built 2026-11-14:* slice 1 (the runtime): `Runtime::start_child_continuing`, the kind `adam.child.reported`
