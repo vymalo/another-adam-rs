@@ -65,7 +65,7 @@ export const SCHEMA = {
   tasks: {
     type: 'object',
     optional: true,
-    doc: 'Task sources and grading: the pinned upstream commit, the clones to mine, the workspace image, the Podman service',
+    doc: 'Task sources and grading: the pinned upstream commit, the clones to mine, the workspace image, the verifier networks',
     fields: {
       upstreamUrl: { type: 'string', default: 'https://github.com/scaleapi/SWE-bench_Pro-os.git' },
       upstreamCommit: { type: 'commit' },
@@ -75,7 +75,6 @@ export const SCHEMA = {
       selfRepo: { type: 'string', default: 'another-adam-rs' },
       verifierNetworks: { type: 'array' },
       seed: { type: 'string', default: '1' },
-      podman: { type: 'object', fields: { connection: { type: 'string' }, url: { type: 'string' } } },
     },
   },
 };
@@ -279,7 +278,7 @@ export function normalizeConfig(raw) {
 /** The `tasks` block: task sources and grading. Every field optional; the commands that need one say which. */
 function normalizeTasks(raw) {
   const f = SCHEMA.tasks.fields;
-  const out = { upstreamUrl: f.upstreamUrl.default, upstreamCommit: null, upstreamDir: f.upstreamDir.default, clones: {}, workspaceImage: null, selfRepo: f.selfRepo.default, seed: f.seed.default, podman: {}, verifierNetworks: [] };
+  const out = { upstreamUrl: f.upstreamUrl.default, upstreamCommit: null, upstreamDir: f.upstreamDir.default, clones: {}, workspaceImage: null, selfRepo: f.selfRepo.default, seed: f.seed.default, verifierNetworks: [] };
   if (raw === undefined) return out;
   if (!isObject(raw)) throw new ConfigError('tasks', 'must be an object');
   checkUnknown(raw, f, 'tasks');
@@ -319,18 +318,6 @@ function normalizeTasks(raw) {
     out.verifierNetworks = raw.verifierNetworks;
   }
   if (raw.seed !== undefined) out.seed = String(typeof raw.seed === 'number' ? raw.seed : str('seed'));
-  if (raw.podman !== undefined) {
-    if (!isObject(raw.podman)) throw new ConfigError('tasks.podman', 'must be an object');
-    checkUnknown(raw.podman, f.podman.fields, 'tasks.podman');
-    for (const k of ['connection', 'url']) {
-      if (raw.podman[k] === undefined) continue;
-      const v = raw.podman[k];
-      if (typeof v !== 'string' || v === '' || /[\s\0]/.test(v)) throw new ConfigError(`tasks.podman.${k}`, 'must be a short string with no space');
-      if (k === 'connection' && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(v)) throw new ConfigError('tasks.podman.connection', 'must be a plain name (never begin with -)');
-      if (k === 'url' && !/^(unix:\/\/|ssh:\/\/)/.test(v)) throw new ConfigError('tasks.podman.url', 'must be a unix:// or ssh:// URL (and never begin with -)');
-      out.podman[k] = v;
-    }
-  }
   return out;
 }
 

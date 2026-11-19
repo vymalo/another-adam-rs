@@ -79,7 +79,8 @@ export function baseScript({ workdir, out = '/out', scratch = '/tmp/bench-base' 
     `tar --exclude=./.git -cf - . | tar -xf - -C ${out}/tree`,
     // What the cache trusts is the content, not a name: the ref a clone would read, and the tree the host rebuilds.
     `printf '%s %s\n' "$(git -C ${out}/base.git rev-parse refs/heads/main)" "$(git -C "$W" rev-parse 'HEAD^{tree}')" > ${out}/${BASE_MARKER}`,
-    `chmod -R a+rX ${out}`,
+    // The work directory is the host's, owned by the host user: a container as uid 10001 cannot chmod it.
+    `chmod -R a+rX ${out} 2>/dev/null || true`,
   ].join('\n');
 }
 
@@ -93,11 +94,14 @@ export async function makeContainerBase({ containers, stack, slot, task, timeout
     image: task.image.ref,
     script: baseScript({ workdir: task.workdir }),
     workdir: '/',
-    mounts: [{ source: BASE_DIR, target: '/out' }],
+    mounts: [{ source: path.join(stack.workRoot(slot), 'bench-base'), target: '/out' }],
     network: 'none',
     timeoutMs,
   });
-  if (r.exitCode !== 0) throw new Error(`the base of task ${task.id} could not be made (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+  if (r.exitCode !== 0) {
+    const lines = r.stderr.trim().split('\n').filter(Boolean);
+    throw new Error(`the base of task ${task.id} could not be made (exit ${r.exitCode}): ${[lines[0], ...lines.slice(-2)].filter(Boolean).join(' | ')}`);
+  }
 }
 
 /** Rebuild the host's own repository of the base from a tar stream of the slot's `tree` (patch collection reads it). */

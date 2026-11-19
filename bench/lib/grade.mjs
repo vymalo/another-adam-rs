@@ -300,10 +300,14 @@ export function sanitizePatch(patch, { hiddenTests = [] } = {}) {
 
 // ---- grading ----
 
-/** The network a task's verifier asks for, as a RunSpec network. */
+/**
+ * The network a task's verifier asks for, as a logical RunSpec network: `none`, `verifier` (the internal network
+ * gradings share), `egress` (the internet, in a window alone) or a name the owner allowed (`tasks.verifierNetworks`).
+ * `default` is the shared internal network, never Docker's default bridge, which has a route out.
+ */
 export function verifierNetwork(task) {
   const n = task.verifierNetwork;
-  return n === 'public' || n === 'default' ? 'default' : n === 'none' || n === 'no-network' ? 'none' : n;
+  return n === 'public' ? 'egress' : n === 'default' ? 'verifier' : n === 'none' || n === 'no-network' ? 'none' : n;
 }
 
 /**
@@ -339,8 +343,7 @@ export const rewardOf = (raw) => (/^[01]\n?$/.test(raw) ? raw.slice(0, 1) : 'inv
  * Where a grading's files live. The default is the host's own: a directory of the harness's, made empty for each
  * attempt, handed to the container and read after it ends. The reward file is one a container wrote, so it is opened
  * without following a link and without blocking (a FIFO would hang the harness) and is read only if it is a regular
- * file of at most 16 bytes; anything else is 'invalid'. The service-backed one (`Stack.graderIO`) keeps the files
- * inside the grader and moves them as tar streams.
+ * file of at most 16 bytes; anything else is 'invalid'.
  *   stage({ task, patchFile }) -> { mounts, readReward(startedMs) -> { reward, stale }, remove() }
  */
 export function hostGradeIO(workRoot = os.tmpdir()) {

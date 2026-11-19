@@ -1,7 +1,7 @@
 // What a container wrote reaches the host as a tar stream this module parses, never as files the host opens.
 //
 // The principle (bench/README.md, "What the host trusts"): the host runs no git in, reads no file from and deletes no
-// file in a place a container could write. A tree or a log comes out of a Podman service as `tar -cf -`; this parser
+// file in a place a container could write. A tree or a log comes out of a container as `tar -cf -`; this parser
 // reads it with limits: regular files and directories only (symbolic links only when the caller asks, for a work
 // tree, and they are never followed), no hard link, device or FIFO, every name normalised and refused if it is
 // absolute, holds `..` or a NUL byte, a cap on the bytes, the entries and one file.

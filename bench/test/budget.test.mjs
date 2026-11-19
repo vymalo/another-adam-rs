@@ -5,13 +5,14 @@ import { test } from 'node:test';
 import { normalizeConfig } from '../lib/config.mjs';
 import { BudgetError, assertLedgerBound, configFingerprint, confirmProposal, digestKey, pilotEstimate, proposalBody, renderEstimate, requireConfirmed } from '../lib/budget.mjs';
 import { PINS } from '../lib/pins.mjs';
+import { RUNTIME } from '../lib/runtime.mjs';
 import { rawConfig, tmp } from './helpers.mjs';
 
 const KEY = 'key-for-tests-0001';
 const mk = (over = {}) => normalizeConfig(rawConfig({ capUSD: 10, ...over }));
 const config = mk();
 const LOCKS = ['{"public":1}', ''];
-const fp = (c = config, { pins = PINS, lockTexts = LOCKS, key = KEY } = {}) => configFingerprint({ config: c, pins, lockTexts, key });
+const fp = (c = config, { pins = PINS, lockTexts = LOCKS, key = KEY, runtime } = {}) => configFingerprint({ config: c, pins, lockTexts, key, ...(runtime ? { runtime } : {}) });
 
 /** A folded ledger of finished pilot runs: [arm, cost in micro-dollars, largest worst case of a call, exit]. */
 function folded(rows) {
@@ -95,7 +96,7 @@ test('a proposal is not confirmed; run needs a confirmed one for this configurat
   assert.deepEqual(requireConfirmed(ok, { config, fingerprint: fp() }), { max: 150_000, off: 150_000 });
 });
 
-test('R1: the fingerprint covers model, prices, arms, limits, context window, pins, locks, seed and selfRepo, and names what changed', () => {
+test('R1: the fingerprint covers model, prices, arms, limits, context window, pins, locks, seed, selfRepo and the runtime, and names what changed', () => {
   const base = fp();
   const cases = {
     model: fp(mk({ modelId: 'another-example-model' })),
@@ -107,6 +108,7 @@ test('R1: the fingerprint covers model, prices, arms, limits, context window, pi
     locks: fp(config, { lockTexts: ['{"public":2}', ''] }),
     seed: fp(mk({ tasks: { seed: '99' } })),
     selfRepo: fp(mk({ tasks: { selfRepo: 'another-repo' } })),
+    runtime: fp(config, { runtime: { ...RUNTIME, uid: 1000 } }),
   };
   const ok = confirmProposal(proposal());
   for (const [name, changed] of Object.entries(cases)) {

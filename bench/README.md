@@ -8,8 +8,9 @@ in a pristine image and reports pass rates with intervals and what they cost. De
 guards, the statistics and the report; the task sources (public and own), the statement lint, selection, the
 environment check and grading by patch replay; the compose stack, the adam and OpenCode drivers, the runner, `doctor` and
 the dry run; and `pilot`, `confirm`, `run` and `regrade`, with task blocks, slots, the pilot's budget and the final report
-("Pilot and run" below). Node 22 or later (CI runs 22 and 24), no dependencies: only Node's standard library. **Nothing that needs a container service has run** (the dry run, the stack,
-`doctor --start`): see "Unverified".
+("Pilot and run" below). Node 22 or later (CI runs 22 and 24), no dependencies: only Node's standard library. **The dry
+run, the stack and the coder probe have run on the host's Docker (2026-11-19); nothing that needs a real model endpoint, a
+model key or two slots has.** See "The dry run" and "Unverified".
 
 ## What it never holds
 
@@ -154,7 +155,7 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/own.mjs` | own tasks: their spec, the image's Dockerfile, the task directory built from a clone |
 | `bench/lib/lint.mjs` | the statement lint |
 | `bench/lib/select.mjs` | seeded stratified selection, the lock files |
-| `bench/lib/containers.mjs` | the container runtime interface: `PodmanRemote` and `FakeContainers` |
+| `bench/lib/containers.mjs` | the host container runtime interface: `HostContainers` (the `docker` CLI) and `FakeContainers` |
 | `bench/lib/grade.mjs` | patch collection and grading by replay |
 | `bench/lib/envcheck.mjs` | the environment check |
 | `bench/lib/tasks-cli.mjs` | `bench tasks ...` |
@@ -162,10 +163,10 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/npm.mjs` | OpenCode's binary from npm, checked against its integrity before anything is written |
 | `bench/lib/a2a.mjs` | the A2A client (the bearer in a private field) and `driveTask`: poll, the one nudge, cancel |
 | `bench/lib/gitops.mjs` | the host's other git: list the pushed branches (isolated), the agent folder of a revision, the script a container pushes the base with |
-| `bench/lib/stack.mjs`, `bench/compose.yaml`, `bench/lib/relay.mjs` | the stack, the Podman clients inside the services, the relays |
+| `bench/lib/stack.mjs`, `bench/compose.yaml`, `bench/lib/relay.mjs` | the stack, the host containers the harness starts (the coder, the arms, the grading), the relays |
 | `bench/lib/tarstream.mjs` | what a container wrote, as a tar stream parsed with limits |
 | `bench/lib/classify.mjs` | infrastructure told apart from the agent, from the meter's record |
-| `bench/lib/base.mjs` | the base of a task: its repository with the dependency links, made in the slot's volume, and the host's own copy of it; both once per (task, image, workdir) for the harness's life; the host copy's tree must equal the container's, which assumes the image's git normalises like the host's (`core.autocrlf=false`, `attributesFile=/dev/null`, `fsmonitor=false`) |
+| `bench/lib/base.mjs` | the base of a task: its repository with the dependency links, made in the slot's work directory for each run (that directory is shared by every task), and the host's own copy of it once per (task, image, workdir) for the harness's life; the host copy's tree must equal the container's, which assumes the image's git normalises like the host's (`core.autocrlf=false`, `attributesFile=/dev/null`, `fsmonitor=false`) |
 | `bench/lib/agents/adam.mjs`, `opencode.mjs`, `common.mjs` | the two drivers (prepare, run, collect, cleanup) and what they share |
 | `bench/lib/runner.mjs` | one run through its states, resume of the ledger, and a plan one run at a time |
 | `bench/lib/plan.mjs`, `bench/lib/schedule.mjs`, `bench/lib/budget.mjs`, `bench/lib/run-cli.mjs` | task blocks in a seeded balanced order; the slots and the wait for budget; the pilot's budget and its confirmation; `bench pilot`, `confirm`, `run`, `regrade` |
@@ -218,7 +219,7 @@ told otherwise.
   however lively the stream). Beside them the configuration's first-byte and idle timeouts. A call over a response
   limit or a time limit is cut, the upstream request is destroyed and the call is charged its worst case.
 * **A client that closes at `[DONE]`** (adam does, right after the last chunk and before the upstream has ended) is charged the usage the meter had already read from the stream, not the worst case; only a client that closes before any usage was seen is charged the worst case.
-* **A proxy:** the meter uses `https.request`, which takes `HTTPS_PROXY` from the environment only when `NODE_USE_ENV_PROXY=1` is set **and** the Node release has it: *verified 2026-11-17* in Node's changelogs (`doc/changelogs/CHANGELOG_V24.md` and `CHANGELOG_V22.md`, "http,https: add built-in proxy support in http/https.request and Agent", nodejs/node#58980): first in 24.5.0 (2025-07-31) and 22.21.0 (2025-10-20); `fetch()` has had it since 24.0.0, which is not what the meter uses. `bench doctor` warns when a proxy is set without the variable, or with a Node older than those, and says what to do. Everything else in the harness needs only Node 22.
+* **A proxy:** the meter uses `https.request`, which takes `HTTPS_PROXY` from the environment only when `NODE_USE_ENV_PROXY=1` is set **and** the Node release has it: *verified 2026-11-17* in Node's changelogs (`doc/changelogs/CHANGELOG_V24.md` and `CHANGELOG_V22.md`, "http,https: add built-in proxy support in http/https.request and Agent", nodejs/node#58980): first in 24.5.0 (2025-07-31) and 22.21.0 (2025-10-20); `fetch()` has had it since 24.0.0, which is not what the meter uses. Each call opens its own connection (an endpoint or proxy that closes an idle socket must not fail the next call), and with a proxy the default agent is kept — Node applies the env proxy to it only — with `connection: close` on every request, so the proxy is never bypassed (`upstreamAgent`, `bench/test/meter.test.mjs`). `bench doctor` warns when a proxy is set without the variable, or with a Node older than those, and says what to do. Everything else in the harness needs only Node 22.
 * **Backpressure:** an SSE stream is relayed chunk by chunk and the upstream is paused while the client does not read.
 
 **The report** shows pass rates with Wilson intervals, paired differences (exact McNemar, seeded bootstrap), splits
@@ -256,14 +257,13 @@ digest and keeps it in `$BENCH_HOME/tasks/pins.json`, and the pin is what a task
   "upstreamCommit": "0123456789abcdef0123456789abcdef01234567",
   "clones": { "demo": "/home/me/src/demo" },
   "workspaceImage": "registry.example.test/workspace@sha256:<64 hex digits>",
-  "podman": { "connection": "bench-slot-1" }
+  "verifierNetworks": ["bench-verifier"]
 }
 ```
 
 `upstreamUrl` (default the public repository; `https:`, `file:`, `ssh:` or an absolute path, never beginning with `-`),
 `upstreamDir` (default `v2`), `selfRepo` (the agent's own repository, default `another-adam-rs`, `null` for no cap of
-its own), `seed` (default `1`), `verifierNetworks` (names of networks a verifier may use, see Grading) and `podman`
-(`connection`, a plain name, or `url`, `unix://` or `ssh://`, of the Podman service, as `podman --remote` takes them)
+its own), `seed` (default `1`) and `verifierNetworks` (names of networks a verifier may use, see Grading)
 are the other fields. The task commands read the same file as the rest, so it must be a
 whole configuration.
 
@@ -295,7 +295,7 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
 * `bench tasks build` makes an own task's directory under `$BENCH_HOME/tasks/materialized` (the hidden tests read from the
   clone into `tests/test_patch.patch`, the gold without them in `solution/`) and builds its image: the workspace image
   by digest, the repository at `/app` at the base with history up to the base only, the toolchain pins you wrote.
-* `bench tasks check` (needs the Podman service) runs, per task, the gold patch three times and the empty patch three
+* `bench tasks check` (needs the host's container runtime) runs, per task, the gold patch three times and the empty patch three
   times **from the clone path the agents will use**, not from `/app`: the base is cloned there, the top-level ignored
   entries are linked to `/app`'s, and `test.sh` runs with `/app` rewritten to that path. A task is kept only if the gold
   passes all three and the empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`,
@@ -331,13 +331,15 @@ patch that touches the grading's own machinery as **suspect**, for a person to r
   `[tool.pytest*]` table, `[[test]]`, `harness`, a `test` script) are kept and flagged **suspect**.
 * **Grading.** The stripped patch is applied in a **new container of the task image, by digest**, `/tests` is mounted
   **read-only in that container only**, `bash /tests/test.sh` runs, and the reward is read from a directory made empty
-  for that attempt, after the container has ended. The `grader` service mounts nothing of the host: the harness copies the tests and
-  the patch into a directory of its own per grading (`/grade/<id>`, a tmpfs) as tar streams, mounts them read-only, takes the reward
-  out as a tar stream and removes the directory inside the service. A pass needs **all** of: exit status 0, a reward of exactly `1` written
+  for that attempt, after the container has ended. The tests and the patch are mounted from the harness's own
+  directories; the logs directory is a new one for each attempt, and the reward is opened without following a link
+  and without blocking. A pass needs **all** of: exit status 0, a reward of exactly `1` written
   during the attempt, and no error. A reward of `1` with another exit status is a fail and **suspect**. A patch whose added
-  lines mention `reward.txt`, `/logs/verifier`, `/tests/` or `test.sh` is graded as it is and **suspect** too. The agent
-  phase has no network; the grading container has the verifier's network.
-* **The verifier's network is an allow-list:** `none`, `default`, `public`, or a name in `tasks.verifierNetworks` of the
+  lines mention `reward.txt`, `/logs/verifier`, `/tests/` or `test.sh` is graded as it is and **suspect** too. The agent's
+  container is on the slot's network (the meter, the git server, postgres and the mock), which is internal; the grading
+  container has the verifier's network.
+* **The verifier's network is an allow-list:** `none`, `default` (the internal `verifier` network, shared by the
+  gradings), `public` (the `egress` network, alone in its window), or a name in `tasks.verifierNetworks` of the
   local configuration. `host` and anything else is refused, when the task is read and again when the container starts.
 * **Three attempts, two of three pass; a split is `flaky`.** An attempt that ends in an infrastructure error (exit 125,
   126, 127, 98, or a timeout of the container) is tried again, at most twice; if it is still one the grade is **`invalid`**:
@@ -345,10 +347,10 @@ patch that touches the grading's own machinery as **suspect**, for a person to r
 * **Suspect list.** The report has a section with every suspect run: the reasons, what was stripped and the path of the
   patch, for a person to read. A suspect run is graded as it is and counted as it is.
 
-The runtime is the `Containers` interface of `lib/containers.mjs`: `PodmanRemote` runs
-`podman --remote [--connection C | --url U] run --rm --pull=never --entrypoint sh ...` (the arguments are the pure
-function `buildRunArgs`) and `FakeContainers` is for tests. A mount source is a path as the Podman service sees it:
-the service and the harness must share the harness's work directory.
+The runtime is the `Containers` interface of `lib/containers.mjs`: `HostContainers` runs
+`docker run --rm --pull=never ...` on the host (the arguments are the pure function `buildRunArgs`), and `FakeContainers`
+is for tests. A mount source is a path on the host: the work directory of a slot is `$BENCH_HOME/work/<slot>`, mounted
+at `/work`.
 
 ## What the host trusts
 
@@ -366,60 +368,68 @@ environment. So one principle holds everywhere:
 
 | What | How |
 |---|---|
-| a work tree, a base | `tar -cf -` inside the Podman service, parsed and extracted by `Stack.extractTree` into a directory the harness made |
+| a work tree, a base | `tar -cf -` from a helper container that mounts the work directory read-only, parsed and extracted by `Stack.extractTree` into a directory the harness made |
 | OpenCode's stream, stderr and export | `Stack.readFiles`: the three names only, a size cap, and a link, FIFO or device in their place is refused, logged and kept out |
-| the exit status of OpenCode | the container runtime's (`podman run`'s status and its time-out), never a file the agent could write |
-| the reward of a grading | read without following a link or blocking (`O_NOFOLLOW`, `O_NONBLOCK`), only if it is a regular file of at most 16 bytes; on the grader it comes out as a tar stream of that one name |
-| the base of a task | made in the slot's volume by the task image once per (task, image, workdir), kept by `Stack.resetWork` and validated by a marker recording the bare repository's HEAD and the tree's digest (a changed ref or a host tree that does not match is remade from the image); the host builds its own repository from a tar of the tree once and reuses it (under `$BENCH_HOME`); adam's copy is pushed to the git server by a one-shot container with no secret |
+| the exit status of OpenCode | the container runtime's (`docker run`'s status and its time-out), never a file the agent could write |
+| the reward of a grading | read without following a link or blocking (`O_NOFOLLOW`, `O_NONBLOCK`), only if it is a regular file of at most 16 bytes |
+| the base of a task | made in the slot's work directory by the task image for each run, because `/work/bench-base` is shared by every task; the host builds its own repository from a tar of the tree once per (task, image, workdir) and reuses it (under `$BENCH_HOME`); adam's copy is pushed to the git server by a one-shot container with no secret |
 | the pushed branches | `git ls-remote` of an `http://` address on the loopback, run in a new empty directory that is not a repository, with discovery stopped and only plain http allowed |
 | the environment of a host git | an allow-list (`PATH`, locale, temp directory); the model's key, a proxy and any credential are not in it. The clone and the fetch of the upstream tasks run in it too (`lib/upstream.mjs`), so an upstream cannot see the key |
 | a token | never on a command line: the coder's settings are in a 0600 file removed once the coder exists, OpenCode's configuration goes in on stdin |
 
 ## The stack
 
-`bench/compose.yaml` reuses the dev stack's pieces without changing `dev/`; `lib/stack.mjs` drives it with `docker compose`.
-Every container of the stack that is ours runs **the coder image of `bench/pins.json`** (the relays, the git sandbox, the
-pusher): no other image is added to the dev stack's postgres, WireMock, git server and Podman service.
+`bench/compose.yaml` reuses the dev stack's pieces without changing `dev/`; `lib/stack.mjs` drives it with `docker compose`
+and starts the arms and the grading as **host containers** of the task image on the host's Docker. Each image is in the
+host's store once. Every container of the stack that is ours runs **the coder image of `bench/pins.json`** (the relays,
+the git sandbox, the pusher): no other image is added to the dev stack's postgres, WireMock and git server.
 
 | Service | What |
 |---|---|
 | `postgres`, `mock-github`, `git-server` | the coders' databases (one for each slot, `postgres-init.sql`), the WireMock mock that makes `open_pull_request` succeed, the dev git server (owner `bench` is made on first push) |
-| `podman-1`, `podman-2` | the Podman service of a slot (4 CPU, 12 GB): what an agent's commands run on. Mounts the slot's work volume and one directory the harness writes, **read-only**; never `$BENCH_HOME`, so no hidden test, gold patch or ledger is visible to it |
-| `grader` | a Podman service of its own, on a network with nothing else, where grading and the environment check run; it mounts nothing of the host (a tmpfs `/grade` holds one directory per grading, filled and emptied through tar streams) |
-| `coder-1`, `coder-2` | the pinned coder, recreated for each run, on its slot's network only |
-| `gitbox-1`, `gitbox-2` | `adam-git-sandbox` of the same image: no network, no secret, a read-only root, an in-memory `/tmp`, the work volume; the coder's git runs there (`GIT_SANDBOX_SOCKET`), so what a repository's configuration names cannot read a secret or reach the network |
+| `gitbox-1`, `gitbox-2` | `adam-git-sandbox` of the same image: no network, no secret, a read-only root, an in-memory `/tmp`, the slot's work directory; the coder's git runs there (`GIT_SANDBOX_SOCKET`), so what a repository's configuration names cannot read a secret or reach the network |
 | `meter-1`, `meter-2` | TCP relays with one fixed target, the harness's meter on the host |
 | `pub-coder-1`, `pub-coder-2`, `pub-git` | TCP relays that publish a coder's A2A port and the git server on the loopback |
 | `pusher-1`, `pusher-2` | one-shot containers that put a run's base on the git server |
+
+The coder, the OpenCode arm and the grading are **host containers** the harness starts with `docker run`: the coder from
+the task image, with `--env-file` (mode 0600), `--user 10001:10001`, the runtime's limits, its binaries and agent folder
+mounted read-only, and `RUN_ENVIRONMENT=local`; the OpenCode arm and the grading from the task image, with the work
+directory at `/work`. The coder and the OpenCode arm join the slot's internal network; `pub-coder-N` publishes the
+coder's A2A port on the loopback.
 
 **Networks** (all internal but `egress`; a test over the rendered file holds each member list):
 
 | Network | Members |
 |---|---|
-| `agentnet-N` | `podman-N`, `meter-N`. A container the Podman service runs shares the service's network namespace, so what an agent's commands reach is the meter relay and nothing else |
-| `slot-N` | `coder-N`, `meter-N`, `pub-coder-N`, `git-server`, `postgres`, `mock-github` |
+| `slot-N` | `git-server`, `meter-N`, `mock-github`, `postgres`, `pub-coder-N`; the coder of the slot joins it at run time (`adam-bench_slot-N`) |
 | `gitpub-net` | `git-server`, `pub-git`, `pusher-1`, `pusher-2` |
-| `grader-net` | `grader` |
+| `verifier` | no service: the network a grading's host container joins (`adam-bench_verifier`), so gradings share one internal network and have no route out. The harness makes it, because Compose makes no network that has no service, and refuses one that exists without the internal flag |
 | `egress` | the five relays and nothing else |
 
-So no coder, sandbox, git server, database or Podman service has a route to the internet, and slot 1 and slot 2 share
-no network (the git server, postgres and the mock answer on both; they do not connect the slots). A Podman service
-joins `egress` only while the harness pulls an image, and the grader only while a verifier needs the network.
+So no coder, sandbox, git server or database has a route to the internet, and slot 1 and slot 2 share no network (the
+git server, postgres and the mock answer on both; they do not connect the slots). A grading whose verifier asks for
+`public` joins `egress` for its window, alone; every other grading joins `verifier`.
 
 * **Every run has a repository of its own** on the git server (`bench/<slug>-<run hash>.git`), made by the pusher and deleted at
   cleanup. A second run of a task, the other arm and a retry never see an `agent/*` branch of another run.
 * **The meter is the harness's own** (it holds the ledger's lock and the key). The relay forwards its bytes and reads none, and
   closes a connection that is idle for ten minutes. The meter listens on `BENCH_METER_PORT` (18090) and `BENCH_METER_BIND`,
-  which is **`127.0.0.1` by default**. `dry-run.sh` sets it to the address of Docker's default bridge, which the relay reaches
-  through the host gateway. Under rootless Docker the host gateway is another address: set `BENCH_METER_BIND` yourself
-  (*unverified* which). The meter serves only paths with a run token of 192 bits.
-* **Before every run** the slot's service is reaped (every container removed, the list read and required empty) and its volume
-  emptied (everything under `/work` but the sandbox's directory, checked). After a run, the agent is stopped and that is
-  confirmed (the coder removed, its devcontainers reaped) **before** its tree is read.
+  which is **`0.0.0.0`** for the bench: only a path with a run token of 192 bits reaches the model. The relays reach it at
+  `BENCH_METER_HOST`, the source address of the host's default route (`ip route get 1.1.1.1`), because under rootless Docker
+  the bridge gateway a container sees is not the host's address.
+* **Before every run** the slot's containers are reaped (every container with the slot's labels removed, the list read and
+  required empty) and its work directory emptied (everything under `/work` but the sandbox's directory, checked). After a
+  run, the agent is stopped and that is confirmed (the coder removed, the containers it started reaped) **before** its
+  tree is read.
+* **Both arms run as uid 10001** and get the same CPU and memory from one setting (`lib/runtime.mjs`: 4 CPU, 12 GB). The
+  coder container and OpenCode's container get them; a task's own `[environment] cpus` and `memory_mb` are for its
+  environment check and its grading, never for an arm. `configFingerprint` records the runtime, so a change in it is a
+  change of configuration.
 * **`ALLOW_LOCAL_REPOS` stays on**, because the bench serves plain `http://`; `ALLOWED_REPO_HOSTS` is the git server only. The
   coder's policy still accepts a local path or a `file://` URL when it is on (`Policy::check` in `crates/adam-workspace`);
-  the coder's container holds nothing but the work volume, so that reaches nothing of the host's.
-* The compose file has two slots. A third needs its own services (listed in the file's header), a database and volumes.
+  the coder's container holds nothing but the work directory, so that reaches nothing of the host's.
+* The compose file has two slots. A third needs its own services (listed in the file's header) and a database.
 
 ## The agents
 
@@ -434,10 +444,10 @@ them equal.
 |  | adam-coder | OpenCode |
 |---|---|---|
 | Driver | `lib/agents/adam.mjs` | `lib/agents/opencode.mjs` |
-| Runs in | the coder container; its commands in a devcontainer of the task image on the Podman service | a container of the task image on the Podman service |
+| Runs in | a coder container of the task image on the host's Docker (`RUN_ENVIRONMENT=local`), its binaries and agent folder mounted read-only | a container of the task image on the host's Docker |
 | Working copy | its worktree `/work/workspaces/<run>/<slot>` of the base on the git server (a repository of this run's own) | a clone of the same base at `/work/workspaces/oc-<run>-a<n>/<slot>` |
 | Statement | one line (`In <repository> (base branch main), do this task:`) and the statement | the statement, byte for byte, on stdin |
-| Network | the stack's, through the meter | the Podman service's: the meter and nothing else |
+| Network | the slot's: the meter, the git server, postgres and the mock (the coder's own network) | the slot's: the same network as the coder's, the meter and the stack's shared services |
 | Ends | polling `GetTask` every 10 s | the container's status, or the time limit |
 | Usage it reports | `usage/v1` totals of the task | `step_finish` events and `opencode session export` |
 
@@ -451,12 +461,12 @@ Both agents clone that bare repository; patch collection leaves the links out (`
 |---|---|
 | `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS` | `git-server`, `true` (a development setting; the chart never sets it) |
 | `GITHUB_API_URL`, `GITHUB_TOKEN` | the WireMock mock, a dummy |
-| `ADAM_AGENT_DIR` | `bin/adam-coder/agent` at the image's revision (`git archive`), **without `mcp.json`**: no GitHub MCP server, as OpenCode has none |
+| `ADAM_AGENT_DIR` | `/etc/adam/agent`, mounted read-only from the image's revision (`git archive`), **without `mcp.json`**: no GitHub MCP server, as OpenCode has none |
 | `WORKSPACE_SWEEP_SECS` | `0`: the worktree stays until it is copied |
-| `DEVCONTAINER_RUNTIME`, `DEVCONTAINER_DEFAULT_IMAGE`, `DEVCONTAINER_PREPULL`, `DEVCONTAINER_NETWORK` | `podman`, the task image by digest only, `false`, `inherit` |
+| `RUN_ENVIRONMENT`, `DEVCONTAINER_RUNTIME` | `local`, `off`: a run's commands run in the coder's own container, which is the task image |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `MODEL_CONTEXT_WINDOW` | the meter's address with the run's token, a dummy, `bench-model`, the configured window |
 | `A2A_BEARER_TOKENS` | a random value for each run |
-| `GIT_SANDBOX_SOCKET`, `DEVCONTAINER_DEPLOYMENT_ID` | the git sandbox's socket on the work volume; `bench-slot-N` |
+| `GIT_SANDBOX_SOCKET`, `DEVCONTAINER_DEPLOYMENT_ID` | the git sandbox's socket on the work directory; `bench-slot-N` |
 | the turn limit | the agent folder's `max_turns` is set to `limits.steps`, the value OpenCode's `steps` gets |
 
 The bearer is in a private field of the client: in no log line, error, result or saved file (the saved task is redacted of it and of the run's token), and every request has a timeout of 15 s. **Polling decides**: the stream
@@ -465,8 +475,8 @@ fixed reply, `Nobody can answer questions in this run; decide yourself and finis
 parks (a new status timestamp), at the time limit (50 minutes) and when the meter refuses a call, the harness sends
 `CancelTask`, waits the configured cancel grace and then stops the coder; the run is collected only after that stop is confirmed. One nudge ever: it is sent once, when the state first parks, and never again because an answer was slow. Exits: `done`, `failed`, `canceled`, `rejected`, `timeout`, `budget_hit`, `stopped_by_cap`, `input_required`,
 `infra` (six polls in a row failed, or the task wants a sign-in (`auth-required`): the run is `Interrupted`, then `Failed_infra`, and is tried again at the next start).
-The final tree is the one run directory of the emptied volume, read as a tar stream into a directory the harness owns and turned
-into a patch, after the coder is removed and its devcontainers are reaped and both are confirmed; the pushed `agent/<run>` branch is the cross-check (`crossCheckBranch`).
+The final tree is the one run directory of the emptied work directory, read as a tar stream into a directory the harness owns and turned
+into a patch, after the coder is removed and the containers it started are reaped and both are confirmed; the pushed `agent/<run>` branch is the cross-check (`crossCheckBranch`).
 
 **OpenCode V2** (`lib/agents/opencode.mjs`, `lib/npm.mjs`). The binary is fetched from npm, checked against the pinned
 integrity **before anything is written**, extracted and mounted read-only at `/opt/bench/opencode`.
@@ -529,9 +539,10 @@ The refusal of a call is retried by OpenCode, so the harness watches the meter a
 of a run, at the time limit or on a refusal, is the same for both agents: a polite stop (OpenCode: SIGTERM; adam: `CancelTask`), the
 configured cancel grace, then a forced stop. OpenCode's stderr is capped at 1 MiB inside the container.
 
-**Fairness.** Both agents get the same step limit, the same context window, the same cancel grace and the task's CPU and memory
-for the container they run in (`limits`, `contextWindow` in the configuration; adam's devcontainer is made by the coder, which
-takes no such limit, so its CPU and memory are the service's: not equal). If the Podman service refuses `--cpus` and `--memory` (it has no cgroups), OpenCode's container gets none, the run record says `limits: service`, and the report lists those runs. The clock of a run starts when the agent is started
+**Fairness.** Both agents get the same step limit, the same context window, the same cancel grace, **the same uid**
+(10001) and **the same CPU and memory** from one setting (`lib/runtime.mjs`, recorded in the configuration fingerprint
+and in the run record as `limits: runtime`); a task's own `cpus` and `memory_mb` are for its environment check and its
+grading, never for an arm. The clock of a run starts when the agent is started
 (adam: the first message; OpenCode: the container), and adam's `wallMs` is the time to the decision, not the cancel grace.
 OpenCode needs no network to load its provider (*verified 2026-11-17*: it ran with the proxy dead and a new home).
 
@@ -673,14 +684,14 @@ ledger.
 ## The runner
 
 `lib/runner.mjs` takes one planned run through the states of the diagram above, one ledger record for each, with one slot
-at a time. The slot's service is reaped and its volume emptied first; the agent is stopped, and that is confirmed, before its
+at a time. The slot's containers are reaped and its work directory emptied first; the agent is stopped, and that is confirmed, before its
 tree is read; **the meter's record decides whether the run is the agent's or the infrastructure's** (`lib/classify.mjs`): a run in
-which the agent made no model call, in which more than two calls (or the last one) failed upstream, in which no container of the
-task's image ran (adam), in which the coder reported an external cause, or that could not be stopped, is `Failed_infra` (tried
-again, then left out of the rates), never a fail. Grading runs on the `grader` service. `runPlan` first reads the ledger (`resumeActions`), so a start after a kill runs what is left: a `Done` run is not
+which the agent made no model call, in which more than two calls (or the last one) failed upstream, in which the coder did not run the
+task's image (adam), in which the coder reported an external cause, or that could not be stopped, is `Failed_infra` (tried
+again, then left out of the rates), never a fail. Grading runs as a host container of the task image, on the `verifier` network. `runPlan` first reads the ledger (`resumeActions`), so a start after a kill runs what is left: a `Done` run is not
 repeated, an interrupted one starts again from scratch (its first attempt's spend stays as waste), a `Grading` one is graded
 again from its saved patch. The patch is written to `runs/<run>-a<n>/model.patch` under the results directory before grading. A
-verifier that needs the network gets it for the window of its grading. `runPlan` is one run at a time; the blocks and the slots are `lib/schedule.mjs` ("Pilot and run").
+verifier that needs the internet gets the `egress` network for the window of its grading. `runPlan` is one run at a time; the blocks and the slots are `lib/schedule.mjs` ("Pilot and run").
 
 ## Pilot and run
 
@@ -688,7 +699,7 @@ The owner's runbook. Each step reads what the one before wrote; nothing past `co
 
 | Step | Command | What it does |
 |---|---|---|
-| 1 | `bench doctor --start` | the machine, the stack, nested Podman |
+| 1 | `bench doctor --start` | the machine, the stack, the host runtime, and the coder in each selected task image |
 | 2 | `bench tasks fetch`, `mine`, `build`, `check`, `select` | the tasks and the two lock files ("Tasks") |
 | 3 | `bench pilot [--blocks 5]` | the first blocks of the plan (five blocks of two agents and two arms are 20 runs), each run reserving `perRunBudgetUSD`; prints the projection; writes `$BENCH_HOME/pilot-budget.json` (not confirmed). Refuses a `--blocks` that cannot give 3 finished runs in each arm, and a cap that cannot hold one block |
 | 4 | read the projection, then `bench confirm [--over-cap] [--censored]` | the owner's yes; `--over-cap` accepts a projection above the cap, `--censored` a budget guessed from pilot runs that hit their budget |
@@ -776,12 +787,11 @@ deletes the file first, so an old yes never covers a new pilot.
   reservation is freed before anything starts; what it spent stays as waste) and then `Planned`, a `Grading` run is graded again,
   a `Done` run is skipped. The scheduler goes over the plan again (at most three passes) so a run that failed in the
   infrastructure is tried again, as often as the ledger allows.
-* **Task images and the grader (`lib/images.mjs`, `lib/stack.mjs`).** A pull of an image is one in-flight promise for each image
-  and service, so two slots never pull the same one twice. The grader's window with the internet is **alone** on the grader: gradings
-  take the shared side of one lock and a window the exclusive side, so no grading of an agent's patch ever has a route out and
-  two windows never overlap. An own task's image is built where `bench tasks build` ran; the harness saves it into an archive on its
-  own side and loads it into each slot's service and into the grader **before anything is spent**, and a regrade makes the grader's
-  image present first.
+* **Task images and the grading (`lib/images.mjs`, `lib/stack.mjs`).** A pull of an image is one in-flight promise for each image,
+  so two slots never pull the same one twice. A grading that needs the internet is **alone** in its window: gradings take the
+  shared side of one lock and a window the exclusive side, so no grading of an agent's patch ever has a route out and
+  two windows never overlap. An own task's image is built where `bench tasks build` ran, in the host's store; a start
+  checks that every own image is there **before anything is spent**, and a regrade makes the task's image present first.
 * **The end.** `report.md` has, for each agent and arm, the resolve rate with its Wilson interval and how many runs of the cell are
   left out, the paired differences, cost per run, per **resolved** task, and per resolved task with every run of the cell (waste
   included), the spend on unsolved runs, tokens (input, cached, cache write, output), the cache-hit rate (cached over input, all
@@ -790,19 +800,30 @@ deletes the file first, so an old yes never covers a new pilot.
 
 ## `bench doctor`
 
-`node bench/bin/bench.mjs doctor [--start]` checks Node, a proxy set without `NODE_USE_ENV_PROXY=1`, Docker and its compose plugin, whether the daemon is rootless,
-`kernel.apparmor_restrict_unprivileged_userns` (a rootless Podman cannot make a user namespace when it is 1; the fix is
-printed), the user namespace limits, free disk (a failure under 30 GB, a warning under 100 GB, in `$BENCH_HOME` and in
-Docker's root) and the coder image by digest. With `--start` it brings the stack up and runs a container inside each Podman
-service, and in the grader, and asks each Podman service whether it takes the task limits (a refusal is a warning: the limits are then the service's own, the same for both agents). Compose 2.24 or newer and an x64 machine are required. Nested Podman has been proven under rootful Docker only (`dev/podman/README.md`). When it does not work the exit is
-1 and the output says which fallback to use: **1. a rootless Podman on the host** (its socket mounted into the coder and the
-harness), **2. the coder's run pods on a k3d cluster**. Neither fallback is built here.
+`node bench/bin/bench.mjs doctor [--start]` checks Node, a proxy set without `NODE_USE_ENV_PROXY=1`, Docker and its compose
+plugin, whether the daemon is rootless, free disk (a failure under 20 GB, a warning under 100 GB, in `$BENCH_HOME` and in
+Docker's root) and the coder image by digest. **For each selected task image** it runs the coder's binary with no
+configuration as uid 10001 in that image: exit 78 means the coder starts (it refuses an empty configuration), a loader
+error or another architecture means the image cannot run it. **The probe runs the binaries of the pinned coder image**, and
+`bench/pins.json` still names the build before ADR 0053 decision 11's static one: in a Debian bookworm task image those
+fail on glibc (`GLIBC_2.38` and `GLIBC_2.39` not found) and the image is **refused for both arms**, until slice 6b moves
+the pin. The static build (musl) starts in bookworm (probed by hand: exit 78), so once the pin moves the image's C library
+stops being the question; an image that cannot run the binary at all is refused for both arms. The probe is the coder's
+alone: the OpenCode binary is linked to glibc, so an image that starts a static coder but cannot run OpenCode (Alpine) is
+not refused by it. The output names the distribution and the error. With
+`--start` it brings the stack up and runs a container of the coder image on the host, for each slot and for the grading,
+and asks the runtime whether it takes the arms' limits (a refusal is a warning: both arms still get the same setting).
+Compose 2.24 or newer and an x64 machine are required. The exit is 1 when a check fails, which includes a task image the
+coder cannot start in.
 
 ## The dry run
 
 `sh bench/dry-run.sh` (Docker-gated: `BENCH_TEST_DOCKER=1`; a failure under `BENCH_TEST_REQUIRE_DOCKER=1`) runs both agents
 through three tasks of `bench/tasks/self/` on the stack, with a scripted model (`lib/agent-script.mjs`, served by
-`lib/scripted-model.mjs`) that tells the callers apart by the tools they are offered and the task by a `[mock:<name>]` marker:
+`lib/scripted-model.mjs`) that tells the callers apart by the tools they are offered and the task by a `[mock:<name>]` marker.
+The harness runs in a session of its own and the script's cleanup stops that whole process group, so a stopped dry run
+leaves no `resume-child` behind: a child that outlived it rebuilt the self images under the next run, which then failed
+with `No such image` (the test is `bench/test/dryrun-sh.test.mjs`).
 
 | Task | Statement | The scripted model writes | Grade |
 |---|---|---|---|
@@ -813,7 +834,7 @@ through three tasks of `bench/tasks/self/` on the stack, with a scripted model (
 The images are built from the pinned coder image (`ARG BASE_IMAGE`), which has Node, git and `sh`. adam makes six model
 calls for a task and OpenCode three. The phases, decided by `lib/dryrun-checks.mjs` from the ledger:
 
-1. **grades and cost.** The environment check passes for each task, on the grader. The grades are 1, 1, 0 for both agents. A run's cost is
+1. **grades and cost.** The environment check passes for each task, as a host container. The grades are 1, 1, 0 for both agents. A run's cost is
    its scripted calls times one call's price, and the model saw exactly the calls the ledger settled.
 2. **budget.** With a price that makes a call's worst case about $32.8 and a reservation of $34, a run fits two calls, the
    third is refused (429), and the run ends `budget_hit`, graded.
@@ -824,14 +845,14 @@ calls for a task and OpenCode three. The phases, decided by `lib/dryrun-checks.m
 The configuration of the dry run sets `limits.minutes` to 10: the same key a real run reads.
 
 `.github/workflows/bench-dry-run.yml` runs it on `workflow_dispatch` only. The tests of the checks, the runner (on fake
-agents, a real meter and ledger, and a crash that stands for the kill), the drivers (on a fake container service and a fake
+agents, a real meter and ledger, and a crash that stands for the kill), the drivers (on a fake container runtime and a fake
 A2A server), the stack (on a fake `docker`) and the self-test tasks (their gold and empty changes, on this machine) are in
-`bench/test` and need no container service. **The dry run itself has not been run: no container service was available where it was written.**
+`bench/test` and need no container runtime. **The dry run passed on this machine on 2026-11-19** (Docker 29.9.3 rootless, the pinned coder image, `BENCH_HOME` and `TMPDIR` outside the repository): the three environment checks, the six runs of phase 1 with grades 1, 1, 0 and their costs, the budget phase and the kill/resume phase.
 
 ## Tests
 
 ```sh
-node --test "bench/test/*.test.mjs"     # about 520 tests, seconds, nothing beyond 127.0.0.1 (fixture git repositories are made in a temp directory)
+node --test "bench/test/*.test.mjs"     # about 650 tests, seconds, nothing beyond 127.0.0.1 (fixture git repositories are made in a temp directory)
 ```
 
 A test of the real OpenCode needs the pinned binary: `BENCH_TEST_OPENCODE_BIN=/path/to/opencode node --test bench/test/opencode.test.mjs`
@@ -839,15 +860,22 @@ runs the command and the configuration of the driver against the scripted model,
 
 Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_TEST_REQUIRE_DOCKER=1`: the dry run
 (`bench/dry-run.sh`) and `bench/test/docker.test.mjs` (a self-made task: the oracle grades 1, the empty patch 0; it needs
-`BENCH_TEST_WORKSPACE_IMAGE`, a digest-named base image, and a Podman service that shares the temporary directory). CI is `.github/workflows/bench.yml`, on changes under `bench/`.
+`BENCH_TEST_WORKSPACE_IMAGE`, a digest-named base image). CI is `.github/workflows/bench.yml`, on changes under `bench/`.
 
 ## Unverified
 
-* **Moving an own image into a slot's service** (`podman save`, `docker compose cp`, `podman load`), the `image exists` probe, and the grader's lock under two real slots: tested on fakes and on a fake `docker`, never against a Podman service.
+* **What the dry run did not cover:** a model key and a real endpoint (the scripted model is the only server the tests
+  have seen), a bookworm task image in a run (the probe's rule is tested on fakes and the static coder was probed in
+  Debian 12 bookworm by hand — exit 78; the pinned, pre-static coder was probed there too and fails on
+  `GLIBC_2.38`/`GLIBC_2.39` not found, which is what `bench doctor` reports until the pin moves; the dry run's images are
+  built from the workspace base), two slots at once with real task
+  images, and `bench doctor --start` (the probe and the stack's `up` ran, not that command). The probe, the stack, the
+  coder in the trixie self image, both arms with the pinned OpenCode binary, the grading, the budget and the kill/resume
+  did run.
 * **Pilot and run against a real stack.** `pilot`, `run` and `regrade` are tested on the fake container interface, the scripted
   model, a real meter and a real ledger (`bench/test/schedule.test.mjs`, `runcli.test.mjs`); `lib/run-cli.mjs` `realHarness` (the
-  stack, the meter, the pulls of task images, the two drivers together) has never run, and nothing has run two slots at once on a
-  real Podman service.
+  stack, the meter, the pulls of task images, the two drivers together) has run in the dry run, and nothing has run two slots at
+  once on a real host runtime with real task images.
 * Behaviour against a real endpoint: whether it honours `stream_options.include_usage`, reports cached and
   reasoning tokens as the OpenAI reference describes, or accepts `max_tokens` (the meter sets it when the agent sends
   no limit). The scripted model is the only server the tests have seen.
@@ -859,33 +887,23 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
   and `SHA256SUMS` are (the harness finds any directory with a `task.toml` up to two levels deep and reads
   `<upstreamDir>/SHA256SUMS`), the exact form of `SHA256SUMS`, and the form of `solution/` (the check needs a `*.patch`
   there and drops a task without one as `no-gold-patch`).
-* Everything that needs a container service: `podman --remote` and its options as the Podman version in use takes them,
-  that a bind mount of a harness path works on the service, that `image inspect --format {{.Digest}}` gives the registry
-  digest of a pulled image and the manifest digest of a locally built one (and that a locally built image can then be
-  run as `name@sha256:...`), the clone-path check's `ln -s` of ignored entries (top level only) and its `sed` of
-  `/app` in `test.sh`, image sizes and pull speed.
 * That the miner's file classification (by path) matches your repositories' layouts.
 * **Verified 2026-11-17 for OpenCode 2.3.0:** the table "OpenCode V2" above. Of the plan's facts only those about 1.19.6 were
   verified before; those about 1.19.x are not carried over. **Unverified at 2.3.0:** the effect of `steps`, `small_model`,
   `autoupdate` and `share`; whether a subagent's background run ends a `run` that the time limit does not (it was not run);
   how an endpoint that answers `429` to every call ends a run (the harness stops it, so it does not matter here).
-* **Unverified, everything below needs a container service and none was available where the slice was written:**
-  the compose stack (it renders with `docker compose config`); nested Podman under rootless Docker (`doctor --start`
-  says); `docker compose exec` as the way to the Podman client; the relay's route to the harness through the host
-  gateway (`BENCH_METER_BIND`); a 0600 env file read by `env_file` with `required: false`; an absolute seccomp path in
-  `security_opt`; the coder with no `mcp.json` and the dev settings (the plan's reading of `serve.rs`); the worktree's
-  name under `/work/workspaces/<run>/<slot>` (the driver takes the one run directory of the emptied volume); the A2A
-  methods `GetTask` and `CancelTask` and the `usage/v1` totals as the coder answers them (read from the repository's
-  own scripts and docs); whether the coder makes model calls the script does not know (a title, say: the scripted model then
-  answers in words); OpenCode V2 in a container of a task image (a native binary linked to glibc on the image's libc, `--standalone` with `HOME` on the shared directory, its `HOME` on the
-  shared directory, the links into `/app` read through a `external_directory` deny); that a locally built self-test image can
-  be run by digest; ownership of files the containers write into the shared directories; `dry-run.sh` and the workflow.
-* `shellcheck` was not available where the slice was written: `dry-run.sh` was read for its findings and checked with `sh -n`.
-* **Finding by finding of the review of slice 3, what cannot be proven without containers:** that a tar made by `tar --format=posix`
-  inside the Podman image is what the parser reads (it is read here from the `tar` of this machine); that the sandbox's socket under
-  `/work/.gitbox` is made by `adam-git-sandbox` with a directory the harness makes (`mkdir -p` in its entrypoint); that the
-  coder reaches the relays by their names and publishes through `pub-coder-N`; that a pusher with `work-N:/work:ro` can `git fetch`
-  from a repository the service's user owns; that `podman ps -a --format json` has `Image` by digest for a container made from
-  `name@sha256:...`, which the `no-task-container` check reads; that the devcontainers carry the label of the coder's deployment
-  (the reap does not rely on it: it removes every container of the slot's service); whether `--cpus` and `--memory` are accepted by a
-  service whose containers have no cgroups (`cgroups="disabled"`: the probe of `doctor --start` and of each slot asks; a refusal means no limits and a note in the run record); that `podman kill --signal TERM` reaches OpenCode through the script's trap; that the stderr FIFO drain works in the task image's shell; that `/grade` as a tmpfs of the grader is usable by its nested mounts; the wording the coder uses for a failure with an external cause (`externalFailure` is a pattern, shown in the report).
+* **Unverified, even after the dry run:** the coder with no `mcp.json` and the dev settings (the plan's reading of
+  `serve.rs`); the worktree's name under `/work/workspaces/<run>/<slot>`; the A2A methods `GetTask` and `CancelTask` and
+  the `usage/v1` totals as the coder answers them (read from the repository's own scripts and docs); whether the coder
+  makes model calls the script does not know (a title, say: the scripted model then answers in words); the gated test
+  with a local OpenCode binary (`BENCH_TEST_OPENCODE_BIN`); ownership of files the containers write into the shared
+  directories; the workflow.
+* `shellcheck -s sh` is clean on `dry-run.sh` (*verified 2026-11-19*, `koalaman/shellcheck:stable`); it was not available
+  where the slice was written, and the script had been read and checked with `sh -n` only.
+* **Finding by finding of the review of slice 3, what the dry run did not prove:** that a tar made by `tar --format=posix`
+  inside the coder image is what the parser reads; that the sandbox's socket under `/work/.gitbox` is made by
+  `adam-git-sandbox` with a directory the harness makes (`mkdir -p` in its entrypoint); that a pusher with the work
+  directory read-only can `git fetch` from a repository uid 10001 owns; that `docker ps -a --format json` has `Image` by
+  digest for a container made from `name@sha256:...`, which the `no-task-container` check reads; that `docker kill
+  --signal TERM` reaches OpenCode through the script's trap; that the stderr FIFO drain works in the task image's shell;
+  the wording the coder uses for a failure with an external cause (`externalFailure` is a pattern, shown in the report).

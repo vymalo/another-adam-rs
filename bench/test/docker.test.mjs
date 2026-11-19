@@ -1,12 +1,11 @@
-// Needs a container service: skipped unless BENCH_TEST_DOCKER=1, a failure under BENCH_TEST_REQUIRE_DOCKER=1.
-// BENCH_TEST_WORKSPACE_IMAGE names the base image by digest (name@sha256:...); BENCH_TEST_PODMAN_CONNECTION
-// and BENCH_TEST_PODMAN_URL name the Podman service (optional). The service must see this machine's temporary
-// directory at the same path (a shared mount).
+// Needs a container runtime: skipped unless BENCH_TEST_DOCKER=1, a failure under BENCH_TEST_REQUIRE_DOCKER=1.
+// BENCH_TEST_WORKSPACE_IMAGE names the base image by digest (name@sha256:...). The runtime is the host's Docker: a
+// mount source is a path on this machine.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { PodmanRemote } from '../lib/containers.mjs';
+import { HostContainers } from '../lib/containers.mjs';
 import { checkTask } from '../lib/envcheck.mjs';
 import { gradePatch } from '../lib/grade.mjs';
 import { materializeOwn, parseOwnSpec, prepareOwnContext } from '../lib/own.mjs';
@@ -21,7 +20,7 @@ test('docker: a self-made task, the oracle grades 1 and the empty patch 0', { sk
   assert.ok(enabled, 'BENCH_TEST_REQUIRE_DOCKER=1 needs BENCH_TEST_DOCKER=1');
   const workspaceImage = process.env.BENCH_TEST_WORKSPACE_IMAGE;
   assert.match(workspaceImage ?? '', /@sha256:[0-9a-f]{64}$/, 'BENCH_TEST_WORKSPACE_IMAGE must name the workspace image by digest');
-  const containers = new PodmanRemote({ connection: process.env.BENCH_TEST_PODMAN_CONNECTION, url: process.env.BENCH_TEST_PODMAN_URL });
+  const containers = new HostContainers();
 
   const clone = initRepo(t);
   commitFiles(clone, { 'src/app.txt': 'start\n' }, 'chore: start (#1)');

@@ -101,12 +101,16 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
   const shared = [];
   const gradePulls = [];
   const resets = [];
+  const resetOptions = [];
   const stack = {
     containers: () => slotContainers,
     graderContainers: () => grading,
     ports: { git: 1 },
     meterHost: (slot) => `meter-${slot}`,
-    resetWork: async (slot) => resets.push(slot),
+    resetWork: async (slot, options) => {
+      resets.push(slot);
+      resetOptions.push(options);
+    },
     pullWindow: async (slot, fn) => fn(),
     graderWindow: async (fn) => (windows.push('grader'), fn()),
     graderShared: async (fn) => (shared.push('grader'), fn()),
@@ -152,6 +156,7 @@ export async function fixture(t, { capUSD = 10, perRunBudgetUSD = 3, prices, cal
     shared,
     gradePulls,
     resets,
+    resetOptions,
     slotContainers,
     grading,
     grader,

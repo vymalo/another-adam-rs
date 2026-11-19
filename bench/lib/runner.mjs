@@ -13,10 +13,10 @@
 // graded again.
 import fs from 'node:fs';
 import path from 'node:path';
-import { BaseCache, BASE_NAME, baseKey } from './base.mjs';
+import { BaseCache, baseKey } from './base.mjs';
 import { CapBook } from './cap.mjs';
 import { callStats, classifyRun } from './classify.mjs';
-import { gradePatch } from './grade.mjs';
+import { gradePatch, hostGradeIO } from './grade.mjs';
 import { foldRecords, resumeActions, resumeRecords } from './ledger.mjs';
 
 /** Thrown by a test hook to stand for a killed harness: nothing is written and nothing is cleaned up. */
@@ -60,12 +60,12 @@ async function gradeSaved({ deps, task, patchPath }) {
   const hasPatch = fs.existsSync(patchPath) && fs.statSync(patchPath).size > 0;
   const work = path.join(deps.home, 'work');
   fs.mkdirSync(work, { recursive: true });
-  const io = deps.stack.graderIO?.();
-  const grade = () => gradePatch({ containers, task, patchFile: hasPatch ? patchPath : null, workRoot: work, ...(io ? { io } : {}) });
+  const io = hostGradeIO(work);
+  const grade = () => gradePatch({ containers, task, patchFile: hasPatch ? patchPath : null, workRoot: work, io });
   const net = task.verifierNetwork;
   await deps.pullGraderImage?.(task);
-  // The grader has no route out; a verifier that needs the network gets it for the window of its grading, alone on the grader.
-  if (net === 'public' || net === 'default') return deps.stack.graderWindow(grade);
+  // The verifier network is internal; a verifier that needs the internet gets the egress network for its window, alone.
+  if (net === 'public') return deps.stack.graderWindow(grade);
   return deps.stack.graderShared ? deps.stack.graderShared(grade) : grade();
 }
 
@@ -124,7 +124,7 @@ export async function executeRun({ deps, spec, attempt }) {
     if (opened.meter) meter.closeRun(run);
     else book.close(run);
     if (interrupted) stateRecord(deps, run, 'Interrupted', { reason });
-    stateRecord(deps, run, 'Failed_infra', { reason });
+    stateRecord(deps, run, 'Failed_infra', { reason, error: message });
     return { state: 'Failed_infra', reason, error: message };
   };
 
@@ -132,8 +132,12 @@ export async function executeRun({ deps, spec, attempt }) {
     stateRecord(deps, run, 'Preparing');
     // What an earlier run or a killed harness left in the slot's service is removed first, and checked.
     await containers.reapAll();
+    // A coder from a killed harness would still write the work directory the base is made in.
+    if (stack.stopCoder) await stack.stopCoder(spec.slot).catch(() => {});
     await deps.pullImage?.(spec.slot, task);
-    await stack.resetWork(spec.slot, { keep: [BASE_NAME] });
+    // The slot's /work/bench-base is shared by every task: a base kept from another task is the wrong repository.
+    // The host's copy is still cached per (task, image, workdir).
+    await stack.resetWork(spec.slot);
     const base = await (deps.prepareBase ?? ((o) => bases.prepare(o)))({
       containers,
       stack,
@@ -203,7 +207,7 @@ export async function executeRun({ deps, spec, attempt }) {
     if (e.name === 'HarnessCrash') throw e;
     await agent.cleanup(ctx).catch(() => {});
     stateRecord(deps, run, 'Interrupted', { reason: 'collect' });
-    stateRecord(deps, run, 'Failed_infra', { reason: 'collect' });
+    stateRecord(deps, run, 'Failed_infra', { reason: 'collect', error: e.message });
     return { state: 'Failed_infra', error: e.message };
   }
   const patchPath = path.join(paths.run, 'model.patch');
