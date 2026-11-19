@@ -86,8 +86,8 @@ test('the script is POSIX sh: no bash-only syntax', () => {
   assert.equal(spawnSync('sh', ['-n', SH]).status, 0);
 });
 
-test('a doctor that fails stops the script before the harness starts: the 20 GB floor is enforced before a pull', (t) => {
-  // `bench doctor` fails under MIN_FREE_GB (20) before anything is pulled; the script's `set -e` is what turns that
+test('a doctor that fails stops the script before the harness starts: the disk floor is enforced before a pull', (t) => {
+  // `bench doctor` fails under the disk requirement before anything is pulled; the script's `set -e` is what turns that
   // failure into "the harness never starts". A stub doctor exits 1 and a stub harness would leave a marker.
   const dir = tmp(t);
   const home = path.join(dir, 'home');
