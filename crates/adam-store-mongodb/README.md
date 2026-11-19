@@ -30,6 +30,9 @@ accept the poll latency.
   state, and returning it would convert the document back on every transition. `load_run`, the claim
   and the listings return the stored state; `journal_put` returns the stored payload (the loop
   decodes the step's outcome from it).
+* `run_header` is one `find_one` projected to the header and `lease_until`: the state is never read,
+  so a reader that only needs what the run is doing (a cancel watch, a status poll) pays for one
+  small document.
 * `codec::{json_to_bson, bson_to_json, encode_key, decode_key}`: the reversible key escaping
   (`$ref`, dotted, empty keys, NUL). Ordinary keys are stored verbatim, so
   `state.messages.0.role` is still a valid query path. The store replaces a NUL with U+FFFD before

@@ -2413,6 +2413,43 @@ mod cases {
         assert_eq!(rt.agent_names(), vec![name]);
     }
 
+    /// A header is one store call: the runtime asks the store for it and reads neither the lease
+    /// nor the record beside it (an adapter answers it from a projection; the trait's default is
+    /// two reads inside the store, not beside it). A view reads both, because its state is the
+    /// record.
+    pub async fn a_header_is_one_store_call(store: DynStore) {
+        let (faulty, store) = faulty(store);
+        let rt = Runtime::builder(store.clone()).build();
+        let name = uniq("header");
+        let run = store
+            .create_run(NewRun::new(&name, json!({"turn": 0})))
+            .await
+            .unwrap();
+        let before = (
+            faulty.calls(Method::RunHeader),
+            faulty.calls(Method::LoadRun),
+            faulty.calls(Method::LeaseUntil),
+        );
+        let header = rt.header(run.id).await.expect("header").expect("the run");
+        assert_eq!((header.id, header.version), (run.id, 1));
+        assert_eq!(
+            faulty.calls(Method::RunHeader),
+            before.0 + 1,
+            "one header read"
+        );
+        assert_eq!(
+            faulty.calls(Method::LoadRun),
+            before.1,
+            "the runtime reads no record beside it"
+        );
+        assert_eq!(
+            faulty.calls(Method::LeaseUntil),
+            before.2,
+            "nor a lease beside it"
+        );
+        assert!(rt.header(RunId::new()).await.expect("header").is_none());
+    }
+
     /// A start-only runtime (`RuntimeBuilder::starter`) creates runs but never
     /// steps them; a runtime with the full agent over the same store does.
     pub async fn a_starter_only_runtime_starts_and_a_full_runtime_steps(store: DynStore) {
@@ -7332,6 +7369,7 @@ macro_rules! runtime_suite {
                 conversation_delivers_to_the_open_run,
                 start_with_id_is_idempotent,
                 api_errors,
+                a_header_is_one_store_call,
                 a_starter_only_runtime_starts_and_a_full_runtime_steps,
                 a_claimed_run_says_so_before_its_first_commit,
                 a_lease_that_ran_out_is_not_a_claim,

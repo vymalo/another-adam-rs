@@ -22,6 +22,9 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, the claim and the listings return the stored state; `journal_put`
   returns the stored payload (the loop decodes the step's outcome from it).
+* `run_header` is one statement over the primary key that selects the header columns and
+  `lease_until`, never `state`: a reader that only needs what the run is doing (a cancel watch, a
+  status poll) does not pay for the largest column.
 * The `Store` implementation: call `migrate()` once at boot (idempotent, safe
   from every replica). On a schema that is already current it runs no DDL and takes no table
   lock, so a start cannot deadlock with live traffic (see "Schema version 3").

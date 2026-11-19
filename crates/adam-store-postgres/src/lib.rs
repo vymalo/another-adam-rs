@@ -39,8 +39,8 @@ use std::time::Duration;
 use adam_core::store::{add_ttl, now, sched_at, storable, truncate_ms};
 use adam_core::{
     ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
-    PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
-    StoreResult,
+    PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store,
+    StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -92,6 +92,9 @@ const RUN_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, state,
 /// transition.
 const RUN_METADATA_COLUMNS: &str =
     "id, agent, conversation_id, parent_id, status, wake_at, version, created_at, updated_at";
+
+/// What [`Store::run_header`] reads: the record's metadata and the lease, never `state`.
+const RUN_HEADER_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, wake_at, version, created_at, updated_at, lease_until";
 
 /// A [`Store`] backed by PostgreSQL (12+).
 #[derive(Clone, Debug)]
@@ -379,6 +382,7 @@ struct Sql {
     schema_version: Arc<str>,
     insert_run: Arc<str>,
     load_run: Arc<str>,
+    run_header: Arc<str>,
     load_version: Arc<str>,
     commit_run: Arc<str>,
     open_run: Arc<str>,
@@ -556,6 +560,9 @@ impl Sql {
                  RETURNING {RUN_METADATA_COLUMNS}"
             )),
             load_run: Arc::from(format!("SELECT {RUN_COLUMNS} FROM {runs} WHERE id = $1")),
+            run_header: Arc::from(format!(
+                "SELECT {RUN_HEADER_COLUMNS} FROM {runs} WHERE id = $1"
+            )),
             load_version: Arc::from(format!("SELECT version FROM {runs} WHERE id = $1")),
             commit_run: Arc::from(format!(
                 "UPDATE {runs}
@@ -762,6 +769,29 @@ fn run_from_row(row: &PgRow) -> StoreResult<RunRecord> {
     Ok(run)
 }
 
+/// A row of [`RUN_HEADER_COLUMNS`]: the record's metadata and its lease, never `state`.
+fn run_header_from_row(row: &PgRow) -> StoreResult<RunHeader> {
+    let status: String = row.try_get("status").map_err(classify)?;
+    let version: i64 = row.try_get("version").map_err(classify)?;
+    Ok(RunHeader {
+        id: RunId(row.try_get::<Uuid, _>("id").map_err(classify)?),
+        agent: row.try_get("agent").map_err(classify)?,
+        conversation_id: row.try_get("conversation_id").map_err(classify)?,
+        parent_id: row
+            .try_get::<Option<Uuid>, _>("parent_id")
+            .map_err(classify)?
+            .map(RunId),
+        status: RunStatus::parse(&status)
+            .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
+        wake_at: row.try_get("wake_at").map_err(classify)?,
+        version: u64::try_from(version)
+            .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
+        created_at: row.try_get("created_at").map_err(classify)?,
+        updated_at: row.try_get("updated_at").map_err(classify)?,
+        lease_until: row.try_get("lease_until").map_err(classify)?,
+    })
+}
+
 /// A row of [`RUN_METADATA_COLUMNS`]: the record a write returns, whose `state` is
 /// [`Value::Null`].
 fn run_metadata_from_row(row: &PgRow) -> StoreResult<RunRecord> {
@@ -874,6 +904,16 @@ impl Store for PgStore {
             .await
             .map_err(classify)?;
         row.as_ref().map(run_from_row).transpose()
+    }
+
+    async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
+        // One statement over the primary key: the header columns and the lease, never `state`.
+        let row = sqlx::query(safe(&self.sql.run_header))
+            .bind(id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(classify)?;
+        row.as_ref().map(run_header_from_row).transpose()
     }
 
     async fn commit_run(

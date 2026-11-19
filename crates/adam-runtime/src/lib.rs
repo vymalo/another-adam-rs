@@ -119,7 +119,7 @@ pub use file::{
 pub use lines::{SystemLine, is_system_line, safe_file_name};
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
-pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
+pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError, view_from_record};
 pub use session::{
     DEFAULT_SESSION_IDLE_TTL, MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_PAGE,
     MAX_SESSION_ROUNDS_SCANNED, ReportRound, RoundOutcome, SESSION_CLOSE_KIND,

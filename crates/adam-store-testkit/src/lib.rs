@@ -48,6 +48,7 @@ macro_rules! store_conformance {
             create_and_load, state_roundtrip, nul_characters_are_stored_as_the_replacement_character,
             a_write_does_not_echo_the_state,
             create_duplicate_id, load_missing,
+            run_header_matches_the_record,
             commit_advances_version, commit_stale_version_conflicts, commit_missing_run,
             concurrent_commits_single_winner, journal_roundtrip_and_order,
             journal_first_writer_wins, journal_concurrent_writers_agree,
@@ -336,6 +337,78 @@ pub mod cases {
 
     pub async fn load_missing(store: DynStore) {
         assert_eq!(store.load_run(RunId::new()).await.unwrap(), None);
+    }
+
+    /// `run_header` says what `load_run` and `lease_until` say together: the same run without its
+    /// state, and the lease that makes a worker's run `claimed` once it is taken. A finished run
+    /// is not `claimed` whatever lease it still carries, and an unknown id is `None`.
+    pub async fn run_header_matches_the_record(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})).conversation("c"))
+            .await
+            .unwrap();
+        assert_eq!(store.run_header(RunId::new()).await.unwrap(), None);
+
+        let header = store.run_header(run.id).await.unwrap().expect("a header");
+        let rec = store.load_run(run.id).await.unwrap().expect("the record");
+        assert_eq!(
+            (
+                header.id,
+                &header.agent,
+                &header.conversation_id,
+                header.parent_id,
+                header.status,
+                header.wake_at,
+                header.version,
+                header.created_at,
+                header.updated_at,
+            ),
+            (
+                rec.id,
+                &rec.agent,
+                &rec.conversation_id,
+                rec.parent_id,
+                rec.status,
+                rec.wake_at,
+                rec.version,
+                rec.created_at,
+                rec.updated_at,
+            ),
+            "the header is the record without its state"
+        );
+        assert_eq!(header.lease_until, None, "never claimed");
+        assert!(!header.claimed(now()));
+
+        let t = truncate_ms(now() + chrono::Duration::seconds(1));
+        let ttl = Duration::from_secs(10);
+        assert_eq!(
+            claim_ids(&store, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        let until = store.lease_until(run.id).await.unwrap().expect("a lease");
+        let header = store.run_header(run.id).await.unwrap().expect("a header");
+        assert_eq!(header.lease_until, Some(until));
+        assert!(header.claimed(t + chrono::Duration::seconds(1)));
+        assert!(!header.claimed(until), "the lease ends at `until`");
+
+        // A commit is visible in the header, and a finished run is never `claimed`, whatever
+        // lease it still carries (a commit does not touch the lease).
+        let rec = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Done, json!({"turn": 1})),
+            )
+            .await
+            .unwrap();
+        let header = store.run_header(run.id).await.unwrap().expect("a header");
+        assert_eq!(
+            (header.status, header.version),
+            (RunStatus::Done, rec.version)
+        );
+        assert_eq!(header.lease_until, Some(until), "the commit kept the lease");
+        assert!(!header.claimed(t + chrono::Duration::seconds(1)));
     }
 
     pub async fn commit_advances_version(store: DynStore) {

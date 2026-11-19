@@ -10,8 +10,8 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use adam_core::{
-    ClaimScope, ConversationScope, DynStore, NewRun, RunId, RunQuery, RunRecord, RunStatus,
-    RunUpdate, StoreError,
+    ClaimScope, ConversationScope, DynStore, NewRun, RunHeader, RunId, RunQuery, RunRecord,
+    RunStatus, RunUpdate, StoreError,
 };
 use adam_error::{BoxError, Classify, ErrorClass};
 
@@ -228,6 +228,22 @@ impl RunView {
             updated_at: rec.updated_at,
         }
     }
+}
+
+/// A run's view, built from a record the caller already holds: the same value
+/// [`Runtime::view`] returns, without a second read of the run.
+///
+/// `claimed` is the lease, which a record does not carry: a caller that lists records reads it
+/// beside the one record it needs it for (`adam-a2a-runtime` reads it only for a runnable run at
+/// version 1, the only record whose task state can still flip from `submitted` to `working`). An
+/// unreadable state is [`RuntimeError::Corrupt`].
+///
+/// # Errors
+///
+/// [`RuntimeError::Corrupt`] when `rec.state` is not a valid envelope.
+pub fn view_from_record(rec: RunRecord, claimed: bool) -> Result<RunView, RuntimeError> {
+    let env = Envelope::decode(rec.id, &rec.state)?;
+    Ok(RunView::new(rec, env, claimed))
 }
 
 pub(crate) struct Config {
@@ -1412,6 +1428,18 @@ impl Runtime {
         let claimed = rec.status == RunStatus::Runnable
             && until.is_some_and(|until| until > self.inner.clock.now());
         Ok(Some(RunView::new(rec, env, claimed)))
+    }
+
+    /// The header of a run from its durable record (`None` if it does not exist): its status, its
+    /// version and whether a worker holds it, without the state.
+    ///
+    /// One store call ([`Store::run_header`](adam_core::Store::run_header)), which an adapter
+    /// answers from a projection that never reads the state; [`view`](Self::view) reads the whole
+    /// record because the view carries it. Use this for a reader that only needs to know what the
+    /// run is doing: a cancel watch, a status poll.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn header(&self, run: RunId) -> Result<Option<RunHeader>, RuntimeError> {
+        Ok(self.inner.store.run_header(run).await?)
     }
 }
 

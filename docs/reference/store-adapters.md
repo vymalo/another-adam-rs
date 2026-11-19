@@ -29,6 +29,12 @@ on every transition. Read the run for the stored state (a store may have replace
 `journal_put` is the exception and returns the payload it stored, because the loop decodes the step's
 outcome from it.
 
+`run_header` answers a run **without its state** — its id, agent, conversation, parent, status, wake
+time, version, timestamps and lease — which is all a reader that only needs what the run is doing
+(a status poll, a cancel watch) reads. The trait defaults it to `lease_until` + `load_run`; both
+adapters override it with one projected read that never touches the state, and the conformance case
+`run_header_matches_the_record` proves an implementation agrees with the two reads.
+
 `PgStore::connect` sizes its pool from `ADAM_PG_POOL_SIZE` (2 to 65535, default 16, per process;
 one is refused because the `adam-notify-postgres` listener holds a connection for the process's
 life); `connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A
@@ -53,6 +59,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Push configs deleted with their run | `ON DELETE CASCADE` | deleted with the journal by the purge |
 | `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`, a prefix is a range plus `starts_with`; a prefix page sorts the matching index entries (the status filter is answered from the index) | `(agent, conversation_id, updated_at, _id)`, and `(agent, status, conversation_id, updated_at, _id)` when a status filter is set: a prefix is an anchored escaped regex, so the index bounds the scan but the page still sorts the matches; a listing of one conversation is read in index order |
 | State | `JSONB` (queryable with SQL) | real BSON document (queryable with dot paths) |
+| `run_header`: a run without its state, with its lease | one primary-key statement selecting the header columns and `lease_until`, never `state` | one `find_one` projected to the header and `lease_until` |
 | Transactions | none held open | none |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll |
 

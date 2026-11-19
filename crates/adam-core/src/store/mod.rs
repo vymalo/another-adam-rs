@@ -234,6 +234,49 @@ impl RunRecord {
     }
 }
 
+/// A run without its state: what a reader that only needs to know what the run *is doing* reads.
+///
+/// The state is the largest member of a run (for an `LlmAgent`, the transcript), and most readers
+/// never look at it: a subscriber that polls for a status change, a cancel watch, a listing that
+/// builds its view from the record it already has. [`Store::run_header`] answers this from a
+/// projection that does not read the state at all, so it costs one small read where
+/// [`Store::load_run`] transfers the whole run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunHeader {
+    /// The run.
+    pub id: RunId,
+    /// Name of its agent.
+    pub agent: String,
+    /// Its conversation, if any.
+    pub conversation_id: Option<String>,
+    /// The run it works for, if it is a child.
+    pub parent_id: Option<RunId>,
+    /// Lifecycle status.
+    pub status: RunStatus,
+    /// Timer: when a parked run wakes, or a runnable run becomes due.
+    pub wake_at: Option<DateTime<Utc>>,
+    /// Starts at 1 on creation and increases by exactly 1 per successful commit.
+    pub version: u64,
+    /// When the run was created.
+    pub created_at: DateTime<Utc>,
+    /// Last commit time.
+    pub updated_at: DateTime<Utc>,
+    /// When the lease on the run ends, or `None` if it has none (never claimed, or released).
+    /// A lease that ran out is still reported: whether it still counts is for the caller's clock
+    /// (see [`claimed`](Self::claimed)).
+    pub lease_until: Option<DateTime<Utc>>,
+}
+
+impl RunHeader {
+    /// Whether a worker holds an unexpired lease on the run: it is being stepped right now,
+    /// though nothing has been committed yet. The same rule as a runtime view's `claimed`: only a
+    /// runnable run is being stepped, whatever lease a parked or finished one still carries, and a
+    /// lease that ran out (the worker died) does not count.
+    pub fn claimed(&self, now: DateTime<Utc>) -> bool {
+        self.status == RunStatus::Runnable && self.lease_until.is_some_and(|until| until > now)
+    }
+}
+
 /// Whose runs a claim may take (see [`Store::claim_due`]).
 ///
 /// The enum is closed on purpose: a new scope must fail to compile in every store and every
@@ -432,6 +475,36 @@ pub trait Store: Send + Sync + 'static {
     async fn create_run(&self, run: NewRun) -> StoreResult<RunRecord>;
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>>;
+
+    /// The run's header — everything about it but its state — or `None` if it does not exist.
+    ///
+    /// **The default implementation reads twice**: [`lease_until`](Self::lease_until) and then
+    /// [`load_run`](Self::load_run), which it projects. An adapter that can answer both in one
+    /// statement overrides it: PostgreSQL selects the header columns and the lease together,
+    /// MongoDB projects them in one `find_one`, so neither reads the state.
+    ///
+    /// The lease is read **before** the record, as the runtime's `view` does: a claim that lands
+    /// between the two reads then reads as not yet, and a step that committed and released is read
+    /// with the version it committed. A reader that needs the state as well reads
+    /// [`load_run`](Self::load_run) instead.
+    async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
+        let lease_until = self.lease_until(id).await?;
+        let Some(rec) = self.load_run(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(RunHeader {
+            id: rec.id,
+            agent: rec.agent,
+            conversation_id: rec.conversation_id,
+            parent_id: rec.parent_id,
+            status: rec.status,
+            wake_at: rec.wake_at,
+            version: rec.version,
+            created_at: rec.created_at,
+            updated_at: rec.updated_at,
+            lease_until,
+        }))
+    }
 
     /// Atomically replace the run's status/state/wake_at if its version is
     /// still `expected_version`, and return the new record (version + 1).
