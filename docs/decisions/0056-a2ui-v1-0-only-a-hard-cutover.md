@@ -1,7 +1,11 @@
 # 0056. A2UI v1.0 only, a hard cutover
 
 Status: **Accepted** (2026-11-19). The owner's decision (2026-11-19): *"That falls into V1, we absolutely need to
-upgrade to a2ui@v1"*: adam moves from A2UI v0.9.1 to v1.0 in R1, the first release, as a hard cutover. Nothing is
+upgrade to a2ui@v1"*: adam moves from A2UI v0.9.1 to v1.0 in R1, the first release, as a hard cutover. *Amended
+2026-11-19 (the owner's answers to sys ADR 0075):* the screen's catalog keeps its `catalogId` and its `version`
+continues at 9 under `ui-catalog/v2` (decision 6), and a surface of a thread from before the cutover is neither drawn
+nor migrated, with actions on it refused (*Consequences*); both are the owner's, marked **(owner)**. Not reading an
+action's `userMessage` (decision 4) follows sys ADR 0075's proposed choice. Nothing is
 built. It amends [ADR 0006](0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md) (decisions 6 to 8: what adam
 writes, reads and declares for A2UI) without reversing it. The other side is the orchestration layer's ADR 0075,
 [*A2UI v1.0 cutover*](https://github.com/vymalo/another-agentic-system/blob/main/docs/decisions/0075-a2ui-v1-0-cutover.md),
@@ -90,7 +94,7 @@ the card.
 4. **What adam reads** (`adam-a2a-runtime`, `vymalo_inbound`). The renderer's capabilities only under
    `a2uiRendererCapabilities["1.0"]`; `a2uiClientCapabilities` and every other key are ignored. An action only as
    `{"version": "1.0", "action": {...}}`; an action of another version is read as any other data part (its JSON as
-   text), never as a form's answer. The action's `userMessage` and `metadata` are not read: the orchestrator never
+   text), never as a form's answer. The action's `userMessage` and `metadata` are not read (proposed, as sys ADR 0075 decision 4): the orchestrator never
    forwards them (sys ADR 0075, decision 4), and adam does not take an agent-authored line as the person's words.
 5. **A turn with no capabilities draws nothing** (A2UI's MUST). `ask_user`, `show` and the plan tools write a surface
    only when the message that started or resumed the run carried `a2uiRendererCapabilities["1.0"]` and the surface's
@@ -100,7 +104,8 @@ the card.
 6. **The catalog is a `ui-catalog/v2` document** (`adam-ui`, `Catalog`, `catalog_digest`): `{catalogId,
    protocolVersion, components}` with `protocolVersion` exactly `"1.0"`, required; a document without it, with
    another value, or with any other member is refused, as `CatalogError` already refuses a member it does not know.
-   The digest is the one `docs/api/ui-catalog-v2.md` of `vymalo/another-agentic-system` defines, with its known-answer
+   **(owner)** The `catalogId` stays `https://agents.vymalo.com/a2ui/catalogs/chat` and the catalog's `version`
+   continues: 9 is the first v2 catalog, so adam needs no second id. The digest is the one `docs/api/ui-catalog-v2.md` of `vymalo/another-agentic-system` defines, with its known-answer
    vector pinned in a test. The degradation paths that read a screen's `Choices` schema stay, since they read the
    schema and not a version number. The vendored v1 catalogs (`crates/adam-ui/tests/fixtures/catalog-v2.json` to
    `catalog-v8.json`) stay byte-for-byte copies: the tests that need them as v2 documents add `protocolVersion` in
@@ -137,8 +142,9 @@ the card.
   no `a2uiRendererCapabilities["1.0"]` (that orchestrator writes `{"v0.9.1": ...}`, or `{"v1.0": ...}` for the
   draft URI) and no `ui-catalog/v2` metadata, so by decision 5 it answers in words. A v0.9.1 adam behind a v1.0
   orchestrator lists no URI that orchestrator detects and gets nothing A2UI. Deploy both at once all the same.
-* **A run parked on a v0.9.1 form across the upgrade** is answered in words: the orchestrator refuses an action on a
-  surface of another version (sys ADR 0075), and words typed instead of a form are read as they are today.
+* **A run parked on a v0.9.1 form across the upgrade** is answered in words: **(owner)** a surface from before the
+  cutover is not drawn or migrated and the orchestrator refuses an action on it (sys ADR 0075, decisions 4 and 6), and
+  words typed instead of a form are read as they are today.
 * A consumer that names `A2UI_EXTENSION_V0_9_1`, `A2UI_BASIC_CATALOG_V0_9_1` or `ExtensionConfig::a2ui_v0_9_1` stops
   compiling; `adam-upgrade` names the replacements. No `Store` or `Notifier` method changes.
 * The function-call messages are not adam's in R1: nothing it writes needs one, and the screen's catalog declares no
