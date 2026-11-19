@@ -36,14 +36,19 @@ use adam_core::{
 };
 use async_trait::async_trait;
 
-/// A [`Store`] method a fault can target. `migrate` is not injectable: a
-/// store that cannot migrate never gets as far as running anything.
+/// A [`Store`] method a wrapper can target: [`FaultyStore`] injects a fault on it and
+/// [`CountingStore`](crate::counting::CountingStore) counts its calls. `CountingStore` counts
+/// every method it forwards, but a `RunHeader` it forwards to an adapter whose `run_header` is the
+/// trait default reads the record inside the adapter, which the wrapper cannot see. `migrate` is
+/// not injectable: a store that cannot migrate never gets as far as running anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Method {
     /// [`Store::create_run`].
     CreateRun,
     /// [`Store::load_run`].
     LoadRun,
+    /// [`Store::run_header`].
+    RunHeader,
     /// [`Store::commit_run`].
     CommitRun,
     /// [`Store::open_run_for_conversation`].
@@ -176,10 +181,10 @@ impl FaultyStore {
     }
 
     /// Fail the next `n` calls of `method` that are about `run` (the ones that take a run id:
-    /// `load_run`, `commit_run`, the journal methods and the lease methods), before they reach the
-    /// store. Calls about other runs pass through, so a test can break one link of a chain, such as
-    /// the message a finished child sends its parent, while everything else works. Replaces any
-    /// earlier run-scoped script for that method and run.
+    /// `load_run`, `run_header`, `commit_run`, the journal methods and the lease methods), before
+    /// they reach the store. Calls about other runs pass through, so a test can break one link of a
+    /// chain, such as the message a finished child sends its parent, while everything else works.
+    /// Replaces any earlier run-scoped script for that method and run.
     pub fn fail_run(&self, method: Method, run: RunId, n: u64) {
         self.script_run(method, run, Some(n), Mode::Before);
     }
@@ -293,6 +298,11 @@ impl Store for FaultyStore {
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
         self.run(Method::LoadRun, Some(id), self.inner.load_run(id))
+            .await
+    }
+
+    async fn run_header(&self, id: RunId) -> StoreResult<Option<adam_core::RunHeader>> {
+        self.run(Method::RunHeader, Some(id), self.inner.run_header(id))
             .await
     }
 

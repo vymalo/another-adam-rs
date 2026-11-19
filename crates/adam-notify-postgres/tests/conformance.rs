@@ -28,7 +28,9 @@ async fn side(url: &str, prefix: &str) -> Side {
     let local = BroadcastSink::default();
     let notify = PgNotify::new(pool, local.clone())
         .with_channel_prefix(prefix)
-        .expect("prefix");
+        .expect("prefix")
+        // An ambient NOTIFY_LOCAL_ONLY must not change what this suite checks.
+        .local_only(false);
     let runner = notify.clone();
     tokio::spawn(async move { runner.run(std::future::pending()).await });
     notify.wait_listening().await;
@@ -107,7 +109,9 @@ async fn items_queued_at_stop_are_drained() {
         .expect("connect");
     let stopping = PgNotify::new(pool, BroadcastSink::default())
         .with_channel_prefix(&prefix)
-        .expect("prefix");
+        .expect("prefix")
+        // The ambient environment must not decide what this test measures.
+        .local_only(false);
     let sent: Vec<Signal> = (0..3)
         .map(|_| Signal::Finished {
             run: adam_core::RunId::new(),

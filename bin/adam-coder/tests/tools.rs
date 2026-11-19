@@ -3856,6 +3856,33 @@ async fn read_file_pages_a_big_file_and_says_where_the_next_page_starts() {
     );
 }
 
+/// A 20 MB file read at a late offset: the page and the `[more]` line are the ones the pager
+/// gives, and the whole file is read once to count the lines the footer needs.
+#[tokio::test]
+async fn read_file_pages_a_late_page_of_a_twenty_megabyte_file() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let lines = 200_000usize;
+    let big: String = (1..=lines).map(|i| format!("{i:099}\n")).collect();
+    std::fs::write(rig.worktree().join("huge.txt"), &big).unwrap();
+    let page = ReadFile
+        .call(&rig.ctx, json!({"path": "huge.txt", "offset": 199_001}))
+        .await
+        .unwrap();
+    assert!(!page.is_error, "{}", page.content);
+    let rows: Vec<&str> = page.content.lines().collect();
+    assert_eq!(
+        rows.len(),
+        479,
+        "478 lines and the line that says what is left"
+    );
+    assert_eq!(rows[0], format!("199001\t{:099}", 199_001));
+    assert_eq!(
+        rows[478],
+        "[more: 522 lines left; next page: offset=199479]"
+    );
+}
+
 // ------------------------------------------------------------------ read_files
 
 /// The section `read_files` gives a file whose page it shows: the line that names it, its rows and

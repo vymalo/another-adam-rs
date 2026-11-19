@@ -266,8 +266,8 @@ async fn recheck_in_flight(inner: &Inner) {
         .copied()
         .collect();
     for run in runs {
-        match inner.store.load_run(run).await {
-            Ok(Some(rec)) if rec.status.is_open() => {}
+        match inner.store.run_header(run).await {
+            Ok(Some(header)) if header.status.is_open() => {}
             Ok(_) => inner.fire_cancel(run),
             Err(e) => tracing::debug!(%run, error = %e, "resync could not read the run"),
         }
@@ -289,13 +289,13 @@ const PARENT_CHECK_EVERY: Duration = Duration::from_secs(1);
 const DEADLINE_SKEW: Duration = Duration::from_secs(1);
 
 /// Whether the run `parent` is `Failed` (any reason, a cancel included): the runs that work for it
-/// have nobody to work for. Only a parent that was **loaded** and is `Failed` says so. A parent that
+/// have nobody to work for. Only a parent that was **read** and is `Failed` says so. A parent that
 /// is `Done` has no working rounds left and a kept-open session stays usable; one that cannot be
 /// loaded (the store is down, or retention purged a finished run) is unknown and cancels nothing, which
 /// assumes retention is longer than the time a failed parent takes to be seen (a minute).
 async fn parent_has_ended(inner: &Inner, parent: RunId) -> bool {
-    match inner.store.load_run(parent).await {
-        Ok(Some(rec)) => rec.status == RunStatus::Failed,
+    match inner.store.run_header(parent).await {
+        Ok(Some(header)) => header.status == RunStatus::Failed,
         Ok(None) => {
             tracing::debug!(%parent, "the parent run is not in the store; carrying on");
             false
@@ -362,7 +362,7 @@ fn spawn_cancel_watch(
     watched: Watched,
     token: CancelToken,
 ) -> AbortOnDrop {
-    let every = inner.cfg.poll_interval.max(Duration::from_millis(1));
+    let every = inner.cfg.cancel_poll_interval.max(Duration::from_millis(1));
     AbortOnDrop(tokio::spawn(async move {
         let mut parent_read: Option<tokio::time::Instant> = None;
         loop {
@@ -374,8 +374,8 @@ fn spawn_cancel_watch(
                 token.cancel();
                 return;
             }
-            match inner.store.load_run(run).await {
-                Ok(Some(rec)) if rec.status.is_open() => {
+            match inner.store.run_header(run).await {
+                Ok(Some(header)) if header.status.is_open() => {
                     let due = parent_read.is_none_or(|at| at.elapsed() >= PARENT_CHECK_EVERY);
                     if let Some(parent) = watched.parent
                         && due
@@ -523,7 +523,12 @@ async fn transition(
                 inner
                     .emit_status(run, &rec.agent, RunStatus::Failed, Some(e.to_string()))
                     .await;
-                inner.notify_parent(&committed).await;
+                // The report the parent gets is the one `ChildStatus::from_record` would build
+                // from a record whose state cannot be decoded.
+                let unreadable = format!("the run's state is unreadable: {e}");
+                inner
+                    .notify_parent(&committed, &Value::Null, Some(&unreadable))
+                    .await;
             }
             return true;
         }
@@ -612,7 +617,10 @@ async fn transition(
         Ok(Some(committed)) => {
             announce(inner, &committed, &next).await;
             // After the commit, never before: the parent's timer is the fallback for a crash here.
-            inner.notify_parent(&committed).await;
+            // The report is built from what was just written: the store does not echo the state.
+            inner
+                .notify_parent(&committed, &next.output, next.error.as_deref())
+                .await;
             true
         }
         Ok(None) => {

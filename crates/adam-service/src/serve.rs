@@ -407,7 +407,7 @@ pub async fn serve(
     // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own pool. The
     // listener (`notify.run`) is a host component below; the runtime only holds the two halves.
     let broadcast = BroadcastSink::default();
-    let notify = PgNotify::new(pool, broadcast.clone());
+    let notify = PgNotify::new(pool, broadcast.clone()).local_only(config.notify_local_only);
     let push_events = broadcast.clone();
     let live = LiveSignals {
         broadcast,

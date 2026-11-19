@@ -161,6 +161,7 @@ dependencies = [
  "adam-model",
  "adam-runtime",
  "adam-store-postgres",
+ "adam-store-testkit",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -219,6 +220,7 @@ dependencies = [
  "async-trait",
  "axum",
  "futures",
+ "mimalloc",
  "secrecy",
  "serde_json",
  "sqlx",
@@ -314,6 +316,7 @@ dependencies = [
  "adam-runtime",
  "adam-service",
  "adam-store-postgres",
+ "adam-store-testkit",
  "adam-ui",
  "adam-workspace",
  "aho-corasick",
@@ -324,6 +327,7 @@ dependencies = [
  "futures",
  "globset",
  "kube",
+ "mimalloc",
  "proptest",
  "regex",
  "rustls",
@@ -381,6 +385,7 @@ dependencies = [
  "adam-error",
  "async-trait",
  "httparse",
+ "mimalloc",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -400,6 +405,7 @@ dependencies = [
  "http",
  "k8s-openapi",
  "kube",
+ "mimalloc",
  "rustls",
  "serde",
  "serde-saphyr 1.3.0",
@@ -426,6 +432,7 @@ version = "0.1.0"
 dependencies = [
  "adam-error",
  "base64 0.22.1",
+ "mimalloc",
  "rustix",
  "serde",
  "serde_json",
@@ -3052,6 +3059,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3178,6 +3194,15 @@ name = "micromap"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a86d3146ed3995b5913c414f6664344b9617457320782e64f0bb44afd49d74"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "mime"

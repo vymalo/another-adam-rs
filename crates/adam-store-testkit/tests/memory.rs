@@ -6,3 +6,5 @@ async fn make_store() -> Option<adam_core::DynStore> {
 }
 
 adam_store_testkit::store_conformance!(make_store);
+
+adam_store_testkit::transcript_measurement!(make_store);

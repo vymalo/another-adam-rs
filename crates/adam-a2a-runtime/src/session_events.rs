@@ -2,10 +2,11 @@
 //!
 //! A subscriber that activated the extension is told when a session of its parent context changes:
 //! `opened`, `round`, `reported`, `closed`. The runtime has no events for it, so the subscription
-//! lists the sessions (on a change of the parent's record and at least every [`SESSIONS_POLL`])
-//! and turns what changed since the last listing into events ([`diff`], a pure function). An event
-//! is a latency optimisation: the sessions object of the task is the truth, so a listing that
-//! failed is retried at the next poll and says nothing.
+//! lists the sessions when it polls — the fallback poll, or a `Status` event of the task it
+//! streams — once [`SESSIONS_POLL`] has passed since the last listing, and turns what changed since
+//! then into events ([`diff`], a pure function). An event is a latency optimisation: the sessions
+//! object of the task is the truth, so a listing that failed is retried at the next poll and says
+//! nothing.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -21,9 +22,15 @@ use crate::backend::RuntimeTaskBackend;
 use crate::child_sessions::{a2a_state_word, wire_state};
 use crate::task_state;
 
-/// The longest a subscription goes without listing the sessions of its parent context (and, for the
-/// stream of a round, without reading its session): a session changes with no change of the
-/// parent's own record when a person acts on it.
+/// The longest a subscription's sessions listing is allowed to be stale **when the subscription
+/// polls**: the tracker asks to be listed this often, and the subscription asks only on its own
+/// poll — the fallback ([`RuntimeTaskBackend::with_poll_interval`](crate::RuntimeTaskBackend::with_poll_interval),
+/// 2 s by default) or a `Status` event of the task it streams. The real bound is therefore
+/// `max(SESSIONS_POLL, poll)`: 2 s with the defaults, not 1 s.
+///
+/// That is deliberate. A listing arm of its own every second would pay a whole `list_sessions`
+/// (two counts and a page, plus a view per changed open round) per subscriber per second, for a
+/// change nobody is blocked on; the fallback poll already bounds it.
 pub(crate) const SESSIONS_POLL: Duration = Duration::from_secs(1);
 
 /// The least time between two listings when the parent's record changed: a busy parent commits far
@@ -31,9 +38,13 @@ pub(crate) const SESSIONS_POLL: Duration = Duration::from_secs(1);
 /// and reads a view per open one.
 pub(crate) const SESSIONS_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Whether a subscription reads its sessions again: [`SESSIONS_POLL`] after the last read, or
-/// [`SESSIONS_MIN_INTERVAL`] after it when the parent's record changed. A read that failed waits
-/// the whole [`SESSIONS_POLL`], whatever changed.
+/// Whether a subscription reads its sessions again, when it polls: [`SESSIONS_POLL`] after the
+/// last read, or [`SESSIONS_MIN_INTERVAL`] after it when the parent's record changed. A read that
+/// failed waits the whole [`SESSIONS_POLL`], whatever changed.
+///
+/// The subscription asks this only on a poll (`subscribe::pump`), so the effective period is
+/// `max(SESSIONS_POLL, poll)` — 2 s with the default fallback — unless the parent's record changes
+/// first, which polls the pump at once.
 pub(crate) fn read_due(changed: bool, failed: bool, since_last: Duration) -> bool {
     since_last >= SESSIONS_POLL || (changed && !failed && since_last >= SESSIONS_MIN_INTERVAL)
 }
@@ -230,9 +241,24 @@ pub(crate) fn diff(prev: Option<&Seen>, now: &Seen) -> Vec<Event> {
     out
 }
 
+/// What the tracker knows of one session: the listing row its `Seen` was read from, and that
+/// `Seen`.
+///
+/// The whole row is the key because it is the only "version" a listing gives, and every member of
+/// a `Seen` derives from it: the record's metadata (a commit bumps `updated_at` and moves
+/// `latest_run` or `round`) and what the listing decides from the record and its clock (`state`,
+/// `closed`, `idle_expired`). A later listing that returns the same row would build the same
+/// `Seen`, so its `view` is skipped; anything that changed — a commit, a new round, the idle TTL
+/// closing the session — changes the row and is read again.
+#[derive(Clone)]
+struct Cached {
+    summary: SessionSummary,
+    seen: Seen,
+}
+
 /// What the stream of a parent task knows of its sessions.
 pub(crate) struct SessionsTracker {
-    seen: HashMap<RunId, Seen>,
+    known: HashMap<RunId, Cached>,
     listed_at: Instant,
     version: u64,
     /// The last listing failed: the next waits a whole interval.
@@ -248,9 +274,11 @@ impl SessionsTracker {
         context: &str,
         version: u64,
     ) -> Option<Self> {
-        let seen = backend.sessions_seen(caller, context).await?;
+        let known = backend
+            .sessions_seen(caller, context, &HashMap::new())
+            .await?;
         Some(Self {
-            seen: seen.into_iter().map(|s| (s.session, s)).collect(),
+            known: known.into_iter().map(|c| (c.seen.session, c)).collect(),
             listed_at: Instant::now(),
             version,
             failed: false,
@@ -280,7 +308,7 @@ impl SessionsTracker {
         // Noted before the read, so a read that fails waits for the next interval.
         self.listed_at = Instant::now();
         self.version = version;
-        let Some(now) = backend.sessions_seen(caller, context_id).await else {
+        let Some(now) = backend.sessions_seen(caller, context_id, &self.known).await else {
             self.failed = true;
             return Vec::new();
         };
@@ -288,17 +316,17 @@ impl SessionsTracker {
         let status = &quiet(status);
         let mut events = Vec::new();
         for now in now {
-            let prev = self.seen.get(&now.session).cloned();
+            let prev = self.known.get(&now.seen.session).map(|c| c.seen.clone());
             // A round that was working and is gone from view (a newer one started) ended unseen:
             // read how, so its report is not lost.
             let mut chain = Vec::new();
             if let Some(prev) = &prev
-                && ended_unseen(prev, &now)
+                && ended_unseen(prev, &now.seen)
                 && let Some(settled) = backend.settled(prev).await
             {
                 chain.push(settled);
             }
-            chain.push(now.clone());
+            chain.push(now.seen.clone());
             let mut before = prev;
             for step in &chain {
                 for event in diff(before.as_ref(), step) {
@@ -314,20 +342,29 @@ impl SessionsTracker {
                 }
                 before = Some(step.clone());
             }
-            self.seen.insert(now.session, now);
+            self.known.insert(now.seen.session, now);
         }
         events
     }
 }
 
 impl RuntimeTaskBackend {
-    /// The sessions of parent context `context` as [`Seen`]; `None` when they could not be listed
-    /// (a warning, at most one per interval: the caller backs off). A session whose latest round
-    /// is not readable is left out, so nothing is said of it yet.
+    /// The sessions of parent context `context` as [`Cached`]; `None` when they could not be
+    /// listed (a warning, at most one per interval: the caller backs off). A session whose latest
+    /// round is not readable is left out, so nothing is said of it yet.
+    ///
+    /// `known` is what the last listing read: a session whose listing row is unchanged is reused
+    /// without a [`view`](adam_runtime::Runtime::view), which is the read this exists to save (an
+    /// open round's view is two queries and a full state read).
     ///
     /// The listing is paged and the sessions can move between pages while it is read, so a session
     /// may be missed by one listing and told `opened` by a later one.
-    async fn sessions_seen(&self, caller: &Caller, context: &str) -> Option<Vec<Seen>> {
+    async fn sessions_seen(
+        &self,
+        caller: &Caller,
+        context: &str,
+        known: &HashMap<RunId, Cached>,
+    ) -> Option<Vec<Cached>> {
         let listed = match self.listed_sessions(caller, context).await {
             Ok(listed) => listed,
             Err(e) => {
@@ -337,18 +374,33 @@ impl RuntimeTaskBackend {
         };
         let mut out = Vec::with_capacity(listed.len());
         for s in &listed {
-            out.extend(self.seen_of(context, s).await);
+            if let Some(cached) = known.get(&s.id)
+                && cached.summary == *s
+            {
+                out.push(cached.clone());
+                continue;
+            }
+            if let Some(seen) = self.seen_of(context, s).await {
+                out.push(Cached {
+                    summary: s.clone(),
+                    seen,
+                });
+            }
         }
         Some(out)
     }
 
     async fn seen_of(&self, context: &str, s: &SessionSummary) -> Option<Seen> {
         let state = match s.state {
-            // Only an open round can wait for the person, and only its view says so.
-            SessionState::Working => match self.runtime.view(s.latest_run).await {
-                Ok(Some(view)) => RoundState::of_task(&task_state(&view)),
-                _ => RoundState::Working,
-            },
+            // Only an open round can wait for the person, and only its view says so. A view that
+            // cannot be read leaves the session out of this listing rather than guessing `working`:
+            // a guessed `Seen` would be cached under the same row, and a parked round never commits,
+            // so its `blocked` report would be lost until something else changed. A session with no
+            // cache entry is always read again.
+            SessionState::Working => {
+                let view = self.runtime.view(s.latest_run).await.ok()??;
+                RoundState::of_task(&task_state(&view))
+            }
             SessionState::Idle | SessionState::Closed => RoundState::of_outcome(s.outcome)?,
         };
         Some(Seen {
@@ -658,5 +710,230 @@ mod tests {
         assert!(settle(&seen(1, Working, true), Canceled).unwrap().closed);
         assert!(settle(&kept, Working).is_none());
         assert!(settle(&kept, Blocked).is_none());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The listing cache: a session whose row did not change is not read again.
+    // ---------------------------------------------------------------------------------------
+
+    use std::sync::Arc;
+
+    use adam_core::{DynStore, MemoryStore, NewRun, RunStatus};
+    use adam_runtime::{
+        AgentError, AgentStarter, BroadcastSink, Inbound, ManualClock, Runtime, RuntimeBuilder,
+        SESSION_STATE_KEY, SessionHeader, session_conversation_id,
+    };
+    use adam_store_testkit::fault::{FaultyStore, Method};
+
+    use crate::child_sessions::{ChildSessionAgent, ChildSessions};
+    use crate::convert::encode_conversation;
+
+    /// The registered helper the listing scans for; a front never steps it, so it only starts.
+    struct Helper;
+
+    impl AgentStarter for Helper {
+        type State = Value;
+
+        fn name(&self) -> &str {
+            "helper"
+        }
+
+        fn init(&self, _input: Inbound) -> Result<Value, AgentError> {
+            Ok(json!({}))
+        }
+    }
+
+    /// A session with one round of `status`, as `list_sessions` reads it: round 1 is the run whose
+    /// id is `session`, its conversation is the session's, its parent is some run, and its agent
+    /// state is `agent` (inside the runtime's version 1 envelope).
+    async fn a_session_with(
+        store: &DynStore,
+        parent: &str,
+        session: RunId,
+        status: RunStatus,
+        agent: Value,
+    ) {
+        store
+            .create_run(
+                NewRun::new("helper", json!({"v": 1, "agent": agent}))
+                    .with_id(session)
+                    .conversation(session_conversation_id(parent, session))
+                    .parent(RunId::new())
+                    .status(status),
+            )
+            .await
+            .expect("create");
+    }
+
+    /// [`a_session_with`] for a session whose round carries a header (the usual case).
+    async fn a_session(store: &DynStore, parent: &str, status: RunStatus) -> RunId {
+        let session = RunId::new();
+        let header = SessionHeader {
+            id: session,
+            agent: "helper".into(),
+            description: "Plan it".into(),
+            keep_open: true,
+            closed: false,
+            closing: false,
+            round: 1,
+        };
+        a_session_with(
+            store,
+            parent,
+            session,
+            status,
+            json!({ SESSION_STATE_KEY: header }),
+        )
+        .await;
+        session
+    }
+
+    /// A backend over `builder`'s runtime that serves `child-sessions/v1` with one helper.
+    fn backend(builder: RuntimeBuilder) -> RuntimeTaskBackend {
+        let runtime = builder.starter(Helper).build();
+        let sessions =
+            ChildSessions::new([ChildSessionAgent::new("planner", "helper", "Plans.")], 16)
+                .expect("child sessions");
+        RuntimeTaskBackend::new(runtime, BroadcastSink::default(), "parent")
+            .with_child_sessions(sessions)
+    }
+
+    fn working() -> TaskStatus {
+        TaskStatus {
+            state: TaskState::Working,
+            message: None,
+            timestamp: None,
+        }
+    }
+
+    /// Ten listings of three open sessions read each session **once**: their row did not change,
+    /// so the view (two queries and a full state read per open round) is skipped. Without the
+    /// cache it was one view per session per listing: 3 at the seed and 30 over the ten.
+    #[tokio::test]
+    async fn a_listing_does_not_read_a_session_whose_row_did_not_change() {
+        let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+        let store: DynStore = faulty.clone();
+        let backend = backend(Runtime::builder(store.clone()));
+        let caller = Caller::new("alice");
+        let context = "ctx-1";
+        let conversation = encode_conversation("alice", context);
+        for _ in 0..3 {
+            a_session(&store, &conversation, RunStatus::Runnable).await;
+        }
+
+        let mut tracker = SessionsTracker::seed(&backend, &caller, context, 1)
+            .await
+            .expect("seed");
+        assert_eq!(
+            faulty.calls(Method::LoadRun),
+            3,
+            "the seed reads one view per session"
+        );
+        for listing in 0..10 {
+            let events = tracker
+                .refresh(&backend, &caller, "task-1", context, 1, &working())
+                .await;
+            assert!(events.is_empty(), "listing {listing} said {events:?}");
+        }
+        assert_eq!(
+            faulty.calls(Method::LoadRun),
+            3,
+            "ten listings of three unchanged sessions: 3 views, not 33"
+        );
+        assert_eq!(
+            faulty.calls(Method::LeaseUntil),
+            3,
+            "a view reads the lease too, and nothing else did"
+        );
+    }
+
+    /// The cache is the listing row, so a session the idle TTL closes is read again and told
+    /// `closed`: it changes with no commit, and a version-only cache would swallow the event.
+    #[tokio::test]
+    async fn a_session_the_idle_ttl_closes_is_read_again_and_told() {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let clock = ManualClock::new();
+        let backend = backend(
+            Runtime::builder(store.clone())
+                .clock(clock.clone())
+                .session_idle_ttl(Duration::from_secs(10)),
+        );
+        let caller = Caller::new("alice");
+        let context = "ctx-1";
+        a_session(
+            &store,
+            &encode_conversation("alice", context),
+            RunStatus::Done,
+        )
+        .await;
+
+        let mut tracker = SessionsTracker::seed(&backend, &caller, context, 1)
+            .await
+            .expect("seed");
+        // The session is idle, not closed: its round ended and it is kept open.
+        clock.advance(Duration::from_secs(11));
+        let events = tracker
+            .refresh(&backend, &caller, "task-1", context, 1, &working())
+            .await;
+        let closed = events.iter().any(|e| match e {
+            TaskEvent::Status(update) => update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(CHILD_SESSIONS_EXTENSION))
+                .is_some_and(|o| o["event"] == "closed"),
+            _ => false,
+        });
+        assert!(closed, "the closed event is still told: {events:?}");
+    }
+
+    /// A view that cannot be read leaves the session out of the listing instead of caching a
+    /// guessed `working`: the next listing reads it again, so a parked round's `blocked` report is
+    /// not lost. (A parked round never commits, so a wrong cached `Seen` would never be corrected
+    /// by a later row.)
+    #[tokio::test]
+    async fn a_view_that_fails_leaves_the_session_out_and_is_retried() {
+        let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+        let store: DynStore = faulty.clone();
+        let backend = backend(Runtime::builder(store.clone()));
+        let caller = Caller::new("alice");
+        let context = "ctx-1";
+        let session = RunId::new();
+        a_session_with(
+            &store,
+            &encode_conversation("alice", context),
+            session,
+            RunStatus::Parked,
+            json!({}),
+        )
+        .await;
+        // The seed's view of the session's round fails once: the store is unavailable.
+        faulty.fail_run(Method::LoadRun, session, 1);
+
+        let mut tracker = SessionsTracker::seed(&backend, &caller, context, 1)
+            .await
+            .expect("seed");
+        // The next listing reads it again, and the parked round is reported as blocked.
+        let events = tracker
+            .refresh(&backend, &caller, "task-1", context, 1, &working())
+            .await;
+        let said: Vec<Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                TaskEvent::Status(update) => update
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get(CHILD_SESSIONS_EXTENSION))
+                    .cloned(),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<String> = said
+            .iter()
+            .map(|o| match o["report"].as_str() {
+                Some(report) => format!("{}:{report}", o["event"].as_str().unwrap_or("?")),
+                None => o["event"].as_str().unwrap_or("?").to_owned(),
+            })
+            .collect();
+        assert_eq!(names, ["opened", "reported:blocked"], "{said:?}");
     }
 }

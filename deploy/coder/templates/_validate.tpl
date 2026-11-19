@@ -271,6 +271,11 @@ from service.yaml, which every render contains, so they always run.
 {{- if lt (int64 $rp.readyTimeoutSecs) 1 -}}
 {{- fail "runPods.readyTimeoutSecs must be at least 1" -}}
 {{- end -}}
+{{- /* The Rust constants the chart cannot see: an idle pod is deleted after idleSecs, the sweep looks every 60 s and the
+       delete has a 2 s grace, so a run's wait must outlast all three or it gives up while a slot is about to free. */ -}}
+{{- if and (gt (int64 $rp.idleSecs) 0) (lt (int64 $rp.waitSecs) (add (int64 $rp.idleSecs) 62)) -}}
+{{- fail (printf "runPods.waitSecs (%d) must be at least runPods.idleSecs + 62 (%d): an idle pod's slot frees only after its idle life, the 60 s sweep and the 2 s delete grace, so a smaller wait gives up while a slot is about to free (set runPods.idleSecs=0 to keep the pod until the run ends)" (int64 $rp.waitSecs) (add (int64 $rp.idleSecs) 62)) -}}
+{{- end -}}
 {{- if not (kindIs "map" $rp.extraEnv) -}}
 {{- fail "runPods.extraEnv must be a name -> value map" -}}
 {{- end -}}

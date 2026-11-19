@@ -31,7 +31,8 @@ npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs   # dia
 ```
 
 CI also runs the MSRV build (`rust-version` in `Cargo.toml`), `cargo deny`, line coverage
-(`cargo llvm-cov nextest --workspace`), and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
+(`cargo llvm-cov nextest --workspace`, on main: the two conformance arms run the suite on every pull request),
+and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
 (`.github/workflows/nightly.yml`, needs secrets). The CI jobs are the reference:
 `.github/workflows/ci.yml` and `coder.yml`.
 
@@ -54,7 +55,7 @@ They are gated apart, so `ADAM_TEST_REQUIRE_DB=1` does not turn them on.
 | devcontainer | `ADAM_TEST_DEVCONTAINER=1` (`ADAM_TEST_REQUIRE_DEVCONTAINER=1` to fail instead of skip) | a rootless Podman service |
 | Kubernetes run pods (`adam-env-kubernetes`) | `ADAM_TEST_KUBECONFIG` (`ADAM_TEST_REQUIRE_KUBERNETES=1`) | a cluster; CI's `run-pods` job makes a `kind` cluster (the node image `ci.yml` pins, whose network plugin enforces `NetworkPolicy`) and runs `deploy/coder/tests/kind-run-pods.sh`, which you can run with `kind`: the cluster test, then the run pods' network policy and the egress proxy ([ADR 0042](../decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md); it fails where a policy is not enforced unless `ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1`), then the git sandbox ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), open decision 6): a pod made from the chart's own StatefulSet, with canaries for the secrets of the coder container, shows that the sandbox container has no token, Secret or view of the coder's processes, that a commit through its socket works, and that a scratch project whose `.git/config` names a clean filter and an fsmonitor runs them in the sandbox, with a marker that holds no canary, where plain git in the coder container (the control) reads them all; it builds `adam-egress`, `adam-git-sandbox` and `adam-git` with cargo and needs `docker`, `kubectl`, `helm` and `python3` |
 | git under a run pod's mounts (ADR 0041) | `ADAM_TEST_REQUIRE_MOUNTS=1` to fail instead of skip | root, `unshare` and `setpriv`: `sudo sh deploy/coder/tests/git-in-run-pod.sh` builds the pod's view with bind mounts (the read-only `HEAD`, `commondir`, `gitdir` and `logs` of the worktree's directory included: it tries to write, rename over, replace and remove them; and each slot as a mount of its own: it tries to rename, remove and exchange it and expects `EBUSY`) and runs real git in it |
-| the real language servers (ADR 0044 slice 17) | `ADAM_TEST_LANGUAGE_SERVERS=1` (`ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` to fail instead of skip) | `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls` and `dart` on `PATH` (each language is skipped without its server): [below](#the-language-server-tools). **No CI job runs it yet** |
+| the real language servers (ADR 0044 slice 17) | `ADAM_TEST_LANGUAGE_SERVERS=1` (`ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` to fail instead of skip) | `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls` and `dart` on `PATH` (each language is skipped without its server): [below](#the-language-server-tools). The `image` job of `.github/workflows/coder.yml` runs it in the built coder image |
 | `#[tool]` compile errors worded by rustc | `ADAM_TRYBUILD=1` | the CI toolchain (the `ui` job); the errors the macro writes itself always run ([`adam` README](../../crates/adam/README.md#tests)) |
 | live model; `adam-acp` against a live OpenCode (the coder no longer uses it) | `ADAM_TEST_OPENAI_*`, `ADAM_TEST_OPENCODE=1` | secrets |
 
@@ -103,17 +104,25 @@ cargo test --workspace --locked --features adam-llm-agent/schema,adam-assembly/d
 The real servers are a gated suite (`real_language_servers.rs`, `ADAM_TEST_LANGUAGE_SERVERS=1`): five tiny projects under
 `bin/adam-coder/tests/fixtures/language-servers/` (Rust, TypeScript, Python, Go, Dart), each with one deliberate error, driven through the
 tools with the production table: the error is reported at its line, the definition of `add` is found from its call, and its references hold
-the call. A language whose server is not on `PATH` is skipped; `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` makes that a failure. **No CI job
-runs it yet**: the coder image has no language server until its workspace pin is bumped, and the images repository checks its servers
-on its own. Run on 2026-11-17 on a machine with `rust-analyzer` 1.97.0 and `pyright-langserver`, both passed; the other two were not installed.
+the call. A language whose server is not on `PATH` is skipped; `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` makes that a failure. **The `image`
+job of `.github/workflows/coder.yml` runs it in the built coder image**, whose workspace base has the four servers
+(vymalo/another-agentic-images#15), with `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1`. Run on 2026-11-17 on a machine with `rust-analyzer`
+1.97.0 and `pyright-langserver`, both passed; the other two were not installed.
 
 ## What the store suite covers
 
-27 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
+48 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
 commits with one winner, journal ordering, first-writer-wins and 16-way races, non-determinism detection, due
 rules, agent filtering and limits, busy runs left unclaimed, 8 workers claiming 60 runs with no double lease,
 lease expiry and takeover, renew and release, pinned claims (an owned run never goes to another worker, 4 workers
-racing), one open run per conversation including a 16-way race, and purging.
+racing), one open run per conversation including a 16-way race, listing and counting (scoped, ordered, keyset
+pages, filters), push configurations, and purging.
+
+The write cost of a transcript-shaped run is measured, not asserted: `counting::measure_transcript_write`
+commits a 10 KB message 50 times through `CountingStore` and prints the bytes; `transcript_measurement!`
+emits the `measure_the_transcript_write` test in each adapter's test file, and `dev/p2-measure.sh` quotes the
+disk side. The baseline is in [ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md);
+S3 rewrites the workload to commit a head and a body, then asserts the bound.
 
 ## Adding a backend
 
@@ -125,7 +134,9 @@ superuser, for its reconnect test). See [Store adapters](../reference/store-adap
 
 Scripts in `dev/` drive the compose stack through A2A and assert the whole chain on the mocks. Each script's
 header lists its steps and variables. CI runs them in `.github/workflows/coder.yml` ("Compose e2e") on the image
-it has just built. Start the stack first:
+it has just built: a pull request runs the seven default coder scenarios and two App-mode ones (all 23 when it
+carries the `e2e-full` label or changes `dev/`, `docker/coder/` or `compose.yaml`), main and a manual `workflow_dispatch` run all of
+them. Start the stack first:
 
 ```sh
 docker compose --profile app up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server coder
@@ -152,4 +163,6 @@ documented in `dev/coder-e2e.sh`.
 | chart render guarantees | `sh deploy/coder/tests/render-check.sh` (also kubeconform and golden renders in CI), `sh deploy/coder/tests/bump-tag-test.sh` |
 | image smoke tests | `sh docker/coder/test/container-smoke.sh <image>`, `sh docker/coder/test/agent-smoke.sh <image>`; with `EXPECT_REVISION=<commit>` (the image's `ADAM_BUILD_REVISION`) they also check the card's version and `build/v1`. Both run `docker/coder/test/http-smoke.sh`, which also checks the card's two interfaces, that `/docs` and `/openapi.json` are public and that the HTTP+JSON binding needs the token |
 | shell scripts | `shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh` |
+| the transcript write measurement | `cargo test -p adam-store-testkit -p adam-store-postgres -p adam-store-mongodb measure_the_transcript_write -- --exact --nocapture` prints one `p2-measure:` line per adapter; the baseline is in [ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md) |
+| what a transcript-shaped run costs | `ADAM_TEST_POSTGRES_URL=... ADAM_TEST_MONGODB_URI=... sh dev/p2-measure.sh` runs the 50-commit measurement against the stack and prints `pg_relation_size`/`pg_total_relation_size`, the `pg_stat_wal` delta, `collStats` sizes and the WiredTiger block-manager and log deltas; a store whose variable is unset is skipped, so it is a no-op without the databases |
 | a model mock's streamed twin | `cargo test -p adam-model-openai --test wiremock_compose` (plays every script both ways) |

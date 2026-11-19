@@ -13,6 +13,11 @@ use std::process::ExitCode;
 use adam_agent::{Config, exit_code};
 use anyhow::Context as _;
 
+/// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
+/// (ADR 0053 decision 11).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Exit code 0 after a clean shutdown; otherwise the sysexits-style code of the error's root cause
 /// ([`adam_agent::exit`]: 78 configuration, 69 dependency unreachable, 71 OS error, 70 internal, 1
 /// anything else). The failure is one structured log line, with the whole cause chain, written by

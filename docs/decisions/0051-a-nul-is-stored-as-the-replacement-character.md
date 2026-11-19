@@ -39,6 +39,12 @@ class as permanent, so the run failed.
    The live transition and the replay therefore agree, and the model's next request is built from the stored value.
    *Amended 2026-11-18:* For these three methods, MongoDB builds the returned record and entry from the values it
    wrote instead of converting the stored document back to JSON; the requirement is unchanged.
+   *Amended 2026-11-19:* `create_run` and `commit_run` no longer return the state: their record carries
+   `state: null`, because the caller supplied it and it is the largest member of the record (PostgreSQL parsed it
+   back from `RETURNING` and MongoDB built it from the values it wrote, on every transition). The rule is unchanged
+   wherever the value is read back: `journal_put` still returns the payload it stored — the loop decodes the step's
+   outcome from it — and every read returns the stored state. The testkit case `a_write_does_not_echo_the_state`
+   pins both halves.
 4. **The testkit requires it.** `nul_characters_are_stored_as_the_replacement_character` replaces the old
    `nul_characters_roundtrip_or_reject_cleanly`, which accepted either behaviour: every adapter must now round-trip a
    NUL as U+FFFD, in the state and in a journal payload, for values and for keys.

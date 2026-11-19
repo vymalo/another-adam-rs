@@ -20,6 +20,7 @@
 // A conformance suite is test code: a failed unwrap is a failed assertion.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod counting;
 pub mod fault;
 
 pub use adam_core::testing::skipped;
@@ -47,7 +48,9 @@ macro_rules! store_conformance {
         $crate::store_conformance!(@cases $make;
             create_and_load, timestamps_keep_millisecond_precision, state_roundtrip,
             nul_characters_are_stored_as_the_replacement_character,
+            a_write_does_not_echo_the_state,
             create_duplicate_id, load_missing,
+            run_header_matches_the_record,
             commit_advances_version, commit_stale_version_conflicts, commit_missing_run,
             concurrent_commits_single_winner, journal_roundtrip_and_order,
             journal_first_writer_wins, journal_concurrent_writers_agree,
@@ -68,6 +71,7 @@ macro_rules! store_conformance {
             push_commit_detects_stale_versions_and_missing_configs,
             push_configs_go_with_their_run,
             list_runs_is_scoped_ordered_and_pages_by_keyset, list_runs_filters_by_status_and_time,
+            list_runs_prefix_status_filter_is_ordered_and_paged,
             list_runs_scopes_match_exactly, count_runs_ignores_the_page,
             list_runs_prefixes_with_slashes_match_literally,
             two_creates_with_different_ids_in_one_conversation_leave_one_open_run,
@@ -90,6 +94,38 @@ macro_rules! store_conformance {
                 $crate::cases::$case(store).await;
             }
         )*
+    };
+}
+
+/// Generate the `measure_the_transcript_write` test: run
+/// [`counting::measure_transcript_write`] through `$make`, print its line, and assert that the
+/// workload ran.
+///
+/// `$make` is a path to an `async fn() -> Option<DynStore>`, like [`store_conformance!`]: `None`
+/// skips the test (and fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
+///
+/// This is a measurement, not a conformance case: it asserts only that the workload ran. S3
+/// rewrites the workload to commit a head and a body, then adds the `< 50 × 20 KB` and
+/// `max < 20 KB` assertions here.
+#[macro_export]
+macro_rules! transcript_measurement {
+    ($make:path) => {
+        #[tokio::test]
+        async fn measure_the_transcript_write() {
+            let Some(store) = $make().await else {
+                $crate::skipped("measure_the_transcript_write: store not configured");
+                return;
+            };
+            store.migrate().await.expect("migrate");
+            let measured = $crate::counting::measure_transcript_write(store).await;
+            println!("{measured}");
+            assert_eq!(
+                measured.commits,
+                $crate::counting::Measurement::COMMITS,
+                "the workload ran to the end"
+            );
+            assert!(measured.total_written > 0, "the commits wrote state");
+        }
     };
 }
 
@@ -119,13 +155,72 @@ pub mod cases {
         assert_eq!(created.version, 1);
         assert!(created.created_at >= before - jiff::SignedDuration::from_secs(5));
         assert_eq!(created.created_at, created.updated_at);
+        assert!(
+            created.state.is_null(),
+            "a write does not echo the state: the caller has it"
+        );
 
         let loaded = store
             .load_run(created.id)
             .await
             .unwrap()
             .expect("run exists");
-        assert_eq!(loaded, created);
+        assert_eq!(
+            loaded.state, new.state,
+            "the stored state is the one written"
+        );
+        assert_eq!(
+            loaded,
+            adam_core::RunRecord {
+                state: loaded.state.clone(),
+                ..created
+            },
+            "every other field of the returned record is the stored one"
+        );
+    }
+
+    /// `create_run` and `commit_run` return the record without its state: the caller wrote it, and
+    /// echoing it back would transfer the largest member of the record on every commit.
+    /// `journal_put` is the exception: the loop decodes the step's outcome from what it returns.
+    pub async fn a_write_does_not_echo_the_state(store: DynStore) {
+        let state = json!({"turn": 0, "transcript": ["hello", "world"]});
+        let created = store
+            .create_run(NewRun::new(agent(), state.clone()))
+            .await
+            .unwrap();
+        assert!(created.state.is_null(), "create_run returns no state");
+        assert_eq!(
+            store.load_run(created.id).await.unwrap().unwrap().state,
+            state
+        );
+
+        let next = json!({"turn": 1});
+        let committed = store
+            .commit_run(
+                created.id,
+                created.version,
+                RunUpdate::new(RunStatus::Runnable, next.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(committed.state.is_null(), "commit_run returns no state");
+        assert_eq!(
+            store.load_run(created.id).await.unwrap().unwrap().state,
+            next
+        );
+
+        let entry = store
+            .journal_put(
+                created.id,
+                JournalEntry::ok(0, "tool", json!({"out": "a\u{0}b"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entry.payload,
+            json!({"out": "a\u{FFFD}b"}),
+            "journal_put returns the payload it stored"
+        );
     }
 
     /// The instant `.120` survives the column (a value whose serde bytes jiff's own serde would
@@ -195,7 +290,7 @@ pub mod cases {
             .create_run(NewRun::new(agent(), state.clone()))
             .await
             .unwrap();
-        assert_eq!(run.state, state);
+        assert!(run.state.is_null(), "a write does not echo the state");
         let loaded = store.load_run(run.id).await.unwrap().unwrap();
         assert_eq!(loaded.state, state, "state must roundtrip exactly");
 
@@ -204,7 +299,8 @@ pub mod cases {
             .commit_run(run.id, 1, RunUpdate::new(RunStatus::Runnable, next.clone()))
             .await
             .unwrap();
-        assert_eq!(committed.state, next);
+        assert!(committed.state.is_null());
+        assert_eq!(store.load_run(run.id).await.unwrap().unwrap().state, next);
         let array_state = json!([1, "two", {"three": 3}]);
         store
             .commit_run(
@@ -234,7 +330,7 @@ pub mod cases {
             ),
         ] {
             let run = store.create_run(NewRun::new(agent(), state)).await.unwrap();
-            assert_eq!(run.state, want, "create_run returns what is stored");
+            assert!(run.state.is_null(), "create_run returns no state");
             assert_eq!(
                 store.load_run(run.id).await.unwrap().unwrap().state,
                 want,
@@ -271,7 +367,7 @@ pub mod cases {
             )
             .await
             .unwrap();
-        assert_eq!(committed.state, json!({"text": "a\u{FFFD}b"}));
+        assert!(committed.state.is_null());
         assert_eq!(
             store.load_run(run.id).await.unwrap().unwrap().state,
             json!({"text": "a\u{FFFD}b"})
@@ -321,6 +417,78 @@ pub mod cases {
         assert_eq!(store.load_run(RunId::new()).await.unwrap(), None);
     }
 
+    /// `run_header` says what `load_run` and `lease_until` say together: the same run without its
+    /// state, and the lease that makes a worker's run `claimed` once it is taken. A finished run
+    /// is not `claimed` whatever lease it still carries, and an unknown id is `None`.
+    pub async fn run_header_matches_the_record(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})).conversation("c"))
+            .await
+            .unwrap();
+        assert_eq!(store.run_header(RunId::new()).await.unwrap(), None);
+
+        let header = store.run_header(run.id).await.unwrap().expect("a header");
+        let rec = store.load_run(run.id).await.unwrap().expect("the record");
+        assert_eq!(
+            (
+                header.id,
+                &header.agent,
+                &header.conversation_id,
+                header.parent_id,
+                header.status,
+                header.wake_at,
+                header.version,
+                header.created_at,
+                header.updated_at,
+            ),
+            (
+                rec.id,
+                &rec.agent,
+                &rec.conversation_id,
+                rec.parent_id,
+                rec.status,
+                rec.wake_at,
+                rec.version,
+                rec.created_at,
+                rec.updated_at,
+            ),
+            "the header is the record without its state"
+        );
+        assert_eq!(header.lease_until, None, "never claimed");
+        assert!(!header.claimed(now()));
+
+        let t = truncate_ms(now() + jiff::SignedDuration::from_secs(1));
+        let ttl = Duration::from_secs(10);
+        assert_eq!(
+            claim_ids(&store, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        let until = store.lease_until(run.id).await.unwrap().expect("a lease");
+        let header = store.run_header(run.id).await.unwrap().expect("a header");
+        assert_eq!(header.lease_until, Some(until));
+        assert!(header.claimed(t + jiff::SignedDuration::from_secs(1)));
+        assert!(!header.claimed(until), "the lease ends at `until`");
+
+        // A commit is visible in the header, and a finished run is never `claimed`, whatever
+        // lease it still carries (a commit does not touch the lease).
+        let rec = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Done, json!({"turn": 1})),
+            )
+            .await
+            .unwrap();
+        let header = store.run_header(run.id).await.unwrap().expect("a header");
+        assert_eq!(
+            (header.status, header.version),
+            (RunStatus::Done, rec.version)
+        );
+        assert_eq!(header.lease_until, Some(until), "the commit kept the lease");
+        assert!(!header.claimed(t + jiff::SignedDuration::from_secs(1)));
+    }
+
     pub async fn commit_advances_version(store: DynStore) {
         let run = store
             .create_run(NewRun::new(agent(), json!({"turn": 0})))
@@ -337,11 +505,20 @@ pub mod cases {
             .unwrap();
         assert_eq!(v2.version, 2);
         assert_eq!(v2.status, RunStatus::Parked);
-        assert_eq!(v2.state, json!({"turn": 1}));
+        assert!(v2.state.is_null(), "a commit does not echo the state");
         assert_eq!(v2.wake_at, Some(truncate_ms(wake)));
         assert_eq!(v2.created_at, run.created_at);
         assert!(v2.updated_at >= run.updated_at);
-        assert_eq!(store.load_run(run.id).await.unwrap().unwrap(), v2);
+        let stored = store.load_run(run.id).await.unwrap().unwrap();
+        assert_eq!(stored.state, json!({"turn": 1}));
+        assert_eq!(
+            stored,
+            adam_core::RunRecord {
+                state: stored.state.clone(),
+                ..v2
+            },
+            "every other field of the returned record is the stored one"
+        );
 
         let v3 = store
             .commit_run(
@@ -424,7 +601,11 @@ pub mod cases {
             .into_iter()
             .map(|r| r.unwrap())
             .collect();
-        let winners: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        let winners: Vec<_> = results
+            .iter()
+            .enumerate()
+            .filter_map(|(writer, r)| r.as_ref().ok().map(|rec| (writer, rec)))
+            .collect();
         assert_eq!(
             winners.len(),
             1,
@@ -438,9 +619,10 @@ pub mod cases {
                 );
             }
         }
+        assert!(winners[0].1.state.is_null(), "a commit echoes no state");
         let stored = store.load_run(run.id).await.unwrap().unwrap();
         assert_eq!(stored.version, 2);
-        assert_eq!(stored.state, winners[0].state);
+        assert_eq!(stored.state, json!({"writer": winners[0].0}));
     }
 
     pub async fn journal_roundtrip_and_order(store: DynStore) {
@@ -1194,8 +1376,12 @@ pub mod cases {
             .await
             .unwrap();
         assert_eq!(
-            store.open_run_for_conversation(&agent, "c").await.unwrap(),
-            Some(first.clone())
+            store
+                .open_run_for_conversation(&agent, "c")
+                .await
+                .unwrap()
+                .map(|run| run.id),
+            Some(first.id)
         );
 
         let err = store
@@ -1239,7 +1425,7 @@ pub mod cases {
             .unwrap();
 
         // Parking keeps the conversation busy; finishing frees it.
-        let parked = store
+        store
             .commit_run(
                 first.id,
                 1,
@@ -1248,8 +1434,12 @@ pub mod cases {
             .await
             .unwrap();
         assert_eq!(
-            store.open_run_for_conversation(&agent, "c").await.unwrap(),
-            Some(parked)
+            store
+                .open_run_for_conversation(&agent, "c")
+                .await
+                .unwrap()
+                .map(|run| (run.id, run.version, run.status)),
+            Some((first.id, 2, RunStatus::Parked))
         );
         store
             .commit_run(first.id, 2, RunUpdate::new(RunStatus::Done, json!("bye")))
@@ -1919,11 +2109,20 @@ pub mod cases {
                 .unwrap();
             // Distinct, increasing update times (milliseconds are the store's resolution).
             tokio::time::sleep(Duration::from_millis(3)).await;
-            made.push(run);
+            // A create returns the record without its state; the listing comparisons want the
+            // stored one.
+            made.push(
+                store
+                    .load_run(run.id)
+                    .await
+                    .unwrap()
+                    .expect("the created run"),
+            );
         }
-        // Commits move `updated_at`: the first run becomes the most recently updated.
+        // Commits move `updated_at`: the first run becomes the most recently updated. The commit
+        // returns the record without its state, so read it back for the listing comparisons.
         let first = made[0].clone();
-        made[0] = store
+        store
             .commit_run(
                 first.id,
                 first.version,
@@ -1931,6 +2130,11 @@ pub mod cases {
             )
             .await
             .unwrap();
+        made[0] = store
+            .load_run(first.id)
+            .await
+            .unwrap()
+            .expect("the committed run");
         made
     }
 
@@ -2027,6 +2231,64 @@ pub mod cases {
         assert!(since.iter().any(|r| r.id == all[1].id), "at or after");
         q.updated_since = Some(all[0].updated_at + jiff::SignedDuration::from_secs(1));
         assert!(store.list_runs(&q).await.unwrap().is_empty());
+    }
+
+    /// A prefix listing with a status filter returns the same rows in the same order as the
+    /// unfiltered page restricted to that status, and the keyset pages over it the same way.
+    /// This is the shape `ListTasks` sends, and the one the adapters index
+    /// (`runs_list INCLUDE (status)`, `adam_list_status`).
+    pub async fn list_runs_prefix_status_filter_is_ordered_and_paged(store: DynStore) {
+        let agent = agent();
+        let made = listing_fixture(&store, &agent).await;
+        // `made[2]` (`a:2`) and `made[5]` (`a:4`) become the two parked runs of the prefix, in
+        // that order, so the filtered page is not creation order: `a:4` is updated last.
+        let mut parked = Vec::new();
+        for at in [2, 5] {
+            parked.push(
+                store
+                    .commit_run(
+                        made[at].id,
+                        made[at].version,
+                        RunUpdate::new(RunStatus::Parked, json!("still waiting")),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        let fields = |r: &adam_core::RunRecord| (r.id, r.status, r.updated_at, r.version);
+        let mut want: Vec<_> = parked.iter().map(fields).collect();
+        want.sort_by_key(|(_, _, at, _)| std::cmp::Reverse(*at));
+        assert_eq!(want.len(), 2, "a:2 and a:4 are parked");
+
+        let mut query = RunQuery::new(&agent, ConversationScope::Prefix("a:".into()), 100);
+        query.statuses = Some(vec![RunStatus::Parked]);
+        let page = store.list_runs(&query).await.unwrap();
+        assert_eq!(
+            page.iter().map(fields).collect::<Vec<_>>(),
+            want,
+            "the status filter keeps the page's order"
+        );
+        assert_eq!(store.count_runs(&query).await.unwrap(), 2);
+
+        // Keyset pages of one cover the filtered list once each, in order.
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let mut q = query.clone();
+            q.limit = 1;
+            q.after = after;
+            let page = store.list_runs(&q).await.unwrap();
+            assert!(page.len() <= 1);
+            seen.extend(page.iter().map(fields));
+            match page.last() {
+                Some(last) if !page.is_empty() && seen.len() < want.len() => {
+                    after = Some((last.updated_at, last.id));
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(seen, want);
     }
 
     pub async fn list_runs_scopes_match_exactly(store: DynStore) {

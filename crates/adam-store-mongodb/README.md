@@ -14,7 +14,8 @@ binary picks one at composition time.
 There are none. A standalone `mongod` has no change streams (they need a replica
 set), and this adapter promises to work on one, so workers of other processes
 find new runs by polling `claim_due` (`poll_interval`), and a cancel issued by
-another process reaches a running step at its next poll. The
+another process reaches a running step at its next cancel poll
+(`cancel_poll_interval`, 1 s by default). The
 [`adam-notify-postgres`](../adam-notify-postgres/README.md) adapter needs a
 PostgreSQL, so it fits when that is the store (or one on the side); otherwise
 accept the poll latency.
@@ -25,7 +26,14 @@ accept the poll latency.
 * `MongoStore::new(database)`: reuse your application's `Database` handle.
 * `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
-* `MongoStore::database()`, `SCHEMA_VERSION` (3).
+* `MongoStore::database()`, `SCHEMA_VERSION` (4).
+* `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
+  state, and returning it would convert the document back on every transition. `load_run`, the claim
+  and the listings return the stored state; `journal_put` returns the stored payload (the loop
+  decodes the step's outcome from it).
+* `run_header` is one `find_one` projected to the header and `lease_until`: the state is never read,
+  so a reader that only needs the run's own bookkeeping (a cancel watch, a parent check) pays for one
+  small document.
 * `codec::{json_to_bson, bson_to_json, encode_key, decode_key}`: the reversible key escaping
   (`$ref`, dotted, empty keys, NUL). Ordinary keys are stored verbatim, so
   `state.messages.0.role` is still a valid query path. The store replaces a NUL with U+FFFD before
@@ -34,6 +42,12 @@ accept the poll latency.
 * The `Store` implementation: call `migrate()` once at boot. It replaces a NUL
   with U+FFFD before the codec (`adam_core::storable`), as every adapter does
   ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
+
+A commit reads the current document projected to the metadata it needs (`agent`, `conversation_id`,
+the version, the parent and the creation time): it never reads the state it is about to replace.
+`journal_put` inserts the entry and, when the run still exists, returns it as it was written; a
+duplicate key means an earlier writer won, and their entry is read back. A journaled step is two
+round trips rather than the four of read, check, insert, check. `lease_until` reads one field.
 
 ```rust
 use std::sync::Arc;
@@ -64,14 +78,30 @@ requirement is `3.9` (verified 2026-09-29, `Cargo.toml`).
 `cursor` as BSON, the scheduling fields (`state`, `next_attempt_at`, `lease_until`) and `version`.
 Indexes: `(agent, state, next_attempt_at)` for claiming and `(run_id, id)` for listing. Runs get `adam_list`
 (`agent, conversation_id, updated_at -1, _id -1`) for `list_runs`, which matches a conversation prefix with an anchored,
-escaped regular expression and leaves out runs a purge has tombstoned. Claiming is
+escaped regular expression: a listing of one conversation is read in index order, while a prefix is a range over the
+index, so its page is a blocking sort of the matching runs. Claiming is
 a loop of `findOneAndUpdate` (each atomic on its document, so two workers never lease one config),
 progress is `findOneAndUpdate({_id, version: expected})`, and the purge deletes a purged run's
 configs after its journal. Still single-document writes only, so a standalone `mongod` is enough.
 
+## Schema version 4: the status-filtered listing index
+
+`adam_list_status` (`agent, status, conversation_id, updated_at -1, _id -1`) is the same listing with a status filter.
+`status` is an equality bound before `conversation_id`, so the index yields the runs of that status and the prefix is a
+range inside it: a page fetches its own rows instead of every candidate the filter excludes (`explain` on 2 000 runs:
+10 documents examined for a page of 10, against 500 fetched to test the filter without it). It serves the order of a
+listing of **one conversation** (`agent`, `status` and `conversation_id` are equalities, so `updated_at, _id` is the
+index's order and no sort runs); a **prefix** listing — the default `ListTasks` path — still sorts its matches, because
+the range on `conversation_id` breaks the order. The index bounds that sort to the matching entries and keeps the state
+of the ones it drops out of it. Neither listing index carries `purging`: a tombstoned run is left out of `commit_run`,
+and a listing may show one until the sweep deletes it — up to a batch of deletes, or the next sweep after a crash.
+
+`ensure_indexes` matches an existing index **by name only**, so a future change to `adam_list_status`'s keys needs a new
+name: reusing the name would leave every existing database on the old keys, silently.
+
 ## Schema version and the owner field
 
-`SCHEMA_VERSION` is 2. Version 2 adds an `owner` field to run documents, set by the first pinned
+The owner field is schema version 2. Version 2 adds an `owner` field to run documents, set by the first pinned
 claim (`ClaimScope::Pinned`, see
 [`adam-core`](../adam-core/README.md#claim-scope-and-the-run-owner)). No data is rewritten: a
 document without the field reads as `owner: null` (`{ owner: null }` matches a missing field), so
@@ -116,9 +146,10 @@ None.
 field) is claimable and then pinned; `src/codec.rs` has property
 tests of the key escaping; `src/lib.rs` has unit tests of the error classes
 (`driver_errors_are_classified_by_what_they_mean`,
-`the_driver_error_is_kept_as_the_source`) and of what a write returns
+`the_driver_error_is_kept_as_the_source`), of what a write returns
 (`returned_value_tests`: the cleaned value it stored, without converting the stored document
-back to JSON).
+back to JSON) and of the round trips a journal entry costs (`round_trip_tests`, counting the
+driver's command events).
 
 | Variable | Meaning |
 |---|---|

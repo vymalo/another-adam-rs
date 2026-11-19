@@ -188,6 +188,9 @@ impl NewRun {
 }
 
 /// Input for [`Store::commit_run`]: the next state of the run.
+///
+/// The returned record does not echo `state` ([`Store::commit_run`]): the caller wrote it, and a
+/// commit that transferred the whole state back would pay for the largest member twice.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunUpdate {
     pub status: RunStatus,
@@ -230,6 +233,61 @@ impl RunRecord {
     pub fn sched_at(&self) -> Option<Timestamp> {
         sched_at(self.status, self.wake_at, self.updated_at)
     }
+}
+
+/// A run without its state: what a reader that only needs the run's own bookkeeping reads — its
+/// status, its version, its lease.
+///
+/// The state is the largest member of a run (for an `LlmAgent`, the transcript), and some readers
+/// never look at it: a step's cancel watch, a parent check, a listing that builds its view from the
+/// record it already has. [`Store::run_header`] answers this: an adapter that overrides it projects
+/// the header and the lease, so it costs one small read where [`Store::load_run`] transfers the
+/// whole run; the trait's default reads the record.
+///
+/// It does not answer an A2A task's state: `input-required` is `waiting`, which the runtime derives
+/// from the envelope's wake bookkeeping, so a task needs the view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunHeader {
+    /// The run.
+    pub id: RunId,
+    /// Name of its agent.
+    pub agent: String,
+    /// Its conversation, if any.
+    pub conversation_id: Option<String>,
+    /// The run it works for, if it is a child.
+    pub parent_id: Option<RunId>,
+    /// Lifecycle status.
+    pub status: RunStatus,
+    /// Timer: when a parked run wakes, or a runnable run becomes due.
+    pub wake_at: Option<Timestamp>,
+    /// Starts at 1 on creation and increases by exactly 1 per successful commit.
+    pub version: u64,
+    /// When the run was created.
+    pub created_at: Timestamp,
+    /// Last commit time.
+    pub updated_at: Timestamp,
+    /// When the lease on the run ends, or `None` if it has none (never claimed, or released).
+    /// A lease that ran out is still reported: whether it still counts is for the caller's clock
+    /// (see [`claimed`](Self::claimed)).
+    pub lease_until: Option<Timestamp>,
+}
+
+impl RunHeader {
+    /// Whether a worker holds an unexpired lease on the run: it is being stepped right now,
+    /// though nothing has been committed yet. [`claimed`] is the rule; this is it for a header.
+    pub fn claimed(&self, now: Timestamp) -> bool {
+        claimed(self.status, self.lease_until, now)
+    }
+}
+
+/// Whether a worker holds an unexpired lease on a run: it is being stepped right now, though
+/// nothing has been committed yet.
+///
+/// The one rule of [`RunHeader::claimed`], a runtime view's `claimed`, and a listing that builds a
+/// view from a record it already has: only a runnable run is being stepped, whatever lease a parked
+/// or finished one still carries, and a lease that ran out (the worker died) does not count.
+pub fn claimed(status: RunStatus, lease_until: Option<Timestamp>, now: Timestamp) -> bool {
+    status == RunStatus::Runnable && lease_until.is_some_and(|until| until > now)
 }
 
 /// Whose runs a claim may take (see [`Store::claim_due`]).
@@ -406,8 +464,12 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// provides a conformance suite every implementation should pass.
 ///
 /// Every JSON value a method writes is passed through [`storable`] first (a NUL in a string or a
-/// key becomes U+FFFD), and the method returns the value it stored, so the same run reads the same
-/// bytes on every backend and a tool that printed a NUL does not fail it.
+/// key becomes U+FFFD), so the same run reads the same bytes on every backend and a tool that
+/// printed a NUL does not fail it. A read returns the stored value. [`Store::journal_put`] returns
+/// the payload it stored (the loop decodes the step's outcome from it) and the push methods return
+/// the cleaned configuration and cursor; [`Store::create_run`] and [`Store::commit_run`] return the
+/// record without its state ([`RunRecord::state`] is [`Value::Null`]), which the caller wrote and
+/// does not need echoed back on every transition.
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
     /// Create tables/collections and indexes. Idempotent and safe to call
@@ -420,9 +482,42 @@ pub trait Store: Send + Sync + 'static {
     /// [`StoreError::ConversationBusy`] if the run is open and its
     /// conversation already has an open run. A deterministic id makes this
     /// an idempotent "fire once" (e.g. one run per schedule tick).
+    ///
+    /// The returned record carries no state ([`RunRecord::state`] is [`Value::Null`]): the caller
+    /// supplied it, and a read returns the stored one (a store may have replaced a NUL in it).
     async fn create_run(&self, run: NewRun) -> StoreResult<RunRecord>;
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>>;
+
+    /// The run's header — everything about it but its state — or `None` if it does not exist.
+    ///
+    /// **The default implementation reads twice**: [`lease_until`](Self::lease_until) and then
+    /// [`load_run`](Self::load_run), which it projects. An adapter that can answer both in one
+    /// statement overrides it: PostgreSQL selects the header columns and the lease together,
+    /// MongoDB projects them in one `find_one`, so neither reads the state.
+    ///
+    /// The lease is read **before** the record, as the runtime's `view` does: a claim that lands
+    /// between the two reads then reads as not yet, and a step that committed and released is read
+    /// with the version it committed. A reader that needs the state as well reads
+    /// [`load_run`](Self::load_run) instead.
+    async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
+        let lease_until = self.lease_until(id).await?;
+        let Some(rec) = self.load_run(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(RunHeader {
+            id: rec.id,
+            agent: rec.agent,
+            conversation_id: rec.conversation_id,
+            parent_id: rec.parent_id,
+            status: rec.status,
+            wake_at: rec.wake_at,
+            version: rec.version,
+            created_at: rec.created_at,
+            updated_at: rec.updated_at,
+            lease_until,
+        }))
+    }
 
     /// Atomically replace the run's status/state/wake_at if its version is
     /// still `expected_version`, and return the new record (version + 1).
@@ -431,6 +526,11 @@ pub trait Store: Send + Sync + 'static {
     /// [`StoreError::NotFound`] if the run doesn't exist, and
     /// [`StoreError::ConversationBusy`] if re-opening a finished run would give
     /// its conversation two open runs. Does not touch the lease.
+    ///
+    /// The returned record carries no state ([`RunRecord::state`] is [`Value::Null`]): the caller
+    /// supplied `update.state`, and a read returns the stored one. Every other field is the stored
+    /// one, so a caller that reports the commit (the version, the status, the parent notice) reads
+    /// it here and does not decode the state it already has.
     async fn commit_run(
         &self,
         id: RunId,
@@ -451,6 +551,10 @@ pub trait Store: Send + Sync + 'static {
     /// the entry that is recorded afterwards: `entry` if this call won, or the
     /// earlier winner. Errors with [`StoreError::NonDeterminism`] if the
     /// recorded entry has a different step name.
+    ///
+    /// The entry returned is the stored one, payload included: the payload went through
+    /// [`storable`], and the loop decodes the step's outcome from what is returned, so it must be
+    /// the bytes a replay will read.
     async fn journal_put(&self, run: RunId, entry: JournalEntry) -> StoreResult<JournalEntry>;
 
     /// All journal entries of a run, ordered by `seq`.
