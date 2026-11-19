@@ -124,7 +124,7 @@ pub fn confine(root: &SlotDir, rel: &str, access: Access) -> Result<Confined, St
             Ok(Confined { parts: resolved })
         }
         Access::Write => {
-            locate_for_write(root, &parts, shown, false)?;
+            locate_parts(root, &parts, shown, false)?;
             Ok(Confined { parts })
         }
     }
@@ -170,23 +170,63 @@ pub fn open_for_read(root: &SlotDir, rel: &str) -> Result<(fs::File, Meta), Stri
 /// Where a write goes: the directory the file is in, as a descriptor, and the file.
 pub struct Located {
     /// What the model called the file.
-    pub shown: String,
+    shown: String,
     /// The slot, for the checkpoints of the tests.
-    pub slot: PathBuf,
+    slot: PathBuf,
     /// The directory of the file; `None` when it (or a directory above it) is not there yet and
     /// nothing was made.
-    pub parent: Option<Dir>,
+    parent: Option<Dir>,
     /// The file's name in that directory.
-    pub name: OsString,
+    name: OsString,
     /// What is at `name`, without following it.
-    pub existing: Option<Meta>,
+    existing: Option<Meta>,
+}
+
+impl Located {
+    /// What the model called the file.
+    pub fn shown(&self) -> &str {
+        &self.shown
+    }
+
+    /// The name of the root, for the checkpoints of a test's races; nothing is opened by it.
+    pub fn slot(&self) -> &Path {
+        &self.slot
+    }
+
+    /// The directory of the file, held; `None` when it (or one above it) is not there and nothing
+    /// was made.
+    pub fn parent(&self) -> Option<&Dir> {
+        self.parent.as_ref()
+    }
+
+    /// The file's name in that directory.
+    pub fn name(&self) -> &std::ffi::OsStr {
+        &self.name
+    }
+
+    /// What is at the name now, without following it.
+    pub fn existing(&self) -> Option<&Meta> {
+        self.existing.as_ref()
+    }
 }
 
 /// Find the directory a write to `parts` goes in, relative to `root`, making the directories that
-/// are missing when `create` is set, and what is at the file now. Refuses (as [`confine`] says) a
-/// link anywhere on the way, the file itself included, a file where a directory is needed and a
-/// directory where the file is to be.
-pub fn locate_for_write(
+/// are missing when `create` is set, and what is at the file now. `rel` is checked as [`confine`]
+/// checks it (empty, absolute, `..`, `.git` and the root are refused) before anything is looked at;
+/// then a link anywhere on the way, the file itself included, a file where a directory is needed and
+/// a directory where the file is to be are refused.
+///
+/// # Errors
+///
+/// The reason the model is told.
+pub fn locate_for_write(root: &SlotDir, rel: &str, create: bool) -> Result<Located, String> {
+    let parts = parts_of(rel)?;
+    locate_parts(root, &parts, rel.trim(), create)
+}
+
+/// [`locate_for_write`] for `parts` that [`parts_of`] gave: never called with parts of another
+/// origin, so it is not public.
+fn locate_parts(
     root: &SlotDir,
     parts: &[OsString],
     shown: &str,
@@ -292,6 +332,36 @@ mod tests {
         assert!(refused.contains("leads outside"), "{refused}");
         let missing = confine(&root, "src/none.rs", Access::Read).unwrap_err();
         assert!(missing.contains("does not exist"), "{missing}");
+    }
+
+    /// `locate_for_write` is a door of its own: it checks the path as `confine` does, so a caller
+    /// that never asked `confine` still cannot write into `.git` (a hook that runs on the next
+    /// commit) or leave the place.
+    #[test]
+    fn locate_for_write_checks_the_path_itself() {
+        let (dir, root) = place();
+        std::fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        for (path, said) in [
+            (".git/hooks/pre-commit", "inside .git"),
+            ("src/.Git/x", "inside .git"),
+            ("../escape", "goes up"),
+            ("/tmp/x", "absolute path"),
+        ] {
+            for create in [false, true] {
+                let Err(refused) = locate_for_write(&root, path, create) else {
+                    panic!("{path:?} create={create}: located");
+                };
+                assert!(
+                    refused.contains(said),
+                    "{path:?} create={create}: {refused}"
+                );
+            }
+        }
+        assert!(!dir.path().join(".git/hooks/pre-commit").exists());
+        let located = locate_for_write(&root, " src/new.rs ", true).unwrap();
+        assert_eq!(located.shown(), "src/new.rs");
+        assert_eq!(located.name(), "new.rs");
+        assert!(located.parent().is_some() && located.existing().is_none());
     }
 
     #[test]

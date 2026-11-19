@@ -393,9 +393,7 @@ fn write_in(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String>
             content.len()
         ));
     }
-    let shown = rel.trim();
-    let parts = parts_of(rel)?;
-    let located = locate_for_write(root, &parts, shown, true)?;
+    let located = locate_for_write(root, rel, true)?;
     write_located(&located, content)
 }
 
@@ -403,11 +401,11 @@ fn write_in(root: &SlotDir, rel: &str, content: &str) -> Result<Written, String>
 /// (`O_EXCL`, so nothing is followed), written, and renamed over the target.
 fn write_located(located: &Located, content: &str) -> Result<Written, String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let shown = &located.shown;
-    let Some(parent) = &located.parent else {
+    let shown = located.shown();
+    let Some(parent) = located.parent() else {
         return Err(format!("`{shown}` has no directory to be written in"));
     };
-    race::checkpoint(&located.slot, "write");
+    race::checkpoint(located.slot(), "write");
     let tmp = OsString::from(format!(
         ".adam-write-{}-{}.tmp",
         std::process::id(),
@@ -418,18 +416,18 @@ fn write_located(located: &Located, content: &str) -> Result<Written, String> {
         let mut file = parent.create_new(&tmp)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
-        if let Some(meta) = &located.existing {
+        if let Some(meta) = located.existing() {
             file.set_permissions(fs::Permissions::from_mode(meta.permissions()))?;
         }
         drop(file);
-        parent.rename(&tmp, &located.name)
+        parent.rename(&tmp, located.name())
     })();
     if let Err(e) = written {
         let _ = parent.unlink(&tmp);
         return Err(format!("cannot write `{shown}`: {e}"));
     }
     Ok(Written {
-        created: located.existing.is_none(),
+        created: located.existing().is_none(),
         bytes: content.len(),
     })
 }
@@ -1288,10 +1286,9 @@ fn edit_in(
     if old == new {
         return Err("old and new are the same text: there is nothing to change".into());
     }
-    let parts = parts_of(rel)?;
-    let located = locate_for_write(root, &parts, shown, false)?;
+    let located = locate_for_write(root, rel, false)?;
     race::checkpoint(root.path(), "edit");
-    let (Some(parent), Some(meta)) = (&located.parent, located.existing) else {
+    let (Some(parent), Some(meta)) = (located.parent(), located.existing().copied()) else {
         return Err(format!(
             "`{shown}` does not exist: edit_file changes a file that is there (write_file \
              creates one)"
@@ -1307,7 +1304,7 @@ fn edit_in(
         ));
     }
     let (file, _) = parent
-        .open_regular(&located.name)
+        .open_regular(located.name())
         .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
     let mut bytes = Vec::new();
     file.take(WRITE_CAP as u64 + 1)
