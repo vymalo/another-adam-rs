@@ -36,6 +36,22 @@ test('the grades are 1, 1, 0: a wrong answer fails, the right ones pass, for bot
   }
 });
 
+test('a plan folds the ledger once, not once per run and twice per new run', async (t) => {
+  const f = await fixture(t);
+  let folds = 0;
+  const fold = f.ledger.fold.bind(f.ledger);
+  f.ledger.fold = () => {
+    folds += 1;
+    return fold();
+  };
+  const plan = [spec(f, 'hello-1', 'adam'), spec(f, 'hello-1', 'opencode'), spec(f, 'fix-add-1', 'adam')];
+  const out = await runPlan({ deps: f.deps(), plan });
+  assert.deepEqual(out.map((o) => o.state), ['Done', 'Done', 'Done']);
+  // resumeLedger reads the ledger once, and runPlan once after the resume records; advance uses that map and folds the
+  // one Planned record of a new run instead of replaying the ledger, which made a plan O(n^2) in its records.
+  assert.equal(folds, 2);
+});
+
 test('the ledger cost is the scripted usage times the price, for each run and in total, and the model saw exactly those calls', async (t) => {
   const f = await fixture(t);
   await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'adam'), spec(f, 'hello-1', 'opencode')] });
