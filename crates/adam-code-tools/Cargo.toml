@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# `GitAt::plain` and `GitAt::refused`, for the tests of a crate that uses the tools.
+test-util = []
+
 [dependencies]
 adam-llm-agent.workspace = true
 adam-runtime.workspace = true
