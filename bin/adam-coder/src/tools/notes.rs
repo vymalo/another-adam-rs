@@ -1181,7 +1181,7 @@ impl NotesStore {
         Ok(Some(notes))
     }
 
-    /// The notes of `run`, parsed once per version of the file (see [`shared`](Self::shared)).
+    /// The notes of `run`, parsed once per version of the file (see `shared`).
     ///
     /// # Errors
     ///
