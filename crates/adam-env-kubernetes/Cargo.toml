@@ -21,13 +21,14 @@ serde_json.workspace = true
 serde-saphyr.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
 adam-workspace = { workspace = true, features = ["test-util"] }
 http.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 tower-test.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "process", "signal", "sync", "time", "macros", "rt-multi-thread"] }
 

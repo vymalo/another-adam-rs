@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock};
 
 use adam_llm_agent::StepIo;
 use adam_workspace::{DynGitCredentials, GitCredentials, RepoRef, WorkspaceError};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
@@ -63,6 +64,10 @@ struct Registered {
     /// Every needle of both, longest first, so that a secret that contains another is replaced
     /// whole.
     needles: Vec<String>,
+    /// Every needle at once: [`scrub`](Redactor::scrub) scans a text with this, once, rather than
+    /// once per needle. `None` when the build failed (more needles than the machine can index):
+    /// `scrub` then replaces them one at a time.
+    automaton: Option<AhoCorasick>,
     /// The length of the longest needle (its base64 and other derived forms included).
     longest: usize,
 }
@@ -83,6 +88,16 @@ impl Registered {
         needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
         needles.dedup();
         self.longest = needles.first().map_or(0, String::len);
+        // Leftmost, then longest: where two values overlap, the one that starts first is replaced
+        // and, of those that start together, the longest, so a value that contains another is
+        // replaced whole. A contiguous NFA, never the DFA the builder would pick for a few
+        // needles: one secret of 150 KB (its Base64 forms are 200 KB) makes a DFA table hundreds
+        // of megabytes and minutes of build, while the NFA stays linear in the needles.
+        self.automaton = AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongest)
+            .kind(Some(AhoCorasickKind::ContiguousNFA))
+            .build(needles.iter().map(String::as_bytes))
+            .ok();
         self.needles = needles;
     }
 }
@@ -279,14 +294,32 @@ impl Redactor {
     }
 
     /// `text` with every registered value replaced by [`REDACTED`].
+    ///
+    /// One scan, leftmost and then longest: where values overlap, the one that starts first is
+    /// replaced, and of those that start together the longest, so a value that contains another is
+    /// replaced whole. The mark is not scanned again: a value that happens to read like a part of
+    /// `[redacted]` is not rewritten inside it.
     pub fn scrub<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        let mut out = Cow::Borrowed(text);
-        for needle in &self.read().needles {
-            if out.contains(needle.as_str()) {
-                out = Cow::Owned(out.replace(needle.as_str(), REDACTED));
-            }
+        let known = self.read();
+        let Some(automaton) = &known.automaton else {
+            // The automaton could not be built: redact one needle at a time, as before.
+            return sequential_scrub(&known.needles, text);
+        };
+        let mut out: Option<String> = None;
+        let mut copied = 0;
+        for found in automaton.find_iter(text.as_bytes()) {
+            let clean = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            clean.push_str(&text[copied..found.start()]);
+            clean.push_str(REDACTED);
+            copied = found.end();
         }
-        out
+        match out {
+            Some(mut clean) => {
+                clean.push_str(&text[copied..]);
+                Cow::Owned(clean)
+            }
+            None => Cow::Borrowed(text),
+        }
     }
 
     /// [`scrub`](Self::scrub) for an owned string.
@@ -389,6 +422,18 @@ fn urlencoding_decode(s: &str) -> Result<String, std::string::FromUtf8Error> {
         }
     }
     String::from_utf8(out)
+}
+
+/// The sequential replacement [`Redactor::scrub`] made before it had an automaton: kept for a
+/// build that fails, and the oracle of the test that compares the two.
+fn sequential_scrub<'a>(needles: &[String], text: &'a str) -> Cow<'a, str> {
+    let mut out = Cow::Borrowed(text);
+    for needle in needles {
+        if out.contains(needle.as_str()) {
+            out = Cow::Owned(out.replace(needle.as_str(), REDACTED));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -731,5 +776,84 @@ mod tests {
             r.scrub(&format!("key={body} and {}", key.pkcs8_pem.trim())),
             "key=[redacted] and [redacted]"
         );
+    }
+
+    /// The one-pass scan replaces what the old per-needle loop replaced, on the values whose order
+    /// the loop made no difference for: a prefix, a Base64 pair (the padded form contains the bare
+    /// one), and repeats. `sequential_scrub` is the old loop, kept as the oracle.
+    #[test]
+    fn the_one_pass_scrub_agrees_with_the_sequential_one_where_the_order_is_the_position() {
+        let r = Redactor::new(["abcd", "abcd-longer", "sk-secret-value"]);
+        let padded = STANDARD.encode("sk-secret-value");
+        let bare = STANDARD_NO_PAD.encode("sk-secret-value");
+        let basic = STANDARD.encode("x-access-token:sk-secret-value");
+        for text in [
+            "abcd and abcd-longer".to_owned(),
+            "abcd-longer, then abcd".to_owned(),
+            "sk-secret-value / sk-secret-value".to_owned(),
+            format!("Basic {padded} and {bare}"),
+            format!("Authorization: Basic {basic}"),
+            "nothing to replace".to_owned(),
+        ] {
+            assert_eq!(
+                r.scrub(&text),
+                sequential_scrub(&r.read().needles, &text),
+                "{text}"
+            );
+        }
+    }
+
+    /// Where two values overlap at different starts, the scan takes the leftmost and then the
+    /// longest; the old loop took whichever needle came first in its longest-first list. Both
+    /// leave no value whole. The mark is never scanned again, so a value that reads like a part of
+    /// it is not rewritten inside it (the old loop rewrote `[redacted]` itself).
+    #[test]
+    fn overlapping_values_are_replaced_leftmost_then_longest_and_the_mark_is_not_rescanned() {
+        let r = Redactor::new(["bcde", "abcd"]);
+        assert_eq!(r.scrub("abcde"), "[redacted]e");
+        let r = Redactor::new(["abcd", "abcdefgh"]);
+        assert_eq!(r.scrub("x abcdefgh y"), "x [redacted] y");
+        let r = Redactor::new(["reda", "secret-value"]);
+        assert_eq!(r.scrub("secret-value"), REDACTED);
+        assert!(!r.scrub("secret-value").contains("secret-value"));
+    }
+
+    /// The 650 needles an App deployment can hold (130 installation tokens, five forms each) over
+    /// a megabyte: one scan finds them all, and a text with none is returned without a copy.
+    #[test]
+    fn six_hundred_and_fifty_needles_scan_a_megabyte_once() {
+        let secrets: Vec<String> = (0..130)
+            .map(|n| format!("ghs_installation_token_{n:04}_abcdefghijklmnop"))
+            .collect();
+        let r = Redactor::new(&secrets);
+        assert_eq!(r.read().needles.len(), 5 * secrets.len());
+        let mut text = "x".repeat(1024 * 1024);
+        for (n, secret) in secrets.iter().step_by(13).enumerate() {
+            let at = 10_000 + n * 100_000;
+            text.replace_range(at..at + secret.len(), secret);
+        }
+        let clean = r.scrub(&text);
+        for secret in &secrets {
+            assert!(!clean.contains(secret), "a secret is left: {secret}");
+        }
+        assert_eq!(
+            clean.matches(REDACTED).count(),
+            secrets.iter().step_by(13).count()
+        );
+        assert!(matches!(r.scrub("nothing here"), Cow::Borrowed(_)));
+    }
+
+    /// A secret of 150 KB (its Base64 forms are 200 KB) builds the automaton the linear way: the
+    /// builder would pick a DFA for a few needles, and that table is hundreds of megabytes and
+    /// minutes of build. It is still replaced.
+    #[test]
+    fn a_secret_of_150_kib_builds_a_linear_automaton() {
+        let secret = "S".repeat(150_000);
+        let r = Redactor::new([secret.as_str()]);
+        assert_eq!(
+            r.read().automaton.as_ref().unwrap().kind(),
+            AhoCorasickKind::ContiguousNFA
+        );
+        assert_eq!(r.scrub(&format!("a{secret}b")), "a[redacted]b");
     }
 }

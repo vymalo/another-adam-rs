@@ -16,6 +16,11 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+use tokio::io::AsyncReadExt as _;
 
 use adam_a2a::AccessTier;
 use serde::{Deserialize, Serialize};
@@ -1169,6 +1174,41 @@ impl RunNotes {
     }
 }
 
+/// What a cached parse was made from: the file's identity and the moment it was written. A write
+/// that keeps the inode, the length and the time is **not** seen (a cache hit); every writer here
+/// replaces the file by a rename ([`NotesStore::save`]), which changes the inode, and a writer in
+/// place changes the length or the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    inode: u64,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let inode = meta.ino();
+        #[cfg(not(unix))]
+        let inode = 0;
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            inode,
+        }
+    }
+}
+
+/// One run's parsed notes, and what they were parsed from.
+#[derive(Debug)]
+struct Cached {
+    stamp: Stamp,
+    notes: Arc<RunNotes>,
+}
+
+/// The most runs whose notes one process keeps parsed: a worker runs a handful at once.
+const MAX_CACHED_NOTES: usize = 64;
+
 /// Where the notes of every run live.
 #[derive(Debug, Clone)]
 pub struct NotesStore {
@@ -1176,6 +1216,14 @@ pub struct NotesStore {
     /// One lock per run, shared by every clone of the store: what makes [`update`](Self::update) one
     /// step for the calls of a turn that run at the same time.
     locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// The parsed notes of each run, keyed by the file they were parsed from. A turn reads them
+    /// several times (the tier before a call, the instructions, the check counters) and the file
+    /// changes only when a call or the agent writes it, so parsing them again per call is the cost
+    /// of a stat.
+    cache: Arc<Mutex<HashMap<String, Cached>>>,
+    /// How many notes files this store read and parsed: the tests count a turn's parses.
+    #[cfg(test)]
+    parses: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl NotesStore {
@@ -1184,6 +1232,9 @@ impl NotesStore {
         Self {
             dir: workspace_root.join("coder"),
             locks: Arc::default(),
+            cache: Arc::default(),
+            #[cfg(test)]
+            parses: Arc::default(),
         }
     }
 
@@ -1198,18 +1249,58 @@ impl NotesStore {
         Ok(self.dir.join(format!("{run}.json")))
     }
 
-    /// The notes of `run` (empty if none were written yet).
+    /// The notes of `run` as the file has them now, parsed once per version of the file; `None`
+    /// when there is no file.
+    ///
+    /// The file is read through a descriptor whose metadata is the cache key: a write of another
+    /// process (the workers of one run share the volume, ADR 0037) is seen by the next call, since
+    /// [`save`](Self::save) replaces the file and the inode changes. A parse is kept until the file
+    /// it was made from is replaced, so a turn's calls do not each parse the same JSON. A write that
+    /// keeps the inode, the length and the time would not be seen; no writer here does that.
+    async fn shared(&self, run: &str) -> io::Result<Option<Arc<RunNotes>>> {
+        let path = self.path(run)?;
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.forget(run);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let meta = file.metadata().await?;
+        let stamp = Stamp::of(&meta);
+        if let Some(hit) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(run)
+            && hit.stamp == stamp
+        {
+            return Ok(Some(Arc::clone(&hit.notes)));
+        }
+        let mut bytes = Vec::new();
+        let mut file = file;
+        file.read_to_end(&mut bytes).await?;
+        #[cfg(test)]
+        self.parses.fetch_add(1, Ordering::Relaxed);
+        let notes = Arc::new(
+            serde_json::from_slice::<RunNotes>(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        );
+        self.remember(run, stamp, Arc::clone(&notes));
+        Ok(Some(notes))
+    }
+
+    /// The notes of `run`, parsed once per version of the file (see `shared`).
     ///
     /// # Errors
     ///
     /// I/O errors, or a file that is not valid notes.
     pub async fn load(&self, run: &str) -> io::Result<RunNotes> {
-        match tokio::fs::read(self.path(run)?).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RunNotes::default()),
-            Err(e) => Err(e),
-        }
+        Ok(self
+            .shared(run)
+            .await?
+            .map_or_else(RunNotes::default, |notes| (*notes).clone()))
     }
 
     /// The notes of `run`, or `None` when none were ever written for it (another worker's volume,
@@ -1219,13 +1310,24 @@ impl NotesStore {
     ///
     /// I/O errors, or a file that is not valid notes.
     pub async fn load_existing(&self, run: &str) -> io::Result<Option<RunNotes>> {
-        match tokio::fs::read(self.path(run)?).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+        Ok(self.shared(run).await?.map(|notes| (*notes).clone()))
+    }
+
+    /// [`load_existing`](Self::load_existing) without the copy: what a caller that only reads a
+    /// field of the notes (the tier of a call) needs, so the 100 KB of a long run are not cloned
+    /// per tool call.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors, or a file that is not valid notes.
+    pub async fn load_shared(&self, run: &str) -> io::Result<Option<Arc<RunNotes>>> {
+        self.shared(run).await
+    }
+
+    /// How many notes files this store read and parsed (the tests count them).
+    #[cfg(test)]
+    fn parses(&self) -> usize {
+        self.parses.load(Ordering::Relaxed)
     }
 
     /// Change the notes of `run` in one step: load, `change`, save when `change` changed them.
@@ -1263,7 +1365,9 @@ impl NotesStore {
         let before = notes.clone();
         let result = change(&mut notes);
         if notes != before {
-            self.save(run, &notes).await?;
+            // The value just written is the one the next load must see, without parsing it again.
+            let stamp = self.save_file(run, &notes).await?;
+            self.remember(run, stamp, Arc::new(notes));
         }
         Ok(result)
     }
@@ -1274,6 +1378,13 @@ impl NotesStore {
     ///
     /// I/O errors.
     pub async fn save(&self, run: &str, notes: &RunNotes) -> io::Result<()> {
+        let stamp = self.save_file(run, notes).await?;
+        self.remember(run, stamp, Arc::new(notes.clone()));
+        Ok(())
+    }
+
+    /// Write `notes` to `run`'s file, atomically, and say what the written file is.
+    async fn save_file(&self, run: &str, notes: &RunNotes) -> io::Result<Stamp> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = self.path(run)?;
         tokio::fs::create_dir_all(&self.dir).await?;
@@ -1285,7 +1396,32 @@ impl NotesStore {
         let bytes = serde_json::to_vec_pretty(notes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         tokio::fs::write(&tmp, bytes).await?;
-        tokio::fs::rename(&tmp, &path).await
+        // The stamp of the inode this rename installs. A write of another process after the rename
+        // changes the inode, and the next read re-parses; one before it is replaced by this rename,
+        // and this value is the file.
+        let meta = tokio::fs::metadata(&tmp).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(Stamp::of(&meta))
+    }
+
+    /// Keep `notes` as the parse of the file `stamp` describes.
+    fn remember(&self, run: &str, stamp: Stamp, notes: Arc<RunNotes>) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= MAX_CACHED_NOTES && !cache.contains_key(run) {
+            cache.clear();
+        }
+        cache.insert(run.to_owned(), Cached { stamp, notes });
+    }
+
+    /// Drop what was parsed for `run`: the file is not what the cache says any more.
+    fn forget(&self, run: &str) {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(run);
     }
 }
 
@@ -1827,6 +1963,85 @@ mod tests {
             Some("a")
         );
         assert!(store.update("../x", |_| ()).await.is_err());
+    }
+
+    /// A turn's calls read the notes many times (the tier before each call, the instructions, the
+    /// check counters), and a turn writes them at its boundary. The file is parsed once per version
+    /// of it — not once per read, and not again for a write this process made — and a write of
+    /// another process is seen by the next read.
+    #[tokio::test]
+    async fn the_notes_are_parsed_once_per_version_of_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NotesStore::new(root.path());
+        let run = "run-1";
+        for turn in 0..5 {
+            let mut notes = store.load(run).await.unwrap();
+            notes.checks.failures += 1;
+            store.save(run, &notes).await.unwrap();
+            for call in 0..4 {
+                let seen = store.load_shared(run).await.unwrap().unwrap();
+                assert_eq!(seen.checks.failures, turn + 1);
+                store
+                    .update(run, |notes| {
+                        notes.pushed_sha = Some(format!("{turn}-{call}"))
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                store.load(run).await.unwrap().pushed_sha.as_deref(),
+                Some(format!("{turn}-3").as_str())
+            );
+        }
+        // Every write kept the value it wrote: after the first read (which found no file) the
+        // turns never parsed the file again.
+        assert_eq!(
+            store.parses(),
+            0,
+            "five turns of its own notes parse nothing"
+        );
+
+        // Another process (the workers of a run share the volume, ADR 0037): a store that did not
+        // write the file parses it once, however many calls read it.
+        let other = NotesStore::new(root.path());
+        for _ in 0..5 {
+            let _ = other.load(run).await.unwrap();
+        }
+        assert_eq!(other.parses(), 1, "one parse for five reads");
+
+        // A write of another process is seen: the file is replaced by a rename, so its identity
+        // changes.
+        let path = root.path().join("coder").join(format!("{run}.json"));
+        let mut theirs = other.load(run).await.unwrap();
+        theirs.pushed_sha = Some("from another worker".into());
+        std::fs::write(&path, serde_json::to_vec_pretty(&theirs).unwrap()).unwrap();
+        assert_eq!(
+            other.load(run).await.unwrap().pushed_sha.as_deref(),
+            Some("from another worker")
+        );
+        assert_eq!(other.parses(), 2, "the write was parsed");
+
+        // The same length, written in place: the inode does not change, the time does.
+        let mut same = other.load(run).await.unwrap();
+        same.pushed_sha = Some("from another workeR".into());
+        let bytes = serde_json::to_vec_pretty(&same).unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            std::fs::metadata(&path).unwrap().len(),
+            "the same length"
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            other.load(run).await.unwrap().pushed_sha.as_deref(),
+            Some("from another workeR")
+        );
+        assert_eq!(other.parses(), 3, "the in-place write was parsed");
     }
 
     #[test]

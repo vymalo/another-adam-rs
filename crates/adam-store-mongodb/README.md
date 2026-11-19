@@ -114,7 +114,9 @@ None.
 field) is claimable and then pinned; `src/codec.rs` has property
 tests of the key escaping; `src/lib.rs` has unit tests of the error classes
 (`driver_errors_are_classified_by_what_they_mean`,
-`the_driver_error_is_kept_as_the_source`).
+`the_driver_error_is_kept_as_the_source`) and of what a write returns
+(`returned_value_tests`: the cleaned value it stored, without converting the stored document
+back to JSON).
 
 | Variable | Meaning |
 |---|---|

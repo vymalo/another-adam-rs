@@ -37,7 +37,14 @@ fn as_refs<'a>(files: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a st
 
 /// A rig and a run whose first slot is the `devbox` repository, with the container's inspect ready.
 async fn devbox() -> (Rig, adam_workspace::RunWorkspace, PathBuf) {
-    let rig = Rig::new();
+    devbox_with(|_| {}).await
+}
+
+/// [`devbox`] with settings `tweak` changes (a short liveness cache, a timeout).
+async fn devbox_with(
+    tweak: impl FnOnce(&mut adam_devcontainer::Settings),
+) -> (Rig, adam_workspace::RunWorkspace, PathBuf) {
+    let rig = Rig::with(tweak);
     let ws = rig.run(RUN);
     let slot = rig
         .repository(&ws, "devbox", &as_refs(&devbox_files()))
@@ -1123,6 +1130,85 @@ async fn two_commands_that_need_the_environment_at_once_make_it_once() {
     b.unwrap();
     assert_eq!(rig.cli("up").len(), 1);
     assert_eq!(rig.cli("read-configuration").len(), 1);
+}
+
+#[tokio::test]
+async fn ten_commands_ask_the_service_once_that_the_container_is_there() {
+    // Every tool call that runs a process asks `ensure`, and `ensure` used to run `podman ps` to
+    // see the container. Ten commands in a turn are ten processes for one answer that cannot have
+    // changed in the second it took to ask.
+    let (rig, ws, _) = devbox().await;
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    let before = rig.podman("ps").len();
+    for _ in 0..10 {
+        rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    }
+    let asked = rig.podman("ps").len() - before;
+    assert_eq!(
+        asked, 1,
+        "ten commands ask once (the first check is never skipped), not {asked} times"
+    );
+    assert_eq!(rig.cli("up").len(), 1, "and nothing was made again");
+}
+
+#[tokio::test]
+async fn a_container_that_dies_is_noticed_when_the_verdict_expires() {
+    // The liveness cache is the setting, so the test waits for its own short one, not the
+    // default's three seconds. The window is longer than the work the third `ensure` does, so a
+    // stalled runner cannot make it expire before that call reads it.
+    let (rig, ws, _) = devbox_with(|s| s.alive_ttl = std::time::Duration::from_secs(2)).await;
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    // The answer is cached by this call.
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    rig.put("ps.json", "[]");
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    assert_eq!(
+        rig.cli("up").len(),
+        1,
+        "within the cache the container is not asked about again"
+    );
+    // After it, the container is gone and the environment is made again.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let steps = Steps::default();
+    rig.env.ensure(&ws, &steps).await.unwrap();
+    assert_eq!(
+        steps.latest()[0].label,
+        "The environment was lost; rebuilding it"
+    );
+    assert_eq!(rig.cli("up").len(), 2);
+}
+
+#[tokio::test]
+async fn a_rebuild_that_could_not_remove_the_container_is_checked_again() {
+    // A rebuild that succeeds writes a `Building` state, so the next `ensure` builds without
+    // asking whether a container is there. One that fails leaves the state `Ready`: the verdict it
+    // forgot must not be believed by the next command, which would otherwise run in a container
+    // that is gone.
+    let (rig, ws, _) = devbox().await;
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    // The container was seen there: the verdict is cached.
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    rig.put("rm.fails", "");
+    rig.put("podman.rm.exit", "125");
+    assert!(
+        rig.env.rebuild(RUN, false).await.is_err(),
+        "the container could not be removed"
+    );
+    rig.remove("rm.fails");
+    rig.remove("podman.rm.exit");
+    rig.put("ps.json", "[]");
+    let asked = rig.podman("ps").len();
+    let steps = Steps::default();
+    rig.env.ensure(&ws, &steps).await.unwrap();
+    assert!(
+        rig.podman("ps").len() > asked,
+        "the next command asks the service whether the container is there"
+    );
+    assert_eq!(
+        steps.latest()[0].label,
+        "The environment was lost; rebuilding it"
+    );
+    assert_eq!(rig.cli("up").len(), 2);
 }
 
 // --------------------------------------------------------------------------------- release, sweep

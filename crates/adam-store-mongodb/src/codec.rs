@@ -37,6 +37,12 @@ pub fn json_to_bson(value: &Value) -> Result<Bson, StoreError> {
 }
 
 pub fn bson_to_json(value: &Bson) -> Result<Value, StoreError> {
+    #[cfg(test)]
+    crate::conversion_counter::bump();
+    from_bson(value)
+}
+
+fn from_bson(value: &Bson) -> Result<Value, StoreError> {
     Ok(match value {
         Bson::Null | Bson::Undefined => Value::Null,
         Bson::Boolean(b) => Value::Bool(*b),
@@ -46,13 +52,11 @@ pub fn bson_to_json(value: &Bson) -> Result<Value, StoreError> {
             .map(Value::Number)
             .ok_or_else(|| StoreError::Corrupt(format!("non-finite number {f} in stored state")))?,
         Bson::String(s) => Value::String(s.clone()),
-        Bson::Array(items) => {
-            Value::Array(items.iter().map(bson_to_json).collect::<Result<_, _>>()?)
-        }
+        Bson::Array(items) => Value::Array(items.iter().map(from_bson).collect::<Result<_, _>>()?),
         Bson::Document(doc) => {
             let mut map = Map::new();
             for (k, v) in doc {
-                map.insert(decode_key(k)?, bson_to_json(v)?);
+                map.insert(decode_key(k)?, from_bson(v)?);
             }
             Value::Object(map)
         }

@@ -47,6 +47,9 @@ a2a-client-lf = "0.2"
 a2a-lf = "0.3"
 a2a-server-lf = "0.4"
 agent-client-protocol = "2.2"
+# The coder's redactor scans an output once for every registered secret: already in the tree under
+# regex, with the default (contiguous NFA) engine.
+aho-corasick = "1"
 anyhow = "1"
 async-trait = "0.1"
 # Signs the JWT of a GitHub App (adam-workspace): already in the tree under rustls, with the features
@@ -73,6 +76,8 @@ jsonschema = { version = "0.58", default-features = false }
 k8s-openapi = { version = "0.28", default-features = false, features = ["v1_32"] }
 kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "aws-lc-rs", "ws"] }
 libc = "0.2"
+# Finds line ends in the SSE parser (adam-model-openai); already in the tree under regex.
+memchr = "2"
 notify = "8"
 proc-macro2 = "1"
 proptest = "1"
@@ -112,3 +117,13 @@ url = "2"
 utoipa-swagger-ui = { version = "10.0.2", default-features = false, features = ["vendored", "minified"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 wiremock = "0.6"
+
+# The shipped binaries: `docker/coder/Dockerfile` builds them with `cargo build --release`, so this
+# profile is what the image carries. `codegen-units = 1` and `strip = "symbols"` take the coder binary
+# from 90.4 MB to 50.8 MB (rustc 1.98.0, 2026-11-18). `lto` is left off on purpose: thin LTO measured
+# 3.6% larger and 20% more build CPU. `panic` stays `unwind`: the worker catches a panicking
+# `agent.step` and fails the run (`crates/adam-runtime/src/worker.rs`), which `panic = "abort"` would
+# turn into a dead process.
+[profile.release]
+codegen-units = 1
+strip = "symbols"

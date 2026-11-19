@@ -15,6 +15,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use std::borrow::Cow;
+
 /// The longest a step's id may be, in bytes: the contract's limit.
 pub const MAX_STEP_ID_BYTES: usize = 128;
 
@@ -281,7 +283,7 @@ impl StepOutput {
         let size = clean.len();
         if size <= max {
             return Self {
-                text: clean,
+                text: clean.into_owned(),
                 truncated: false,
                 bytes: None,
                 error,
@@ -389,11 +391,48 @@ fn clean_id(id: &str) -> String {
     out
 }
 
-/// `text` without the control characters other than the line break and the tab.
-fn printable(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect()
+/// `text` without the control characters other than the line break and the tab, borrowed when it
+/// has none.
+fn printable(text: &str) -> Cow<'_, str> {
+    if is_printable(text) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(
+        text.chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .collect(),
+    )
+}
+
+/// Whether `text` already is what [`printable`] returns.
+fn is_printable(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+}
+
+/// `key` made printable, kept as it is when it already is.
+fn printable_key(key: String) -> String {
+    if is_printable(&key) {
+        key
+    } else {
+        printable(&key).into_owned()
+    }
+}
+
+/// `text` made printable and cut to [`STEP_INPUT_STRING_MAX_CHARS`] characters, kept as it is when
+/// it needs neither.
+fn bounded_string(text: String) -> String {
+    let text = if is_printable(&text) {
+        text
+    } else {
+        printable(&text).into_owned()
+    };
+    if text.chars().count() <= STEP_INPUT_STRING_MAX_CHARS {
+        text
+    } else {
+        cut(&text, STEP_INPUT_STRING_MAX_CHARS)
+    }
 }
 
 /// `input` made printable and cut: see [`StepEvent::with_input`].
@@ -401,7 +440,7 @@ fn bound_input(input: Map<String, Value>, max: usize) -> Map<String, Value> {
     let original = serialized_len(&input);
     let bounded: Map<String, Value> = input
         .into_iter()
-        .map(|(key, value)| (printable(&key), bound_value(value)))
+        .map(|(key, value)| (printable_key(key), bound_value(value)))
         .collect();
     if serialized_len(&bounded) <= max {
         return bounded;
@@ -416,20 +455,40 @@ fn bound_input(input: Map<String, Value>, max: usize) -> Map<String, Value> {
 /// [`STEP_INPUT_STRING_MAX_CHARS`] characters.
 fn bound_value(value: Value) -> Value {
     match value {
-        Value::String(text) => Value::String(cut(&printable(&text), STEP_INPUT_STRING_MAX_CHARS)),
+        Value::String(text) => Value::String(bounded_string(text)),
         Value::Array(items) => Value::Array(items.into_iter().map(bound_value).collect()),
         Value::Object(map) => Value::Object(
             map.into_iter()
-                .map(|(key, value)| (printable(&key), bound_value(value)))
+                .map(|(key, value)| (printable_key(key), bound_value(value)))
                 .collect(),
         ),
         other => other,
     }
 }
 
+/// A writer that only counts what is written to it: the length of a serialised map, without the
+/// text.
+#[derive(Default)]
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn serialized_len(map: &Map<String, Value>) -> usize {
+    let mut counted = Counted::default();
     // Serializing a `Map` cannot fail: its keys are strings.
-    serde_json::to_string(map).map_or(usize::MAX, |json| json.len())
+    match serde_json::to_writer(&mut counted, map) {
+        Ok(()) => counted.0,
+        Err(_) => usize::MAX,
+    }
 }
 
 /// The head and the tail of `text` (longer than `max`) with a line that says how many bytes are left
@@ -647,6 +706,61 @@ mod tests {
         let step = StepEvent::new("tool:c1", StepKind::Tool, "t", StepState::Running)
             .with_input_within(one, 1_000_000);
         assert_eq!(step.input.unwrap()["s"], json!("z".repeat(500)));
+    }
+
+    /// A 1 MiB argument is measured, not serialised into a copy of itself: the `_cut` map is the
+    /// same shape and the same byte count as before, and a small input keeps its exact bytes.
+    #[test]
+    fn a_megabyte_input_is_measured_without_serialising_a_copy_of_it() {
+        // Strings under the 512-character bound are kept as they are, so the input stays over the
+        // 4 KiB bound and is replaced by its size. (One 1 MiB string would be cut to 512 characters
+        // first: that is the string bound doing its work, not this one.)
+        let pieces: Vec<Value> = (0..2100).map(|_| json!("z".repeat(500))).collect();
+        let big = object(json!({ "files": pieces }));
+        let original = serde_json::to_string(&big).expect("serialises").len();
+        assert!(original > 1024 * 1024, "{original}");
+        let step = StepEvent::new("tool:c1", StepKind::Tool, "write_files", StepState::Running)
+            .with_input(big);
+        assert_eq!(
+            serde_json::to_value(step.input.expect("an input")).expect("serialises"),
+            json!({"_cut": true, "bytes": original})
+        );
+
+        let small = object(json!({"query": "rust", "n": 3, "deep": {"a": ["b", null]}}));
+        let step = StepEvent::new("tool:c1", StepKind::Tool, "search", StepState::Running)
+            .with_input(small.clone());
+        assert_eq!(
+            serde_json::to_string(&step.input.expect("an input")).expect("serialises"),
+            serde_json::to_string(&small).expect("serialises"),
+            "a small input keeps its exact bytes"
+        );
+    }
+
+    /// `bytes` is the size of the input as JSON writes it: an escaped control character and a
+    /// multi-byte character count their bytes, not their characters.
+    #[test]
+    fn a_cut_input_counts_its_bytes_as_json_writes_them() {
+        let input = object(serde_json::json!({"k\u{7}ey": "a\u{0}b", "é": "ü"}));
+        let original = serde_json::to_string(&input).expect("serialises").len();
+        // A bound of one byte forces the `_cut` map, whose `bytes` is the unbounded input's size.
+        let step = StepEvent::new("tool:c1", StepKind::Tool, "t", StepState::Running)
+            .with_input_within(input, 1);
+        assert_eq!(
+            serde_json::to_value(step.input.expect("an input")).expect("serialises"),
+            serde_json::json!({"_cut": true, "bytes": original})
+        );
+    }
+
+    /// A string that needs no cleaning is borrowed, not rebuilt; one that does is rebuilt.
+    #[test]
+    fn printable_borrows_a_clean_string() {
+        assert!(matches!(
+            printable("plain\nline\twith a tab"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(printable("bell\u{7}"), Cow::Owned(_)));
+        assert_eq!(printable("bell\u{7}"), "bell");
+        assert_eq!(printable("a\r\nb"), "a\nb");
     }
 
     #[test]

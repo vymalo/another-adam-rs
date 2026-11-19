@@ -13,6 +13,7 @@ use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::make::Run;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
+use adam_coder::tools::shell::KEPT_OUTPUT_MAX;
 use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput};
 use adam_runtime::CollectingSink;
 use common::{DB_PASSWORD, Fixture, GITHUB_TOKEN, MODEL_KEY};
@@ -97,6 +98,17 @@ fn id_of(text: &str) -> String {
         .unwrap_or_else(|| panic!("no id in:\n{text}"))
         + "kept as ".len();
     text[at..at + 18].to_owned()
+}
+
+/// The `N` and `M` of the `only the first N of M bytes are kept` line of a view or a page.
+fn kept_counts(text: &str) -> (u64, u64) {
+    let at = text
+        .rfind("only the first ")
+        .unwrap_or_else(|| panic!("no kept count in:\n{text}"))
+        + "only the first ".len();
+    let (kept, rest) = text[at..].split_once(" of ").unwrap();
+    let (total, _) = rest.split_once(" bytes are kept").unwrap();
+    (kept.parse().unwrap(), total.parse().unwrap())
 }
 
 fn files_under(dir: &Path) -> Vec<PathBuf> {
@@ -359,12 +371,14 @@ async fn a_command_cannot_forge_the_last_line_of_a_view_or_of_a_page() {
     );
 }
 
-/// A secret that sits across the cut at 16 MiB is replaced whole before the text is cut.
+/// A secret that sits across the end of the capture (4 MiB and the margin) is replaced whole
+/// before the text is cut: no part of it is kept, and the cut is said.
 #[tokio::test]
-async fn a_secret_across_the_16_mib_cut_is_not_left_in_part() {
+async fn a_secret_across_the_capture_cut_is_not_left_in_part() {
     let rig = Rig::new().await;
     let command = format!(
-        "head -c 16777206 /dev/zero | tr '\\0' a; printf %s '{GITHUB_TOKEN}'; head -c 100000 /dev/zero | tr '\\0' b"
+        "head -c {} /dev/zero | tr '\\0' a; printf %s '{GITHUB_TOKEN}'; head -c 100000 /dev/zero | tr '\\0' b",
+        KEPT_OUTPUT_MAX + adam_llm_agent::SCRUB_OVERLAP - 20
     );
     let out = RunCommand
         .call(&rig.ctx, json!({"command": command}))
@@ -385,13 +399,18 @@ async fn a_secret_across_the_16_mib_cut_is_not_left_in_part() {
             // The secret straddles the margin the keeper cuts back (the capture less 64 KiB): the
             // text ends before it, and it is neither kept whole nor in part.
             assert!(text.contains("(output cut: only the first"));
+            assert!(
+                text.len() <= KEPT_OUTPUT_MAX + adam_llm_agent::SCRUB_OVERLAP + 1024,
+                "the kept file is the capped capture: {}",
+                text.len()
+            );
         }
     }
 }
 
-/// An output over what the shell captures (16 MiB and a little): the tail the model is shown starts
-/// inside a secret and has no newline to realign on; the secret is still gone. And the cut is said:
-/// in the view and in the last page.
+/// An output over what the shell captures (4 MiB and the margin): the tail the model is shown
+/// starts inside a secret and has no newline to realign on; the secret is still gone, the capture
+/// is capped, and the cut is said: in the view and in the last page.
 #[tokio::test]
 async fn an_output_over_the_bound_says_so_and_its_tail_shows_no_part_of_a_secret() {
     let rig = Rig::new().await;
@@ -401,12 +420,16 @@ async fn an_output_over_the_bound_says_so_and_its_tail_shows_no_part_of_a_secret
     let out = tools_call(&rig, "run_command", json!({"command": command})).await;
     let view = out.content;
     let id = id_of(&view);
+    let (kept, total) = kept_counts(&view);
+    assert_eq!(
+        total,
+        17_000_000 + GITHUB_TOKEN.len() as u64 + 12_268,
+        "the output is counted whole"
+    );
     assert!(
-        view.contains("only the first 1678")
-            && view.contains(" of 1701")
-            && view.contains(" bytes are kept"),
-        "{}",
-        view.lines().last().unwrap()
+        kept >= KEPT_OUTPUT_MAX as u64
+            && kept <= (KEPT_OUTPUT_MAX + adam_llm_agent::SCRUB_OVERLAP + 1024) as u64,
+        "the capture is capped: {kept} of {total} bytes are kept"
     );
     assert!(
         !view.contains("6789abcdefghijklmnop") && !view.contains("ghp_"),
@@ -417,7 +440,86 @@ async fn an_output_over_the_bound_says_so_and_its_tail_shows_no_part_of_a_secret
         "the hidden count is an estimate here: {view}"
     );
     let last = rig.read_wrapped(&id, -2).await.content;
-    assert!(last.contains("(output cut: only the first 1677"), "{last}");
+    assert!(last.contains("(output cut: only the first"), "{last}");
+}
+
+/// A 16 MiB output is captured at most at the kept-output bound (4 MiB and the margin), is kept
+/// cut with the view and the last page saying so, and the head and the tail the model is shown are
+/// unchanged: a bounded view of a long output.
+#[tokio::test]
+async fn a_16_mib_output_is_captured_capped_and_kept_cut() {
+    let rig = Rig::new().await;
+    let out = RunCommand
+        .call(
+            &rig.ctx,
+            json!({"command": "head -c 16777216 /dev/zero | tr '\\0' a"}),
+        )
+        .await
+        .unwrap();
+    let view = out.content;
+    let id = id_of(&view);
+    let (kept, total) = kept_counts(&view);
+    assert_eq!(total, 16 * 1024 * 1024, "the output is counted whole");
+    assert!(
+        kept >= KEPT_OUTPUT_MAX as u64
+            && kept <= (KEPT_OUTPUT_MAX + adam_llm_agent::SCRUB_OVERLAP + 1024) as u64,
+        "the capture is capped: {kept} of {total} bytes are kept"
+    );
+    assert!(
+        view.contains("head and tail shown") && view.contains("[... about "),
+        "{}",
+        &view[..200]
+    );
+    assert!(view.len() < 20 * 1024, "a bounded view: {}", view.len());
+    let file = rig
+        .fx
+        .root
+        .join("outputs")
+        .join(rig.ctx.run_id().to_string())
+        .join(format!("{id}.txt"));
+    let size = std::fs::metadata(&file).unwrap().len();
+    assert!(
+        size <= (KEPT_OUTPUT_MAX + adam_llm_agent::SCRUB_OVERLAP + 1024) as u64,
+        "the kept file is the capped capture: {size}"
+    );
+    let last = rig.read_wrapped(&id, -1).await.content;
+    assert!(last.contains("(output cut: only the first"), "{last}");
+}
+
+/// A run keeps at most its budget on the volume: two outputs of 3 MiB under a 4 MiB budget, the
+/// first kept, the second refused and said so, and the files on disk never over the budget.
+#[tokio::test]
+async fn a_run_keeps_at_most_its_budget_and_says_what_is_not_kept() {
+    let rig = Rig::with(|s| s.run_kept_max = 4 * 1024 * 1024).await;
+    let command = "head -c 3145728 /dev/zero | tr '\\0' a";
+    let first = RunCommand
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(
+        first.content.contains("kept as o-"),
+        "{}",
+        &first.content[..300]
+    );
+    let second = RunCommand
+        .call(&rig.call_ctx("second"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(
+        second.content.contains("NOT kept") && second.content.contains("at most 4 MiB"),
+        "{}",
+        &second.content[..400]
+    );
+    let mut total = 0;
+    for file in files_under(&rig.fx.root) {
+        if file.extension().is_some_and(|e| e == "txt") {
+            total += std::fs::metadata(&file).unwrap().len();
+        }
+    }
+    assert!(
+        (3 * 1024 * 1024..=4 * 1024 * 1024).contains(&total),
+        "the run keeps {total} bytes"
+    );
 }
 
 /// No 8-byte window of the GitHub token is in `text`.
@@ -428,15 +530,15 @@ fn assert_no_part(text: &str, what: &str) {
     }
 }
 
-/// The first 20 characters of a secret end the capture (16 MiB and 64 KiB) after thousands of whole
-/// secrets that shrink the scrubbed text under the 16 MiB bound: nothing is cut at 16 MiB of it, and
-/// the half of a secret at the capture's end must still not be kept. From a real command, with the
-/// file's own bytes read from the disk and every page read as the tool gives it.
+/// The first 20 characters of a secret end the capture (4 MiB and 64 KiB) after thousands of whole
+/// secrets that shrink the scrubbed text under the capture's bound: nothing is cut at 4 MiB of it,
+/// and the half of a secret at the capture's end must still not be kept. From a real command, with
+/// the file's own bytes read from the disk and every page read as the tool gives it.
 #[tokio::test]
 async fn the_first_half_of_a_secret_at_the_end_of_the_capture_is_not_kept_when_scrubbing_shrinks_the_text()
  {
     let rig = Rig::new().await;
-    let capture = adam_llm_agent::MAX_KEPT_BYTES + adam_llm_agent::SCRUB_OVERLAP;
+    let capture = KEPT_OUTPUT_MAX + adam_llm_agent::SCRUB_OVERLAP;
     let fill = capture - 20 - 3000 * (GITHUB_TOKEN.len() + 1);
     let command = format!(
         "yes '{GITHUB_TOKEN}' | head -n 3000; head -c {fill} /dev/zero | tr '\\0' a; \
@@ -578,18 +680,16 @@ async fn assert_no_big_secret(rig: &Rig, view: &str, what: &str) {
             kept += text.iter().filter(|b| **b == b'a').count();
         }
     }
-    assert!(
-        kept > 15 * 1024 * 1024,
-        "{what}: the filler is kept: {kept}"
-    );
+    assert!(kept > 3 * 1024 * 1024, "{what}: the filler is kept: {kept}");
 }
 
-/// A secret longer than 64 KiB (150,000 bytes) that starts before the 16 MiB mark and goes past what
-/// the old assumed margin (64 KiB) captured: the margin is the longest value the redactor holds.
+/// A secret longer than 64 KiB (150,000 bytes) that starts before the end of the capture and goes
+/// past what the old assumed margin (64 KiB) captured: the margin is the longest value the
+/// redactor holds.
 #[tokio::test]
-async fn a_secret_longer_than_64_kib_across_the_16_mib_mark_is_not_kept_in_part() {
+async fn a_secret_longer_than_64_kib_across_the_capture_cut_is_not_kept_in_part() {
     let rig = Rig::new().await;
-    let command = big_output(&rig, adam_llm_agent::MAX_KEPT_BYTES - 10_000, 100_000);
+    let command = big_output(&rig, KEPT_OUTPUT_MAX + margin_for(BIG) - 10_000, 100_000);
     let out = RunCommand
         .call(&rig.ctx, json!({"command": command}))
         .await
@@ -599,14 +699,14 @@ async fn a_secret_longer_than_64_kib_across_the_16_mib_mark_is_not_kept_in_part(
         "{}",
         &out.content[..300]
     );
-    assert_no_big_secret(&rig, &out.content, "the 16 MiB mark").await;
+    assert_no_big_secret(&rig, &out.content, "the capture's cut").await;
 }
 
-/// The same across the end of the capture, which is 16 MiB and the margin of this redactor.
+/// The same with more of the secret inside the capture, and the same cut back by its margin.
 #[tokio::test]
 async fn a_secret_longer_than_64_kib_across_the_end_of_the_capture_is_not_kept_in_part() {
     let rig = Rig::new().await;
-    let capture = adam_llm_agent::MAX_KEPT_BYTES + margin_for(BIG);
+    let capture = KEPT_OUTPUT_MAX + margin_for(BIG);
     let command = big_output(&rig, capture - 100_000, 100_000);
     let out = RunCommand
         .call(&rig.ctx, json!({"command": command}))

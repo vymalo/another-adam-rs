@@ -75,14 +75,17 @@ export function loadOwnSpecs(dir) {
 /** The local tag an own task's image is built under. */
 export const ownImageTag = (spec) => `adam-bench-own/${spec.id.toLowerCase()}:${spec.base.slice(0, 12)}`;
 
-/** The Dockerfile of an own task: the workspace image by digest, the repository at /app at the base, the pins. Pure. */
+/**
+ * The Dockerfile of an own task: the workspace image by digest, the repository at /app at the base, the pins. Pure.
+ * The system git configuration comes after the toolchain lines, so a workspace image without git can install it there.
+ */
 export function ownDockerfile({ workspaceImage, workdir = '/app', toolchain = { env: {}, run: [] } }) {
   const ref = parseImageRef(workspaceImage);
   if (!ref || !ref.digest) throw new OwnTaskError('(dockerfile)', 'the workspace image must be named by digest (name@sha256:...)');
-  const lines = [`FROM ${workspaceImage}`, 'USER root', `COPY repo/ ${workdir}/`, `RUN chown -R 10001:10001 ${workdir} && git config --system --add safe.directory '*'`];
+  const lines = [`FROM ${workspaceImage}`, 'USER root', `COPY repo/ ${workdir}/`, `RUN chown -R 10001:10001 ${workdir}`];
   for (const [k, v] of Object.entries(toolchain.env ?? {})) lines.push(`ENV ${k}="${v}"`);
   for (const l of toolchain.run ?? []) lines.push(`RUN ${l}`);
-  lines.push(`WORKDIR ${workdir}`, 'USER 10001', '');
+  lines.push("RUN git config --system --add safe.directory '*'", `WORKDIR ${workdir}`, 'USER 10001', '');
   return lines.join('\n');
 }
 

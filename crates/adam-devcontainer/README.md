@@ -24,7 +24,7 @@ in the coder (it holds the credentials); **a path means the same inside the cont
 | Item | What |
 |---|---|
 | `DevContainer` | the `Environment`: `new(Settings)`, plus `probe()`, `prepull()`, `install_tools()` and `prune()` for a binary's startup and care, and `rebuild(run, use_default)` (also the port's own `Environment::rebuild`, which the coder's `rebuild_environment` tool calls). Nothing but `adam-exec` is mounted into a container, and no secret: `Settings::opencode`, `Settings::model_key`, the copy of `opencode` into the tools directory and the `secrets/model-key` mount are gone ([ADR 0038](../../docs/decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md); a breaking change of `Settings`, and of `EnvSession` in `adam-workspace`). An old `state.json` that holds `model_key` still loads |
-| `Settings` | the root, the CLI and Podman programs, `CONTAINER_HOST`, the default image, the network, the deployment label, the timeouts; `Settings::new(root)` has the defaults |
+| `Settings` | the root, the CLI and Podman programs, `CONTAINER_HOST`, the default image, the network, the deployment label, the timeouts (including `alive_ttl`, how long a check that a run's container is there is believed); `Settings::new(root)` has the defaults |
 | `Runtime` | `Off` (every run is in the coder's own container; the default) or `Podman` |
 | `Network` | `Inherit` (the Podman service's own network, which the deployment limits) or `None` |
 

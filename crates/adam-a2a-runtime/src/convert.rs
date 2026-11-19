@@ -278,13 +278,18 @@ pub(crate) fn task_from_view(view: &RunView, context_id: &str, prompt: &PromptFn
 /// standard artifact. The artifact id is derived from the file's digest, not from its bytes
 /// serialized, so it costs one pass over them.
 pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
+    artifact_of_with(artifact, artifact_id(artifact))
+}
+
+/// [`artifact_of`] for a caller that already derived the id ([`ArtifactIds`] caches it).
+pub(crate) fn artifact_of_with(artifact: &adam_runtime::Artifact, id: String) -> Artifact {
     if let Some(file) = &artifact.file {
         let mut part = Part::raw(file.bytes.clone()).with_filename(file.filename.clone());
         if let Some(mime) = &artifact.mime_type {
             part = part.with_media_type(mime.clone());
         }
         return Artifact {
-            artifact_id: artifact_id(artifact),
+            artifact_id: id,
             name: Some(artifact.name.clone()),
             description: None,
             parts: vec![part],
@@ -313,7 +318,7 @@ pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
         parts.push(Part::url(url));
     }
     Artifact {
-        artifact_id: artifact_id(artifact),
+        artifact_id: id,
         name: Some(artifact.name.clone()),
         description: None,
         parts,
@@ -344,17 +349,125 @@ pub fn artifact_id(artifact: &adam_runtime::Artifact) -> String {
     artifact.id.clone().unwrap_or_else(|| derived_id(artifact))
 }
 
+/// How an artifact is said to a subscriber: the id it is known by, and the content that id held.
+#[derive(Clone)]
+pub(crate) struct Mapped {
+    /// The A2A artifact id: the artifact's own id, else the content-derived one.
+    pub(crate) id: String,
+    /// The content-derived id: what tells one content of an id from another.
+    pub(crate) content: String,
+}
+
+impl Mapped {
+    fn of(artifact: &adam_runtime::Artifact) -> Self {
+        let content = derived_id(artifact);
+        Self {
+            id: artifact.id.clone().unwrap_or_else(|| content.clone()),
+            content,
+        }
+    }
+}
+
+/// The artifacts of one run as a subscriber maps them, remembered across polls.
+///
+/// A poll of a new version of the run asks for every artifact again; an artifact that is what an
+/// entry was derived from answers from the entry, so a changed run derives only the artifacts it
+/// added or replaced. An entry holds what it compares: the data of an artifact that is not a file
+/// (a plan, a surface: JSON, never the bytes of a file), and the name and length of a file. A run
+/// never replaces a file ([ADR 0012](../../../docs/decisions/0012-files-as-a2a-artifacts.md)), and
+/// its bytes are what its id hashes.
+///
+/// The cache holds one copy of every non-file artifact's data per subscription; file bytes are
+/// never copied, only the filename and the length. A run with large JSON artifacts costs that much
+/// resident memory per open stream, not per run.
+#[derive(Default)]
+pub(crate) struct ArtifactIds {
+    /// By position in the run's list. The list only grows, and an artifact with an id is replaced
+    /// where it stands (`add_artifact` in `adam-runtime`), so a position names an artifact.
+    entries: Vec<Option<Entry>>,
+}
+
+struct Entry {
+    /// What the entry was derived from.
+    held: Held,
+    mapped: Mapped,
+}
+
+/// The parts of an artifact that tell it from another one at the same position.
+struct Held {
+    id: Option<String>,
+    name: String,
+    mime_type: Option<String>,
+    /// `null` for a file ([`adam_runtime::Artifact::file`]).
+    data: Value,
+    /// A file's filename and length.
+    file: Option<(String, usize)>,
+}
+
+impl Held {
+    fn of(artifact: &adam_runtime::Artifact) -> Self {
+        Self {
+            id: artifact.id.clone(),
+            name: artifact.name.clone(),
+            mime_type: artifact.mime_type.clone(),
+            data: artifact.data.clone(),
+            file: artifact
+                .file
+                .as_ref()
+                .map(|file| (file.filename.clone(), file.bytes.len())),
+        }
+    }
+
+    fn is(&self, artifact: &adam_runtime::Artifact) -> bool {
+        self.id == artifact.id
+            && self.name == artifact.name
+            && self.mime_type == artifact.mime_type
+            && self.data == artifact.data
+            && self.file.as_ref().map(|(name, len)| (name.as_str(), *len))
+                == artifact
+                    .file
+                    .as_ref()
+                    .map(|file| (file.filename.as_str(), file.bytes.len()))
+    }
+}
+
+impl ArtifactIds {
+    /// The id of `artifact`, at position `at` in the run's list, from the entry of the last poll
+    /// when it is the same artifact.
+    pub(crate) fn mapped(&mut self, at: usize, artifact: &adam_runtime::Artifact) -> Mapped {
+        #[cfg(test)]
+        work::asked();
+        if let Some(Some(entry)) = self.entries.get(at)
+            && entry.held.is(artifact)
+        {
+            // A file is never replaced (ADR 0012), so a hit on a file entry is the same file; the
+            // filename and length compared above are enough only because of that.
+            return entry.mapped.clone();
+        }
+        let mapped = Mapped::of(artifact);
+        let entry = Entry {
+            held: Held::of(artifact),
+            mapped: mapped.clone(),
+        };
+        match self.entries.get_mut(at) {
+            Some(held) => *held = Some(entry),
+            None => {
+                self.entries.resize_with(at, || None);
+                self.entries.push(Some(entry));
+            }
+        }
+        mapped
+    }
+}
+
 /// Where a subscriber's memory of an artifact is kept, and what it holds: `(slot, content)`. The
 /// slot is the artifact's id when it has one, so the subscriber remembers **the last content it was
 /// sent under that id** (one entry per id, however often it changes, and a change back to an earlier
 /// content is a change); an artifact with no id has its content-derived id for a slot, and is said
 /// once.
 pub(crate) fn artifact_slot(artifact: &adam_runtime::Artifact) -> (String, String) {
-    let content = derived_id(artifact);
-    (
-        artifact.id.clone().unwrap_or_else(|| content.clone()),
-        content,
-    )
+    let mapped = Mapped::of(artifact);
+    (mapped.id, mapped.content)
 }
 
 /// Content-derived artifact id: `<name>-<12 hex digits>`.
@@ -363,19 +476,24 @@ pub(crate) fn artifact_slot(artifact: &adam_runtime::Artifact) -> (String, Strin
 /// by one byte have two ids and the same file twice has one.
 fn derived_id(artifact: &adam_runtime::Artifact) -> String {
     let digest = match &artifact.file {
-        Some(file) => Sha256::digest(
-            serde_json::to_vec(&(
+        Some(file) => {
+            let bytes = sha(&file.bytes);
+            let held = (
                 &artifact.name,
                 &artifact.mime_type,
                 &file.filename,
-                hex(&Sha256::digest(&file.bytes)),
-            ))
-            .unwrap_or_default(),
-        ),
-        None => Sha256::digest(
-            serde_json::to_vec(&(&artifact.name, &artifact.mime_type, &artifact.data))
-                .unwrap_or_default(),
-        ),
+                hex(&bytes),
+            );
+            #[cfg(test)]
+            work::serialised();
+            sha(&serde_json::to_vec(&held).unwrap_or_default())
+        }
+        None => {
+            let held = (&artifact.name, &artifact.mime_type, &artifact.data);
+            #[cfg(test)]
+            work::serialised();
+            sha(&serde_json::to_vec(&held).unwrap_or_default())
+        }
     };
     let hex: String = hex(&digest[..6]);
     let name: String = artifact
@@ -386,9 +504,53 @@ fn derived_id(artifact: &adam_runtime::Artifact) -> String {
     format!("{name}-{hex}")
 }
 
+/// The SHA-256 of `bytes`, counted for the tests that prove a poll of an unchanged run hashes
+/// nothing.
+fn sha(bytes: &[u8]) -> [u8; 32] {
+    #[cfg(test)]
+    work::hashed();
+    Sha256::digest(bytes).into()
+}
+
 /// Lowercase hex of `bytes`.
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What deriving an artifact id costs, for the tests that prove a poll of an unchanged run pays
+/// nothing. Thread-local: the tests run in parallel, each on its own thread.
+#[cfg(test)]
+pub(crate) mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HASHES: Cell<u64> = const { Cell::new(0) };
+        static SERIALISATIONS: Cell<u64> = const { Cell::new(0) };
+        static ASKED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn hashed() {
+        HASHES.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(crate) fn serialised() {
+        SERIALISATIONS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// An artifact a poll asked the cache about.
+    pub(crate) fn asked() {
+        ASKED.with(|n| n.set(n.get() + 1));
+    }
+
+    /// `(hashes, serialisations)` done on this thread so far.
+    pub(crate) fn counts() -> (u64, u64) {
+        (HASHES.with(Cell::get), SERIALISATIONS.with(Cell::get))
+    }
+
+    /// The artifacts asked about on this thread so far.
+    pub(crate) fn artifacts_asked() -> u64 {
+        ASKED.with(Cell::get)
+    }
 }
 
 /// Conversation id under which a caller's context is stored: the subject is
