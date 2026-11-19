@@ -18,7 +18,9 @@ agent needs, each with its server parts turned off, and it re-exports them:
 The API (start, send, steer, answer, cancel, list and a stream of events, over `RuntimeTaskBackend`) is slice 4. The
 model's credentials come from the host through `adam_model::ModelCredentials`
 ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)): the engine
-reads no key.
+reads no key. The secrets the agent's files name come from the host too: `default_secrets()` is `adam_core::NoSecrets`,
+which refuses every name, set in the person's environment or not (ADR 0047 decision 5); a host with secrets for them
+gives its own `SecretSource` to the agent's definition (`AgentDef::secrets` in `adam-assembly`).
 
 ## The dependency check
 
@@ -43,7 +45,8 @@ No Cargo features, no environment variables.
 
 ## Tests
 
-None yet beyond the check above: the API arrives with slice 4.
+`a_name_the_environment_has_is_refused_by_the_engines_default` (slice 2's proof: `PATH` through `default_secrets()`
+is refused). The API's tests arrive with slice 4.
 
 ## See also
 

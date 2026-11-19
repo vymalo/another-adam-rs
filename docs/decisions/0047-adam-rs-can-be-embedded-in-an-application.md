@@ -86,7 +86,8 @@ workspace as it is.
    *Built 2026-11-19 (slice 2):* `adam_core::SecretSource` with `ProcessEnv` (the default of `AgentDef` and
    `adam_mcp::Env`) and `NoSecrets`; `AgentDef::secrets` gives one source to the remote subagents and the MCP servers,
    after the values of `AgentDef::env`. A refused name is `RemoteAuthProblem::Refused` or `VarProblem::Refused`, and a
-   `${VAR:-default}` keeps its default. `adam-engine` takes `NoSecrets` as its default when its builder exists (slice 4).
+   `${VAR:-default}` keeps its default. `adam_engine::default_secrets()` is `NoSecrets` (its test is the slice's proof), and the engine's builder (slice 4)
+   takes it as its default.
 6. **A tool call can need the person's approval.** An `ApprovalPolicy` decides before a tool's journaled step: allow,
    refuse, or ask. An ask parks the run as a question; the answer runs or refuses **the same call**, once, and a replay
    never asks again. The access tiers of ADR 0036 decide what is asked.
