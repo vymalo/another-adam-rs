@@ -11,7 +11,8 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 
 ## API at a glance
 
-* `PgStore::connect(url)`: default pool (16 connections).
+* `PgStore::connect(url)`: a pool of `ADAM_PG_POOL_SIZE` connections (default 16, per process).
+* `PgStore::connect_with_pool_size(url, n)`: the same with an explicit size (1 to 65535).
 * `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
@@ -45,6 +46,14 @@ index. No transaction is held open while agent code runs. `JSONB` cannot hold
 (`adam_core::storable`), as every adapter does, so a state or a journal payload is
 the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
 The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
+
+## Pool
+
+`connect` sizes the pool from `ADAM_PG_POOL_SIZE` (1 to 65535, default 16) and
+`connect_with_pool_size` from its argument; `from_pool` uses the pool you pass. The pool is **per
+process**: N replicas open up to N × the size against one server, and an `adam-notify-postgres`
+listener holds one connection for the process's lifetime. A value that is not an integer in range
+fails the connect with `InvalidInput`; it never falls back to 16 silently.
 
 ## Schema version 3: the push table
 

@@ -29,6 +29,10 @@ on every transition. Read the run for the stored state (a store may have replace
 `journal_put` is the exception and returns the payload it stored, because the loop decodes the step's
 outcome from it.
 
+`PgStore::connect` sizes its pool from `ADAM_PG_POOL_SIZE` (1 to 65535, default 16, per process);
+`connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A value
+that is not an integer in range fails the connect rather than falling back to 16.
+
 Creating a run with a deterministic id gives idempotent "fire once" semantics, for example one run per
 cron tick across all replicas. A second message on a conversation that has an open run gets
 `ConversationBusy`; resume the open run instead.

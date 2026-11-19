@@ -8,7 +8,7 @@ The chart sets these from its values: [chart README](../../deploy/coder/README.m
 files or logs; they are `SecretString`s and absent from `Debug`.
 
 The roles that run workers (`all`, `worker`) read everything below except where a row says otherwise.
-A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
+A `control-plane` reads only `ROLE`, `DATABASE_URL`, `ADAM_PG_POOL_SIZE`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
 `ADAM_AGENT_DIR`, the `SESSION_*` limits and the optional `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS`, and a chart may set the rest for every role.
 
 ## Both binaries (`adam-service`)
@@ -17,6 +17,7 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLI
 |---|---|---|
 | `ROLE` | `all`, `control-plane` or `worker` | `all` |
 | `DATABASE_URL` | Postgres for the run store | required |
+| `ADAM_PG_POOL_SIZE` | connections in the Postgres store's pool, **per process** (1 to 65535); an `adam-notify-postgres` listener holds one of them for the process's lifetime. Read by `adam-store-postgres` when it connects, not by `adam-service`'s own configuration: a value that is not an integer in range fails that connect at startup | `16` |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens; **none = no server** | required by `all`, `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (goes in the agent card) | required by `all`, `control-plane` |
 | `LISTEN_ADDR` | the A2A server, or a worker's `/healthz` | `0.0.0.0:8080` |

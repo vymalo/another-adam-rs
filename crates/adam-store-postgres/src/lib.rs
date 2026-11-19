@@ -64,6 +64,13 @@ pub const SCHEMA_VERSION: i32 = 4;
 /// Purge deletes in batches of this many runs (plus their journals).
 const PURGE_BATCH: i64 = 500;
 
+/// The pool size [`PgStore::connect`] uses when `ADAM_PG_POOL_SIZE` is unset: 16 connections per
+/// process.
+pub const DEFAULT_POOL_SIZE: u32 = 16;
+
+/// The largest pool `ADAM_PG_POOL_SIZE` or [`PgStore::connect_with_pool_size`] accepts.
+pub const MAX_POOL_SIZE: u32 = 65_535;
+
 const PUSH_COLUMNS: &str = "run_id, id, agent, owner, config, cursor, state, attempts, last_error, next_attempt_at, version, created_at, updated_at";
 
 const RUN_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, state, wake_at, version, created_at, updated_at";
@@ -83,10 +90,22 @@ pub struct PgStore {
 }
 
 impl PgStore {
-    /// Connect with a default pool. Call [`Store::migrate`] before first use.
+    /// Connect with a pool of [`ADAM_PG_POOL_SIZE`](pool_size_from_env) connections (16 by
+    /// default). Call [`Store::migrate`] before first use.
     pub async fn connect(url: &str) -> StoreResult<Self> {
+        Self::connect_with_pool_size(url, pool_size_from_env()?).await
+    }
+
+    /// Connect with a pool of exactly `max_connections` (1 to [`MAX_POOL_SIZE`]), whatever the
+    /// environment says. Call [`Store::migrate`] before first use.
+    pub async fn connect_with_pool_size(url: &str, max_connections: u32) -> StoreResult<Self> {
+        if !(1..=MAX_POOL_SIZE).contains(&max_connections) {
+            return Err(StoreError::InvalidInput(format!(
+                "pool size {max_connections} is out of range (1 to {MAX_POOL_SIZE})"
+            )));
+        }
         let pool = PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(max_connections)
             .connect(url)
             .await
             .map_err(classify)?;
@@ -159,6 +178,38 @@ impl PgStore {
         }
         classify(err)
     }
+}
+
+/// `ADAM_PG_POOL_SIZE`: the connections one process's pool may open, 1 to [`MAX_POOL_SIZE`].
+///
+/// Unset means [`DEFAULT_POOL_SIZE`]. The pool is **per process**: a deployment of N replicas opens
+/// up to N × this many connections, and an `adam-notify-postgres` listener holds one of them for
+/// the process's lifetime. A value that is not an integer in range is
+/// [`StoreError::InvalidInput`], not a silent fallback: a typo must not change capacity without
+/// saying so.
+pub fn pool_size_from_env() -> StoreResult<u32> {
+    match std::env::var("ADAM_PG_POOL_SIZE") {
+        Ok(raw) => pool_size_from_text(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_POOL_SIZE),
+        Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidInput(
+            "ADAM_PG_POOL_SIZE is not valid unicode".into(),
+        )),
+    }
+}
+
+/// [`pool_size_from_env`]'s rule for one value.
+fn pool_size_from_text(raw: &str) -> StoreResult<u32> {
+    let size: u32 = raw.trim().parse().map_err(|_| {
+        StoreError::InvalidInput(format!(
+            "ADAM_PG_POOL_SIZE {raw:?} is not an integer (1 to {MAX_POOL_SIZE})"
+        ))
+    })?;
+    if !(1..=MAX_POOL_SIZE).contains(&size) {
+        return Err(StoreError::InvalidInput(format!(
+            "ADAM_PG_POOL_SIZE {raw:?} is out of range (1 to {MAX_POOL_SIZE})"
+        )));
+    }
+    Ok(size)
 }
 
 /// Decide what a driver error means to the caller and box it as the source.
@@ -1146,6 +1197,50 @@ mod tests {
         let e = classify(sqlx::Error::Decode(boxed("bad")));
         assert!(!e.is_retryable());
         assert!(e.class().should_alert());
+    }
+
+    #[test]
+    fn the_pool_size_is_validated_and_defaults_to_sixteen() {
+        assert_eq!(pool_size_from_text("1").unwrap(), 1);
+        assert_eq!(pool_size_from_text(" 16 ").unwrap(), 16);
+        assert_eq!(
+            pool_size_from_text(&MAX_POOL_SIZE.to_string()).unwrap(),
+            MAX_POOL_SIZE
+        );
+        for bad in ["0", "65536", "", "sixteen", "-1", "1.5"] {
+            let err = pool_size_from_text(bad).unwrap_err();
+            assert!(
+                matches!(err, StoreError::InvalidInput(_)),
+                "{bad:?}: {err:?}"
+            );
+            assert_eq!(err.class(), ErrorClass::Invalid);
+        }
+        // The unset path is the default; a suite that sets the variable checks its value instead.
+        match std::env::var("ADAM_PG_POOL_SIZE") {
+            Err(std::env::VarError::NotPresent) => {
+                assert_eq!(pool_size_from_env().unwrap(), DEFAULT_POOL_SIZE);
+                assert_eq!(DEFAULT_POOL_SIZE, 16);
+            }
+            Ok(raw) => assert_eq!(
+                pool_size_from_env().unwrap(),
+                pool_size_from_text(&raw).unwrap()
+            ),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pool_size_out_of_range_is_refused_before_connecting() {
+        // No server is needed: the size is checked before a connection is attempted.
+        for size in [0, MAX_POOL_SIZE + 1] {
+            let err = PgStore::connect_with_pool_size("postgres://example.invalid/db", size)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StoreError::InvalidInput(_)),
+                "{size}: {err:?}"
+            );
+        }
     }
 
     /// Provoke a server-side error with a chosen SQLSTATE.
