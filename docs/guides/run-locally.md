@@ -50,8 +50,9 @@ To talk to an agent from a terminal instead, `dev/chat.sh` (the general agent) o
 model with `-f dev/compose.real-model.yaml`: [Try the agents](try-the-agents.md).
 
 Say "hi" to either agent and it greets you from its own instructions. The other scenarios (a scratch project,
-a second repository, a repository created on request, the devcontainer, a GitHub App) are scripts:
-[Testing](testing.md#end-to-end-scenarios).
+a second repository, a repository created on request, a GitHub App) are scripts:
+[Testing](testing.md#end-to-end-scenarios). A run's commands run in the coder's own container; on
+Kubernetes a repository's own environment is a run pod of its image ([ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)).
 
 ## Change what an agent says
 
@@ -97,4 +98,3 @@ what it says.
 | the container exits 69 | Postgres is not reachable yet or at all |
 | `401` on every call | a missing or wrong `Authorization: Bearer dev-token` (no token means no server, by design) |
 | the model mock answers `404 off_script` | a request left the scripted model's script, on purpose, so a run that wanders fails loudly; see [scripted models](../reference/dev-stack.md#scripted-models) |
-| Podman scenarios fail on Ubuntu 24.04 | `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` |
