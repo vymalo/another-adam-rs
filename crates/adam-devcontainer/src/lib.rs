@@ -120,6 +120,10 @@ pub struct Settings {
     pub probe_timeout: Duration,
     /// How long a probe's answer is reused (30 seconds).
     pub probe_interval: Duration,
+    /// How long a check that a run's container is there is believed (3 seconds): `ensure` is
+    /// asked on every tool call that runs a process, and only a container that was seen running is
+    /// remembered, for the container it was seen for.
+    pub alive_ttl: Duration,
     /// How long releasing a run may take (60 seconds).
     pub release_timeout: Duration,
 }
@@ -141,6 +145,7 @@ impl Settings {
             read_timeout: Duration::from_secs(120),
             probe_timeout: Duration::from_secs(10),
             probe_interval: Duration::from_secs(30),
+            alive_ttl: Duration::from_secs(3),
             release_timeout: Duration::from_secs(60),
         }
     }

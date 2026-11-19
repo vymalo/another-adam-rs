@@ -41,6 +41,13 @@ use crate::{Runtime, Settings};
 /// What the step of building an environment shows.
 const STEP: &str = "environment";
 
+/// The verdict that a run's container was there, when it was asked, and which container was seen
+/// (a rebuild makes another one).
+struct Alive {
+    at: Instant,
+    container: String,
+}
+
 /// What the process holds: the settings, the clients and the per-run locks.
 pub(crate) struct Inner {
     pub(crate) settings: Settings,
@@ -51,6 +58,8 @@ pub(crate) struct Inner {
     pub(crate) epoch: String,
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     probe: StdMutex<Option<(Instant, Result<(), String>)>>,
+    /// The runs whose container was found there, at most [`ALIVE_TTL`] ago.
+    alive: StdMutex<HashMap<String, Alive>>,
     tools: OnceCell<PathBuf>,
     announced: StdMutex<HashSet<String>>,
 }
@@ -164,6 +173,7 @@ impl DevContainer {
                 epoch,
                 locks: StdMutex::default(),
                 probe: StdMutex::default(),
+                alive: StdMutex::default(),
                 tools: OnceCell::new(),
                 announced: StdMutex::default(),
             }),
@@ -246,6 +256,7 @@ impl DevContainer {
     pub async fn rebuild(&self, run: &str, use_default: bool) -> Result<(), EnvError> {
         let dir = state::run_dir(&self.inner.settings.root, run)?;
         let _guard = self.lock_run(run, false).await?;
+        self.forget_alive(run);
         if self.inner.settings.runtime == Runtime::Podman {
             let previous = State::read(&self.inner.settings.root, run)?;
             self.remove_container_and_images(run, previous.as_ref())
@@ -392,22 +403,76 @@ impl DevContainer {
         })
     }
 
-    /// Whether the container of `state` is there and running.
+    /// Whether the container of `state` is there and running, believed for
+    /// [`Settings::alive_ttl`]: `ensure` asks on every tool call, and `podman ps` is a process per
+    /// call for an answer that only a container dying changes. A verdict is only cached when the
+    /// container was seen there, and only for the container it was seen for.
     async fn alive(&self, run: &str, state: &State) -> Result<bool, EnvError> {
+        let env_file = state::run_dir(&self.inner.settings.root, run)?.join("devcontainer.json");
+        let env_file_is_there = env_file.is_file();
+        let id = state.container_id.as_deref().filter(|id| !id.is_empty());
+        if env_file_is_there
+            && let Some(id) = id
+            && self.alive_recently(run, id)
+        {
+            return Ok(true);
+        }
         let rows = self
             .inner
             .podman
             .containers(RUN_LABEL, run)
             .await
             .map_err(|e| EnvError::Unavailable(e.to_string()))?;
-        let Some(id) = state.container_id.as_deref().filter(|id| !id.is_empty()) else {
+        let Some(id) = id else {
             return Ok(false);
         };
-        let env_file = state::run_dir(&self.inner.settings.root, run)?.join("devcontainer.json");
-        Ok(env_file.is_file()
+        let alive = env_file_is_there
             && rows.iter().any(|r: &Row| {
                 r.running && (r.id == id || r.id.starts_with(id) || id.starts_with(&r.id))
-            }))
+            });
+        self.remember_alive(run, id, alive);
+        Ok(alive)
+    }
+
+    /// Whether the container `id` of `run` was found there less than [`Settings::alive_ttl`] ago.
+    fn alive_recently(&self, run: &str, id: &str) -> bool {
+        let cache = self
+            .inner
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get(run).is_some_and(|seen| {
+            seen.container == id && seen.at.elapsed() < self.inner.settings.alive_ttl
+        })
+    }
+
+    /// Keep (or forget) what `alive` found: only a container that was there is worth believing.
+    fn remember_alive(&self, run: &str, id: &str, alive: bool) {
+        let mut cache = self
+            .inner
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if alive {
+            cache.insert(
+                run.to_owned(),
+                Alive {
+                    at: Instant::now(),
+                    container: id.to_owned(),
+                },
+            );
+        } else {
+            cache.remove(run);
+        }
+    }
+
+    /// Forget the verdict of `run`: its container is being removed or made again.
+    fn forget_alive(&self, run: &str) {
+        self.inner
+            .alive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(run);
     }
 
     /// `ensure` for a deployment that has a runtime.
@@ -497,6 +562,8 @@ impl DevContainer {
         let s = &self.inner.settings;
         let run = ws.run();
 
+        // Whatever was seen of a container of this run is being made again.
+        self.forget_alive(run);
         if let Err(why) = self.probe_cached().await {
             if had_environment {
                 return Err(EnvError::Unavailable(why));
@@ -961,6 +1028,8 @@ impl DevContainer {
 
     async fn release_locked(&self, run: &str, dir: &Path) -> Result<(), EnvError> {
         let s = &self.inner.settings;
+        // The container is going: no verdict about it outlives this call.
+        self.forget_alive(run);
         if !dir.exists() {
             return Ok(());
         }
