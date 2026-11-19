@@ -420,16 +420,12 @@ pub async fn serve(
     if role.runs_control_plane() && card.is_none() {
         return Err(ServeError::NoCard);
     }
-    let (store, pool): (DynStore, _) = {
-        let store = PgStore::connect(config.database_url.expose_secret())
-            .await
-            .map_err(ServeError::Connect)?;
-        adam_core::Store::migrate(&store)
-            .await
-            .map_err(ServeError::Migrate)?;
-        let pool = store.pool().clone();
-        (Arc::new(store), pool)
-    };
+    // The store connects lazily so that the process's own configuration is checked before it
+    // depends on the database: a mistake of the binary is exit 78 whether or not Postgres answers.
+    let pg =
+        PgStore::connect_lazy(config.database_url.expose_secret()).map_err(ServeError::Connect)?;
+    let pool = pg.pool().clone();
+    let store: DynStore = Arc::new(pg.clone());
 
     // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own pool. The
     // listener (`notify.run`) is a host component below; the runtime only holds the two halves.
@@ -468,6 +464,11 @@ pub async fn serve(
             card.extensions.push(extension);
         }
     }
+
+    pg.ping().await.map_err(ServeError::Connect)?;
+    adam_core::Store::migrate(&pg)
+        .await
+        .map_err(ServeError::Migrate)?;
 
     // Bind before anything runs: an address that cannot be bound fails the process at once.
     let listener = TcpListener::bind(config.listen_addr)

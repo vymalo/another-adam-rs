@@ -77,6 +77,30 @@ async fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// The helpers are checked before the database is: a misconfiguration is exit 78 even when no
+/// database answers, not the 69 of a store that cannot be reached.
+#[tokio::test]
+async fn an_unregistered_helper_is_78_before_the_database_is_asked() {
+    let name = unique("serve-sessions-early");
+    let dead = free_port().await;
+    let port = free_port().await;
+    let cfg = config(
+        &format!("postgres://nobody:nothing@127.0.0.1:{dead}/none"),
+        "all",
+        port,
+    );
+    let helper = format!("{name}/helper");
+    let agents = agents(&name, &cfg).child_sessions(sessions_for(&helper));
+    let error = adam_service::serve(&cfg, agents, std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, ServeError::ChildSessions { agent } if *agent == helper),
+        "{error}"
+    );
+    assert_eq!(exit_code(&error), 78);
+}
+
 fn config(database: &str, role: &str, port: u16) -> ServiceConfig {
     config_with(database, role, port, &[])
 }

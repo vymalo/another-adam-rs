@@ -91,10 +91,12 @@ sequenceDiagram
   participant P as Postgres
   participant H as Host (adam-host)
   B->>B: parse the configuration, read the agent's files, assemble the agent
-  B->>S: serve(config, Agents { name, card, register, options, inbound }, shutdown)
-  S->>P: connect, migrate
+  B->>S: serve(config, Agents { name, card, register, options, inbound, child_sessions }, shutdown)
+  S->>S: open the pool without connecting (PgStore::connect_lazy)
   S->>S: PgNotify (LISTEN/NOTIFY) as LiveSignals
   S->>S: Service::new_with(register(Runtime::builder(store)), name, options, live)
+  S->>S: every helper of child_sessions is registered, else ServeError::ChildSessions (78), and the card lists the extension
+  S->>P: connect, migrate
   S->>S: bind LISTEN_ADDR, log `listening` (addr, role, workers, worker_id)
   S->>H: the components of the role
   H-->>S: shutdown: drain the server, let the steps finish, flush notify
@@ -105,7 +107,7 @@ sequenceDiagram
 stateDiagram-v2
   [*] --> Connecting
   Connecting --> Listening: migrated, bound
-  Connecting --> Failed: Postgres down or schema refused, address taken, no card
+  Connecting --> Failed: no card, a helper of child-sessions/v1 not registered (78), Postgres down or schema refused, address taken
   Listening --> Draining: the shutdown future resolves
   Listening --> Failed: a component stops on its own
   Draining --> [*]: components stopped, notify flushed
@@ -115,7 +117,7 @@ stateDiagram-v2
 | Role | Components | Also |
 |---|---|---|
 | `all` (default) | `a2a-server`, `worker`, `notify` | |
-| `control-plane` | `a2a-server`, `notify` | the runtime knows the agent as a starter only: no model, no tools |
+| `control-plane` | `a2a-server`, `notify` | the runtime knows the agent, and the helpers of `child-sessions/v1`, as starters only: no model, no tools |
 | `worker` | `worker`, `health`, `notify` | `/healthz` on `LISTEN_ADDR`, no A2A |
 
 A binary adds components of its own with `Agents::worker_component(name, |store, stop| async { .. })`: they

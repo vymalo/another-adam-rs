@@ -85,6 +85,22 @@ impl PgStore {
         Ok(Self::from_pool(pool))
     }
 
+    /// Like [`connect`](Self::connect), but opens no connection yet: the first use does. A process
+    /// that wants to check its own configuration before it depends on the database builds on this,
+    /// then calls [`ping`](Self::ping). Fails only on a URL the driver cannot parse.
+    pub fn connect_lazy(url: &str) -> StoreResult<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(16)
+            .connect_lazy(url)
+            .map_err(classify)?;
+        Ok(Self::from_pool(pool))
+    }
+
+    /// Open a connection now, to learn whether the database answers.
+    pub async fn ping(&self) -> StoreResult<()> {
+        self.pool.acquire().await.map(drop).map_err(classify)
+    }
+
     /// Use an existing pool, e.g. the one your app already has.
     pub fn from_pool(pool: PgPool) -> Self {
         Self::build(pool, "adam_".to_owned())

@@ -11,7 +11,7 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 
 ## API at a glance
 
-* `PgStore::connect(url)`: default pool (16 connections).
+* `PgStore::connect(url)`: default pool (16 connections). `PgStore::connect_lazy(url)` opens none until first use and `ping()` opens one, for a process that checks its own configuration before it needs the database (`adam-service`'s `serve`).
 * `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
