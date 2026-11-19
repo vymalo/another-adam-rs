@@ -44,9 +44,9 @@ use a2a::{Message, Task, TaskState};
 use adam_a2a::{BackendError, CHILD_SESSIONS_EXTENSION, Caller, ChildSessionInfo, ExtensionConfig};
 use adam_core::{RunId, RunRecord};
 use adam_runtime::{
-    Inbound, MAX_SESSION_PAGE, RunView, RuntimeError, SESSION_CLOSE_KIND, SESSION_STATE_KEY,
-    SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView, closing_round_payload,
-    parse_session_conversation_id, session_conversation_id,
+    Inbound, MAX_SESSION_PAGE, RoundOutcome, RunView, RuntimeError, SESSION_CLOSE_KIND,
+    SESSION_STATE_KEY, SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView,
+    closing_round_payload, parse_session_conversation_id, session_conversation_id,
 };
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -82,6 +82,10 @@ pub struct ChildSessionAgent {
     pub description: String,
     /// The time limit of each of its rounds.
     pub within: Option<Duration>,
+    /// Whether a round of it works on another agent's task, which a cancel of the round does not
+    /// stop by itself: the process that serves the front holds no endpoint, so a cancel that closes
+    /// the session is followed by a closing round, which a worker steps and which cancels it.
+    pub remote: bool,
 }
 
 impl ChildSessionAgent {
@@ -96,7 +100,15 @@ impl ChildSessionAgent {
             agent: agent.into(),
             description: description.into(),
             within: None,
+            remote: false,
         }
+    }
+
+    /// Mark the helper as one whose rounds work on a task of another agent.
+    #[must_use]
+    pub fn remote(mut self) -> Self {
+        self.remote = true;
+        self
     }
 
     /// The time limit of each of its rounds.
@@ -940,7 +952,7 @@ impl RuntimeTaskBackend {
             let helper = sessions.by_registered(&view.agent);
             let within = helper.and_then(|h| h.within);
             if close.is_some() {
-                if view.closed && !working {
+                if view.closed && !working && !needs_cleanup(&view, helper) {
                     return self.answer_round(caller, &view.latest_run).await;
                 }
                 if working {
@@ -1024,6 +1036,44 @@ impl RuntimeTaskBackend {
         Err(BackendError::unavailable(
             "the session kept changing while the message was sent",
         ))
+    }
+
+    /// After a cancel of round `run` of a person's session: when the cancel closed a session on a
+    /// remote helper, start the closing round that cancels the remote task. The process that
+    /// serves the front holds no endpoint and no credential, so the cancel's own hook cannot send
+    /// `CancelTask`; the worker's round agent does, as it does for any closing round. The round's
+    /// id derives from the cancelled run, so a repeat finds it.
+    pub(crate) async fn clean_up_after_cancel(
+        &self,
+        caller: &Caller,
+        round: &Round,
+    ) -> Result<(), BackendError> {
+        let sessions = self.sessions()?;
+        let Some(view) = self
+            .session_of(caller, &round.parent_context, round.session)
+            .await?
+        else {
+            return Ok(());
+        };
+        let helper = sessions.by_registered(&view.agent);
+        if view.latest_run != round.run || !needs_cleanup(&view, helper) {
+            return Ok(());
+        }
+        let within = helper.and_then(|h| h.within);
+        let mut header = next_header(&view, round.session);
+        header.closed = true;
+        header.closing = true;
+        let next = task_id_for(
+            &view.agent,
+            &caller.subject,
+            Some(&round.context),
+            &format!("cleanup-after-cancel-{}", round.run),
+        );
+        let input = Inbound::new("message", closing_round_payload(&header))
+            .with_id(format!("cleanup-after-cancel-{}", round.run));
+        // Busy: another request already started a round after the cancel; it cleans up as well.
+        self.next_round(&view, next, input, within).await?;
+        Ok(())
     }
 
     /// Start round `id` of `view`'s session, continuing its latest round. The round is its own
@@ -1129,6 +1179,16 @@ enum Next {
     Busy,
 }
 
+/// Whether `view`'s session was closed by a cancel of its latest round, and the helper works on
+/// another agent's task: the remote task is still running until a closing round has cancelled it.
+fn needs_cleanup(view: &SessionView, helper: Option<&ChildSessionAgent>) -> bool {
+    helper.is_some_and(|h| h.remote)
+        && view.closed
+        && view.state != SessionState::Working
+        && view.outcome == Some(RoundOutcome::Cancelled)
+        && view.header.as_ref().is_some_and(|h| !h.closing)
+}
+
 /// The id of the round a message to `view`'s session would start: derived from the message, so a
 /// repeat finds it; a message with no id starts a round that cannot be recognised.
 fn round_id(
@@ -1199,12 +1259,14 @@ mod tests {
                     agent: "root/planner".into(),
                     description: "Plans".into(),
                     within: None,
+                    remote: false,
                 },
                 ChildSessionAgent {
                     name: "researcher".into(),
                     agent: "root/researcher".into(),
                     description: "Looks things up".into(),
                     within: Some(Duration::from_secs(60)),
+                    remote: false,
                 },
             ],
             16,
@@ -1225,6 +1287,7 @@ mod tests {
             agent: agent.into(),
             description: String::new(),
             within: None,
+            remote: false,
         };
         assert!(ChildSessions::new([], 4).is_err());
         assert!(ChildSessions::new([one("a", "x/a")], 0).is_err());

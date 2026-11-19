@@ -1204,20 +1204,37 @@ mod tests {
         );
     }
 
-    /// The front's starter and the worker's agent start every round from the same state, closing
-    /// and carried messages included, so the worker steps what the front started.
+    /// The front's starter and the worker's agent each make the state a round starts from, closing
+    /// and carried messages included, checked against what that state must be and not against
+    /// each other: the worker steps what the front started.
     #[test]
-    fn the_starter_makes_the_state_the_round_agent_does() {
+    fn the_starter_and_the_round_agent_each_make_the_state_a_round_needs() {
         let starter = RemoteRoundStarter::new("coder/billing");
         let agent = round_agent();
-        assert_eq!(AgentStarter::name(&starter), AgentStarter::name(&agent));
-        let state = |s: &RoundState| serde_json::to_value(s).unwrap();
+        assert_eq!(AgentStarter::name(&starter), "coder/billing");
+        assert_eq!(AgentStarter::name(&agent), AgentStarter::name(&starter));
 
         let open = Inbound::new("start", json!({"text": "invoice 7"}));
-        let a = AgentStarter::init(&starter, open.clone()).unwrap();
-        let b = AgentStarter::init(&agent, open).unwrap();
-        assert_eq!(state(&a), state(&b));
-        assert!(AgentStarter::init(&starter, Inbound::new("start", json!({"text": " "}))).is_err());
+        let mut want = RoundState {
+            queues_messages: true,
+            ..RoundState::default()
+        };
+        want.queued.push(Queued {
+            id: String::new(),
+            text: "invoice 7".into(),
+        });
+        let want = serde_json::to_value(&want).unwrap();
+        assert_eq!(want["queued"][0]["text"], "invoice 7");
+        for state in [
+            AgentStarter::init(&starter, open.clone()).unwrap(),
+            AgentStarter::init(&agent, open.clone()).unwrap(),
+        ] {
+            assert_eq!(serde_json::to_value(&state).unwrap(), want);
+            assert!(!state.closing());
+        }
+        let blank = Inbound::new("start", json!({"text": " "}));
+        assert!(AgentStarter::init(&starter, blank.clone()).is_err());
+        assert!(AgentStarter::init(&agent, blank).is_err());
 
         // A close names the session and needs no text.
         let header = SessionHeader {
@@ -1233,26 +1250,36 @@ mod tests {
             SESSION_CLOSE_KIND,
             json!({ SESSION_STATE_KEY: header, SESSION_CLOSE_ROUND_KEY: true }),
         );
-        let (a, b) = (
+        for state in [
             AgentStarter::init(&starter, close.clone()).unwrap(),
-            AgentStarter::init(&agent, close).unwrap(),
-        );
-        assert!(a.closing());
-        assert_eq!(state(&a), state(&b));
+            AgentStarter::init(&agent, close.clone()).unwrap(),
+        ] {
+            assert!(state.closing());
+            assert!(state.queued.is_empty(), "a close has nothing to send");
+            assert_eq!(state.session.as_ref().map(|h| h.id), Some(header.id));
+        }
 
-        // A later round carries the context and what was never sent.
+        // A later round carries the context, the task to cancel and what was never sent.
         let mut before = AgentStarter::init(&agent, message("m1", "first")).unwrap();
         before.context_id = Some("ctx".into());
+        before.task = Some("t1".into());
         before.unhandled = vec![Queued {
             id: "u".into(),
             text: "unhandled".into(),
         }];
         let run = adam_core::RunId::new();
-        let (a, b) = (
+        for next in [
             AgentStarter::init_continuing(&starter, message("m2", "next"), &before, run).unwrap(),
             AgentStarter::init_continuing(&agent, message("m2", "next"), &before, run).unwrap(),
-        );
-        assert_eq!(state(&a), state(&b));
-        assert_eq!(a.context_id.as_deref(), Some("ctx"));
+        ] {
+            assert_eq!(next.context_id.as_deref(), Some("ctx"));
+            assert_eq!(next.prior_open_task.as_deref(), Some("t1"));
+            let texts: Vec<&str> = next.queued.iter().map(|q| q.text.as_str()).collect();
+            assert_eq!(
+                texts,
+                ["unhandled", "first", "next"],
+                "what waited goes first"
+            );
+        }
     }
 }

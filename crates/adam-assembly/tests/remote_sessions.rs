@@ -408,6 +408,16 @@ impl Rig {
     /// The assembly of the root's files, with a wait timer of 30 ms and the remote's time limit
     /// `limit` when given.
     fn assemble(&self, limit: Option<Duration>) -> Assembly {
+        self.def(limit)
+            .bind(ToolSet::new().tool(gate(&self.remote, &self.open)))
+            .unwrap()
+            .wait_poll(Duration::from_millis(30))
+            .model(self.model.clone(), "default")
+            .unwrap()
+    }
+
+    /// The definition of the root's files, as a worker and a control plane both read it.
+    fn def(&self, limit: Option<Duration>) -> AgentDef {
         let owned = files(&self.root, &self.server.card_url());
         let refs: Vec<(&str, &str)> = owned
             .iter()
@@ -417,11 +427,7 @@ impl Rig {
         if let Some(limit) = limit {
             def = def.remote_timeout(limit);
         }
-        def.bind(ToolSet::new().tool(gate(&self.remote, &self.open)))
-            .unwrap()
-            .wait_poll(Duration::from_millis(30))
-            .model(self.model.clone(), "default")
-            .unwrap()
+        def
     }
 
     fn runtime(&self, store: &DynStore, limit: Option<Duration>) -> Runtime {
@@ -1236,4 +1242,207 @@ async fn a_cancelled_round_repeats_a_send_only_when_it_does_not_know_the_task() 
     assert_eq!(rig.remote.submits().len(), 1);
     assert_eq!(rig.remote.made().len(), 1);
     assert_eq!(rig.remote.cancels(), [rig.remote.made()[0].0.clone()]);
+}
+
+// --- a person's session on a remote helper, a control plane and a worker --------------------
+
+/// The control plane serves the A2A front and registers only the starters of the helpers, so it
+/// knows no endpoint and no credential; the worker has the assembly and steps the rounds. Both run
+/// on one store.
+#[cfg(feature = "a2a")]
+mod split {
+    use super::*;
+    use a2a::Role as A2aRole;
+    use adam_a2a::CHILD_SESSIONS_EXTENSION;
+    use adam_a2a_runtime::RuntimeTaskBackend;
+    use adam_llm_agent::LlmStarter;
+    use adam_runtime::BroadcastSink;
+    use std::time::Instant;
+
+    pub(super) struct Split {
+        pub backend: RuntimeTaskBackend,
+        pub worker: common::Worker,
+        pub alice: Caller,
+    }
+
+    pub(super) fn alice() -> Caller {
+        let mut caller = Caller::new("alice");
+        caller.extensions = vec![CHILD_SESSIONS_EXTENSION.to_owned()];
+        caller
+    }
+
+    pub(super) fn said(text: &str, context: Option<&str>, metadata: Value) -> Message {
+        let mut message = Message::new(A2aRole::User, vec![Part::text(text)]);
+        message.context_id = context.map(str::to_owned);
+        message.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            metadata,
+        )]));
+        message
+    }
+
+    pub(super) fn object(task: &Task) -> Value {
+        task.metadata
+            .as_ref()
+            .and_then(|m| m.get(CHILD_SESSIONS_EXTENSION))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    pub(super) async fn until(split: &Split, id: &str, state: TaskState) -> Task {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let task = split
+                .backend
+                .get(&split.alice, id)
+                .await
+                .unwrap()
+                .expect("the round");
+            if task.status.state == state {
+                return task;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {state:?}; last {:?}",
+                task.status.state
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    impl Split {
+        pub async fn new(rig: &Rig, store: &DynStore) -> Self {
+            let worker_rt = rig.runtime(store, None);
+            let events = BroadcastSink::default();
+            let def = rig.def(None);
+            let sessions = def.child_sessions().expect("a root with a helper");
+            let control = def
+                .session_starters(
+                    Runtime::builder(store.clone()).starter(LlmStarter::new(&rig.root)),
+                )
+                .event_sink(events.clone())
+                .poll_interval(Duration::from_millis(10))
+                .build();
+            assert_eq!(
+                control.agent_names(),
+                [rig.root.clone(), format!("{}/billing", rig.root)],
+                "the control plane has starters and no agent"
+            );
+            let backend = RuntimeTaskBackend::new(control.clone(), events, rig.root.clone())
+                .with_poll_interval(Duration::from_millis(10))
+                .with_child_sessions(sessions);
+            Self {
+                backend,
+                worker: spawn_worker(&worker_rt),
+                alice: alice(),
+            }
+        }
+
+        pub async fn start(&self, text: &str, keep_open: bool) -> Task {
+            self.backend
+                .submit(
+                    self.alice.clone(),
+                    said(
+                        text,
+                        Some("ctx-1"),
+                        json!({"start": {"agent": "billing", "description": "billing",
+                                         "keepOpen": keep_open}}),
+                    ),
+                    None,
+                    Some("ctx-1".into()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("the start was refused: {e:?}"))
+        }
+    }
+
+    /// A round on a remote helper started on the control plane is stepped by the worker's round
+    /// agent: it sends the person's words to the remote and reports the remote's answer. Were the
+    /// control plane to register another starter for the helper, the worker could not read the
+    /// state it made and the round would not complete.
+    #[tokio::test]
+    async fn a_round_on_a_remote_helper_started_on_a_control_plane_is_worked_by_the_worker() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::new(&rig, &store).await;
+            let start = split.start("invoice 7", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            rig.remote.release();
+            let done = until(&split, &start.id, TaskState::Completed).await;
+            let answer = serde_json::to_string(&done).unwrap();
+            assert!(answer.contains("done: invoice 7"), "{backend}: {answer}");
+            assert_eq!(object(&done)["state"], "idle", "{backend}: kept open");
+            let submits = rig.remote.submits();
+            assert_eq!(submits.len(), 1, "{backend}");
+            assert_eq!(submits[0].text, "invoice 7", "{backend}");
+            split.worker.stop().await;
+        }
+    }
+
+    /// The control plane holds no endpoint, so it cannot cancel the remote task itself. A cancel
+    /// of a round that closes its session (`keep_open: false`) still makes the worker send it.
+    #[tokio::test]
+    async fn cancelling_a_round_of_a_session_that_closes_with_it_cancels_the_remote_task() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::new(&rig, &store).await;
+            let start = split.start("invoice 7", false).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            let task = split.backend.cancel(&split.alice, &start.id).await.unwrap();
+            assert_eq!(task.status.state, TaskState::Canceled, "{backend}");
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            // The session is closed, and one closing round was made for it.
+            let task = split
+                .backend
+                .get(&split.alice, &start.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(object(&task)["state"], "closed", "{backend}");
+            split.worker.stop().await;
+        }
+    }
+
+    /// A close that cancels, of a session that does not stay open, ends the remote task too.
+    #[tokio::test]
+    async fn closing_with_cancel_a_session_that_does_not_stay_open_cancels_the_remote_task() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::new(&rig, &store).await;
+            let start = split.start("invoice 7", false).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            let context = start.context_id.clone();
+            split
+                .backend
+                .submit(
+                    split.alice.clone(),
+                    said("stop", Some(&context), json!({"close": {"cancel": true}})),
+                    None,
+                    Some(context.clone()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: the close was refused: {e:?}"));
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            split.worker.stop().await;
+        }
+    }
 }

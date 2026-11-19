@@ -353,6 +353,7 @@ impl AgentDef {
             .into_iter()
             .map(|helper| {
                 let agent = ChildSessionAgent::new(helper.name, helper.agent, helper.description);
+                let agent = if helper.remote { agent.remote() } else { agent };
                 match helper.within {
                     Some(within) => agent.within(within),
                     None => agent,
@@ -378,8 +379,10 @@ impl AgentDef {
     /// registers nothing. Do not call it on a runtime that also registers the assembly: a second
     /// registration under a name replaces the first.
     ///
-    /// A process that registers only starters cannot cancel the task of a remote round it
-    /// cancels: the cancel is sent by the full agent, where it commits ([`RemoteRoundAgent`]).
+    /// A process that registers only starters holds no endpoint, so it cannot send the
+    /// `CancelTask` of a remote round it cancels. The front follows a cancel that closes a session
+    /// on a remote helper with a closing round ([`ChildSessionAgent::remote`](adam_a2a_runtime::ChildSessionAgent::remote)),
+    /// which a worker steps and whose [`RemoteRoundAgent`] cancels the task.
     #[must_use]
     pub fn session_starters(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
         let root = &self.manifest.name;

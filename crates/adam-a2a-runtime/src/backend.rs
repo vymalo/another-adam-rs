@@ -933,6 +933,9 @@ impl TaskBackend for RuntimeTaskBackend {
                 .map_err(map_err)?;
             view = self.view_of(run).await?;
             state = crate::task_state(&view);
+            if let Some(round) = self.round_of(caller, task_id).await? {
+                self.clean_up_after_cancel(caller, &round).await?;
+            }
         }
         match state {
             TaskState::Canceled => {
