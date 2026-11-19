@@ -615,7 +615,7 @@ metadata:
 spec:
   replicas: 1
   serviceName: coder
-  podManagementPolicy: OrderedReady
+  podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
   selector:

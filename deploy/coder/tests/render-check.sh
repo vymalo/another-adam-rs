@@ -55,6 +55,10 @@ golden="$chart/tests/golden/combined.yaml"
 # The default render is the pre-split chart, byte for byte (regenerate with the
 # command above, at the same --namespace and --set, only for a deliberate change).
 check "the default render equals tests/golden/combined.yaml" cmp -s "$out" "$golden"
+# Nothing needs ordinal ordering (a worker's identity is its pod name; one database, one volume), and OrderedReady would
+# serialise every replica start behind the previous one's readiness.
+check "the StatefulSet starts its replicas together (Parallel)" \
+  dhas StatefulSet '^  podManagementPolicy: Parallel$'
 
 # The model's reasoning (ADR 0020 of adam-rs): MODEL_EXTRA_BODY is a value of the chart, not a secret,
 # empty by default (nothing is rendered), and a JSON object when it is set. MODEL_ECHO_REASONING likewise.
