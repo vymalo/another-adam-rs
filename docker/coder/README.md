@@ -38,7 +38,7 @@ gateway, GitHub or a git remote.
 | `test/static-smoke.sh <image>` | `file` says each binary is static, the image's default user is 10001, and each starts in `debian:bookworm-slim` and Alpine as uid 10001, ending on its configuration error (78; 64 for `adam-kube-exec`), never a loader error |
 | `test/container-smoke.sh <image>` | the coder starts under tini, serves A2A fail-closed and takes a task to completion against a stub model (needs a Postgres) |
 | `test/agent-smoke.sh <image>` | the same image with `--entrypoint tini -- adam-agent` |
-| `test/http-smoke.sh <image>` | the HTTP+JSON binding, `/docs` and `/openapi.json` |
+| `test/http-smoke.sh <base-url> <bearer-token>` | the HTTP+JSON binding, `/docs` and `/openapi.json` (run by the container and agent smoke tests) |
 | `test/github-mcp-tools.sh` | the GitHub MCP server lists the coder's read tools over stdio, with no credential |
 
 `.github/workflows/coder.yml` runs the build, `static-smoke.sh`, the other smoke tests and the compose
