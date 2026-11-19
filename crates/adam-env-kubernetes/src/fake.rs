@@ -22,9 +22,11 @@ use k8s_openapi::api::core::v1::{
     ContainerState, ContainerStateWaiting, ContainerStatus, Pod, PodCondition, PodStatus,
 };
 use kube::Client;
+use kube::api::WatchEvent;
 use kube::client::Body;
 use tower_test::mock;
 
+use crate::environment::is_ready;
 use crate::exec::{Captured, ExecError, ExitStatus, PodExec};
 use crate::template::tests::template_at;
 use crate::{KubeEnvironment, Settings};
@@ -48,6 +50,14 @@ pub(crate) struct State {
     pub(crate) blind_gets: u32,
     /// Answer every request with 503.
     pub(crate) down: bool,
+    /// Answer watch requests with 503, as an API that does not serve them.
+    pub(crate) watch_down: bool,
+    /// Answer a watch with an `ERROR` event (a version the server no longer has, or a 5xx).
+    pub(crate) watch_error: bool,
+    /// How long a watch answer waits before it is sent: a pod that takes time to come up.
+    pub(crate) watch_delay: Duration,
+    /// The fake's `resourceVersion` counter: a status that changes is a new version.
+    version: u64,
     /// Pods that were read, by name.
     reads: BTreeMap<String, u32>,
 }
@@ -167,6 +177,55 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Read a pod the way the API would: the fake's clock is a count of observations (`reads`), and a
+/// pod with no status yet is given one. Both `GET` and a watch event observe. A status that
+/// actually changes is a new `resourceVersion`, as it is on the cluster.
+fn observe(st: &mut State, name: &str) -> Option<Pod> {
+    let reads = {
+        let n = st.reads.entry(name.to_owned()).or_insert(0);
+        *n += 1;
+        *n
+    };
+    let (ready_after, stuck) = (st.ready_after, st.stuck.clone());
+    let pod = st.pods.get_mut(name)?;
+    let mut changed = false;
+    // A pod that is already ended or going away keeps the status it was given.
+    if pod.status.is_none() {
+        pod.status = Some(match stuck {
+            Some(stuck) => stuck,
+            None if reads > ready_after => ready_status(),
+            None => PodStatus {
+                phase: Some("Pending".to_owned()),
+                ..PodStatus::default()
+            },
+        });
+        changed = true;
+    } else if let (None, Some(status)) = (&stuck, &mut pod.status)
+        && status.phase.as_deref() == Some("Pending")
+        && reads > ready_after
+    {
+        *status = ready_status();
+        changed = true;
+    }
+    if changed {
+        st.version += 1;
+        pod.metadata.resource_version = Some(st.version.to_string());
+    }
+    Some(pod.clone())
+}
+
+/// The watch event the fake answers with when a test asks for an API error (a version the server
+/// no longer has, or a 5xx).
+fn watch_error_event() -> serde_json::Value {
+    serde_json::json!({
+        "type": "ERROR",
+        "object": {
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "message": "too old resource version: 1 (2)", "reason": "Expired", "code": 410
+        }
+    })
+}
+
 async fn answer(state: &Shared, request: Request<Body>) -> Response<Body> {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -188,11 +247,85 @@ async fn answer(state: &Shared, request: Request<Body>) -> Response<Body> {
         return failure(404, "NotFound", &format!("no such path {path}"));
     };
     let name = rest.strip_prefix('/');
+    // A watch answer may be made to wait, for a pod that takes its time to come up. The delay is
+    // read before the lock is taken for the answer: a guard must not be held across an await.
+    if method.as_str() == "GET" && query_of(&query, "watch").as_deref() == Some("true") {
+        let delay = lock(state).watch_delay;
+        tokio::time::sleep(delay).await;
+    }
     let mut st = lock(state);
     if st.down {
         return failure(503, "ServiceUnavailable", "the API server is down");
     }
     match (method.as_str(), name) {
+        // A watch of the collection, narrowed by `metadata.name` (which is how `Api::watch` asks
+        // for one object). The pod is the only one a field selector can name here.
+        ("GET", None) if query_of(&query, "watch").as_deref() == Some("true") => {
+            if st.watch_down {
+                return failure(503, "ServiceUnavailable", "watching pods is not allowed");
+            }
+            if st.watch_error {
+                let body = format!("{}\n", watch_error_event());
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.into_bytes()))
+                    .unwrap();
+            }
+            let Some(name) = query_of(&query, "fieldSelector")
+                .and_then(|selector| selector.strip_prefix("metadata.name=").map(str::to_owned))
+            else {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap();
+            };
+            let Some(pod) = st.pods.get(&name).cloned() else {
+                // Gone: the client reads it, finds nothing and makes it again.
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap();
+            };
+            let requested = query_of(&query, "resourceVersion").unwrap_or_default();
+            let current = pod.metadata.resource_version.clone().unwrap_or_default();
+            let mut events: Vec<WatchEvent<Pod>> = Vec::new();
+            if requested.is_empty() || requested == "0" {
+                // What `resourceVersion=0` means: the state as it is now, as an `Added`, before
+                // any change. It is not a change, and the fake's clock does not move for it.
+                events.push(WatchEvent::Added(pod));
+            } else if requested == current {
+                // The client is up to date: a watch waits for the next change and then delivers
+                // it. The fake's clock is its observations, so it moves the clock to that change
+                // (bounded, so a pod that never changes ends the answer instead of looping).
+                let mut budget = st.ready_after.saturating_add(1);
+                while budget > 0 {
+                    budget -= 1;
+                    let Some(next) = observe(&mut st, &name) else {
+                        break;
+                    };
+                    if next.metadata.resource_version != pod.metadata.resource_version {
+                        events.push(WatchEvent::Modified(next));
+                        break;
+                    }
+                }
+            } else {
+                // A version the pod has moved past: the state the client missed.
+                events.push(WatchEvent::Modified(pod));
+            }
+            let lines: Vec<String> = events
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect();
+            let body = format!("{}\n", lines.join("\n"));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(body.into_bytes()))
+                .unwrap()
+        }
         ("GET", None) => {
             let selector = query_of(&query, "labelSelector").unwrap_or_default();
             let items: Vec<&Pod> = st
@@ -211,36 +344,10 @@ async fn answer(state: &Shared, request: Request<Body>) -> Response<Body> {
             st.blind_gets -= 1;
             failure(404, "NotFound", &format!("pods \"{name}\" not found"))
         }
-        ("GET", Some(name)) => {
-            let reads = {
-                let n = st.reads.entry(name.to_owned()).or_insert(0);
-                *n += 1;
-                *n
-            };
-            let (ready_after, stuck) = (st.ready_after, st.stuck.clone());
-            match st.pods.get_mut(name) {
-                None => failure(404, "NotFound", &format!("pods \"{name}\" not found")),
-                Some(pod) => {
-                    // A pod that is already ended or going away keeps the status it was given.
-                    if pod.status.is_none() {
-                        pod.status = Some(match stuck {
-                            Some(stuck) => stuck,
-                            None if reads > ready_after => ready_status(),
-                            None => PodStatus {
-                                phase: Some("Pending".to_owned()),
-                                ..PodStatus::default()
-                            },
-                        });
-                    } else if let (None, Some(status)) = (&stuck, &mut pod.status)
-                        && status.phase.as_deref() == Some("Pending")
-                        && reads > ready_after
-                    {
-                        *status = ready_status();
-                    }
-                    json(StatusCode::OK, &serde_json::to_value(&*pod).unwrap())
-                }
-            }
-        }
+        ("GET", Some(name)) => match observe(&mut st, name) {
+            None => failure(404, "NotFound", &format!("pods \"{name}\" not found")),
+            Some(pod) => json(StatusCode::OK, &serde_json::to_value(&pod).unwrap()),
+        },
         ("POST", None) => {
             if st.quota {
                 return failure(
@@ -262,7 +369,11 @@ async fn answer(state: &Shared, request: Request<Body>) -> Response<Body> {
                 );
             }
             let mut stored = pod;
+            // A real apiserver reports `Pending` on the create; the fake's first status is a change,
+            // which is why the fixed client reads 3 times, not 2.
             stored.status = None;
+            st.version += 1;
+            stored.metadata.resource_version = Some(st.version.to_string());
             st.pods.insert(name, stored.clone());
             json(StatusCode::CREATED, &serde_json::to_value(&stored).unwrap())
         }
@@ -280,8 +391,13 @@ pub(crate) fn client() -> (Client, Shared) {
     let (service, mut handle) = mock::pair::<Request<Body>, Response<Body>>();
     let driver = Arc::clone(&state);
     tokio::spawn(async move {
+        // One task per request, as an API server answers them: a watch that is made to wait (see
+        // `State::watch_delay`) must not hold up the reads that come after it.
         while let Some((request, send)) = handle.next_request().await {
-            send.send_response(answer(&driver, request).await);
+            let driver = Arc::clone(&driver);
+            tokio::spawn(async move {
+                send.send_response(answer(&driver, request).await);
+            });
         }
     });
     (Client::new(service, "coder"), state)
@@ -502,6 +618,37 @@ impl Fixture {
         lock(&self.api).pods.keys().cloned().collect()
     }
 
+    /// How many plain reads of `pod` the fake answered. A watch is not one: it carries its events.
+    pub(crate) fn gets(&self, pod: &str) -> usize {
+        let path = format!("GET /api/v1/namespaces/coder/pods/{pod}");
+        lock(&self.api)
+            .requests
+            .iter()
+            .filter(|r| **r == path)
+            .count()
+    }
+
+    /// The list requests the fake answered (a watch of the collection is not one).
+    pub(crate) fn lists(&self) -> usize {
+        lock(&self.api)
+            .requests
+            .iter()
+            .filter(|r| {
+                r.starts_with("GET /api/v1/namespaces/coder/pods?") && !r.contains("watch=true")
+            })
+            .count()
+    }
+
+    /// The watch requests the fake answered.
+    pub(crate) fn watches(&self) -> Vec<String> {
+        lock(&self.api)
+            .requests
+            .iter()
+            .filter(|r| r.contains("watch=true"))
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn requests(&self, prefix: &str) -> usize {
         lock(&self.api)
             .requests
@@ -519,6 +666,51 @@ mod tests {
     use adam_error::{Classify, ErrorClass};
 
     use crate::names::{pod_name, run_hash};
+
+    /// A log sink for the tests: what the environment logged at `warn` and above.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
+        fn count(&self, needle: &str) -> usize {
+            self.text().matches(needle).count()
+        }
+    }
+
+    /// Capture the `warn`-and-above logs for as long as the guard lives. The default subscriber is
+    /// per thread, and the test's future stays on this one (a current-thread runtime).
+    fn capture() -> (Capture, tracing::subscriber::DefaultGuard) {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
 
     #[tokio::test]
     async fn ensure_makes_the_pod_of_the_run_from_the_template_and_waits_for_it() {
@@ -591,6 +783,186 @@ mod tests {
             "a pod that is ready is reused with no step"
         );
         assert_eq!(first.describe(), second.describe());
+    }
+
+    /// A pod that takes a while to come up is waited on with one watch of that pod, not a read per
+    /// `ready_poll`: the fake's pod becomes ready after 10 observations, which polling would spend
+    /// ten sleeps on and the watch delivers at once.
+    #[tokio::test]
+    async fn a_pod_that_takes_its_time_is_watched_not_read_over_and_over() {
+        // Long enough for the old spin (one read per round trip) to be counted, not timed out.
+        let mut settings = settings();
+        settings.ready_timeout = Duration::from_secs(2);
+        let fx = fixture(settings);
+        lock(&fx.api).ready_after = 10;
+        lock(&fx.api).watch_delay = Duration::from_millis(60);
+        let started = std::time::Instant::now();
+        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(60),
+            "the wait was real: {:?}",
+            started.elapsed()
+        );
+        let name = pod_name(RUN);
+        assert_eq!(
+            fx.gets(&name),
+            3,
+            "not found, the pod's first status, then the one the watch said is ready (a real create \
+             is already Pending; the fake's first status is a change, hence 3 and not 2): {:?}",
+            lock(&fx.api).requests
+        );
+        let watches = fx.watches();
+        assert_eq!(
+            watches.len(),
+            2,
+            "the first status, then the change: {watches:?}"
+        );
+        assert!(
+            watches
+                .iter()
+                .all(|w| w.contains("fieldSelector=metadata.name")),
+            "one pod, by name: {watches:?}"
+        );
+        // The watch resumes from the version the read returned: `0` would replay the pod the
+        // loop already has, and every replay would be another round trip.
+        assert!(
+            watches.iter().all(|w| !w.contains("resourceVersion=0")),
+            "a version, never 0: {watches:?}"
+        );
+        assert!(
+            watches[0].contains("resourceVersion=1"),
+            "the create's version: {}",
+            watches[0]
+        );
+        assert_eq!(fx.pod_names(), [name]);
+    }
+
+    /// An API that refuses the watch is the poll's, as it always was: the pod still comes up, and
+    /// the refusal is reported once (a missing `watch` RBAC is then visible without a line every
+    /// few seconds).
+    #[tokio::test]
+    async fn a_pod_comes_up_when_the_watch_is_refused() {
+        let fx = fixture(settings());
+        lock(&fx.api).ready_after = 2;
+        lock(&fx.api).watch_down = true;
+        let (log, _guard) = capture();
+        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
+        assert!(!fx.watches().is_empty(), "it tried the watch");
+        let name = pod_name(RUN);
+        assert_eq!(
+            fx.gets(&name),
+            3,
+            "the reads the poll made: {:?}",
+            lock(&fx.api).requests
+        );
+        assert_eq!(
+            log.count("cannot be kept"),
+            1,
+            "one warning for two refusals: {}",
+            log.text()
+        );
+    }
+
+    /// An API that never answers the watch does not outlive `ready_timeout`: the wait is bounded
+    /// by the same deadline as everything else.
+    #[tokio::test]
+    async fn a_watch_that_never_answers_ends_at_the_deadline() {
+        let mut settings = settings();
+        settings.ready_timeout = Duration::from_millis(200);
+        let fx = fixture(settings);
+        lock(&fx.api).ready_after = 100;
+        lock(&fx.api).watch_delay = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let error = fx
+            .env
+            .ensure(&fx.ws(RUN), &Steps::default())
+            .await
+            .err()
+            .expect("the watch never answers");
+        assert!(
+            matches!(error, EnvError::Timeout { phase: "start", .. }),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded by ready_timeout, not by the watch: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An `ERROR` event (a version the server no longer has) is reported and the poll takes over:
+    /// the pod still comes up, and the event is not mistaken for a change of the pod.
+    #[tokio::test]
+    async fn an_error_event_is_reported_and_the_poll_takes_over() {
+        let fx = fixture(settings());
+        lock(&fx.api).ready_after = 2;
+        lock(&fx.api).watch_error = true;
+        let (log, _guard) = capture();
+        fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
+        assert!(!fx.watches().is_empty(), "it tried the watch");
+        assert_eq!(
+            fx.gets(&pod_name(RUN)),
+            3,
+            "the reads the poll made: {:?}",
+            lock(&fx.api).requests
+        );
+        assert_eq!(
+            log.count("cannot be kept"),
+            1,
+            "one warning for two error events: {}",
+            log.text()
+        );
+    }
+
+    /// The fake's watch protocol, which the client's loop is written against: `resourceVersion=0`
+    /// replays the pod as it is now (one `Added`, no change), and the version a read returned gets
+    /// the next change.
+    #[tokio::test]
+    async fn the_watch_replays_at_zero_and_delivers_the_next_change_from_a_version() {
+        use futures::TryStreamExt as _;
+        use kube::api::{PostParams, WatchParams};
+
+        let (client, api) = client();
+        lock(&api).ready_after = 3;
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client, "coder");
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}
+        }))
+        .unwrap();
+        pods.create(&PostParams::default(), &pod).await.unwrap();
+        let read = pods.get("p").await.unwrap();
+        let rv = read.metadata.resource_version.clone().unwrap();
+        let at_read = read.status.clone();
+
+        let params = WatchParams::default().fields("metadata.name=p").timeout(30);
+        let at_zero = pods.watch(&params, "0").await.unwrap();
+        tokio::pin!(at_zero);
+        match at_zero.try_next().await.unwrap().unwrap() {
+            WatchEvent::Added(added) => {
+                assert_eq!(
+                    added.metadata.resource_version.as_deref(),
+                    Some(rv.as_str())
+                );
+                assert_eq!(added.status, at_read, "the replay is the pod as it is now");
+            }
+            other => panic!("expected Added, got {other:?}"),
+        }
+        let from_rv = pods.watch(&params, &rv).await.unwrap();
+        tokio::pin!(from_rv);
+        match from_rv.try_next().await.unwrap().unwrap() {
+            WatchEvent::Modified(modified) => {
+                assert!(
+                    is_ready(&modified),
+                    "the next change is the pod becoming ready"
+                );
+                assert_ne!(
+                    modified.metadata.resource_version.as_deref(),
+                    Some(rv.as_str()),
+                    "a change is a new version"
+                );
+            }
+            other => panic!("expected Modified, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -863,7 +1235,9 @@ mod tests {
         let list = lock(&fx.api)
             .requests
             .iter()
-            .find(|r| r.starts_with("GET /api/v1/namespaces/coder/pods?"))
+            .find(|r| {
+                r.starts_with("GET /api/v1/namespaces/coder/pods?") && !r.contains("watch=true")
+            })
             .cloned()
             .unwrap();
         assert!(list.contains("labelSelector="), "{list}");
@@ -964,7 +1338,7 @@ mod tests {
         let fx = fixture(never);
         fx.env.ensure(&fx.ws(RUN), &Steps::default()).await.unwrap();
         assert!(fx.env.reap_idle().await.unwrap().is_empty());
-        assert_eq!(fx.requests("GET /api/v1/namespaces/coder/pods?"), 0);
+        assert_eq!(fx.lists(), 0, "no listing: a watch is not one");
     }
 
     // ----- the workspace mounts -------------------------------------------------------------------

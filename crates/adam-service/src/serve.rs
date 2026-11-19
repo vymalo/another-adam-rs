@@ -329,6 +329,20 @@ async fn run_notify(
     }
 }
 
+/// The listener that turns Nagle off on every connection it accepts: a small write (a response
+/// head, an SSE frame) then goes out at once instead of waiting for the previous one to be
+/// acknowledged. The failure to set it is the connection's, not the process's: it is logged.
+fn no_delay(
+    listener: TcpListener,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = SocketAddr> {
+    use axum::serve::ListenerExt as _;
+    listener.tap_io(|stream| {
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(error = %e, "cannot set TCP_NODELAY on an accepted connection");
+        }
+    })
+}
+
 /// Pinned runs for the placements that keep a run's files on one worker, any run otherwise: what a
 /// binary that has a [`Placement`] puts in [`RuntimeOptions::claim_scope`].
 pub fn claim_scope_for(placement: Placement) -> ClaimScope {
@@ -409,6 +423,9 @@ pub async fn serve(
     // The bound address, not the configured one: `LISTEN_ADDR=…:0` picks a
     // free port, and this line is how a supervisor (or a test) learns it.
     let addr = listener.local_addr().map_err(ServeError::LocalAddr)?;
+    // Nagle holds a small write (a response head, an SSE frame) until the previous one is
+    // acknowledged, which a client that is not sending delays by up to 40 ms.
+    let listener = no_delay(listener);
     tracing::info!(%addr, %role, workers, worker_id = worker_id.as_deref(), "listening");
 
     let host = Host::new(role)
@@ -486,6 +503,25 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The connection the helper accepts writes at once: `TCP_NODELAY` is on it.
+    ///
+    /// This proves the helper, not that [`serve`] uses it: the server's own socket is not
+    /// reachable from a test, so that wiring is the one `no_delay(listener)` call in `serve`,
+    /// reviewed by eye.
+    #[tokio::test]
+    async fn an_accepted_connection_has_nagle_off() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut listener = no_delay(listener);
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = axum::serve::Listener::accept(&mut listener).await;
+        assert!(
+            accepted.nodelay().unwrap(),
+            "the accepted socket has TCP_NODELAY set"
+        );
+        client.await.unwrap().unwrap();
+    }
 
     #[test]
     fn a_placement_that_pins_runs_claims_pinned_runs_and_the_others_any() {

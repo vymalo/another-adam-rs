@@ -407,6 +407,7 @@ dependencies = [
  "tokio",
  "tower-test",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

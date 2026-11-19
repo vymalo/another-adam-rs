@@ -46,7 +46,7 @@ pub struct Settings {
     /// How long a pod may take to be ready (`RUN_POD_READY_TIMEOUT_SECS`, 300): scheduling, pulling
     /// the image, starting.
     pub ready_timeout: Duration,
-    /// How often the pod is looked at while waiting (2 seconds).
+    /// How often the pod is read while waiting when the watch cannot be kept (2 seconds).
     pub ready_poll: Duration,
     /// How long no command may have used a pod before it is deleted (`RUN_POD_IDLE_SECS`, 900);
     /// `None` keeps it until the run ends.

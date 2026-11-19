@@ -53,7 +53,7 @@ It looks for the pod `adam-run-<hash>` of the run and makes it when it is not th
 `app.kubernetes.io/managed-by=adam-coder`, `app.kubernetes.io/instance=<release>` and `adam.vymalo.com/run=<hash>` and the
 annotations `adam.vymalo.com/run-id` (the full id), `adam.vymalo.com/worker` and `adam.vymalo.com/workspace-mounts` (the mounts of the
 workspace volume it was made with). A name that is another run's is refused. It then waits until the pod is `Running` and `Ready`,
-polling, and reports one step (`run-pod`) while it waits and when it is done; a pod that is there and ready is reused with **no step**, so a command does not announce itself. It is single-flight per
+watching the pod (`fieldSelector` on its name), polling only as a fallback when the watch is refused or closes, and reports one step (`run-pod`) while it waits and when it is done; a pod that is there and ready is reused with **no step**, so a command does not announce itself. It is single-flight per
 run in a process (a lock), and across workers the pod's name is the lock: a create that answers "already exists" goes on with
 the pod that is there. A dropped call leaves nothing a later call cannot use.
 
@@ -208,7 +208,7 @@ one line); none carries a secret, and the API server never echoes one in a refus
 
 * **Unit tests, no cluster.** The environment is tested over a fake API server (`src/fake.rs`): a `tower-test` mock service
   behind a real `kube::Client`, which keeps pods in memory and answers `GET`, `POST`, `DELETE` and list with the answers a test
-  turns on (a quota, an admission refusal, a pod that takes some polls to be ready, one that never schedules, an image that
+  turns on (a quota, an admission refusal, a pod that takes some watch events to be ready, one that never schedules, an image that
   cannot be pulled). Commands in a pod are another seam (`PodExec`) with a fake. They cover `ensure` (the pod, its labels, its
   steps, idempotency, concurrent calls, a create that races), the refusals above, `release`, `held_runs` (this release's pods
   only), the idle sweep (idle, busy, cannot be asked, another worker's, off), `prepare` and the quoting of the words, `kill`,
