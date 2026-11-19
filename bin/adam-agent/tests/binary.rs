@@ -726,7 +726,7 @@ fn sessions_folder(root_limits: &str) -> tempfile::TempDir {
     .unwrap();
     std::fs::write(
         dir.path().join("agent/subagents/helper.md"),
-        "---\ndescription: Helps.\n---\nHelp.\n",
+        "---\ndescription: Helps.\n---\nYour name is Helper.\nIn one sentence: I help with small jobs.\n",
     )
     .unwrap();
     dir
@@ -747,7 +747,7 @@ async fn session_settings_reach_the_agent_the_process_serves() {
         env.push(pair("SESSION_MAX_ROUNDS", "10"));
         env.push(pair("SESSION_IDLE_DAYS", "2"));
         let mut p = Proc::spawn(&env);
-        p.ready().await;
+        let addr = p.ready().await;
         let line = p.line("session limits").unwrap_or_else(|| {
             panic!("{role}: the `session limits` line\n{}", p.logs());
         });
@@ -758,6 +758,16 @@ async fn session_settings_reach_the_agent_the_process_serves() {
         assert_eq!(line["max_working"], 2, "{role}: the file lowers 3: {line}");
         assert_eq!(line["max_rounds"], 10, "{role}: {line}");
         assert_eq!(line["idle_days"], 2, "{role}: {line}");
+        // The card lists the helper with the effective `maxOpen`, from the same limits.
+        let (_, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
+        assert_eq!(
+            child_sessions_entry(&common::json_of(&card)),
+            Some(serde_json::json!({
+                "agents": [{"name": "helper", "description": "Helps."}],
+                "maxOpen": 8
+            })),
+            "{role}: {card}"
+        );
         if role == "all" {
             assert!(
                 p.stdout()
@@ -769,6 +779,219 @@ async fn session_settings_reach_the_agent_the_process_serves() {
         p.stop_cleanly().await;
     }
     db.finish().await;
+}
+
+/// The params of the `child-sessions/v1` entry of a served card, if it lists one.
+fn child_sessions_entry(card: &Value) -> Option<Value> {
+    const URI: &str = adam_a2a::CHILD_SESSIONS_EXTENSION;
+    card["capabilities"]["extensions"]
+        .as_array()?
+        .iter()
+        .find(|e| e["uri"] == URI)
+        .map(|e| e["params"].clone())
+}
+
+/// A folder without a subagent has no helper to open a session on: no entry on the card, on either
+/// role that serves A2A.
+#[tokio::test]
+async fn a_folder_without_subagents_lists_no_child_sessions() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let agent = chat();
+    for role in ["all", "control-plane"] {
+        let mut p = Proc::spawn(&role_env(role, &db.url(), agent.path()));
+        let addr = p.ready().await;
+        let (_, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
+        assert_eq!(
+            child_sessions_entry(&common::json_of(&card)),
+            None,
+            "{role}"
+        );
+        p.stop_cleanly().await;
+    }
+    db.finish().await;
+}
+
+/// A person's session, started on a control plane and worked by a worker in another process: the
+/// round is a task of a child context, a second message continues the conversation, a close ends
+/// it, and a client that did not activate the extension is refused. Then the same in one process.
+#[tokio::test]
+async fn a_session_started_on_a_control_plane_is_worked_by_a_worker_process() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let folder = sessions_folder("max_open_sessions: 8");
+    let (model, seen) = mount_persona_model().await;
+
+    // Two processes: the control plane never builds the helper, the worker never serves A2A.
+    let mut front = Proc::spawn(&role_env("control-plane", &db.url(), folder.path()));
+    let addr = front.ready().await;
+    let mut worker_env = role_env("worker", &db.url(), folder.path());
+    worker_env.retain(|(k, _)| k != "MODEL_BASE_URL");
+    worker_env.push(pair("MODEL_BASE_URL", model.uri()));
+    let mut worker = Proc::spawn(&worker_env);
+    worker.ready().await;
+    front.notifying().await;
+    worker.notifying().await;
+    person_session(addr, &seen).await;
+    worker.stop_cleanly().await;
+    front.stop_cleanly().await;
+
+    // One process, every role.
+    let mut env = role_env("all", &db.url(), folder.path());
+    env.retain(|(k, _)| k != "MODEL_BASE_URL");
+    env.push(pair("MODEL_BASE_URL", model.uri()));
+    let mut all = Proc::spawn(&env);
+    let addr = all.ready().await;
+    seen.lock().unwrap().clear();
+    person_session(addr, &seen).await;
+    all.stop_cleanly().await;
+    db.finish().await;
+}
+
+/// The requests of `child-sessions/v1` that a person makes of the agent at `addr`.
+async fn person_session(addr: SocketAddr, seen: &Arc<Mutex<Vec<Value>>>) {
+    use a2a::{GetTaskRequest, SendMessageResponse};
+    const URI: &str = adam_a2a::CHILD_SESSIONS_EXTENSION;
+    let activated = common::a2a_client_activating(addr, A2A_TOKEN, URI).await;
+    let plain = common::a2a_client(addr, A2A_TOKEN).await;
+    let say = |text: &str, context: Option<&str>, extension: Value| {
+        let mut message = Message::new(Role::User, vec![Part::text(text)]);
+        message.context_id = context.map(str::to_owned);
+        message.metadata = Some(std::collections::HashMap::from([(
+            URI.to_owned(),
+            extension,
+        )]));
+        SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }
+    };
+    let task_of = |response: SendMessageResponse| match response {
+        SendMessageResponse::Task(task) => task,
+        other => panic!("a task was expected: {other:?}"),
+    };
+    let until_completed = |id: String| {
+        let activated = &activated;
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let task = activated
+                    .get_task(&GetTaskRequest {
+                        id: id.clone(),
+                        history_length: None,
+                        tenant: None,
+                    })
+                    .await
+                    .unwrap();
+                if task.status.state == TaskState::Completed {
+                    return task;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "round {id} did not complete: {task:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    };
+    let object = |task: &a2a::Task| task.metadata.as_ref().and_then(|m| m.get(URI)).cloned();
+
+    // 1. Start: round 1, in a child context of the person's own context.
+    let start = task_of(
+        activated
+            .send_message(&say(
+                "hello helper",
+                Some("ctx-1"),
+                serde_json::json!({"start": {"agent": "helper", "description": "Help me", "keepOpen": true}}),
+            ))
+            .await
+            .expect("the start is served"),
+    );
+    let object_1 = object(&start).expect("the round object");
+    // The client reads every JSON number as a float.
+    assert_eq!(object_1["round"].as_f64(), Some(1.0), "{object_1}");
+    assert_eq!(object_1["agent"], "helper", "{object_1}");
+    assert!(
+        start.context_id.starts_with("ctx-1/s/"),
+        "{}",
+        start.context_id
+    );
+
+    // 2. The worker steps it; the session is idle (kept open).
+    let done = until_completed(start.id.clone()).await;
+    assert_eq!(object(&done).unwrap()["state"], "idle");
+    let reply = done
+        .status
+        .message
+        .as_ref()
+        .and_then(|m| m.text())
+        .unwrap_or_default();
+    assert_eq!(reply, "Hi! I'm Helper. I help with small jobs.");
+
+    // 3. A message to the session is round 2, and the model saw round 1.
+    let second = task_of(
+        activated
+            .send_message(&say(
+                "and again",
+                Some(&start.context_id),
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("the message is served"),
+    );
+    assert_ne!(second.id, start.id);
+    until_completed(second.id.clone()).await;
+    let last = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("a model request");
+    assert!(
+        last.to_string().contains("hello helper"),
+        "round 2 carries round 1: {last}"
+    );
+
+    // 4. Closing ends it; a later message is refused.
+    let closed = task_of(
+        activated
+            .send_message(&say(
+                "done",
+                Some(&start.context_id),
+                serde_json::json!({"close": {"cancel": false}}),
+            ))
+            .await
+            .expect("the close is served"),
+    );
+    until_completed(closed.id).await;
+    assert!(
+        activated
+            .send_message(&say(
+                "too late",
+                Some(&start.context_id),
+                serde_json::json!({})
+            ))
+            .await
+            .is_err(),
+        "a closed session takes no message"
+    );
+
+    // 5. A client that did not activate the extension cannot talk to a session.
+    assert!(
+        plain
+            .send_message(&say(
+                "hello",
+                Some(&start.context_id),
+                serde_json::json!({})
+            ))
+            .await
+            .is_err(),
+        "a child context needs the extension"
+    );
 }
 
 /// A bad `SESSION_*` value stops every role (exit 78) and names the variable; nothing connects.

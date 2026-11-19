@@ -287,7 +287,7 @@ flowchart LR
 | `ROLE` | Components | Needs |
 |---|---|---|
 | `all` (default) | `a2a-server`, `worker`, `notify` in one process | every variable |
-| `control-plane` | `a2a-server`, `notify`, over a runtime that has only the agent's starter (starts, delivers, cancels and views runs; never steps) | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variable |
+| `control-plane` | `a2a-server`, `notify`, over a runtime that has only the agent's starter and its helpers' starters (`AgentDef::session_starters`; starts, delivers, cancels and views runs; never steps) | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variable |
 | `worker` | `worker`, `notify`, `health` (`GET /healthz` on `LISTEN_ADDR`, no A2A) | everything except `A2A_BEARER_TOKENS` and `PUBLIC_URL` |
 
 * The roles meet in the store (the record and its CAS, the leases) and in `NOTIFY` ([below](#across-processes-signals-and-events)).
