@@ -12,7 +12,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 value: 0
 preemptionPolicy: Never
 globalDefault: false
@@ -30,7 +30,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   podSelector:
     matchLabels:
@@ -64,7 +64,7 @@ metadata:
     app.kubernetes.io/component: egress-proxy
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   podSelector:
     matchLabels:
@@ -128,7 +128,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   podSelector:
     matchLabels:
@@ -175,7 +175,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   hard:
     limits.memory: "8Gi"
@@ -199,7 +199,7 @@ metadata:
     app.kubernetes.io/component: egress-proxy
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   minAvailable: 1
   selector:
@@ -224,7 +224,7 @@ metadata:
     app.kubernetes.io/component: egress-proxy
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 automountServiceAccountToken: false
 ---
 # Source: coder/templates/run-pods-rbac.yaml
@@ -239,7 +239,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 automountServiceAccountToken: false
 ---
 # Source: coder/templates/run-pods-configmap.yaml
@@ -254,7 +254,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 data:
   pod.yaml: |
     apiVersion: v1
@@ -370,7 +370,7 @@ metadata:
     app.kubernetes.io/component: egress-proxy
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 data:
   allow.txt: |
     # The hosts a run pod may reach through the egress proxy: runPods.egressProxy.allow and extraAllow.
@@ -400,7 +400,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   accessModes:
     - ReadWriteMany
@@ -422,7 +422,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -441,7 +441,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -464,7 +464,7 @@ metadata:
     app.kubernetes.io/component: egress-proxy
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   type: ClusterIP
   selector:
@@ -489,7 +489,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   type: ClusterIP
   selector:
@@ -512,7 +512,7 @@ metadata:
     app.kubernetes.io/component: egress-proxy
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   replicas: 2
   strategy:
@@ -532,7 +532,7 @@ spec:
         app.kubernetes.io/instance: coder
         app.kubernetes.io/component: egress-proxy
       annotations:
-        checksum/egress-allow: ba5975945ecb43910efc70a5baeb639782fc7010b975a6aa4b889a62c51934d6
+        checksum/egress-allow: c3351f62c30a197cac028328ea08353c128c820417fdd0b83b66d447bb31f405
     spec:
       serviceAccountName: coder-egress
       automountServiceAccountToken: false
@@ -611,11 +611,11 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   replicas: 1
   serviceName: coder
-  podManagementPolicy: OrderedReady
+  podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate
   selector:
@@ -628,7 +628,7 @@ spec:
         app.kubernetes.io/name: coder
         app.kubernetes.io/instance: coder
       annotations:
-        checksum/run-pod: 57ad0b8a9378d15ed5e816ae1f48cc57f23b32396fdbf69983c250d22c346829
+        checksum/run-pod: 8be486d94205e9ad031bcc9b4389d08f6827a66430522910107b7fb8e1c66564
     spec:
       serviceAccountName: coder
       automountServiceAccountToken: false
@@ -783,7 +783,7 @@ spec:
             - name: RUN_POD_IDLE_SECS
               value: "900"
             - name: RUN_POD_WAIT_SECS
-              value: "600"
+              value: "1020"
             - name: GIT_SANDBOX_SOCKET
               value: "/run/git-sandbox/git.sock"
             - name: DATABASE_URL
@@ -907,7 +907,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   instances: 1
   storage:
@@ -930,7 +930,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   refreshInterval: 1h
   secretStoreRef:
@@ -970,7 +970,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -1017,7 +1017,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.4.0
+    helm.sh/chart: coder-0.5.0
 spec:
   policyName: coder-coder-ns-run-pods
   validationActions: ["Deny"]

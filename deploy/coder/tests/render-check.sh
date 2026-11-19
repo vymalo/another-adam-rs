@@ -38,6 +38,13 @@ doc() {
 dhas() { doc "$1" | grep -Eq -- "$2"; }
 dlacks() { ! doc "$1" | grep -Eq -- "$2"; }
 dcount() { [ "$(doc "$1" | grep -Ec -- "$2")" -eq "$3" ]; }
+# env_value <name>: from stdin, the text of one container, the value of the variable of that name.
+env_value() {
+  awk -v v="$1" '
+    $0 == "            - name: " v { want = 1; next }
+    /^            - name: / { want = 0 }
+    want && /^              value: / { sub(/^              value: /, ""); gsub(/"/, ""); print; exit }'
+}
 # The parts of a StatefulSet that must not change between topologies: its
 # name, the immutable selector and the volume claim (so the PVC is reused).
 sts_identity() { # sts_identity <file>
@@ -55,6 +62,10 @@ golden="$chart/tests/golden/combined.yaml"
 # The default render is the pre-split chart, byte for byte (regenerate with the
 # command above, at the same --namespace and --set, only for a deliberate change).
 check "the default render equals tests/golden/combined.yaml" cmp -s "$out" "$golden"
+# Nothing needs ordinal ordering (a worker's identity is its pod name; one database, one volume), and OrderedReady would
+# serialise every replica start behind the previous one's readiness.
+check "the StatefulSet starts its replicas together (Parallel)" \
+  dhas StatefulSet '^  podManagementPolicy: Parallel$'
 
 # The model's reasoning (ADR 0020 of adam-rs): MODEL_EXTRA_BODY is a value of the chart, not a secret,
 # empty by default (nothing is rendered), and a JSON object when it is set. MODEL_ECHO_REASONING likewise.
@@ -1110,8 +1121,10 @@ check "coder: RUN_ENVIRONMENT=kubernetes" sts_of 'value: kubernetes'
 check "coder: the template file is the mounted one" sts_of 'value: "/etc/adam/run-pod/pod.yaml"'
 check "coder: the namespace is the pod's own (downward API)" sts_of 'fieldPath: metadata.namespace'
 check "coder: RUN_POD_INSTANCE is the release" sts_of 'name: RUN_POD_INSTANCE'
-check "coder: RUN_POD_IDLE_SECS is 900" sts_of 'name: RUN_POD_IDLE_SECS'
-check "coder: RUN_POD_WAIT_SECS is 600 and RUN_POD_READY_TIMEOUT_SECS is 600" sts_of 'name: RUN_POD_WAIT_SECS'
+check "coder: RUN_POD_IDLE_SECS is 900" [ "$(doc StatefulSet | env_value RUN_POD_IDLE_SECS)" = "900" ]
+check "coder: RUN_POD_WAIT_SECS is 1020: it outlasts the idle life (900), the sweep (60) and the delete grace (2)" \
+  [ "$(doc StatefulSet | env_value RUN_POD_WAIT_SECS)" = "1020" ]
+check "coder: RUN_POD_READY_TIMEOUT_SECS is 600" [ "$(doc StatefulSet | env_value RUN_POD_READY_TIMEOUT_SECS)" = "600" ]
 check "coder: WORKER_ID is the pod name (the idle sweep is a worker's own)" sts_of 'name: WORKER_ID'
 check "coder: the template is mounted read-only" sts_of 'name: run-pod'
 check "coder: a changed template is a deploy (checksum annotation)" sts_of 'checksum/run-pod:'
@@ -1144,13 +1157,6 @@ mount_path() {
     $0 == "            - name: " v { want = 1; next }
     /^            - name: / { want = 0 }
     want && /^              mountPath: / { print $2; exit }'
-}
-# env_value <name>: from stdin, the text of one container, the value of the variable of that name.
-env_value() {
-  awk -v v="$1" '
-    $0 == "            - name: " v { want = 1; next }
-    /^            - name: / { want = 0 }
-    want && /^              value: / { sub(/^              value: /, ""); gsub(/"/, ""); print; exit }'
 }
 # volume_of <name>: the pod's volume of that name (not a container of the same name).
 volume_of() {
@@ -1293,6 +1299,14 @@ helm_rp > "$out"
 check "default volume: the sandbox mounts the volume the claim template makes (work)" \
   dhas StatefulSet '^        name: work$'
 # Refusals.
+check "refused: a waitSecs below idleSecs + 62 (the idle life, the sweep and the delete grace)" \
+  fails helm_rp --set runPods.idleSecs=900 --set runPods.waitSecs=961
+message=$(helm_rp --set runPods.idleSecs=900 --set runPods.waitSecs=961 2>&1 || true)
+check "... the error names the bound" says "$message" 'must be at least runPods.idleSecs + 62'
+helm_rp --set runPods.idleSecs=900 --set runPods.waitSecs=962 > "$out"
+check "waitSecs of exactly idleSecs + 62 is accepted" sts_of 'name: RUN_POD_WAIT_SECS'
+helm_rp --set runPods.idleSecs=0 --set runPods.waitSecs=0 > "$out"
+check "idleSecs 0 (keep the pod until the run ends) puts no bound on the wait" sts_of 'name: RUN_POD_IDLE_SECS'
 check "refused: the sandbox without a memory limit" fails helm_rp --set runPods.gitSandbox.resources.limits.memory=null
 check "refused: a /tmp size that is not a quantity" fails helm_rp --set runPods.gitSandbox.tmpSize=lots
 check "refused: no commands at once" fails helm_rp --set runPods.gitSandbox.maxCommands=0
@@ -1505,7 +1519,7 @@ check "values: ... its request" tpl '^          memory: 1Gi$'
 check "values: ... CARGO_BUILD_JOBS" tpl 'value: "4"'
 check "values: ... extra environment" tpl 'name: RUSTFLAGS'
 helm_rp --set runPods.quota.pods=2 --set runPods.quota.limitsMemory=4Gi --set runPods.idleSecs=60 \
-  --set runPods.waitSecs=30 --set runPods.readyTimeoutSecs=900 > "$out"
+  --set runPods.waitSecs=122 --set runPods.readyTimeoutSecs=900 > "$out"
 check "values: the quota" rhas ResourceQuota coder-run-pods 'pods: "2"'
 check "values: ... its memory" rhas ResourceQuota coder-run-pods 'limits.memory: "4Gi"'
 check "values: the idle timeout" sts_of 'name: RUN_POD_IDLE_SECS'

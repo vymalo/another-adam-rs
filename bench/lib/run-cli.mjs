@@ -299,7 +299,7 @@ async function cmdRun(argv, ctx) {
 export async function regradeStranded({ deps, specs }) {
   const folded = deps.ledger.fold();
   const out = [];
-  for (const spec of specs) if (folded.get(spec.run)?.state === 'Grading') out.push(await advance({ deps, spec: { ...spec, slot: 1 } }));
+  for (const spec of specs) if (folded.get(spec.run)?.state === 'Grading') out.push(await advance({ deps, spec: { ...spec, slot: 1 }, folded }));
   return out;
 }
 

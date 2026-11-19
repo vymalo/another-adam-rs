@@ -49,9 +49,11 @@ pub struct Settings {
     /// How often the pod is read while waiting when the watch cannot be kept (2 seconds).
     pub ready_poll: Duration,
     /// How long no command may have used a pod before it is deleted (`RUN_POD_IDLE_SECS`, 900);
-    /// `None` keeps it until the run ends.
+    /// `None` keeps it until the run ends. The chart's `runPods.waitSecs` must be at least this
+    /// plus the sweep interval and the 2 s delete grace: the chart refuses a smaller wait.
     pub idle: Option<Duration>,
-    /// How often the idle sweep looks (60 seconds).
+    /// How often the idle sweep looks (60 seconds). With `idle` it bounds how long a slot stays
+    /// taken, which is what `RUN_POD_WAIT_SECS` (`runPods.waitSecs`) must outlast.
     pub reap_every: Duration,
     /// How long stopping a command, or asking whether the pod is busy, may take (15 seconds).
     pub exec_timeout: Duration,
