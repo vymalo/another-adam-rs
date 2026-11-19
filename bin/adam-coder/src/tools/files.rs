@@ -992,6 +992,20 @@ pub async fn read_file(
     })
 }
 
+/// The check epoch moves: a file the project **ignores** does not change the tree id, and a check
+/// may read it, so a failed record from before this change is not reused
+/// (`ChecksNotes::epoch`). A write to a file the project tracks changes the tree anyway; the bump
+/// costs nothing there.
+async fn moved_the_epoch(env: &ToolEnv, ctx: &ToolCtx) -> Result<(), ToolError> {
+    let run = ctx.root_run_id().to_string();
+    env.notes
+        .update(&run, |notes| {
+            notes.checks.epoch = notes.checks.epoch.saturating_add(1);
+        })
+        .await
+        .map_err(|e| notes_error(&e))
+}
+
 // ------------------------------------------------------------------ read_files
 
 /// Most paths one `read_files` call accepts.
@@ -1342,18 +1356,6 @@ pub async fn read_files(
         out.pop();
     }
     Ok(ToolOutput::text(out))
-/// The check epoch moves: a file the project **ignores** does not change the tree id, and a check
-/// may read it, so a failed record from before this change is not reused
-/// (`ChecksNotes::epoch`). A write to a file the project tracks changes the tree anyway; the bump
-/// costs nothing there.
-async fn moved_the_epoch(env: &ToolEnv, ctx: &ToolCtx) -> Result<(), ToolError> {
-    let run = ctx.root_run_id().to_string();
-    env.notes
-        .update(&run, |notes| {
-            notes.checks.epoch = notes.checks.epoch.saturating_add(1);
-        })
-        .await
-        .map_err(|e| notes_error(&e))
 }
 
 /// Create a file, or replace one, with exactly `content`. Parent directories are created. The
