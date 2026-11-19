@@ -424,6 +424,10 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
 
 ## Amended
 
+* **2026-11-19, [ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md) (not built yet).** A run pod may run the repository's own image (`use_repository_environment`): only
+  the `run` container's image changes, to one that starts with a prefix the deployment allows. What a run pod mounts and sees, and every
+  other refusal of the admission policy, are unchanged; ADR 0010, which this record builds on for "a path means the same in every
+  environment", is superseded in part, and that rule now holds between the coder and its run pods only.
 * **2026-10-18, after a security review of the first version (#117).** The coder's file operations on paths a run can write (decision
   10); a slot that is a link is not a slot (decision 10); the directories of the mirror are `<run>+<slot>`, made in staging and moved,
   never pruned, and a record is believed only while it is still the run's (decisions 6 and 9); `commondir`, `gitdir` and `logs` are

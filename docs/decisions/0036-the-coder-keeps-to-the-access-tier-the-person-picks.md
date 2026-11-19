@@ -18,6 +18,10 @@ enforcement becomes rules. The tiers are presets of rules generated from `needs`
 
 *Amended 2026-11-14 ([ADR 0046](0046-the-operator-lives-in-the-platform-repository.md)):* the operator this ADR mentions (decision 12, `maxAccessTier`; the upgrade note on run pods) was removed from this repository; those lines now describe the operator of `vymalo/another-agentic-platform`.
 
+*Amended 2026-11-19 ([ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md), not built yet):* Podman devcontainers are removed, so the 2026-10-19 rule has one way out
+fewer: a GitHub App key file with commands in the coder's own container (`RUN_ENVIRONMENT=local`) needs
+`ALLOW_COMMANDS_NEXT_TO_SECRETS=true`, and run pods do not. The new tool `use_repository_environment` is a `plan`-tier tool.
+
 ## Context
 
 The owner, 2026-10-11, about the coder: *"The goal is for the agent to be autonomous."* A person could not say how much the

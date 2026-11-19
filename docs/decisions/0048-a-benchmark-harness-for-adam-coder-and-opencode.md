@@ -343,3 +343,23 @@ records and to the report.
 `read_files` (#184) reads 1 to 16 files in one call and is a later revision than the pin. The pin's text does not name it; the coder's
 step 3 does (since #184), and OpenCode's `read` reads one file, so it is renamed to `read` in the table above like `read_file`. Nothing
 else in the decision changes.
+
+## Amended 2026-11-19: the host's container runtime, not Podman ([ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md))
+
+The owner removed Podman from adam-rs (a hard cutover), and smoke test 4 could not run: each Podman service held its own copy of the
+9.7 GB coder image, and own task images were saved whole and loaded into each, about 30 GB more than one copy. Not built yet; it is
+ADR 0052's slice B1, the first after the record and independent of the rest:
+
+* `bench/lib/containers.mjs` gets `HostContainers` over the host's container runtime in place of `PodmanRemote`; `podman-1`,
+  `podman-2` and `grader` leave `bench/compose.yaml`, and nothing builds `dev/podman`. Each image is in the host's store once, and an
+  own task's image is used where `bench tasks build` made it.
+* The environment check, the base, grading and the OpenCode arm run as containers of the task image, on networks with the members the
+  stack gives them today.
+* adam's arm runs its commands where the coder runs (`RUN_ENVIRONMENT=local`, settings that exist at the pin), and the coder container
+  is started from the task image with the coder's files from the pinned image in a read-only volume; the git sandbox, the relays and
+  the pusher stay on the coder image. `bench doctor` checks that the coder starts in each selected task image (*unverified* that a
+  Debian bookworm task image loads a binary built on trixie), and selection refuses for both arms a task image it cannot start in.
+* Kubernetes Jobs in kind were not chosen: a kind node keeps its own copy of every image it runs.
+
+The proof is that `bench doctor` and the dry run pass on a host with about 20 GB free. The table "Runs in" of `bench/README.md`
+("the coder container; its commands in a devcontainer of the task image on the Podman service") changes with it.

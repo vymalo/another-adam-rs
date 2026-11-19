@@ -7,6 +7,10 @@ person); the seven decisions are the ones of the design comment on that issue, a
 orchestration layer's, `docs/api/usage-v1.md` of `vymalo/another-agentic-system`, changed in its own pull request; the price per
 CPU-second and per GiB-second belongs to that side's usage record (its issue 281).
 
+*Amended 2026-11-19 ([ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md), not built yet):* adam no longer has dev containers, so it never reports
+`{"environment": "devcontainer"}` again (`SandboxEnvironment::Devcontainer` goes). The word stays in the `usage/v1` contract, so a
+reader of older reports is unchanged. A run pod of a repository's own image reports `kubernetes`, measured like any run pod.
+
 ## Context
 
 Model tokens are not the only cost of a coder run. A run pod holds CPU and memory, and a limit or a price per person needs that

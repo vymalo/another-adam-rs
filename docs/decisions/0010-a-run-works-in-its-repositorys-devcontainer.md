@@ -14,6 +14,13 @@ OpenCode in a devcontainer. The tools directory holds `adam-exec` only, and deci
 `/run/adam/secrets/model-key` goes: no secret enters a devcontainer. The OpenCode CLI of the image stays on `PATH`, for
 people and repositories that want it.
 
+*Superseded in part 2026-11-19 ([ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md), not built yet):* the owner's hard cutover removes the Podman path. The crate
+`adam-devcontainer`, `DEVCONTAINER_*` and `CONTAINER_HOST`, the devcontainer CLI and `podman-remote` in the image, the Podman service
+of the dev stack, its CI job and scenarios, and `rebuild_environment` go; `DEVCONTAINER_RUNTIME=podman` becomes exit 78. Decision 3's
+lookup of the file is kept and moves to `adam-workspace`; `adam-exec` moves to `adam-env-kubernetes`. A repository's own environment is
+now a run pod of its image, through `use_repository_environment`, offered only with run pods, an allowed image prefix and a
+configuration in a writable slot. The rest of this record is history.
+
 ## Context
 
 The coder runs every command in its own container: `run_command`, `run_checks`, OpenCode, and every command
