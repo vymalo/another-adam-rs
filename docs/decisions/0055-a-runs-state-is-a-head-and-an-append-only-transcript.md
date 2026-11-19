@@ -75,8 +75,8 @@ a later cleanup.
 | Slice | What lands | The gate that proves it |
 |---|---|---|
 | **S0 — measure** | `CountingStore` in the testkit; the 50 × 10 KB test in today's shape, asserting `total < 50 × 20 KB` and **recorded red**; `dev/p2-measure.sh` for `pg_relation_size`, `pg_stat_wal` and Mongo `collStats` | the test fails on `main` with the recorded number; the script prints the baseline |
-| **S1 — blobs** | `BlobId`, `keeps_blobs`/`put_blob`/`get_blob`, `purge_blobs`; schema v5 part 1; the three implementations; `blob_conformance!`; the runtime uploads file artifacts and passes `RunUpdate.blobs`; `state` unchanged | blob conformance on Memory/Postgres/Mongo; a 4 MiB file round-trips; the v4 fixture still decodes every `state` |
-| **S2a — the shadow** | `Agent`/`AgentStarter::split`/`join`, `Conversation`'s split, the `Head` type, schema v5 part 2, `RunUpdate.head/body`; the step path writes the head and rows; **nothing reads the head** | `split/join` conformance; the per-commit reconstruction check; every runtime test green; the v4 fixture green |
+| **S1 — blobs** | `BlobId`, `keeps_blobs`/`put_blob`/`get_blob`, `purge_blobs`; schema v5 part 1; the three implementations; `blob_conformance!`; the runtime uploads file artifacts and passes `RunUpdate.blobs`; `state` unchanged. The blob sweep and a commit's ref insert are **not one transaction**: an uncommitted ref is invisible to the sweep, which S2a's CTE closes (see the S1 amendment) | blob conformance on Memory/Postgres/Mongo; a 4 MiB file round-trips; the v4 fixture still decodes every `state` |
+| **S2a — the shadow** | `Agent`/`AgentStarter::split`/`join`, `Conversation`'s split, the `Head` type, schema v5 part 2, `RunUpdate.head/body`; the step path writes the head and rows; **nothing reads the head**; a run seeded from a prior run's state gets its artifact references at create (see the S1 amendment) | `split/join` conformance; the per-commit reconstruction check; every runtime test green; the v4 fixture green |
 | **S2b — the view** | `load_head`, `Stored` (`v1`/`v5`), `Runtime::view` on the head, `RunView.state` = the head, `RunView.artifacts: Vec<ArtifactRef>`, `Runtime::state`/`artifact_bytes`, the A2A blob read and cache | the read-counting test; every A2A test; the write measurement still shows the old cost |
 | **S3 — contract** | `state = null` on every commit; `load_run`, `claim_due`, `open_run` and `list_runs` return the head; the step path joins; `deliver`, `cancel_run` and `park_again` write the head they read; `start_continuing`/`on_cancelled` join; the v4 fixture test inverted to assert the documented failure | the 50 × 20 KB test green; `pg_relation_size`/WAL green; the "v4 cannot read a v5 run" test |
 | **S4 — later** | drop the v4 `Envelope` read path and the `state` column, after every live run is v5 | — |
@@ -92,6 +92,21 @@ max_commit=521202 first_read=10434 final_read=521202`. On a fresh database: Post
 MongoDB `collStats(adam_runs).size` 514,331 B and the WiredTiger log 13,207,552 B. `pg_relation_size`
 alone is the wrong gate: the state is TOASTed, so the heap stays at 8,192 B; `pg_total_relation_size`
 is retained size including bloat, and `pg_stat_wal.wal_bytes` is the bytes written.
+
+*Amended 2026-11-19 (S1)*: two constraints S1 leaves for S2a, recorded so they are not lost.
+
+1. **The sweep is not atomic with a commit.** `purge_blobs`, and the sweep `purge_finished` runs in the
+   same call, delete a blob no `adam_run_blob` row names. Under PostgreSQL's `READ COMMITTED` (and in
+   MongoDB's find-then-delete) a reference another commit is inserting at that moment is invisible, so
+   the sweep can collect a blob that commit is about to name. In S1 this only costs the copy in the
+   expand release, because the run's `state` still carries the bytes; S2a's data-modifying CTE (decision
+   3) writes the refs, the GC and the CAS in one statement and closes the window.
+2. **A run seeded from a prior run's state has no reference until its first commit.** `create_run`
+   takes no blobs, and the runtime's upload writes the blob, not a reference. A session round started
+   from the previous round's state therefore names artifacts no `adam_run_blob` row holds; if the prior
+   round is purged before the new run's first commit, the sweep can collect a digest the new run's
+   state still carries. S2a either writes the references at create or makes the sweep read the state;
+   S1 does not widen `create_run`.
 
 ## Consequences
 

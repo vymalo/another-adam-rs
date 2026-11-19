@@ -20,3 +20,24 @@ final-status-level = "fail"
 [[profile.ci.overrides]]
 filter = "binary_id(adam::ui)"
 slow-timeout = { period = "60s", terminate-after = 15 }
+
+# A blob is global and content-addressed: `purge_blobs`, and `purge_finished` in the same call,
+# delete every unreferenced blob in the database older than a cutoff. The cases that read, upload
+# or sweep a blob must not run beside each other. nextest runs each test in its own process, so the
+# suite's in-process mutex cannot serialise them, and an adapter's conformance cases share one
+# fixed table/collection prefix. One group, one thread; the libtest path takes the suite's mutex
+# instead (`crates/adam-store-testkit/src/lib.rs`).
+#
+# Membership is a **name convention**: a test that calls `purge_finished` or `purge_blobs` must
+# carry `purge` in its name (or be added to the filter below), and a repository that runs its own
+# store tests must put the same cases in a single-thread group of its own.
+[test-groups.store-global-sweeps]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(/blob_|purge|push_configs_go_with_their_run|measure_the_transcript_write|events_and_durable_artifacts|a_run_continues_a_finished_run_from_a_start_only_front/)'
+test-group = "store-global-sweeps"
+
+[[profile.ci.overrides]]
+filter = 'test(/blob_|purge|push_configs_go_with_their_run|measure_the_transcript_write|events_and_durable_artifacts|a_run_continues_a_finished_run_from_a_start_only_front/)'
+test-group = "store-global-sweeps"

@@ -26,7 +26,7 @@ accept the poll latency.
 * `MongoStore::new(database)`: reuse your application's `Database` handle.
 * `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
-* `MongoStore::database()`, `SCHEMA_VERSION` (4).
+* `MongoStore::database()`, `SCHEMA_VERSION` (5).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and returning it would convert the document back on every transition. `load_run`, the claim
   and the listings return the stored state; `journal_put` returns the stored payload (the loop
@@ -97,6 +97,32 @@ and a listing may show one until the sweep deletes it — up to a batch of delet
 `ensure_indexes` matches an existing index **by name only**, so a future change to `adam_list_status`'s keys needs a new
 name: reusing the name would leave every existing database on the old keys, silently.
 
+## Schema version 5, part 1: file bytes out of the run
+
+`<prefix>blob` holds the bytes: `_id` is the digest (64 lower-case hex, a SHA-256), `bytes` is a
+binary, `size` its length and `created_at` when it was first written; the GC index `adam_blob_gc`
+is `{created_at: 1}`. `<prefix>run_blob` is the append-only set of digests one run references,
+`_id = "<run>:<digest>"` with `run_id` and `digest`, indexed by `adam_run_blob_digest` (the GC's
+"does any run name this digest") and `adam_run_blob_run` (a purge batch's "which digests does this
+run name"). A `put_blob` is one `insertOne`; a duplicate key is a no-op, because the bytes behind a
+digest never change.
+
+A commit inserts its references **before** the CAS, in one unordered `insertMany` (duplicates
+ignored): there is no cross-document transaction, so a commit that loses the CAS leaves rows nothing
+names, and they are deleted with the run's purge. A commit whose run was purged between the refs and
+the CAS removes them itself.
+
+`purge_finished` deletes the purged runs' references and sweeps unreferenced blobs written before its
+cutoff; `purge_blobs(before)` is the explicit knob. The sweep pages candidates by `_id`, so a batch
+that is entirely referenced still moves on, and a digest a surviving run names is kept however old
+it is. Nothing is rewritten by the migration: a version 4 run document has no blob field at all.
+
+`RunUpdate` gained the public field `blobs` — a delta the store unions; a commit that names none
+keeps the earlier ones — so **a hand-built `RunUpdate { .. }` literal stops compiling**: add
+`blobs: Vec::new()` or use `RunUpdate::new(..)`/`.blobs(..)`. The four blob methods are
+**defaulted** on `Store`, so a store of your own that keeps no blobs still compiles and behaves as
+before.
+
 ## Schema version and the owner field
 
 The owner field is schema version 2. Version 2 adds an `owner` field to run documents, set by the first pinned
@@ -140,8 +166,8 @@ None.
 
 ## Tests
 
-`tests/conformance.rs` runs the shared suite and checks that a version 1 document (no `owner`
-field) is claimable and then pinned; `src/codec.rs` has property
+`tests/conformance.rs` runs the shared suite and the blob suite, and checks that a version 1
+document (no `owner` field) is claimable and then pinned; `src/codec.rs` has property
 tests of the key escaping; `src/lib.rs` has unit tests of the error classes
 (`driver_errors_are_classified_by_what_they_mean`,
 `the_driver_error_is_kept_as_the_source`), of what a write returns

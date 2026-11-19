@@ -20,6 +20,16 @@ dependency.
   exclusivity, busy runs that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
   run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
+* `blob_conformance!(make)` generates one `#[tokio::test]` per blob case (9 cases: put/get round
+  trip, a 4 MiB round trip (a file artifact's cap), an idempotent put whose first bytes win, an
+  unknown id answers `None`, empty bytes are a blob, a run's reference keeps a blob alive (including
+after a commit that names a different one), a shared
+  digest survives until the last referencing run is purged, `purge_blobs` respects its cutoff, and
+  `purge_finished` removes the run's references and the unreferenced blob). Every case asserts `keeps_blobs()`: a store that keeps none is not
+  given this suite. Blobs are global, so the cases take turns inside one test binary (the
+  `BLOB_SUITE` lock, which the cases that purge take too); under nextest, where each test is its own
+  process, `.config/nextest.toml` puts the same cases in one single-thread group. Runs are still
+  isolated by agent name. `make` is the same `async fn() -> Option<DynStore>` as above.
 * `transcript_measurement!(make)` generates the `measure_the_transcript_write` test: it runs
   `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts
   only that the workload ran. `make` is the same `async fn() -> Option<DynStore>` as above; `None`
@@ -48,7 +58,8 @@ dependency.
   the message a finished child sends its parent), with
   `fault::Method` and `fault::Mode` selecting the method and whether the
   operation is applied before the error is returned. `fault::Method` is **not** `#[non_exhaustive]`:
-  a new variant breaks an exhaustive `match` on it. `fault::is_injected`
+  a new variant breaks an exhaustive `match` on it (schema version 5 part 1 added `PutBlob`,
+  `GetBlob` and `PurgeBlobs`). `fault::is_injected`
   tells an injected error from a real one.
 * `skipped`: re-export of `adam_core::testing::skipped`.
 
@@ -70,7 +81,7 @@ failure (see `adam_core::testing`).
 
 ## Tests
 
-* `tests/memory.rs`: runs the suite against `MemoryStore` (always on).
+* `tests/memory.rs`: runs the store suite and the blob suite against `MemoryStore` (always on).
 * `claim_skips_busy_runs` (both scopes): runs named as `busy` are not claimed, with a live lease or an expired one,
   take no slot of the limit, and are not leased by the call that skipped them.
 * `lease_until_reports_the_lease`: nothing before a claim or for an unknown run, the end of the claim, of a renewal, still the same after a commit and after a stranger's release, nothing after the holder's release, and an expired lease reported as it was.
