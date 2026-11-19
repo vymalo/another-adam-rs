@@ -215,6 +215,7 @@ test('finding 9: the slot\'s containers are reaped and its work directory emptie
   await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'opencode'), spec(f, 'fix-add-1', 'opencode')] });
   assert.ok(f.slotContainers.reaped >= 3, `reaped ${f.slotContainers.reaped} times: at the plan, and before each of the two runs`);
   assert.deepEqual(f.resets, [1, 1]);
+  assert.ok(f.resetOptions.every((o) => o === undefined), 'the slot base is rebuilt for each task, never kept');
   const log = f.agents.opencode.log.map((l) => `${l[0]}:${l[1]}`);
   assert.ok(log.indexOf('prepare:hello-1-opencode-max') >= 0);
 });
