@@ -1049,7 +1049,9 @@ of body rows (1,275 rows, 50 generations) against ~0.5 MB of deltas for consecut
 checks that all of them landed, and a commit that loses deletes its own rows and refs, so a loser
 cannot poison the next append. A duplicate slot is resolved by content and age: an identical foreign
 row is adopted, a differing one older than the 5-minute orphan grace is collected and the insert
-retried once, and a live attempt's differing row is a `Conflict` (ADR 0055). The runtime reconstructs `join(head, rows)` before every commit and
+retried once, and a live attempt's differing row is a `Conflict` (ADR 0055). The grace is far longer
+than the insert→CAS gap of a live attempt (milliseconds; the default lease is 30 s), so it
+distinguishes a dead attempt from a live one without trusting the lease. The runtime reconstructs `join(head, rows)` before every commit and
 refuses a split that does not equal the state, which keeps a bad split at `state` only. A commit that
 does not split (a delivery, a cancel, a park) leaves the stored head and its version alone;
 `load_head` serves the head only when `head_version == version`. **The contract release (S3) stops

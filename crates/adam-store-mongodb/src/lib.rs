@@ -364,10 +364,11 @@ const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
 
 /// How old a foreign attempt's body row must be before a commit may collect it.
 ///
-/// A row is written just before its attempt's CAS, so a **live** attempt's row is seconds old, and
-/// the runtime's lease (30 s by default) has expired long before this grace. A row older than it
-/// belongs to an attempt that died between its insert and its CAS; nothing else will collect it,
-/// because the head it never wrote does not name it and the run may not be terminal.
+/// A row is written just before its attempt's CAS, so the age that separates a live attempt from a
+/// dead one is the **insert→CAS gap** (milliseconds): 5 minutes is far longer than that gap, and
+/// longer than the runtime's default 30 s lease. A row older than it belongs to an attempt that
+/// died between its insert and its CAS; nothing else will collect it, because the head it never
+/// wrote does not name it and the run may not be terminal.
 const BODY_ORPHAN_GRACE: chrono::Duration = chrono::Duration::minutes(5);
 
 /// One row as the document `adam_body` holds.
@@ -2981,6 +2982,61 @@ mod body_loser_tests {
             .await
             .expect("a second commit at the new version");
         assert_eq!(next.version, 3, "the run is not wedged");
+        // A split after the orphan collection still writes a complete transcript. The headless
+        // commit made the head stale, so this one compacts into a new generation: the appended row
+        // and the two the orphan collection left are all there.
+        let split = store
+            .commit_run(
+                run.id,
+                next.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 3}))
+                    .head(head(
+                        generation,
+                        3,
+                        &BlobId::from_hex(&"a".repeat(64)).expect("a digest"),
+                    ))
+                    .body(BodyWrite {
+                        generation: None,
+                        rows: vec![
+                            BodyRow {
+                                idx: 0,
+                                message: json!("ours 0"),
+                            },
+                            BodyRow {
+                                idx: 1,
+                                message: json!("ours 1"),
+                            },
+                            BodyRow {
+                                idx: 2,
+                                message: json!("ours 2"),
+                            },
+                        ],
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await
+            .expect("a split after the orphan collection");
+        assert_eq!(split.version, 4);
+        let served = store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run");
+        assert_eq!(
+            served.state["body"]["len"], 3,
+            "the transcript gained one row"
+        );
+        let appended = Uuid::parse_str(
+            served.state["body"]["generation"]
+                .as_str()
+                .expect("the store resolved a generation"),
+        )
+        .expect("a uuid");
+        assert_eq!(
+            store.body_list(run.id, appended).await.expect("rows").len(),
+            3,
+            "the generation holds the two rows the orphan collection left and the appended one"
+        );
         clean(&store, &prefix).await;
     }
 

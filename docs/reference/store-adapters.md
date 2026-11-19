@@ -57,7 +57,8 @@ serves neither: the runtime reads `state` exactly as before. A generation is `(r
 `RunUpdate.body` is `{generation, rows, writer}`, where `generation: None` appends the rows after the
 head's `len` and `Some(new)` is a compaction. A duplicate slot is this attempt's retry when the row's
 `writer` is this attempt. A row another attempt wrote is adopted when its message is the one this
-attempt would write; foreign rows older than the orphan grace (5 minutes) are collected and the
+attempt would write; foreign rows older than the orphan grace (5 minutes, far longer than the
+insert→CAS gap of a live attempt — milliseconds; the default lease is 30 s) are collected and the
 insert retried once; a live attempt with a different message is a `Conflict`. The delta win holds
 across splitting commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed one) makes
 the next split a compaction until S3, which writes the head those paths read. A commit with `head: None` leaves the stored head and

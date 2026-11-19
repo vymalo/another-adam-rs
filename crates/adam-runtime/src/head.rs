@@ -162,6 +162,10 @@ impl Head {
 
     /// Decode `state` as a v5 head; [`RuntimeError::Corrupt`] for another version or a document
     /// that does not decode.
+    #[allow(
+        dead_code,
+        reason = "S2a writes and verifies the head; S2b's read path decodes it"
+    )]
     pub(crate) fn decode(run: RunId, state: &Value) -> Result<Self, RuntimeError> {
         let corrupt = |reason: String| RuntimeError::Corrupt {
             run,
@@ -226,8 +230,8 @@ pub(crate) enum Stored {
 }
 
 // S2a writes and verifies the head but reads neither; the read path (S2b) is what calls these.
-// The allow keeps `Stored` live, and through `Stored::decode` it keeps `Head::decode` live too:
-// without it a non-test build reports both, and S2b is the caller.
+// The allow covers this enum and its methods; `Head::decode`, the one callee outside it, carries
+// its own allow.
 #[allow(
     dead_code,
     reason = "S2a writes and verifies the head; S2b's read path decodes and serves it"

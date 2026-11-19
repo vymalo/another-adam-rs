@@ -149,10 +149,13 @@ first split), else the current head's, else a new UUID. It writes only the rows 
 rows.len()`. A duplicate is this attempt's own row when its `writer` is this attempt. A duplicate
 written by **another** attempt is read back with `adam_body_generation` over the attempted range: if
 every foreign row has the message this attempt would write, it is **adopted** and the CAS decides
-whose head names it; else if every foreign row is older than the orphan grace (5 minutes, longer
-than any lease the runtime grants), its attempt died before its CAS, so the rows are deleted and the
-insert retried once; else a live attempt owns the slots and the commit is a `Conflict`. The runtime
-drops the result of a conflict and the next claim steps the run again; a run wedged by an older
+whose head names it; else if every foreign row is older than the orphan grace (5 minutes, far longer
+than the insert→CAS gap of a live attempt — milliseconds; the default lease is 30 s), its attempt
+died before its CAS, so the rows are deleted and the insert retried once; else a live attempt owns
+the slots and the commit is a `Conflict`. The runtime drops the result of a conflict and the next
+claim steps the run again. After a crash in the insert→CAS window the run is re-stepped and each
+attempt's result is dropped until the grace expires — minutes of wasted store round trips; the
+journaled steps replay, so no model call or tool side effect is repeated. A run wedged by an older
 binary is cancelled by an operator. Any other write error, and any **write-concern** error (the write
 may or may not have landed), aborts before the CAS — a head never names a generation that is missing
 a row. The refs go next, then the CAS, then the GC: the superseded generations of the run written

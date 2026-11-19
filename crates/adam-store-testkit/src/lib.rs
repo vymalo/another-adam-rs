@@ -327,7 +327,10 @@ pub mod cases {
     pub async fn blob_round_trip(store: DynStore) {
         let _turn = BLOB_SUITE.lock().await;
         keeps_blobs(&store);
-        let bytes = b"a run's file, byte for byte: \x00\xff\x01".to_vec();
+        // A digest unique to this run: the case must pass against a database that holds an earlier
+        // run's blobs, and a fixed one would already be stored (the first assertion below).
+        let mut bytes = b"a run's file, byte for byte: \x00\xff\x01 ".to_vec();
+        bytes.extend_from_slice(Uuid::new_v4().as_bytes());
         let id = blob_digest(&bytes);
         assert_eq!(
             store.get_blob(&id).await.unwrap(),

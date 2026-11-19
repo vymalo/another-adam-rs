@@ -140,9 +140,9 @@ trait at your rev: its doc comments are the contract.
   the CAS with the attempt's `writer`, and check that all of them landed. A duplicate key is this
   attempt's retry when the row's `writer` is this attempt. A row another attempt wrote is resolved
   by content and age: **adopt** it when its message equals the one this attempt would write, delete
-  it and retry the insert once when it is older than the **orphan grace** (5 minutes, longer than
-  any lease the runtime grants), and answer `Conflict` when a live attempt holds the slot with a
-  different message. A live conflict is not a wedge: the runtime drops the result and the next
+  it and retry the insert once when it is older than the **orphan grace** (5 minutes, far longer
+  than the insert→CAS gap of a live attempt — milliseconds; the default lease is 30 s), and answer
+  `Conflict` when a live attempt holds the slot with a different message. A live conflict is not a wedge: the runtime drops the result and the next
   claim steps the run again; an attempt that died before its CAS leaves rows that are adopted or
   collected. A **write-concern** error is not a completeness answer. A commit that loses the CAS deletes the
   rows and refs its `writer` added, but never a row or digest the winner's head names — and a commit

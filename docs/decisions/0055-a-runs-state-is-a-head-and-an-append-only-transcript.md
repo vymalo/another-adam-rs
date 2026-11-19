@@ -148,14 +148,20 @@ commit" language is superseded.
    MongoDB reads the foreign rows at the attempted slots. If every one has the message this attempt
    would write, it is **adopted** (the completeness check passes and the CAS decides whose head names
    it), so a deterministic re-run makes progress. Otherwise, if every foreign row is older than the
-   **orphan grace** (5 minutes, longer than any lease the runtime grants), the attempt that wrote it
-   died before its CAS, so the rows are deleted and the insert retried once. Otherwise a live attempt
-   owns the slots and the commit is a `Conflict`. A loser deletes its own rows and refs, and never a
-   row below the winner's head's `len`; the PostgreSQL follow-up does the same inside its
-   transaction. A live concurrent attempt's rows stay a `Conflict` — the runtime drops the result and
-   the next claim steps the run again — but rows from an attempt that died in the insert→CAS window
-   are adopted when identical or removed after the grace, so they no longer wedge the run. An older
-   binary that still wedges one is cancelled by an operator.
+   **orphan grace** (5 minutes, far longer than the insert→CAS gap of a live attempt — milliseconds;
+   the default lease is 30 s), the attempt that wrote it died before its CAS, so the rows are deleted
+   and the insert retried once. Otherwise a live attempt owns the slots and the commit is a
+   `Conflict`. A loser deletes its own rows and refs, and never a row below the winner's head's
+   `len`; the PostgreSQL follow-up does the same inside its transaction. A live concurrent attempt's
+   rows stay a `Conflict` — the runtime drops the result and the next claim steps the run again —
+   but rows from an attempt that died in the insert→CAS window are adopted when identical or removed
+   after the grace, so they no longer wedge the run. The grace is not free: after such a crash the
+   run is re-stepped and each attempt's result is dropped until the grace expires — minutes of
+   wasted store round trips; the journaled steps replay, so no model call or tool side effect is
+   repeated. A live attempt whose insert stalls for more than the grace (or a clock skew larger
+   than it) can have its rows collected while it is alive: the writer-keyed rows
+   (`(run, generation, writer, idx)`, the head naming its writer) in S2b/S3 remove the shared slot
+   and this adoption heuristic. An older binary that still wedges one is cancelled by an operator.
 
 ## Consequences
 
