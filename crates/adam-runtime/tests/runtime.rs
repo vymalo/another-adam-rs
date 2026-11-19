@@ -4212,6 +4212,39 @@ mod cases {
         );
     }
 
+    /// `start_child_in` is `start_child` for a child that lives in another conversation: it records
+    /// the parent and that conversation, and starting the same child twice starts it once.
+    pub async fn start_child_in_records_the_conversation_and_is_idempotent(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let parent_agent = child_parked(&name);
+        let rt = builder(&store, &uniq("w"), &parent_agent)
+            .agent(child_parked(&child_name))
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let id = child_run_id(parent, "timer");
+        let conversation = uniq("alice:ctx");
+
+        let first = Inbound::new("start", json!({"which": "first"}));
+        assert!(
+            rt.start_child_in(parent, id, &child_name, first, &conversation)
+                .await
+                .expect("first")
+        );
+        let second = Inbound::new("start", json!({"which": "second"}));
+        assert!(
+            !rt.start_child_in(parent, id, &child_name, second, &conversation)
+                .await
+                .expect("second"),
+            "the same id is the same child"
+        );
+
+        let rec = store.load_run(id).await.expect("load").expect("child");
+        assert_eq!(rec.parent_id, Some(parent));
+        assert_eq!(rec.conversation_id.as_deref(), Some(conversation.as_str()));
+        let view = rt.view(id).await.expect("view").expect("child");
+        assert_eq!(view.state["which"], "first", "the second input was ignored");
+    }
+
     /// The child finishes, the parent resumes exactly once with its answer, and it got it from
     /// the message: the timer (an hour off, on a clock nobody moves) could not have.
     pub async fn a_finished_child_wakes_its_parent_once(store: DynStore) {
@@ -7453,6 +7486,7 @@ macro_rules! runtime_suite {
                 pinned_workers_step_a_run_only_on_its_owner,
                 any_workers_let_a_run_move_between_workers,
                 start_child_records_the_parent_and_is_idempotent,
+                start_child_in_records_the_conversation_and_is_idempotent,
                 a_finished_child_wakes_its_parent_once,
                 a_notice_that_beats_the_park_is_not_lost,
                 a_failed_or_cancelled_child_tells_its_parent_why,

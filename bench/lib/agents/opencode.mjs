@@ -1,6 +1,7 @@
 // The OpenCode driver. OpenCode V2 (`@opencode/cli` 2.x: a pinned binary from npm, checked against its integrity hash
-// and mounted read-only) runs in a container of the task's own image on the slot's Podman service, in a clone of the
-// same base at the same kind of path, with the statement on stdin and the meter as its only way to the model.
+// and mounted read-only) runs in a container of the task's own image on the host's Docker, on the slot's network, in a
+// clone of the same base at the same kind of path, with the statement on stdin and the meter as its only way to the
+// model. It runs as uid 10001 and under the same limits as the coder (lib/runtime.mjs).
 //
 //   cd <clone> && opencode run --standalone --format json --model bench/bench-model --auto --title <run> < instruction.md
 //
@@ -17,8 +18,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { probeLimits } from '../limits.mjs';
 import { fetchPinnedBinary } from '../npm.mjs';
+import { runtimeLimits, runtimeUser } from '../runtime.mjs';
 import { InfraError, patchOfTree, saveRaw } from './common.mjs';
 
 export const MODEL = 'bench/bench-model';
@@ -151,7 +152,6 @@ export class OpenCodeAgent {
     Object.assign(this, { pins, home, fetchBinary, now, contextWindow, pollMs, sharedPrompt });
     this.binary = null;
     this.binarySha = null;
-    this.limitsBySlot = new Map(); // slot -> { accepted }
   }
 
   #names(ctx) {
@@ -199,23 +199,15 @@ export class OpenCodeAgent {
     }
     const r = await ctx.containers.run({
       image: ctx.task.image.ref,
-      script: ['set -eu', "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'", `git clone -q --no-hardlinks ${ctx.base.containerRepo} ${names.dir}`, `git -C ${names.dir} checkout -q main`, `chmod -R a+rwX ${names.parent}`].join('\n'),
+      script: ['set -eu', "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'", `git clone -q --no-hardlinks ${ctx.base.containerRepo} ${names.dir}`, `git -C ${names.dir} checkout -q main`].join('\n'),
       workdir: '/',
-      mounts: [
-        { source: path.dirname(ctx.base.containerRepo), target: path.dirname(ctx.base.containerRepo), readOnly: true },
-        { source: names.parent, target: names.parent },
-      ],
+      user: runtimeUser(),
+      mounts: [{ source: ctx.stack.workRoot(ctx.slot), target: '/work' }],
       network: 'none',
       timeoutMs: 10 * 60 * 1000,
       labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) },
     });
     if (r.exitCode !== 0) throw new Error(`the clone for OpenCode failed (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
-    // Does the service accept the task's CPU and memory? Asked once for a slot; the answer decides what the run is given.
-    if (!this.limitsBySlot.has(ctx.slot)) {
-      const probe = await probeLimits({ containers: ctx.containers, image: ctx.task.image.ref, cpus: ctx.task.cpus, memoryMb: ctx.task.memoryMb });
-      if (probe.runtimeFailed) throw new InfraError('runtime', `the Podman service cannot run a container: ${probe.detail}`);
-      this.limitsBySlot.set(ctx.slot, { accepted: probe.accepted });
-    }
   }
 
   async run(ctx) {
@@ -223,16 +215,16 @@ export class OpenCodeAgent {
     const config = opencodeConfig({ baseUrl: ctx.meter.baseUrl, contextWindow: this.contextWindow, steps: ctx.limits.steps, instructions: this.sharedPrompt ? [`/bench/in/${SHARED_PROMPT_FILE}`] : [] });
     const input = opencodeInput({ config });
     const globals = this.#globals(ctx);
+    const outHost = path.join(ctx.stack.workRoot(ctx.slot), 'bench-out', path.basename(names.out));
     const mounts = [
       { source: path.join(this.slotDir(ctx), 'bin', 'opencode'), target: '/opt/bench/opencode', readOnly: true },
       { source: globals, target: '/.claude', readOnly: true },
       { source: globals, target: '/.opencode', readOnly: true },
       { source: names.inDir, target: '/bench/in', readOnly: true },
-      { source: names.out, target: '/bench/out' },
-      { source: names.parent, target: names.parent },
+      { source: outHost, target: '/bench/out' },
+      { source: ctx.stack.workRoot(ctx.slot), target: '/work' },
     ];
-    const limitsAccepted = this.limitsBySlot.get(ctx.slot)?.accepted ?? false;
-    const base = { image: ctx.task.image.ref, workdir: '/', env: opencodeEnv(), mounts, input, ...(limitsAccepted ? { cpus: ctx.task.cpus, memoryMb: ctx.task.memoryMb } : {}), labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) } };
+    const base = { image: ctx.task.image.ref, workdir: '/', user: runtimeUser(), env: opencodeEnv(), mounts, input, ...runtimeLimits(), labels: { 'bench.slot': String(ctx.slot), 'bench.run': names.container.slice(14) } };
     // The image the container runs is the task's, by digest: asserted here, before the container starts.
     if (!/@sha256:[0-9a-f]{64}$/.test(base.image)) throw new InfraError('no-task-container', 'the task image is not named by digest');
     // The end of a run, for the time limit and for a refusal of the meter (OpenCode retries a refused call, so it would
@@ -252,7 +244,7 @@ export class OpenCodeAgent {
     const started = this.now();
     let r;
     try {
-      r = await ctx.containers.run({ ...base, name: names.container, script: opencodeRunScript({ bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: names.dir, run: `${ctx.run}-a${ctx.attempt}`.replace(/[^A-Za-z0-9._-]/g, '-') }), network: 'default' });
+      r = await ctx.containers.run({ ...base, name: names.container, script: opencodeRunScript({ bin: '/opt/bench/opencode', stmt: '/bench/in/instruction.md', out: '/bench/out', dir: names.dir, run: `${ctx.run}-a${ctx.attempt}`.replace(/[^A-Za-z0-9._-]/g, '-') }), network: 'slot' });
     } finally {
       clearTimeout(limitTimer);
       clearTimeout(graceTimer);
@@ -283,10 +275,10 @@ export class OpenCodeAgent {
     else if (r.exitCode === 0 && events.errors === 0) exit = 'done';
     else if (refusal) exit = refusal === 'cap' ? 'stopped_by_cap' : 'budget_hit';
     else exit = 'failed';
-    return { exit, wallMs, sessionId: events.sessionId, selfReported: events.selfReported, retries: events.retries, backgroundWaits: events.backgroundWaits, exportKept: got.files.has('export.json'), processExit: r.exitCode, record: { limits: limitsAccepted ? 'task' : 'service', outputRefused: got.refused } };
+    return { exit, wallMs, sessionId: events.sessionId, selfReported: events.selfReported, retries: events.retries, backgroundWaits: events.backgroundWaits, exportKept: got.files.has('export.json'), processExit: r.exitCode, record: { limits: 'runtime', outputRefused: got.refused } };
   }
 
-  /** The container ran with --rm and has ended; nothing of the run may be left in the service. */
+  /** The container ran with --rm and has ended; nothing of the run may be left on the host. */
   async stop(ctx) {
     try {
       await ctx.containers.reapAll();

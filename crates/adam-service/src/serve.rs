@@ -92,6 +92,13 @@ pub struct Agents {
     /// expands a message that names one. `None`: the extension is never read. Only the roles that
     /// serve A2A use it.
     pub commands: Option<adam_a2a_runtime::Commands>,
+    /// The helpers the agent serves `child-sessions/v1` for, when it has any
+    /// (`AgentDef::child_sessions`): the backend then starts, continues and closes a person's
+    /// sessions on them, and [`serve`] adds the extension to the card **only when the backend
+    /// accepted them**. Every helper must be registered on the runtime ([`Agents::register`]: the
+    /// full agent or its starter), or [`serve`] stops with [`ServeError::ChildSessions`]. `None`:
+    /// the extension is never listed or read. Only the roles that serve A2A use it.
+    pub child_sessions: Option<adam_a2a_runtime::ChildSessions>,
     /// The components the binary adds to the worker tier ([`Agents::worker_component`]).
     components: Vec<(String, StartComponent)>,
 }
@@ -110,6 +117,7 @@ impl Agents {
             inbound: None,
             access_tiers: None,
             commands: None,
+            child_sessions: None,
             components: Vec::new(),
         }
     }
@@ -192,6 +200,16 @@ impl Agents {
     }
 }
 
+impl Agents {
+    /// The agent serves `child-sessions/v1` for `sessions`: see
+    /// [`Agents::child_sessions`](struct@Agents#structfield.child_sessions).
+    #[must_use]
+    pub fn child_sessions(mut self, sessions: adam_a2a_runtime::ChildSessions) -> Self {
+        self.child_sessions = Some(sessions);
+        self
+    }
+}
+
 impl std::fmt::Debug for Agents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Agents")
@@ -201,6 +219,7 @@ impl std::fmt::Debug for Agents {
             .field("inbound", &self.inbound.is_some())
             .field("access_tiers", &self.access_tiers)
             .field("commands", &self.commands.as_ref().map(|c| !c.is_empty()))
+            .field("child_sessions", &self.child_sessions.is_some())
             .field(
                 "components",
                 &self
@@ -218,7 +237,7 @@ impl std::fmt::Debug for Agents {
 /// whole says it once.
 ///
 /// [`exit_code`](crate::exit_code) maps the variants: a store that cannot be reached is 69, an
-/// address that cannot be bound 71, a missing card 78, a component that stopped 70.
+/// address that cannot be bound 71, a missing card or an unregistered child-sessions helper 78, a component that stopped 70.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ServeError {
@@ -232,6 +251,13 @@ pub enum ServeError {
     /// deployment, but one only a restart with other code fixes.
     #[error("no agent card was given for a role that serves A2A")]
     NoCard,
+    /// `Agents::child_sessions` names a helper that is not registered on the runtime: a mistake of
+    /// the binary, found at start, so the card never lists an extension the process does not serve.
+    #[error("the child-sessions helper `{agent}` is not registered on the runtime")]
+    ChildSessions {
+        /// The registered name of the first helper that is missing.
+        agent: String,
+    },
     /// The listener cannot be bound.
     #[error("binding {addr}")]
     Bind {
@@ -372,7 +398,7 @@ pub fn claim_scope_for(placement: Placement) -> ClaimScope {
 ///
 /// # Errors
 ///
-/// [`ServeError`]: connecting to or migrating Postgres, a missing card, binding
+/// [`ServeError`]: connecting to or migrating Postgres, a missing card, a child-sessions helper that is not registered, binding
 /// [`ServiceConfig::listen_addr`], or a component stopping unexpectedly.
 pub async fn serve(
     config: &ServiceConfig,
@@ -388,21 +414,18 @@ pub async fn serve(
         inbound,
         access_tiers,
         commands,
+        child_sessions,
         components,
     } = agents;
     if role.runs_control_plane() && card.is_none() {
         return Err(ServeError::NoCard);
     }
-    let (store, pool): (DynStore, _) = {
-        let store = PgStore::connect(config.database_url.expose_secret())
-            .await
-            .map_err(ServeError::Connect)?;
-        adam_core::Store::migrate(&store)
-            .await
-            .map_err(ServeError::Migrate)?;
-        let pool = store.pool().clone();
-        (Arc::new(store), pool)
-    };
+    // The store connects lazily so that the process's own configuration is checked before it
+    // depends on the database: a mistake of the binary is exit 78 whether or not Postgres answers.
+    let pg =
+        PgStore::connect_lazy(config.database_url.expose_secret()).map_err(ServeError::Connect)?;
+    let pool = pg.pool().clone();
+    let store: DynStore = Arc::new(pg.clone());
 
     // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own pool. The
     // listener (`notify.run`) is a host component below; the runtime only holds the two halves.
@@ -421,7 +444,31 @@ pub async fn serve(
     let service = Service::new_with(register(Runtime::builder(store)), name, &options, live)
         .with_inbound(inbound)
         .with_access_tiers(access_tiers)
-        .with_commands(commands);
+        .with_commands(commands)
+        .with_child_sessions(child_sessions.clone());
+    // The card lists the extension if and only if this process serves it.
+    let mut card = card;
+    if role.runs_control_plane()
+        && let Some(sessions) = &child_sessions
+    {
+        if service.child_sessions().is_none() {
+            let registered = service.runtime.agent_names();
+            let missing = sessions
+                .agents()
+                .iter()
+                .find(|helper| !registered.contains(&helper.agent))
+                .map_or_else(String::new, |helper| helper.agent.clone());
+            return Err(ServeError::ChildSessions { agent: missing });
+        }
+        if let (Some(card), Some(extension)) = (card.as_mut(), sessions.card_extension()) {
+            card.extensions.push(extension);
+        }
+    }
+
+    pg.ping().await.map_err(ServeError::Connect)?;
+    adam_core::Store::migrate(&pg)
+        .await
+        .map_err(ServeError::Migrate)?;
 
     // Bind before anything runs: an address that cannot be bound fails the process at once.
     let listener = TcpListener::bind(config.listen_addr)

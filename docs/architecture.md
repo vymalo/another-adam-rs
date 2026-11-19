@@ -246,13 +246,13 @@ flowchart LR
             mcp["AgentDef::connect_mcp<br/>the folder's mcp.json, McpSettings policy"]
             agent["CoderAgent::try_from_def<br/>model + ToolEnv + MCP tools"]
         end
-        starter["CoderStarter<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
-        agents["Agents { name, card, register, options }"]
+        starter["CoderStarter + the helpers' starters (AgentDef::session_starters)<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
+        agents["Agents { name, card, register, options, child_sessions }"]
     end
 
     subgraph svc["adam-service: serve(ServiceConfig, Agents, shutdown)"]
         direction LR
-        pg["PgStore::connect + migrate()<br/>as DynStore"]
+        pg["PgStore::connect_lazy, then ping + migrate()<br/>as DynStore"]
         pgn["PgNotify::new(store pool, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
         service["Service::new_with(register(Runtime::builder(store)), name, options, live)"]
         rtm["Runtime<br/>PgEventSink as EventSink, PgNotifier as Notifier"]
@@ -294,7 +294,7 @@ flowchart LR
 | `ROLE` | Components | Needs |
 |---|---|---|
 | `all` (default) | `a2a-server`, `worker`, `notify` in one process | every variable |
-| `control-plane` | `a2a-server`, `notify`, over a runtime that has only the agent's starter (starts, delivers, cancels and views runs; never steps) | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variable |
+| `control-plane` | `a2a-server`, `notify`, over a runtime that has only the agent's starter and its helpers' starters (`AgentDef::session_starters`; starts, delivers, cancels and views runs; never steps) | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variable |
 | `worker` | `worker`, `notify`, `health` (`GET /healthz` on `LISTEN_ADDR`, no A2A) | everything except `A2A_BEARER_TOKENS` and `PUBLIC_URL` |
 
 * The roles meet in the store (the record and its CAS, the leases) and in `NOTIFY` ([below](#across-processes-signals-and-events)).

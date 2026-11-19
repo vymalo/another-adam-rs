@@ -1,26 +1,26 @@
-// `bench doctor`: what the machine must have for the stack, and which fallback to use when nested Podman does not work.
+// `bench doctor`: what the machine must have for the stack, and whether the coder starts in each selected task image.
 //
-// The Podman service of bench/compose.yaml is a container that runs containers. It was proven under rootful Docker
-// in CI (dev/podman/README.md) and never under rootless Docker, so this is the first thing to check on the
-// owner's desktop. Each check is { name, status: 'ok' | 'warn' | 'fail', detail, fix? }; the exit code is 1 when any
-// check fails. Nothing is started unless `start` is set.
+// The bench runs its containers on the host's Docker (lib/containers.mjs): every image is in one store, and a task
+// image is run as it is. The coder's binaries are static (musl, ADR 0053 decision 11), so the image's C library does
+// not matter: a Debian bookworm task image starts the coder as well as a trixie one. The probe runs the coder with
+// no configuration as uid 10001 in the image: exit 78 means it starts (the coder refuses an empty configuration,
+// which is what a start is); a loader error, a missing interpreter or an architecture the image cannot run means it
+// does not, and such an image is refused for both arms. Each check is { name, status: 'ok' | 'warn' | 'fail', detail,
+// fix? }; the exit code is 1 when any check fails. Nothing is started unless `start` is set.
 import fs from 'node:fs';
-import { runCommand } from './stack.mjs';
+import { dockerEnv } from './containers.mjs';
 import { probeLimits } from './limits.mjs';
 import { coderRef } from './pins.mjs';
+import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
+import { runCommand } from './stack.mjs';
 
-// The limits of a task that has none of its own (lib/task.mjs); the probe uses what a driver would pass.
-const PROBE_CPUS = 1;
-const PROBE_MEMORY_MB = 4096;
+// The limits the probe asks the runtime to enforce: the arms' own (lib/runtime.mjs).
+const PROBE = runtimeLimits(RUNTIME);
 
-export const MIN_FREE_GB = 30;
+/** The dry run needs about 20 GB (the coder image once, the task images and their layers); the full run about 100. */
+export const MIN_FREE_GB = 20;
 export const WARN_FREE_GB = 100;
 const GB = 1024 ** 3;
-
-export const FALLBACKS = [
-  'fallback 1: a rootless Podman on the host (not inside Docker), its socket mounted into the coder and the harness; the tasks run in it',
-  'fallback 2: the coder\'s run pods on a k3d cluster (deploy/coder, RUN_ENVIRONMENT=kubernetes)',
-];
 
 /**
  * Does this Node's `http.request`/`https.request` (what the meter uses) take a proxy from the environment under NODE_USE_ENV_PROXY=1?
@@ -40,28 +40,56 @@ const ok = (name, detail) => ({ name, status: 'ok', detail });
 const warn = (name, detail, fix) => ({ name, status: 'warn', detail, ...(fix ? { fix } : {}) });
 const fail = (name, detail, fix) => ({ name, status: 'fail', detail, ...(fix ? { fix } : {}) });
 
-const readSysctl = (file, readFile) => {
-  try {
-    return readFile(file, 'utf8').trim();
-  } catch {
-    return null;
-  }
-};
+const LOADER_ERROR = /error while loading shared libraries|GLIBC_[0-9.]+.*not found|version `[^']+' not found|No such file or directory|exec format error|not found/i;
+
+/**
+ * Run the coder binary with no configuration, as uid 10001, in `image`: exit 78 means it starts (it refuses the empty
+ * configuration, which is a start), a loader error means the image cannot load it. Returns { starts, exitCode, detail }.
+ */
+export async function coderProbe({ containers, image, filesDir, timeoutMs = 120_000 }) {
+  const r = await containers.run({
+    image,
+    network: 'none',
+    user: runtimeUser(),
+    mounts: [{ source: filesDir, target: '/opt/adam/bin', readOnly: true }],
+    entrypoint: '/opt/adam/bin/adam-coder',
+    timeoutMs,
+  });
+  const text = `${r.stderr ?? ''}\n${r.stdout ?? ''}`.trim().split('\n').filter(Boolean).slice(-2).join(' | ');
+  if (r.exitCode === 78) return { starts: true, exitCode: 78, detail: 'exit 78: the coder starts and refuses an empty configuration' };
+  if (r.exitCode === 126 || r.exitCode === 127 || LOADER_ERROR.test(text)) return { starts: false, exitCode: r.exitCode, detail: `exit ${r.exitCode}: ${text || 'the binary could not be loaded'}` };
+  return { starts: null, exitCode: r.exitCode, detail: `exit ${r.exitCode}: ${text || 'no output'}` };
+}
+
+/** The image's distribution, best effort: `PRETTY_NAME` from `/etc/os-release`, or null when it cannot be read. */
+export async function osRelease({ containers, image, timeoutMs = 60_000 }) {
+  const r = await containers.run({ image, network: 'none', entrypoint: '/bin/cat', command: ['/etc/os-release'], timeoutMs });
+  if (r.exitCode !== 0) return null;
+  const m = /^PRETTY_NAME="?([^"\n]+)"?$/m.exec(r.stdout ?? '');
+  return m ? m[1] : null;
+}
 
 /**
  * @param {object} o
  * @param {string} o.home       $BENCH_HOME
  * @param {object} o.pins
+ * @param {Array} [o.tasks]     the selected tasks: one probe per task image
+ * @param {object} [o.containers] what the probes run on (a HostContainers); the stack's when `stack` is given
  * @param {(file: string, args: string[]) => Promise<{exitCode: number, stdout: string, stderr: string}>} [o.exec]
- * @param {object} [o.stack]    a Stack; with `start` it is brought up and the nested checks run
+ * @param {object} [o.stack]    a Stack; with `start` it is brought up and a container is run on the host
  * @param {boolean} [o.start]
- * @returns {Promise<{checks: object[], exitCode: number, fallback: string|null}>}
+ * @param {object} [o.env]      the environment to read (default: the stack's `baseEnv`, or `process.env` without a stack)
+ * @returns {Promise<{checks: object[], exitCode: number}>}
  */
-export async function doctor({ home, pins, exec = runCommand, readFile = fs.readFileSync, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, env = process.env }) {
+export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, tasks = [], taskError = null, containers = null, env = null }) {
+  // A stack carries the environment it was built with (`baseEnv`), which is what its compose calls and host containers
+  // already use. The doctor's own docker calls must use the same one, never the ambient environment: a caller that
+  // injects a stack (the tests do, and `bench doctor` builds it from `main`'s env) would otherwise get two lists.
+  const baseEnv = env ?? stack?.baseEnv ?? process.env;
   const checks = [];
   const run = async (file, args) => {
     try {
-      return await exec(file, args, {});
+      return await exec(file, args, { env: dockerEnv(baseEnv) });
     } catch {
       return { exitCode: 127, stdout: '', stderr: '' };
     }
@@ -71,12 +99,12 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
   checks.push(major >= 22 ? ok('node', `Node ${nodeVersion} (CI runs 22 and 24)`) : fail('node', `Node ${nodeVersion} is too old`, 'install Node 22 or newer (CI runs 22 and 24)'));
 
   // The meter reaches the endpoint with Node's own http client, which uses a proxy from the environment only when asked to.
-  const proxy = env.HTTPS_PROXY ?? env.https_proxy;
+  const proxy = baseEnv.HTTPS_PROXY ?? baseEnv.https_proxy;
   if (proxy) {
     if (!envProxyInRequest(nodeVersion)) {
       checks.push(warn('proxy', `HTTPS_PROXY is set but Node ${nodeVersion}'s https.request ignores it, so the meter would reach the endpoint directly`, 'use Node 22.21.0 or newer, or 24.5.0 or newer, and start the harness with NODE_USE_ENV_PROXY=1'));
     } else {
-      checks.push(env.NODE_USE_ENV_PROXY === '1' ? ok('proxy', 'HTTPS_PROXY is set and NODE_USE_ENV_PROXY=1: the meter reaches the endpoint through it') : warn('proxy', 'HTTPS_PROXY is set but the meter would reach the endpoint directly', 'start the harness with NODE_USE_ENV_PROXY=1 if the endpoint is reached through that proxy'));
+      checks.push(baseEnv.NODE_USE_ENV_PROXY === '1' ? ok('proxy', 'HTTPS_PROXY is set and NODE_USE_ENV_PROXY=1: the meter reaches the endpoint through it') : warn('proxy', 'HTTPS_PROXY is set but the meter would reach the endpoint directly', 'start the harness with NODE_USE_ENV_PROXY=1 if the endpoint is reached through that proxy'));
     }
   }
 
@@ -101,21 +129,12 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
   if (info) {
     const rootless = (info.SecurityOptions ?? []).some((o) => /rootless/.test(o));
     checks.push(ok('docker daemon', `${info.ServerVersion ?? 'unknown version'}, ${rootless ? 'rootless' : 'rootful'}, cgroup v${info.CgroupVersion ?? '?'}`));
-    if (rootless) checks.push(warn('rootless docker', 'nested Podman under rootless Docker was never proven', `if the nested check below fails, use ${FALLBACKS[0]}`));
+    if (rootless) checks.push(warn('rootless docker', 'a container runs as a subuid on the host; the work directory is 0777, so uid 10001 can write it', 'none if the dry run passes; a bind-mounted directory the harness owns must stay writable by uid 10001'));
   } else {
     checks.push(fail('docker daemon', 'the daemon does not answer', 'start Docker, or fix DOCKER_HOST / the docker context'));
   }
 
-  // Unprivileged user namespaces: the service runs a rootless Podman, which makes one.
-  const apparmor = readSysctl('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', readFile);
-  if (apparmor === '1') checks.push(fail('sysctl kernel.apparmor_restrict_unprivileged_userns', 'is 1: a rootless Podman cannot make a user namespace', 'sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0  (dev/podman/README.md)'));
-  else checks.push(ok('sysctl kernel.apparmor_restrict_unprivileged_userns', apparmor === null ? 'not present on this kernel' : `is ${apparmor}`));
-  const clone = readSysctl('/proc/sys/kernel/unprivileged_userns_clone', readFile);
-  if (clone === '0') checks.push(fail('sysctl kernel.unprivileged_userns_clone', 'is 0', 'sudo sysctl -w kernel.unprivileged_userns_clone=1'));
-  const maxUserns = readSysctl('/proc/sys/user/max_user_namespaces', readFile);
-  if (maxUserns !== null && Number(maxUserns) <= 0) checks.push(fail('sysctl user.max_user_namespaces', 'is 0', 'sudo sysctl -w user.max_user_namespaces=15000'));
-
-  // Disk: the images (several GB each) are in Docker's root and in the Podman services' storage volumes.
+  // Disk: the images are in Docker's root once (the coder image is the big one), and the results are in $BENCH_HOME.
   const dirs = [['results ($BENCH_HOME)', home], ...(info?.DockerRootDir ? [['Docker root', info.DockerRootDir]] : [])];
   for (const [label, dir] of dirs) {
     let freeGb = null;
@@ -127,7 +146,7 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
     }
     const name = `free disk, ${label}`;
     if (freeGb === null) checks.push(warn(name, `${dir} cannot be read`, 'create it, or run as a user that can read it'));
-    else if (freeGb < MIN_FREE_GB) checks.push(fail(name, `${freeGb.toFixed(0)} GB free in ${dir}, less than ${MIN_FREE_GB}`, 'free disk space; the full run needs about 100 GB for its images'));
+    else if (freeGb < MIN_FREE_GB) checks.push(fail(name, `${freeGb.toFixed(0)} GB free in ${dir}, less than ${MIN_FREE_GB}`, 'free disk space; the dry run needs about 20 GB and the full run about 100 GB'));
     else if (freeGb < WARN_FREE_GB) checks.push(warn(name, `${freeGb.toFixed(0)} GB free in ${dir}`, `about ${WARN_FREE_GB} GB is comfortable for the 100 task images`));
     else checks.push(ok(name, `${freeGb.toFixed(0)} GB free`));
   }
@@ -135,6 +154,7 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
   // The coder image, present by the digest the pins name.
   const ref = coderRef(pins);
   const image = await run('docker', ['image', 'inspect', '--format', '{{json .RepoDigests}}', ref]);
+  let coderPresent = false;
   if (image.exitCode !== 0) checks.push(warn('coder image', `${ref} is not on this machine`, `docker pull ${ref}`));
   else {
     let digests = [];
@@ -143,7 +163,8 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
     } catch {
       digests = [];
     }
-    checks.push(digests.some((d) => d.endsWith(`@${pins.coder.digest}`)) ? ok('coder image', `present by digest ${pins.coder.digest.slice(0, 19)}...`) : fail('coder image', `a different image has the tag ${pins.coder.tag}`, `docker pull ${ref}`));
+    coderPresent = digests.some((d) => d.endsWith(`@${pins.coder.digest}`));
+    checks.push(coderPresent ? ok('coder image', `present by digest ${pins.coder.digest.slice(0, 19)}...`) : fail('coder image', `a different image has the tag ${pins.coder.tag}`, `docker pull ${ref}`));
   }
 
   // What a killed harness leaves: an env file holds a bearer and a run token.
@@ -152,40 +173,61 @@ export async function doctor({ home, pins, exec = runCommand, readFile = fs.read
     checks.push(gone.length > 0 ? warn('stale env files', `removed ${gone.join(', ')} (a killed harness left them)`) : ok('stale env files', 'none'));
   }
 
-  // The nested part, which needs the stack.
+  // Per selected task image: does the coder start there? The static coder starts in any x86-64 Linux image; an image
+  // that cannot run it (a loader error, no /bin/sh for the probe's entry, another architecture) is refused for both arms.
+  const probe = containers ?? stack?.hostContainers?.() ?? null;
+  if (taskError) checks.push(warn('task images', `the selected tasks could not be read: ${taskError}`, 'fix the configuration and the lock files (bench tasks select)'));
+  else if (tasks.length === 0) checks.push(warn('task images', 'none selected: nothing to probe', 'bench tasks select, then bench doctor'));
+  else if (!coderPresent) checks.push(warn('task images', 'not probed: the coder image is not on this machine', `docker pull ${ref}`));
+  else if (!probe) checks.push(warn('task images', 'not probed: the doctor has no container runtime', 'run bench doctor with the stack'));
+  else {
+    let filesDir = null;
+    let filesError = null;
+    try {
+      filesDir = await stack.ensureCoderFiles();
+    } catch (e) {
+      filesError = e.message;
+    }
+    if (!filesDir) checks.push(warn('task images', `not probed: the coder's binaries could not be read from the image (${filesError})`, `docker pull ${ref}`));
+    else {
+      for (const task of tasks) {
+        const imageRef = task.image?.ref ?? task.image?.name;
+        const label = `task image ${task.id}`;
+        const distro = await osRelease({ containers: probe, image: imageRef }).catch(() => null);
+        const p = await coderProbe({ containers: probe, image: imageRef, filesDir }).catch((e) => ({ starts: null, exitCode: null, detail: e.message }));
+        const where = distro ? `${distro}; ` : '';
+        if (p.starts === true) checks.push(ok(label, `${where}the coder starts (${p.detail})`));
+        else if (p.starts === false) checks.push(fail(label, `${where}the coder does not start (${p.detail}); the image is refused for both arms`, 'use a task image whose loader and architecture can run a static x86-64 binary, or fix the image'));
+        else checks.push(warn(label, `${where}the coder's start is unclear (${p.detail})`, 'run a container of the image by hand and read the error'));
+      }
+    }
+  }
+
+  // The host runtime itself, which needs the stack.
   if (stack && start && checks.every((c) => c.status !== 'fail')) {
     try {
       await stack.up();
-      checks.push(ok('stack', 'the shared services and the Podman services are up'));
-      const targets = [...Array.from({ length: Math.min(slots, stack.slots) }, (_, i) => ({ label: `slot ${i + 1}`, containers: stack.containers(i + 1), window: (fn) => stack.pullWindow(i + 1, fn) })), ...(stack.graderContainers ? [{ label: 'grader', containers: stack.graderContainers(), window: (fn) => stack.graderWindow(fn) }] : [])];
-      for (const { label, containers, window } of targets) {
-        try {
-          await window(() => containers.pull(ref));
-          const r = await containers.run({ image: ref, script: 'true', network: 'none', timeoutMs: 120_000 });
-          checks.push(r.exitCode === 0 ? ok(`nested Podman, ${label}`, 'a container ran inside the service') : fail(`nested Podman, ${label}`, `a container did not run (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
-          if (r.exitCode === 0 && label !== 'grader') {
-            const p = await probeLimits({ containers, image: ref, cpus: PROBE_CPUS, memoryMb: PROBE_MEMORY_MB });
-            checks.push(p.accepted ? ok(`task limits, ${label}`, 'the service takes --cpus and --memory') : warn(`task limits, ${label}`, `the service refuses --cpus and --memory (${p.detail}): the limits are the service's own, the same for both agents; the run record says so`));
-          }
-        } catch (e) {
-          checks.push(fail(`Podman service, ${label}`, e.message, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
-        }
+      checks.push(ok('stack', 'the shared services are up'));
+      const targets = Array.from({ length: Math.min(slots, stack.slots) }, (_, i) => ({ label: `slot ${i + 1}`, containers: stack.containers(i + 1) }));
+      targets.push({ label: 'grader', containers: stack.graderContainers() });
+      for (const { label, containers: c } of targets) {
+        const r = await c.run({ image: ref, script: 'true', network: 'none', timeoutMs: 120_000 });
+        checks.push(r.exitCode === 0 ? ok(`host runtime, ${label}`, 'a container of the coder image ran') : fail(`host runtime, ${label}`, `a container did not run (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`, 'check the Docker daemon and its storage'));
       }
+      const p = await probeLimits({ containers: stack.containers(1), image: ref, ...PROBE });
+      checks.push(p.accepted ? ok('runtime limits', `the runtime takes --cpus ${PROBE.cpus} and --memory ${PROBE.memoryMb} MiB`) : warn('runtime limits', `the runtime refuses the limits (${p.detail}): both arms still get the same setting`, 'fix the daemon, or accept that the limits are not enforced'));
     } catch (e) {
-      checks.push(fail('stack', e.message, `use ${FALLBACKS[0]}; then ${FALLBACKS[1]}`));
+      checks.push(fail('stack', e.message, 'read the error above; bench doctor --start starts the shared services'));
     }
   } else if (stack && !start) {
-    checks.push(warn('nested Podman', 'not checked: the stack is not started', 'bench doctor --start brings it up and runs a container in each Podman service'));
+    checks.push(warn('host runtime', 'not checked: the stack is not started', 'bench doctor --start brings it up and runs a container of the coder image'));
   }
 
   const failed = checks.filter((c) => c.status === 'fail');
-  const nested = failed.some((c) => /nested Podman|Podman service|^stack$|apparmor|userns|namespaces/.test(c.name));
-  return { checks, exitCode: failed.length > 0 ? 1 : 0, fallback: nested ? FALLBACKS[0] : null };
+  return { checks, exitCode: failed.length > 0 ? 1 : 0 };
 }
 
 /** The lines `bench doctor` prints. */
-export function renderDoctor({ checks, fallback }) {
-  const lines = checks.map((c) => `${c.status.toUpperCase().padEnd(4)} ${c.name}: ${c.detail}${c.fix ? `\n     fix: ${c.fix}` : ''}`);
-  if (fallback) lines.push('', `Nested Podman does not work here. Use ${fallback}; then ${FALLBACKS[1]}.`);
-  return lines.join('\n');
+export function renderDoctor({ checks }) {
+  return checks.map((c) => `${c.status.toUpperCase().padEnd(4)} ${c.name}: ${c.detail}${c.fix ? `\n     fix: ${c.fix}` : ''}`).join('\n');
 }

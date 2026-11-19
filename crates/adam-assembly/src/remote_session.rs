@@ -23,8 +23,9 @@ use a2a::{
 };
 use adam_llm_agent::{MESSAGE_KIND, ToolError};
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, Ctx, Inbound, SESSION_CLOSE_KIND, SESSION_CLOSE_ROUND_KEY,
-    SESSION_STATE_KEY, SessionHeader, Transition, child_run_id,
+    Agent, AgentError, AgentStarter, Ctx, Inbound, RuntimeError, SESSION_CLOSE_KIND,
+    SESSION_CLOSE_ROUND_KEY, SESSION_STATE_KEY, SessionHeader, SessionState, Transition,
+    child_run_id, closing_round_payload,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -106,6 +107,10 @@ pub struct RoundState {
     /// What the next send says: the round's message and the messages that waited.
     #[serde(default)]
     queued: Vec<Queued>,
+    /// Set on a **timer run**, never on a round: when the session this round ended may have
+    /// expired, a run parked until then ends the remote task of a session nobody reads again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reap: Option<Reap>,
     /// What the remote answered, in order.
     #[serde(default)]
     answers: Vec<String>,
@@ -190,6 +195,18 @@ enum Action {
     Poll(String),
     /// Nothing is in flight and nothing waits: report.
     Finish,
+}
+
+/// [`Inbound::kind`] of the message that starts a timer run of a session (see [`Reap`]).
+const REAP_KIND: &str = "adam.session.reap";
+
+/// What a timer run watches: round `round` of `session`, the latest when the timer was set, and
+/// the instant the session expires if nobody writes to it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Reap {
+    session: adam_core::RunId,
+    round: adam_core::RunId,
+    due: adam_core::time::Timestamp,
 }
 
 impl RoundState {
@@ -354,67 +371,6 @@ impl RemoteRoundAgent {
     pub fn with_wait_poll(mut self, every: Duration) -> Self {
         self.wait_poll = every.max(Duration::from_millis(1));
         self
-    }
-
-    fn start(&self, input: &Inbound) -> Result<RoundState, AgentError> {
-        let payload = &input.payload;
-        let mut header: Option<SessionHeader> = payload
-            .get(SESSION_STATE_KEY)
-            .and_then(|value| serde_json::from_value(value.clone()).ok());
-        let closes = payload
-            .get(SESSION_CLOSE_ROUND_KEY)
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if closes && let Some(header) = &mut header {
-            header.closing = true;
-        }
-        let mut state = RoundState {
-            session: header,
-            queues_messages: true,
-            ..RoundState::default()
-        };
-        if !closes {
-            match text_of(payload).filter(|text| !text.trim().is_empty()) {
-                Some(text) => state.queued.push(Queued {
-                    id: String::new(),
-                    text,
-                }),
-                None => {
-                    return Err(AgentError::permanent(
-                        "unusable start message: it has no text for the remote agent",
-                    ));
-                }
-            }
-        }
-        Ok(state)
-    }
-
-    fn carry(&self, input: &Inbound, prior: &RoundState) -> Result<RoundState, AgentError> {
-        let mut state = self.start(input)?;
-        if state.session.is_none() {
-            state.session.clone_from(&prior.session);
-        }
-        state.context_id.clone_from(&prior.context_id);
-        state.last_task.clone_from(&prior.last_task);
-        state.answer_task.clone_from(&prior.answer_task);
-        state.last_text.clone_from(&prior.last_text);
-        state.prior_open_task = prior.task.clone().or_else(|| prior.prior_open_task.clone());
-        state.prior_sending = prior
-            .sending
-            .clone()
-            .or_else(|| prior.prior_sending.clone());
-        // What waited and was never sent goes first: the person's words are not dropped with a failure.
-        if state.queued.len() == 1 && !state.closing() {
-            let mut carried: Vec<Queued> = prior
-                .unhandled
-                .iter()
-                .chain(&prior.queued)
-                .cloned()
-                .collect();
-            carried.append(&mut state.queued);
-            state.queued = carried;
-        }
-        Ok(state)
     }
 
     /// One `ctx.step` that calls the remote: the call's outcome is journaled, a transient failure
@@ -625,11 +581,124 @@ impl RemoteRoundAgent {
         Ok(now + adam_core::time::span_of(wait))
     }
 
+    /// A round of a session that may stay open has ended: start the timer run that, if nobody
+    /// writes to the session by the time it expires, starts the closing round whose first act is to
+    /// cancel what the remote still runs. Best effort and journaled: a failure is a warning, and
+    /// the next read of the session cleans up as well. The timer is a run of this agent in a
+    /// conversation of the session's parent, parked until the expiry, so a worker wakes it with no process
+    /// of its own.
+    async fn schedule_reap(&self, ctx: &mut Ctx, st: &RoundState) -> Result<(), AgentError> {
+        let Some(header) = &st.session else {
+            return Ok(());
+        };
+        if header.closing || header.closed {
+            return Ok(());
+        }
+        let starter = ctx.child_starter();
+        let ttl = adam_core::time::span_of(starter.session_idle_ttl());
+        let round = ctx.run_id();
+        let due = ctx.now_journaled().await? + ttl;
+        let input = Inbound::new(
+            REAP_KIND,
+            serde_json::to_value(Reap {
+                session: header.id,
+                round,
+                due,
+            })
+            .map_err(|e| AgentError::permanent(format!("the timer message: {e}")))?,
+        );
+        let (id, name) = (child_run_id(round, "reap"), self.name.clone());
+        let started: Result<(), String> = ctx
+            .step("schedule-reap", move || async move {
+                starter
+                    .start_in_parent_conversation(id, &name, input)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+            .await?;
+        if let Err(error) = started {
+            tracing::warn!(agent = %self.name, %error, "the expiry timer of a session was not set");
+        }
+        Ok(())
+    }
+
+    /// The timer run: wait for the expiry, then, if the session is as the round left it (no other
+    /// round, none working, no closing round), start the closing round, which a worker steps and
+    /// which cancels the remote task. Any activity since makes it a no-op, because everything is
+    /// read again here.
+    async fn reap(
+        ctx: &mut Ctx,
+        st: RoundState,
+        agent: &str,
+    ) -> Result<Transition<RoundState>, AgentError> {
+        let done = |st: RoundState, what: &str| {
+            Ok(Transition::Done {
+                state: st,
+                output: json!({ "reaped": what }),
+            })
+        };
+        let Some(reap) = st.reap.clone() else {
+            return done(st, "nothing");
+        };
+        let now = ctx.now();
+        if now < reap.due {
+            return Ok(Transition::Park {
+                wake_at: Some(reap.due),
+                state: st,
+            });
+        }
+        let starter = ctx.child_starter();
+        let Some(view) = starter
+            .session(reap.session)
+            .await
+            .map_err(AgentError::transient)?
+        else {
+            return done(st, "gone");
+        };
+        let Some(header) = view.header.clone() else {
+            return done(st, "no header");
+        };
+        if view.latest_run != reap.round || view.state == SessionState::Working || header.closing {
+            return done(st, "activity since");
+        }
+        if !(view.idle_expired || view.closed) {
+            // The clocks differ by a moment: look again.
+            return Ok(Transition::Park {
+                wake_at: Some(now + jiff::SignedDuration::from_secs(1)),
+                state: st,
+            });
+        }
+        let mut header = header;
+        header.round = view.round + 1;
+        header.closed = true;
+        header.closing = true;
+        let input = Inbound::new(MESSAGE_KIND, closing_round_payload(&header));
+        match starter
+            .start_round(
+                reap.session,
+                child_run_id(ctx.run_id(), "close"),
+                agent,
+                input,
+                Some(view.latest_run),
+                None,
+            )
+            .await
+        {
+            // Busy: a reader got there first, and that round cancels as well.
+            Ok(_) | Err(RuntimeError::ConversationBusy { .. }) => done(st, "closed"),
+            Err(e) => Err(AgentError::transient(e)),
+        }
+    }
+
     async fn run(
         &self,
         ctx: &mut Ctx,
         mut st: RoundState,
     ) -> Result<Transition<RoundState>, AgentError> {
+        if st.reap.is_some() {
+            return Self::reap(ctx, st, &self.name).await;
+        }
         ctx.reopen_on_arrival();
         let started = *st.started.get_or_insert_with(|| ctx.now());
         st.absorb_inbox(ctx.take_inbox());
@@ -666,7 +735,11 @@ impl RemoteRoundAgent {
                 failed
             }
             Action::Finish => {
-                return Ok(match st.finish() {
+                let finished = st.finish();
+                if finished.is_ok() {
+                    self.schedule_reap(ctx, &st).await?;
+                }
+                return Ok(match finished {
                     Ok(text) => Transition::Done {
                         state: st,
                         output: json!({ "text": text }),
@@ -809,6 +882,124 @@ async fn stop_tasks(
     }
 }
 
+/// The state a round starts with, from its message (or the close): never from the endpoint, so
+/// the front that starts the round and the worker that steps it make the same state.
+fn start_round(input: &Inbound) -> Result<RoundState, AgentError> {
+    let payload = &input.payload;
+    if input.kind == REAP_KIND {
+        let reap: Reap = serde_json::from_value(payload.clone())
+            .map_err(|e| AgentError::permanent(format!("unusable timer message: {e}")))?;
+        return Ok(RoundState {
+            reap: Some(reap),
+            ..RoundState::default()
+        });
+    }
+    let mut header: Option<SessionHeader> = payload
+        .get(SESSION_STATE_KEY)
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let closes = payload
+        .get(SESSION_CLOSE_ROUND_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if closes && let Some(header) = &mut header {
+        header.closing = true;
+    }
+    let mut state = RoundState {
+        session: header,
+        queues_messages: true,
+        ..RoundState::default()
+    };
+    if !closes {
+        match text_of(payload).filter(|text| !text.trim().is_empty()) {
+            Some(text) => state.queued.push(Queued {
+                id: String::new(),
+                text,
+            }),
+            None => {
+                return Err(AgentError::permanent(
+                    "unusable start message: it has no text for the remote agent",
+                ));
+            }
+        }
+    }
+    Ok(state)
+}
+
+/// The state of a later round: `start_round`'s, with what the prior round knew carried over.
+fn carry_round(input: &Inbound, prior: &RoundState) -> Result<RoundState, AgentError> {
+    let mut state = start_round(input)?;
+    if state.session.is_none() {
+        state.session.clone_from(&prior.session);
+    }
+    state.context_id.clone_from(&prior.context_id);
+    state.last_task.clone_from(&prior.last_task);
+    state.answer_task.clone_from(&prior.answer_task);
+    state.last_text.clone_from(&prior.last_text);
+    state.prior_open_task = prior.task.clone().or_else(|| prior.prior_open_task.clone());
+    // A task that waits for an answer is still open at the remote: a round that closes the session
+    // cancels it too, and nobody is left to answer it.
+    if state.closing()
+        && state.prior_open_task.is_none()
+        && let Some(waiting) = state.answer_task.take()
+    {
+        state.prior_open_task = Some(waiting);
+    }
+    state.prior_sending = prior
+        .sending
+        .clone()
+        .or_else(|| prior.prior_sending.clone());
+    // What waited and was never sent goes first: the person's words are not dropped with a failure.
+    if state.queued.len() == 1 && !state.closing() {
+        let mut carried: Vec<Queued> = prior
+            .unhandled
+            .iter()
+            .chain(&prior.queued)
+            .cloned()
+            .collect();
+        carried.append(&mut state.queued);
+        state.queued = carried;
+    }
+    Ok(state)
+}
+
+/// The start-only agent of a session on a remote subagent, registered as `<root>/<subagent>` on a
+/// process that serves the A2A front and does not step rounds (a control plane): it makes the same
+/// state as [`RemoteRoundAgent`], so a worker with the full agent steps what it starts. It knows
+/// no endpoint, holds no credential and cannot cancel the remote task of a round.
+/// [`AgentDef::session_starters`](crate::AgentDef::session_starters) registers it.
+#[derive(Clone, Debug)]
+pub struct RemoteRoundStarter {
+    name: String,
+}
+
+impl RemoteRoundStarter {
+    /// The starter of the round agent registered as `name` (`<root>/<subagent>`).
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl AgentStarter for RemoteRoundStarter {
+    type State = RoundState;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn init(&self, input: Inbound) -> Result<RoundState, AgentError> {
+        start_round(&input)
+    }
+
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &RoundState,
+        _prior_run: adam_core::RunId,
+    ) -> Result<RoundState, AgentError> {
+        carry_round(&input, prior)
+    }
+}
+
 #[async_trait]
 impl Agent for RemoteRoundAgent {
     type State = RoundState;
@@ -818,7 +1009,7 @@ impl Agent for RemoteRoundAgent {
     }
 
     fn init(&self, input: Inbound) -> Result<RoundState, AgentError> {
-        self.start(&input)
+        start_round(&input)
     }
 
     fn init_continuing(
@@ -827,7 +1018,7 @@ impl Agent for RemoteRoundAgent {
         prior: &RoundState,
         _prior_run: adam_core::RunId,
     ) -> Result<RoundState, AgentError> {
-        self.carry(&input, prior)
+        carry_round(&input, prior)
     }
 
     async fn step(
@@ -864,7 +1055,7 @@ impl AgentStarter for RemoteRoundAgent {
     }
 
     fn init(&self, input: Inbound) -> Result<RoundState, AgentError> {
-        self.start(&input)
+        start_round(&input)
     }
 
     fn init_continuing(
@@ -873,7 +1064,7 @@ impl AgentStarter for RemoteRoundAgent {
         prior: &RoundState,
         _prior_run: adam_core::RunId,
     ) -> Result<RoundState, AgentError> {
-        self.carry(&input, prior)
+        carry_round(&input, prior)
     }
 }
 
@@ -1040,48 +1231,17 @@ mod tests {
 
     #[test]
     fn a_round_starts_from_a_message_and_a_continuation_carries_the_remotes_context() {
-        use crate::error::Origin;
-        use crate::remote::{RemoteEndpoint, RemoteSettings};
-        use adam_agent_fs::RemoteAgent;
-        let agent = RemoteAgent {
-            name: "billing".into(),
-            description: "d".into(),
-            url: "https://billing.example.com/card".into(),
-            auth: None,
-            files: false,
-            note: String::new(),
-            path: "agent/subagents/billing.md".into(),
-        };
-        let endpoint = RemoteEndpoint::bind(
-            &Origin::new("coder/billing", "billing.md"),
-            &agent,
-            &RemoteSettings::default(),
-        )
-        .unwrap();
-        let round = RemoteRoundAgent::new(
-            "coder/billing".into(),
-            Arc::new(endpoint),
-            DEFAULT_WAIT_POLL,
-        );
-        let first = round
-            .start(&Inbound::new("start", json!({"text": "invoice 7"})))
-            .unwrap();
+        let first = start_round(&Inbound::new("start", json!({"text": "invoice 7"}))).unwrap();
         assert!(first.queues_messages, "until the card says otherwise");
         assert_eq!(first.queued[0].text, "invoice 7");
-        assert!(
-            round
-                .start(&Inbound::new("start", json!({"text": "  "})))
-                .is_err()
-        );
+        assert!(start_round(&Inbound::new("start", json!({"text": "  "}))).is_err());
 
         let mut before = first.clone();
         before.context_id = Some("ctx".into());
         before.last_task = Some("t1".into());
         before.task = Some("t2".into());
         before.last_text = "answer".into();
-        let next = round
-            .carry(&Inbound::new("start", json!({"text": "next"})), &before)
-            .unwrap();
+        let next = carry_round(&Inbound::new("start", json!({"text": "next"})), &before).unwrap();
         assert_eq!(next.context_id.as_deref(), Some("ctx"));
         assert_eq!(next.last_task.as_deref(), Some("t1"));
         assert_eq!(next.prior_open_task.as_deref(), Some("t2"));
@@ -1122,10 +1282,7 @@ mod tests {
 
     #[test]
     fn what_waited_goes_first_in_the_order_it_was_taken_and_what_may_have_been_sent_is_carried() {
-        let round = round_agent();
-        let mut before = round
-            .start(&Inbound::new("start", json!({"text": "ignored"})))
-            .unwrap();
+        let mut before = start_round(&Inbound::new("start", json!({"text": "ignored"}))).unwrap();
         before.queued = vec![Queued {
             id: "q".into(),
             text: "queued".into(),
@@ -1134,22 +1291,16 @@ mod tests {
             id: "u".into(),
             text: "unhandled".into(),
         }];
-        let next = round
-            .carry(&Inbound::new("start", json!({"text": "next"})), &before)
-            .unwrap();
+        let next = carry_round(&Inbound::new("start", json!({"text": "next"})), &before).unwrap();
         let texts: Vec<&str> = next.queued.iter().map(|q| q.text.as_str()).collect();
         assert_eq!(texts, ["unhandled", "queued", "next"]);
 
         // A send the round before may have made, and one it inherited, are not lost by a round that
         // never got to cancel them.
         let probe = request_of(Message::new(Role::User, vec![Part::text("p")]));
-        let mut third = round
-            .start(&Inbound::new("start", json!({"text": "x"})))
-            .unwrap();
+        let mut third = start_round(&Inbound::new("start", json!({"text": "x"}))).unwrap();
         third.prior_sending = Some(probe);
-        let fourth = round
-            .carry(&Inbound::new("start", json!({"text": "y"})), &third)
-            .unwrap();
+        let fourth = carry_round(&Inbound::new("start", json!({"text": "y"})), &third).unwrap();
         assert!(
             fourth.prior_sending.is_some(),
             "an inherited probe is carried on"
@@ -1200,5 +1351,146 @@ mod tests {
             look_delay(2, Duration::from_secs(5)),
             Duration::from_secs(5)
         );
+    }
+
+    /// The front's starter and the worker's agent each make the state a round starts from, closing
+    /// and carried messages included, checked against what that state must be and not against
+    /// each other: the worker steps what the front started.
+    #[test]
+    fn the_starter_and_the_round_agent_each_make_the_state_a_round_needs() {
+        let starter = RemoteRoundStarter::new("coder/billing");
+        let agent = round_agent();
+        assert_eq!(AgentStarter::name(&starter), "coder/billing");
+        assert_eq!(AgentStarter::name(&agent), AgentStarter::name(&starter));
+
+        let open = Inbound::new("start", json!({"text": "invoice 7"}));
+        let mut want = RoundState {
+            queues_messages: true,
+            ..RoundState::default()
+        };
+        want.queued.push(Queued {
+            id: String::new(),
+            text: "invoice 7".into(),
+        });
+        let want = serde_json::to_value(&want).unwrap();
+        assert_eq!(want["queued"][0]["text"], "invoice 7");
+        for state in [
+            AgentStarter::init(&starter, open.clone()).unwrap(),
+            AgentStarter::init(&agent, open.clone()).unwrap(),
+        ] {
+            assert_eq!(serde_json::to_value(&state).unwrap(), want);
+            assert!(!state.closing());
+        }
+        let blank = Inbound::new("start", json!({"text": " "}));
+        assert!(AgentStarter::init(&starter, blank.clone()).is_err());
+        assert!(AgentStarter::init(&agent, blank).is_err());
+
+        // A close names the session and needs no text.
+        let header = SessionHeader {
+            id: adam_core::RunId::new(),
+            agent: "coder/billing".into(),
+            description: "billing".into(),
+            keep_open: true,
+            closed: false,
+            closing: false,
+            round: 1,
+        };
+        let close = Inbound::new(
+            SESSION_CLOSE_KIND,
+            json!({ SESSION_STATE_KEY: header, SESSION_CLOSE_ROUND_KEY: true }),
+        );
+        for state in [
+            AgentStarter::init(&starter, close.clone()).unwrap(),
+            AgentStarter::init(&agent, close.clone()).unwrap(),
+        ] {
+            assert!(state.closing());
+            assert!(state.queued.is_empty(), "a close has nothing to send");
+            assert_eq!(state.session.as_ref().map(|h| h.id), Some(header.id));
+        }
+
+        // A later round carries the context, the task to cancel and what was never sent.
+        let mut before = AgentStarter::init(&agent, message("m1", "first")).unwrap();
+        before.context_id = Some("ctx".into());
+        before.task = Some("t1".into());
+        before.unhandled = vec![Queued {
+            id: "u".into(),
+            text: "unhandled".into(),
+        }];
+        let run = adam_core::RunId::new();
+        for next in [
+            AgentStarter::init_continuing(&starter, message("m2", "next"), &before, run).unwrap(),
+            AgentStarter::init_continuing(&agent, message("m2", "next"), &before, run).unwrap(),
+        ] {
+            assert_eq!(next.context_id.as_deref(), Some("ctx"));
+            assert_eq!(next.prior_open_task.as_deref(), Some("t1"));
+            let texts: Vec<&str> = next.queued.iter().map(|q| q.text.as_str()).collect();
+            assert_eq!(
+                texts,
+                ["unhandled", "first", "next"],
+                "what waited goes first"
+            );
+        }
+    }
+
+    /// A closing round cancels the task that waits for an answer, which no round works on.
+    #[test]
+    fn a_closing_round_cancels_the_task_that_waits_for_an_answer() {
+        let agent = round_agent();
+        let mut before = AgentStarter::init(&agent, message("m1", "first")).unwrap();
+        before.answer_task = Some("t9".into());
+        let header = SessionHeader {
+            id: adam_core::RunId::new(),
+            agent: "coder/billing".into(),
+            description: String::new(),
+            keep_open: true,
+            closed: true,
+            closing: true,
+            round: 2,
+        };
+        let close = Inbound::new(
+            SESSION_CLOSE_KIND,
+            json!({ SESSION_STATE_KEY: header, SESSION_CLOSE_ROUND_KEY: true }),
+        );
+        let next =
+            AgentStarter::init_continuing(&agent, close, &before, adam_core::RunId::new()).unwrap();
+        assert_eq!(next.prior_open_task.as_deref(), Some("t9"));
+        assert_eq!(next.answer_task, None);
+        // A round that sends keeps answering it.
+        let next = AgentStarter::init_continuing(
+            &agent,
+            message("m2", "yes"),
+            &before,
+            adam_core::RunId::new(),
+        )
+        .unwrap();
+        assert_eq!(next.prior_open_task, None);
+        assert_eq!(next.answer_task.as_deref(), Some("t9"));
+    }
+
+    /// A task the round before left working is the one a closing round cancels; the task that
+    /// waits for an answer is not swapped for it.
+    #[test]
+    fn a_closing_round_cancels_the_working_task_before_the_one_that_waits() {
+        let agent = round_agent();
+        let mut before = AgentStarter::init(&agent, message("m1", "first")).unwrap();
+        before.task = Some("t1".into());
+        before.answer_task = Some("t9".into());
+        let header = SessionHeader {
+            id: adam_core::RunId::new(),
+            agent: "coder/billing".into(),
+            description: String::new(),
+            keep_open: true,
+            closed: true,
+            closing: true,
+            round: 2,
+        };
+        let close = Inbound::new(
+            SESSION_CLOSE_KIND,
+            json!({ SESSION_STATE_KEY: header, SESSION_CLOSE_ROUND_KEY: true }),
+        );
+        let next =
+            AgentStarter::init_continuing(&agent, close, &before, adam_core::RunId::new()).unwrap();
+        assert_eq!(next.prior_open_task.as_deref(), Some("t1"));
+        assert_eq!(next.answer_task.as_deref(), Some("t9"));
     }
 }

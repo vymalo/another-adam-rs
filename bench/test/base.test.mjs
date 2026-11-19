@@ -56,6 +56,7 @@ test('the base script refuses a path that is not plain', () => {
 /** What the real stack does for the base: the container's tree comes out as a tar stream into a directory the host owns. */
 function fakeStack(produced, calls) {
   return {
+    workRoot: (slot) => `/tmp/bench-work-${slot}`,
     workDir: async (slot, dir, o) => calls.push(['workDir', slot, dir, Boolean(o?.remove)]),
     extractTree: async (slot, dir, dest) => {
       calls.push(['extractTree', slot, dir]);
@@ -77,7 +78,7 @@ test('the base is made in the slot\'s volume in the task image with no network, 
   const base = await makeHostBase({ stack, slot: 2, task, hostRoot });
   const spec = containers.runs[0];
   assert.deepEqual([spec.image, spec.network, spec.workdir], [`${IMAGE}@${DIGEST}`, 'none', '/']);
-  assert.deepEqual(spec.mounts, [{ source: '/work/bench-base', target: '/out' }]);
+  assert.deepEqual(spec.mounts, [{ source: '/tmp/bench-work-2/bench-base', target: '/out' }]);
   assert.match(spec.script, /git clone -q --no-hardlinks \/app /);
   // the marker is the content a clone would read and the tree the host rebuilds, not a name
   assert.match(spec.script, /base-marker/);
@@ -121,6 +122,7 @@ function cacheStack(produced, calls, volumes, content, extract = () => produced.
     v.packed = null;
   };
   return {
+    workRoot: (slot) => `/tmp/bench-work-${slot}`,
     workDir: async (slot, dir, o) => {
       calls.push(['workDir', slot, dir, Boolean(o?.remove)]);
       if (o?.remove) {

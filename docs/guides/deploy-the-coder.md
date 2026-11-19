@@ -90,6 +90,8 @@ added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/wor
 `adam-agent`, `adam-kube-exec`) still read the system's CA bundle for HTTPS (the `workspace` base has one), so
 an image that runs the coder without one cannot reach the model gateway, GitHub or a git remote.
 
+The served card lists `child-sessions/v1` (`explorer` and `reviewer`, which a person can open as sessions; `maxOpen` is `SESSION_MAX_OPEN`). The chart does not change; with a split deployment, roll the workers before the control plane.
+
 The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into the binaries. The agent card then says
 which build answers: `version` is `<crate version>+<first 7>` and the `build/v1` extension carries the whole revision
 and a digest of the agent's files ([ADR 0028](../decisions/0028-the-card-says-which-build-answers.md), contract in

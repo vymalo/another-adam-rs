@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { ContainerError, FakeContainers, PodmanRemote, buildRunArgs } from '../lib/containers.mjs';
+import { ContainerError, FakeContainers, HostContainers, buildRunArgs } from '../lib/containers.mjs';
 import { CLONE_PATH, checkTask, pinTask } from '../lib/envcheck.mjs';
 import { MAX_PATCH_BYTES, PatchTooLarge, collectPatch, gradeOnce, gradePatch, gradeScript, verifierNetwork } from '../lib/grade.mjs';
 import { loadTask } from '../lib/task.mjs';
@@ -82,27 +82,27 @@ test('the base must be a full commit id', async (t) => {
   await assert.rejects(collectPatch({ tree: dir, baseRepo: bare, base: 'HEAD' }), /full commit id/);
 });
 
-// ---- the podman --remote arguments ----
+// ---- the docker arguments ----
 
 const SPEC = { image: `${IMAGE}@${DIGEST}`, script: 'echo hi', network: 'none', workdir: '/', mounts: [], name: 'job-1' };
 
-test('the arguments: remote, no network for the agent phase, the image and the script last', () => {
-  const a = buildRunArgs({ ...SPEC, cpus: 2, memoryMb: 4096, env: { A: 'b' } }, { connection: 'svc' });
-  assert.deepEqual(a.slice(0, 4), ['--remote', '--connection', 'svc', 'run']);
+test('the arguments: no network for the agent phase, the image and the script last', () => {
+  const a = buildRunArgs({ ...SPEC, cpus: 2, memoryMb: 4096, env: { A: 'b' } });
+  assert.deepEqual(a.slice(0, 3), ['run', '--rm', '--pull=never']);
   assert.ok(a.includes('--network=none'));
-  assert.ok(a.includes('--rm') && a.includes('--pull=never'));
   assert.deepEqual(a.slice(a.indexOf('--cpus'), a.indexOf('--cpus') + 2), ['--cpus', '2']);
   assert.deepEqual(a.slice(a.indexOf('--memory'), a.indexOf('--memory') + 2), ['--memory', '4096m']);
   assert.ok(a.includes('A=b'));
   assert.deepEqual(a.slice(-5), ['--entrypoint', 'sh', SPEC.image, '-c', 'echo hi']);
-  assert.ok(buildRunArgs(SPEC, { url: 'unix:///run/podman.sock' }).join(' ').startsWith('--remote --url unix:///run/podman.sock run'));
+  assert.ok(buildRunArgs({ ...SPEC, network: 'adam-bench_slot-1' }).includes('--network=adam-bench_slot-1'));
 });
 
 test('the verifier has the network its task names; none stays none; a name is passed on', () => {
-  assert.equal(verifierNetwork({ verifierNetwork: 'public' }), 'default');
+  assert.equal(verifierNetwork({ verifierNetwork: 'public' }), 'egress');
+  assert.equal(verifierNetwork({ verifierNetwork: 'default' }), 'verifier');
   assert.equal(verifierNetwork({ verifierNetwork: 'no-network' }), 'none');
   assert.equal(verifierNetwork({ verifierNetwork: 'bench-verifier' }), 'bench-verifier');
-  assert.ok(!buildRunArgs({ ...SPEC, network: 'default' }).some((x) => x.startsWith('--network')));
+  assert.throws(() => buildRunArgs({ ...SPEC, network: 'default' }), ContainerError);
   assert.ok(buildRunArgs({ ...SPEC, network: 'bench-verifier' }).includes('--network=bench-verifier'));
 });
 
@@ -117,7 +117,7 @@ test('a mount is read-only when asked, and an unsafe path or name is refused', (
   assert.throws(() => buildRunArgs({ ...SPEC, env: { 'A B': '1' } }), ContainerError);
 });
 
-test('PodmanRemote runs the binary with those arguments, and removes a container that timed out', async () => {
+test('HostContainers runs docker with those arguments, and removes a container that timed out', async () => {
   const calls = [];
   const exec = (bin, args, opts, cb) => {
     calls.push({ bin, args, opts });
@@ -125,21 +125,21 @@ test('PodmanRemote runs the binary with those arguments, and removes a container
     else cb(null, '', '');
     return { stdin: { end() {} } };
   };
-  const p = new PodmanRemote({ bin: 'podman', connection: 'svc', exec });
+  const p = new HostContainers({ bin: 'docker', exec });
   const r = await p.run({ ...SPEC, timeoutMs: 5 });
   assert.equal(r.timedOut, true);
-  assert.equal(calls[0].bin, 'podman');
+  assert.equal(calls[0].bin, 'docker');
   assert.equal(calls[0].opts.timeout, 5);
-  assert.deepEqual(calls[1].args, ['--remote', '--connection', 'svc', 'rm', '-f', 'job-1']);
+  assert.deepEqual(calls[1].args, ['rm', '-f', 'job-1']);
 });
 
-test('PodmanRemote reads digests and ids, and refuses what is not one', async () => {
+test('HostContainers reads digests and ids, and refuses what is not one', async () => {
   const answers = { digest: `sha256:${'1'.repeat(64)}`, id: '2'.repeat(64) };
   const exec = (bin, args, opts, cb) => {
     cb(null, args.includes('{{.Digest}}') ? `${answers.digest}\n` : `${answers.id}\n`, '');
     return {};
   };
-  const p = new PodmanRemote({ exec });
+  const p = new HostContainers({ exec });
   assert.equal(await p.digestOf('x/y:1'), answers.digest);
   assert.equal(await p.imageId('x/y:1'), `sha256:${answers.id}`);
   answers.digest = 'nonsense';
@@ -181,7 +181,7 @@ test('a grading container: /tests read-only, patch read-only, logs writable, the
   await gradeOnce({ containers: fake, task, patchFile: '/tmp/p.patch', workRoot: tmp(t) });
   const spec = fake.runs[0];
   assert.equal(spec.image, `${IMAGE}@${DIGEST}`);
-  assert.equal(spec.network, 'default');
+  assert.equal(spec.network, 'egress', 'a public verifier gets the internet, alone in its window');
   const by = Object.fromEntries(spec.mounts.map((m) => [m.target, m]));
   assert.equal(by['/tests'].readOnly, true);
   assert.equal(by['/tests'].source, path.join(task.dir, 'tests'));
