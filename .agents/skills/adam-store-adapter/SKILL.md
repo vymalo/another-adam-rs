@@ -58,7 +58,9 @@ trait at your rev: its doc comments are the contract.
 
    `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
    calls `migrate` first. `None` skips the suite. Cases isolate themselves with a unique agent
-   name, so they run in parallel on one shared database.
+   name, so they run in parallel on one shared database. `counting::measure_transcript_write` is a
+   measurement helper, not a conformance case: it runs one 50-commit transcript and prints the
+   bytes, and it asserts nothing.
 5. **In CI set `ADAM_TEST_REQUIRE_DB=1`**: a suite whose database variable is unset then fails
    instead of skipping (`adam_core::testing::test_env`), so a typo cannot turn CI green.
 6. **After a trait change in adam-rs** (a method added or a signature changed): implement it in

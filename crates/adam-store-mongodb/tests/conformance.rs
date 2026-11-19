@@ -1,5 +1,10 @@
 //! Runs the shared conformance suite against a real MongoDB.
 //!
+//! The two bespoke tests below (`the_listing_index_covers_the_status_filter` and
+//! `a_document_without_an_owner_field_is_unowned`) build their own store with the default `adam_`
+//! collection prefix and name `adam_runs` directly: they do not follow
+//! `ADAM_TEST_MONGO_COLLECTION_PREFIX`.
+//!
 //! ```sh
 //! ADAM_TEST_MONGODB_URI=mongodb://localhost:27017 cargo test -p adam-store-mongodb
 //! ```
@@ -14,7 +19,13 @@ use adam_store_mongodb::MongoStore;
 async fn make_store() -> Option<adam_core::DynStore> {
     let uri = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI")?;
     let db = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
-    let store = MongoStore::connect(&uri, &db).await.expect("connect");
+    let prefix =
+        std::env::var("ADAM_TEST_MONGO_COLLECTION_PREFIX").unwrap_or_else(|_| "adam_".into());
+    let store = MongoStore::connect(&uri, &db)
+        .await
+        .expect("connect")
+        .with_collection_prefix(&prefix)
+        .expect("prefix");
     Some(Arc::new(store))
 }
 
@@ -126,3 +137,5 @@ async fn a_document_without_an_owner_field_is_unowned() {
         .unwrap();
     assert!(other.is_empty(), "w1 owns the run now");
 }
+
+adam_store_testkit::transcript_measurement!(make_store);
