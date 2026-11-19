@@ -803,8 +803,12 @@ deletes the file first, so an old yes never covers a new pilot.
 ## `bench doctor`
 
 `node bench/bin/bench.mjs doctor [--start]` checks Node, a proxy set without `NODE_USE_ENV_PROXY=1`, Docker and its compose
-plugin, whether the daemon is rootless, free disk (a failure under 20 GB, a warning under 100 GB, in `$BENCH_HOME` and in
-Docker's root) and the coder image by digest. **For each selected task image** it runs the coder's binary with no
+plugin, whether the daemon is rootless, free disk (in `$BENCH_HOME` and in
+Docker's root) and the coder image by digest. **Disk rule (changed 2026-11-19; before it counted free space alone).** An image already
+on the machine is space the run does not need to find: the check **passes when `free + the size (docker's .Size) of the coder image and of
+each selected task image that is present` is at least 20 GB** (a failure under 20 GB), and warns under 100 GB on the same sum (so 8 GB free with a 12 GB coder
+image present passes, 8 GB free with none present fails). A task image's size includes its shared base, so a few shared layers
+are counted more than once. The failure says both numbers. **For each selected task image** it runs the coder's binary with no
 configuration as uid 10001 in that image: exit 78 means the coder starts (it refuses an empty configuration), a loader
 error or another architecture means the image cannot run it. **The probe runs the binaries of the pinned coder image**, and
 `bench/pins.json` still names the build before ADR 0053 decision 11's static one: in a Debian bookworm task image those

@@ -430,3 +430,5 @@ and the Grading section no longer claims the agent phase has no network. The gra
 dropped, are back. Proof on the final head: `node --test "bench/test/*.test.mjs"` 649 tests, 646 pass, 3 gated skips;
 `node tools/docs-check/check-docs.mjs`; `shellcheck -s sh bench/dry-run.sh`; `BENCH_TEST_DOCKER=1 sh bench/dry-run.sh`
 with the same phases and 27 model requests = 27 ledger calls; 18 deliberate mutations, each killed by the suite.
+
+**Amended 2026-11-19:** the disk check counts the images already present toward its 20 GB floor (`bench/README.md`, "`bench doctor`").

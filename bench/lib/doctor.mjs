@@ -17,7 +17,11 @@ import { runCommand } from './stack.mjs';
 // The limits the probe asks the runtime to enforce: the arms' own (lib/runtime.mjs).
 const PROBE = runtimeLimits(RUNTIME);
 
-/** The dry run needs about 20 GB (the coder image once, the task images and their layers); the full run about 100. */
+/**
+ * The dry run needs about 20 GB (the coder image once, the task images and their layers); the full run about 100. The images
+ * already on the machine count as free: the check passes when `free + the size of the coder and selected task images present`
+ * reaches the floor (a task image's size includes its shared base, so a few shared layers are counted more than once).
+ */
 export const MIN_FREE_GB = 20;
 export const WARN_FREE_GB = 100;
 const GB = 1024 ** 3;
@@ -134,6 +138,18 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
     checks.push(fail('docker daemon', 'the daemon does not answer', 'start Docker, or fix DOCKER_HOST / the docker context'));
   }
 
+  // The images already here are space this run does not need to find: their `.Size` counts toward the floor.
+  const ref = coderRef(pins);
+  const image = await run('docker', ['image', 'inspect', '--format', '{{json .RepoDigests}}', ref]);
+  let presentBytes = 0;
+  for (const imageRef of [ref, ...tasks.map((t) => t.image?.ref ?? t.image?.name)]) {
+    if (!imageRef) continue;
+    const size = await run('docker', ['image', 'inspect', '--format', '{{.Size}}', imageRef]);
+    const bytes = size.exitCode === 0 ? Number(size.stdout.trim()) : 0;
+    if (Number.isFinite(bytes) && bytes > 0) presentBytes += bytes;
+  }
+  const presentGb = presentBytes / GB;
+
   // Disk: the images are in Docker's root once (the coder image is the big one), and the results are in $BENCH_HOME.
   const dirs = [['results ($BENCH_HOME)', home], ...(info?.DockerRootDir ? [['Docker root', info.DockerRootDir]] : [])];
   for (const [label, dir] of dirs) {
@@ -146,14 +162,12 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
     }
     const name = `free disk, ${label}`;
     if (freeGb === null) checks.push(warn(name, `${dir} cannot be read`, 'create it, or run as a user that can read it'));
-    else if (freeGb < MIN_FREE_GB) checks.push(fail(name, `${freeGb.toFixed(0)} GB free in ${dir}, less than ${MIN_FREE_GB}`, 'free disk space; the dry run needs about 20 GB and the full run about 100 GB'));
-    else if (freeGb < WARN_FREE_GB) checks.push(warn(name, `${freeGb.toFixed(0)} GB free in ${dir}`, `about ${WARN_FREE_GB} GB is comfortable for the 100 task images`));
+    else if (freeGb + presentGb < MIN_FREE_GB) checks.push(fail(name, `${freeGb.toFixed(1)} GB free in ${dir} and ${presentGb.toFixed(1)} GB of the images already present, less than ${MIN_FREE_GB}`, 'free disk space; the dry run needs about 20 GB (images already present count) and the full run about 100 GB'));
+    else if (freeGb + presentGb < WARN_FREE_GB) checks.push(warn(name, `${freeGb.toFixed(0)} GB free in ${dir}${presentGb > 0 ? ` and ${presentGb.toFixed(0)} GB of images already present` : ''}`, `about ${WARN_FREE_GB} GB is comfortable for the 100 task images`));
     else checks.push(ok(name, `${freeGb.toFixed(0)} GB free`));
   }
 
   // The coder image, present by the digest the pins name.
-  const ref = coderRef(pins);
-  const image = await run('docker', ['image', 'inspect', '--format', '{{json .RepoDigests}}', ref]);
   let coderPresent = false;
   if (image.exitCode !== 0) checks.push(warn('coder image', `${ref} is not on this machine`, `docker pull ${ref}`));
   else {
