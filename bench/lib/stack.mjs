@@ -356,7 +356,7 @@ export class Stack {
     const kept = keep.map((n) => `! -name ${n} `).join('');
     // root inside the helper is the host user under rootless Docker: it can remove the harness's own directories,
     // whatever user wrote in them; the helper mounts the work directory only.
-    const r = await this.helper(slot, `find /work -mindepth 1 -maxdepth 1 ! -name .gitbox ${kept}-exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox && chmod 777 /work/workspaces`, { user: '0:0' });
+    const r = await this.helper(slot, `find /work -mindepth 1 -maxdepth 1 ! -name .gitbox ${kept}-exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox && chmod 777 /work/workspaces /work/.gitbox`, { user: '0:0' });
     if (r.exitCode !== 0) throw new StackError(`the work directory of slot ${slot} could not be emptied (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
     const left = (await this.listDir(slot, '/work')).filter((n) => !['workspaces', '.gitbox', ...keep].includes(n));
     if (left.length > 0) throw new StackError(`the work volume still holds ${left.join(', ')}`);
@@ -457,10 +457,16 @@ export class Stack {
     return dir;
   }
 
-  /** The coder image's own environment (its PATH): a coder in a task image keeps the task's tools. */
+  /** The image's own environment, read once for each image (`docker image inspect`, never a run). */
+  async imageEnvOf(image) {
+    this.imageEnvCache ??= new Map();
+    if (!this.imageEnvCache.has(image)) this.imageEnvCache.set(image, await this.host().imageEnv(image));
+    return this.imageEnvCache.get(image);
+  }
+
+  /** The coder image's own environment (its PATH), the fallback when a task image sets none. */
   async coderImageEnv() {
-    this.imageEnvCache ??= await this.host().imageEnv(this.coderImage);
-    return this.imageEnvCache;
+    return this.imageEnvOf(this.coderImage);
   }
 
   /**
@@ -472,9 +478,12 @@ export class Stack {
     const name = this.slotService('coder', slot);
     if (typeof image !== 'string' || !/@sha256:[0-9a-f]{64}$/.test(image)) throw new StackError('the coder starts from the task image, named by digest');
     if (!this.agentDir) throw new StackError('the coder needs its agent folder: set the stack\'s agentDir before startCoder');
-    const imageEnv = await this.coderImageEnv();
+    // The task image's own PATH, so the coder finds the tools that image installs (a conda or a /opt toolchain); the
+    // coder image's is the fallback, and /opt/adam/bin (its binaries) comes first.
+    const taskEnv = await this.imageEnvOf(image);
+    const pathEnv = taskEnv.PATH ? taskEnv : await this.coderImageEnv();
     const settings = {
-      ...coderEnvironment({ slot, publicUrl: this.coderUrl(slot), databaseUrl: `postgres://postgres:postgres@postgres:5432/adam_bench_${slot}`, imagePath: imageEnv.PATH ?? DEFAULT_PATH }),
+      ...coderEnvironment({ slot, publicUrl: this.coderUrl(slot), databaseUrl: `postgres://postgres:postgres@postgres:5432/adam_bench_${slot}`, imagePath: pathEnv.PATH ?? DEFAULT_PATH }),
       ...env,
     };
     const lines = [];

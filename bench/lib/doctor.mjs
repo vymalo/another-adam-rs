@@ -1,12 +1,12 @@
 // `bench doctor`: what the machine must have for the stack, and whether the coder starts in each selected task image.
 //
 // The bench runs its containers on the host's Docker (lib/containers.mjs): every image is in one store, and a task
-// image is run as it is. The one thing a task image can take away is the coder's own binary: the pin is linked
-// against the C library of Debian trixie, so a task image built on an older one (bookworm) cannot load it. The
-// probe runs the coder with no configuration as uid 10001 in the image: exit 78 means it starts (the coder refuses
-// an empty configuration, which is what a start is), a loader error means it does not, and such an image is refused
-// for both arms until the static coder (ADR 0053 slice 1) lands. Each check is { name, status: 'ok' | 'warn' |
-// 'fail', detail, fix? }; the exit code is 1 when any check fails. Nothing is started unless `start` is set.
+// image is run as it is. The coder's binaries are static (musl, ADR 0053 decision 11), so the image's C library does
+// not matter: a Debian bookworm task image starts the coder as well as a trixie one. The probe runs the coder with
+// no configuration as uid 10001 in the image: exit 78 means it starts (the coder refuses an empty configuration,
+// which is what a start is); a loader error, a missing interpreter or an architecture the image cannot run means it
+// does not, and such an image is refused for both arms. Each check is { name, status: 'ok' | 'warn' | 'fail', detail,
+// fix? }; the exit code is 1 when any check fails. Nothing is started unless `start` is set.
 import fs from 'node:fs';
 import { probeLimits } from './limits.mjs';
 import { coderRef } from './pins.mjs';
@@ -167,7 +167,8 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
     checks.push(gone.length > 0 ? warn('stale env files', `removed ${gone.join(', ')} (a killed harness left them)`) : ok('stale env files', 'none'));
   }
 
-  // Per selected task image: does the coder start there? A bookworm image is reported and refused for both arms.
+  // Per selected task image: does the coder start there? The static coder starts in any x86-64 Linux image; an image
+  // that cannot run it (a loader error, no /bin/sh for the probe's entry, another architecture) is refused for both arms.
   const probe = containers ?? stack?.hostContainers?.() ?? null;
   if (taskError) checks.push(warn('task images', `the selected tasks could not be read: ${taskError}`, 'fix the configuration and the lock files (bench tasks select)'));
   else if (tasks.length === 0) checks.push(warn('task images', 'none selected: nothing to probe', 'bench tasks select, then bench doctor'));
@@ -190,7 +191,7 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
         const p = await coderProbe({ containers: probe, image: imageRef, filesDir }).catch((e) => ({ starts: null, exitCode: null, detail: e.message }));
         const where = distro ? `${distro}; ` : '';
         if (p.starts === true) checks.push(ok(label, `${where}the coder starts (${p.detail})`));
-        else if (p.starts === false) checks.push(fail(label, `${where}the coder does not start (${p.detail}); the image is refused for both arms until the static coder (ADR 0053 slice 1) is in the pin`, 'use a task image whose C library can load the coder, or wait for the static build'));
+        else if (p.starts === false) checks.push(fail(label, `${where}the coder does not start (${p.detail}); the image is refused for both arms`, 'use a task image whose loader and architecture can run a static x86-64 binary, or fix the image'));
         else checks.push(warn(label, `${where}the coder's start is unclear (${p.detail})`, 'run a container of the image by hand and read the error'));
       }
     }

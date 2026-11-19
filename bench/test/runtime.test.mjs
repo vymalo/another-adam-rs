@@ -21,9 +21,10 @@ const fp = (runtime) => configFingerprint({ config, pins: PINS, lockTexts: LOCKS
 test('both arms run as uid 10001 and get the same CPU and memory from one setting', () => {
   assert.equal(RUNTIME.uid, 10001);
   assert.equal(RUNTIME.gid, 10001);
+  assert.equal(RUNTIME.cpus, 4);
+  assert.equal(RUNTIME.memoryMb, 12 * 1024);
   assert.equal(runtimeUser(), '10001:10001');
-  assert.deepEqual(runtimeLimits(), { cpus: RUNTIME.cpus, memoryMb: RUNTIME.memoryMb });
-  assert.ok(RUNTIME.cpus > 0 && RUNTIME.memoryMb > 0);
+  assert.deepEqual(runtimeLimits(), { cpus: 4, memoryMb: 12 * 1024 });
 });
 
 test('the fingerprint has a runtime field, and a change in the runtime changes the digest and is named', () => {

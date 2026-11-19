@@ -119,16 +119,31 @@ test('osRelease reads PRETTY_NAME, and says nothing when the image has no cat', 
   assert.equal(await osRelease({ containers: new FakeContainers({ onRun: () => ({ exitCode: 127, stderr: 'no cat' }) }), image: TASK.image.ref }), null);
 });
 
-test('bench doctor reports, per selected task image, whether the coder starts there; a bookworm image is refused for both arms', async () => {
+test('bench doctor reports that the static coder starts in a bookworm task image: the distribution is not the question', async () => {
+  // ADR 0053 decision 11: the coder's binaries are static (musl), so a Debian bookworm image runs the coder as well as
+  // a trixie one. Before the static build, this probe failed a bookworm image on its glibc.
   const containers = new FakeContainers({
-    onRun: (spec) => (spec.entrypoint === '/bin/cat' ? { exitCode: 0, stdout: 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n' } : { exitCode: 127, stderr: "adam-coder: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found" }),
+    onRun: (spec) => (spec.entrypoint === '/bin/cat' ? { exitCode: 0, stdout: 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n' } : { exitCode: 78 }),
+  });
+  const r = await run(machine(), { tasks: [TASK], containers, stack: probeStack(containers) });
+  const c = by(r, 'task image hello');
+  assert.equal(c.status, 'ok');
+  assert.match(c.detail, /bookworm/);
+  assert.match(c.detail, /exit 78/);
+  assert.equal(r.exitCode, 0);
+});
+
+test('bench doctor refuses, for both arms, a task image that cannot run the coder, and says why without waiting for a later slice', async () => {
+  const containers = new FakeContainers({
+    onRun: (spec) => (spec.entrypoint === '/bin/cat' ? { exitCode: 0, stdout: 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\n' } : { exitCode: 126, stderr: 'exec /opt/adam/bin/adam-coder: exec format error' }),
   });
   const r = await run(machine(), { tasks: [TASK], containers, stack: probeStack(containers) });
   const c = by(r, 'task image hello');
   assert.equal(c.status, 'fail');
   assert.match(c.detail, /bookworm/);
   assert.match(c.detail, /refused for both arms/);
-  assert.match(c.detail, /GLIBC_2\.38/);
+  assert.match(c.detail, /exec format error/);
+  assert.doesNotMatch(c.detail, /until the static coder|slice 1/);
   assert.equal(r.exitCode, 1);
 
   const good = new FakeContainers({ onRun: (spec) => (spec.entrypoint === '/bin/cat' ? { exitCode: 0, stdout: 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\n' } : { exitCode: 78 }) });

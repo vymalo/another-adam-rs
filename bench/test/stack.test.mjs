@@ -90,7 +90,8 @@ test('the coder is a host container of the task image, as uid 10001, under the r
   const { stack, calls, logs, home } = makeStack(t);
   stack.waitForCoder = async () => {};
   stack.ensureCoderFiles = async () => '/h/coder-bin';
-  stack.coderImageEnv = async () => ({ PATH: '/usr/bin' });
+  // The task image's PATH is the one the coder's commands get: its tools come first, after the coder's own binaries.
+  stack.imageEnvOf = async (image) => (image === TASK_IMAGE ? { PATH: '/task/bin:/usr/bin' } : { PATH: '/coder/bin' });
   const bearer = 'bearer-value-aaaaaaaaaaaaaaaa';
   const url = 'http://meter-1:8090/r/tokentokentokentokentoken/v1';
   await stack.startCoder(1, { A2A_BEARER_TOKENS: bearer, MODEL_BASE_URL: url, MODEL_CONTEXT_WINDOW: '131072' }, { image: TASK_IMAGE });
@@ -114,10 +115,20 @@ test('the coder is a host container of the task image, as uid 10001, under the r
   assert.match(file.text, /^RUN_ENVIRONMENT=local$/m);
   assert.match(file.text, /^DEVCONTAINER_RUNTIME=off$/m);
   assert.match(file.text, /^MODEL_CONTEXT_WINDOW=131072$/m);
-  assert.match(file.text, /^PATH=\/opt\/adam\/bin:/m);
+  assert.match(file.text, /^PATH=\/opt\/adam\/bin:\/task\/bin:\/usr\/bin$/m, 'the task image\'s PATH, not the coder image\'s');
   assert.ok(!JSON.stringify(run.args).includes(bearer) && !JSON.stringify(run.args).includes('tokentoken'));
   assert.ok(!JSON.stringify(logs).includes(bearer) && !JSON.stringify(logs).includes('tokentoken'));
   assert.deepEqual(fs.readdirSync(path.join(home, 'stack')).filter((f) => f.endsWith('.env')), []);
+});
+
+test('a task image that sets no PATH falls back to the coder image\'s', async (t) => {
+  const { stack, calls } = makeStack(t);
+  stack.waitForCoder = async () => {};
+  stack.ensureCoderFiles = async () => '/h/coder-bin';
+  stack.imageEnvOf = async (image) => (image === TASK_IMAGE ? {} : { PATH: '/coder/bin' });
+  await stack.startCoder(1, {}, { image: TASK_IMAGE });
+  const run = calls.find((c) => c.args[0] === 'run');
+  assert.match(run.envFile['slot-1.env'].text, /^PATH=\/opt\/adam\/bin:\/coder\/bin$/m);
 });
 
 test('the coder refuses a task image that is not named by digest, and a setting that is not plain', async (t) => {
@@ -196,7 +207,7 @@ test('the database of a slot is reset by postgres; the work directory is emptied
   assert.ok(helper.includes('0:0'), 'the cleanup helper is root inside the container, the host user under rootless Docker');
   assert.ok(helper.includes('--network=none'));
   const script = helper.at(-1);
-  assert.match(script, /find \/work -mindepth 1 -maxdepth 1 ! -name \.gitbox -exec rm -rf \{\} \+ ; mkdir -p \/work\/workspaces \/work\/\.gitbox && chmod 777 \/work\/workspaces/);
+  assert.match(script, /find \/work -mindepth 1 -maxdepth 1 ! -name \.gitbox -exec rm -rf \{\} \+ ; mkdir -p \/work\/workspaces \/work\/\.gitbox && chmod 777 \/work\/workspaces \/work\/\.gitbox/);
   assert.doesNotMatch(script, /rm -rf \/work\/workspaces \/work\/git/);
   void calls;
 });
