@@ -104,7 +104,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      deployer owns the ReadWriteMany claim, its root must be writable by uid and gid 10001, and cargo takes no lock
      on NFS. One trust domain: runs get no registry credential and the claim is shared only with deployments you
      trust (ADR 0040, `docs/decisions/0040-a-shared-package-cache-at-cache.md`; chart README, "The package cache").
-     The image must be on the workspace base `1.98.1-e6a528f` or later, which has the caches under `/cache`.
+     The image must be on the workspace base `1.98.1-8c297d3` or later, which has the caches under `/cache`.
    * No Ingress: the service is cluster-internal and reached over A2A with a bearer token.
    * Devcontainers are off on Kubernetes (README "Devcontainers are off here"). Its own answer is
      `runPods.enabled` (off by default and then invisible): each active run's processes run in a pod of its own

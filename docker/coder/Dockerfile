@@ -39,16 +39,20 @@
 # published by vymalo/another-agentic-images (merged in #7 as bc97d51). Deployments
 # pin an immutable tag, never `latest`. Bump it when that image changes (the tag
 # of its newest build on main), together with anything here that depends on it.
-# Anonymous pull verified 2026-10-11: the manifest request for this tag with an
-# anonymous ghcr.io token returned 200, and the image's config has the
+# Anonymous pull verified 2026-11-19: the manifest request for this tag with an
+# anonymous ghcr.io token returned 200 and sha256:b465808bfb8a1baae5e59a429bf292726b021e3b37322f759dbda3ee2c57ed67
+# (a single linux/amd64 manifest, 7 layers, 3.05 GB compressed), and the image's config has the
 # `devcontainer.metadata` label (it is a dev container base: the default environment of the
-# coder's devcontainers, ADR 0010), /opt/obscura/bin on PATH (obscura 0.2.4, a headless
+# coder's devcontainers, ADR 0010), /opt/obscura/bin on PATH (obscura, a headless
 # browser, vymalo/another-agentic-images#11) and the package caches under /cache
-# (CARGO_HOME=/cache/cargo; npm and pnpm by their own config files; vymalo/another-agentic-images#12,
-# ADR 0040). The same build is the default of DEVCONTAINER_DEFAULT_IMAGE, by its digest alone
+# (CARGO_HOME=/cache/cargo; npm and pnpm by their own config files, checked on 2026-10-11;
+# vymalo/another-agentic-images#12, ADR 0040). This tag is the merge of vymalo/another-agentic-images#15 (commit 8c297d3,
+# 2026-11-17), which adds rust-analyzer, gopls, typescript-language-server and pyright: the
+# servers of the coder's language-server tools (ADR 0044, slice 17). The same build is the
+# default of DEVCONTAINER_DEFAULT_IMAGE, by its digest alone
 # (bin/adam-coder/src/config.rs: the devcontainer CLI cannot parse a tag together with a digest);
 # a test keeps this tag equal to the tag that digest was published as.
-ARG WORKSPACE_TAG=1.98.1-e6a528f
+ARG WORKSPACE_TAG=1.98.1-8c297d3
 
 FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
 WORKDIR /src

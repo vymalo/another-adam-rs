@@ -452,9 +452,10 @@ The servers are a **closed table in code** (`table.rs`, never a setting, so a de
 | `.dart` | `dart language-server --protocol=lsp` | `pubspec.yaml` |
 
 The root is the nearest directory, from the file's own up to the slot's root, that holds one of the markers; the slot's root
-when none does. **Today's coder image has no language server**: it is built on a workspace image from before the
-servers were added (vymalo/another-agentic-images#15), and the bump of that pin is a pull request of its own. Until then
-every call answers `No language server for Rust in this environment (`rust-analyzer` is not on PATH in ...). Use `run_checks`
+when none does. **The coder image has the four servers**: it is built on the workspace image `1.98.1-8c297d3`, the merge of
+vymalo/another-agentic-images#15, so `rust-analyzer`, `typescript-language-server`, `pyright-langserver` and `gopls` are on
+`PATH` (the Dart server comes with the base's Flutter SDK). A server that is not there answers
+`No language server for Rust in this environment (`rust-analyzer` is not on PATH in ...). Use `run_checks`
 or `run_command` with `cargo check` instead.`, a result and not an error, and starts nothing. The probe (`command -v`, and
 `--version` in the project root for `rust-analyzer`, which catches a toolchain file that pins a version without the
 component) is made once per run, slot and language, in the run's environment, and forgotten when the environment is made
@@ -608,7 +609,8 @@ pyright; `buildFlags` of gopls): a name a server does not know is ignored, so a 
 definition, references); `typescript-language-server` and `gopls` were not installed here and have not been run. `dart language-server`
 takes `--protocol=lsp` (*verified* 2026-11-18 in dart-lang/sdk at tag 3.12.2, `pkg/dartdev/lib/src/commands/language_server.dart`); the
 author of the pull request that added it reports the gated suite passing on Dart SDK 3.12.2 in the workspace image (*unverified* here: no Dart
-SDK where it was merged). No CI job runs the gated suite yet.
+SDK where it was merged). The `image` job of `.github/workflows/coder.yml` runs the gated suite in the built image
+(`ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1`: a missing server fails the job).
 
 ## Rules in code
 
