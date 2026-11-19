@@ -14,12 +14,13 @@
 # ADAM_AGENT_DIR (compose.yaml, service `agent`): one image and one package, so
 # there is nothing else to publish or to make public.
 #
-# Stage 1 compiles the binaries (and `adam-kube-exec`, the client a run's commands use to run in a pod of
+# Stage 1 compiles the six binaries (and `adam-kube-exec`, the client a run's commands use to run in a pod of
 # their own, ADR 0019, `adam-egress`, the HTTPS-only proxy those pods reach the internet through, and
 # `adam-git-sandbox` with `adam-git`, which run the coder's git where no secret is readable)
-# on a Debian trixie Rust image, so their glibc
-# matches the runtime image (debian:trixie-slim). Stage 2 is the workspace
-# image (Rust, Flutter/Dart, Node, git, tini) with the binaries added.
+# for `x86_64-unknown-linux-musl`, statically linked (ADR 0053 decision 11), so they start in any x86-64
+# Linux image whatever its C library: the bench starts the coder from each task image (ADR 0052
+# decision 10). Stage 2 is the workspace image (Rust, Flutter/Dart, Node, git, tini) with the binaries
+# added; the base stays a glibc image because the binaries no longer care, and the tools in it do.
 
 # Rust builder, pinned by tag and digest.
 # Verified 2026-09-29: HEAD on registry-1.docker.io/v2/library/rust/manifests/1.94-trixie
@@ -56,27 +57,40 @@ ARG WORKSPACE_TAG=1.98.1-8c297d3
 
 FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
 WORKDIR /src
+# The musl target and its C compiler: `musl-gcc` builds the C sources of aws-lc-sys and mimalloc, the
+# global allocator of every binary (ADR 0053 decision 11). `protoc` is vendored and runs on this build
+# host, so it is not cross-compiled. `file` checks the result below.
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends file musl-tools \
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup target add x86_64-unknown-linux-musl
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
 # The workspace is `crates/*` and `bin/*`, so every member's manifest is needed to
-# resolve the lockfile even though only the two binaries are built. Only a C compiler is needed
-# (aws-lc-sys uses its pregenerated sources; the vendored protoc covers a2a-pb).
+# resolve the lockfile even though only the six binaries are built. Only a C compiler is needed
+# (aws-lc-sys uses its pregenerated sources; the vendored protoc covers a2a-pb), here the musl one.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY bin bin
-# The commit the image is built from (CI passes the commit sha): `option_env!` bakes it into both binaries, which say
+# The commit the image is built from (CI passes the commit sha): `option_env!` bakes it into the six binaries, which say
 # it on their card as the version's build metadata (`0.1.0+<first 7>`) and in `build/v1` (ADR 0028). A build
 # without it says `unknown`. Declared after the COPYs so that it never invalidates them.
 ARG ADAM_BUILD_REVISION=
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p adam-coder --bin adam-coder -p adam-agent --bin adam-agent \
+    cargo build --release --locked --target x86_64-unknown-linux-musl \
+      -p adam-coder --bin adam-coder -p adam-agent --bin adam-agent \
       -p adam-env-kubernetes --bin adam-kube-exec -p adam-egress --bin adam-egress \
       -p adam-git-sandbox --bin adam-git-sandbox --bin adam-git \
- && install -D -m 0755 target/release/adam-coder /out/adam-coder \
- && install -D -m 0755 target/release/adam-agent /out/adam-agent \
- && install -D -m 0755 target/release/adam-kube-exec /out/adam-kube-exec \
- && install -D -m 0755 target/release/adam-egress /out/adam-egress \
- && install -D -m 0755 target/release/adam-git-sandbox /out/adam-git-sandbox \
- && install -D -m 0755 target/release/adam-git /out/adam-git
+ && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-coder /out/adam-coder \
+ && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-agent /out/adam-agent \
+ && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-kube-exec /out/adam-kube-exec \
+ && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-egress /out/adam-egress \
+ && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-git-sandbox /out/adam-git-sandbox \
+ && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-git /out/adam-git \
+ && file /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-egress /out/adam-git-sandbox /out/adam-git \
+      > /tmp/binaries.file \
+ && test "$(grep -Ec 'statically linked|static-pie linked' /tmp/binaries.file)" = 6
 
 FROM ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6 AS github-mcp
 
@@ -101,6 +115,8 @@ LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs
 
 # hadolint ignore=DL3066
 USER root
+# The six binaries are static (x86_64-unknown-linux-musl): they carry their own C library and need no
+# loader from this base or from a task image that runs them (ADR 0053 decision 11). The paths do not change.
 COPY --from=build /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-egress /out/adam-git-sandbox /out/adam-git /usr/local/bin/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
 # The tools a run pod gets (ADR 0019): the chart's init container copies /opt/adam/bin/* into an emptyDir that the
@@ -124,7 +140,7 @@ RUN curl -fsSL -o /tmp/podman-remote.tar.gz \
  && rm -rf /tmp/podman-remote.tar.gz /tmp/podman-remote.sha256 /tmp/bin \
  && npm install -g --no-fund --no-audit "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}"
 
-# MCP_ALLOW_STDIO is **not** set here: the image carries two binaries, and only the coder may start
+# MCP_ALLOW_STDIO is **not** set here: the image carries two agent binaries, and only the coder may start
 # local-process MCP servers if its deployment says so (the chart and compose.yaml still set it for one
 # release); `adam-agent` from this image refuses such servers unless its own deployment opts in. The coder's
 # shipped mcp.json no longer starts one: it reads `github-mcp-server http`, which the deployment runs as a
@@ -142,7 +158,7 @@ USER 10001
 WORKDIR /work
 EXPOSE 8080
 
-# Smoke test in a login shell as uid 10001: both binaries start and reject an
+# Smoke test in a login shell as uid 10001: the binaries start and reject an
 # empty environment (they fail closed) instead of crashing, adam-agent names the
 # folder it needs, adam-egress exits 78 for want of an allow-list, adam-git-sandbox exits 78 for want of
 # its socket and root, adam-git (the relay that stands in for git, and never runs it itself) says that it

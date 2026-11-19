@@ -209,6 +209,7 @@ Put these in a `.env` next to `compose.yaml`.
 | Variable | Meaning |
 |---|---|
 | `ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_MONGODB_URI` | the database suites; skipped when unset |
+| `ADAM_TEST_TABLE_PREFIX`, `ADAM_TEST_MONGO_COLLECTION_PREFIX` | the Postgres table prefix (`adam_test_`) and the MongoDB collection prefix (`adam_`) the store suite and the transcript measurement write to; set the same value on `dev/p2-measure.sh` |
 | `ADAM_TEST_REQUIRE_DB=1` | a suite whose variable is unset **fails** instead of skipping (CI sets it) |
 | `ADAM_TEST_MOCK_OPENAI_URL`, `ADAM_TEST_MOCK_GITHUB_URL`, `ADAM_TEST_MOCK_GITHUB_MCP_URL` | the tests of the real clients against the compose mocks |
 | `ADAM_TEST_DEVCONTAINER=1`, `ADAM_TEST_REQUIRE_DEVCONTAINER=1` | the devcontainer suite; the second fails instead of skipping |

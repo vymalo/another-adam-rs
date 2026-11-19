@@ -197,7 +197,7 @@ classDiagram
 
 | Port | Defined in | Real implementations | Doubles |
 |---|---|---|---|
-| `Store` | `adam-core` | `PgStore`, `MongoStore` | `MemoryStore` (reference), `FaultyStore` (testkit) |
+| `Store` | `adam-core` | `PgStore`, `MongoStore` | `MemoryStore` (reference), `FaultyStore` and `CountingStore` (testkit) |
 | `ModelClient` | `adam-model` | `OpenAiCompatible` (`adam-model-openai`) | `MockModel` |
 | `ModelCredentials` | `adam-model` | `StaticBearer` (`MODEL_API_KEY`), `DeviceGrant` (`adam-model-oauth`, `MODEL_AUTH=device`); a host's own: a renewed token, a proof, an injector's tag ([ADR 0058](decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)) | `RenewingCredentials` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` (`adam-a2a-runtime`) | `InMemoryBackend` (feature `test-util`) |

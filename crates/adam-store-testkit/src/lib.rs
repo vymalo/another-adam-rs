@@ -20,6 +20,7 @@
 // A conformance suite is test code: a failed unwrap is a failed assertion.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod counting;
 pub mod fault;
 
 pub use adam_core::testing::skipped;
@@ -92,6 +93,38 @@ macro_rules! store_conformance {
                 $crate::cases::$case(store).await;
             }
         )*
+    };
+}
+
+/// Generate the `measure_the_transcript_write` test: run
+/// [`counting::measure_transcript_write`] through `$make`, print its line, and assert that the
+/// workload ran.
+///
+/// `$make` is a path to an `async fn() -> Option<DynStore>`, like [`store_conformance!`]: `None`
+/// skips the test (and fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
+///
+/// This is a measurement, not a conformance case: it asserts only that the workload ran. S3
+/// rewrites the workload to commit a head and a body, then adds the `< 50 × 20 KB` and
+/// `max < 20 KB` assertions here.
+#[macro_export]
+macro_rules! transcript_measurement {
+    ($make:path) => {
+        #[tokio::test]
+        async fn measure_the_transcript_write() {
+            let Some(store) = $make().await else {
+                $crate::skipped("measure_the_transcript_write: store not configured");
+                return;
+            };
+            store.migrate().await.expect("migrate");
+            let measured = $crate::counting::measure_transcript_write(store).await;
+            println!("{measured}");
+            assert_eq!(
+                measured.commits,
+                $crate::counting::Measurement::COMMITS,
+                "the workload ran to the end"
+            );
+            assert!(measured.total_written > 0, "the commits wrote state");
+        }
     };
 }
 
