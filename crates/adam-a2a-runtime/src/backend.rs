@@ -451,8 +451,8 @@ impl RuntimeTaskBackend {
         }
     }
 
-    /// A new-task submission: `(run id, context id)` of the task that took the
-    /// message.
+    /// A new-task submission: the run, its context id, and the view a repeated request already
+    /// read while settling it (a run that existed and was not written to).
     ///
     /// The run id is [`task_id_for`], so a repeat of the same request (same
     /// caller, `contextId` and `messageId`) finds the run its first attempt
@@ -466,7 +466,7 @@ impl RuntimeTaskBackend {
         message: &Message,
         inbound: adam_runtime::Inbound,
         context_id: Option<String>,
-    ) -> Result<(RunId, String), BackendError> {
+    ) -> Result<Joined, BackendError> {
         let Pick {
             run: mut prior,
             skipped: mut tally,
@@ -504,7 +504,11 @@ impl RuntimeTaskBackend {
             }
             .map_err(map_err)?;
             say_fresh(prior, tally.as_ref());
-            return Ok((run, context));
+            return Ok(Joined {
+                run,
+                context,
+                view: None,
+            });
         }
         let run = task_id_for(
             &self.agent,
@@ -536,17 +540,26 @@ impl RuntimeTaskBackend {
             match started {
                 Ok(true) => {
                     say_fresh(prior, tally.as_ref());
-                    return Ok((run, context));
+                    return Ok(Joined {
+                        run,
+                        context,
+                        view: None,
+                    });
                 }
                 Ok(false) => {
                     // A repeat: the task exists, and its context is the one it
                     // was created with (a request without `contextId` got a
-                    // generated one the first time).
-                    let (_, _, context) =
+                    // generated one the first time). The view that proves it is
+                    // the task's: no write followed the failed start.
+                    let (_, view, context) =
                         self.owned(caller, &run.to_string()).await?.ok_or_else(|| {
                             BackendError::internal("a repeated submission found a foreign task")
                         })?;
-                    return Ok((run, context));
+                    return Ok(Joined {
+                        run,
+                        context,
+                        view: Some(view),
+                    });
                 }
                 // The run it continued was purged or became unreadable in the meantime: there is
                 // nothing to continue.
@@ -565,7 +578,14 @@ impl RuntimeTaskBackend {
                         .map_err(|e| map_err(e.into()))?;
                     if let Some(open) = open {
                         match self.runtime.deliver(open.id, inbound.clone()).await {
-                            Ok(()) => return Ok((open.id, context)),
+                            // The delivery wrote: the view is read below, not here.
+                            Ok(()) => {
+                                return Ok(Joined {
+                                    run: open.id,
+                                    context,
+                                    view: None,
+                                });
+                            }
                             // It finished meanwhile: the context takes a new task.
                             Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {}
                             Err(e) => return Err(map_err(e)),
@@ -648,10 +668,15 @@ impl RuntimeTaskBackend {
         }
 
         let Some(task_id) = task_id else {
-            let (run, context) = self
+            let Joined { run, context, view } = self
                 .start_or_join(caller, &message, inbound, context_id)
                 .await?;
-            let view = self.view_of(run).await?;
+            // A repeated request already read the run it found; only a start (or a delivery) is
+            // read again, because it wrote.
+            let view = match view {
+                Some(view) => view,
+                None => self.view_of(run).await?,
+            };
             let mut task = self.said(caller, &view, task_from_view(&view, &context, &self.prompt));
             let mut first = message;
             first.task_id = Some(task.id.clone());
@@ -723,6 +748,15 @@ impl RuntimeTaskBackend {
             .map_err(map_err)?
             .ok_or_else(|| BackendError::TaskNotFound(run.to_string()))
     }
+}
+
+/// What starting or joining a task settled.
+struct Joined {
+    run: RunId,
+    context: String,
+    /// The view of a run that already existed, read while settling a repeat. No write followed it,
+    /// so the task can be built from it instead of reading the run again.
+    view: Option<RunView>,
 }
 
 /// What picking the run to continue found: the run, if a reference qualified, and what was
