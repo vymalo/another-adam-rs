@@ -8,6 +8,10 @@ that keeps its package caches under `/cache` (its pull request 12).
 
 *Amended 2026-11-14 ([ADR 0046](0046-the-operator-lives-in-the-platform-repository.md)):* the operator named here was removed from this repository; the operator parts of this decision now belong to the operator of `vymalo/another-agentic-platform`.
 
+*Amended 2026-11-19 ([ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md), not built yet):* there are no Podman devcontainers any more. Decision 6 and the row of
+`DEVCONTAINER_CACHE_DIR` go; the coder's container and run pods keep the cache as decided here, a run pod of a repository's own image
+included.
+
 ## Context
 
 A pod starts with an empty home. Every `npm ci`, `pnpm install` and `cargo build` of a run downloads again what the run

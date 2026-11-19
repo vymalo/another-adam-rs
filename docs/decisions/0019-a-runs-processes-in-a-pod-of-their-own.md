@@ -23,6 +23,14 @@ Decision 7's NetworkPolicy allows DNS, the egress proxy (an HTTPS-only `CONNECT`
 the run pods) and `extraEgress`, and no longer the internet; the template sets `HTTPS_PROXY` and the other proxy variables; OD-K6 is
 resolved the other way; `runPods.networkPolicy.enabled` is gone.
 
+*Amended 2026-11-19 ([ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md), not built yet):* there is no Podman path any more, so decision 1's refusal of
+`RUN_ENVIRONMENT=kubernetes` with `DEVCONTAINER_RUNTIME=podman` becomes a refusal of `podman` on its own. Decision 2's "the pod is the
+deployment's" keeps every field but one: when a run calls `use_repository_environment`, the `run` container's image is the image the
+repository's `devcontainer.json` names (`customizations.adam.image` or `image`), if it starts with a prefix the deployment allows
+(`RUN_POD_REPOSITORY_IMAGES`, chart `runPods.repositoryImages.allowedPrefixes`, empty by default). Decision 7's admission policy then
+admits that prefix for the `run` container only. `adam-exec` moves to this crate. `Environment::rebuild` gives way to a defaulted
+method that sets or clears a run's image.
+
 ## Context
 
 The coder runs every command of every run in its own container: `run_command`, `run_checks`, OpenCode and every command
