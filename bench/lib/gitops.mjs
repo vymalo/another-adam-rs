@@ -58,39 +58,80 @@ export async function lsRemoteHeads({ url, pattern = 'refs/heads/agent/*' }) {
   return heads;
 }
 
+/** The preparations of one destination, in this process: a waiter is the promise of the preparation before it. */
+const preparations = new Map();
+
 /**
  * The agent folder of the coder image's revision, from this repository, without `mcp.json`: no GitHub MCP
  * server is connected, as OpenCode has none either (and the mock's answers would be sandbox data).
  * Returns the directory; it is made once for a revision and kept.
+ *
+ * Two slots of a run prepare the same folder at the same time (one home, one coder revision). They are
+ * serialised per destination in this process, and each preparation is built in a temporary sibling and renamed
+ * into place: the lock makes the second caller wait and find the first one's marker (renaming its own copy over a
+ * folder the first slot's coder has mounted would delete it), and the rename means a failed or killed preparation
+ * never leaves a half-written folder at the destination. `unpack` is the extraction, so a test can fail it halfway.
  */
-export async function ensureAgentFolder({ repoDir, revision, dest, steps, folder = 'bin/adam-coder/agent' }) {
+export async function ensureAgentFolder({ repoDir, revision, dest, steps, folder = 'bin/adam-coder/agent', unpack = unpackAgentFolder }) {
   if (!Number.isSafeInteger(steps) || steps < 1) throw new Error('the turn limit is required: both agents are given the same one');
   if (!REV.test(revision)) throw new Error('the revision must be a full commit id');
-  const marker = path.join(dest, '.revision');
-  try {
-    if (fs.readFileSync(marker, 'utf8').trim() === `${revision}:${steps}`) return dest;
-  } catch {
-    // not made yet
-  }
-  const git = localGit(repoDir);
-  try {
-    await git(['cat-file', '-e', `${revision}^{commit}`]);
-  } catch {
-    throw new Error(`the coder image's revision ${revision.slice(0, 7)} is not in this checkout; fetch it (git fetch origin ${revision})`);
-  }
-  const tarball = await git(['archive', '--format=tar', revision, '--', folder]);
-  const strip = folder.split('/').length;
-  fs.rmSync(dest, { recursive: true, force: true });
-  fs.mkdirSync(dest, { recursive: true });
+  if (folderIsMade(dest, revision, steps)) return dest;
+  return serialized(path.resolve(dest), async () => {
+    if (folderIsMade(dest, revision, steps)) return dest;
+    const git = localGit(repoDir);
+    try {
+      await git(['cat-file', '-e', `${revision}^{commit}`]);
+    } catch {
+      throw new Error(`the coder image's revision ${revision.slice(0, 7)} is not in this checkout; fetch it (git fetch origin ${revision})`);
+    }
+    const tarball = await git(['archive', '--format=tar', revision, '--', folder]);
+    const strip = folder.split('/').length;
+    const temp = `${dest}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+    try {
+      fs.mkdirSync(temp, { recursive: true });
+      await unpack(tarball, temp, strip);
+      fs.rmSync(path.join(temp, 'mcp.json'), { force: true });
+      setTurnLimit(path.join(temp, 'instructions.md'), steps);
+      await new Promise((resolve) => execFile('chmod', ['-R', 'a+rX', temp], resolve));
+      fs.writeFileSync(path.join(temp, '.revision'), `${revision}:${steps}\n`);
+      fs.rmSync(dest, { recursive: true, force: true });
+      fs.renameSync(temp, dest);
+      return dest;
+    } catch (e) {
+      fs.rmSync(temp, { recursive: true, force: true });
+      throw e;
+    }
+  });
+}
+
+/** The tar of the agent folder into `dir`, without the archive's leading components. */
+async function unpackAgentFolder(tarball, dir, strip) {
   await new Promise((resolve, reject) => {
-    const child = execFile('tar', ['-xf', '-', '-C', dest, `--strip-components=${strip}`, '--no-same-owner', '--no-same-permissions'], { env: safeEnv() }, (e) => (e ? reject(new Error('the agent folder could not be unpacked')) : resolve()));
+    const child = execFile('tar', ['-xf', '-', '-C', dir, `--strip-components=${strip}`, '--no-same-owner', '--no-same-permissions'], { env: safeEnv() }, (e) => (e ? reject(new Error('the agent folder could not be unpacked')) : resolve()));
+    // A tar that exits early closes the pipe: that is the callback's error, not an unhandled one on the socket.
+    child.stdin.on('error', () => {});
     child.stdin.end(tarball);
   });
-  fs.rmSync(path.join(dest, 'mcp.json'), { force: true });
-  setTurnLimit(path.join(dest, 'instructions.md'), steps);
-  await new Promise((resolve) => execFile('chmod', ['-R', 'a+rX', dest], resolve));
-  fs.writeFileSync(marker, `${revision}:${steps}\n`);
-  return dest;
+}
+
+/** Is the folder at `dest` the one this revision and step limit make? */
+function folderIsMade(dest, revision, steps) {
+  try {
+    return fs.readFileSync(path.join(dest, '.revision'), 'utf8').trim() === `${revision}:${steps}`;
+  } catch {
+    return false;
+  }
+}
+
+/** Run `fn` after the preparation of the same destination that came before it. A failed one does not block the next. */
+function serialized(key, fn) {
+  const run = (preparations.get(key) ?? Promise.resolve()).then(fn);
+  const tail = run.catch(() => {});
+  preparations.set(key, tail);
+  tail.then(() => {
+    if (preparations.get(key) === tail) preparations.delete(key);
+  });
+  return run;
 }
 
 /** The repository a run has on the git server: the task's slug, the run and the attempt, so no run sees another's branches. */
