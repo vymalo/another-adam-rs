@@ -1,7 +1,7 @@
 //! The worker loop: claim due runs, advance them one transition, commit with
 //! CAS, renew leases while stepping, release.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -14,7 +14,8 @@ use serde_json::Value;
 use tokio::task::{JoinHandle, JoinSet};
 
 use adam_core::{
-    BodyRow, BodyWrite, Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError, StoreResult,
+    BlobId, BodyRow, BodyWrite, Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError,
+    StoreResult,
 };
 use adam_error::{Classify, ErrorClass, report};
 use uuid::Uuid;
@@ -26,7 +27,7 @@ use crate::ctx::{Ctx, CtxOutcome, CtxParts};
 use crate::envelope::Envelope;
 use crate::erased::Stepped;
 use crate::events::Artifact;
-use crate::head::{BodyRef, Head};
+use crate::head::Head;
 use crate::notify::{Delivery, Signal};
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
 
@@ -481,6 +482,14 @@ struct Next {
     /// `(head, rows)` when the agent splits the state this transition commits; `None` writes the
     /// whole state and no head.
     split: Option<(Value, Vec<Value>)>,
+    /// `Some(new)` when this commit starts a body generation (a first split or a compaction);
+    /// `None` appends to the current one. Filled in `transition`, after the split is checked.
+    generation: Option<Uuid>,
+    /// The digests the shadow's upload pass stored (the union the commit references).
+    shadow_blobs: Vec<BlobId>,
+    /// The digest and size of every file artifact in the head's upload pass, so `Head::of` does not
+    /// re-hash the bytes.
+    shadow_sizes: HashMap<BlobId, u64>,
     /// The deadline and what is left of the time limit to store (set once, when the run is made, or
     /// restored from what was left after a wait for a person: never recomputed from the commit).
     deadline: Option<DateTime<Utc>>,
@@ -636,9 +645,52 @@ async fn transition(
             }
         }
     }
-    // One body set per step attempt: the commit's CAS retries reuse it, so a retry of the same
-    // attempt is idempotent and a lost CAS leaves rows no head names.
-    let body_commit = Uuid::new_v4();
+    // Where the rows go: a new generation for the first split or a compaction, an append
+    // otherwise. The previous transcript is in the full v4 state this step read, so the decision
+    // costs no store read.
+    let generation = match &next.split {
+        None => None,
+        Some((_, rows)) => {
+            let previous = rec.state.get("agent").cloned();
+            let previous_rows = previous.and_then(|state| match agent.transcript(state) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(
+                        run = %run,
+                        error = %report(&e),
+                        "the previous state's transcript does not decode; starting a new generation"
+                    );
+                    None
+                }
+            });
+            let compaction = env.rev == 0
+                || previous_rows
+                    .as_ref()
+                    .is_some_and(|previous| !is_prefix(previous, rows));
+            compaction.then(Uuid::new_v4)
+        }
+    };
+    next.generation = generation;
+    // The head names every file artifact of the state, so upload them all and refuse the head if
+    // one's bytes are not stored (a pre-E artifact, a failed put): a head never names a digest that
+    // is not there.
+    if next.split.is_some() {
+        let artifacts = merged_artifacts(&env, &next);
+        let uploaded = crate::blob::upload_all(&inner.store, &artifacts).await;
+        if uploaded.all_stored {
+            next.shadow_sizes = uploaded.sizes;
+            next.shadow_blobs = uploaded.ids;
+        } else {
+            tracing::error!(
+                run = %run,
+                "a file artifact's bytes are not stored; writing the state only (the run stays v4)"
+            );
+            next.split = None;
+        }
+    }
+    // One writer per step attempt: the commit's CAS retries reuse it, so a retry of the same
+    // attempt is idempotent and a lost CAS deletes exactly the rows this attempt inserted.
+    let body_writer = Uuid::new_v4();
     next.deadline = deadline;
     next.remaining_secs = remaining_secs;
     // Parked with no timer: the run waits for a person (or a message), whose time is not the run's.
@@ -655,7 +707,7 @@ async fn transition(
         &env,
         &next,
         rec.parent_id.is_some(),
-        body_commit,
+        body_writer,
     )
     .await
     {
@@ -736,6 +788,9 @@ fn plan(
         reopen,
         read: read.clone(),
         split,
+        generation: None,
+        shadow_blobs: Vec::new(),
+        shadow_sizes: HashMap::new(),
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
     };
@@ -754,6 +809,9 @@ fn plan(
         reopen: false,
         read: Vec::new(),
         split: None,
+        generation: None,
+        shadow_blobs: Vec::new(),
+        shadow_sizes: HashMap::new(),
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
     };
@@ -799,6 +857,9 @@ fn plan(
                 reopen: false,
                 read: Vec::new(),
                 split: None,
+                generation: None,
+                shadow_blobs: Vec::new(),
+                shadow_sizes: HashMap::new(),
                 deadline: base.deadline,
                 remaining_secs: base.remaining_secs,
             }
@@ -943,10 +1004,7 @@ fn build_update(
         },
         _ => wake_at,
     };
-    let mut artifacts = cur.artifacts.clone();
-    for artifact in &next.artifacts {
-        add_artifact(&mut artifacts, artifact);
-    }
+    let artifacts = merged_artifacts(cur, next);
     // `next` and `cur` are borrowed for the whole retry loop, which builds this update again from
     // them after a lost CAS race, so the envelope owns copies of what it keeps. Moving them would
     // leave a retry with `null`.
@@ -975,16 +1033,9 @@ fn build_update(
     // The shadow: the head beside the full state, and the rows it names. Only a step that split
     // writes them; a commit that writes no head leaves the stored one (and its version) alone.
     if let Some((head, rows)) = &next.split {
-        let len = u64::try_from(rows.len())
-            .map_err(|_| StoreError::InvalidInput("a transcript is longer than u64".into()))?;
-        let head = Head::of(
-            &env,
-            head.clone(),
-            BodyRef {
-                commit: body_commit,
-                len,
-            },
-        );
+        let len = u32::try_from(rows.len())
+            .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
+        let head = Head::of(&env, head.clone(), len, &next.shadow_sizes);
         update.head = Some(head.encode()?);
         let rows = rows
             .iter()
@@ -1000,11 +1051,28 @@ fn build_update(
             })
             .collect::<StoreResult<Vec<_>>>()?;
         update.body = Some(BodyWrite {
-            commit: body_commit,
+            generation: next.generation,
             rows,
+            writer: body_commit,
         });
     }
     Ok(update)
+}
+
+/// The artifacts of the state this commit writes: the ones the run already had, plus this
+/// transition's, merged by [`add_artifact`].
+fn merged_artifacts(cur: &Envelope, next: &Next) -> Vec<Artifact> {
+    let mut artifacts = cur.artifacts.clone();
+    for artifact in &next.artifacts {
+        add_artifact(&mut artifacts, artifact);
+    }
+    artifacts
+}
+
+/// Whether `previous` is a prefix of `rows`: an append (the store writes only the rows after the
+/// head's `len`), as opposed to a compaction (a new generation with the whole transcript).
+fn is_prefix(previous: &[Value], rows: &[Value]) -> bool {
+    previous.len() <= rows.len() && rows[..previous.len()] == previous[..]
 }
 
 /// `artifact` added to the run's `artifacts`: after the others, unless it has an id
@@ -1090,14 +1158,17 @@ async fn commit(
         // carries them, so a failed upload costs a log line, not the transition.
         //
         // Only this transition's new artifacts, plus — before any worker commit (`rev == 0`) — the
-        // ones the run started with: a run seeded from a prior run's state (a session round) begins
-        // with file artifacts no commit has referenced yet, and this is the commit that names them.
+        // ones the run was created with: a run created directly with a file artifact in its state
+        // (a pre-E run) has no reference yet, and this is the commit that names it. The runtime's
+        // start paths do not copy a prior run's artifacts, so a seeded run has none here.
         // Afterwards every file is uploaded once, not once per commit.
         let mut blobs = Vec::new();
         if cur_env.rev == 0 {
             blobs = crate::blob::upload_files(&inner.store, &cur_env.artifacts).await;
         }
         blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
+        // The shadow's own upload pass (all file artifacts of the state it names), already checked.
+        blobs.extend(next.shadow_blobs.iter().cloned());
         blobs.sort();
         blobs.dedup();
         update.blobs = blobs;

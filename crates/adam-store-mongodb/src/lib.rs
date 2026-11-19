@@ -68,7 +68,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use adam_core::store::{
-    add_ttl, now, open_conversation_key, sched_at, storable, storable_owned, truncate_ms,
+    add_ttl, head_body, now, open_conversation_key, sched_at, set_head_body, storable,
+    storable_owned, truncate_ms,
 };
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig,
@@ -85,6 +86,7 @@ use mongodb::options::{
     CollectionOptions, IndexOptions, ReadPreference, ReturnDocument, SelectionCriteria,
 };
 use mongodb::{Client, Collection, Database, IndexModel};
+use serde_json::Value;
 use uuid::Uuid;
 
 use codec::{bson_to_json, json_to_bson};
@@ -217,7 +219,8 @@ impl MongoStore {
             .runs
             .find_one(doc! { "_id": uuid(id), "purging": { "$ne": true } })
             .projection(doc! {
-                "agent": 1, "conversation_id": 1, "parent_id": 1, "version": 1, "created_at": 1
+                "agent": 1, "conversation_id": 1, "parent_id": 1, "version": 1, "created_at": 1,
+                "head": 1, "head_version": 1
             })
             .await
             .map_err(classify)?;
@@ -293,23 +296,26 @@ fn run_blob_id(run: RunId, digest: &BlobId) -> String {
     format!("{run}:{digest}")
 }
 
-/// A transcript set id as BSON: the `commit_id` a row is keyed by.
-fn commit_uuid(commit: Uuid) -> Bson {
-    Bson::from(bson::Uuid::from_bytes(commit.into_bytes()))
+/// A body generation id as BSON.
+fn generation_uuid(generation: Uuid) -> Bson {
+    Bson::from(bson::Uuid::from_bytes(generation.into_bytes()))
 }
 
-/// The `_id` of one body row: `(run, commit, idx)`, the set's identity and the row's position.
-fn body_id(run: RunId, commit: Uuid, idx: u32) -> String {
-    format!("{run}:{commit}:{idx}")
+/// The `_id` of one body row: `(run, generation, idx)`, the generation's identity and the row's
+/// position.
+fn body_id(run: RunId, generation: Uuid, idx: u32) -> String {
+    format!("{run}:{generation}:{idx}")
 }
 
-/// How long a superseded body set stays readable before the next commit of its run collects it.
+/// How long a superseded body generation stays readable before the next commit of its run collects
+/// it.
 const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
 
 /// One row as the document `adam_body` holds.
 fn body_doc(
     run: RunId,
-    commit: Uuid,
+    generation: Uuid,
+    writer: Uuid,
     row: &BodyRow,
     written_at: DateTime<Utc>,
 ) -> StoreResult<Document> {
@@ -317,9 +323,10 @@ fn body_doc(
         StoreError::InvalidInput(format!("body index {} exceeds i32::MAX", row.idx))
     })?;
     Ok(doc! {
-        "_id": body_id(run, commit, row.idx),
+        "_id": body_id(run, generation, row.idx),
         "run_id": uuid(run),
-        "commit_id": commit_uuid(commit),
+        "generation": generation_uuid(generation),
+        "writer": generation_uuid(writer),
         "idx": idx,
         "message": json_to_bson(&storable(&row.message))?,
         "written_at": date(written_at),
@@ -328,26 +335,45 @@ fn body_doc(
 
 /// Whether a body insert landed every row: `inserted + duplicate_keys == expected`.
 ///
-/// A duplicate key is a row that is already there (a retry of the same attempt, which reuses the
-/// set id); any other failure means a row is missing, and the commit must abort **before** the CAS
-/// so a head never names a partial set.
+/// A duplicate key is a row that is already there (a retry of the same attempt); any other failure
+/// means a row is missing, and the commit must abort **before** the CAS so a head never names a
+/// generation that is missing a row.
 fn body_insert_is_complete(inserted: usize, duplicates: usize, expected: usize) -> bool {
     inserted + duplicates == expected
 }
 
 /// The `(inserted, duplicates)` of an unordered `insert_many` that failed, from the write errors it
-/// reports. `None` when the error is not an `InsertMany` answer: nothing can be said about what
-/// landed.
+/// reports. `None` when the error is not an `InsertMany` answer, or when the server reported a
+/// **write concern** error: the write may or may not have landed, so nothing can be said about what
+/// is complete, and the commit must abort before the CAS.
 fn body_insert_counts(err: &mongodb::error::Error, expected: usize) -> Option<(usize, usize)> {
     let ErrorKind::InsertMany(failure) = err.kind.as_ref() else {
         return None;
     };
+    if failure.write_concern_error.is_some() {
+        return None;
+    }
     let errors = failure.write_errors.as_ref()?;
     let duplicates = errors
         .iter()
         .filter(|write| write.code == DUPLICATE_KEY)
         .count();
     Some((expected.saturating_sub(errors.len()), duplicates))
+}
+/// The digests a v5 head's file artifacts name: what a losing commit must not collect.
+fn head_digests(head: &Value) -> HashSet<BlobId> {
+    head.get("artifacts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|artifact| {
+            artifact
+                .get("file")?
+                .get("digest")?
+                .as_str()
+                .and_then(BlobId::from_hex)
+        })
+        .collect()
 }
 
 /// The filters of a [`RunQuery`] (not its position or its limit).
@@ -517,15 +543,29 @@ struct CommitContext {
     conversation_id: Option<String>,
     parent_id: Option<RunId>,
     created_at: DateTime<Utc>,
+    /// The v5 head, when one was written; a commit that appends reads its `body` generation.
+    head: Option<serde_json::Value>,
+    /// The version the head was written at; a stale head names no current generation.
+    head_version: Option<u64>,
 }
 
 fn commit_context_from_doc(d: &Document) -> StoreResult<CommitContext> {
+    let head = match d.get("head") {
+        None | Some(Bson::Null) => None,
+        Some(head) => Some(bson_to_json(head)?),
+    };
+    let head_version = match d.get("head_version") {
+        None | Some(Bson::Null) => None,
+        Some(_) => Some(get_u64(d, "head_version")?),
+    };
     Ok(CommitContext {
         version: get_u64(d, "version")?,
         agent: get_str(d, "agent")?.ok_or_else(|| bad("agent"))?,
         conversation_id: get_str(d, "conversation_id")?,
         parent_id: get_uuid(d, "parent_id")?,
         created_at: get_date(d, "created_at")?.ok_or_else(|| bad("created_at"))?,
+        head,
+        head_version,
     })
 }
 
@@ -870,42 +910,76 @@ impl Store for MongoStore {
         } = update;
         let wake_at = wake_at.map(truncate_ms);
         let state = storable_owned(state);
-        // The transcript rows go first, as the head that names them would: there is no
-        // multi-document transaction, so a commit that loses the CAS leaves rows nothing names.
-        // They are ignored by every reader and collected by the GC (or the run's purge). The
-        // completeness check is what keeps a head from naming a set that is missing a row.
-        let mut superseded: Option<(Uuid, DateTime<Utc>)> = None;
+        // The generation this commit writes to: a compaction names a new one, an append keeps the
+        // current head's, and a run with no current head starts one.
+        let current_generation = if current.head_version == Some(expected) {
+            current.head.as_ref().and_then(head_body)
+        } else {
+            None
+        };
+        let mut body_plan = None;
+        let mut head = head;
         if let Some(body) = body {
-            let BodyWrite { commit, rows } = body;
-            let written_at = t;
-            if !rows.is_empty() {
-                let docs = rows
-                    .iter()
-                    .map(|row| body_doc(id, commit, row, written_at))
-                    .collect::<StoreResult<Vec<_>>>()?;
+            let BodyWrite {
+                generation,
+                rows,
+                writer,
+            } = body;
+            let target = generation
+                .or(current_generation.map(|(generation, _)| generation))
+                .unwrap_or_else(Uuid::new_v4);
+            // A new generation writes the whole transcript; an append writes only the rows after
+            // the head's `len`. The runtime guarantees the rows start with the old transcript.
+            let start = match (generation, current_generation) {
+                (Some(_), _) | (None, None) => 0,
+                (None, Some((_, len))) => usize::try_from(len)
+                    .map_err(|_| StoreError::InvalidInput("body length exceeds usize".into()))?,
+            };
+            if start > rows.len() {
+                return Err(StoreError::InvalidInput(format!(
+                    "the body append starts at {start}, past the {} rows given",
+                    rows.len()
+                )));
+            }
+            let len = u32::try_from(rows.len())
+                .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
+            if let Some(head) = &mut head {
+                set_head_body(head, target, len)?;
+            }
+            body_plan = Some((target, start, writer, rows, t));
+        }
+        // The rows go first, as the head that names them would: there is no multi-document
+        // transaction, so a commit that loses the CAS deletes the rows its `writer` inserted. The
+        // completeness check is what keeps a head from naming a generation missing a row.
+        if let Some((generation, start, writer, rows, written_at)) = &body_plan {
+            let docs = rows
+                .iter()
+                .skip(*start)
+                .map(|row| body_doc(id, *generation, *writer, row, *written_at))
+                .collect::<StoreResult<Vec<_>>>()?;
+            if !docs.is_empty() {
                 let expected = docs.len();
                 match self.body.insert_many(&docs).ordered(false).await {
                     Ok(result) => {
                         if !body_insert_is_complete(result.inserted_ids.len(), 0, expected) {
                             return Err(StoreError::Corrupt(format!(
-                                "body set {commit} of run {id}: only {} of {expected} rows landed",
+                                "body generation {generation} of run {id}: only {} of {expected} rows landed",
                                 result.inserted_ids.len()
                             )));
                         }
                     }
                     Err(err) => match body_insert_counts(&err, expected) {
-                        // Every failure is a row that is already there (a retry of the same set).
+                        // Every failure is a row that is already there (a retry of the same attempt).
                         Some((inserted, duplicates))
                             if body_insert_is_complete(inserted, duplicates, expected) => {}
                         _ => return Err(classify(err)),
                     },
                 }
             }
-            superseded = Some((commit, written_at));
         }
         // The refs go first, as the head that names them would: there is no multi-document
-        // transaction, so a commit that loses the CAS leaves rows nothing names. They are ignored
-        // by every reader and deleted with the run's purge.
+        // transaction, so a commit that loses the CAS deletes them. They are ignored by every
+        // reader and deleted with the run's purge.
         if !blobs.is_empty() {
             self.insert_run_blobs(id, &blobs).await?;
         }
@@ -943,10 +1017,12 @@ impl Store for MongoStore {
             .await;
         match result {
             Ok(Some(_)) => {
-                // The superseded sets are collected only after the CAS: a commit that lost names
-                // nothing, so it has nothing to supersede.
-                if let Some((commit, written_at)) = superseded {
-                    let _ = self.gc_body(id, commit, written_at - BODY_GC_GRACE).await;
+                // The superseded generations are collected only after the CAS: a commit that lost
+                // names nothing, so it has nothing to supersede.
+                if let Some((generation, _, _, _, written_at)) = body_plan {
+                    let _ = self
+                        .gc_body(id, generation, written_at - BODY_GC_GRACE)
+                        .await;
                 }
                 Ok(RunRecord {
                     id,
@@ -976,11 +1052,19 @@ impl Store for MongoStore {
                         .map_err(classify)?;
                     Err(StoreError::NotFound(id))
                 }
-                Some(actual) => Err(StoreError::Conflict {
-                    run: id,
-                    expected,
-                    actual,
-                }),
+                Some(actual) => {
+                    // The loser removes its own rows and refs, but never a row or a digest the
+                    // winner's current head names.
+                    if let Some((generation, _, writer, _, _)) = &body_plan {
+                        self.delete_loser(id, *generation, *writer, actual, &blobs)
+                            .await?;
+                    }
+                    Err(StoreError::Conflict {
+                        run: id,
+                        expected,
+                        actual,
+                    })
+                }
             },
             Err(err) if is_duplicate_key(&err) => Err(StoreError::ConversationBusy {
                 agent: current.agent,
@@ -1496,10 +1580,19 @@ impl Store for MongoStore {
         true
     }
 
-    async fn body_list(&self, run: RunId, commit: Uuid) -> StoreResult<Vec<BodyRow>> {
+    async fn gc_body(
+        &self,
+        run: RunId,
+        keep_generation: Uuid,
+        before: DateTime<Utc>,
+    ) -> StoreResult<u64> {
+        MongoStore::gc_body(self, run, keep_generation, before).await
+    }
+
+    async fn body_list(&self, run: RunId, generation: Uuid) -> StoreResult<Vec<BodyRow>> {
         let docs: Vec<Document> = self
             .body
-            .find(doc! { "run_id": uuid(run), "commit_id": commit_uuid(commit) })
+            .find(doc! { "run_id": uuid(run), "generation": generation_uuid(generation) })
             .sort(doc! { "idx": 1 })
             .await
             .map_err(classify)?
@@ -1560,18 +1653,79 @@ impl Store for MongoStore {
 }
 
 impl MongoStore {
-    /// Delete the body sets of `run` other than `keep` that were written before `before`, and
-    /// return how many rows went. The set a commit names is never collected, however old it is;
-    /// a superseded one is collected by the next commit of the run, with a one-hour grace.
+    /// Delete the rows a losing commit inserted (its `writer`), and the references it added,
+    /// except what the winner's current head names. A loser must not poison the next append, and
+    /// it must not remove a row or a digest the winner's head serves.
+    async fn delete_loser(
+        &self,
+        id: RunId,
+        generation: Uuid,
+        writer: Uuid,
+        actual: u64,
+        refs: &[BlobId],
+    ) -> StoreResult<()> {
+        let found = self
+            .runs
+            .find_one(doc! { "_id": uuid(id) })
+            .projection(doc! { "head": 1, "head_version": 1 })
+            .await
+            .map_err(classify)?;
+        let (keep_len, keep_digests) = match found.as_ref() {
+            Some(doc) if get_u64(doc, "head_version").ok() == Some(actual) => match doc.get("head")
+            {
+                None | Some(Bson::Null) => (0, HashSet::new()),
+                Some(head) => {
+                    let head = bson_to_json(head)?;
+                    let keep_len = head_body(&head)
+                        .filter(|(named, _)| *named == generation)
+                        .map(|(_, len)| len)
+                        .unwrap_or(0);
+                    (keep_len, head_digests(&head))
+                }
+            },
+            _ => (0, HashSet::new()),
+        };
+        self.body
+            .delete_many(doc! {
+                "run_id": uuid(id),
+                "generation": generation_uuid(generation),
+                "writer": generation_uuid(writer),
+                "idx": { "$gte": i64::from(keep_len) },
+            })
+            .await
+            .map_err(classify)?;
+        let doomed: Vec<&str> = refs
+            .iter()
+            .filter(|digest| !keep_digests.contains(*digest))
+            .map(BlobId::as_str)
+            .collect();
+        if !doomed.is_empty() {
+            self.run_blobs
+                .delete_many(doc! { "run_id": uuid(id), "digest": { "$in": doomed } })
+                .await
+                .map_err(classify)?;
+        }
+        Ok(())
+    }
+
+    /// Delete the body generations of `run` other than `keep_generation` that were written before
+    /// `before`, and return how many rows went. The generation a commit names is never collected,
+    /// however old it is; a superseded one is collected by the next commit of the run, with a
+    /// one-hour grace.
     ///
     /// Exposed so a test (or an operator) can collect with an explicit cutoff: the grace is a
     /// constant of the commit path, not a value a caller has to guess.
-    pub async fn gc_body(&self, run: RunId, keep: Uuid, before: DateTime<Utc>) -> StoreResult<u64> {
+    pub async fn gc_body(
+        &self,
+        run: RunId,
+        keep_generation: Uuid,
+        before: DateTime<Utc>,
+    ) -> StoreResult<u64> {
         let deleted = self
             .body
             .delete_many(doc! {
                 "run_id": uuid(run),
-                "commit_id": { "$ne": commit_uuid(keep) },
+                "generation": { "$ne": generation_uuid(keep_generation) },
                 "written_at": { "$lt": date(before) },
             })
             .await
@@ -2033,5 +2187,260 @@ mod body_insert_tests {
             "one row landed, one duplicate, one lost"
         );
         assert!(!body_insert_is_complete(3, 1, 3), "more rows than asked");
+    }
+}
+
+#[cfg(test)]
+mod body_loser_tests {
+    use adam_core::store::now;
+    use adam_core::{BlobId, BodyRow, BodyWrite, NewRun, RunStatus, RunUpdate};
+    use serde_json::json;
+
+    use super::*;
+
+    async fn store() -> Option<(MongoStore, String)> {
+        let uri = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI")?;
+        let db = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
+        let prefix = format!("s2a_loser_{}_", &Uuid::now_v7().simple().to_string()[..8]);
+        let store = MongoStore::connect(&uri, &db)
+            .await
+            .expect("connect")
+            .with_collection_prefix(&prefix)
+            .expect("prefix");
+        store.migrate().await.expect("migrate");
+        Some((store, prefix))
+    }
+
+    async fn clean(store: &MongoStore, prefix: &str) {
+        for name in [
+            "runs", "journal", "push", "blob", "run_blob", "body", "meta",
+        ] {
+            let _ = store
+                .database()
+                .collection::<Document>(&format!("{prefix}{name}"))
+                .drop()
+                .await;
+        }
+    }
+
+    /// A head naming generation `generation` with `len` rows and one file artifact, `digest`.
+    fn head(generation: Uuid, len: u32, digest: &BlobId) -> serde_json::Value {
+        json!({
+            "v": 5,
+            "agent": {},
+            "body": {"generation": generation.to_string(), "len": len},
+            "artifacts": [{
+                "name": "chart",
+                "data": null,
+                "file": {"filename": "c.svg", "digest": digest.as_str(), "size": 1},
+            }],
+        })
+    }
+
+    /// A loser's rows are deleted; a row the winner's head names is kept, and a reference the
+    /// winner's head names survives.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_loser_rows_and_refs_are_deleted_but_what_the_head_names_is_kept() {
+        let Some((store, prefix)) = store().await else {
+            return;
+        };
+        let agent = format!("loser-{}", Uuid::now_v7().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .expect("create");
+        let generation = Uuid::new_v4();
+        let writer = Uuid::new_v4();
+        let digest = BlobId::from_hex(&"a".repeat(64)).expect("a digest");
+        let other = BlobId::from_hex(&"b".repeat(64)).expect("a digest");
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head(generation, 2, &digest))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: vec![
+                            BodyRow {
+                                idx: 0,
+                                message: json!("winner"),
+                            },
+                            BodyRow {
+                                idx: 1,
+                                message: json!("kept"),
+                            },
+                        ],
+                        writer,
+                    }),
+            )
+            .await
+            .expect("commit");
+        let actual = store
+            .load_run(run.id)
+            .await
+            .expect("load")
+            .expect("the run")
+            .version;
+        // The loser's rows (an append it inserted before losing) and refs.
+        let loser = Uuid::new_v4();
+        let rows = [2_u32, 3]
+            .into_iter()
+            .map(|idx| {
+                body_doc(
+                    run.id,
+                    generation,
+                    loser,
+                    &BodyRow {
+                        idx,
+                        message: json!(format!("loser {idx}")),
+                    },
+                    now(),
+                )
+                .expect("a row")
+            })
+            .collect::<Vec<_>>();
+        store
+            .body
+            .insert_many(&rows)
+            .await
+            .expect("insert the loser rows");
+        store
+            .insert_run_blobs(run.id, &[digest.clone(), other.clone()])
+            .await
+            .expect("refs");
+
+        store
+            .delete_loser(
+                run.id,
+                generation,
+                loser,
+                actual,
+                &[digest.clone(), other.clone()],
+            )
+            .await
+            .expect("delete the loser");
+        let rows = store.body_list(run.id, generation).await.expect("rows");
+        assert_eq!(rows.len(), 2, "the loser's rows went, the winner's stayed");
+        let refs: Vec<Document> = store
+            .run_blobs
+            .find(doc! { "run_id": uuid(run.id) })
+            .await
+            .expect("refs")
+            .try_collect()
+            .await
+            .expect("refs");
+        let digests: Vec<&str> = refs
+            .iter()
+            .filter_map(|doc| doc.get_str("digest").ok())
+            .collect();
+        assert!(
+            digests.contains(&digest.as_str()),
+            "the head's digest is kept"
+        );
+        assert!(
+            !digests.contains(&other.as_str()),
+            "the loser's other ref went"
+        );
+
+        // A row the winner's head names is never deleted, even with the loser's writer.
+        let rows = [2_u32, 3]
+            .into_iter()
+            .map(|idx| {
+                body_doc(
+                    run.id,
+                    generation,
+                    loser,
+                    &BodyRow {
+                        idx,
+                        message: json!(format!("named {idx}")),
+                    },
+                    now(),
+                )
+                .expect("a row")
+            })
+            .collect::<Vec<_>>();
+        store
+            .body
+            .insert_many(&rows)
+            .await
+            .expect("insert the named rows");
+        store
+            .runs
+            .update_one(
+                doc! { "_id": uuid(run.id) },
+                doc! { "$set": { "head.body.len": 4_i64 } },
+            )
+            .await
+            .expect("the winner names four rows");
+        store
+            .delete_loser(run.id, generation, loser, actual, &[])
+            .await
+            .expect("delete the loser again");
+        assert_eq!(
+            store
+                .body_list(run.id, generation)
+                .await
+                .expect("rows")
+                .len(),
+            4,
+            "a row the winner's head names is kept"
+        );
+        clean(&store, &prefix).await;
+    }
+}
+
+#[cfg(test)]
+mod body_insert_error_tests {
+    use mongodb::bson::{doc, from_document};
+    use mongodb::error::{ErrorKind, InsertManyError};
+
+    use super::body_insert_counts;
+
+    fn insert_many(write_errors: bool, write_concern: bool) -> mongodb::error::Error {
+        let mut document = doc! {};
+        if write_errors {
+            document.insert(
+                "writeErrors",
+                vec![doc! {
+                    "index": 0_i32,
+                    "code": 11000_i32,
+                    "errmsg": "duplicate key",
+                }],
+            );
+        }
+        if write_concern {
+            document.insert(
+                "writeConcernError",
+                doc! {
+                    "code": 100_i32,
+                    "codeName": "UnsatisfiableWriteConcern",
+                    "errmsg": "not enough data-bearing nodes",
+                },
+            );
+        }
+        let error: InsertManyError = from_document(document).expect("an insert-many answer");
+        mongodb::error::Error::from(ErrorKind::InsertMany(error))
+    }
+
+    /// A write-concern error is not a completeness answer, even when every write error is a
+    /// duplicate: the write may or may not have landed, so the commit must abort.
+    #[test]
+    fn body_insert_counts_aborts_on_a_write_concern_error() {
+        assert_eq!(
+            body_insert_counts(&insert_many(true, true), 2),
+            None,
+            "a duplicate plus a write-concern failure is not complete"
+        );
+        assert_eq!(
+            body_insert_counts(&insert_many(false, true), 2),
+            None,
+            "a write-concern failure alone is not complete"
+        );
+        assert_eq!(
+            body_insert_counts(&insert_many(true, false), 2),
+            Some((1, 1)),
+            "a duplicate alone is a row that is already there"
+        );
     }
 }

@@ -252,11 +252,11 @@ impl NewRun {
     }
 }
 
-/// One message of a run's transcript: the row at `idx` of the body set a head names.
+/// One message of a run's transcript: the row at `idx` of the body **generation** a head names.
 ///
-/// A body set is `(run, commit, idx)`: `commit` is the UUID a commit picks for the transcript it
-/// writes ([`BodyWrite`]), so a commit that loses the version CAS leaves rows no head names rather
-/// than overwriting the winner's rows at the same index. See [`Store::body_list`].
+/// A body row is `(run, generation, idx)`. A generation is a transcript that only grows: a normal
+/// commit appends the rows after the head's `len`, and a **compaction** starts a new generation
+/// with the whole transcript. See [`BodyWrite`] and [`Store::body_list`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BodyRow {
     /// Position in the transcript, oldest first.
@@ -265,18 +265,30 @@ pub struct BodyRow {
     pub message: Value,
 }
 
-/// The transcript rows one commit writes, as one body set named by `commit`.
+/// The transcript rows one commit writes, and where they go.
 ///
-/// The rows are written once and never updated: a retry of the same attempt reuses `commit`, and a
-/// row that is already there is left as it is, so the set is idempotent. A later commit of the same
-/// run writes a new set with a new `commit`; the earlier one is superseded, stays readable for a
-/// grace period, and is collected afterwards ([`Store::body_list`]).
+/// A run's transcript is **append-only per generation**: a normal commit passes the full transcript
+/// and `generation: None`, and the store inserts only the rows after the current head's `len` (the
+/// runtime guarantees the rows start with the previous transcript). A **compaction** — the agent
+/// shortened or replaced messages, so the new transcript does not start with the old one — passes
+/// `generation: Some(new)` and the whole transcript; the store writes it under a new generation and
+/// the old one is collected later. A run with no current head (a v4 run's first split) starts a
+/// generation: `Some(new)` from the runtime, or `None` and the store picks one.
+///
+/// `writer` is this **attempt's** id, fixed across the CAS retries of one attempt: the store keys
+/// the rows it inserts with it, so a commit that loses the CAS can delete exactly its own rows and
+/// a retry of the same attempt is idempotent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BodyWrite {
-    /// The set's identity; the head that names these rows carries the same value.
-    pub commit: Uuid,
-    /// The rows, oldest first. Their `idx` values must be unique.
+    /// `Some(new)` starts a generation with all `rows` (a compaction, or a first split); `None`
+    /// appends the rows after the current head's `len`, or starts a generation when there is no
+    /// current head.
+    pub generation: Option<Uuid>,
+    /// The rows, oldest first, as the full transcript. Their `idx` values must be unique and
+    /// contiguous from 0.
     pub rows: Vec<BodyRow>,
+    /// This attempt's writer id: the store deletes the rows it inserted if the CAS loses.
+    pub writer: Uuid,
 }
 
 /// Input for [`Store::commit_run`]: the next state of the run.
@@ -295,11 +307,11 @@ pub struct RunUpdate {
     /// cancel or a park re-encodes what it read and passes `None`, so it keeps the format it read
     /// and a stale head is not made current by a commit that did not rebuild it.
     pub head: Option<Value>,
-    /// The transcript set this commit writes, or `None` to write no rows.
+    /// The transcript rows this commit writes, or `None` to write no rows.
     ///
-    /// The rows go to the store **before** the version CAS: a commit that loses leaves rows no
-    /// head names, which readers ignore and the store collects later. The head this commit writes
-    /// names the same `commit` and carries the row count.
+    /// The rows go to the store **before** the version CAS: a commit that loses deletes the rows
+    /// its `writer` inserted, so a loser cannot poison the next append. The head this commit writes
+    /// names the generation the store resolved and the transcript's length; see [`BodyWrite`].
     pub body: Option<BodyWrite>,
     /// The content addresses of the file bytes this commit **adds** (see [`BlobId`]).
     ///
@@ -690,10 +702,14 @@ pub trait Store: Send + Sync + 'static {
     /// `update.head` and `update.body` are the expand release's shadow (ADR 0055): a step that
     /// splits its agent state writes the v5 head beside the full `state` and the rows the head
     /// names. `head: None` leaves the stored head and its version alone, so a delivery, a cancel or
-    /// a park keeps the format it read. `body: None` writes no rows. A store that keeps bodies
-    /// ([`keeps_bodies`](Self::keeps_bodies)) writes the rows **before** the CAS and checks that all
-    /// of them landed: a commit that loses leaves rows no head names, and a head must never name a
-    /// set that is missing a row.
+    /// a park keeps the format it read. `body: None` writes no rows.
+    ///
+    /// A store that keeps bodies ([`keeps_bodies`](Self::keeps_bodies)) resolves the generation
+    /// ([`BodyWrite`]), appends only the rows after the current head's `len` (or writes all of them
+    /// for a new generation), writes them **before** the CAS with the attempt's `writer`, and
+    /// patches the head's `body` to `{generation, len}`. A commit that loses deletes the rows its
+    /// `writer` inserted: a loser must not poison the next append. It also checks that all the rows
+    /// landed, so a head never names a generation that is missing a row.
     async fn commit_run(
         &self,
         id: RunId,
@@ -846,10 +862,10 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// The sweep and a commit's reference insert are **not one transaction**: a reference another
     /// commit is writing at that moment is invisible to the sweep, which can therefore collect a
-    /// blob that commit is about to name. S2a closes it (PostgreSQL: one data-modifying CTE;
-    /// MongoDB: insert the references, check their completeness, then CAS — ADR 0055, decision 3);
-    /// until then the window is a blob whose bytes a run's state still carries in the expand
-    /// release.
+    /// blob that commit is about to name. The PostgreSQL follow-up (after #361) closes it with one
+    /// data-modifying CTE; MongoDB inserts the references, checks their completeness, then CASes
+    /// (ADR 0055, decision 3); until then the window is a blob whose bytes a run's state still
+    /// carries in the expand release.
     ///
     /// **Retention must be longer than a minute.** A child run looks at its parent at least once a
     /// minute (`adam-runtime`), and fails when the parent is `Failed`; a parent that is missing is
@@ -864,14 +880,29 @@ pub trait Store: Send + Sync + 'static {
         false
     }
 
-    /// The rows of body set `commit` of `run`, ordered by [`idx`](BodyRow::idx); empty when the set
-    /// does not exist (never written, or collected after it was superseded).
+    /// The rows of generation `generation` of `run`, ordered by [`idx`](BodyRow::idx); empty when
+    /// it does not exist (never written, or collected after a compaction).
     ///
-    /// A store that keeps no bodies ([`keeps_bodies`](Self::keeps_bodies)) answers empty. The rows
-    /// of a set no head names are still readable: nothing hides them, and nothing serves them.
-    async fn body_list(&self, run: RunId, commit: Uuid) -> StoreResult<Vec<BodyRow>> {
-        let _ = (run, commit);
+    /// A store that keeps no bodies ([`keeps_bodies`](Self::keeps_bodies)) answers empty.
+    async fn body_list(&self, run: RunId, generation: Uuid) -> StoreResult<Vec<BodyRow>> {
+        let _ = (run, generation);
         Ok(Vec::new())
+    }
+
+    /// Delete the body generations of `run` other than `keep_generation` that were written before
+    /// `before`, and return how many rows went. The generation a head names is never collected,
+    /// however old it is; a superseded one is collected by the next commit of the run, with a
+    /// grace period, or by an explicit call with its own cutoff.
+    ///
+    /// A store that keeps no bodies ([`keeps_bodies`](Self::keeps_bodies)) answers `0`.
+    async fn gc_body(
+        &self,
+        run: RunId,
+        keep_generation: Uuid,
+        before: DateTime<Utc>,
+    ) -> StoreResult<u64> {
+        let _ = (run, keep_generation, before);
+        Ok(0)
     }
 
     /// Whether this store keeps a run's file bytes out of its state
@@ -944,6 +975,31 @@ pub fn truncate_ms(t: DateTime<Utc>) -> DateTime<Utc> {
 /// Current time, truncated to milliseconds.
 pub fn now() -> DateTime<Utc> {
     truncate_ms(Utc::now())
+}
+
+/// The `(generation, len)` a v5 head's `body` names, or `None` when it has none yet: a head the
+/// runtime built leaves `generation` `null` for the store to resolve ([`set_head_body`]).
+pub fn head_body(head: &Value) -> Option<(Uuid, u32)> {
+    let body = head.get("body")?;
+    let generation = body
+        .get("generation")?
+        .as_str()
+        .and_then(|text| Uuid::parse_str(text).ok())?;
+    let len = u32::try_from(body.get("len")?.as_u64()?).ok()?;
+    Some((generation, len))
+}
+
+/// Point a v5 head's `body` at `generation`, with `len` rows: what a store does when it resolves
+/// the generation an append belongs to. The runtime leaves `generation` `null` in the head it
+/// builds, because only the store can see the current head.
+pub fn set_head_body(head: &mut Value, generation: Uuid, len: u32) -> StoreResult<()> {
+    let body = head
+        .get_mut("body")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| StoreError::InvalidInput("a v5 head has no body object".into()))?;
+    body.insert("generation".into(), Value::String(generation.to_string()));
+    body.insert("len".into(), Value::from(len));
+    Ok(())
 }
 
 /// A JSON value as **every** store keeps it: the NUL character (`\u{0}`) in a string or an object

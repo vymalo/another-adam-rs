@@ -377,6 +377,10 @@ pub trait AgentStarter: Send + Sync + 'static {
 
     /// The start-only half of [`Agent::split`]: it must return what the agent of the same name
     /// does, or a run it starts is never split. The default is [`Agent::split`]'s: no split.
+    ///
+    /// **A wrapper that delegates [`init`](Self::init) must delegate this too** (and
+    /// [`join`](Self::join), and [`init_continuing`](Self::init_continuing)), or its runs silently
+    /// stay in the v4 format.
     fn split(&self, state: &Self::State) -> Option<(Self::State, Vec<Value>)> {
         let _ = state;
         None

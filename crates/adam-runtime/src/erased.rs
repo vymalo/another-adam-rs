@@ -36,6 +36,11 @@ pub(crate) trait ErasedAgent: ErasedStarter {
     /// The whole state a head and its rows reconstruct ([`Agent::join`](crate::Agent::join)).
     fn join(&self, head: Value, rows: Vec<Value>) -> Result<Value, AgentError>;
 
+    /// The transcript of `state`, or `None` when the agent does not split it. The runtime compares
+    /// it with the rows it is about to write, to tell an append from a compaction without reading
+    /// the store.
+    fn transcript(&self, state: Value) -> Result<Option<Vec<Value>>, AgentError>;
+
     async fn on_cancelled(&self, run: RunId, state: Value);
 }
 
@@ -176,6 +181,17 @@ impl<A: Agent> ErasedAgent for Erased<A> {
             .with_source(e)
         })?;
         encode(&self.0.join(head, rows)?)
+    }
+
+    fn transcript(&self, state: Value) -> Result<Option<Vec<Value>>, AgentError> {
+        let state: A::State = serde_json::from_value(state).map_err(|e| {
+            AgentError::permanent(format!(
+                "a run's previous state does not decode as {:?}'s state",
+                self.0.name()
+            ))
+            .with_source(e)
+        })?;
+        Ok(self.0.split(&state).map(|(_, rows)| rows))
     }
 
     async fn on_cancelled(&self, run: RunId, state: Value) {

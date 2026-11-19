@@ -4510,6 +4510,13 @@ mod cases {
         tokio::time::sleep(Duration::from_millis(150)).await;
         worker.stop().await;
         assert_eq!(agent.hook_calls().len(), 1, "once per cancel commit");
+        let state = store.load_run(run).await.unwrap().expect("the run").state;
+        assert_eq!(
+            super::common::v4::V4Envelope::decode(&state)
+                .expect("a v4 envelope")
+                .v,
+            1
+        );
     }
 
     /// A run that finished is not cancelled, so the hook does not run.
@@ -5316,6 +5323,12 @@ mod cases {
         );
         assert_eq!(count(&steps), 1, "the agent was not stepped");
         assert_eq!(rec.version, version + 2, "and there was no loop");
+        assert_eq!(
+            super::common::v4::V4Envelope::decode(&rec.state)
+                .expect("a v4 envelope")
+                .v,
+            1
+        );
 
         clock.advance(Duration::from_secs(7));
         let ended = wait_failed(&rt, child).await;
@@ -7380,6 +7393,13 @@ mod cases {
             json!({"k": 2}),
             "the exhausted retry kept the agent's state"
         );
+        let state = store.load_run(run).await.unwrap().expect("the run").state;
+        assert_eq!(
+            super::common::v4::V4Envelope::decode(&state)
+                .expect("a v4 envelope")
+                .v,
+            1
+        );
     }
 }
 
@@ -7552,6 +7572,10 @@ struct TranscriptAgent {
     park_at: Option<u32>,
     /// Drop the last row: a split that does not reconstruct the state it was taken from.
     wrong: bool,
+    /// A file artifact the first step emits, for the blob gate.
+    file: Option<Artifact>,
+    /// Replace the transcript on the second step: a compaction, not an append.
+    compact: bool,
 }
 
 impl TranscriptAgent {
@@ -7561,7 +7585,14 @@ impl TranscriptAgent {
             steps,
             park_at: None,
             wrong: false,
+            file: None,
+            compact: false,
         }
+    }
+
+    fn with_file(mut self, file: Artifact) -> Self {
+        self.file = Some(file);
+        self
     }
 }
 
@@ -7606,9 +7637,18 @@ impl Agent for TranscriptAgent {
 
     async fn step(
         &self,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
         mut state: Transcript,
     ) -> Result<Transition<Transcript>, AgentError> {
+        if state.turns == 0
+            && let Some(file) = &self.file
+        {
+            ctx.emit(RunEvent::from(file.clone())).await;
+        }
+        if self.compact && state.turns == 1 {
+            state.messages.clear();
+            state.messages.push("compacted".into());
+        }
         state.turns += 1;
         state.messages.push(format!("turn {}", state.turns));
         if self.park_at == Some(state.turns) {
@@ -7657,8 +7697,12 @@ async fn a_step_that_splits_writes_the_head_and_the_body_beside_the_state() {
     let head = first.head.as_ref().expect("the step commit writes a head");
     let body = first.body.as_ref().expect("and the rows the head names");
     assert_eq!(head["v"], 5);
-    assert_eq!(head["body"]["commit"], json!(body.commit.to_string()));
-    assert_eq!(head["body"]["len"], json!(body.rows.len()));
+    // The runtime leaves the generation null; the store resolves and patches it.
+    assert_eq!(head["body"]["generation"], Value::Null);
+    let generation = body
+        .generation
+        .expect("the first split starts a generation");
+    assert_eq!(head["body"]["len"], 2);
     assert!(
         head["agent"]["messages"].as_array().unwrap().is_empty(),
         "the head keeps no message"
@@ -7675,22 +7719,27 @@ async fn a_step_that_splits_writes_the_head_and_the_body_beside_the_state() {
         json!({"messages": ["start", "turn 1"], "turns": 1})
     );
 
-    // The last commit's head names the last transcript, and the store serves that one at its
-    // version (the first head was superseded by the done commit).
+    // The done commit appends to the same generation: the head grows, the rows are not rewritten.
     let last = commits.last().expect("the done commit");
     let last_head = last.head.as_ref().expect("the done commit writes a head");
     let last_body = last.body.as_ref().expect("and a body");
-    assert_eq!(last_body.rows.len(), 3, "the final transcript is complete");
-    let served = inner.load_head(run).await.expect("load").expect("the run");
-    assert_eq!(&served.state, last_head, "the current head is the done one");
     assert_eq!(
-        inner.body_list(run, last_body.commit).await.expect("body"),
-        last_body.rows
+        last_body.generation, None,
+        "an append does not start a generation"
     );
-    // The superseded first set is still readable until the GC collects it.
+    assert_eq!(last_body.rows.len(), 3, "the final transcript is complete");
+    assert_eq!(last_head["body"]["len"], 3);
+    let served = inner.load_head(run).await.expect("load").expect("the run");
     assert_eq!(
-        inner.body_list(run, body.commit).await.expect("body"),
-        body.rows
+        served.state["body"]["generation"],
+        json!(generation.to_string())
+    );
+    assert_eq!(served.state["body"]["len"], 3);
+    assert_eq!(served.state["agent"], last_head["agent"]);
+    assert_eq!(
+        inner.body_list(run, generation).await.expect("body"),
+        last_body.rows,
+        "one generation holds the whole transcript, not one set per commit"
     );
 }
 
@@ -7746,6 +7795,18 @@ async fn every_state_written_is_a_v4_envelope_and_a_head_is_not_one() {
     let worker = spawn_worker(&rt);
     wait_waiting(&rt, run).await;
     worker.stop().await;
+    let parked_head = inner
+        .load_head(run)
+        .await
+        .expect("load")
+        .expect("the run")
+        .state;
+    let parked_generation = uuid::Uuid::parse_str(
+        parked_head["body"]["generation"]
+            .as_str()
+            .expect("the park's generation"),
+    )
+    .expect("a uuid");
 
     // A delivery: a commit that re-encodes the state it read, with no head.
     rt.deliver(run, late()).await.expect("deliver");
@@ -7763,6 +7824,26 @@ async fn every_state_written_is_a_v4_envelope_and_a_head_is_not_one() {
     let worker = spawn_worker(&rt);
     wait_done(&rt, run).await;
     worker.stop().await;
+    let served = inner.load_head(run).await.expect("load").expect("the run");
+    let done_generation = uuid::Uuid::parse_str(
+        served.state["body"]["generation"]
+            .as_str()
+            .expect("the done generation"),
+    )
+    .expect("a uuid");
+    assert_ne!(
+        done_generation, parked_generation,
+        "a stale head's generation is not appended to: the done commit starts a new one"
+    );
+    assert_eq!(
+        inner
+            .body_list(run, done_generation)
+            .await
+            .expect("body")
+            .len(),
+        3,
+        "the new generation holds the whole transcript"
+    );
 
     let states = recording.states();
     assert!(
@@ -7822,11 +7903,11 @@ async fn the_view_reads_the_state_and_never_the_head() {
     assert_eq!(served.state["v"], 5);
 }
 
-/// A run created with a file artifact already in its state (a seeded run, a session round) uploads
-/// it on its first commit, before the head that names it: a head never names a digest that was not
-/// just uploaded or already referenced.
+/// A run created with a file artifact in its state but no blob (a pre-E run; the runtime's start
+/// paths do not copy artifacts, so this is a direct `create_run`) uploads it on its first commit,
+/// before the head that names it: a head never names a digest that is not there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_run_seeded_with_a_file_uploads_it_before_the_head_names_it() {
+async fn a_pre_e_file_artifact_is_uploaded_before_the_head_names_it() {
     let inner: DynStore = Arc::new(MemoryStore::new());
     let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
     let store: DynStore = recording.clone();
@@ -7865,5 +7946,126 @@ async fn a_run_seeded_with_a_file_uploads_it_before_the_head_names_it() {
         inner.get_blob(&digest).await.expect("read the blob"),
         Some(SVG.to_vec()),
         "the bytes were uploaded before the head named them"
+    );
+}
+
+/// A head never names a digest whose bytes are not stored: a failed upload refuses the split, and
+/// the commit writes the state only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_whose_file_is_not_stored_writes_the_state_only() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let faulty = Arc::new(FaultyStore::new(inner.clone()));
+    faulty.fail_always(Method::PutBlob);
+    let recording = Arc::new(common::recording::RecordingStore::new(faulty.clone()));
+    let store: DynStore = recording.clone();
+    let file =
+        Artifact::file("chart", "image/svg+xml", "chart.svg", SVG.to_vec()).expect("a small file");
+    let agent = TranscriptAgent::new(&uniq("no-blob"), 1).with_file(file);
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let commits = recording.commits();
+    assert!(!commits.is_empty());
+    assert!(
+        commits
+            .iter()
+            .all(|update| update.head.is_none() && update.body.is_none()),
+        "a head is not written when a file artifact's bytes are missing"
+    );
+    let record = inner.load_run(run).await.expect("load").expect("the run");
+    assert_eq!(record.state["v"], 1);
+    assert_eq!(
+        inner
+            .load_head(run)
+            .await
+            .expect("load")
+            .expect("the run")
+            .state["v"],
+        1,
+        "there is no head to serve"
+    );
+}
+
+/// A transcript that no longer starts with the previous one is a compaction: the commit starts a
+/// new generation with the whole transcript, and the old one stays readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compaction_starts_a_new_generation() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let mut agent = TranscriptAgent::new(&uniq("compact"), 2);
+    agent.compact = true;
+    let rt = transcript_runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let commits = recording.commits();
+    assert_eq!(commits.len(), 2);
+    let first = commits[0]
+        .body
+        .as_ref()
+        .expect("a body")
+        .generation
+        .expect("a generation");
+    let second = commits[1]
+        .body
+        .as_ref()
+        .expect("a body")
+        .generation
+        .expect("a generation");
+    assert_ne!(first, second, "a compaction starts a new generation");
+    let served = inner.load_head(run).await.expect("load").expect("the run");
+    assert_eq!(
+        served.state["body"]["generation"],
+        json!(second.to_string()),
+        "the head names the new generation"
+    );
+    assert_eq!(
+        inner.body_list(run, first).await.expect("body").len(),
+        2,
+        "the old generation is still readable"
+    );
+    assert_eq!(
+        inner.body_list(run, second).await.expect("body").len(),
+        2,
+        "the compaction wrote the whole transcript under the new generation"
+    );
+}
+
+/// A CAS retry reuses the attempt's body writer and generation: a retry of one transition writes
+/// the same rows, not a second set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cas_retry_reuses_the_body_writer() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let agent = TranscriptAgent::new(&uniq("retry-writer"), 2);
+    let rt = transcript_runtime(&store, &agent);
+    recording.conflict_next_commit();
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let attempts = recording.attempts();
+    assert!(attempts.len() >= 3, "the first commit was tried twice");
+    let first = attempts[0].body.as_ref().expect("the first attempt's body");
+    let retry = attempts[1].body.as_ref().expect("the retry's body");
+    assert_eq!(
+        first.writer, retry.writer,
+        "a retry of one attempt reuses its writer"
+    );
+    assert_eq!(
+        first.generation, retry.generation,
+        "and the generation it resolved"
+    );
+    assert_eq!(
+        first.rows, retry.rows,
+        "the retry writes the same transcript"
     );
 }

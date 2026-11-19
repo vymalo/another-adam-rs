@@ -177,9 +177,13 @@ macro_rules! blob_conformance {
 macro_rules! body_conformance {
     ($make:path) => {
         $crate::body_conformance!(@cases $make;
-            body_round_trip, body_a_retry_reuses_the_set, body_a_superseded_set_stays_readable,
-            body_a_headless_commit_leaves_the_head_stale, body_sets_are_per_run,
-            body_purge_removes_the_rows,
+            body_an_append_writes_only_the_delta, body_the_generation_is_stable_across_appends,
+            body_a_compaction_starts_a_new_generation_and_the_gc_collects_the_old,
+            body_a_lost_cas_leaves_only_the_winners_rows,
+            body_a_first_split_writes_the_whole_transcript,
+            body_a_retry_with_the_same_writer_is_idempotent, body_purge_removes_the_rows,
+            body_an_unknown_generation_is_empty,
+            body_a_nul_is_stored_as_the_replacement_character,
         );
     };
     (@cases $make:path; $($case:ident),* $(,)?) => {
@@ -238,19 +242,29 @@ pub mod cases {
         );
     }
 
-    /// The smallest document a head can be for a store test: the store treats it as an opaque
-    /// value, so only its identity matters here.
-    fn head_doc(commit: Uuid, len: usize) -> Value {
+    /// The smallest document a head can be for a store test: the runtime leaves the body's
+    /// `generation` null and the store fills it. The store patches `len` to the rows it wrote.
+    fn head_doc(len: usize) -> Value {
         json!({
             "v": 5,
             "agent": {},
-            "body": { "commit": commit, "len": len },
+            "body": { "generation": null, "len": len },
         })
     }
 
-    fn rows(commit: Uuid, messages: &[&str]) -> BodyWrite {
+    /// A head whose agent carries `agent`, for the NUL case.
+    fn head_doc_with_agent(agent: Value, len: usize) -> Value {
+        json!({
+            "v": 5,
+            "agent": agent,
+            "body": { "generation": null, "len": len },
+        })
+    }
+
+    fn rows(generation: Option<Uuid>, writer: Uuid, messages: &[&str]) -> BodyWrite {
         BodyWrite {
-            commit,
+            generation,
+            writer,
             rows: messages
                 .iter()
                 .enumerate()
@@ -260,6 +274,20 @@ pub mod cases {
                 })
                 .collect(),
         }
+    }
+
+    /// The generation a served head names.
+    fn generation_of(head: &Value) -> Uuid {
+        Uuid::parse_str(
+            head["body"]["generation"]
+                .as_str()
+                .expect("the store resolved a generation"),
+        )
+        .expect("a uuid")
+    }
+
+    fn messages(rows: &[BodyRow]) -> Vec<Value> {
+        rows.iter().map(|row| row.message.clone()).collect()
     }
 
     pub async fn blob_round_trip(store: DynStore) {
@@ -511,121 +539,101 @@ pub mod cases {
         );
     }
 
-    /// A body set round-trips, ordered by `idx` however the caller passed the rows, and the head
-    /// that names it is what `load_head` serves.
-    pub async fn body_round_trip(store: DynStore) {
+    /// A normal commit appends only the rows after the head's `len`: the generation holds the
+    /// transcript once, not once per commit.
+    pub async fn body_an_append_writes_only_the_delta(store: DynStore) {
         keeps_bodies(&store);
         let agent = agent();
         let run = store
             .create_run(NewRun::new(&agent, json!({"turn": 0})))
             .await
             .unwrap();
-        let commit = Uuid::new_v4();
-        let head = head_doc(commit, 3);
-        // Deliberately out of order: a transcript is read oldest first.
-        let body = BodyWrite {
-            commit,
-            rows: vec![
-                BodyRow {
-                    idx: 2,
-                    message: json!({"n": 2}),
-                },
-                BodyRow {
-                    idx: 0,
-                    message: json!({"n": 0}),
-                },
-                BodyRow {
-                    idx: 1,
-                    message: json!({"n": 1}),
-                },
-            ],
-        };
+        let generation = Uuid::new_v4();
+        let writer = Uuid::new_v4();
         store
             .commit_run(
                 run.id,
                 run.version,
                 RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1}))
-                    .head(head.clone())
-                    .body(body),
+                    .head(head_doc(2))
+                    .body(rows(Some(generation), writer, &["a", "b"])),
             )
             .await
             .unwrap();
         assert_eq!(
-            store.body_list(run.id, commit).await.unwrap(),
-            (0..3)
-                .map(|idx| BodyRow {
-                    idx,
-                    message: json!({"n": idx}),
-                })
-                .collect::<Vec<_>>(),
-            "the set comes back ordered by idx"
+            messages(&store.body_list(run.id, generation).await.unwrap()),
+            vec![json!("a"), json!("b")],
+            "the first split writes the whole transcript under its generation"
+        );
+
+        store
+            .commit_run(
+                run.id,
+                run.version + 1,
+                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 2}))
+                    .head(head_doc(4))
+                    .body(rows(None, Uuid::new_v4(), &["a", "b", "c", "d"])),
+            )
+            .await
+            .unwrap();
+        let rows = store.body_list(run.id, generation).await.unwrap();
+        assert_eq!(
+            messages(&rows),
+            vec![json!("a"), json!("b"), json!("c"), json!("d")],
+            "an append writes the two new rows, not the four of the transcript"
         );
         assert_eq!(
-            store.load_head(run.id).await.unwrap().unwrap().state,
-            head,
-            "the head that names the set is current"
+            rows.len(),
+            4,
+            "the generation holds the transcript once, not once per commit"
         );
+        let head = store.load_head(run.id).await.unwrap().unwrap().state;
+        assert_eq!(generation_of(&head), generation);
+        assert_eq!(head["body"]["len"], 4, "the head counts the transcript");
     }
 
-    /// A retry of the same attempt reuses the commit id: the second write adds no row and keeps the
-    /// first bytes, so the set is idempotent.
-    pub async fn body_a_retry_reuses_the_set(store: DynStore) {
+    /// Every append keeps the generation the first split chose; the head's `len` grows with the
+    /// transcript.
+    pub async fn body_the_generation_is_stable_across_appends(store: DynStore) {
         keeps_bodies(&store);
         let agent = agent();
         let run = store
             .create_run(NewRun::new(&agent, json!({})))
             .await
             .unwrap();
-        let commit = Uuid::new_v4();
-        store
-            .commit_run(
-                run.id,
-                run.version,
-                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
-                    .head(head_doc(commit, 2))
-                    .body(rows(commit, &["first", "second"])),
-            )
-            .await
-            .unwrap();
-        // The same set again (a retry after a lost acknowledgement), with a row whose bytes differ.
-        let mut retry = rows(commit, &["changed", "second"]);
-        retry.rows.push(BodyRow {
-            idx: 9,
-            message: json!("late"),
-        });
-        store
-            .commit_run(
-                run.id,
-                run.version + 1,
-                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
-                    .head(head_doc(commit, 2))
-                    .body(retry),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.body_list(run.id, commit).await.unwrap(),
-            vec![
-                BodyRow {
-                    idx: 0,
-                    message: json!("first")
-                },
-                BodyRow {
-                    idx: 1,
-                    message: json!("second")
-                },
-                BodyRow {
-                    idx: 9,
-                    message: json!("late")
-                },
-            ],
-            "rows already written are not rewritten"
-        );
+        let generation = Uuid::new_v4();
+        let transcripts: [&[&str]; 3] = [&["one"], &["one", "two"], &["one", "two", "three"]];
+        for (step, transcript) in transcripts.iter().enumerate() {
+            store
+                .commit_run(
+                    run.id,
+                    run.version + u64::try_from(step).unwrap(),
+                    RunUpdate::new(RunStatus::Runnable, json!({"turn": step + 1}))
+                        .head(head_doc(transcript.len()))
+                        .body(rows(
+                            (step == 0).then_some(generation),
+                            Uuid::new_v4(),
+                            transcript,
+                        )),
+                )
+                .await
+                .unwrap();
+            let head = store.load_head(run.id).await.unwrap().unwrap().state;
+            assert_eq!(
+                generation_of(&head),
+                generation,
+                "an append never moves the generation"
+            );
+            assert_eq!(head["body"]["len"], transcript.len());
+        }
+        assert_eq!(store.body_list(run.id, generation).await.unwrap().len(), 3);
     }
 
-    /// A later commit supersedes the set with a new one; the old set stays readable, and the head
-    /// names the new one.
-    pub async fn body_a_superseded_set_stays_readable(store: DynStore) {
+    /// A compaction starts a new generation with the whole transcript; the old one stays readable
+    /// until the GC's cutoff, which collects it and never the current one.
+    pub async fn body_a_compaction_starts_a_new_generation_and_the_gc_collects_the_old(
+        store: DynStore,
+    ) {
         keeps_bodies(&store);
         let agent = agent();
         let run = store
@@ -639,8 +647,8 @@ pub mod cases {
                 run.id,
                 run.version,
                 RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
-                    .head(head_doc(first, 1))
-                    .body(rows(first, &["old"])),
+                    .head(head_doc(2))
+                    .body(rows(Some(first), Uuid::new_v4(), &["old", "older"])),
             )
             .await
             .unwrap();
@@ -649,135 +657,189 @@ pub mod cases {
                 run.id,
                 run.version + 1,
                 RunUpdate::new(RunStatus::Runnable, json!({"turn": 2}))
-                    .head(head_doc(second, 2))
-                    .body(rows(second, &["new", "newer"])),
+                    .head(head_doc(3))
+                    .body(rows(
+                        Some(second),
+                        Uuid::new_v4(),
+                        &["new", "newer", "newest"],
+                    )),
             )
             .await
             .unwrap();
+        assert_eq!(store.body_list(run.id, first).await.unwrap().len(), 2);
         assert_eq!(
-            store.body_list(run.id, first).await.unwrap().len(),
-            1,
-            "the superseded set is still readable"
+            messages(&store.body_list(run.id, second).await.unwrap()),
+            vec![json!("new"), json!("newer"), json!("newest")],
+            "a compaction writes the whole transcript under the new generation"
+        );
+        let head = store.load_head(run.id).await.unwrap().unwrap().state;
+        assert_eq!(generation_of(&head), second);
+        assert_eq!(head["body"]["len"], 3);
+
+        let cutoff = now() + chrono::Duration::hours(1);
+        assert!(
+            store.gc_body(run.id, second, cutoff).await.unwrap() >= 2,
+            "the superseded generation is collected"
+        );
+        assert!(
+            store.body_list(run.id, first).await.unwrap().is_empty(),
+            "the old generation is gone"
         );
         assert_eq!(
             store.body_list(run.id, second).await.unwrap().len(),
-            2,
-            "the current set is complete"
+            3,
+            "the current generation is never collected"
         );
         assert_eq!(
-            store.load_head(run.id).await.unwrap().unwrap().state,
-            head_doc(second, 2),
-            "the head names the new set"
+            store
+                .gc_body(run.id, second, now() + chrono::Duration::hours(24))
+                .await
+                .unwrap(),
+            0,
+            "a second sweep collects nothing"
         );
     }
 
-    /// A commit that writes no head (a delivery, a cancel, a park) leaves the stored head stale:
-    /// `load_head` serves the whole state, and the rows it wrote are readable but named by nothing.
-    pub async fn body_a_headless_commit_leaves_the_head_stale(store: DynStore) {
+    /// A commit at a stale version writes no row: the generation holds the winner's transcript,
+    /// not the loser's.
+    pub async fn body_a_lost_cas_leaves_only_the_winners_rows(store: DynStore) {
         keeps_bodies(&store);
         let agent = agent();
         let run = store
             .create_run(NewRun::new(&agent, json!({})))
             .await
             .unwrap();
-        let current = Uuid::new_v4();
-        let unnamed = Uuid::new_v4();
+        let generation = Uuid::new_v4();
         store
             .commit_run(
                 run.id,
                 run.version,
-                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1}))
-                    .head(head_doc(current, 1))
-                    .body(rows(current, &["current"])),
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc(2))
+                    .body(rows(Some(generation), Uuid::new_v4(), &["winner", "kept"])),
             )
             .await
             .unwrap();
-        // The shape of a `deliver`: the state is re-encoded, no head, and it happens to write rows
-        // too. The head must not move.
-        store
+        // The same expected version, with a longer transcript: the version moved, so it loses.
+        let err = store
             .commit_run(
                 run.id,
-                run.version + 1,
-                RunUpdate::new(
-                    RunStatus::Runnable,
-                    json!({"v": 1, "turn": 1, "late": true}),
-                )
-                .body(rows(unnamed, &["unnamed"])),
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1, "loser": true}))
+                    .head(head_doc(4))
+                    .body(rows(
+                        None,
+                        Uuid::new_v4(),
+                        &["loser", "lost", "more", "rows"],
+                    )),
             )
             .await
-            .unwrap();
-        let loaded = store.load_head(run.id).await.unwrap().unwrap();
-        assert_eq!(
-            loaded.state,
-            json!({"v": 1, "turn": 1, "late": true}),
-            "a stale head is not served; the whole state is"
+            .expect_err("a stale version loses the CAS");
+        assert!(
+            matches!(err, StoreError::Conflict { .. }),
+            "the loser is a conflict: {err:?}"
         );
         assert_eq!(
-            store.body_list(run.id, unnamed).await.unwrap().len(),
-            1,
-            "the rows a headless commit wrote are still there"
+            messages(&store.body_list(run.id, generation).await.unwrap()),
+            vec![json!("winner"), json!("kept")],
+            "the loser wrote no row into the winner's generation"
         );
-        assert_eq!(
-            store.body_list(run.id, current).await.unwrap().len(),
-            1,
-            "the set the stale head names is untouched"
-        );
-        // A later step writes a head again and names a fresh set.
-        let next = Uuid::new_v4();
-        store
-            .commit_run(
-                run.id,
-                run.version + 2,
-                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 2}))
-                    .head(head_doc(next, 1))
-                    .body(rows(next, &["next"])),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            store.load_head(run.id).await.unwrap().unwrap().state,
-            head_doc(next, 1)
-        );
-        assert_eq!(
-            store.body_list(run.id, unnamed).await.unwrap().len(),
-            1,
-            "a set no head ever named stays readable (and is collected later)"
-        );
+        let head = store.load_head(run.id).await.unwrap().unwrap().state;
+        assert_eq!(generation_of(&head), generation);
+        assert_eq!(head["body"]["len"], 2, "the winner's head did not move");
     }
 
-    /// Two runs may pick the same commit id: a set is `(run, commit, idx)`, not `(commit, idx)`.
-    pub async fn body_sets_are_per_run(store: DynStore) {
+    /// A v4 run has no current head: its first split writes the whole transcript, whether the
+    /// runtime names the generation or leaves it to the store.
+    pub async fn body_a_first_split_writes_the_whole_transcript(store: DynStore) {
         keeps_bodies(&store);
-        let commit = Uuid::new_v4();
-        let mut runs = Vec::new();
-        for text in ["one", "two"] {
+        for named in [true, false] {
             let agent = agent();
             let run = store
                 .create_run(NewRun::new(&agent, json!({})))
                 .await
                 .unwrap();
+            let generation = Uuid::new_v4();
             store
                 .commit_run(
                     run.id,
                     run.version,
                     RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
-                        .head(head_doc(commit, 1))
-                        .body(rows(commit, &[text])),
+                        .head(head_doc(3))
+                        .body(rows(
+                            named.then_some(generation),
+                            Uuid::new_v4(),
+                            &["one", "two", "three"],
+                        )),
                 )
                 .await
                 .unwrap();
-            runs.push((run.id, text));
-        }
-        for (run, text) in runs {
+            let head = store.load_head(run.id).await.unwrap().unwrap().state;
+            let served = generation_of(&head);
+            if named {
+                assert_eq!(served, generation);
+            }
+            assert_eq!(head["body"]["len"], 3);
             assert_eq!(
-                store.body_list(run, commit).await.unwrap(),
-                vec![BodyRow {
-                    idx: 0,
-                    message: json!(text)
-                }],
-                "one run's set is not another's"
+                messages(&store.body_list(run.id, served).await.unwrap()),
+                vec![json!("one"), json!("two"), json!("three")],
+                "the first split writes the whole transcript under one generation"
             );
         }
+    }
+
+    /// A retry of the same attempt (the same writer, the same transcript) adds no row and keeps the
+    /// first bytes.
+    pub async fn body_a_retry_with_the_same_writer_is_idempotent(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let generation = Uuid::new_v4();
+        let writer = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc(2))
+                    .body(rows(Some(generation), writer, &["first", "second"])),
+            )
+            .await
+            .unwrap();
+        store
+            .commit_run(
+                run.id,
+                run.version + 1,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 2}))
+                    .head(head_doc(4))
+                    .body(rows(None, writer, &["first", "second", "third", "fourth"])),
+            )
+            .await
+            .unwrap();
+        // The same commit again (an acknowledgement was lost): the same writer and transcript.
+        store
+            .commit_run(
+                run.id,
+                run.version + 2,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 2}))
+                    .head(head_doc(4))
+                    .body(rows(None, writer, &["first", "second", "third", "fourth"])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            messages(&store.body_list(run.id, generation).await.unwrap()),
+            vec![
+                json!("first"),
+                json!("second"),
+                json!("third"),
+                json!("fourth")
+            ],
+            "the retry added no row and rewrote none"
+        );
     }
 
     /// Purging a run removes its body rows with its journal and references.
@@ -789,25 +851,82 @@ pub mod cases {
             .create_run(NewRun::new(&agent, json!({})))
             .await
             .unwrap();
-        let commit = Uuid::new_v4();
+        let generation = Uuid::new_v4();
         store
             .commit_run(
                 run.id,
                 run.version,
                 RunUpdate::new(RunStatus::Done, json!({"done": true}))
-                    .head(head_doc(commit, 2))
-                    .body(rows(commit, &["one", "two"])),
+                    .head(head_doc(2))
+                    .body(rows(Some(generation), Uuid::new_v4(), &["one", "two"])),
             )
             .await
             .unwrap();
-        assert_eq!(store.body_list(run.id, commit).await.unwrap().len(), 2);
+        assert_eq!(store.body_list(run.id, generation).await.unwrap().len(), 2);
         let cutoff = now() + chrono::Duration::hours(1);
         assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 1);
         assert!(
-            store.body_list(run.id, commit).await.unwrap().is_empty(),
+            store
+                .body_list(run.id, generation)
+                .await
+                .unwrap()
+                .is_empty(),
             "the rows went with the run"
         );
         assert!(store.load_head(run.id).await.unwrap().is_none());
+    }
+
+    /// An unknown generation is empty: a generation is an identity, not a filter over all rows.
+    pub async fn body_an_unknown_generation_is_empty(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let generation = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc(1))
+                    .body(rows(Some(generation), Uuid::new_v4(), &["only"])),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .body_list(run.id, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A NUL in a head and in a body row is stored as U+FFFD, as every JSON value is (ADR 0051).
+    pub async fn body_a_nul_is_stored_as_the_replacement_character(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let generation = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc_with_agent(json!({"text": "a\u{0}b"}), 1))
+                    .body(rows(Some(generation), Uuid::new_v4(), &["x\u{0}y"])),
+            )
+            .await
+            .unwrap();
+        let head = store.load_head(run.id).await.unwrap().unwrap().state;
+        assert_eq!(head["agent"]["text"], json!("a\u{FFFD}b"));
+        let rows = store.body_list(run.id, generation).await.unwrap();
+        assert_eq!(rows[0].message, json!("x\u{FFFD}y"));
     }
 
     pub async fn create_and_load(store: DynStore) {

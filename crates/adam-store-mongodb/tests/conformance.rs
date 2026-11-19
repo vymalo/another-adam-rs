@@ -176,20 +176,21 @@ async fn a_head_is_stored_with_its_version_and_a_headless_commit_leaves_it_alone
         .create_run(NewRun::new(&agent, json!({"v": 1, "turn": 0})))
         .await
         .expect("create");
-    let commit = uuid::Uuid::new_v4();
-    let head = json!({"v": 5, "agent": {"turn": 1}, "body": {"commit": commit, "len": 1}});
+    let generation = uuid::Uuid::new_v4();
+    let head = json!({"v": 5, "agent": {"turn": 1}, "body": {"generation": null, "len": 1}});
     store
         .commit_run(
             run.id,
             run.version,
             RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1}))
-                .head(head.clone())
+                .head(head)
                 .body(BodyWrite {
-                    commit,
+                    generation: Some(generation),
                     rows: vec![BodyRow {
                         idx: 0,
                         message: json!("one"),
                     }],
+                    writer: uuid::Uuid::new_v4(),
                 }),
         )
         .await
@@ -211,15 +212,18 @@ async fn a_head_is_stored_with_its_version_and_a_headless_commit_leaves_it_alone
         2,
         "the head was written by the commit that moved version 1 to 2"
     );
+    let served = store
+        .load_head(run.id)
+        .await
+        .expect("load")
+        .expect("the run")
+        .state;
     assert_eq!(
-        store
-            .load_head(run.id)
-            .await
-            .expect("load")
-            .expect("the run")
-            .state,
-        head
+        served["body"]["generation"],
+        json!(generation.to_string()),
+        "the store resolves and patches the generation"
     );
+    assert_eq!(served["body"]["len"], 1);
 
     // A commit with no head (the shape of `deliver`) must leave `head` and `head_version` alone.
     store
@@ -334,15 +338,15 @@ async fn a_partial_body_insert_aborts_before_the_cas() {
         .create_run(NewRun::new(&agent, json!({"v": 1, "turn": 0})))
         .await
         .expect("create");
-    let commit = uuid::Uuid::new_v4();
+    let generation = uuid::Uuid::new_v4();
     let err = store
         .commit_run(
             run.id,
             run.version,
             RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1}))
-                .head(json!({"v": 5, "agent": {}, "body": {"commit": commit, "len": 2}}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 2}}))
                 .body(BodyWrite {
-                    commit,
+                    generation: Some(generation),
                     rows: vec![
                         BodyRow {
                             idx: 0,
@@ -353,6 +357,7 @@ async fn a_partial_body_insert_aborts_before_the_cas() {
                             message: json!("poison"),
                         },
                     ],
+                    writer: uuid::Uuid::new_v4(),
                 }),
         )
         .await
@@ -381,7 +386,7 @@ async fn a_partial_body_insert_aborts_before_the_cas() {
         json!({"v": 1, "turn": 0}),
         "no head names a set that is missing a row"
     );
-    let landed = store.body_list(run.id, commit).await.expect("list");
+    let landed = store.body_list(run.id, generation).await.expect("list");
     assert_eq!(
         landed,
         vec![BodyRow {
@@ -442,19 +447,20 @@ async fn the_body_gc_respects_an_explicit_cutoff() {
         .expect("create");
     let old = uuid::Uuid::new_v4();
     let current = uuid::Uuid::new_v4();
-    let set = |commit, text: &str| BodyWrite {
-        commit,
+    let set = |generation, text: &str| BodyWrite {
+        generation: Some(generation),
         rows: vec![BodyRow {
             idx: 0,
             message: json!(text),
         }],
+        writer: uuid::Uuid::new_v4(),
     };
     store
         .commit_run(
             run.id,
             run.version,
             RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
-                .head(json!({"v": 5, "agent": {}, "body": {"commit": old, "len": 1}}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 1}}))
                 .body(set(old, "old")),
         )
         .await
@@ -464,7 +470,7 @@ async fn the_body_gc_respects_an_explicit_cutoff() {
             run.id,
             run.version + 1,
             RunUpdate::new(RunStatus::Runnable, json!({"turn": 2}))
-                .head(json!({"v": 5, "agent": {}, "body": {"commit": current, "len": 1}}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 1}}))
                 .body(set(current, "current")),
         )
         .await
@@ -474,7 +480,7 @@ async fn the_body_gc_respects_an_explicit_cutoff() {
         .database()
         .collection::<Document>(&format!("{prefix}body"));
     body.update_many(
-        doc! { "commit_id": mongodb::bson::Bson::from(
+        doc! { "generation": mongodb::bson::Bson::from(
             mongodb::bson::Uuid::from_bytes(old.into_bytes())
         ) },
         doc! { "$set": { "written_at": mongodb::bson::DateTime::from_millis(
@@ -517,6 +523,245 @@ async fn the_body_gc_respects_an_explicit_cutoff() {
         let _ = store
             .database()
             .collection::<Document>(&format!("{prefix}{name}"))
+            .drop()
+            .await;
+    }
+}
+
+/// A rejected insert command is not a completeness answer: the commit aborts before the CAS and
+/// no head names the rows. (The write-concern answer itself is pinned by
+/// `body_insert_counts_aborts_on_a_write_concern_error`, which needs no server.)
+#[tokio::test]
+async fn a_rejected_insert_command_aborts_before_the_cas() {
+    use adam_core::{BodyRow, BodyWrite, NewRun, RunStatus, RunUpdate, Store};
+    use mongodb::Client;
+    use mongodb::options::{Acknowledgment, DatabaseOptions, WriteConcern};
+    use serde_json::json;
+
+    let Some(uri) = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI") else {
+        adam_core::testing::skipped(
+            "a_rejected_insert_command_aborts_before_the_cas: not configured",
+        );
+        return;
+    };
+    let db_name = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
+    let prefix = format!(
+        "s2a_wc_{}_",
+        &uuid::Uuid::now_v7().simple().to_string()[..8]
+    );
+    let store = MongoStore::connect(&uri, &db_name)
+        .await
+        .expect("connect")
+        .with_collection_prefix(&prefix)
+        .expect("prefix");
+    store.migrate().await.expect("migrate");
+    let agent = adam_store_testkit::agent();
+    let run = store
+        .create_run(NewRun::new(&agent, json!({})))
+        .await
+        .expect("create");
+
+    // A handle on the same collections whose writes need a second node: a standalone cannot
+    // acknowledge it, so `insert_many` reports a write-concern error.
+    let client = Client::with_uri_str(&uri).await.expect("client");
+    let concern = WriteConcern::builder()
+        .w(Acknowledgment::Nodes(2))
+        .w_timeout(std::time::Duration::from_millis(250))
+        .build();
+    let db = client.database_with_options(
+        &db_name,
+        DatabaseOptions::builder().write_concern(concern).build(),
+    );
+    let strict = MongoStore::new(db)
+        .with_collection_prefix(&prefix)
+        .expect("prefix");
+    let generation = uuid::Uuid::new_v4();
+    // One row is already there, so the insert reports a duplicate **and** the write-concern
+    // failure: a check that only counted duplicates would call the set complete.
+    let body = store
+        .database()
+        .collection::<mongodb::bson::Document>(&format!("{prefix}body"));
+    body.insert_one(mongodb::bson::doc! {
+        "_id": format!("{}:{}:0", run.id, generation),
+        "run_id": mongodb::bson::Bson::from(
+            mongodb::bson::Uuid::from_bytes(run.id.0.into_bytes())
+        ),
+        "generation": mongodb::bson::Bson::from(
+            mongodb::bson::Uuid::from_bytes(generation.into_bytes())
+        ),
+        "writer": mongodb::bson::Bson::from(
+            mongodb::bson::Uuid::from_bytes(uuid::Uuid::new_v4().into_bytes())
+        ),
+        "idx": 0_i32,
+        "message": "already there",
+        "written_at": mongodb::bson::DateTime::now(),
+    })
+    .await
+    .expect("the duplicate row");
+    let err = strict
+        .commit_run(
+            run.id,
+            run.version,
+            RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 2}}))
+                .body(BodyWrite {
+                    generation: Some(generation),
+                    rows: vec![
+                        BodyRow {
+                            idx: 0,
+                            message: json!("one"),
+                        },
+                        BodyRow {
+                            idx: 1,
+                            message: json!("two"),
+                        },
+                    ],
+                    writer: uuid::Uuid::new_v4(),
+                }),
+        )
+        .await
+        .expect_err("a rejected insert must abort the commit");
+    assert!(
+        !matches!(err, adam_core::StoreError::Conflict { .. }),
+        "the store reports the backend's failure: {err:?}"
+    );
+    let loaded = store
+        .load_run(run.id)
+        .await
+        .expect("load")
+        .expect("the run");
+    assert_eq!(loaded.version, 1, "the CAS did not run");
+    assert_eq!(
+        store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run")
+            .state,
+        json!({}),
+        "no head names a generation the store could not confirm"
+    );
+
+    for name in [
+        "runs", "journal", "push", "blob", "run_blob", "body", "meta",
+    ] {
+        let _ = store
+            .database()
+            .collection::<mongodb::bson::Document>(&format!("{prefix}{name}"))
+            .drop()
+            .await;
+    }
+}
+
+/// A normal commit sends only the rows after the head's `len`: the insert command's document count
+/// is the delta, not the transcript. The data looks the same either way (duplicates are ignored),
+/// so the driver's command is what proves the write win.
+#[tokio::test]
+async fn an_append_sends_only_the_delta() {
+    use std::sync::{Arc, Mutex};
+
+    use adam_core::{BodyRow, BodyWrite, NewRun, RunStatus, RunUpdate, Store};
+    use mongodb::Client;
+    use mongodb::event::EventHandler;
+    use mongodb::event::command::CommandEvent;
+    use mongodb::options::ClientOptions;
+    use serde_json::json;
+
+    let Some(uri) = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI") else {
+        adam_core::testing::skipped("an_append_sends_only_the_delta: not configured");
+        return;
+    };
+    let db_name = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
+    let prefix = format!(
+        "s2a_delta_{}_",
+        &uuid::Uuid::now_v7().simple().to_string()[..8]
+    );
+    let seen = Arc::new(Mutex::new(Vec::<(String, usize)>::new()));
+    let sink = Arc::clone(&seen);
+    let mut options = ClientOptions::parse(&uri).await.expect("options");
+    options.command_event_handler = Some(EventHandler::callback(move |event: CommandEvent| {
+        if let CommandEvent::Started(event) = event {
+            let documents = event
+                .command
+                .get_array("documents")
+                .map(Vec::len)
+                .unwrap_or(0);
+            sink.lock()
+                .expect("lock")
+                .push((event.command_name, documents));
+        }
+    }));
+    let client = Client::with_options(options).expect("client");
+    let store = MongoStore::new(client.database(&db_name))
+        .with_collection_prefix(&prefix)
+        .expect("prefix");
+    store.migrate().await.expect("migrate");
+    let agent = adam_store_testkit::agent();
+    let run = store
+        .create_run(NewRun::new(&agent, json!({})))
+        .await
+        .expect("create");
+    let generation = uuid::Uuid::new_v4();
+    let rows = |generation, writer, messages: &[&str]| BodyWrite {
+        generation,
+        writer,
+        rows: messages
+            .iter()
+            .enumerate()
+            .map(|(idx, message)| BodyRow {
+                idx: u32::try_from(idx).expect("a short transcript"),
+                message: json!(message),
+            })
+            .collect(),
+    };
+    store
+        .commit_run(
+            run.id,
+            run.version,
+            RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 2}}))
+                .body(rows(Some(generation), uuid::Uuid::new_v4(), &["a", "b"])),
+        )
+        .await
+        .expect("the first split");
+    seen.lock().expect("lock").clear();
+    store
+        .commit_run(
+            run.id,
+            run.version + 1,
+            RunUpdate::new(RunStatus::Runnable, json!({"turn": 2}))
+                .head(json!({"v": 5, "agent": {}, "body": {"generation": null, "len": 4}}))
+                .body(rows(None, uuid::Uuid::new_v4(), &["a", "b", "c", "d"])),
+        )
+        .await
+        .expect("the append");
+    let inserts: Vec<usize> = seen
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|(name, _)| name == "insert")
+        .map(|(_, documents)| *documents)
+        .collect();
+    assert_eq!(
+        inserts,
+        vec![2],
+        "the append sent two rows, not the four of the transcript"
+    );
+    assert_eq!(
+        store
+            .body_list(run.id, generation)
+            .await
+            .expect("body")
+            .len(),
+        4
+    );
+
+    for name in [
+        "runs", "journal", "push", "blob", "run_blob", "body", "meta",
+    ] {
+        let _ = store
+            .database()
+            .collection::<mongodb::bson::Document>(&format!("{prefix}{name}"))
             .drop()
             .await;
     }

@@ -6,6 +6,7 @@
 
 #![allow(dead_code)] // one test binary includes this module
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use adam_core::{
@@ -30,6 +31,10 @@ pub enum Written {
 pub struct RecordingStore {
     inner: DynStore,
     written: Mutex<Vec<Written>>,
+    /// Every `commit_run` update, successful or not: a CAS retry shows the same attempt twice.
+    attempts: Mutex<Vec<RunUpdate>>,
+    /// When set, the next `commit_run` answers `Conflict` without writing (a forced CAS retry).
+    conflict_next: AtomicBool,
 }
 
 impl RecordingStore {
@@ -37,6 +42,8 @@ impl RecordingStore {
         Self {
             inner,
             written: Mutex::new(Vec::new()),
+            attempts: Mutex::new(Vec::new()),
+            conflict_next: AtomicBool::new(false),
         }
     }
 
@@ -70,8 +77,26 @@ impl RecordingStore {
             .collect()
     }
 
+    /// Every commit attempt's update, in order, including the ones that lost.
+    pub fn attempts(&self) -> Vec<RunUpdate> {
+        self.attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Make the next `commit_run` answer `Conflict` without writing: the runtime retries the same
+    /// attempt, which must reuse its body writer.
+    pub fn conflict_next_commit(&self) {
+        self.conflict_next.store(true, Ordering::SeqCst);
+    }
+
     pub fn reset(&self) {
         self.written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.attempts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
@@ -116,6 +141,17 @@ impl Store for RecordingStore {
         expected_version: u64,
         update: RunUpdate,
     ) -> StoreResult<RunRecord> {
+        self.attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(update.clone());
+        if self.conflict_next.swap(false, Ordering::SeqCst) {
+            return Err(adam_core::StoreError::Conflict {
+                run: id,
+                expected: expected_version,
+                actual: expected_version,
+            });
+        }
         let recorded = update.clone();
         let record = self.inner.commit_run(id, expected_version, update).await?;
         self.record(Written::Committed(recorded));

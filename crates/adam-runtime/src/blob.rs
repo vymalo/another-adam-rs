@@ -7,18 +7,76 @@
 //! release**: a failed upload is logged and the commit goes on, because the run's state still
 //! carries the bytes. The contract release gates a run's head on the upload instead.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use adam_core::{BlobId, DynStore};
 use sha2::{Digest as _, Sha256};
 
-use crate::events::Artifact;
+use crate::events::{Artifact, ArtifactFile};
 
 /// The content address of `bytes`: their SHA-256 as 64 lower-case hexadecimal digits.
 pub fn blob_id(bytes: &[u8]) -> BlobId {
     let mut digest = [0_u8; 32];
     digest.copy_from_slice(&Sha256::digest(bytes));
     BlobId::from_sha256(&digest)
+}
+
+/// What one [`upload_all`] pass found: the digests of the file artifacts (with their sizes) and
+/// whether every one of them is stored.
+pub(crate) struct Uploaded {
+    /// The digests, without duplicates.
+    pub ids: Vec<BlobId>,
+    /// Each digest and its byte length, for a head that names it by reference.
+    pub sizes: HashMap<BlobId, u64>,
+    /// Whether every file's bytes are stored. A head may only name bytes that are there.
+    pub all_stored: bool,
+}
+
+/// Upload every file artifact of `artifacts` (idempotent, digest-deduped) and report whether all of
+/// them are stored.
+///
+/// Unlike [`upload_files`], a failed put is **not** ignored: a commit that writes a head must not
+/// name a digest whose bytes are missing, so the caller writes the state only when `all_stored` is
+/// false. A store that keeps no blobs cannot back a file reference at all: `all_stored` is false
+/// when there is a file, and the pass uploads nothing.
+pub(crate) async fn upload_all(store: &DynStore, artifacts: &[Artifact]) -> Uploaded {
+    let mut uploaded = Uploaded {
+        ids: Vec::new(),
+        sizes: HashMap::new(),
+        all_stored: true,
+    };
+    let files: Vec<&ArtifactFile> = artifacts
+        .iter()
+        .filter_map(|artifact| artifact.file.as_ref())
+        .collect();
+    if files.is_empty() {
+        return uploaded;
+    }
+    if !store.keeps_blobs() {
+        uploaded.all_stored = false;
+        return uploaded;
+    }
+    let mut seen = HashSet::new();
+    for file in files {
+        let id = blob_id(&file.bytes);
+        uploaded.sizes.insert(
+            id.clone(),
+            u64::try_from(file.bytes.len()).unwrap_or(u64::MAX),
+        );
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Err(error) = store.put_blob(&id, &file.bytes).await {
+            tracing::warn!(
+                blob = %id,
+                error = %adam_error::report(&error),
+                "a file artifact's bytes could not be stored; a head must not name them"
+            );
+            uploaded.all_stored = false;
+        }
+        uploaded.ids.push(id);
+    }
+    uploaded
 }
 
 /// Store the bytes of every file artifact in `artifacts` and return their digests, without
