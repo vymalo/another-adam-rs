@@ -76,6 +76,8 @@ pub const DEFAULT_POOL_SIZE: u32 = 16;
 /// pool, and `PgListener::connect_with(&pool)` holds one connection for the process's life. A
 /// one-connection pool hands that connection to the listener, and every store query then waits
 /// out sqlx's acquire timeout — for ever, while startup succeeded and the pod reports Ready.
+///
+/// Two is the floor, not a size to run: [`DEFAULT_POOL_SIZE`] (16) is the intended size.
 pub const MIN_POOL_SIZE: u32 = 2;
 
 /// The largest pool `ADAM_PG_POOL_SIZE` or [`PgStore::connect_with_pool_size`] accepts.
@@ -527,10 +529,12 @@ impl Sql {
             runs_table: runs.clone(),
             migrate_lock: format!("adam-rs:migrate:{p}"),
             listing_index: runs_list.clone(),
+            // `to_regclass` resolves the unqualified name through the search path, like every
+            // other statement here, so two deployments that share a database with the same prefix
+            // in different schemas each inspect their own index (a `pg_class.relname` match would
+            // read whichever came first).
             listing_index_state: Arc::from(
-                "SELECT i.indisvalid FROM pg_index i
-                   JOIN pg_class c ON c.oid = i.indexrelid
-                  WHERE c.relname = $1",
+                "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
             ),
             create_listing_index: Arc::from(format!(
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS {runs_list}
@@ -1426,11 +1430,29 @@ mod tests {
                 store.upgrade_listing_index(&mut conn).await
             })
         };
-        // Let the upgrade reach its DDL, then write from another connection. A concurrent build
-        // takes `SHARE UPDATE EXCLUSIVE`, which a write does not conflict with; a non-concurrent
-        // one takes `SHARE` (against writes) or `ACCESS EXCLUSIVE` (against everything), and this
-        // insert would queue behind the whole build.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait until the build holds its `SHARE UPDATE EXCLUSIVE` lock on `runs`: from then on the
+        // probe below runs beside the DDL itself, not before or after it. (A non-concurrent build
+        // asks for `SHARE`/`ACCESS EXCLUSIVE` instead, so this wait times out and the test fails.)
+        let build_started = async {
+            loop {
+                let held: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_locks
+                      WHERE locktype = 'relation' AND relation = to_regclass($1)
+                        AND mode = 'ShareUpdateExclusiveLock' AND granted",
+                )
+                .bind(format!("{p}runs"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if held > 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), build_started)
+            .await
+            .expect("the upgrade never took its ShareUpdateExclusiveLock on runs");
         let probe = Uuid::new_v4();
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -1444,6 +1466,10 @@ mod tests {
         .await
         .expect("a write waited for the listing-index upgrade")
         .expect("the write");
+        assert!(
+            !upgrade.is_finished(),
+            "the upgrade finished before the probe, so the probe proved nothing"
+        );
 
         // The build waits for the writer's transaction to end, not the other way round.
         writer.rollback().await.unwrap();
@@ -1458,9 +1484,7 @@ mod tests {
         assert_eq!(written, 1, "the write landed beside the build");
 
         let valid: Option<bool> = sqlx::query_scalar(
-            "SELECT i.indisvalid FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indexrelid
-              WHERE c.relname = $1",
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
         )
         .bind(format!("{p}runs_list_status"))
         .fetch_optional(&pool)

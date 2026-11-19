@@ -263,15 +263,11 @@ async fn index_definition(pool: &PgPool, name: &str) -> Option<String> {
 /// `Some(true)` for a valid index, `Some(false)` for one a failed build left INVALID, `None` for
 /// no such index.
 async fn index_valid(pool: &PgPool, name: &str) -> Option<bool> {
-    sqlx::query_scalar(
-        "SELECT i.indisvalid FROM pg_index i
-           JOIN pg_class c ON c.oid = i.indexrelid
-          WHERE c.relname = $1",
-    )
-    .bind(name)
-    .fetch_optional(pool)
-    .await
-    .unwrap()
+    sqlx::query_scalar("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
 }
 
 /// The listing index answers the status filter from the index (`INCLUDE (status)`), so a page does
@@ -384,6 +380,83 @@ async fn the_listing_index_answers_the_status_filter_and_replaces_the_version_3_
         listed.iter().map(|r| r.id).collect::<Vec<_>>(),
         vec![second.id, first.id]
     );
+
+    drop_tables(&pool, &p).await;
+}
+
+/// A concurrent build that fails leaves an INVALID index under the name the migration looks for.
+/// `CREATE INDEX IF NOT EXISTS` would keep it for ever; the upgrade drops and rebuilds it, and the
+/// end state is a valid index with the included status.
+#[tokio::test]
+async fn an_invalid_listing_index_is_dropped_and_rebuilt() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let p = format!(
+        "adam_mig_{}_",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store = PgStore::from_pool(pool.clone())
+        .with_table_prefix(&p)
+        .unwrap();
+    let new_index = format!("{p}runs_list_status");
+    store.migrate().await.unwrap();
+
+    // Two runs of one agent: a unique index on `agent` cannot be built over them, and a concurrent
+    // build that fails leaves the index INVALID rather than removing it.
+    let agent = format!(
+        "invalid-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    store
+        .create_run(NewRun::new(&agent, json!({"n": 1})))
+        .await
+        .unwrap();
+    store
+        .create_run(NewRun::new(&agent, json!({"n": 2})))
+        .await
+        .unwrap();
+    sqlx::query(AssertSqlSafe(format!("DROP INDEX {new_index}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let failed = sqlx::query(AssertSqlSafe(format!(
+        "CREATE UNIQUE INDEX CONCURRENTLY {new_index} ON {p}runs (agent)"
+    )))
+    .execute(&pool)
+    .await;
+    assert!(
+        failed.is_err(),
+        "a unique index over duplicate agents cannot be built"
+    );
+    assert_eq!(
+        index_valid(&pool, &new_index).await,
+        Some(false),
+        "a failed concurrent build leaves an INVALID index"
+    );
+
+    // Back to version 3, then migrate: the invalid index is dropped and rebuilt.
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {p}meta SET value = '3' WHERE key = 'schema_version'"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    store.migrate().await.unwrap();
+    let definition = index_definition(&pool, &new_index)
+        .await
+        .expect("the rebuilt index");
+    assert!(
+        definition.contains("INCLUDE (status)"),
+        "the rebuilt index is the listing index, not the failed one: {definition}"
+    );
+    assert_eq!(index_valid(&pool, &new_index).await, Some(true));
+    assert_eq!(version(&pool, &p).await, "4");
 
     drop_tables(&pool, &p).await;
 }
