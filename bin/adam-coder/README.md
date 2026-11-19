@@ -217,7 +217,7 @@ sequenceDiagram
   participant M as Model
   participant E as Thread tools endpoint
   S->>C: message: text, ui-catalog/v1 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
-  C->>E: tools/list (at every model turn, with the grant)
+  C->>E: tools/list (once per grant, and again after the 60 s TTL, with the grant)
   E-->>C: get_ui_catalog and the tools attached since
   C->>M: the coder's tools, ask_user, show, ui_catalog, plan_work, plan_check, plan_add, then the listed ones except get_ui_catalog
   M->>C: ask_user {question, choices: [db, auth, deploy]}

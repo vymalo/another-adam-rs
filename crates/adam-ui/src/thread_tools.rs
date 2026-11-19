@@ -110,7 +110,7 @@ const MAX_CACHED_LISTINGS: usize = 16;
 
 /// One listing and the instant it stops being reused.
 struct CachedListing {
-    tools: Vec<RemoteTool>,
+    tools: Arc<Vec<RemoteTool>>,
     until: DateTime<Utc>,
 }
 
@@ -161,9 +161,9 @@ pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 /// Reaches the thread-tools endpoint a run's context announces.
 ///
-/// The listings this process has read are kept here, by `(url, token)`: a model turn reuses the one
-/// its grant read instead of opening a new MCP session for the same static list. A call still dials
-/// per call (the token is short-lived, and the endpoint is stateless).
+/// The listings this process has read are kept here, by `(url, sha256(token))`: a model turn reuses
+/// the one its grant read instead of opening a new MCP session for the same static list. A call
+/// still dials per call (the token is short-lived, and the endpoint is stateless).
 #[derive(Clone)]
 pub struct ThreadToolsClient {
     policy: McpPolicy,
@@ -260,40 +260,45 @@ impl ThreadToolsClient {
 
     /// The tools `grant`'s endpoint lists, from the listing this client read for it when that is
     /// still reusable ([`LISTING_TTL`], and never past the grant's expiry), else over a new session
-    /// (initialize, `tools/list`, close). A failed listing is not remembered.
-    pub(crate) async fn listed(&self, grant: &Grant) -> Result<Vec<RemoteTool>, EndpointError> {
+    /// (initialize, `tools/list`, close). A failed listing is not remembered, and neither is an
+    /// empty one: an endpoint that lists nothing is asked again next turn.
+    pub(crate) async fn listed(
+        &self,
+        grant: &Grant,
+    ) -> Result<Arc<Vec<RemoteTool>>, EndpointError> {
         let key = listing_key(grant);
         let now = (self.clock)();
         if let Some(tools) = self.cached(&key, now) {
             return Ok(tools);
         }
-        let tools = self.endpoint(grant)?.list_tools().await?;
-        self.remember(key, &tools, now, grant.expires_at);
+        let tools = Arc::new(self.endpoint(grant)?.list_tools().await?);
+        if !tools.is_empty() {
+            self.remember(key, Arc::clone(&tools), now, grant.expires_at);
+        }
         Ok(tools)
     }
 
     /// Drop the listing read for `grant`: the next turn lists again. A call the endpoint refused
-    /// may name a tool it no longer has, so the list it came from is not trusted after it.
+    /// may name a tool it no longer has, so the list it came from is not trusted after it. Any
+    /// protocol refusal counts, bad arguments included: the cost is one `tools/list` on the next
+    /// turn, and the alternative is trusting a list the endpoint just disagreed with.
     pub(crate) fn forget_listing(&self, grant: &Grant) {
-        self.listings
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&listing_key(grant));
+        let now = (self.clock)();
+        let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
+        listings.retain(|_, listing| listing.until > now);
+        listings.remove(&listing_key(grant));
     }
 
-    fn cached(&self, key: &(String, String), now: DateTime<Utc>) -> Option<Vec<RemoteTool>> {
-        self.listings
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
-            .filter(|listing| listing.until > now)
-            .map(|listing| listing.tools.clone())
+    fn cached(&self, key: &(String, String), now: DateTime<Utc>) -> Option<Arc<Vec<RemoteTool>>> {
+        let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
+        listings.retain(|_, listing| listing.until > now);
+        listings.get(key).map(|listing| Arc::clone(&listing.tools))
     }
 
     fn remember(
         &self,
         key: (String, String),
-        tools: &[RemoteTool],
+        tools: Arc<Vec<RemoteTool>>,
         now: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) {
@@ -309,13 +314,16 @@ impl ThreadToolsClient {
         {
             listings.remove(&oldest);
         }
-        listings.insert(
-            key,
-            CachedListing {
-                tools: tools.to_vec(),
-                until,
-            },
-        );
+        listings.insert(key, CachedListing { tools, until });
+    }
+
+    /// How many listings the cache holds (a test of the expiry sweep).
+    #[cfg(test)]
+    fn cached_listings(&self) -> usize {
+        self.listings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Ask the endpoint for the thread's current catalog: `get_ui_catalog` with `known_digest`
@@ -577,8 +585,8 @@ impl ToolSource for ThreadTools {
         let listed = self.client.listed(&grant).await;
         match listed {
             Ok(tools) => {
-                let tools: Vec<RemoteTool> = tools
-                    .into_iter()
+                let tools: Vec<&RemoteTool> = tools
+                    .iter()
                     .filter(|tool| !self.hidden.contains(&tool.name.as_str()))
                     .filter(|tool| {
                         let fine = fits(&tool.name);
@@ -592,8 +600,8 @@ impl ToolSource for ThreadTools {
                     })
                     .collect();
                 Listing {
-                    specs: tools.iter().map(RemoteTool::spec).collect(),
-                    notes: tools.iter().filter_map(note_of).collect(),
+                    specs: tools.iter().map(|tool| tool.spec()).collect(),
+                    notes: tools.iter().filter_map(|tool| note_of(tool)).collect(),
                 }
             }
             Err(e) => {
@@ -886,6 +894,26 @@ mod tests {
             SourceCtx::detached(context(&server.url("t1"), "tok2", "2026-10-01T14:00:00Z"));
         assert_eq!(source.specs(&renewed).await, second);
         assert_eq!((server.initializations(), server.lists()), (3, 3));
+    }
+
+    #[tokio::test]
+    async fn an_expired_listing_is_dropped_even_when_nothing_is_read() {
+        let server = ThreadToolsServer::start(&["tok", "tok2"]).await;
+        let (clock, now) = moving_clock("2026-10-01T12:00:00Z");
+        let client = ThreadToolsClient::new(McpPolicy::default()).with_clock(clock);
+        let source = ThreadTools::new(Arc::new(client.clone()));
+        let ctx = SourceCtx::detached(context(&server.url("t1"), "tok", "2026-10-01T14:00:00Z"));
+        assert!(!source.specs(&ctx).await.is_empty());
+        assert_eq!(client.cached_listings(), 1);
+
+        set(&now, "2026-10-01T12:01:01Z");
+        // Dropping another grant's listing prunes what expired on the way, so an idle process does
+        // not keep a digest and a URL for ever.
+        let other = client
+            .grant(&context(&server.url("t1"), "tok2", "2026-10-01T14:00:00Z"))
+            .unwrap();
+        client.forget_listing(&other);
+        assert_eq!(client.cached_listings(), 0, "the expired entry was swept");
     }
 
     #[tokio::test]

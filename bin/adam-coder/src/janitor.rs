@@ -6,10 +6,12 @@
 //!
 //! Every `WORKSPACE_SWEEP_SECS` ([`crate::config`]; 300 by default, and once at startup) it walks the
 //! runs that have a workspace on this worker's volume ([`Workspaces::runs`]) and asks the store
-//! about each one, once: what that read learned is reused by the later passes of the same sweep.
-//! The record's `status` is enough, so no state is decoded; the read still transfers the whole
-//! record, because a status projection is not in this tree yet (P3 of the 2026-11-18 optimisation
-//! review). What the store answers is:
+//! about each one. What that read learned is reused by the passes over kept output and held runs;
+//! the pass over image scopes still reads the run that noted a scope. A purged id is not remembered
+//! as finished, because a retry can create the same run during the sweep. The record's `status` is
+//! enough, so no state is decoded; the read still transfers the whole record, because a status
+//! projection is not in this tree yet (P3 of the 2026-11-18 optimisation review). What the store
+//! answers is:
 //!
 //! * the run is **open** (`runnable` or `parked`): its workspace stays, whatever it holds. A run
 //!   that waits for the person's answer for a week keeps its workspace for a week;
@@ -201,7 +203,13 @@ impl Janitor {
                     report.failed.push(run);
                 }
                 Ok(Standing::Over(record)) => {
-                    seen.insert(run.clone(), Some(true));
+                    // A purged id is not over for good: `task_id_for` derives it from the caller,
+                    // the context and the message id, so a retry can create the same run during
+                    // this sweep. Only a record the store still knows is remembered as finished;
+                    // the passes below re-read an unknown one.
+                    if record.is_some() {
+                        seen.insert(run.clone(), Some(true));
+                    }
                     // What runs in the environment goes first: the commands that keep running, and
                     // what a worker that is gone left in the records.
                     self.commands.stop_run(&run, "the run ended").await;
@@ -496,11 +504,14 @@ impl Janitor {
                 return;
             }
         };
+        // The runs the sweep already failed, by id: `report.failed` is a list, and a sweep can
+        // hold many runs.
+        let mut failed: HashSet<String> = report.failed.iter().cloned().collect();
         for run in held {
             if stop.is_cancelled() {
                 break;
             }
-            if released.contains(&run) || report.failed.contains(&run) {
+            if released.contains(&run) || failed.contains(&run) {
                 continue;
             }
             let over = match seen.get(&run) {
@@ -515,12 +526,14 @@ impl Janitor {
                     }
                     Err(e) => {
                         tracing::warn!(%run, error = %adam_error::report(&e), "cannot release the environment of a finished run");
+                        failed.insert(run.clone());
                         report.failed.push(run);
                     }
                 },
                 Ok(Some(false) | None) => {}
                 Err(e) => {
                     tracing::warn!(%run, error = %adam_error::report(&e), "cannot ask the store about a run; its environment stays");
+                    failed.insert(run.clone());
                     report.failed.push(run);
                 }
             }

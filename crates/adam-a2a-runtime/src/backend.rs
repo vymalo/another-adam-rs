@@ -352,6 +352,34 @@ impl RuntimeTaskBackend {
         (subject == caller.subject).then_some(context)
     }
 
+    /// The view and context of a run a repeated submission found. `start_with_id` said the run
+    /// exists; if the view says it is not this caller's, a purge between the two reads is a retry
+    /// (the id is derived, and a retry can create it again), while a record that exists under
+    /// another owner is a bug.
+    async fn repeated(
+        &self,
+        caller: &Caller,
+        run: RunId,
+    ) -> Result<(RunView, String), BackendError> {
+        let Some((_, view, context)) = self.owned(caller, &run.to_string()).await? else {
+            let gone = self
+                .runtime
+                .store()
+                .load_run(run)
+                .await
+                .map_err(|e| map_err(e.into()))?
+                .is_none();
+            return Err(if gone {
+                BackendError::unavailable(
+                    "the task was removed while a repeated request was settled",
+                )
+            } else {
+                BackendError::internal("a repeated submission found a foreign task")
+            });
+        };
+        Ok((view, context))
+    }
+
     /// The run that a new task started by `message` in `context_id` continues: the first of its
     /// `referenceTaskIds` that is this caller's, this agent's, in this context and finished.
     ///
@@ -551,10 +579,7 @@ impl RuntimeTaskBackend {
                     // was created with (a request without `contextId` got a
                     // generated one the first time). The view that proves it is
                     // the task's: no write followed the failed start.
-                    let (_, view, context) =
-                        self.owned(caller, &run.to_string()).await?.ok_or_else(|| {
-                            BackendError::internal("a repeated submission found a foreign task")
-                        })?;
+                    let (view, context) = self.repeated(caller, run).await?;
                     return Ok(Joined {
                         run,
                         context,
@@ -1093,5 +1118,53 @@ mod tests {
         assert_eq!(told.code, -32603);
         assert_eq!(told.message, "backend temporarily unavailable");
         assert!(!told.message.contains("connection reset"));
+    }
+
+    /// A repeated submission whose run vanished between the start and the view is a retry, not a
+    /// server fault; a record of another agent under the same id is a bug.
+    #[tokio::test]
+    async fn a_repeated_run_that_vanished_is_a_retry_and_a_foreign_one_is_a_bug() {
+        use adam_core::{DynStore, MemoryStore};
+        use adam_runtime::{AgentStarter, Inbound};
+        use std::sync::Arc;
+
+        struct Other;
+        impl AgentStarter for Other {
+            type State = serde_json::Value;
+            fn name(&self) -> &str {
+                "someone-else"
+            }
+            fn init(&self, _input: Inbound) -> Result<Self::State, AgentError> {
+                Ok(serde_json::json!({}))
+            }
+        }
+
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let runtime = Runtime::builder(store.clone()).starter(Other).build();
+        let backend =
+            RuntimeTaskBackend::new(runtime.clone(), BroadcastSink::default(), "scripted");
+        let caller = Caller::new("token-0");
+
+        let ghost = backend.repeated(&caller, RunId::new()).await.unwrap_err();
+        assert!(
+            matches!(ghost, BackendError::Unavailable { .. }),
+            "{ghost:?}"
+        );
+
+        let id = RunId::new();
+        runtime
+            .start_with_id(
+                id,
+                "someone-else",
+                Inbound::new("m-1", serde_json::json!({"text": "go"})),
+                Some("token-1:ctx"),
+            )
+            .await
+            .unwrap();
+        let foreign = backend.repeated(&caller, id).await.unwrap_err();
+        assert!(
+            matches!(foreign, BackendError::Internal { .. }),
+            "{foreign:?}"
+        );
     }
 }

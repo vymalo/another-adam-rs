@@ -207,7 +207,9 @@ inbound function reads a screen's action as JSON text.
 * **The thread tools** are not tools of this crate: `ThreadTools` lists the endpoint (`tools/list` over one
   connection, with the grant's bearer token) once per grant — a turn reuses the listing, and a new grant, a refused
   call or the 60 s `LISTING_TTL` lists again — and answers a call to a
-  tool that is none of the agent's own by calling the endpoint (`tools/call`). A listed tool whose name no model
+  tool that is none of the agent's own by calling the endpoint (`tools/call`). **A tool the endpoint adds mid-run is
+  therefore not offered until the next grant or 60 s, whichever comes first**; a call it refuses drops the listing at
+  once, so the turn after it lists again. A listed tool whose name no model
   provider accepts is left out (with a warning); one that clashes with an own tool loses to it, with a warning, **except a relayed
   tool** (`<server>__<tool>`: the conversation attached a server the agent's own `mcp.json` has too, as a web search), whose omission is
   a debug line (`ToolSource::expects_repeat`; `tests/duplicate_tools.rs`). The source of a
@@ -394,7 +396,7 @@ stateDiagram-v2
   the model's mistakes (a typed default with a character the person cannot see among them), the instance, the text form.
   `adam-a2a-runtime`'s `src/words.rs`: which characters are controls or formats and what two spellings of the same words have in common
   (U+FEFF, the zero-width and bidirectional marks, case, U+212A). `src/thread_tools.rs`: the grant and its expiry (with a clock),
-  the answer of `get_ui_catalog`, the listing at every turn against the fake endpoint, a call, and every way a call
+  the answer of `get_ui_catalog`, the listing once per grant and again after the TTL against the fake endpoint, a call, and every way a call
   degrades with the token never shown.
 * `tests/tools.rs`: the three tools against the web's real catalog: the digest of the fixture is the web's lock;
   three questions as one Choices (the surface is a golden file, `tests/golden/ask_choices.json`); text for a screen

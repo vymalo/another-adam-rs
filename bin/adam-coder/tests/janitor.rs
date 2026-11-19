@@ -5,12 +5,13 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use adam_coder::Janitor;
 use adam_coder::tools::RunNotes;
 use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus, RunUpdate};
+use adam_llm_agent::KeptOutputs as _;
 use adam_workspace::RepoRef;
 use common::{FakeEnvironment, Fixture};
 use serde_json::json;
@@ -381,7 +382,8 @@ async fn a_sweep_reads_each_run_once() {
         runs.push(run);
     }
     // Every one of them is also something the environment still holds: the orphan pass would ask
-    // again about the open ones, and the kept-output pass about all four.
+    // again about the open ones, and the kept-output pass about the open ones (a finished run's
+    // output went with its workspace).
     *fake.held.lock().unwrap() = runs.clone();
 
     let report = janitor_with(&fx, &fake)
@@ -392,6 +394,89 @@ async fn a_sweep_reads_each_run_once() {
         counting.calls(Method::LoadRun),
         4,
         "one read per run, not one per pass: {report:?}"
+    );
+}
+
+/// An environment that, when the sweep asks what it holds, does what a retry after a purge does:
+/// creates the run again under the same id, with kept output under the same id.
+struct Recreated {
+    inner: Arc<FakeEnvironment>,
+    store: DynStore,
+    kept: Arc<adam_coder::kept::FileKept>,
+    run: String,
+    once: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl adam_workspace::Environment for Recreated {
+    async fn ensure(
+        &self,
+        workspace: &adam_workspace::RunWorkspace,
+        progress: &dyn adam_workspace::EnvProgress,
+    ) -> Result<Arc<dyn adam_workspace::EnvSession>, adam_workspace::EnvError> {
+        self.inner.ensure(workspace, progress).await
+    }
+
+    async fn release(&self, run: &str) -> Result<(), adam_workspace::EnvError> {
+        self.inner.release(run).await
+    }
+
+    async fn held_runs(&self) -> Result<Vec<String>, adam_workspace::EnvError> {
+        if !self.once.swap(true, Ordering::SeqCst) {
+            self.store
+                .create_run(NewRun {
+                    id: RunId(self.run.parse().unwrap()),
+                    agent: "coder".to_owned(),
+                    conversation_id: None,
+                    parent_id: None,
+                    status: RunStatus::Runnable,
+                    state: json!({}),
+                    wake_at: None,
+                })
+                .await
+                .unwrap();
+            let id = adam_llm_agent::output_id(&self.run, "c1");
+            self.kept
+                .keep(&self.run, &id, "kept again\n", 0)
+                .await
+                .unwrap();
+        }
+        self.inner.held_runs().await
+    }
+}
+
+/// A purged id is not remembered as finished: `task_id_for` derives it from the caller, the context
+/// and the message id, so a retry can create the same run during a sweep. The kept-output pass
+/// re-reads an unknown id, sees the live run, and leaves its output alone.
+#[tokio::test]
+async fn a_purged_run_recreated_during_a_sweep_keeps_its_output() {
+    use adam_llm_agent::KeptOutputs as _;
+
+    let fx = Fixture::new().await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let unknown = RunId::new().to_string();
+    workspace_of(&fx, &unknown).await;
+    let id = adam_llm_agent::output_id(&unknown, "c1");
+    fx.env.kept.keep(&unknown, &id, "kept\n", 0).await.unwrap();
+    let fake = FakeEnvironment::new(Some(&fx.root));
+    *fake.held.lock().unwrap() = vec![unknown.clone()];
+    let recreated = Arc::new(Recreated {
+        inner: fake,
+        store: store.clone(),
+        kept: fx.env.kept.clone(),
+        run: unknown.clone(),
+        once: AtomicBool::new(false),
+    });
+    let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)))
+        .with_environment(recreated);
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(report.removed, std::slice::from_ref(&unknown), "{report:?}");
+    assert!(
+        fx.root.join("outputs").join(&unknown).is_dir(),
+        "the retry recreated the run during the sweep: its output stays"
     );
 }
 
