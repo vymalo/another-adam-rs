@@ -295,7 +295,7 @@ change's added lines is in your statement. An `Interface` section is exempt: it 
 * `bench tasks build` makes an own task's directory under `$BENCH_HOME/tasks/materialized` (the hidden tests read from the
   clone into `tests/test_patch.patch`, the gold without them in `solution/`) and builds its image: the workspace image
   by digest, the repository at `/app` at the base with history up to the base only, the toolchain pins you wrote.
-* `bench tasks check` (needs the host's container runtime) runs, per task, the gold patch three times and the empty patch three
+* `bench tasks check` (needs the host's container runtime; it grades on the networks the stack names, `adam-bench_verifier` (internal) and, for a task that asks for the internet, `adam-bench_egress`: it makes the ones that are missing the way `bench doctor --start` does and removes what it made, uses and keeps those of a running stack, and refuses a verifier network that is not internal or an owner-named one that does not exist) runs, per task, the gold patch three times and the empty patch three
   times **from the clone path the agents will use**, not from `/app`: the base is cloned there, the top-level ignored
   entries are linked to `/app`'s, and `test.sh` runs with `/app` rewritten to that path. A task is kept only if the gold
   passes all three and the empty patch fails all three, and is dropped with its reason otherwise (`gold-fails`,
