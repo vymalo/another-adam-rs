@@ -316,8 +316,13 @@ export class Stack {
   /** `adam-bench_verifier` (internal): made here, because no compose service is on it. Returns its name. */
   async ensureNetwork(name) {
     const full = `${this.project}_${name}`;
-    const inspect = await this.docker(['network', 'inspect', full], { timeoutMs: 60_000 });
-    if (inspect.exitCode === 0) return full;
+    const inspect = await this.docker(['network', 'inspect', '--format', '{{.Internal}}', full], { timeoutMs: 60_000 });
+    if (inspect.exitCode === 0) {
+      // The flag is what keeps a grading off the internet: a network that exists without it would silently open every
+      // grading, so it is refused, never used.
+      if (inspect.stdout.trim() !== 'true') throw new StackError(`the ${full} network exists and is not internal: remove it (docker network rm ${full}) and start again`);
+      return full;
+    }
     const created = await this.docker(['network', 'create', '--internal', full], { timeoutMs: 60_000 });
     if (created.exitCode !== 0 && !/already exists/.test(created.stderr)) throw new StackError(`the ${full} network could not be made (exit ${created.exitCode}): ${created.stderr.trim()}`);
     return full;
@@ -349,7 +354,8 @@ export class Stack {
 
   /**
    * The slot's work directory as it is when the coder first starts: nothing of an earlier run but the sandbox's directory
-   * and the names `keep` lists (a task's base, which is derived from its image and validated by its own marker).
+   * and the names `keep` lists. The runner keeps nothing: `/work/bench-base` is shared by every task, so a base kept
+   * from another task would be the wrong repository (the host's copy is still cached per task, image and workdir).
    */
   async resetWork(slot, { keep = [] } = {}) {
     if (!keep.every((n) => /^[A-Za-z0-9._-]+$/.test(n))) throw new StackError('a kept name is not plain');

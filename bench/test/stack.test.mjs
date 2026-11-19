@@ -25,6 +25,8 @@ function makeStack(t, { exec, execBuf, baseEnv } = {}) {
     agentDir: '/h/agent',
     exec: exec ?? (async (file, args, opts) => {
       calls.push({ file, args, opts, envFile: snapshotEnvFiles(home) });
+      // The verifier network is the one the harness makes; an existing one is read for its internal flag.
+      if (args[0] === 'network' && args[1] === 'inspect') return { exitCode: 0, stdout: 'true\n', stderr: '' };
       return { exitCode: 0, stdout: '', stderr: '' };
     }),
     execBuf,
@@ -67,7 +69,7 @@ test('up starts the shared services and, for each slot, its git sandbox and mete
   assert.equal(fs.statSync(path.join(home, 'work', '1')).mode & 0o777, 0o777, 'uid 10001 writes the work directory');
   assert.ok(fs.statSync(path.join(home, 'slots', '2')).isDirectory());
   // the verifier network is made by the stack: compose makes no network that has no service
-  assert.ok(calls.some((x) => x.args.join(' ') === 'network inspect adam-bench_verifier'));
+  assert.ok(calls.some((x) => x.args[0] === 'network' && x.args[1] === 'inspect' && x.args.at(-1) === 'adam-bench_verifier'));
 });
 
 test('a compose call gets the variables of the file and none of the model\'s: the key is not in its environment', async (t) => {
@@ -107,6 +109,7 @@ test('the coder is a host container of the task image, as uid 10001, under the r
   assert.ok(run.args.some((a) => a.endsWith(':/etc/adam/agent:ro')));
   assert.ok(run.args.some((a) => a.endsWith(':/opt/adam/bin:ro')));
   assert.ok(run.args.some((a) => a.endsWith(':/work')));
+  assert.ok(!run.args.includes('--read-only'), 'the coder\'s own root stays writable: its temp files (the LSP\'s, a tool\'s) live there, only its binaries and agent folder are read-only');
   assert.ok(!run.args.includes('-p'), 'the coder publishes nothing itself: the relay does');
   // the run's settings are in the file, mode 0600, and in no command line or log
   const file = run.envFile['slot-1.env'];
@@ -430,17 +433,67 @@ test('finding 3: each network has exactly the members the docs say, and gradings
   for (const n of ['agentnet-1', 'agentnet-2']) assert.equal(config.networks[n], undefined, n);
 });
 
-test('up makes the verifier network when the daemon does not have it, and leaves an existing one alone', async (t) => {
+test('up makes the verifier network internal, leaves an internal one alone, and refuses one that is not internal', async (t) => {
+  // The network is the property that a grading has no route out. A stale `adam-bench_verifier` that is not internal
+  // (made by an older harness or by hand) would silently give every grading the internet, so it is refused, never used.
   const created = [];
-  const { stack } = makeStack(t, {
-    exec: async (file, args) => {
-      if (args.join(' ') === 'network inspect adam-bench_verifier') return { exitCode: 1, stdout: '', stderr: 'no such network' };
-      if (args[0] === 'network' && args[1] === 'create') created.push(args);
-      return { exitCode: 0, stdout: '', stderr: '' };
-    },
-  });
-  await stack.up();
-  assert.deepEqual(created, [['network', 'create', '--internal', 'adam-bench_verifier']]);
+  const daemon = (internal) =>
+    makeStack(t, {
+      exec: async (file, args) => {
+        if (args[0] === 'network' && args[1] === 'inspect') {
+          return internal === null ? { exitCode: 1, stdout: '', stderr: 'no such network' } : { exitCode: 0, stdout: `${internal}\n`, stderr: '' };
+        }
+        if (args[0] === 'network' && args[1] === 'create') created.push(args);
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    });
+  await daemon(null).stack.up();
+  assert.deepEqual(created, [['network', 'create', '--internal', 'adam-bench_verifier']], 'the missing network is made internal');
+  await daemon(true).stack.up();
+  assert.deepEqual(created, [['network', 'create', '--internal', 'adam-bench_verifier']], 'an internal network is left alone');
+  await assert.rejects(daemon(false).stack.up(), /adam-bench_verifier network exists and is not internal/);
+});
+
+test('a grading that needs the internet is alone in its window: two windows never overlap', async () => {
+  // The `egress` network is the one with a route out; a verifier that asks for it grades alone, and the lock is what
+  // makes "alone" true (`graderWindow` is its exclusive side, `graderShared` the shared one).
+  const stack = new Stack({ composeFile: COMPOSE, home: '/h', meterPort: 1 });
+  const events = [];
+  const work = (name, ms = 20) => async () => {
+    events.push(`${name} start`);
+    await new Promise((r) => setTimeout(r, ms));
+    events.push(`${name} end`);
+  };
+  await Promise.all([stack.graderWindow(work('a')), stack.graderWindow(work('b'))]);
+  assert.deepEqual(events, ['a start', 'a end', 'b start', 'b end']);
+});
+
+test('shared gradings run together; a window waits for them, and a grading that arrives after the window waits for it', async () => {
+  const stack = new Stack({ composeFile: COMPOSE, home: '/h', meterPort: 1 });
+  const events = [];
+  const work = (name, ms = 20) => async () => {
+    events.push(`${name} start`);
+    await new Promise((r) => setTimeout(r, ms));
+    events.push(`${name} end`);
+  };
+  const g1 = stack.graderShared(work('g1'));
+  const g2 = stack.graderShared(work('g2'));
+  await new Promise((r) => setTimeout(r, 5));
+  const w = stack.graderWindow(work('window'));
+  const g3 = stack.graderShared(work('g3'));
+  await Promise.all([g1, g2, w, g3]);
+  const at = (e) => events.indexOf(e);
+  assert.ok(at('g1 start') < at('g2 end') && at('g2 start') < at('g1 end'), 'the two shared gradings overlap');
+  assert.ok(at('window start') > at('g1 end') && at('window start') > at('g2 end'), 'the window opens only when they have ended');
+  assert.ok(at('g3 start') > at('window end'), 'a grading that came after the window waits until it is closed');
+});
+
+test('a window that fails releases the lock, and a shared grading that fails does not hold it', async () => {
+  const stack = new Stack({ composeFile: COMPOSE, home: '/h', meterPort: 1 });
+  await assert.rejects(stack.graderWindow(async () => { throw new Error('grading failed'); }), /grading failed/);
+  assert.equal(await stack.graderWindow(async () => 'next'), 'next');
+  await assert.rejects(stack.graderShared(async () => { throw new Error('shared failed'); }), /shared failed/);
+  assert.equal(await stack.graderWindow(async () => 'after'), 'after');
 });
 
 test('finding 2: only the relays are on a network with the internet; no sandbox, git server or database is', compose, () => {
