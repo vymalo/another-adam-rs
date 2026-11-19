@@ -10,7 +10,8 @@ rust-version.workspace = true
 
 [features]
 default = []
-# `Assembly::card`: the root agent's `card:` frontmatter as an `adam_a2a::AgentCardConfig`.
+# The root agent's A2A side: `Assembly::card` (its `card:` frontmatter as an `adam_a2a::AgentCardConfig`),
+# and `child-sessions/v1`: `AgentDef::child_sessions` and `session_starters`, `Assembly::child_sessions`.
 a2a = ["dep:adam-a2a", "dep:adam-a2a-runtime"]
 # Dev reload: watch the agent directory and swap the agents when a file changes (`LiveAssembly`).
 # Off by default, so a release build cannot watch and reload prompts unless it opts in (reading a

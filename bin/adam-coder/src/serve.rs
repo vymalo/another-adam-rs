@@ -15,7 +15,7 @@
 //! | Role | Components | Also |
 //! |---|---|---|
 //! | `all` (default) | `a2a-server` (control plane), `worker`, `notify` | |
-//! | `control-plane` | `a2a-server`, `notify` | [`Coder::control_plane_with`]: a runtime with the agent's starter only, no model or GitHub configuration |
+//! | `control-plane` | `a2a-server`, `notify` | a runtime with the starters of the agent and of its helpers only (`AgentDef::session_starters`), no model or GitHub configuration |
 //! | `worker` | `worker`, `health`, `notify` | `/healthz` on [`ServiceConfig::listen_addr`](adam_service::ServiceConfig::listen_addr), no A2A |
 //!
 //! `notify` is the `adam_notify_postgres::PgNotify` listener and publisher: live events and

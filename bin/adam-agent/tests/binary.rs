@@ -968,29 +968,33 @@ async fn person_session(addr: SocketAddr, seen: &Arc<Mutex<Vec<Value>>>) {
             .expect("the close is served"),
     );
     until_completed(closed.id).await;
-    assert!(
-        activated
-            .send_message(&say(
-                "too late",
-                Some(&start.context_id),
-                serde_json::json!({})
-            ))
-            .await
-            .is_err(),
-        "a closed session takes no message"
+    let refused = activated
+        .send_message(&say(
+            "too late",
+            Some(&start.context_id),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code,
+        a2a::error_code::UNSUPPORTED_OPERATION,
+        "a closed session takes no message: {refused:?}"
     );
 
     // 5. A client that did not activate the extension cannot talk to a session.
-    assert!(
-        plain
-            .send_message(&say(
-                "hello",
-                Some(&start.context_id),
-                serde_json::json!({})
-            ))
-            .await
-            .is_err(),
-        "a child context needs the extension"
+    let refused = plain
+        .send_message(&say(
+            "hello",
+            Some(&start.context_id),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code,
+        a2a::error_code::INVALID_PARAMS,
+        "a child context needs the extension: {refused:?}"
     );
 }
 

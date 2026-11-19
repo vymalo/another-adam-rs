@@ -88,6 +88,7 @@ fn expected(root: &str, limits: SessionLimits, remote_wait: Duration) -> ChildSe
     ChildSessions::new(
         [
             ChildSessionAgent::new("billing", format!("{root}/billing"), "Handles billing.")
+                .remote()
                 .within(remote_wait),
             ChildSessionAgent::new("explorer", format!("{root}/explorer"), "Looks around.")
                 .within(Duration::from_secs(300)),
@@ -121,6 +122,7 @@ fn the_helpers_are_the_roots_subagents_in_file_order_with_their_time_limits() {
     let want = ChildSessions::new(
         [
             ChildSessionAgent::new("billing", format!("{root}/billing"), "Handles billing.")
+                .remote()
                 .within(Duration::from_secs(90)),
             ChildSessionAgent::new("explorer", format!("{root}/explorer"), "Looks around.")
                 .within(Duration::from_secs(300)),
@@ -188,20 +190,93 @@ fn the_file_lowers_the_deployments_limits_and_never_raises_them() {
     );
 }
 
-#[test]
-fn the_assembly_holds_the_value_of_the_definition() {
+/// The limits and the helpers the root's own session tools use are the ones the card and the front
+/// are made from. Read from the bound root, not from the definition twice: the tools are asked to
+/// open a second session where the effective limit is one, and the spec of `subagent_start` is
+/// compared with the card's helpers.
+#[tokio::test]
+async fn the_bound_session_tools_hold_the_effective_limits_and_helpers_of_the_definition() {
     let root = uniq("root");
     let build = || {
-        def_of(&files(&root, "limits:\n  max_open_sessions: 6"))
+        def_of(&files(&root, "limits:\n  max_open_sessions: 1"))
             .session_limits(SessionLimits::new(8, 4, 20).unwrap())
     };
+    let effective = build().effective_session_limits();
+    assert_eq!(effective, SessionLimits::new(1, 1, 20).unwrap());
+    let model = Arc::new(MockModel::new());
     let assembly = build()
         .bind(ToolSet::new())
         .unwrap()
-        .model(Arc::new(MockModel::new()), "m")
+        .model(model.clone(), "m")
         .unwrap();
-    assert_eq!(assembly.child_sessions(), build().child_sessions().as_ref());
-    assert!(assembly.child_sessions().is_some());
+    assert_eq!(assembly.session_limits(), effective);
+    let card = assembly.child_sessions().expect("sessions").clone();
+    assert_eq!(card.card_extension().unwrap().params["maxOpen"], 1);
+
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = assembly
+        .register(Runtime::builder(store))
+        .poll_interval(Duration::from_millis(10))
+        .build();
+    let start = |id: &str, agent: &str| adam_model::ToolCall {
+        id: id.into(),
+        name: "subagent_start".into(),
+        arguments: json!({"agent": agent, "description": "d", "prompt": "go", "keep_open": true}),
+        ..Default::default()
+    };
+    model
+        .push_tool_calls(vec![start("c1", "explorer"), start("c2", "reviewer")])
+        .push_text("helper")
+        .push_text("helper")
+        .push_text("done");
+    let run = rt
+        .start(&root, adam_llm_agent::user_message("go"), None)
+        .await
+        .unwrap();
+    let worker = spawn_worker(&rt);
+    common::wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let requests = model.requests();
+    let spec = requests
+        .iter()
+        .flat_map(|r| &r.tools)
+        .find(|t| t.name == "subagent_start")
+        .expect("the root has the session tools");
+    let listed: Vec<String> = spec.parameters["properties"]["agent"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(listed, names(&card), "the tool lists the card's helpers");
+    let results: Vec<(String, bool, String)> = requests
+        .iter()
+        .flat_map(|r| &r.messages)
+        .filter_map(|m| match m {
+            adam_model::Message::Tool {
+                call_id,
+                content,
+                is_error,
+                ..
+            } => Some((call_id.clone(), *is_error, content.clone())),
+            _ => None,
+        })
+        .collect();
+    let refused: Vec<_> = results
+        .iter()
+        .filter(|(id, is_error, _)| (id == "c1" || id == "c2") && *is_error)
+        .collect();
+    assert_eq!(
+        refused.len(),
+        1,
+        "one of two starts is refused: {results:?}"
+    );
+    assert!(
+        refused[0].2.contains("1 open sessions") || refused[0].2.contains("1 subagent rounds"),
+        "the refusal names the limit of one: {}",
+        refused[0].2
+    );
 }
 
 #[test]
@@ -284,7 +359,11 @@ proptest! {
                 .unwrap()
                 .model(Arc::new(MockModel::new()), "m")
                 .unwrap();
-            prop_assert_eq!(assembly.child_sessions(), Some(&sessions));
+            // What the session tools enforce, read from the bound root, is what the card says.
+            prop_assert_eq!(
+                u64::from(assembly.session_limits().max_open()),
+                card["maxOpen"].as_u64().unwrap()
+            );
         }
     }
 }
@@ -411,7 +490,6 @@ async fn a_session_started_on_a_control_plane_is_worked_by_a_worker() {
             "{store_name}: round 2 carries round 1's conversation: {seen}"
         );
 
-        // Closing it, a later message is refused.
         let closed = backend
             .submit(
                 alice.clone(),
@@ -426,6 +504,19 @@ async fn a_session_started_on_a_control_plane_is_worked_by_a_worker() {
             .await
             .unwrap();
         until(&backend, &alice, &closed.id, TaskState::Completed).await;
+        // Closed, a later message is refused.
+        let later = backend
+            .submit(
+                alice.clone(),
+                said("one more thing", Some(&start.context_id), json!({})),
+                None,
+                Some(start.context_id.clone()),
+            )
+            .await;
+        assert!(
+            matches!(&later, Err(adam_a2a::BackendError::UnsupportedOperation(_))),
+            "{store_name}: a closed session takes no more messages: {later:?}"
+        );
         worker.stop().await;
     }
 }

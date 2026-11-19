@@ -2266,7 +2266,7 @@ notifications and the drain are [`adam-service`](../../crates/adam-service/READM
 | Role | Starts | Listener | Workspace root |
 |---|---|---|---|
 | `all` (default) | the A2A server and the workers, in one process: today's behaviour | A2A and `/healthz` on `LISTEN_ADDR` | created |
-| `control-plane` | the A2A server over `Coder::control_plane_with`: a `Runtime` with the agent's `CoderStarter` and its helpers' starters only (`coder/explorer`, `coder/reviewer`, for a person's sessions), used to start, deliver to, cancel and view runs; `run_worker` is never called | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
+| `control-plane` | the A2A server (`serve`, `src/serve.rs`) over a `Runtime` with the agent's `CoderStarter` and its helpers' starters only (`AgentDef::session_starters`: `coder/explorer`, `coder/reviewer`, for a person's sessions), used to start, deliver to, cancel and view runs; `run_worker` is never called. (`Coder::control_plane_with` and `control_plane_capped` are the library's embeddable front: they register the coder's starter alone and serve no sessions) | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
 | `worker` | `Runtime::run_worker`, and a listener that answers `GET /healthz` (`200 ok`, the route the A2A router serves) and nothing else | `/healthz` only on `LISTEN_ADDR` | created |
 
 Every role also runs the component `notify` (below). The roles meet in the Postgres store (the

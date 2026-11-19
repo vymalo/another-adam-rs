@@ -239,13 +239,13 @@ flowchart LR
             mcp["AgentDef::connect_mcp<br/>the folder's mcp.json, McpSettings policy"]
             agent["CoderAgent::try_from_def<br/>model + ToolEnv + MCP tools"]
         end
-        starter["CoderStarter<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
-        agents["Agents { name, card, register, options }"]
+        starter["CoderStarter + the helpers' starters (AgentDef::session_starters)<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
+        agents["Agents { name, card, register, options, child_sessions }"]
     end
 
     subgraph svc["adam-service: serve(ServiceConfig, Agents, shutdown)"]
         direction LR
-        pg["PgStore::connect + migrate()<br/>as DynStore"]
+        pg["PgStore::connect_lazy, then ping + migrate()<br/>as DynStore"]
         pgn["PgNotify::new(store pool, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
         service["Service::new_with(register(Runtime::builder(store)), name, options, live)"]
         rtm["Runtime<br/>PgEventSink as EventSink, PgNotifier as Notifier"]
