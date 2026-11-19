@@ -265,8 +265,9 @@ async fn the_agent_asks_three_questions_as_one_form_the_person_answers_and_it_go
             "The person answered through the interface (form ask-choices-call-1):\n- db: pg\n- auth: keycloak\n- deploy: compose"
         ))
     );
-    // The catalog came inline, so the endpoint was listed twice (once a turn) and never asked for it.
-    assert_eq!(server.lists(), 2);
+    // The catalog came inline, so the endpoint was listed once for the two turns (the listing of a
+    // grant is reused) and never asked for it.
+    assert_eq!(server.lists(), 1);
     assert!(server.catalog_requests().is_empty());
     assert_eq!(rig.ui.cache().len(), 1);
 }

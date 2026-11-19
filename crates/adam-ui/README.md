@@ -26,7 +26,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 |---|---|
 | `Ui::new(McpPolicy)`, `Ui::with_client(..)` | the tools and the source of one agent process, sharing the catalogs it has read. `McpPolicy` is the deployment's (`MCP_ALLOW_INSECURE` decides whether the thread-tools URL may be plain `http` to another machine; the call timeout, and `thread_tools_max_call`, the cap of `THREAD_TOOLS_MAX_CALL_SECS`) |
 | `Ui::tools() -> ToolSet`, `Ui::with_ask_lead(text)`, `DEFAULT_ASK_LEAD` | `ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check`, `plan_add`, in that order (**six tools; it was three**: the specs are part of the prompt's stable prefix, so their order is fixed and a build that adds one changes every agent's prefix once). `with_ask_lead` opens the description of `ask_user` with the agent's own words about when to ask (the coder names pull requests); what follows, about `choices`, is the same |
-| `Ui::source() -> ThreadTools` | a `ToolSource` that offers **every tool the thread-tools endpoint lists, under its listed name**, listed again at every model turn, **except `get_ui_catalog`** (the model has `ui_catalog`; the relayed tools of attached servers and `ask_agent` appear with no change here), and that **describes `show` with the components of the conversation's screen** (`ToolSource::refine`, from the catalogs this process holds). Add it last among an agent's sources, and register `Ui::tools()` on the same agent |
+| `Ui::source() -> ThreadTools` | a `ToolSource` that offers **every tool the thread-tools endpoint lists, under its listed name**, read once per grant (a turn reuses the listing; a new grant, a refused call or `LISTING_TTL` lists again), **except `get_ui_catalog`** (the model has `ui_catalog`; the relayed tools of attached servers and `ask_agent` appear with no change here), and that **describes `show` with the components of the conversation's screen** (`ToolSource::refine`, from the catalogs this process holds). Add it last among an agent's sources, and register `Ui::tools()` on the same agent |
 | `AskUser`, `ASK_USER` | `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`: see *The tools* |
 | `Show`, `SHOW`, `MAX_BLOCKS` | `show { blocks, title? }`, at most 16 blocks; refuses a `Choices` block |
 | `UiCatalogTool`, `UI_CATALOG` | `ui_catalog {}` |
@@ -205,7 +205,8 @@ inbound function reads a screen's action as JSON text.
 * **`ui_catalog {}`** gives the components: for each its name, what it is for and the schema of its properties, as
   compact JSON. The model calls it before `show`.
 * **The thread tools** are not tools of this crate: `ThreadTools` lists the endpoint (`tools/list` over one
-  connection, with the grant's bearer token) each time the model is about to be called, and answers a call to a
+  connection, with the grant's bearer token) once per grant — a turn reuses the listing, and a new grant, a refused
+  call or the 60 s `LISTING_TTL` lists again — and answers a call to a
   tool that is none of the agent's own by calling the endpoint (`tools/call`). A listed tool whose name no model
   provider accepts is left out (with a warning); one that clashes with an own tool loses to it, with a warning, **except a relayed
   tool** (`<server>__<tool>`: the conversation attached a server the agent's own `mcp.json` has too, as a web search), whose omission is
