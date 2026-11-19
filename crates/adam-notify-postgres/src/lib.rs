@@ -1019,25 +1019,34 @@ mod tests {
     async fn a_failed_statement_is_counted_once_however_many_items_it_carried() {
         let (n, _) = notify();
         n.inner.pool.close().await;
-        let one = vec![Outgoing {
-            signals: false,
-            payload: "x".into(),
-        }];
-        assert!(
-            !n.inner.send(one).await,
-            "a closed pool fails the statement"
-        );
-        assert_eq!(n.inner.failed.load(Relaxed), 1);
-        assert_eq!(n.inner.failed_statements.load(Relaxed), 1);
-        assert!(should_log(1), "the first failed statement is logged");
-
+        // The first failed statement is the big batch: it is the one the old item counter would
+        // have swallowed (32, not 1), so the counters must still see one statement.
         let batch: Vec<Outgoing> = (0..MAX_BATCH_ITEMS)
             .map(|_| Outgoing {
                 signals: false,
                 payload: "y".into(),
             })
             .collect();
-        assert!(!n.inner.send(batch).await);
+        assert!(
+            !n.inner.send(batch).await,
+            "a closed pool fails the statement"
+        );
+        assert_eq!(
+            n.inner.failed.load(Relaxed),
+            MAX_BATCH_ITEMS as u64,
+            "the item counter counts every dropped item"
+        );
+        assert_eq!(n.inner.failed_statements.load(Relaxed), 1);
+        assert!(
+            should_log(1),
+            "the first failed statement is logged whatever its size"
+        );
+
+        let one = vec![Outgoing {
+            signals: false,
+            payload: "x".into(),
+        }];
+        assert!(!n.inner.send(one).await);
         assert_eq!(
             n.inner.failed.load(Relaxed),
             1 + MAX_BATCH_ITEMS as u64,
