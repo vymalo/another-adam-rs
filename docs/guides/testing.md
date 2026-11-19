@@ -126,7 +126,8 @@ S3 rewrites the workload to commit a head and a body, then asserts the bound.
 
 ## Adding a backend
 
-Implement `Store` and add one line: `adam_store_testkit::store_conformance!(make_store);`. A new `Notifier` runs
+Implement `Store` and add one line: `adam_store_testkit::store_conformance!(make_store);` (and
+`adam_store_testkit::blob_conformance!(make_store);` when it keeps blobs). A new `Notifier` runs
 `adam_notify_testkit::notifier_conformance!(make_pair);` (the Postgres one needs `ADAM_TEST_POSTGRES_URL`, a
 superuser, for its reconnect test). See [Store adapters](../reference/store-adapters.md#adding-a-backend).
 

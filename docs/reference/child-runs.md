@@ -207,6 +207,10 @@ background as a session that is sent more messages. The runtime half (slice 1) i
   conversation or of a session with no first round, a run id that exists and is not this round, a conversation id
   that is not a session's or is over 1024 bytes. A repeat with the same ids answers `false`; a round purged
   before its repeat is not recognised (retention must outlast retries).
+  A seeded round's state carries the previous round's artifacts, but the store has no reference for them until
+  the new run's first commit (schema version 5, part 1); purging the previous round before then can collect a
+  file the new round still names. S2a of ADR 0055 writes the references at create (or makes the blob sweep read
+  the state), which closes it.
 * A child with a conversation reports its end with **`adam.child.reported`** instead of `adam.run.finished`.
   Same id, same payload, same standing: a wake-up, and the parent reads the round with `Ctx::child_status` or
   `ChildStarter::session`, so the lost-notice cases above hold for a round. A child without a conversation is unchanged.

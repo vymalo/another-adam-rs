@@ -113,10 +113,12 @@ references (`(run_id, digest)`, `ON DELETE CASCADE`, index `<prefix>run_blob_dig
 (a retried put writes nothing), and a commit writes its references **in the same transaction as the
 CAS**: a commit that loses the version check writes none.
 
-A version 4 database upgrades through `upgrade_blobs`, its own step gated on the stored version,
+A version 4 database upgrades through `upgrade_blobs`, its own step gated on `stored == Some(4)`,
 run after the listing-index step. It is metadata-only: two new tables, their indexes and a foreign
 key from a table that is empty on a version 4 database, so no row of `runs` is rewritten. A version
-4 start does not re-check the version 4 listing index; a version 3 database runs both steps.
+4 start does not re-check the version 4 listing index. A version 3 (or older) database runs the
+listing-index step and gets the blob tables from the migration transaction that follows; the blob
+step itself only runs from version 4.
 
 `purge_finished` sweeps unreferenced blobs written before its cutoff in the same call (the run's
 references cascaded away), and `purge_blobs(before)` is the explicit knob for a host that reclaims

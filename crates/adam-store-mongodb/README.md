@@ -102,8 +102,10 @@ name: reusing the name would leave every existing database on the old keys, sile
 `<prefix>blob` holds the bytes: `_id` is the digest (64 lower-case hex, a SHA-256), `bytes` is a
 binary, `size` its length and `created_at` when it was first written; the GC index `adam_blob_gc`
 is `{created_at: 1}`. `<prefix>run_blob` is the append-only set of digests one run references,
-`_id = "<run>:<digest>"` with `run_id` and `digest`, indexed by `adam_run_blob_digest`. A `put_blob`
-is one `insertOne`; a duplicate key is a no-op, because the bytes behind a digest never change.
+`_id = "<run>:<digest>"` with `run_id` and `digest`, indexed by `adam_run_blob_digest` (the GC's
+"does any run name this digest") and `adam_run_blob_run` (a purge batch's "which digests does this
+run name"). A `put_blob` is one `insertOne`; a duplicate key is a no-op, because the bytes behind a
+digest never change.
 
 A commit inserts its references **before** the CAS, in one unordered `insertMany` (duplicates
 ignored): there is no cross-document transaction, so a commit that loses the CAS leaves rows nothing

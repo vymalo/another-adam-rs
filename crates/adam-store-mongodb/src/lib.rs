@@ -592,16 +592,23 @@ impl Store for MongoStore {
                 .options(named("adam_push_run"))
                 .build(),
         ];
-        // Schema version 5, part 1: the blob GC asks "which blobs were written before the cutoff",
-        // and the refs ask "does any run name this digest".
+        // Schema version 5, part 1: the blob sweep asks "which blobs were written before the
+        // cutoff", its reference check asks "does any run name this digest", and a purge (or a
+        // lost-CAS cleanup) asks "which digests does this run name".
         let blob_indexes = [IndexModel::builder()
             .keys(doc! { "created_at": 1 })
             .options(named("adam_blob_gc"))
             .build()];
-        let run_blob_indexes = [IndexModel::builder()
-            .keys(doc! { "digest": 1 })
-            .options(named("adam_run_blob_digest"))
-            .build()];
+        let run_blob_indexes = [
+            IndexModel::builder()
+                .keys(doc! { "digest": 1 })
+                .options(named("adam_run_blob_digest"))
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "run_id": 1 })
+                .options(named("adam_run_blob_run"))
+                .build(),
+        ];
         ensure_indexes(&self.runs, run_indexes).await?;
         ensure_indexes(&self.journal, journal_indexes).await?;
         ensure_indexes(&self.push, push_indexes).await?;
@@ -1269,7 +1276,9 @@ impl Store for MongoStore {
         loop {
             let ids = self.ids(finished.clone(), Some(PURGE_BATCH)).await?;
             if ids.is_empty() {
-                return Ok(total);
+                // Nothing left to purge; the sweep below still runs, as it does in the other
+                // stores: a call that purges no run still collects unreferenced blobs.
+                break;
             }
             // 1. Tombstone. From here on commit_run treats these runs as gone, so
             //    none can be re-opened after its journal is deleted. The filter

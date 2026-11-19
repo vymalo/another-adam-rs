@@ -25,7 +25,9 @@ dependency.
   unknown id answers `None`, empty bytes are a blob, a run's reference keeps a blob alive, a shared
   digest survives until the last referencing run is purged, `purge_blobs` respects its cutoff, and
   `purge_finished` removes the run's references and the unreferenced blob). Every case asserts `keeps_blobs()`: a store that keeps none is not
-  given this suite. Blobs are global, so the cases take turns inside one test binary; runs are still
+  given this suite. Blobs are global, so the cases take turns inside one test binary (the
+  `BLOB_SUITE` lock, which the cases that purge take too); under nextest, where each test is its own
+  process, `.config/nextest.toml` puts the same cases in one single-thread group. Runs are still
   isolated by agent name. `make` is the same `async fn() -> Option<DynStore>` as above.
 * `transcript_measurement!(make)` generates the `measure_the_transcript_write` test: it runs
   `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts

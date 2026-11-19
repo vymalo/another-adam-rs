@@ -215,6 +215,9 @@ const MESSAGE_BYTES: usize = 10 * 1024;
 ///
 /// When the store errors: a measurement that cannot run is a broken test, not a number.
 pub async fn measure_transcript_write(store: DynStore) -> Measurement {
+    // It purges the measured run at the end, and that call sweeps unreferenced blobs too: take the
+    // suite's lock so a concurrent case's blob is not collected (see `crate::BLOB_SUITE`).
+    let _turn = crate::BLOB_SUITE.lock().await;
     let store = CountingStore::new(store);
     let agent = crate::agent();
     let run = store

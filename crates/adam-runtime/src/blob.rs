@@ -1,11 +1,11 @@
 //! File bytes as content-addressed blobs, and the upload a commit does before it lands.
 //!
-//! A file artifact's bytes are stored under their SHA-256 ([`BlobId`]) and a commit names the
-//! digests its state references ([`RunUpdate::blobs`]), so a store can keep the bytes outside the
-//! run and collect them once no run names them (ADR 0055). This module owns the digest rule —
-//! `adam-core` has no hash dependency — and the upload, which is **fail-open in this release**: a
-//! failed upload is logged and the commit goes on, because the run's state still carries the bytes.
-//! The contract release gates a run's head on the upload instead.
+//! A file artifact's bytes are stored under their SHA-256 ([`BlobId`]) and the commit that first
+//! names them references the digest ([`RunUpdate::blobs`]), so a store can keep the bytes outside
+//! the run and collect them once no run references them (ADR 0055). This module owns the digest
+//! rule — `adam-core` has no hash dependency — and the upload, which is **fail-open in this
+//! release**: a failed upload is logged and the commit goes on, because the run's state still
+//! carries the bytes. The contract release gates a run's head on the upload instead.
 
 use std::collections::HashSet;
 
@@ -28,8 +28,9 @@ pub fn blob_id(bytes: &[u8]) -> BlobId {
 /// and nothing at all when no artifact is a file, so the common step costs no round trip.
 ///
 /// **Fail-open** (the expand release): an upload that fails is logged and its digest is still
-/// referenced — the state names the artifact, and a later commit of the same run retries it. A
-/// store error is never a reason to lose the transition.
+/// referenced — the state names the artifact, so the transition is not lost. A later commit retries
+/// it only if the artifact is emitted again; otherwise the reference outlives the bytes, which S2
+/// must gate the head on (ADR 0055).
 pub(crate) async fn upload_files(store: &DynStore, artifacts: &[Artifact]) -> Vec<BlobId> {
     if !store.keeps_blobs() {
         return Vec::new();

@@ -904,7 +904,7 @@ erDiagram
     RUNS ||--o{ JOURNAL : "one entry per step (cascade delete)"
     RUNS ||--o{ PUSH : "one per webhook of a task (cascade delete)"
     RUNS ||--o{ RUN_BLOB : "the digests it references (cascade delete)"
-    BLOB ||--o{ RUN_BLOB : "one blob per digest, shared by runs"
+    BLOB |o--o{ RUN_BLOB : "the bytes, when the upload landed: a ref may name a digest with no blob row"
     RUNS |o--o{ RUNS : "parent_id: a child run"
     RUNS {
         uuid id PK

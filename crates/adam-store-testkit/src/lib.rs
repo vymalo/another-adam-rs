@@ -135,7 +135,7 @@ macro_rules! transcript_measurement {
 /// Every case asserts that the store keeps blobs ([`Store::keeps_blobs`](adam_core::Store::keeps_blobs)):
 /// a store that does not is not given this suite, rather than passing it by answering the
 /// defaulted methods. Blobs are global, so the cases take turns inside one test binary (see
-/// `cases::BLOB_SUITE`).
+/// `BLOB_SUITE`).
 #[macro_export]
 macro_rules! blob_conformance {
     ($make:path) => {
@@ -164,14 +164,16 @@ macro_rules! blob_conformance {
     };
 }
 
+/// Serialises the cases that sweep blobs inside one test binary: a blob is global and
+/// content-addressed, so a sweep (`purge_blobs`, and `purge_finished` in the same call) with a
+/// future cutoff deletes every unreferenced blob in the database, including one a case running at
+/// the same time is about to read. Runs are isolated by agent name; blobs cannot be, so every case
+/// that can sweep takes this lock. nextest runs each test in its own process, where a process-local
+/// mutex excludes nothing: `.config/nextest.toml` puts the same cases in one single-thread group.
+pub(crate) static BLOB_SUITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub mod cases {
     use super::*;
-
-    /// Serialises the blob cases inside one test binary: blobs are global and content-addressed, so
-    /// a sweep (`purge_blobs`, `purge_finished`) with a future cutoff deletes every unreferenced
-    /// blob in the database, including one a case running at the same time is about to read. The
-    /// runs of the other cases are isolated by agent name; blobs cannot be, so they take turns.
-    static BLOB_SUITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// The digest of `bytes`, computed here so the suite pins the convention: the same SHA-256 the
     /// runtime's `blob_id` makes, as 64 lower-case hex. A store trusts the id it is given.
@@ -208,8 +210,9 @@ pub mod cases {
     pub async fn blob_four_mib_round_trip(store: DynStore) {
         let _turn = BLOB_SUITE.lock().await;
         keeps_blobs(&store);
-        // A file artifact's cap (`MAX_ARTIFACT_FILE_BYTES`): the largest blob a run can make. The
-        // bytes are varied, so a store that compresses or truncates cannot pass by accident.
+        // A file artifact's cap (`MAX_ARTIFACT_FILE_BYTES`), which is the largest blob a run can
+        // make — not a comparison with any older limit. The bytes are varied, so a store that
+        // compresses or truncates cannot pass by accident.
         let bytes: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
         let id = blob_digest(&bytes);
         store.put_blob(&id, &bytes).await.unwrap();
@@ -218,6 +221,12 @@ pub mod cases {
             Some(bytes.as_slice()),
             "four mebibytes round-trip byte for byte"
         );
+        // Leave no four-mebibyte row behind in a suite that runs repeatedly.
+        store
+            .purge_blobs(now() + chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(store.get_blob(&id).await.unwrap(), None);
     }
 
     pub async fn blob_put_is_idempotent(store: DynStore) {
@@ -284,7 +293,10 @@ pub mod cases {
             "a referenced blob is never collected, however old"
         );
 
-        // Clean up: a finished run that is purged takes its reference, and then the bytes.
+        // Clean up: a finished run that is purged takes its reference, and then the bytes. Before
+        // that, the second commit named no digest at all — a store unions each commit's delta with
+        // the references it already has, so the sweep must still keep the bytes. A store that
+        // replaced the set on an empty delta fails here.
         store
             .commit_run(
                 run.id,
@@ -293,6 +305,12 @@ pub mod cases {
             )
             .await
             .unwrap();
+        store.purge_blobs(cutoff).await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(bytes.clone()),
+            "a commit that names no blob keeps the earlier references"
+        );
         assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 1);
         assert_eq!(store.get_blob(&id).await.unwrap(), None);
     }
@@ -1717,6 +1735,8 @@ pub mod cases {
     }
 
     pub async fn purge_finished_runs(store: DynStore) {
+        // It sweeps unreferenced blobs with its cutoff (see `BLOB_SUITE`).
+        let _turn = BLOB_SUITE.lock().await;
         let agent = agent();
         let open = store
             .create_run(NewRun::new(&agent, json!({})))
@@ -2261,6 +2281,8 @@ pub mod cases {
     }
 
     pub async fn push_configs_go_with_their_run(store: DynStore) {
+        // Its `purge_finished` sweeps unreferenced blobs (see `BLOB_SUITE`).
+        let _turn = BLOB_SUITE.lock().await;
         let agent = agent();
         let finished = store
             .create_run(NewRun::new(&agent, json!({})).status(RunStatus::Done))
