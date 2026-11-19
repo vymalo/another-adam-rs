@@ -54,6 +54,13 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   parts stay in the stored state. An array of typed parts is for a part that is not text
   (`ContentPart` has only `Text` today), so a chat template that wants a string content always gets one.
 * Tool-call arguments that are not JSON do not fail the call: the response carries the call with `ToolCall::invalid_arguments` set to the raw text (cut at 8 KiB, with a marker saying how much) and `arguments` the JSON string `INVALID_ARGUMENTS_MARKER`, and the agent answers it with an error. A call like that is sent back to the provider with `{}` as its arguments. A call with no name is still `Protocol`.
+* A tool call whose arguments are complete is announced while the stream goes on: `ModelDelta::ToolCallComplete` with
+  the call the assembled response holds (the same id, name and arguments), once per call, the first time the accumulated
+  argument text parses as a JSON object, and for a call whose text never does (empty, or not JSON) immediately before
+  `Finished` ([ADR 0049](../../docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md), amended). A
+  provider that sends the id and the name in one chunk and the arguments in later ones is announced when the arguments
+  close, never as `{}`; a provider that sends a whole call in one chunk is announced in that chunk, after its
+  `ToolCallStarted`.
 * A transport failure (timeout, connection error) is a `Transient` that keeps
   the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
   that keeps the parser's error. The message does not repeat the source.

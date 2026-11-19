@@ -26,6 +26,16 @@
 //! provider that **requires** it (DeepSeek's thinking mode with tools, *verified 2026-10-05*) is
 //! served by a client set to echo it, which then keeps it in [`Message::Assistant::reasoning`].
 //!
+//! # Streaming a tool call
+//!
+//! A streaming client says [`ModelDelta::ToolCallComplete`] once per tool call, when its arguments
+//! are whole: the first time the accumulated argument text parses as a JSON object, and for every
+//! call it did not say it for, immediately before [`ModelDelta::Finished`]. The call is the one the
+//! response holds (same id, name and arguments), so a caller may start it before the turn ends
+//! ([ADR 0049](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md),
+//! amended). Empty argument text is not complete on its own. [`ModelDelta`] is `#[non_exhaustive]`
+//! since this variant: a `match` over it needs one more arm.
+//!
 //! # Images
 //!
 //! A message names an image by reference ([`ContentPart::Image`], [`Message::Tool`]'s `images`):

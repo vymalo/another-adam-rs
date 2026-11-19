@@ -636,8 +636,14 @@ impl Usage {
 }
 
 /// One item of a streamed completion.
+///
+/// `#[non_exhaustive]`: a client may say more about a stream later, and a consumer that matches
+/// this has no reason to fail to compile on a variant it does not know (it ignores it). A consumer
+/// in this workspace still names every variant it handles, and one more arm, so that the known ones
+/// are checked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ModelDelta {
     /// A piece of generated text.
     Text(String),
@@ -653,6 +659,18 @@ pub enum ModelDelta {
         /// Tool name.
         name: String,
     },
+    /// The arguments of a tool call are complete: the text of them parses as a JSON **object**,
+    /// and the call holds exactly what [`ModelDelta::Finished`] will hold for it (same id, same
+    /// name, same arguments), so a consumer may start it before the turn ends.
+    ///
+    /// A client says it **once** per call: the first time the accumulated argument text parses as
+    /// an object, and for every call it did not say it for, immediately before
+    /// [`ModelDelta::Finished`]. Empty argument text is not complete on its own (it parses as
+    /// `{}`): a provider that sends the id and the name first and the arguments after must not
+    /// announce `{}`. A call whose arguments never parse as JSON is announced with
+    /// [`ToolCall::invalid_arguments`] set, and does not run. A model that does not stream says
+    /// none of this.
+    ToolCallComplete(ToolCall),
     /// The final item: the fully assembled response.
     Finished(ModelResponse),
 }
@@ -918,7 +936,18 @@ mod tests {
             id: "c".into(),
             name: "n".into(),
         });
+        roundtrip(ModelDelta::ToolCallComplete(tool_call()));
+        roundtrip(ModelDelta::ToolCallComplete(
+            ToolCall::with_invalid_arguments("c", "w", "{oops"),
+        ));
         roundtrip(ModelDelta::Finished(response()));
+        assert_eq!(
+            serde_json::to_value(ModelDelta::ToolCallComplete(tool_call())).unwrap(),
+            json!({"tool_call_complete": {
+                "id": "call_1", "name": "weather",
+                "arguments": {"city": "Paris", "days": [1, 2]}
+            }})
+        );
     }
 
     #[test]

@@ -221,3 +221,70 @@ stateDiagram-v2
 order (they are in call order anyway); the owner's gateway and model asking for several calls per turn; the steps panel of
 `vymalo/another-agentic-system` with concurrent steps; that the coder's `write_file` and `edit_file` write atomically; the
 token estimate for `after_previous`.
+
+## Amended 2026-11-18: a call starts when its arguments are complete
+
+The last sentence of decision 13 ("No call starts while the model is still streaming") no longer holds. A call starts as
+soon as its arguments are whole, while the model is still writing the rest of its answer, as OpenCode does; the journal
+still gets the turn before any of its calls, so the guarantees of decisions 6 and 8 are unchanged. Everything else in
+decision 13 stands: `parallel_tool_calls` is not sent.
+
+**What the client says.** `adam_model::ModelDelta` gains `ToolCallComplete(ToolCall)`, and the enum is `#[non_exhaustive]`
+(a consumer that matches it has one more arm). A streaming client says it **once per call**: the first time the
+accumulated argument text parses as a JSON **object**, and, for every call it did not say it for, immediately before
+`Finished`. Empty argument text is not complete on its own (it parses as `{}`), so a provider that sends the id and the name
+first and the arguments after is not announced as `{}`. The call it carries is the one the turn will hold: the same id (a
+made-up id is fixed at the announcement and the response keeps it), the same name and the same arguments, and a call whose
+text never parses as JSON is announced with `invalid_arguments` set. The position of a call is the order the client
+announced it, which is call order unless a provider interleaves its indices; the turn checks the batch against the calls it
+recorded. A client that cannot stream says nothing: a non-streaming model starts nothing early. **Decision 12 is unchanged**:
+a call that says `after_previous: true` is still a barrier and waits for the turn, the gate never starts one, and a value
+that is not a boolean still answers an error and takes no step.
+
+**The gate** (`crates/adam-llm-agent/src/early.rs`, pure, like `schedule.rs`). A call starts early only when starting it
+early cannot change what the turn would have done. All of these must hold:
+
+* `max_parallel` is above 1, fewer calls than it are running, and the call does not conflict with one that started early
+  and is still running (decision 1: two conflicting calls never overlap);
+* the turn is not the closing one, and the run is not cancelled;
+* the call takes a step at all (not a shortcut: arguments that are not JSON, a tool nobody has with no source to ask);
+* the call is not a barrier: its access is not `Alone`, it does not say `after_previous: true`, and its key differs from the
+  call before it (the committed `repeats.key` for the first call of the turn);
+* no earlier call of the turn was a barrier: the call is in the first segment;
+* `tool_calls + i <= max_tool_calls` for its 1-based position `i`;
+* for the first call of the turn only, `doom_loop` would not refuse it (for a later call that decision needs the result of
+  the one before it, which does not exist yet).
+
+A call that fails the gate waits for the turn, exactly as before, so the segments, the queue, the barriers, the results in
+call order and the step events of decisions 5 and 7 are unchanged for it. A call whose `after_previous` is not a boolean
+does not run at all, so it is not started early either.
+
+**The loop.** `model_turn` creates the batch (`Early`) and moves it into the journaled step `model:N`; the stream polls its
+futures beside the deltas (`tokio::select!`), so a started call really runs while the model writes, and says its `running`
+step event when it starts and its end when it finishes. When the step returns, the turn is journaled, and `run_pending`
+hands the batch to the turn: a started call whose recorded call is equal (id, name, arguments) is recorded by
+`ReservedStep::run` with the outcome it gave, instead of running again. A batch that does not match the turn's calls at
+their positions is dropped whole, and every call runs at the turn as before (the calls it started ran, and run again:
+at-least-once, decision 8).
+
+**The journal is unchanged.** No tool step is written before its turn: `Ctx::step` writes `model:N` when the closure
+returns, and only then does the turn reserve the seqs of its calls. At any limit the journal is `model:N`, then
+`tool:<id>` in call order at consecutive seqs. A crash in the middle of the stream writes nothing and the replay asks the
+model again and runs the calls again; a result that finished before the turn was recorded waits in memory, and a crash
+loses it.
+
+**A stream error** (a transient failure of the model call) waits for the started calls within their own time limits,
+discards their results and fails the transition transiently; the retry asks the model again and runs the calls again.
+
+**A cancel** fires the run's token, which is the parent of each call's. The stream returns at once; the loop then waits up
+to `TOOL_STOP_GRACE` (5 s) for the started calls and drops the futures, and the run fails `cancelled`, as a cancel between
+two calls of a segment does (decision 10). The model step is not written: the run was already failed in the store.
+
+**What is not decided here.** A turn over `max_tool_calls` may have started its first calls early (their position was
+within the limit when each was announced) and then answers all of them "not run": their results are dropped, and the run
+goes to the closing turn. The step events of those calls say `running` and their end, and the answer says "not run"; the
+alternative (never starting a call early until the whole turn is known) is not possible while the model writes. An early
+call that runs in a segment of one (because the call after it is a barrier) is still answered like a call of a segment for
+`NeedsInput`, `Await*` and `reported` rounds (decision 11): a tool that asks or parks must declare `Alone`, and the gate
+never starts one.
+

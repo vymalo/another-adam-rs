@@ -642,6 +642,29 @@ struct PartialCall {
     name: String,
     arguments: String,
     started: bool,
+    /// [`ModelDelta::ToolCallComplete`] was said for it: a client says it once per call.
+    announced: bool,
+}
+
+impl PartialCall {
+    /// The call as the assembled response holds it, with its id fixed (the one the early
+    /// `ToolCallComplete` carried is the one [`Assembler::finish`] writes).
+    fn value(&mut self) -> Result<ToolCall, ModelError> {
+        check_name(&self.name)?;
+        let id = self.id.get_or_insert_with(fallback_id).clone();
+        Ok(match parse_arguments(&self.arguments) {
+            Ok(arguments) => ToolCall::new(id, self.name.clone(), arguments),
+            Err(raw) => ToolCall::with_invalid_arguments(id, self.name.clone(), raw),
+        })
+    }
+
+    /// Whether the argument text is whole: it parses as a JSON **object**. Empty text is not: the
+    /// parser reads it as `{}` ([`parse_arguments`]), which a provider that sends the name first and
+    /// the arguments after has not finished saying.
+    fn arguments_are_complete(&self) -> bool {
+        !self.arguments.trim().is_empty()
+            && matches!(parse_arguments(&self.arguments), Ok(Value::Object(_)))
+    }
 }
 
 /// Assembles streamed chunks into a [`ModelResponse`], keyed by tool-call
@@ -701,9 +724,7 @@ impl Assembler {
                 }
                 for (position, call) in delta.tool_calls.unwrap_or_default().into_iter().enumerate()
                 {
-                    if let Some(started) = self.push_tool_call(position, call) {
-                        out.push(started);
-                    }
+                    self.push_tool_call(position, call, &mut out);
                 }
             }
             if let Some(reason) = choice.finish_reason {
@@ -713,7 +734,9 @@ impl Assembler {
         Ok(out)
     }
 
-    fn push_tool_call(&mut self, position: usize, delta: DeltaToolCall) -> Option<ModelDelta> {
+    /// One tool call of a chunk: say that it started when its name is first whole, and that its
+    /// arguments are complete the first time they parse as an object.
+    fn push_tool_call(&mut self, position: usize, delta: DeltaToolCall, out: &mut Vec<ModelDelta>) {
         // Servers that omit `index` send whole calls, one per position.
         let index = delta.index.unwrap_or(position);
         let call = self.calls.entry(index).or_default();
@@ -731,28 +754,47 @@ impl Assembler {
         if !call.started && !call.name.is_empty() {
             call.started = true;
             let id = call.id.get_or_insert_with(fallback_id).clone();
-            return Some(ModelDelta::ToolCallStarted {
+            out.push(ModelDelta::ToolCallStarted {
                 id,
                 name: call.name.clone(),
             });
         }
-        None
+        // The arguments are whole the first time they parse as an object: the call can start.
+        if !call.announced && call.arguments_are_complete() {
+            call.announced = true;
+            if let Ok(value) = call.value() {
+                out.push(ModelDelta::ToolCallComplete(value));
+            }
+        }
+    }
+
+    /// The calls whose arguments were never announced while they streamed (an empty argument text,
+    /// or one that never parses as an object): the deltas that say them, for the caller to send
+    /// immediately before [`ModelDelta::Finished`]. A call with no name is left out: it is not a
+    /// call, and [`Assembler::finish`] refuses it.
+    pub(crate) fn remaining(&mut self) -> Vec<ModelDelta> {
+        let mut out = Vec::new();
+        for call in self.calls.values_mut() {
+            if call.announced || call.name.is_empty() {
+                continue;
+            }
+            call.announced = true;
+            if let Ok(value) = call.value() {
+                out.push(ModelDelta::ToolCallComplete(value));
+            }
+        }
+        out
     }
 
     /// Finish the stream. Fails if the server never said why it stopped,
     /// rather than fabricating a response from a truncated stream.
-    pub(crate) fn finish(self) -> Result<ModelResponse, ModelError> {
+    pub(crate) fn finish(mut self) -> Result<ModelResponse, ModelError> {
         let reason = self
             .finish_reason
             .ok_or_else(|| ModelError::transient("stream ended without a finish_reason"))?;
         let mut tool_calls = Vec::with_capacity(self.calls.len());
-        for call in self.calls.into_values() {
-            check_name(&call.name)?;
-            let id = call.id.unwrap_or_else(fallback_id);
-            tool_calls.push(match parse_arguments(&call.arguments) {
-                Ok(arguments) => ToolCall::new(id, call.name, arguments),
-                Err(raw) => ToolCall::with_invalid_arguments(id, call.name, raw),
-            });
+        for call in self.calls.values_mut() {
+            tool_calls.push(call.value()?);
         }
         let mut response = build_response(
             self.text,
@@ -1284,8 +1326,167 @@ mod tests {
         assert_eq!(map_finish("weird"), FinishReason::Other("weird".into()));
     }
 
-    fn feed(asm: &mut Assembler, chunks: &[&str]) -> Vec<ModelDelta> {
-        chunks.iter().flat_map(|c| asm.push(c).unwrap()).collect()
+    fn feed<S: AsRef<str>>(asm: &mut Assembler, chunks: &[S]) -> Vec<ModelDelta> {
+        chunks
+            .iter()
+            .flat_map(|c| asm.push(c.as_ref()).unwrap())
+            .collect()
+    }
+
+    /// A chunk that says one thing about tool call `index`.
+    fn call_chunk(index: usize, body: &str) -> String {
+        format!(
+            r#"{{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{index},{body}}}]}}}}]}}"#
+        )
+    }
+
+    /// The chunk that says why the model stopped.
+    const FINISH: &str = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
+
+    #[test]
+    fn the_arguments_are_announced_once_when_they_parse_as_an_object() {
+        let mut asm = Assembler::default();
+        // The id and the name first: the empty argument text is not a complete `{}`.
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(0, r#""id":"c1","function":{"name":"w"}"#)],
+        );
+        assert_eq!(
+            deltas,
+            [ModelDelta::ToolCallStarted {
+                id: "c1".into(),
+                name: "w".into()
+            }]
+        );
+        // An object that is not whole yet: nothing.
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(0, r#""function":{"arguments":"{\"a\""}"#)],
+        );
+        assert!(deltas.is_empty(), "{deltas:?}");
+        // The closing brace: the call, once, with what the turn will hold.
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(0, r#""function":{"arguments":":1}"}"#)],
+        );
+        assert_eq!(
+            deltas,
+            [ModelDelta::ToolCallComplete(ToolCall::new(
+                "c1",
+                "w",
+                json!({"a": 1})
+            ))]
+        );
+        // More text that parses again does not say it twice.
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(0, r#""function":{"arguments":" "}"#)],
+        );
+        assert!(deltas.is_empty(), "{deltas:?}");
+        feed(&mut asm, &[FINISH]);
+        // And the response holds the same call.
+        let response = asm.finish().unwrap();
+        assert_eq!(
+            response.message.tool_calls(),
+            [ToolCall::new("c1", "w", json!({"a": 1}))]
+        );
+    }
+
+    #[test]
+    fn a_call_that_streamed_without_whole_arguments_is_announced_just_before_finished() {
+        // No arguments at all: the turn holds `{}`.
+        let mut asm = Assembler::default();
+        feed(
+            &mut asm,
+            &[&call_chunk(0, r#""id":"c1","function":{"name":"w"}"#)],
+        );
+        assert_eq!(
+            asm.remaining(),
+            [ModelDelta::ToolCallComplete(ToolCall::new(
+                "c1",
+                "w",
+                json!({})
+            ))]
+        );
+        assert!(asm.remaining().is_empty(), "once per call");
+        feed(&mut asm, &[FINISH]);
+        let response = asm.finish().unwrap();
+        assert_eq!(
+            response.message.tool_calls(),
+            [ToolCall::new("c1", "w", json!({}))]
+        );
+
+        // Arguments that are not JSON: the turn holds the invalid call.
+        let mut asm = Assembler::default();
+        feed(
+            &mut asm,
+            &[&call_chunk(
+                0,
+                r#""id":"c2","function":{"name":"w","arguments":"{oops"}"#,
+            )],
+        );
+        assert_eq!(
+            asm.remaining(),
+            [ModelDelta::ToolCallComplete(
+                ToolCall::with_invalid_arguments("c2", "w", "{oops")
+            )]
+        );
+        feed(&mut asm, &[FINISH]);
+        let response = asm.finish().unwrap();
+        assert_eq!(
+            response.message.tool_calls()[0]
+                .invalid_arguments
+                .as_deref(),
+            Some("{oops")
+        );
+    }
+
+    #[test]
+    fn the_id_announced_is_the_one_the_response_holds() {
+        // A provider that gives no id: the fallback id is made once, in the announcement.
+        let mut asm = Assembler::default();
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(
+                0,
+                r#""function":{"name":"w","arguments":"{}"}"#,
+            )],
+        );
+        let Some(ModelDelta::ToolCallStarted { id, .. }) = deltas.first() else {
+            panic!("{deltas:?}")
+        };
+        assert!(deltas.iter().any(|d| matches!(
+            d, ModelDelta::ToolCallComplete(call) if call.id == *id
+        )));
+        feed(&mut asm, &[FINISH]);
+        let response = asm.finish().unwrap();
+        assert_eq!(response.message.tool_calls()[0].id, *id);
+    }
+
+    /// A chunk that starts and finishes a call in one piece says both, in that order.
+    #[test]
+    fn one_chunk_can_say_the_start_and_the_completion() {
+        let mut asm = Assembler::default();
+        let deltas = feed(
+            &mut asm,
+            &[&call_chunk(
+                0,
+                r#""id":"c1","function":{"name":"w","arguments":"{\"a\":1}"}"#,
+            )],
+        );
+        assert_eq!(
+            deltas,
+            [
+                ModelDelta::ToolCallStarted {
+                    id: "c1".into(),
+                    name: "w".into()
+                },
+                ModelDelta::ToolCallComplete(ToolCall::new("c1", "w", json!({"a": 1}))),
+            ]
+        );
+        assert!(asm.remaining().is_empty());
+        feed(&mut asm, &[FINISH]);
+        assert_eq!(asm.finish().unwrap().message.tool_calls().len(), 1);
     }
 
     /// The parts OpenAI's reference names: reasoning in `completion_tokens_details`, cache reads and
@@ -1415,6 +1616,10 @@ mod tests {
                     id: "b".into(),
                     name: "two".into()
                 },
+                // Each call's arguments are whole at a different chunk, and `b`'s before `a`'s:
+                // the announcement is the call's, not the turn's.
+                ModelDelta::ToolCallComplete(ToolCall::new("b", "two", json!({"k": true}))),
+                ModelDelta::ToolCallComplete(ToolCall::new("a", "one", json!({"x": 1}))),
             ]
         );
         let r = asm.finish().unwrap();

@@ -117,13 +117,17 @@ impl<S> State<S> {
         }
     }
 
-    /// End of stream (`[DONE]` or EOF): emit `Finished`, or a transient error
-    /// when the server never said why it stopped.
+    /// End of stream (`[DONE]` or EOF): say the calls whose arguments were never announced, then
+    /// `Finished`, or a transient error when the server never said why it stopped.
     fn finalize(&mut self) {
         self.done = true;
-        if let Some(assembler) = self.assembler.take() {
+        if let Some(mut assembler) = self.assembler.take() {
+            let rest = assembler.remaining();
             match assembler.finish() {
-                Ok(response) => self.pending.push_back(ModelDelta::Finished(response)),
+                Ok(response) => {
+                    self.pending.extend(rest);
+                    self.pending.push_back(ModelDelta::Finished(response));
+                }
                 Err(e) => self.failure = Some(e),
             }
         }
@@ -261,6 +265,34 @@ mod tests {
         assert_eq!(r.message.text(), "Hello");
         assert_eq!(r.finish, FinishReason::Stop);
         assert_eq!(r.usage.output_tokens, 2);
+    }
+
+    /// A call whose arguments never came is announced just before `Finished`, as the call the turn
+    /// holds (`{}`), never while the stream goes on.
+    #[tokio::test]
+    async fn a_call_with_no_arguments_is_announced_just_before_finished() {
+        let out: Vec<_> = deltas(
+            byte_stream(vec![
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"w\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ]),
+            Duration::from_secs(5),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 3, "started, complete, finished: {out:?}");
+        assert!(matches!(out[0], ModelDelta::ToolCallStarted { .. }));
+        assert_eq!(
+            out[1],
+            ModelDelta::ToolCallComplete(adam_model::ToolCall::new(
+                "c1",
+                "w",
+                serde_json::json!({})
+            ))
+        );
+        assert!(matches!(out[2], ModelDelta::Finished(_)));
     }
 
     #[tokio::test]
