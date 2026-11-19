@@ -29,12 +29,12 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use adam_core::time::Timestamp;
 use adam_core::{
     ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
     RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult,
 };
 use async_trait::async_trait;
-use adam_core::time::Timestamp;
 
 /// A [`Store`] method a fault can target. `migrate` is not injectable: a
 /// store that cannot migrate never gets as far as running anything.

@@ -27,7 +27,6 @@ use adam_runtime::{
     SESSION_STATE_KEY, SessionHeader, Transition, child_run_id,
 };
 use async_trait::async_trait;
-use chrono::Duration as ChronoDuration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -100,7 +99,7 @@ pub struct RoundState {
     sending_count: usize,
     /// When the round first stepped: the round gives up `max_wait` after it, whatever started it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    started: Option<chrono::DateTime<chrono::Utc>>,
+    started: Option<adam_core::time::Timestamp>,
     /// Messages taken from the inbox that no step has dealt with yet.
     #[serde(default)]
     unhandled: Vec<Queued>,
@@ -620,10 +619,10 @@ impl RemoteRoundAgent {
         &self,
         ctx: &mut Ctx,
         looks: u32,
-    ) -> Result<chrono::DateTime<chrono::Utc>, AgentError> {
+    ) -> Result<adam_core::time::Timestamp, AgentError> {
         let wait = look_delay(looks, self.wait_poll);
         let now = ctx.now_journaled().await?;
-        Ok(now + ChronoDuration::from_std(wait).unwrap_or(ChronoDuration::seconds(60)))
+        Ok(now + adam_core::time::span_of(wait))
     }
 
     async fn run(
@@ -690,11 +689,11 @@ fn look_delay(looks: u32, cap: Duration) -> Duration {
 
 /// Whether a round that first stepped at `started` has worked `max_wait`.
 fn past_limit(
-    now: chrono::DateTime<chrono::Utc>,
-    started: chrono::DateTime<chrono::Utc>,
+    now: adam_core::time::Timestamp,
+    started: adam_core::time::Timestamp,
     max_wait: Duration,
 ) -> bool {
-    ChronoDuration::from_std(max_wait).is_ok_and(|limit| now - started > limit)
+    now - started > adam_core::time::span_of(max_wait)
 }
 
 fn request_of(message: Message) -> SendMessageRequest {

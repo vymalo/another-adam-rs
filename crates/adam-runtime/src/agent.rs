@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use async_trait::async_trait;
 use adam_core::time::Timestamp;
+use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

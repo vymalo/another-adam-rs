@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use crate::time::Timestamp;
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use super::{

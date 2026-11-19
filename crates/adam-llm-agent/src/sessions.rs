@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 
 use adam_core::RunId;
 use adam_model::ToolSpec;
@@ -318,7 +318,7 @@ pub(crate) struct DueFacts<'a> {
     /// not due while its call is there, or the history would hold the id twice.
     pub in_history: &'a HashSet<String>,
     /// When the chain of tasks began: a person's round that ended before it is not due.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
 }
 
 /// Whether the report of `session` is **due** to the model of the run `facts.me` ([ADR 0045],
@@ -1214,7 +1214,7 @@ mod tests {
             round: 1,
             state: SessionState::Idle,
             outcome: Some(RoundOutcome::Done),
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
             description: String::new(),
             keep_open: true,
             closed: false,
@@ -1226,7 +1226,7 @@ mod tests {
                 ended: true,
                 cancelled: false,
                 started_by: by.or(Some(me)),
-                updated_at: Utc::now(),
+                updated_at: Timestamp::now(),
             },
         }
     }
@@ -1315,7 +1315,7 @@ mod tests {
             ended: false,
             cancelled: false,
             started_by: Some(me),
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
         };
         assert!(!due(&session, me, &[]));
     }
@@ -1345,12 +1345,12 @@ mod tests {
         let at = session.report.updated_at;
         assert!(is_due(
             &session,
-            &facts(Some(at - chrono::Duration::seconds(1)))
+            &facts(Some(at - jiff::SignedDuration::from_secs(1)))
         ));
         assert!(is_due(&session, &facts(Some(at))));
         assert!(!is_due(
             &session,
-            &facts(Some(at + chrono::Duration::seconds(1)))
+            &facts(Some(at + jiff::SignedDuration::from_secs(1)))
         ));
     }
 

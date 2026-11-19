@@ -53,11 +53,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_a2a_runtime::{CONTEXT_THREAD_TOOLS, integral_numbers};
+use adam_core::time::Timestamp;
 use adam_llm_agent::{Listing, SourceCtx, ToolCtx, ToolError, ToolNote, ToolOutput, ToolSource};
 use adam_mcp::{CallOptions, Endpoint, EndpointError, McpPolicy, RemoteTool};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use secrecy::SecretString;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -123,7 +123,7 @@ impl Unavailable {
 pub(crate) struct Grant {
     pub(crate) url: String,
     pub(crate) token: SecretString,
-    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) expires_at: Timestamp,
 }
 
 impl std::fmt::Debug for Grant {
@@ -137,7 +137,7 @@ impl std::fmt::Debug for Grant {
 }
 
 /// What the clock says now; replaced in tests.
-pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 /// Reaches the thread-tools endpoint a run's context announces.
 #[derive(Clone)]
@@ -177,7 +177,7 @@ impl ThreadToolsClient {
             default_call: policy.call_timeout_value(),
             max_call: policy.thread_tools_max_call_value(),
             policy: policy.connect_timeout(listing),
-            clock: Arc::new(Utc::now),
+            clock: Arc::new(Timestamp::now),
         }
     }
 
@@ -212,9 +212,9 @@ impl ThreadToolsClient {
         else {
             return Err(Unavailable::Malformed);
         };
-        let expires_at = DateTime::parse_from_rfc3339(expires)
-            .map_err(|_| Unavailable::Malformed)?
-            .with_timezone(&Utc);
+        let expires_at = expires
+            .parse::<Timestamp>()
+            .map_err(|_| Unavailable::Malformed)?;
         if expires_at <= (self.clock)() {
             return Err(Unavailable::Expired);
         }
@@ -620,9 +620,7 @@ mod tests {
     }
 
     fn at(time: &str) -> Clock {
-        let now = DateTime::parse_from_rfc3339(time)
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = time.parse::<Timestamp>().unwrap();
         Arc::new(move || now)
     }
 

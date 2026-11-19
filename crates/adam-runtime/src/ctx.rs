@@ -744,10 +744,7 @@ mod tests {
             .await
             .expect("get")
             .expect("recorded");
-        assert_eq!(
-            entry.payload,
-            serde_json::json!("2026-01-02T03:04:05.120Z")
-        );
+        assert_eq!(entry.payload, serde_json::json!("2026-01-02T03:04:05.120Z"));
 
         let (store, run) = (ctx.store.clone(), ctx.run_id());
         let mut replay = ctx_on(&store, run, 0);
@@ -756,7 +753,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peeking_the_inbox_leaves_it_for_the_step_that_takes_it() {        let sink = CollectingSink::new();
+    async fn peeking_the_inbox_leaves_it_for_the_step_that_takes_it() {
+        let sink = CollectingSink::new();
         let mut ctx = ctx(&sink).await;
         assert!(ctx.peek_inbox().is_empty());
         ctx.inbox = vec![

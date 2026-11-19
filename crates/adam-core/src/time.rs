@@ -1,5 +1,5 @@
 //! The instant adam-rs stores and sends: [`Timestamp`], a [`jiff::Timestamp`] with the serde
-//! bytes the framework wrote before it moved off `chrono` (ADR 0053).
+//! bytes the framework wrote before it moved off `chrono` (ADR 0057).
 //!
 //! `chrono::DateTime<Utc>` serialized as RFC 3339 with `Z` and chrono's `SecondsFormat::AutoSi`:
 //! no fractional digits for a whole second, else 3, 6 or 9, whichever is the shortest exact one.
@@ -126,7 +126,7 @@ impl Sub for Timestamp {
 /// The framework's std-duration arithmetic: a duration too large for [`SignedDuration`] saturates.
 ///
 /// `chrono::Duration::from_std(..).unwrap_or(chrono::Duration::MAX)` was the same rule before
-/// ADR 0053; use this instead of a per-crate copy.
+/// ADR 0057; use this instead of a per-crate copy.
 pub fn span_of(duration: Duration) -> SignedDuration {
     SignedDuration::try_from(duration).unwrap_or(SignedDuration::MAX)
 }
@@ -137,9 +137,9 @@ impl fmt::Display for Timestamp {
         let nanos = self.0.subsec_nanosecond().unsigned_abs();
         let precision = if nanos == 0 {
             0
-        } else if nanos % 1_000_000 == 0 {
+        } else if nanos.is_multiple_of(1_000_000) {
             3
-        } else if nanos % 1_000 == 0 {
+        } else if nanos.is_multiple_of(1_000) {
             6
         } else {
             9
@@ -231,8 +231,14 @@ mod tests {
 
     #[test]
     fn arithmetic_saturates_instead_of_panicking() {
-        assert_eq!(Timestamp::MAX + SignedDuration::from_secs(1), Timestamp::MAX);
-        assert_eq!(Timestamp::MIN - SignedDuration::from_secs(1), Timestamp::MIN);
+        assert_eq!(
+            Timestamp::MAX + SignedDuration::from_secs(1),
+            Timestamp::MAX
+        );
+        assert_eq!(
+            Timestamp::MIN - SignedDuration::from_secs(1),
+            Timestamp::MIN
+        );
         let start = Timestamp::from_second(1_700_000_000).expect("in range");
         assert_eq!(
             start + SignedDuration::from_millis(1_500),
@@ -252,6 +258,9 @@ mod tests {
     fn a_duration_that_does_not_fit_saturates() {
         let at = Timestamp::from_second(1_700_000_000).expect("in range");
         assert_eq!(at + span_of(Duration::MAX), Timestamp::MAX);
-        assert_eq!(span_of(Duration::from_millis(1_500)), SignedDuration::from_millis(1_500));
+        assert_eq!(
+            span_of(Duration::from_millis(1_500)),
+            SignedDuration::from_millis(1_500)
+        );
     }
 }

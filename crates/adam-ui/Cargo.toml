@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 a2a-lf.workspace = true
+adam-core.workspace = true
 adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true
 adam-llm-agent.workspace = true
@@ -17,7 +18,7 @@ adam-mcp.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 jsonschema.workspace = true
 secrecy.workspace = true
 serde.workspace = true

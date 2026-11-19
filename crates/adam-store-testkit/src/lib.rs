@@ -28,11 +28,11 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use adam_core::store::{now, truncate_ms};
+use adam_core::time::Timestamp;
 use adam_core::{
     ClaimScope, ConversationScope, DynStore, JournalEntry, NewPushConfig, NewRun, PushProgress,
     PushState, RunId, RunQuery, RunStatus, RunUpdate, StoreError,
 };
-use adam_core::time::Timestamp;
 use futures::future::join_all;
 use serde_json::json;
 
@@ -157,12 +157,10 @@ pub mod cases {
         assert_eq!(committed.wake_at, Some(at));
 
         let finer: Timestamp = "2026-01-02T03:04:05.120500000Z".parse().unwrap();
+        let mut update = RunUpdate::new(RunStatus::Parked, json!({}));
+        update.wake_at = Some(finer);
         let rounded = store
-            .commit_run(
-                run.id,
-                committed.version,
-                RunUpdate::new(RunStatus::Parked, json!({})).wake_at(finer),
-            )
+            .commit_run(run.id, committed.version, update)
             .await
             .unwrap();
         assert_eq!(rounded.wake_at, Some(at), "truncated, never rounded up");
@@ -640,7 +638,7 @@ pub mod cases {
             &store,
             &agent,
             "w3",
-            far + jiff::SignedDuration::from_hours(24 * (1)),
+            far + jiff::SignedDuration::from_hours(24),
             ttl,
             10,
         )
@@ -679,7 +677,10 @@ pub mod cases {
         for l in &leases {
             assert_eq!(l.run.agent, a, "only requested agents are claimed");
             assert_eq!(l.worker, "w");
-            assert_eq!(l.until, truncate_ms(now) + jiff::SignedDuration::from_secs(60));
+            assert_eq!(
+                l.until,
+                truncate_ms(now) + jiff::SignedDuration::from_secs(60)
+            );
         }
         let first_three: Vec<_> = leases.iter().map(|l| l.run.id).collect();
         assert_eq!(first_three, a_ids[..3].to_vec(), "earliest sched_at first");

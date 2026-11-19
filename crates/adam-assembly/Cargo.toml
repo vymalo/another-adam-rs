@@ -34,7 +34,7 @@ adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 notify = { workspace = true, optional = true }
 reqwest.workspace = true
 secrecy.workspace = true

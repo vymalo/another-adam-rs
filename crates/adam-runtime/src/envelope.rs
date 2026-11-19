@@ -177,7 +177,10 @@ mod tests {
         let env = Envelope::new(serde_json::json!({}))
             .with_limit(now, std::time::Duration::from_secs(1800));
         let back = Envelope::decode(RunId::new(), &env.encode().unwrap()).unwrap();
-        assert_eq!(back.deadline, Some(now + jiff::SignedDuration::from_secs(1800)));
+        assert_eq!(
+            back.deadline,
+            Some(now + jiff::SignedDuration::from_secs(1800))
+        );
         assert_eq!(back.limit_secs, Some(1800));
     }
 
@@ -191,11 +194,27 @@ mod tests {
         let state = env.encode().expect("encodes");
         assert_eq!(state["deadline"], "2026-01-02T03:05:05.120Z");
         let back = Envelope::decode(RunId::new(), &state).expect("decodes");
-        assert_eq!(back.deadline, Some(at + jiff::SignedDuration::from_secs(60)));
+        assert_eq!(
+            back.deadline,
+            Some(at + jiff::SignedDuration::from_secs(60))
+        );
         assert_eq!(
             back.encode().expect("encodes again")["deadline"],
             "2026-01-02T03:05:05.120Z"
         );
+    }
+
+    /// A time limit too large for a signed duration saturates at the end of jiff's range instead
+    /// of overflowing: the run still parks with a deadline far in the future.
+    #[test]
+    fn a_time_limit_too_large_for_jiff_parks_at_the_end_of_time() {
+        let now = Timestamp::from_second(1_700_000_000).expect("in range");
+        let env = Envelope::new(serde_json::json!({})).with_limit(now, std::time::Duration::MAX);
+        assert_eq!(env.deadline, Some(Timestamp::MAX));
+        assert_eq!(env.limit_secs, Some(u64::MAX));
+        let back =
+            Envelope::decode(RunId::new(), &env.encode().expect("encodes")).expect("decodes");
+        assert_eq!(back.deadline, Some(Timestamp::MAX));
     }
 
     /// The state is decoded from a borrow and re-encoded as it was: every member, in the order the

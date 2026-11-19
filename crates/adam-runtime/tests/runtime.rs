@@ -596,10 +596,7 @@ fn child_with_child(
 
 /// Two instants of a clock that is the wall clock plus an offset are the same within a second or two.
 fn near(a: adam_core::time::Timestamp, b: adam_core::time::Timestamp) {
-    assert!(
-        (a - b).as_millis().abs() < 2_000,
-        "{a} is not near {b}"
-    );
+    assert!((a - b).as_millis().abs() < 2_000, "{a} is not near {b}");
 }
 
 /// A child that parks on a timer of `minutes` minutes, and does so again at each wake.
@@ -5664,7 +5661,10 @@ mod cases {
         back_worker.stop().await;
 
         let purged = dynamic
-            .purge_finished(&child_name, adam_core::store::now() + jiff::SignedDuration::from_hours(1))
+            .purge_finished(
+                &child_name,
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
+            )
             .await
             .expect("purge");
         assert!(purged >= 1);
@@ -5828,7 +5828,10 @@ mod cases {
                 .unwrap()
         );
         let purged = store
-            .purge_finished(&name, adam_core::store::now() + jiff::SignedDuration::from_hours(1))
+            .purge_finished(
+                &name,
+                adam_core::store::now() + jiff::SignedDuration::from_hours(1),
+            )
             .await
             .expect("purge");
         assert!(purged >= 2, "purged {purged}");

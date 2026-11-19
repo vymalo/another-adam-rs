@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use adam_core::time::Timestamp;
 use adam_core::{RunId, RunStatus};
 use adam_error::report;
 use adam_model::{
@@ -19,7 +20,6 @@ use adam_runtime::{
     child_run_id,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -806,7 +806,7 @@ struct ReportPlan {
     /// The ids of the report calls the history holds.
     in_history: HashSet<String>,
     /// When the chain of tasks began ([`Conversation::chain_started`]).
-    since: Option<DateTime<Utc>>,
+    since: Option<Timestamp>,
 }
 
 impl ReportPlan {
@@ -1777,23 +1777,17 @@ impl LlmAgent {
     }
 
     /// When a run that waits for a child looks at it next.
-    fn next_poll(&self, ctx: &Ctx) -> DateTime<Utc> {
-        let every = chrono::Duration::from_std(self.wait_poll).unwrap_or(chrono::Duration::MAX);
-        ctx.now()
-            .checked_add_signed(every)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    fn next_poll(&self, ctx: &Ctx) -> Timestamp {
+        ctx.now() + adam_core::time::span_of(self.wait_poll)
     }
 
     /// `ms` milliseconds from now, by the journaled clock.
-    async fn deadline_after(&self, ctx: &mut Ctx, ms: u64) -> Result<DateTime<Utc>, AgentError> {
+    async fn deadline_after(&self, ctx: &mut Ctx, ms: u64) -> Result<Timestamp, AgentError> {
         let now = ctx.now_journaled().await?;
         let every = i64::try_from(ms)
-            .ok()
-            .and_then(chrono::Duration::try_milliseconds)
-            .unwrap_or(chrono::Duration::MAX);
-        Ok(now
-            .checked_add_signed(every)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC))
+            .map(jiff::SignedDuration::from_millis)
+            .unwrap_or(jiff::SignedDuration::MAX);
+        Ok(now + every)
     }
 
     /// The child's outcome as the result of the call that waited for it. Returns the state the end of

@@ -540,9 +540,8 @@ fn read_latest(
     let closed_already = facts.close_asked
         || facts.header.as_ref().is_some_and(|h| h.closed)
         || (!open && !keep_open);
-    let idle_expired = !open
-        && !closed_already
-        && now - latest.updated_at >= adam_core::time::span_of(idle_ttl);
+    let idle_expired =
+        !open && !closed_already && now - latest.updated_at >= adam_core::time::span_of(idle_ttl);
     let closed = closed_already || idle_expired;
     let status = ChildStatus::from_record(latest);
     let (state, outcome) = if open {
@@ -802,7 +801,8 @@ mod tests {
     ) -> RunRecord {
         let mut env = crate::envelope::Envelope::new(serde_json::json!({}));
         env.error = error.map(str::to_owned);
-        let t = Timestamp::from_second(1_700_000_000).unwrap() + jiff::SignedDuration::from_secs(at);
+        let t =
+            Timestamp::from_second(1_700_000_000).unwrap() + jiff::SignedDuration::from_secs(at);
         RunRecord {
             id,
             agent: "a".into(),
