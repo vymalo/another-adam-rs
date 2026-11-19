@@ -366,7 +366,7 @@ impl RuntimeTaskBackend {
             task: s.latest_run,
             state,
             closing_round: s.closing,
-            closed: wire_state(s.state, s.closing) == "closed",
+            closed: wire_state(s.state, s.closes()) == "closed",
         })
     }
 

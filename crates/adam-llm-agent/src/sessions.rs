@@ -763,6 +763,8 @@ impl Tool for Send {
                 round: 0,
             });
             header.round = view.round + 1;
+            // The round before may have been one that only cleaned up after a cancel.
+            header.closing = false;
             let within = self
                 .roster
                 .by_registered(&view.agent)

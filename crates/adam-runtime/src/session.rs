@@ -372,6 +372,13 @@ impl ReportRound {
 }
 
 impl SessionSummary {
+    /// Whether the latest round ends the session: a closing round of a session that is closed. A
+    /// round that only cancels what the round before left running (`closing` with the session
+    /// still open) does not.
+    pub fn closes(&self) -> bool {
+        self.closing && self.closed
+    }
+
     /// Whether the latest round is doing work somebody will want to read: it is open and not a
     /// round that only closes the session (that one calls no model and ends by itself). What the
     /// working limit counts.

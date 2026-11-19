@@ -82,9 +82,9 @@ pub struct ChildSessionAgent {
     pub description: String,
     /// The time limit of each of its rounds.
     pub within: Option<Duration>,
-    /// Whether a round of it works on another agent's task, which a cancel of the round does not
-    /// stop by itself: the process that serves the front holds no endpoint, so a cancel that closes
-    /// the session is followed by a closing round, which a worker steps and which cancels it.
+    /// Whether a round of it works on a task of another agent, which a cancel of the round or an
+    /// idle expiry does not stop by itself: the process that serves the front holds no endpoint, so
+    /// a reader of such a session starts a closing round, which a worker steps and which cancels it.
     pub remote: bool,
 }
 
@@ -411,7 +411,7 @@ pub(crate) fn wire_state(state: SessionState, latest_closes: bool) -> &'static s
 fn select_listed(listed: Vec<SessionSummary>) -> Vec<SessionSummary> {
     let (mut open, closed): (Vec<_>, Vec<_>) = listed
         .into_iter()
-        .partition(|s| wire_state(s.state, s.closing) != "closed");
+        .partition(|s| wire_state(s.state, s.closes()) != "closed");
     open.extend(closed.into_iter().take(CLOSED_LISTED));
     open
 }
@@ -507,7 +507,20 @@ impl RuntimeTaskBackend {
             .session_view(&parent_conversation(&caller.subject, context), session)
             .await
             .map_err(map_err)?;
-        Ok(view.filter(|v| sessions.by_registered(&v.agent).is_some()))
+        let Some(view) = view.filter(|v| sessions.by_registered(&v.agent).is_some()) else {
+            return Ok(None);
+        };
+        // Whoever reads such a session starts what ends the remote task it left running. A failure
+        // is tried again by the next read: the session itself is as it was.
+        let helper = sessions.by_registered(&view.agent);
+        if needs_cleanup(&view, helper)
+            && let Err(error) = self
+                .start_cleanup(caller, context, &view, helper.and_then(|h| h.within))
+                .await
+        {
+            tracing::warn!(session = %view.id, %error, "cancelling the remote task of a session failed");
+        }
+        Ok(Some(view))
     }
 
     /// The round `run` as a task of child context `context`, and what it says about its session.
@@ -544,7 +557,7 @@ impl RuntimeTaskBackend {
             "keepOpen": latest.is_some_and(|h| h.keep_open),
             "round": number,
             "by": if round.by_person { "person" } else { "agent" },
-            "state": wire_state(session.state, latest.is_some_and(|h| h.closing)),
+            "state": wire_state(session.state, latest.is_some_and(|h| h.closing && h.closed)),
             "closing": session.closed && session.state == SessionState::Working,
         })
     }
@@ -655,6 +668,14 @@ impl RuntimeTaskBackend {
                 .list_sessions(&parent, &names, all.len(), sessions.listing_page)
                 .await?;
             let empty = page.sessions.is_empty();
+            // A session on a remote helper that expired idle: reading it starts its cleanup.
+            for expired in page.sessions.iter().filter(|s| {
+                s.idle_expired
+                    && !s.closing
+                    && sessions.by_registered(&s.agent).is_some_and(|a| a.remote)
+            }) {
+                let _ = self.session_of(caller, context, expired.id).await;
+            }
             all.extend(page.sessions);
             if empty || all.len() >= page.total || enough(&all) {
                 return Ok(all);
@@ -677,7 +698,7 @@ impl RuntimeTaskBackend {
             "agent": name,
             "description": s.description,
             "keepOpen": s.keep_open,
-            "state": wire_state(s.state, s.closing),
+            "state": wire_state(s.state, s.closes()),
             "round": {"number": s.round, "taskId": s.latest_run, "state": round_state},
         })
     }
@@ -1038,41 +1059,40 @@ impl RuntimeTaskBackend {
         ))
     }
 
-    /// After a cancel of round `run` of a person's session: when the cancel closed a session on a
-    /// remote helper, start the closing round that cancels the remote task. The process that
-    /// serves the front holds no endpoint and no credential, so the cancel's own hook cannot send
-    /// `CancelTask`; the worker's round agent does, as it does for any closing round. The round's
-    /// id derives from the cancelled run, so a repeat finds it.
+    /// After a cancel of round `run` of a person's session: the session is read, and
+    /// [`start_cleanup`](Self::start_cleanup) runs for it when it needs it.
     pub(crate) async fn clean_up_after_cancel(
         &self,
         caller: &Caller,
         round: &Round,
     ) -> Result<(), BackendError> {
-        let sessions = self.sessions()?;
-        let Some(view) = self
-            .session_of(caller, &round.parent_context, round.session)
-            .await?
-        else {
-            return Ok(());
-        };
-        let helper = sessions.by_registered(&view.agent);
-        if view.latest_run != round.run || !needs_cleanup(&view, helper) {
-            return Ok(());
-        }
-        let within = helper.and_then(|h| h.within);
-        let mut header = next_header(&view, round.session);
-        header.closed = true;
+        self.session_of(caller, &round.parent_context, round.session)
+            .await
+            .map(drop)
+    }
+
+    /// Start the round that cancels the remote task a remote helper's session left running: a
+    /// closing round continuing the latest one, which a worker steps (`carry_round` puts the task
+    /// in `prior_open_task`, `cancel_prior` sends `CancelTask`). The process that serves the front
+    /// holds no endpoint and no credential, so only a worker can send it. The session closes with
+    /// it when it was closed already (not kept open, or expired idle) and otherwise stays open: the
+    /// round only cancels. Its id derives from the latest run, so a repeat finds it.
+    async fn start_cleanup(
+        &self,
+        caller: &Caller,
+        context: &str,
+        view: &SessionView,
+        within: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        let mut header = next_header(view, view.id);
+        header.closed = view.closed;
         header.closing = true;
-        let next = task_id_for(
-            &view.agent,
-            &caller.subject,
-            Some(&round.context),
-            &format!("cleanup-after-cancel-{}", round.run),
-        );
-        let input = Inbound::new("message", closing_round_payload(&header))
-            .with_id(format!("cleanup-after-cancel-{}", round.run));
-        // Busy: another request already started a round after the cancel; it cleans up as well.
-        self.next_round(&view, next, input, within).await?;
+        let message_id = format!("cleanup-after-{}", view.latest_run);
+        let child = session_conversation_id(context, view.id);
+        let next = task_id_for(&view.agent, &caller.subject, Some(&child), &message_id);
+        let input = Inbound::new("message", closing_round_payload(&header)).with_id(message_id);
+        // Busy: another request already started a round after it; that one cleans up as well.
+        self.next_round(view, next, input, within).await?;
         Ok(())
     }
 
@@ -1179,13 +1199,14 @@ enum Next {
     Busy,
 }
 
-/// Whether `view`'s session was closed by a cancel of its latest round, and the helper works on
-/// another agent's task: the remote task is still running until a closing round has cancelled it.
+/// Whether a remote task of `view`'s session may still be running with nobody to cancel it: the
+/// helper works on another agent's task, and the latest round was cancelled or the session
+/// expired idle, and no closing round has been started since. A closing round sent
+/// `CancelTask` for what the round before left (`carry_round`).
 fn needs_cleanup(view: &SessionView, helper: Option<&ChildSessionAgent>) -> bool {
     helper.is_some_and(|h| h.remote)
-        && view.closed
         && view.state != SessionState::Working
-        && view.outcome == Some(RoundOutcome::Cancelled)
+        && (view.outcome == Some(RoundOutcome::Cancelled) || view.idle_expired)
         && view.header.as_ref().is_some_and(|h| !h.closing)
 }
 
@@ -1221,6 +1242,8 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         round: 0,
     });
     header.round = view.round + 1;
+    // The round before may have been one that only cleaned up after a cancel.
+    header.closing = false;
     header
 }
 
@@ -1468,7 +1491,7 @@ mod tests {
         let kept = select_listed(listed);
         assert_eq!(kept.len(), 2 + CLOSED_LISTED);
         assert!(kept.iter().any(|s| s.id == pending.id));
-        assert_eq!(wire_state(kept[0].state, kept[0].closing), "working");
+        assert_eq!(wire_state(kept[0].state, kept[0].closes()), "working");
         assert!(kept[2..].iter().all(|s| s.state == SessionState::Closed));
     }
 

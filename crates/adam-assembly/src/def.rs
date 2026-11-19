@@ -380,7 +380,7 @@ impl AgentDef {
     /// registration under a name replaces the first.
     ///
     /// A process that registers only starters holds no endpoint, so it cannot send the
-    /// `CancelTask` of a remote round it cancels. The front follows a cancel that closes a session
+    /// `CancelTask` of a remote round it cancels. The front follows a cancel of a round, or an idle expiry, of a session
     /// on a remote helper with a closing round ([`ChildSessionAgent::remote`](adam_a2a_runtime::ChildSessionAgent::remote)),
     /// which a worker steps and whose [`RemoteRoundAgent`] cancels the task.
     #[must_use]

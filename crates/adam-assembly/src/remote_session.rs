@@ -795,6 +795,14 @@ fn carry_round(input: &Inbound, prior: &RoundState) -> Result<RoundState, AgentE
     state.answer_task.clone_from(&prior.answer_task);
     state.last_text.clone_from(&prior.last_text);
     state.prior_open_task = prior.task.clone().or_else(|| prior.prior_open_task.clone());
+    // A task that waits for an answer is still open at the remote: a round that closes the session
+    // cancels it too, and nobody is left to answer it.
+    if state.closing()
+        && state.prior_open_task.is_none()
+        && let Some(waiting) = state.answer_task.take()
+    {
+        state.prior_open_task = Some(waiting);
+    }
     state.prior_sending = prior
         .sending
         .clone()
@@ -1281,5 +1289,40 @@ mod tests {
                 "what waited goes first"
             );
         }
+    }
+
+    /// A closing round cancels the task that waits for an answer, which no round works on.
+    #[test]
+    fn a_closing_round_cancels_the_task_that_waits_for_an_answer() {
+        let agent = round_agent();
+        let mut before = AgentStarter::init(&agent, message("m1", "first")).unwrap();
+        before.answer_task = Some("t9".into());
+        let header = SessionHeader {
+            id: adam_core::RunId::new(),
+            agent: "coder/billing".into(),
+            description: String::new(),
+            keep_open: true,
+            closed: true,
+            closing: true,
+            round: 2,
+        };
+        let close = Inbound::new(
+            SESSION_CLOSE_KIND,
+            json!({ SESSION_STATE_KEY: header, SESSION_CLOSE_ROUND_KEY: true }),
+        );
+        let next =
+            AgentStarter::init_continuing(&agent, close, &before, adam_core::RunId::new()).unwrap();
+        assert_eq!(next.prior_open_task.as_deref(), Some("t9"));
+        assert_eq!(next.answer_task, None);
+        // A round that sends keeps answering it.
+        let next = AgentStarter::init_continuing(
+            &agent,
+            message("m2", "yes"),
+            &before,
+            adam_core::RunId::new(),
+        )
+        .unwrap();
+        assert_eq!(next.prior_open_task, None);
+        assert_eq!(next.answer_task.as_deref(), Some("t9"));
     }
 }

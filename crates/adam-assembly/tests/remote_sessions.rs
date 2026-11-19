@@ -1312,14 +1312,21 @@ mod split {
 
     impl Split {
         pub async fn new(rig: &Rig, store: &DynStore) -> Self {
+            Self::with_idle_ttl(rig, store, None).await
+        }
+
+        /// The control plane reads a session closed after `idle` of nobody writing to it.
+        pub async fn with_idle_ttl(rig: &Rig, store: &DynStore, idle: Option<Duration>) -> Self {
             let worker_rt = rig.runtime(store, None);
             let events = BroadcastSink::default();
             let def = rig.def(None);
             let sessions = def.child_sessions().expect("a root with a helper");
+            let mut builder = Runtime::builder(store.clone()).starter(LlmStarter::new(&rig.root));
+            if let Some(idle) = idle {
+                builder = builder.session_idle_ttl(idle);
+            }
             let control = def
-                .session_starters(
-                    Runtime::builder(store.clone()).starter(LlmStarter::new(&rig.root)),
-                )
+                .session_starters(builder)
                 .event_sink(events.clone())
                 .poll_interval(Duration::from_millis(10))
                 .build();
@@ -1438,6 +1445,82 @@ mod split {
                 .await
                 .unwrap_or_else(|e| panic!("{backend}: the close was refused: {e:?}"));
             wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            split.worker.stop().await;
+        }
+    }
+
+    /// A cancel of a round of a session that stays open sends the remote `CancelTask` too, and the
+    /// session stays open: it is idle, not closed, and takes the next message as a new round.
+    #[tokio::test]
+    async fn cancelling_a_round_of_a_kept_open_session_cancels_the_remote_task_and_keeps_it_open() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::new(&rig, &store).await;
+            let start = split.start("invoice 7", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            split.backend.cancel(&split.alice, &start.id).await.unwrap();
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            // The cleanup round is done once the session is idle again, and it is still open.
+            let task = wait_for("the session idle", || async {
+                let task = split.backend.get(&split.alice, &start.id).await.ok()??;
+                (object(&task)["state"] == "idle").then_some(task)
+            })
+            .await;
+            assert_eq!(object(&task)["keepOpen"], true, "{backend}");
+            rig.remote.release();
+            let again = split
+                .backend
+                .submit(
+                    split.alice.clone(),
+                    said("invoice 8", Some(&start.context_id), json!({})),
+                    None,
+                    Some(start.context_id.clone()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: an open session takes a message: {e:?}"));
+            let done = until(&split, &again.id, TaskState::Completed).await;
+            assert!(
+                serde_json::to_string(&done)
+                    .unwrap()
+                    .contains("done: invoice 8"),
+                "{backend}"
+            );
+            split.worker.stop().await;
+        }
+    }
+
+    /// A session on a remote helper that expires idle, with the remote task still open (it asked a
+    /// question and nobody answered), is followed by a closing round that cancels the task.
+    #[tokio::test]
+    async fn a_remote_session_that_expires_idle_has_its_remote_task_cancelled() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::with_idle_ttl(&rig, &store, Some(Duration::from_millis(300))).await;
+            let start = split.start("invoice [input]", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            rig.remote.release();
+            until(&split, &start.id, TaskState::Completed).await;
+            assert!(rig.remote.cancels().is_empty(), "{backend}: nothing yet");
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            // Whoever looks at the session after it expired starts the cleanup.
+            wait_for("the CancelTask after the expiry", || async {
+                let _ = split.backend.get(&split.alice, &start.id).await;
                 (!rig.remote.cancels().is_empty()).then_some(())
             })
             .await;
