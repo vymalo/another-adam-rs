@@ -146,15 +146,20 @@ A commit resolves the generation: `RunUpdate.body.generation` names a new one (a
 first split), else the current head's, else a new UUID. It writes only the rows after the old head's
 `len` for an append (all rows for a new generation), **before** the CAS, in one unordered
 `insertMany` (duplicates ignored), then **checks completeness**: `inserted + duplicate_keys ==
-rows.len()`. A duplicate is this attempt's row only if its `writer` is this attempt: a slot written
-by **another** attempt at the same expected version is a `Conflict` (checked with `count_documents`
-over the attempted range, using `adam_body_generation`), and the runtime retries from the new head.
-Any other write error, and any **write-concern** error (the write may or may not have landed),
-aborts before the CAS — a head never names a generation that is missing a row. The refs go next, then the CAS,
-then the GC: the superseded generations of the run written more than an hour ago are deleted. A
-commit that loses the CAS deletes the rows and refs its `writer` added (but never a row or digest
-the winner's head names), so a loser cannot poison the next append. `load_head` reads the document
-once and serves the head only when `head_version == version`.
+rows.len()`. A duplicate is this attempt's own row when its `writer` is this attempt. A duplicate
+written by **another** attempt is read back with `adam_body_generation` over the attempted range: if
+every foreign row has the message this attempt would write, it is **adopted** and the CAS decides
+whose head names it; else if every foreign row is older than the orphan grace (5 minutes, longer
+than any lease the runtime grants), its attempt died before its CAS, so the rows are deleted and the
+insert retried once; else a live attempt owns the slots and the commit is a `Conflict`. The runtime
+drops the result of a conflict and the next claim steps the run again; a run wedged by an older
+binary is cancelled by an operator. Any other write error, and any **write-concern** error (the write
+may or may not have landed), aborts before the CAS — a head never names a generation that is missing
+a row. The refs go next, then the CAS, then the GC: the superseded generations of the run written
+more than an hour ago are deleted. A commit that loses the CAS deletes the rows and refs its
+`writer` added (but never a row or digest the winner's head names), so a loser cannot poison the
+next append. `load_head` reads the document once and serves the head only when `head_version ==
+version`.
 
 `purge_finished` deletes the purged runs' body rows with their journal and references. The body
 methods are **defaulted** on `Store`; `RunUpdate` gained the public fields `head` and `body`, so a

@@ -1047,7 +1047,9 @@ under a new generation. The delta win holds across **splitting** commits, not ac
 full `state`) arrives at S3. Measured with a delivery between every step: 50 × 10 KB writes 12.7 MB
 of body rows (1,275 rows, 50 generations) against ~0.5 MB of deltas for consecutive splits. The store writes the rows **before** the CAS with the attempt's `writer`,
 checks that all of them landed, and a commit that loses deletes its own rows and refs, so a loser
-cannot poison the next append. The runtime reconstructs `join(head, rows)` before every commit and
+cannot poison the next append. A duplicate slot is resolved by content and age: an identical foreign
+row is adopted, a differing one older than the 5-minute orphan grace is collected and the insert
+retried once, and a live attempt's differing row is a `Conflict` (ADR 0055). The runtime reconstructs `join(head, rows)` before every commit and
 refuses a split that does not equal the state, which keeps a bad split at `state` only. A commit that
 does not split (a delivery, a cancel, a park) leaves the stored head and its version alone;
 `load_head` serves the head only when `head_version == version`. **The contract release (S3) stops

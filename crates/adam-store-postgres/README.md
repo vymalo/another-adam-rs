@@ -142,7 +142,11 @@ and the one-transaction CTE are the PostgreSQL follow-up after #361.
 When that half lands, its upgrade gate must be `stored < 6` (or a check of
 `to_regclass('<prefix>body')`), **not** `stored == Some(4)`: a database stamped 5 by S1/S2a already
 has the blob tables but no head or body, so a gate on the blob step would skip the new columns
-silently. The follow-up bumps `SCHEMA_VERSION` to 6.
+silently. The follow-up bumps `SCHEMA_VERSION` to 6. It also applies the body duplicate rule the
+MongoDB half implements (ADR 0055, S2a amendment 6): an identical foreign row is adopted, a differing
+one older than the 5-minute orphan grace is collected and the insert retried once, and a live
+attempt's differing row is a `Conflict` — all inside the one transaction that writes the rows, the
+refs and the CAS.
 
 ## Schema version and the owner column
 

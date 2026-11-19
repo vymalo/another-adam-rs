@@ -118,9 +118,11 @@ commit" language is superseded.
 1. **A normal commit writes the delta.** `Conversation::split` returns the whole transcript, but a
    commit whose rows start with the previous transcript passes `BodyWrite { generation: None }`; the
    store appends only `rows[old_len..]` to the current generation. The head names
-   `{generation, len}`. The write win therefore holds in the expand release: commit `t` writes `b`
-   bytes, not `t·b`. The first design (a new set per commit) would have written the whole transcript
-   every commit, and S3's `< 50 × 20 KB` gate would have been unreachable.
+   `{generation, len}`. The **body's** write win therefore holds in the expand release across a run
+   of splitting commits: commit `t` appends `b` bytes, not `t·b`. It does not hold across a headless
+   commit or a v4 commit — the next split compacts (point 5) — and every commit still carries the
+   full `state` until S3. The first design (a new set per commit) would have written the whole
+   transcript every commit, and S3's `< 50 × 20 KB` gate would have been unreachable.
 2. **A compaction bumps the generation.** When the new transcript does not start with the previous one
    (a shortening, a dropped turn), the runtime passes `BodyWrite { generation: Some(new) }`; the store
    writes all rows under `new` and collects the old generation after a grace period (`gc_body`). A
@@ -141,18 +143,28 @@ commit" language is superseded.
    arrives there. Measured with a delivery-shaped commit between every step:
    `p2-headless: steps=50 rows=1275 bytes=13288347 generations=50` (12.7 MB) against ~0.5 MB of
    deltas for consecutive splits.
-6. **A duplicate slot belongs to this attempt only if its `writer` is this attempt.** Two attempts at
-   the same expected version can insert different messages at the same `(run, generation, idx)`;
-   MongoDB checks `count_documents({run_id, generation, idx in [start, len), writer != this writer})
-   == 0` on the duplicate path and answers `Conflict` (the runtime retries from the new head), and a
-   loser deletes its own rows and refs. The PostgreSQL follow-up does the same inside its
-   transaction.
+6. **A duplicate slot is resolved by content, then by age.** Two attempts at the same expected
+   version can insert different messages at the same `(run, generation, idx)`. On a duplicate key
+   MongoDB reads the foreign rows at the attempted slots. If every one has the message this attempt
+   would write, it is **adopted** (the completeness check passes and the CAS decides whose head names
+   it), so a deterministic re-run makes progress. Otherwise, if every foreign row is older than the
+   **orphan grace** (5 minutes, longer than any lease the runtime grants), the attempt that wrote it
+   died before its CAS, so the rows are deleted and the insert retried once. Otherwise a live attempt
+   owns the slots and the commit is a `Conflict`. A loser deletes its own rows and refs, and never a
+   row below the winner's head's `len`; the PostgreSQL follow-up does the same inside its
+   transaction. A live concurrent attempt's rows stay a `Conflict` — the runtime drops the result and
+   the next claim steps the run again — but rows from an attempt that died in the insert→CAS window
+   are adopted when identical or removed after the grace, so they no longer wedge the run. An older
+   binary that still wedges one is cancelled by an operator.
 
 ## Consequences
 
-* The quadratic write is gone: a commit writes one message plus a head, not the transcript (amended
-  S2a: the append-only generation is what makes this true in the expand release too). The corrected
-  20× at 40 turns and 50× at 100 become ~1×. The read of a status becomes one small row.
+* The **body's** quadratic write is gone across splitting commits: a split writes one message plus a
+  head, not the transcript (amended S2a: the append-only generation is what makes this true in the
+  expand release too). A headless commit or a v4 commit still compacts the transcript until S3, and
+  every commit still carries the full `state`, so the commit's full win (no `state`) arrives at S3.
+  Across splitting commits the corrected 20× at 40 turns and 50× at 100 become ~1× for the body. The
+  read of a status becomes one small row.
 * **Breaking:** `RunView.artifacts` becomes `Vec<ArtifactRef>` (bytes by reference,
   `Runtime::artifact_bytes` to fetch), and `RunView.state` is the agent's head, not the whole state
   (`Runtime::state(run)` is the joined state). Every in-repo consumer already reads only head members;

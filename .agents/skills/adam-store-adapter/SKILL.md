@@ -138,9 +138,13 @@ trait at your rev: its doc comments are the contract.
   under `new`. Validate `rows[i].idx == i`, resolve the target, patch the head's `body` to
   `{generation, len}` (`adam_core::set_head_body`; `head_body` reads it), write the rows **before**
   the CAS with the attempt's `writer`, and check that all of them landed. A duplicate key is this
-  attempt's retry **only if the row's `writer` is this attempt**; a slot written by another attempt
-  at the same expected version is a `Conflict` (the runtime retries from the new head). A
-  **write-concern** error is not a completeness answer. A commit that loses the CAS deletes the
+  attempt's retry when the row's `writer` is this attempt. A row another attempt wrote is resolved
+  by content and age: **adopt** it when its message equals the one this attempt would write, delete
+  it and retry the insert once when it is older than the **orphan grace** (5 minutes, longer than
+  any lease the runtime grants), and answer `Conflict` when a live attempt holds the slot with a
+  different message. A live conflict is not a wedge: the runtime drops the result and the next
+  claim steps the run again; an attempt that died before its CAS leaves rows that are adopted or
+  collected. A **write-concern** error is not a completeness answer. A commit that loses the CAS deletes the
   rows and refs its `writer` added, but never a row or digest the winner's head names — and a commit
   with no body still cleans the refs it inserted. A commit with `head: None` leaves the stored head **and its `head_version`**
   alone; `load_head` serves the head only when `head_version == version`. Collect superseded

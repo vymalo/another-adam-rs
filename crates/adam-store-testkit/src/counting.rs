@@ -291,7 +291,7 @@ pub struct HeadlessMeasurement {
 }
 
 impl HeadlessMeasurement {
-    /// The one line the test prints: `p2-headless: steps=50 rows=1275 bytes=13056000
+    /// The one line the test prints: `p2-headless: steps=50 rows=1275 bytes=13288347
     /// generations=50`.
     pub fn report(&self) -> String {
         format!(
