@@ -169,6 +169,11 @@ test('a verifier that needs the network gets it for its grading only', async (t)
   const none = await fixture(t);
   await runPlan({ deps: none.deps(), plan: [spec(none, 'hello-1', 'opencode')] });
   assert.deepEqual(none.windows, []);
+  // The internal verifier network is shared: a `default` verifier grades alongside others, never in the egress window.
+  const shared = await fixture(t, { verifier: 'default' });
+  await runPlan({ deps: shared.deps(), plan: [spec(shared, 'hello-1', 'opencode')] });
+  assert.deepEqual(shared.windows, [], 'never the egress window');
+  assert.deepEqual(shared.shared, ['grader'], 'the grading takes the shared side');
   const open = await fixture(t, { verifier: 'public' });
   await runPlan({ deps: open.deps(), plan: [spec(open, 'hello-1', 'opencode')] });
   assert.deepEqual(open.windows, ['grader']);

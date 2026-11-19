@@ -65,7 +65,7 @@ async function gradeSaved({ deps, task, patchPath }) {
   const net = task.verifierNetwork;
   await deps.pullGraderImage?.(task);
   // The verifier network is internal; a verifier that needs the internet gets the egress network for its window, alone.
-  if (net === 'public' || net === 'default') return deps.stack.graderWindow(grade);
+  if (net === 'public') return deps.stack.graderWindow(grade);
   return deps.stack.graderShared ? deps.stack.graderShared(grade) : grade();
 }
 

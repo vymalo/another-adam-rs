@@ -367,6 +367,10 @@ test('the containers of a slot and of the grader are host containers with their 
   assert.equal(slot.aliases.slot, 'adam-bench_slot-2');
   assert.equal(slot.prefix, 'adam-bench_');
   assert.deepEqual(stack.graderContainers().labels, { 'bench.project': 'adam-bench', 'bench.role': 'grader' });
+  const grader = stack.graderContainers();
+  assert.equal(grader.prefix, '', 'a network the owner named in tasks.verifierNetworks is used as it is');
+  assert.equal(grader.aliases.verifier, 'adam-bench_verifier');
+  assert.equal(grader.aliases.egress, 'adam-bench_egress');
   assert.deepEqual(stack.coderContainers(1).labels, { 'bench.project': 'adam-bench', 'bench.slot': '1', 'bench.role': 'coder' });
 });
 

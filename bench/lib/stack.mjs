@@ -572,10 +572,10 @@ export class Stack {
   }
 
   /** A HostContainers over this stack's promise-returning exec (the tests' fake is async too). */
-  host(labels = {}, aliases = {}) {
+  host(labels = {}, aliases = {}, prefix = `${this.project}_`) {
     return new HostContainers({
       labels,
-      prefix: `${this.project}_`,
+      prefix,
       aliases,
       invoke: (args, { timeoutMs, input }) => this.exec('docker', args, { env: this.dockerEnv(), timeoutMs, input }),
     });
@@ -593,9 +593,9 @@ export class Stack {
     return this.host({ 'bench.project': this.project, 'bench.slot': String(slot), 'bench.role': 'coder' });
   }
 
-  /** The containers that grade: no agent runs under these labels. */
+  /** The containers that grade: no agent runs under these labels. A network the owner named is used as it is. */
   graderContainers() {
-    return this.host({ 'bench.project': this.project, 'bench.role': 'grader' });
+    return this.host({ 'bench.project': this.project, 'bench.role': 'grader' }, { verifier: `${this.project}_verifier`, egress: `${this.project}_egress` }, '');
   }
 
   /** Containers that neither arm owns (a probe): their labels keep them out of a reap of a slot or the grader. */
