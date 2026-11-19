@@ -6,7 +6,12 @@
 //!
 //! Every `WORKSPACE_SWEEP_SECS` ([`crate::config`]; 300 by default, and once at startup) it walks the
 //! runs that have a workspace on this worker's volume ([`Workspaces::runs`]) and asks the store
-//! about each one:
+//! about each one. What that read learned is reused by the passes over kept output and held runs;
+//! the pass over image scopes still reads the run that noted a scope. A purged id is not remembered
+//! as finished, because a retry can create the same run during the sweep. The record's `status` is
+//! enough, so no state is decoded; the read still transfers the whole record, because a status
+//! projection is not in this tree yet (P3 of the 2026-11-18 optimisation review). What the store
+//! answers is:
 //!
 //! * the run is **open** (`runnable` or `parked`): its workspace stays, whatever it holds. A run
 //!   that waits for the person's answer for a week keeps its workspace for a week;
@@ -46,7 +51,7 @@
 //! stops the process. The janitor is a worker component of the host (`Agents::worker_component` of
 //! `adam-service`), so it runs in the `all` and `worker` roles and stops with the workers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -63,6 +68,12 @@ use crate::tools::Commands;
 /// How long a scope of images that the sweep cannot place stays after anything in it was last
 /// written.
 pub const IMAGE_SCOPE_BACKSTOP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// What one sweep learned about a run from its record's status: `Some(true)` over **and known**
+/// (an id the store does not have is never inserted: it can be recreated by a retry), `Some(false)`
+/// open, `None` not a run id. A later pass of the same sweep reuses it instead of asking the store
+/// again; the state is never decoded (the record's `status` is enough).
+type Verdicts = HashMap<String, Option<bool>>;
 
 /// What one sweep did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -171,18 +182,35 @@ impl Janitor {
             }
         };
         let mut released = HashSet::new();
+        // One read per run for the whole sweep: the passes over kept output and held runs reuse
+        // what the loop over workspaces learned.
+        let mut seen: Verdicts = Verdicts::new();
         for run in runs {
             if stop.is_cancelled() {
                 break;
             }
             match standing(store, &run).await {
                 // A directory that is not a run id is not ours.
-                Ok(Standing::NotARun | Standing::Open) => report.kept += 1,
+                Ok(Standing::NotARun) => {
+                    report.kept += 1;
+                    seen.insert(run, None);
+                }
+                Ok(Standing::Open) => {
+                    report.kept += 1;
+                    seen.insert(run, Some(false));
+                }
                 Err(e) => {
                     tracing::warn!(%run, error = %adam_error::report(&e), "cannot ask the store about a run; its workspace stays");
                     report.failed.push(run);
                 }
                 Ok(Standing::Over(record)) => {
+                    // A purged id is not over for good: `task_id_for` derives it from the caller,
+                    // the context and the message id, so a retry can create the same run during
+                    // this sweep. Only a record the store still knows is remembered as finished;
+                    // the passes below re-read an unknown one.
+                    if record.is_some() {
+                        seen.insert(run.clone(), Some(true));
+                    }
                     // What runs in the environment goes first: the commands that keep running, and
                     // what a worker that is gone left in the records.
                     self.commands.stop_run(&run, "the run ended").await;
@@ -249,9 +277,9 @@ impl Janitor {
                 }
             }
         }
-        self.release_orphans(store, stop, &released, &mut report)
+        self.release_orphans(store, stop, &released, &seen, &mut report)
             .await;
-        self.sweep_outputs(store, stop).await;
+        self.sweep_outputs(store, stop, &seen).await;
         self.sweep_images(store, stop, &mut report).await;
         report
     }
@@ -336,8 +364,9 @@ impl Janitor {
     }
 
     /// Remove the kept output of runs that are over and have no workspace here any more (a crash
-    /// between the two removals, a workspace removed by hand). An open run's stays.
-    async fn sweep_outputs(&self, store: &dyn Store, stop: &CancellationToken) {
+    /// between the two removals, a workspace removed by hand). An open run's stays. A run this
+    /// sweep already judged is not read again.
+    async fn sweep_outputs(&self, store: &dyn Store, stop: &CancellationToken, seen: &Verdicts) {
         let runs = match self.kept.runs().await {
             Ok(runs) => runs,
             Err(e) => {
@@ -349,7 +378,11 @@ impl Janitor {
             if stop.is_cancelled() {
                 break;
             }
-            match is_over(store, &run).await {
+            let over = match seen.get(&run) {
+                Some(over) => Ok(*over),
+                None => is_over(store, &run).await,
+            };
+            match over {
                 Ok(Some(true)) => {
                     self.commands.settle_over_run(&self.kept, &run).await;
                     if let Err(e) = self.kept.remove_run(&run).await {
@@ -456,11 +489,13 @@ impl Janitor {
 
     /// Release what the environment holds for runs that are over and that the loop above did not
     /// see: the run has no workspace on this volume (it was removed, or the crash was in between).
+    /// A run this sweep already judged is not read again.
     async fn release_orphans(
         &self,
         store: &dyn Store,
         stop: &CancellationToken,
         released: &HashSet<String>,
+        seen: &Verdicts,
         report: &mut Sweep,
     ) {
         let held = match self.environment.held_runs().await {
@@ -470,14 +505,21 @@ impl Janitor {
                 return;
             }
         };
+        // The runs the sweep already failed, by id: `report.failed` is a list, and a sweep can
+        // hold many runs.
+        let mut failed: HashSet<String> = report.failed.iter().cloned().collect();
         for run in held {
             if stop.is_cancelled() {
                 break;
             }
-            if released.contains(&run) || report.failed.contains(&run) {
+            if released.contains(&run) || failed.contains(&run) {
                 continue;
             }
-            match is_over(store, &run).await {
+            let over = match seen.get(&run) {
+                Some(over) => Ok(*over),
+                None => is_over(store, &run).await,
+            };
+            match over {
                 Ok(Some(true)) => match self.release_after_commands(&run).await {
                     Ok(()) => {
                         tracing::info!(%run, "released the environment of a finished run that has no workspace here");
@@ -485,12 +527,14 @@ impl Janitor {
                     }
                     Err(e) => {
                         tracing::warn!(%run, error = %adam_error::report(&e), "cannot release the environment of a finished run");
+                        failed.insert(run.clone());
                         report.failed.push(run);
                     }
                 },
                 Ok(Some(false) | None) => {}
                 Err(e) => {
                     tracing::warn!(%run, error = %adam_error::report(&e), "cannot ask the store about a run; its environment stays");
+                    failed.insert(run.clone());
                     report.failed.push(run);
                 }
             }

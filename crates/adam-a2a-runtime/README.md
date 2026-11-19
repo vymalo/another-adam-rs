@@ -15,7 +15,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | Item | What |
 |---|---|
 | `RuntimeTaskBackend::new(runtime, events, agent)` | `events` must be the `BroadcastSink` the runtime was built with; `agent` is the registered name, as an agent (`.agent`) or as a start-only starter (`.starter`) |
-| `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run |
+| `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run: the fallback for a state change no live event announced, 2 s by default. A `Status` event (a commit) makes the pump poll at once, so this is not the latency of a run this process steps |
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`; the default reads `state.pending_wait.question`, and `state.pending_question.question` for runs parked by an older build) and how an A2A message becomes an `Inbound` (`InboundFn`) |
 | `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings. `default_inbound` marks a line of text that begins as a form's answer `(typed) `, as `vymalo_inbound` does ([below](#a-screen-as-the-sender)). `artifact_of`: string data is a text part, anything else a data part; an object whose `url` is an absolute `http(s)` URL also gets a `url` part after the data part (A2A v1 `Part.url`), so a client can show a link; **a file artifact (`adam_runtime::Artifact::file`) is one `raw` part** (`Part.raw`: the bytes, base64 in JSON) with `mediaType` and `filename` and nothing else, so any A2A client reads a standard file artifact and no extension is involved ([ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)). `artifact_id` is the id an artifact was given (`adam_runtime::Artifact::id`), else follows a file's name, media type, filename and the SHA-256 of its bytes, so the live event and the durable copy are one artifact. **An artifact with an id is one artifact however often it changes** (a plan): `GetTask` lists it once, holding the newest, and the stream sends each change under that `artifactId` with no `append` (in A2A an update without `append` replaces the artifact with that id); a subscriber is sent an id again whenever its content differs from the **last** content it was sent under that id (so A, B, A is three updates), and remembers one entry per id. Such an artifact carries `metadata["vymalo.replaceable"] = true`, which tells a delivery cursor that its id can hold different content later. **Breaking** (from `adam-runtime`): `RunEvent::Artifact` has a member `id` |
 | `vymalo_inbound`, `form_answer_surface`, `ASK_SURFACE_PREFIX`, `comparable`, `is_format_or_control`, `CONTEXT_UI_REF`, `CONTEXT_UI_CATALOG`, `CONTEXT_THREAD_TOOLS`, `integral_numbers` | the inbound function of an agent that serves a screen (`.with_inbound(vymalo_inbound)`): an A2UI action reads as the person's answer, and the extensions a message carries become the run's inbound context; see *A screen as the sender* |
@@ -97,8 +97,13 @@ they are the state that ends the stream, so they wait for the client to read ins
 no subject's namespace is a prefix of another's), ordered by last update, newest first, id breaking ties, and continued by the
 `PageToken` of `adam-a2a` (the position of the last task; never an offset). The A2A state is derived, not stored (`failed` and
 `canceled` are both a failed run, `submitted` and `working` both a runnable one), so a `status` filter narrows by the run
-statuses its state can come from and each candidate is read as a task and kept only if its state is the one asked for, reading
-at most `MAX_SCAN` (500) runs per page: a rare filter returns a short page and a token that continues. **`totalSize` is exact for
+statuses its state can come from and each candidate is kept only if its state is the one asked for, reading
+at most `MAX_SCAN` (500) runs per page: a rare filter returns a short page and a token that continues. A candidate is built
+from the record the listing returned (`adam_runtime::view_from_record`), not read again: the state is already in it, and the
+lease is read only for a runnable run at version 1, the one row whose task state can still turn from `submitted` to
+`working` because a worker claimed it. A 50-task page is one count, one page and one lease read per runnable run at version 1
+(submitted, or claimed and still at version 1).
+**`totalSize` is exact for
 no status filter and for `completed`, and an upper bound for the other states.** A run of another agent in the same store, an
 unreadable record and a record whose conversation id has no subject are not listed.
 
@@ -146,9 +151,17 @@ parent. **`round.state` is the A2A JSON spelling** (`TASK_STATE_WORKING`, `TASK_
 in the sessions object, not the contract's lower-case examples. The tracker lists the sessions once before the snapshot is built (so it is a separate listing from the one
 the snapshot's sessions object makes: a session that starts between the two may be told twice, once in the object and once as
 `opened`, never missed), and a session that existed then says nothing. It lists again after at least 200 ms when the parent's
-record changed and at least every second (`SESSIONS_MIN_INTERVAL`, `SESSIONS_POLL`); a listing that fails is warned about and
-retried after the full second; and it lists once more before the final event. A session whose latest round the listing cannot
-read is left out until it can. Per session the diff is a pure function (`diff`) in the contract's order: new -> `opened`; the
+record changed, and on the subscription's next poll once a second has passed (`SESSIONS_MIN_INTERVAL`, `SESSIONS_POLL`); a
+listing that fails is warned about and retried at the next poll; and it lists once more before the final event. **The real
+bound for a session change is `max(SESSIONS_POLL, poll)` — 2 s with the default 2 s fallback poll** — because the tracker is
+evaluated only when the subscription polls. That is the deliberate trade: a listing arm of its own every second would pay a
+whole `list_sessions` (two counts and a page, plus a view per changed open round) per subscriber per second, for a change
+nobody is blocked on. A session whose latest round the listing cannot
+read is left out until it can. **A session whose listing row did not change is not read again**: the tracker keeps the row its
+`Seen` came from and skips the `view` (two queries and the full state of an open round) when the next listing returns the same
+row. The row is the version that matters — a commit moves `updated_at`, a new round moves `round` and `latestRun`, and the
+listing decides `state` and `closed` (the idle TTL) from the record and its clock — so anything that can change a `Seen`
+changes the row. Per session the diff is a pure function (`diff`) in the contract's order: new -> `opened`; the
 latest round's number grew and it is not a round that only closes -> `round`; the latest round left `working`, or waits for the
 person -> `reported`; the session turned closed -> `closed`. **`opened` carries the latest round**, which is not round 1 for a
 session first seen later (a session that began and went through rounds between two listings, or that a shifting page hid from

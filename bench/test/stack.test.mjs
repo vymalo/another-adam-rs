@@ -158,6 +158,19 @@ test('the database of a slot is reset by postgres; the work volume by the slot\'
   await assert.rejects(leftover.stack.resetWork(1), /still holds staging/);
 });
 
+test('resetWork keeps the names it is told to (a task base), and refuses a name that is not plain', async (t) => {
+  const outputs = [];
+  const { stack } = makeStack(t, {
+    exec: async (file, args) => {
+      outputs.push(args);
+      return { exitCode: 0, stdout: args.join(' ').includes('ls -1A') ? 'workspaces\n.gitbox\nbench-base\n' : '', stderr: '' };
+    },
+  });
+  await stack.resetWork(1, { keep: ['bench-base'] });
+  assert.match(outputs[0].slice(5).join(' '), /find \/work -mindepth 1 -maxdepth 1 ! -name \.gitbox ! -name bench-base -exec rm -rf \{\} \+/);
+  await assert.rejects(stack.resetWork(1, { keep: ['../etc'] }), /not plain/);
+});
+
 test('finding 5: a directory of the volume is removed by the service as its owner and checked to be gone', async (t) => {
   const seen = [];
   const { stack } = makeStack(t, { exec: async (file, args) => (seen.push(args.slice(5).join(' ')), { exitCode: 0, stdout: '', stderr: '' }) });

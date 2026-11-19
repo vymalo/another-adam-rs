@@ -36,6 +36,10 @@ fn options() -> RuntimeOptions {
         concurrency: 2,
         lease_ttl: Duration::from_secs(30),
         poll_interval: Duration::from_millis(20),
+        // The test's clocks are compressed: a cancel watch and a subscription poll at the worker's
+        // 20 ms rather than at the production 1 s and 2 s.
+        cancel_poll_interval: Duration::from_millis(20),
+        view_poll_interval: Duration::from_millis(20),
         session_idle_ttl: adam_runtime::DEFAULT_SESSION_IDLE_TTL,
     }
 }

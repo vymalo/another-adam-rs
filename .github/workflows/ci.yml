@@ -20,20 +20,23 @@ env:
   # cargo-llvm-cov 0.6.21 (workspace, Postgres, no MongoDB: adam-store-mongodb's
   # 273 lines counted as uncovered, so CI with MongoDB reads higher), gated at
   # measured minus 2. Raise it whenever coverage rises, never lower it to get a
-  # change through.
+  # change through. The job runs on main only (see its `if`): a pull request
+  # still runs the whole suite twice in conformance, just not instrumented.
   COVERAGE_MIN_LINES: "87"
   # Not coverage: fake agent binary, the MCP test server and the test code itself.
   COVERAGE_IGNORE: '(adam-acp-fake-agent|adam-mcp-testkit|/tests/)'
 
 jobs:
-  lint:
+  # Formatting and the README rule that does not need a compiler. The five compiles are their own jobs below, and
+  # `lint` is the required check that aggregates them.
+  fmt:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt
       # Every crate documents itself: update its README in the same change as
       # any change to its public API, environment variables or tests.
       - name: Every crate has a README
@@ -47,19 +50,93 @@ jobs:
             fi
           done
           exit "$missing"
-      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+
+  # The two clippy arms: the default features, and the optional ones (or their code never runs in CI).
+  clippy-default:
+    name: clippy (default)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # Optional features are linted and doc-tested too, or their code never runs in CI.
+
+  clippy-features:
+    name: clippy (optional features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp -- -D warnings
-      # nextest does not run doctests; the database suites are not needed here.
+
+  # nextest does not run doctests; the database suites are not needed here.
+  doctest-default:
+    name: doctest (default)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --doc --locked
+
+  doctest-features:
+    name: doctest (optional features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --doc --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
-      # Broken or redundant intra-doc links, with every feature on (the documented build; some
-      # docs link to items that exist only behind a feature).
+
+  # Broken or redundant intra-doc links, with every feature on (the documented build; some
+  # docs link to items that exist only behind a feature).
+  rustdoc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # The required check. It compiles nothing: it fails unless every job above passed, so a clippy, doctest or
+  # rustdoc error cannot merge on a green `lint`. The five jobs are extra checks, not required ones.
+  lint:
+    name: lint
+    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every gate above passed
+        run: |
+          failed=0
+          for pair in \
+            "fmt=${{ needs.fmt.result }}" \
+            "clippy-default=${{ needs['clippy-default'].result }}" \
+            "clippy-features=${{ needs['clippy-features'].result }}" \
+            "doctest-default=${{ needs['doctest-default'].result }}" \
+            "doctest-features=${{ needs['doctest-features'].result }}" \
+            "rustdoc=${{ needs.rustdoc.result }}"
+          do
+            name=${pair%%=*}
+            result=${pair#*=}
+            echo "$name: $result"
+            [ "$result" = success ] || failed=1
+          done
+          exit "$failed"
 
   # The oldest toolchain the workspace promises to build with (`rust-version`
   # in Cargo.toml; keep the two in step).
@@ -186,9 +263,19 @@ jobs:
 
   # Line coverage of the whole workspace against the newest servers. The lcov
   # file is an artifact; the summary is on the run page; the gate ratchets.
+  # Main only: on a pull request this was a third full workspace run (after the
+  # two conformance arms) on the critical path, for a measurement that is about
+  # the tree as a whole. The trade-off is that a pull request can lower coverage
+  # and main's run says so after the merge; the gate itself is unchanged (87)
+  # and still fails main, so the ratchet cannot silently drift.
   coverage:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # The gate is main-only, so a red main needs a follow-up: the last step opens an issue.
+    permissions:
+      contents: read
+      issues: write
     services:
       postgres:
         image: postgres:17
@@ -221,6 +308,7 @@ jobs:
       - name: lcov report
         run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$COVERAGE_IGNORE"
       - name: Summary and gate
+        id: gate
         run: |
           cargo llvm-cov report --summary-only --ignore-filename-regex "$COVERAGE_IGNORE" | tee summary.txt
           {
@@ -242,6 +330,35 @@ jobs:
             lcov.info
             summary.txt
           if-no-files-found: ignore
+      # Nothing else follows up a red main: one open issue (deduplicated by its title) with the run's link.
+      - name: Open an issue when main's coverage falls below the gate
+        if: failure() && steps.gate.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: coverage on main fell below the gate
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          body="The line-coverage gate (>= ${COVERAGE_MIN_LINES}%) failed on main: ${RUN_URL}"
+          existing=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi
+      # A recovered main must not leave the issue open.
+      - name: Close the coverage issue when main is green again
+        if: success() && steps.gate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: coverage on main fell below the gate
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          existing=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --comment "The gate passed again on main: ${RUN_URL}"
+          fi
 
   # compose.yaml must keep working: the WireMock mappings are exercised by the
   # real clients (OpenAiCompatible, GitHub), so they cannot rot.
