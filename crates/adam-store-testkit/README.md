@@ -13,10 +13,10 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (45
-  cases: create/load, state round trip, CAS conflicts, concurrent commits,
-  journal ordering and first-writer-wins, claim rules and exclusivity, busy runs
-  that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (48
+  cases: create/load, `run_header` against `load_run` + `lease_until`, state round trip, CAS
+  conflicts, concurrent commits, journal ordering and first-writer-wins, claim rules and
+  exclusivity, busy runs that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
   run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
@@ -27,7 +27,8 @@ dependency.
   `fail_run_after_apply`, which strike only the calls about one run, to break one link of a chain such as
   the message a finished child sends its parent), with
   `fault::Method` and `fault::Mode` selecting the method and whether the
-  operation is applied before the error is returned. `fault::is_injected`
+  operation is applied before the error is returned. `fault::Method` is **not** `#[non_exhaustive]`:
+  a new variant (the last one was `RunHeader`) breaks an exhaustive `match` on it. `fault::is_injected`
   tells an injected error from a real one.
 * `skipped`: re-export of `adam_core::testing::skipped`.
 

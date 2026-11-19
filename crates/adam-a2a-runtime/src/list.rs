@@ -5,8 +5,12 @@
 //! express is the A2A state, which is derived from a run's status **and** its error text, its
 //! lease and its version (see [`task_state`](crate::task_state)): `failed` and `canceled` are both
 //! a failed run, `submitted` and `working` both a runnable one. So the store narrows by the run
-//! statuses the state can come from, and each candidate is read as a task and kept only if its
-//! state is the one asked for.
+//! statuses the state can come from, and each candidate is read as a task from the record the
+//! listing returned ([`view_from_record`]): its state is already there, and the lease is read only
+//! for the one record whose state can still turn from `submitted` to `working` (a runnable run at
+//! version 1, before a worker's first commit). A page is then one count, one list and one lease
+//! read per runnable run at version 1 (submitted, or claimed and still at version 1), not two more
+//! queries per record.
 //!
 //! `total_size` comes from [`Store::count_runs`](adam_core::Store::count_runs) over those statuses,
 //! so it is **exact** with no `status` filter, for `completed` (one status, one state) and for the
@@ -20,8 +24,7 @@
 use a2a::{Task, TaskState};
 use adam_a2a::{BackendError, Caller, PageToken, TaskPage, TaskQuery};
 use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, RunStatus};
-use adam_runtime::RunView;
-use adam_runtime::RuntimeError;
+use adam_runtime::{RunView, RuntimeError, view_from_record};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -169,9 +172,34 @@ impl RuntimeTaskBackend {
             for rec in page {
                 cursor = Some((rec.updated_at, rec.id));
                 scanned += 1;
-                let view = match self.runtime.view(rec.id).await {
-                    Ok(Some(view)) => view,
-                    Ok(None) => continue,
+                // `task_state` needs the lease only where it can still say `submitted` or
+                // `working`: a runnable run at version 1, the record as created, before any worker
+                // has committed. Every other row is not claimed, whatever lease it carries, so its
+                // lease is not read. The record was read before the lease, so a run that commits in
+                // between reads as it was listed; the next listing has it.
+                let lease = if rec.status == RunStatus::Runnable && rec.version <= 1 {
+                    match store.lease_until(rec.id).await {
+                        Ok(until) => until,
+                        Err(e) => return Err(map_err(e.into())),
+                    }
+                } else {
+                    None
+                };
+                let claimed = adam_core::claimed(rec.status, lease, self.runtime.now());
+                // The record already holds the state a view is built from: decode it here instead
+                // of reading the run again (two more queries and a second state read per task).
+                // The state moves into the view; the rest of the record (a few strings) is what
+                // `shaped` reads, so it is cloned after the state is taken, not with it.
+                let mut rec = rec;
+                let state = std::mem::take(&mut rec.state);
+                let view = match view_from_record(
+                    RunRecord {
+                        state,
+                        ..rec.clone()
+                    },
+                    claimed,
+                ) {
+                    Ok(view) => view,
                     Err(RuntimeError::Corrupt { .. }) => {
                         tracing::warn!(run = %rec.id, "a task of the caller has an unreadable state; it is not listed");
                         continue;

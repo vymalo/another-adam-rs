@@ -19,6 +19,7 @@
 | 11 | Hooks around the agent loop: compiled plugins, every loop event, custom events, then programs ([ADR 0050](decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md), H0 to P3) | decided 2026-11-18; not started: hook code waits for ADR 0049's last part (P8, P9) |
 | 12 | No Podman: a repository's own environment is a run pod of its image, `use_repository_environment`, and the bench on the host's container runtime ([ADR 0052](decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md), slices B1 and 1 to 6) | decided 2026-11-19; not started: B1, the bench, comes first |
 | 13 | SQLite, a store service, a database per agent and a static coder ([ADR 0053](decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md), slices 1 to 7) | decided 2026-11-19; not started: the static coder and the bench's first half (6a) can start at once |
+| 14 | A run's state is a head and an append-only transcript ([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), slices S0 to S3) | decided 2026-11-19; not started: follows the I/O-layer pull request |
 
 Known gaps recorded in the docs: a pinned run whose worker never returns is stranded
 ([Architecture](architecture.md#where-a-runs-files-and-processes-live)); subagent calls of one turn run one after the other

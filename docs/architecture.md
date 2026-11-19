@@ -351,7 +351,7 @@ sequenceDiagram
         par live events
             K-->>B: Progress, Custom or Artifact event
             B-->>C: SSE: status-update (working) or artifact-update
-        and durable poll, every 250 ms or when a Status event arrives
+        and durable poll, every 2 s or when a Status event arrives
             B->>R: view(run)
             R->>DB: load_run
             B-->>C: SSE: status change or new artifact
@@ -371,7 +371,8 @@ Rules this diagram cannot show:
 * **A request names the extensions it wants; the card decides.** The handler passes the backend only the
   ones the card declares (`Caller::extensions`), so each extension is optional on both sides.
 * **Streams survive restarts.** The snapshot comes from `Runtime::view` (the durable record) and is
-  polled every 250 ms; live events only cut latency. A subscriber that attaches after the worker began
+  polled every 2 s; a `Status` event (a commit) makes the pump poll at once, so live events cut the
+  latency and the interval is only the fallback for a change no event announced. A subscriber that attaches after the worker began
   first gets the run's recent live events from a bounded replay in `BroadcastSink` (the newest 64, none older
   than 30 s, dropped at each status change), so a step that started before it attached keeps its input; a
   repeat is possible and harmless. Dropping the SSE stream drops only the subscription; only `CancelTask` cancels.
@@ -588,9 +589,9 @@ sequenceDiagram
         W->>DB: claim_due(agents, worker id, claim scope, runs in flight here, now, lease ttl, free slots)
         DB-->>W: leases: due runs with no live lease, not in flight here (and, if pinned, not owned by another worker), earliest first
         W->>T: spawn advance(lease), at most concurrency at once
-        T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every poll interval)
+        T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every cancel poll interval)
         opt the run has a parent_id
-            T->>DB: load_run(parent)
+            T->>DB: run_header(parent)
             DB-->>T: Failed: cancel_run(run), cancelled: the parent run ended, no step
         end
         T->>T: decode the Envelope, and cancel_run (cancelled: time limit) when its deadline has passed
@@ -674,7 +675,8 @@ sequenceDiagram
   park resumes at once.
 * **Retry.** A transient failure is committed as `Runnable` with a future `wake_at`; the failed try's
   journal entries are abandoned.
-* **Defaults** (`runtime.rs`, `retry.rs`): lease 30 s, poll 250 ms, 4 concurrent runs per worker loop,
+* **Defaults** (`runtime.rs`, `retry.rs`): lease 30 s, worker poll 250 ms, cancel watch 1 s,
+  subscription poll 2 s, 4 concurrent runs per worker loop,
   5 tries per transition, backoff 1 s doubling to 60 s.
 
 ### Compaction: a long history is summarised once
@@ -953,12 +955,15 @@ erDiagram
 | unique `runs (agent, conversation_id)` where the run is open | one open run per conversation |
 | `runs (agent, updated_at)` where finished | retention sweeps |
 | `runs (parent_id)` where set | children of a run |
-| `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC)` where set | `ListTasks`: an owner's runs, newest first, by keyset |
+| `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)` where set | `ListTasks`: an owner's runs, newest first, by keyset; the status filter is answered from the index |
 | `push (agent, next_attempt_at, run_id, id)` where active | claiming due push configs |
 
 MongoDB keeps the same fields in `adam_runs` (`_id` is the run's UUID) plus `open_key` (a plain unique
-index; closed runs get `~<run id>`) and `lease_token`, and the journal in `adam_journal` with
-`_id = "<run>:<seq>"`, and the push configs in `adam_push` with `_id = "<run>:<config id>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
+index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_list`
+(`(agent, conversation_id, updated_at, _id)`) and `adam_list_status`
+(`(agent, status, conversation_id, updated_at, _id)`, for a status filter), the journal in
+`adam_journal` with `_id = "<run>:<seq>"`, and the push configs in `adam_push` with
+`_id = "<run>:<config id>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 `crates/adam-runtime/src/envelope.rs`):
@@ -1026,10 +1031,11 @@ sequenceDiagram
     W->>W: fire_cancel(run): ctx.cancelled() resolves in the step
 ```
 
-* **Best effort.** `publish` and `emit` queue (1 024 items, then drop); a failed `pg_notify` drops its item.
+* **Best effort.** `publish` and `emit` queue (1 024 items, then drop); a failed `pg_notify` drops its batch (up to `MAX_BATCH_ITEMS`, 32 items).
 * **No echo.** Events carry the sender's id and the listener skips its own; signals have no origin.
 * **Size.** PostgreSQL rejects a payload of 8000 bytes or more, so nothing over 7 999 is sent. An
-  oversize `Status` loses the tail of its detail; any other oversize event stays local.
+  oversize `Status` loses the tail of its detail; an oversize `Step` crosses without its input and
+  output; any other oversize event is dropped.
 * **One pooled connection** held by the listener: no transaction-mode pooler in front of it.
 * **MongoDB has no equivalent** on a standalone `mongod`, so it keeps polling.
 

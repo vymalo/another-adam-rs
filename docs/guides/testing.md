@@ -31,7 +31,8 @@ npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs   # dia
 ```
 
 CI also runs the MSRV build (`rust-version` in `Cargo.toml`), `cargo deny`, line coverage
-(`cargo llvm-cov nextest --workspace`), and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
+(`cargo llvm-cov nextest --workspace`, on main: the two conformance arms run the suite on every pull request),
+and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
 (`.github/workflows/nightly.yml`, needs secrets). The CI jobs are the reference:
 `.github/workflows/ci.yml` and `coder.yml`.
 
@@ -126,7 +127,9 @@ superuser, for its reconnect test). See [Store adapters](../reference/store-adap
 
 Scripts in `dev/` drive the compose stack through A2A and assert the whole chain on the mocks. Each script's
 header lists its steps and variables. CI runs them in `.github/workflows/coder.yml` ("Compose e2e") on the image
-it has just built. Start the stack first:
+it has just built: a pull request runs the seven default coder scenarios and two App-mode ones (all 23 when it
+carries the `e2e-full` label or changes `dev/`, `docker/coder/` or `compose.yaml`), main and a manual `workflow_dispatch` run all of
+them. Start the stack first:
 
 ```sh
 docker compose --profile app up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server coder

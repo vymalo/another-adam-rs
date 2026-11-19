@@ -11,7 +11,7 @@
 //! | [`Show`] (`show { blocks, title? }`) | draws blocks of the screen's components, each checked against the catalog's schema; the A2UI surface goes out as a run artifact |
 //! | [`UiCatalogTool`] (`ui_catalog {}`) | the components, what they are for, and their schemas |
 //! | [`PlanWork`], [`PlanCheck`], [`PlanAdd`] (`plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }`) | the conversation's plan: a checklist the agent keeps and the person sees; each call returns the whole plan and draws it as one `Checklist` (or lines of `Text`) when the screen can |
-//! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, listed again at every model turn; a successful `turn_output { text }` makes `text` the run's answer; a tool the orchestrator reports as a step (`reportsStep`) gets no step of the agent's, a call waits as long as the tool's `timeoutSecs` (capped by `THREAD_TOOLS_MAX_CALL_SECS`) and carries a stable `callId`; with mentions in the run's context it adds a "Mentioned agents" block to the instructions |
+//! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, read once per grant (a turn reuses the listing; a new grant, a refused call or [`LISTING_TTL`] lists again); a successful `turn_output { text }` makes `text` the run's answer; a tool the orchestrator reports as a step (`reportsStep`) gets no step of the agent's, a call waits as long as the tool's `timeoutSecs` (capped by `THREAD_TOOLS_MAX_CALL_SECS`) and carries a stable `callId`; with mentions in the run's context it adds a "Mentioned agents" block to the instructions |
 //! | [`card_extensions`] | the card entries that announce all this (A2UI v0.9.1, `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`) |
 //!
 //! A binary wires it in a few lines (the inbound function is `adam-a2a-runtime`'s `vymalo_inbound`):
@@ -68,7 +68,7 @@ pub use surface::{
     A2UI_VERSION, ask_attempt, ask_retry_surface_id, ask_surface_id, is_ask_surface_of,
 };
 pub use thread_tools::{
-    Clock, GET_UI_CATALOG, META_KEY, TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools,
+    Clock, GET_UI_CATALOG, LISTING_TTL, META_KEY, TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools,
     ThreadToolsClient,
 };
 
@@ -133,7 +133,7 @@ impl Ui {
     }
 
     /// The thread tools as a tool source: every tool the endpoint of the run's messages lists, under
-    /// its listed name, read at every model turn, **except `get_ui_catalog`** (the model has
+    /// its listed name, read once per grant, **except `get_ui_catalog`** (the model has
     /// `ui_catalog` for that: [`ThreadTools`]). The source also describes `show` with the components
     /// of the conversation's screen, so register [`tools`](Self::tools) and this source on the same
     /// agent. Add it **last** among an agent's sources.

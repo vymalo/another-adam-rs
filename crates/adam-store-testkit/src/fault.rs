@@ -44,6 +44,8 @@ pub enum Method {
     CreateRun,
     /// [`Store::load_run`].
     LoadRun,
+    /// [`Store::run_header`].
+    RunHeader,
     /// [`Store::commit_run`].
     CommitRun,
     /// [`Store::open_run_for_conversation`].
@@ -176,10 +178,10 @@ impl FaultyStore {
     }
 
     /// Fail the next `n` calls of `method` that are about `run` (the ones that take a run id:
-    /// `load_run`, `commit_run`, the journal methods and the lease methods), before they reach the
-    /// store. Calls about other runs pass through, so a test can break one link of a chain, such as
-    /// the message a finished child sends its parent, while everything else works. Replaces any
-    /// earlier run-scoped script for that method and run.
+    /// `load_run`, `run_header`, `commit_run`, the journal methods and the lease methods), before
+    /// they reach the store. Calls about other runs pass through, so a test can break one link of a
+    /// chain, such as the message a finished child sends its parent, while everything else works.
+    /// Replaces any earlier run-scoped script for that method and run.
     pub fn fail_run(&self, method: Method, run: RunId, n: u64) {
         self.script_run(method, run, Some(n), Mode::Before);
     }
@@ -293,6 +295,11 @@ impl Store for FaultyStore {
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
         self.run(Method::LoadRun, Some(id), self.inner.load_run(id))
+            .await
+    }
+
+    async fn run_header(&self, id: RunId) -> StoreResult<Option<adam_core::RunHeader>> {
+        self.run(Method::RunHeader, Some(id), self.inner.run_header(id))
             .await
     }
 

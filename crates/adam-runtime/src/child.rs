@@ -367,20 +367,34 @@ impl ChildStatus {
             };
         }
         match Envelope::decode(rec.id, &rec.state) {
-            Ok(env) if rec.status == RunStatus::Done => Self {
-                status: RunStatus::Done,
-                output: (!env.output.is_null()).then_some(env.output),
-                error: None,
-            },
-            Ok(env) => Self {
-                status: RunStatus::Failed,
-                output: None,
-                error: Some(env.error.unwrap_or_else(|| "the run failed".to_owned())),
-            },
+            Ok(env) => Self::from_parts(rec.status, &env.output, env.error.as_deref()),
             Err(e) => Self {
                 status: RunStatus::Failed,
                 output: None,
                 error: Some(format!("the run's state is unreadable: {e}")),
+            },
+        }
+    }
+
+    /// The status a commit this process just made reports, from the values it wrote: a store
+    /// returns the record without its state ([`Store::commit_run`](adam_core::Store::commit_run)),
+    /// so the caller reports from what it holds instead of decoding what it just sent.
+    pub(crate) fn from_parts(status: RunStatus, output: &Value, error: Option<&str>) -> Self {
+        match status {
+            RunStatus::Done => Self {
+                status,
+                output: (!output.is_null()).then(|| output.clone()),
+                error: None,
+            },
+            RunStatus::Failed => Self {
+                status,
+                output: None,
+                error: Some(error.unwrap_or("the run failed").to_owned()),
+            },
+            RunStatus::Runnable | RunStatus::Parked => Self {
+                status,
+                output: None,
+                error: None,
             },
         }
     }

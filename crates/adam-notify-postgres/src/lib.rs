@@ -20,6 +20,12 @@
 //! notification arriving. A listener that reconnects tells its subscribers
 //! ([`Delivery::Resync`]) so they look again at once.
 //!
+//! A batch is one statement, and PostgreSQL folds identical channel-and-payload
+//! pairs of one transaction into one notification: whether the second copy of an
+//! identical event arrives therefore depends on how the queue happened to be
+//! batched when it was sent, so nothing may depend on the count. A duplicate is
+//! indistinguishable from the first.
+//!
 //! # Channels and payloads
 //!
 //! Two channels, `{prefix}events` and `{prefix}signals` (prefix `adam_` by
@@ -42,12 +48,21 @@
 //!
 //! # Running
 //!
-//! [`PgNotify::run`] drives one publisher (a queue of 1024 drained with
-//! `SELECT pg_notify(..)` on the pool, one at a time, in order) and one
-//! listener, until `stop` resolves. **The listener holds one connection of the
-//! pool for as long as `run` runs**, and `LISTEN` needs a session, so connect
-//! directly or through a session-mode pooler, not a transaction-mode one. The
-//! publisher never blocks the caller: a full queue drops the item.
+//! [`PgNotify::run`] drives one publisher (a queue of 1024 drained with one
+//! `SELECT pg_notify(..)` statement per batch of up to [`MAX_BATCH_ITEMS`], in
+//! order) and one listener, until `stop` resolves. **The listener holds one
+//! connection of the pool for as long as `run` runs**, and `LISTEN` needs a
+//! session, so connect directly or through a session-mode pooler, not a
+//! transaction-mode one. The publisher never blocks the caller: a full queue
+//! drops the item.
+//!
+//! A process whose events no one else needs (`ROLE=all`, one pod) can keep them
+//! local: set `NOTIFY_LOCAL_ONLY` (`true`/`1`, default `false`) and
+//! [`PgEventSink`] delivers to the local sink without encoding or queueing
+//! anything for `NOTIFY`. With `topology: split` (a front and its workers, even
+//! one replica each) it silences the live events between them; their state
+//! changes still reach the 250 ms poll. It is a deployment choice, never
+//! detected.
 //!
 //! Its lifecycle, and the guarantees, are in the [crate README](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-notify-postgres/README.md)
 //! and `docs/architecture.md`.
@@ -57,6 +72,7 @@
 mod error;
 mod wire;
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -78,6 +94,15 @@ pub use crate::wire::MAX_PAYLOAD_BYTES;
 /// How long [`PgNotify::run`] keeps sending the items still queued when its
 /// `stop` resolves.
 pub const DRAIN_ON_STOP: Duration = Duration::from_secs(2);
+
+/// The most items one `pg_notify` statement carries: a batch is one round trip,
+/// and a statement of 32 payloads of at most [`MAX_PAYLOAD_BYTES`] stays small.
+pub const MAX_BATCH_ITEMS: usize = 32;
+
+/// The variable that keeps this process's events local: `true`/`1` or
+/// `false`/`0` (ASCII case ignored), absent is `false`. Read by
+/// [`PgNotify::new`]; [`PgNotify::local_only`] overrides it.
+pub const LOCAL_ONLY_ENV: &str = "NOTIFY_LOCAL_ONLY";
 
 /// Channel-name prefix unless [`PgNotify::with_channel_prefix`] says otherwise.
 const DEFAULT_PREFIX: &str = "adam_";
@@ -110,8 +135,13 @@ struct Inner {
     local: BroadcastSink,
     /// Tells our own events from those of others.
     origin: Uuid,
+    prefix: String,
     events_channel: String,
     signals_channel: String,
+    /// Events stay in this process: no encoding, no outbox, no `NOTIFY`.
+    local_only: bool,
+    /// The value of [`LOCAL_ONLY_ENV`] when it was not a boolean: `run` refuses it.
+    local_only_problem: Option<String>,
     queue: mpsc::Sender<Outgoing>,
     /// The receiving end of `queue`, held by `run` while it runs.
     outbox: Mutex<Option<mpsc::Receiver<Outgoing>>>,
@@ -120,6 +150,10 @@ struct Inner {
     listening: watch::Sender<bool>,
     dropped: AtomicU64,
     failed: AtomicU64,
+    /// Failed statements, whatever the size of the batch each carried.
+    failed_statements: AtomicU64,
+    /// `pg_notify` statements issued, a batch counting once.
+    statements: AtomicU64,
 }
 
 /// Whether the `n`th occurrence of something noisy deserves a log line: the
@@ -141,12 +175,65 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(BACKOFF_MAX)
 }
 
+/// `true`/`1` or `false`/`0`, ASCII case ignored; anything else is not a boolean.
+fn parse_flag(raw: &str) -> Option<bool> {
+    if raw.eq_ignore_ascii_case("true") || raw == "1" {
+        Some(true)
+    } else if raw.eq_ignore_ascii_case("false") || raw == "0" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// [`LOCAL_ONLY_ENV`] from `lookup`: the value, and the raw text when it is not a boolean (then
+/// the value is `false`, and `run` refuses it).
+fn local_only_from(lookup: impl Fn(&str) -> Option<OsString>) -> (bool, Option<String>) {
+    let Some(raw) = lookup(LOCAL_ONLY_ENV) else {
+        return (false, None);
+    };
+    let raw = raw.to_string_lossy().into_owned();
+    match parse_flag(&raw) {
+        Some(on) => (on, None),
+        None => (false, Some(raw)),
+    }
+}
+
+fn local_only_from_env() -> (bool, Option<String>) {
+    local_only_from(|name| std::env::var_os(name))
+}
+
+/// The item just received plus whatever else is already queued, up to
+/// [`MAX_BATCH_ITEMS`], in queue order. Never waits for the batch to fill.
+fn take_batch(first: Outgoing, outbox: &mut mpsc::Receiver<Outgoing>) -> Vec<Outgoing> {
+    let mut batch = Vec::with_capacity(MAX_BATCH_ITEMS);
+    batch.push(first);
+    while batch.len() < MAX_BATCH_ITEMS {
+        match outbox.try_recv() {
+            Ok(item) => batch.push(item),
+            Err(_) => break,
+        }
+    }
+    batch
+}
+
 impl PgNotify {
     /// Notifications over `pool`, delivering the events of other processes to
     /// `local` (the sink the process's A2A backend subscribes to). Call
     /// [`run`](Self::run) for anything to flow.
+    ///
+    /// [`LOCAL_ONLY_ENV`] is read here, once: an unset variable is `false`, and
+    /// [`local_only`](Self::local_only) overrides it.
     pub fn new(pool: PgPool, local: BroadcastSink) -> Self {
-        Self::build(pool, local, DEFAULT_PREFIX, Uuid::new_v4())
+        let (local_only, local_only_problem) = local_only_from_env();
+        Self::build(
+            pool,
+            local,
+            DEFAULT_PREFIX,
+            Uuid::new_v4(),
+            local_only,
+            local_only_problem,
+        )
     }
 
     /// Use channels `{prefix}events` and `{prefix}signals` instead of the
@@ -164,24 +251,57 @@ impl PgNotify {
             self.inner.local.clone(),
             prefix,
             self.inner.origin,
+            self.inner.local_only,
+            self.inner.local_only_problem.clone(),
         ))
     }
 
-    fn build(pool: PgPool, local: BroadcastSink, prefix: &str, origin: Uuid) -> Self {
+    /// Keep this process's events local: [`PgEventSink::emit`] delivers them to
+    /// the local sink and does not encode them, queue them or `NOTIFY` them.
+    /// Signals still cross: wake-ups and cancels are not events.
+    ///
+    /// Default `false`; [`new`](Self::new) takes the value from
+    /// [`LOCAL_ONLY_ENV`], and this call overrides it, including a value that
+    /// is not a boolean. Call it before [`event_sink`](Self::event_sink), for
+    /// the same reason as [`with_channel_prefix`](Self::with_channel_prefix).
+    pub fn local_only(self, local_only: bool) -> Self {
+        Self::build(
+            self.inner.pool.clone(),
+            self.inner.local.clone(),
+            &self.inner.prefix,
+            self.inner.origin,
+            local_only,
+            None,
+        )
+    }
+
+    fn build(
+        pool: PgPool,
+        local: BroadcastSink,
+        prefix: &str,
+        origin: Uuid,
+        local_only: bool,
+        local_only_problem: Option<String>,
+    ) -> Self {
         let (queue, outbox) = mpsc::channel(QUEUE_CAPACITY);
         Self {
             inner: Arc::new(Inner {
                 pool,
                 local,
                 origin,
+                prefix: prefix.to_owned(),
                 events_channel: format!("{prefix}events"),
                 signals_channel: format!("{prefix}signals"),
+                local_only,
+                local_only_problem,
                 queue,
                 outbox: Mutex::new(Some(outbox)),
                 fanout: LocalNotifier::default(),
                 listening: watch::channel(false).0,
                 dropped: AtomicU64::new(0),
                 failed: AtomicU64::new(0),
+                failed_statements: AtomicU64::new(0),
+                statements: AtomicU64::new(0),
             }),
         }
     }
@@ -213,14 +333,22 @@ impl PgNotify {
         let _ = listening.wait_for(|on| *on).await;
     }
 
+    /// How many `pg_notify` statements this instance has issued: one per batch,
+    /// up to [`MAX_BATCH_ITEMS`] items each. A counter for tests and for a
+    /// process's own metric, not a durable count.
+    pub fn statements_sent(&self) -> u64 {
+        self.inner.statements.load(Relaxed)
+    }
+
     /// Publish queued items and listen for others', until `stop` resolves.
     ///
     /// Returns `Ok(())` only when stopped. Connection trouble is not an error:
     /// the listener logs it, reconnects with a doubling backoff (100 ms to
     /// 10 s) and tells its subscribers to [`Resync`](Delivery::Resync), and a
-    /// failed `pg_notify` drops its item. Fails with
-    /// [`NotifyError::AlreadyRunning`] if it is already running (also through
-    /// a clone), and with [`NotifyError::PoolClosed`] once the pool is closed.
+    /// failed `pg_notify` drops its batch (up to [`MAX_BATCH_ITEMS`] items).
+    /// Fails with [`NotifyError::AlreadyRunning`] if it is already running
+    /// (also through a clone), and with [`NotifyError::PoolClosed`] once the
+    /// pool is closed.
     ///
     /// The listener holds one connection of the pool for as long as this
     /// runs. When `stop` resolves, the `pg_notify` in flight completes and the
@@ -228,8 +356,15 @@ impl PgNotify {
     /// returns, so the events of a step that ended just before the stop still
     /// go out; what cannot be sent in that time is dropped (best effort, like
     /// any notification).
+    ///
+    /// Fails at once with [`NotifyError::InvalidLocalOnly`] when
+    /// [`LOCAL_ONLY_ENV`] was set to something that is not a boolean and
+    /// [`local_only`](Self::local_only) did not override it.
     pub async fn run(&self, stop: impl Future<Output = ()> + Send) -> Result<(), NotifyError> {
         let inner = &*self.inner;
+        if let Some(raw) = &inner.local_only_problem {
+            return Err(NotifyError::InvalidLocalOnly(raw.clone()));
+        }
         let mut outbox = inner.take_outbox()?;
         // The listener ends the run; the publisher notices between two items
         // (never in the middle of a `pg_notify`) and then drains the queue.
@@ -303,7 +438,7 @@ impl Inner {
         }
     }
 
-    /// Send queued items, one `pg_notify` at a time, in order, until `stopped`;
+    /// Send queued items, one statement per batch, in order, until `stopped`;
     /// then send what is left for at most [`DRAIN_ON_STOP`]. A send is never
     /// cut short by the stop: it runs in the arm, after the `select!`.
     async fn publish_loop(
@@ -317,7 +452,9 @@ impl Inner {
                 // Drop the watch guard inside, so the future stays `Send`.
                 () = async { drop(stopped.wait_for(|stopped| *stopped).await); } => break,
                 item = outbox.recv() => match item {
-                    Some(item) => self.send(item).await,
+                    Some(item) => {
+                        self.send(take_batch(item, outbox)).await;
+                    }
                     // The sender lives in `self`; unreachable, but never spin.
                     None => break,
                 },
@@ -326,13 +463,17 @@ impl Inner {
         self.drain(outbox, DRAIN_ON_STOP).await;
     }
 
-    /// Send what is already queued, in order, for at most `within`.
+    /// Send what is already queued, one statement per batch, in order, for at
+    /// most `within`. Only a batch whose statement succeeded is counted.
     async fn drain(&self, outbox: &mut mpsc::Receiver<Outgoing>, within: Duration) {
         let sending = async {
             let mut sent = 0_usize;
-            while let Ok(item) = outbox.try_recv() {
-                self.send(item).await;
-                sent += 1;
+            while let Ok(first) = outbox.try_recv() {
+                let batch = take_batch(first, outbox);
+                let count = batch.len();
+                if self.send(batch).await {
+                    sent += count;
+                }
             }
             sent
         };
@@ -345,22 +486,55 @@ impl Inner {
         }
     }
 
-    /// One `pg_notify`; a failure drops the item.
-    async fn send(&self, item: Outgoing) {
-        let channel = if item.signals {
-            &self.signals_channel
-        } else {
-            &self.events_channel
-        };
-        let sent = sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(channel)
-            .bind(&item.payload)
-            .execute(&self.pool)
-            .await;
-        if let Err(e) = sent {
-            let n = self.failed.fetch_add(1, Relaxed) + 1;
-            if should_log(n) {
-                tracing::warn!(error = %e, failed = n, "pg_notify failed, dropping (best effort)");
+    /// The two `text[]` columns of one statement: the channel and the payload of
+    /// each item, in queue order.
+    fn columns(&self, items: Vec<Outgoing>) -> (Vec<String>, Vec<String>) {
+        let mut channels = Vec::with_capacity(items.len());
+        let mut payloads = Vec::with_capacity(items.len());
+        for item in items {
+            channels.push(if item.signals {
+                self.signals_channel.clone()
+            } else {
+                self.events_channel.clone()
+            });
+            payloads.push(item.payload);
+        }
+        (channels, payloads)
+    }
+
+    /// One `pg_notify` statement for a whole batch; a failure drops the items in
+    /// it. PostgreSQL delivers the notifications in row order, and folds
+    /// identical channel-and-payload pairs of one statement into one. `true`
+    /// when the statement succeeded.
+    async fn send(&self, items: Vec<Outgoing>) -> bool {
+        debug_assert!(!items.is_empty(), "a batch has at least one item");
+        let (channels, payloads) = self.columns(items);
+        let count = channels.len();
+        let sent = sqlx::query(
+            "SELECT pg_notify(channel, payload) FROM unnest($1::text[], $2::text[]) AS t(channel, payload)",
+        )
+        .bind(channels)
+        .bind(payloads)
+        .execute(&self.pool)
+        .await;
+        self.statements.fetch_add(1, Relaxed);
+        match sent {
+            Ok(_) => true,
+            Err(e) => {
+                let items = self.failed.fetch_add(count as u64, Relaxed) + count as u64;
+                let statements = self.failed_statements.fetch_add(1, Relaxed) + 1;
+                // The first failed statement, then every thousandth, whatever
+                // the batch size: a batch of 32 must not swallow the first one.
+                if should_log(statements) {
+                    tracing::warn!(
+                        error = %e,
+                        batch = count,
+                        failed = items,
+                        statements,
+                        "pg_notify failed, dropping the batch (best effort)"
+                    );
+                }
+                false
             }
         }
     }
@@ -468,21 +642,26 @@ pub struct PgEventSink {
 #[async_trait]
 impl EventSink for PgEventSink {
     async fn emit(&self, run: RunId, agent: &str, event: RunEvent) {
-        let encoded = encode_event(self.inner.origin, run, agent, &event);
+        // Local only: no encoding and no outbox entry. The listener of every
+        // process drops an event of its own origin, this one included, so
+        // nothing would come of sending it.
+        let encoded =
+            (!self.inner.local_only).then(|| encode_event(self.inner.origin, run, agent, &event));
         self.inner.local.emit(run, agent, event).await;
         match encoded {
-            Encoded::Fits(payload) => self.inner.enqueue(Outgoing {
+            None => {}
+            Some(Encoded::Fits(payload)) => self.inner.enqueue(Outgoing {
                 signals: false,
                 payload,
             }),
-            Encoded::Truncated(payload) => {
+            Some(Encoded::Truncated(payload)) => {
                 tracing::debug!(%run, "event cut to fit a notification (a status's detail, a step's input and output)");
                 self.inner.enqueue(Outgoing {
                     signals: false,
                     payload,
                 });
             }
-            Encoded::Dropped => {
+            Some(Encoded::Dropped) => {
                 tracing::debug!(%run, max = MAX_PAYLOAD_BYTES, "event too big for a notification, not sent to other processes");
             }
         }
@@ -528,13 +707,14 @@ mod tests {
     use super::*;
 
     /// A pool that never connects: enough to test everything that does not
-    /// touch the database.
+    /// touch the database. The explicit `local_only(false)` keeps an ambient
+    /// `NOTIFY_LOCAL_ONLY` from changing what these tests measure.
     fn notify() -> (PgNotify, BroadcastSink) {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://nobody@127.0.0.1:1/none")
             .expect("lazy pool");
         let local = BroadcastSink::default();
-        (PgNotify::new(pool, local.clone()), local)
+        (PgNotify::new(pool, local.clone()).local_only(false), local)
     }
 
     fn progress(m: &str) -> RunEvent {
@@ -713,5 +893,166 @@ mod tests {
     fn logging_is_rate_limited() {
         let logged: Vec<u64> = (1..=3000).filter(|n| should_log(*n)).collect();
         assert_eq!(logged, [1, 1000, 2000, 3000]);
+    }
+
+    #[test]
+    fn the_local_only_variable_is_a_boolean_or_a_problem() {
+        assert_eq!(local_only_from(|_| None), (false, None));
+        for (raw, want) in [
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("1", true),
+            ("false", false),
+            ("False", false),
+            ("0", false),
+        ] {
+            assert_eq!(
+                local_only_from(|_| Some(raw.into())),
+                (want, None),
+                "{raw:?}"
+            );
+        }
+        for bad in ["", "yes", "on", "2", " true", "false "] {
+            assert_eq!(
+                local_only_from(|_| Some(bad.into())),
+                (false, Some(bad.to_owned())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bad_local_only_value_fails_run_without_taking_the_outbox() {
+        let (n, _) = notify();
+        let bad = PgNotify::build(
+            n.inner.pool.clone(),
+            n.inner.local.clone(),
+            "adam_",
+            n.inner.origin,
+            false,
+            Some("yes".into()),
+        );
+        assert!(matches!(
+            bad.run(std::future::ready(())).await,
+            Err(NotifyError::InvalidLocalOnly(raw)) if raw == "yes"
+        ));
+        assert!(bad.inner.take_outbox().is_ok(), "nothing was started");
+    }
+
+    #[tokio::test]
+    async fn local_only_keeps_every_event_in_this_process() {
+        let (n, local) = notify();
+        let n = n.local_only(true);
+        let sink = n.event_sink();
+        let mut rx = local.subscribe();
+        let run = RunId::new();
+        for i in 0..100 {
+            sink.emit(run, "a", progress(&format!("{i}"))).await;
+        }
+        // Every event reached the local sink, in order and whole.
+        for i in 0..100 {
+            let got = rx.try_recv().expect("the local sink gets every event");
+            assert_eq!((got.run, got.event), (run, progress(&format!("{i}"))));
+        }
+        // Nothing was encoded or queued for the other processes.
+        let mut outbox = n.inner.take_outbox().expect("not running");
+        assert!(
+            outbox.receiver().try_recv().is_err(),
+            "no outbox entry with the flag on"
+        );
+        assert_eq!(n.inner.dropped.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_takes_what_is_queued_up_to_the_cap() {
+        let (tx, mut rx) = mpsc::channel(2 * MAX_BATCH_ITEMS);
+        for i in 0..2 * MAX_BATCH_ITEMS {
+            tx.send(Outgoing {
+                signals: false,
+                payload: format!("{i}"),
+            })
+            .await
+            .expect("queue");
+        }
+        let first = take_batch(rx.try_recv().expect("one"), &mut rx);
+        assert_eq!(first.len(), MAX_BATCH_ITEMS);
+        assert_eq!(first[0].payload, "0");
+        assert_eq!(
+            first[MAX_BATCH_ITEMS - 1].payload,
+            (MAX_BATCH_ITEMS - 1).to_string()
+        );
+        let second = take_batch(rx.try_recv().expect("one"), &mut rx);
+        assert_eq!(second.len(), MAX_BATCH_ITEMS);
+        assert_eq!(
+            second[MAX_BATCH_ITEMS - 1].payload,
+            (2 * MAX_BATCH_ITEMS - 1).to_string()
+        );
+        assert!(rx.try_recv().is_err(), "exactly what was queued, no wait");
+    }
+
+    #[tokio::test]
+    async fn a_batch_keeps_its_order_and_each_items_channel() {
+        let (n, _) = notify();
+        let batch = vec![
+            Outgoing {
+                signals: false,
+                payload: "e1".into(),
+            },
+            Outgoing {
+                signals: true,
+                payload: "s1".into(),
+            },
+            Outgoing {
+                signals: false,
+                payload: "e2".into(),
+            },
+        ];
+        let (channels, payloads) = n.inner.columns(batch);
+        assert_eq!(channels, ["adam_events", "adam_signals", "adam_events"]);
+        assert_eq!(payloads, ["e1", "s1", "e2"]);
+    }
+
+    /// The log rate limit counts failed **statements**, so the first one is
+    /// loud whatever its batch carried; the item counter keeps counting items.
+    #[tokio::test]
+    async fn a_failed_statement_is_counted_once_however_many_items_it_carried() {
+        let (n, _) = notify();
+        n.inner.pool.close().await;
+        // The first failed statement is the big batch: it is the one the old item counter would
+        // have swallowed (32, not 1), so the counters must still see one statement.
+        let batch: Vec<Outgoing> = (0..MAX_BATCH_ITEMS)
+            .map(|_| Outgoing {
+                signals: false,
+                payload: "y".into(),
+            })
+            .collect();
+        assert!(
+            !n.inner.send(batch).await,
+            "a closed pool fails the statement"
+        );
+        assert_eq!(
+            n.inner.failed.load(Relaxed),
+            MAX_BATCH_ITEMS as u64,
+            "the item counter counts every dropped item"
+        );
+        assert_eq!(n.inner.failed_statements.load(Relaxed), 1);
+        assert!(
+            should_log(1),
+            "the first failed statement is logged whatever its size"
+        );
+
+        let one = vec![Outgoing {
+            signals: false,
+            payload: "x".into(),
+        }];
+        assert!(!n.inner.send(one).await);
+        assert_eq!(
+            n.inner.failed.load(Relaxed),
+            1 + MAX_BATCH_ITEMS as u64,
+            "the item counter counts every dropped item"
+        );
+        assert_eq!(n.inner.failed_statements.load(Relaxed), 2);
+        assert!(!should_log(2), "the second failed statement is not logged");
     }
 }
