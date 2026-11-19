@@ -84,11 +84,7 @@ async fn a_nested_agents_md_is_shown_through_the_port() {
         None
     );
     // A place the coder did not make carries no slot: nothing to show.
-    let foreign = Place::new(
-        "x",
-        std::sync::Arc::clone(place.root()),
-        place.git().clone(),
-    );
+    let foreign = Place::new("x", place.git().clone());
     assert_eq!(
         h.workspace
             .nested_instructions(&h.ctx, &foreign, Some("sub/lib.rs"), Target::File)

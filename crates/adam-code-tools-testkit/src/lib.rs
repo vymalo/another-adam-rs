@@ -28,7 +28,8 @@ pub struct Harness {
     pub workspace: DynCodeWorkspace,
     /// A context the workspace answers for (its run, its state).
     pub ctx: ToolCtx,
-    /// The name of a place a tool may write.
+    /// The name of the place a tool may write: the only one, so it is also the place a tool works
+    /// in when it names none.
     pub writable: String,
     /// The name of a place a tool may only read, if the implementation has such places.
     pub read_only: Option<String>,
@@ -46,6 +47,8 @@ pub fn detached_ctx() -> ToolCtx {
 
 /// The conformance cases, each an `async fn(&Harness)` that panics on a failure.
 pub mod cases {
+    use std::sync::Arc;
+
     use super::{Harness, Intent};
 
     /// A name the model writes for a place that does not exist.
@@ -60,12 +63,25 @@ pub mod cases {
                 Err(answer) => panic!("{intent:?} of {:?}: {answer:?}", h.writable),
             };
             assert!(place.is_writable(), "{intent:?}");
-            assert!(!place.name().is_empty(), "{intent:?}");
+            assert_eq!(place.name(), h.writable, "{intent:?}");
             assert!(
                 place.path().is_dir(),
                 "{intent:?}: {}",
                 place.path().display()
             );
+            // The directory a tool checks a path against is the one `git` is asked in.
+            assert!(Arc::ptr_eq(place.root(), place.git().root()), "{intent:?}");
+        }
+    }
+
+    /// With no name, a tool works in the only place it may write, for a read and for a write: a
+    /// place that may only be read is used when it is named, never by default.
+    pub async fn no_name_is_the_place_a_tool_may_write(h: &Harness) {
+        for intent in [Intent::Read, Intent::Write] {
+            match h.workspace.place(&h.ctx, None, intent).await {
+                Ok(place) => assert_eq!(place.name(), h.writable, "{intent:?}"),
+                Err(answer) => panic!("{intent:?} with no name: {answer:?}"),
+            }
         }
     }
 
@@ -81,7 +97,7 @@ pub mod cases {
     }
 
     /// A place a tool may only read is given for a read, not writable, and never for a write: a
-    /// write is an answer for the model.
+    /// write is an answer for the model. A harness with no such place passes it with nothing checked.
     pub async fn a_read_only_place_is_never_given_for_a_write(h: &Harness) {
         let Some(name) = &h.read_only else { return };
         match h.workspace.place(&h.ctx, Some(name), Intent::Read).await {
@@ -98,7 +114,12 @@ pub mod cases {
     pub async fn the_redactor_scrubs_the_secret(h: &Harness) {
         let text = format!("token={} done", h.secret);
         let scrubbed = h.workspace.redactor().scrub(&text);
-        assert!(!scrubbed.contains(&h.secret), "{scrubbed}");
+        // On a failure the message says how long the secret is, never what it is.
+        assert!(
+            !scrubbed.contains(&h.secret),
+            "the redactor does not hold the harness's secret ({} bytes)",
+            h.secret.len()
+        );
     }
 }
 
@@ -108,6 +129,7 @@ pub mod cases {
 macro_rules! code_workspace_conformance {
     ($harness:expr) => {
         $crate::code_workspace_conformance!(@case $harness, a_writable_place_is_given_for_a_read_and_a_write);
+        $crate::code_workspace_conformance!(@case $harness, no_name_is_the_place_a_tool_may_write);
         $crate::code_workspace_conformance!(@case $harness, an_unknown_name_is_an_answer_for_the_model);
         $crate::code_workspace_conformance!(@case $harness, a_read_only_place_is_never_given_for_a_write);
         $crate::code_workspace_conformance!(@case $harness, the_redactor_scrubs_the_secret);
@@ -122,8 +144,8 @@ macro_rules! code_workspace_conformance {
 }
 
 /// A workspace of named directories, for the tests of the tools and as the reference
-/// implementation of the cases. A place is found by its name; with no name, the only place, if
-/// there is exactly one.
+/// implementation of the cases. A place is found by its name; with no name, the only place that may
+/// be written, if there is exactly one (as the coder finds a slot).
 #[derive(Debug, Default)]
 pub struct DirWorkspace {
     places: Vec<Place>,
@@ -159,8 +181,9 @@ impl DirWorkspace {
     }
 
     fn add(mut self, name: &str, dir: &Path, writable: bool) -> std::io::Result<Self> {
-        let root = Arc::new(SlotDir::open(dir)?);
-        let place = Place::new(name, root, GitAt::plain(dir));
+        // `GitAt::plain` holds the directory open itself; this says, as an error, when it cannot.
+        SlotDir::open(dir)?;
+        let place = Place::new(name, GitAt::plain(dir));
         self.places
             .push(if writable { place } else { place.read_only() });
         Ok(self)
@@ -177,8 +200,13 @@ impl CodeWorkspace for DirWorkspace {
     ) -> Result<Place, Outcome> {
         let place = match repo.map(str::trim).filter(|r| !r.is_empty()) {
             Some(name) => self.places.iter().find(|p| p.name() == name),
-            None if self.places.len() == 1 => self.places.first(),
-            None => None,
+            None => {
+                let mut writable = self.places.iter().filter(|p| p.is_writable());
+                match (writable.next(), writable.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => None,
+                }
+            }
         };
         let Some(place) = place else {
             let names: Vec<&str> = self.places.iter().map(Place::name).collect();

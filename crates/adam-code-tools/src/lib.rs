@@ -17,4 +17,6 @@ pub mod shell;
 pub mod workspace;
 
 pub use redact::Redactor;
-pub use workspace::{CodeWorkspace, DynCodeWorkspace, Intent, Outcome, Place, Target};
+pub use workspace::{
+    CodeWorkspace, DynCodeWorkspace, Intent, MAX_INSTRUCTIONS_BLOCK, Outcome, Place, Target,
+};

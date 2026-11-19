@@ -6,8 +6,6 @@
 //! carrying the [`Slot`] itself, so the coder's own answers (the nested project instructions) work
 //! on what was found.
 
-use std::sync::Arc;
-
 use adam_code_tools::git::GitAt;
 use adam_code_tools::{CodeWorkspace, Intent, Outcome, Place, Redactor, Target};
 use adam_llm_agent::{ToolCtx, ToolError};
@@ -17,9 +15,13 @@ use async_trait::async_trait;
 use super::ToolEnv;
 use super::project;
 
+// A block of the nested instructions fits the room the port promises (`MAX_INSTRUCTIONS_BLOCK`):
+// the text, cut at `NESTED_CAP`, and its header and footer.
+const _: () = assert!(project::NESTED_CAP + 4 * 1024 <= adam_code_tools::MAX_INSTRUCTIONS_BLOCK);
+
 /// A slot as a [`Place`].
 pub(crate) fn place_of(slot: Slot) -> Place {
-    let place = Place::new(slot.dir(), Arc::clone(slot.root()), GitAt::slot(&slot));
+    let place = Place::new(slot.dir(), GitAt::slot(&slot));
     let place = if slot.writable() {
         place
     } else {

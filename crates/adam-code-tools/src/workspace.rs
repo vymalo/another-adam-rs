@@ -8,7 +8,16 @@
 //! it over a person's own directory (slice 7), which a run never owns, cleans or restores.
 //!
 //! The commands (`run_command`, `run`) need more of the workspace (a session to run in, a guard that
-//! records and undoes what a command changed); that is a port of its own, which comes with them.
+//! records what a command changed and, where the workspace owns the place, undoes it). They get a
+//! port that extends this one and takes a [`Place`] from the same [`CodeWorkspace::place`], so a
+//! command and a file tool find a place and refuse a write the same way. The file tools' hook after
+//! a write comes with them (step 4) as a required method: a stated break for the implementations of
+//! this repository, the only ones until then.
+//!
+//! A place's `git` is a [`GitAt`] from the workspace's own metadata (`GitAt::slot`,
+//! `GitAt::worktree`). A host's directory, which no workspace metadata describes, gets a
+//! constructor of its own when a host implementation exists (slice 7); adding it changes nothing
+//! here.
 //!
 //! [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
 
@@ -23,6 +32,10 @@ use async_trait::async_trait;
 
 use crate::git::GitAt;
 use crate::redact::Redactor;
+
+/// The most bytes a block of [`CodeWorkspace::nested_instructions`] has: the room a tool that shows
+/// several files leaves for it.
+pub const MAX_INSTRUCTIONS_BLOCK: usize = 12 * 1024;
 
 /// What a tool answers: its output, or the error the runtime classifies.
 pub type Outcome = Result<ToolOutput, ToolError>;
@@ -63,12 +76,13 @@ pub struct Place {
 }
 
 impl Place {
-    /// A place named `name` over `root`, asked about with `git`; writable unless
+    /// A place named `name`: the directory `git` is asked in, held ([`GitAt::root`]), so the
+    /// directory a tool checks a path against is always the one `git` writes in. Writable unless
     /// [`read_only`](Self::read_only).
-    pub fn new(name: impl Into<String>, root: Arc<SlotDir>, git: GitAt) -> Self {
+    pub fn new(name: impl Into<String>, git: GitAt) -> Self {
         Self {
             name: name.into(),
-            root,
+            root: Arc::clone(git.root()),
             git,
             writable: true,
             handle: None,
@@ -114,7 +128,8 @@ impl Place {
         self.writable
     }
 
-    /// The value the workspace attached, if it is a `T`.
+    /// The value the workspace attached, if it is exactly a `T` (an `Arc<T>` attached is not a `T`).
+    /// For the implementation's own methods: a tool does not look at it.
     pub fn handle<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.handle.as_deref()?.downcast_ref()
     }
@@ -132,10 +147,14 @@ impl fmt::Debug for Place {
 /// The workspace of the file and search tools.
 #[async_trait]
 pub trait CodeWorkspace: Send + Sync {
-    /// The place a tool works in: `repo` as the model wrote it, or the only place when it wrote
-    /// none. `Err` is the tool's answer: `Ok` of a message for the model (no workspace yet, which of
-    /// several, a place that cannot be written for a [`Write`](Intent::Write)), or a
-    /// [`ToolError`]. A [`Write`](Intent::Write) is never given a place that
+    /// The place a tool works in: the one `repo` names, as the model wrote it; with no `repo`, the
+    /// one place a tool works in by default, which is the only place that may be written (a place
+    /// that may only be read is used when it is named, never by default), and none when there are
+    /// several or none.
+    ///
+    /// `Err` is the tool's answer: `Ok` of an **error result** for the model (no workspace yet, which
+    /// of several, an unknown name, a place that cannot be written for a [`Write`](Intent::Write)),
+    /// or a [`ToolError`]. A [`Write`](Intent::Write) is never given a place that
     /// [is not writable](Place::is_writable).
     async fn place(
         &self,
@@ -150,6 +169,9 @@ pub trait CodeWorkspace: Send + Sync {
     /// The project instructions `path` touches in `place` and that this run has not been shown yet
     /// (`AGENTS.md` of a directory below the place's root), as a block put before a tool's result.
     /// `None` when there are none, or when the workspace does not show any (the default).
+    ///
+    /// A block returned is **claimed**: the workspace counts it as shown, so the tool puts it in its
+    /// result. It is at most [`MAX_INSTRUCTIONS_BLOCK`] bytes, which the tools leave room for.
     ///
     /// # Errors
     ///
