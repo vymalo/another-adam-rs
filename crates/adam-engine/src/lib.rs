@@ -9,6 +9,10 @@
 //! HTTP server or client, a database driver, the Kubernetes client, a TLS stack or the MCP client.
 //! The API (start, send, steer, answer, cancel, list and the events) is slice 4.
 //!
+//! **Secrets** ([ADR 0047] decision 5): an embedded agent reads none of the person's environment.
+//! [`default_secrets`] refuses every name, and a host that has secrets for the agent's files gives
+//! a source of its own (`adam_core::SecretSource`) to the agent's definition.
+//!
 //! [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
 
 #![forbid(unsafe_code)]
@@ -22,3 +26,29 @@ pub use adam_llm_agent;
 pub use adam_model;
 pub use adam_runtime;
 pub use adam_ui;
+
+use std::sync::Arc;
+
+use adam_core::{DynSecretSource, NoSecrets};
+
+/// The secrets an embedded agent's files may name until the host gives a source of its own:
+/// none. Every name is refused, the ones the process environment has included.
+pub fn default_secrets() -> DynSecretSource {
+    Arc::new(NoSecrets)
+}
+
+#[cfg(test)]
+mod tests {
+    use adam_core::SecretError;
+
+    use super::*;
+
+    /// ADR 0047 slice 2's proof: a name the environment has is refused by the engine's default.
+    #[test]
+    fn a_name_the_environment_has_is_refused_by_the_engines_default() {
+        assert!(std::env::var_os("PATH").is_some());
+        let secrets = default_secrets();
+        assert_eq!(secrets.secret("PATH").unwrap_err(), SecretError::Refused);
+        assert_eq!(format!("{secrets:?}"), "SecretSource(none)");
+    }
+}
