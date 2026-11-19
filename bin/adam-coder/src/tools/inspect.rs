@@ -363,9 +363,13 @@ impl Snapshot {
 
 /// The git directory and `HEAD` from one `rev-parse --absolute-git-dir HEAD`: git prints each on
 /// its own line. Splitting from the end keeps a git directory whose name holds a newline whole.
+/// The directory is trimmed at its end, as `git_stdout` trims the one [`restore`](Snapshot::restore)
+/// asks for, so the two compare like with like; a git directory whose name ends in whitespace is
+/// not supported (a worktree's is `.git` or a directory the coder generated, so none does).
 fn split_rev_parse(out: Option<String>) -> Option<(String, String)> {
     let out = out?;
     let (git_dir, head) = out.rsplit_once('\n')?;
+    let git_dir = git_dir.trim_end();
     (!git_dir.is_empty() && !head.is_empty()).then(|| (git_dir.to_owned(), head.to_owned()))
 }
 
@@ -483,6 +487,33 @@ mod tests {
             truncated,
             ..ShellOutcome::default()
         }
+    }
+
+    /// A git directory whose name holds a newline is not split in two: the split is at the last
+    /// line, which is `HEAD`.
+    #[tokio::test]
+    async fn a_git_directory_whose_name_holds_a_newline_is_split_whole() {
+        let tmp = tempfile::Builder::new().prefix("a\nb").tempdir().unwrap();
+        // git answers with the path it resolved: compare like with like.
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        git(&dir, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(dir.join("README.md"), "x\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "--quiet", "-m", "seed"]);
+        let at = GitAt::plain(&dir);
+        let snap = Snapshot::take(&at, None).await.unwrap();
+        assert_eq!(snap.git_dir, format!("{}/.git", dir.display()));
+        assert_eq!(snap.head, head_sha(&at).await.unwrap());
+    }
+
+    /// The directory is trimmed at its end, as `git_stdout` trims the one `restore` compares it
+    /// with: a path ending in whitespace is not supported, and this is what "not supported" means.
+    #[test]
+    fn the_git_directory_is_trimmed_at_its_end_as_the_restore_query_trims_it() {
+        assert_eq!(
+            split_rev_parse(Some("/a/gitdir \n0123abc".to_owned())),
+            Some(("/a/gitdir".to_owned(), "0123abc".to_owned()))
+        );
     }
 
     #[test]

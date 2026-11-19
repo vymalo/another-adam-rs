@@ -568,18 +568,22 @@ fn ref_scan_args() -> Vec<&'static str> {
 }
 
 /// Why [`ref_scan_args`] failed: a `git` without `for-each-ref --exclude` is told apart from a
-/// repository that cannot be read at all, so a tool can say which.
+/// repository that cannot be read at all, so a tool can say which. Both probes use a format that
+/// reads no object, as the scan's does: the default format reads the first ref's object type, so a
+/// ref whose object is missing would make the plain probe fail and an old git be blamed on the
+/// repository. The only difference between the two is the option under test.
 async fn ref_scan_error(at: &GitAt) -> SnapshotError {
-    if git_stdout(at, &["for-each-ref", "--count=1"])
-        .await
-        .is_none()
-    {
+    let plain = ["for-each-ref", "--count=1", "--format=%(refname)"];
+    if git_stdout(at, &plain).await.is_none() {
         return SnapshotError::Unreadable;
     }
-    if git_stdout(at, &["for-each-ref", "--count=1", "--exclude=refs/tags/**"])
-        .await
-        .is_none()
-    {
+    let excluded = [
+        "for-each-ref",
+        "--count=1",
+        "--format=%(refname)",
+        "--exclude=refs/tags/**",
+    ];
+    if git_stdout(at, &excluded).await.is_none() {
         SnapshotError::GitTooOld
     } else {
         SnapshotError::Unreadable
@@ -1105,6 +1109,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let at = GitAt::refused(tmp.path());
         assert_eq!(ref_scan_error(&at).await, SnapshotError::Unreadable);
+    }
+
+    /// The probes read no object, as the scan does. A ref whose object is missing makes the default
+    /// `for-each-ref` format fail (it asks for the object type); a probe in that format would blame
+    /// an old git on the repository and say "cannot read the state".
+    #[tokio::test]
+    async fn the_probe_format_reads_no_object_so_a_missing_one_is_not_an_unreadable_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, None, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(dir.join("README.md"), "x\n").unwrap();
+        git(dir, None, &["add", "-A"]);
+        git(dir, None, &["commit", "--quiet", "-m", "seed"]);
+        // A loose ref to an object the repository does not have, first in the order.
+        std::fs::write(
+            dir.join(".git/refs/heads/aaa-broken"),
+            "0123456789012345678901234567890123456789\n",
+        )
+        .unwrap();
+        let at = GitAt::plain(dir);
+        assert!(
+            git_stdout(&at, &["for-each-ref", "--count=1"])
+                .await
+                .is_none()
+        );
+        assert!(
+            git_stdout(&at, &["for-each-ref", "--count=1", "--format=%(refname)"])
+                .await
+                .is_some()
+        );
     }
 }
 
