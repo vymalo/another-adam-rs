@@ -235,7 +235,8 @@ impl RunView {
 ///
 /// `claimed` is the lease, which a record does not carry: a caller that lists records reads it
 /// beside the one record it needs it for (`adam-a2a-runtime` reads it only for a runnable run at
-/// version 1, the only record whose task state can still flip from `submitted` to `working`). An
+/// version 1, the only record whose task state can still flip from `submitted` to `working`) and
+/// compares it against [`Runtime::now`], so the result agrees with [`Runtime::view`]. An
 /// unreadable state is [`RuntimeError::Corrupt`].
 ///
 /// # Errors
@@ -732,6 +733,14 @@ impl Runtime {
     /// The store this runtime commits to.
     pub fn store(&self) -> &DynStore {
         &self.inner.store
+    }
+
+    /// The runtime's current time, from its clock ([`RuntimeBuilder::clock`]).
+    ///
+    /// A caller that builds a view from a record it holds ([`view_from_record`]) reads the run's
+    /// lease against this, so the `claimed` it computes agrees with [`view`](Self::view)'s.
+    pub fn now(&self) -> DateTime<Utc> {
+        self.inner.clock.now()
     }
 
     /// This runtime's lease identity.

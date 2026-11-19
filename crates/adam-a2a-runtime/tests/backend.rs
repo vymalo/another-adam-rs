@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use a2a::{Message, Part, Role, Task, TaskState};
 use adam_a2a::{
-    A2aServer, AgentCardConfig, AuthConfig, BackendError, Caller, TaskBackend, TaskEvent,
+    A2aServer, AgentCardConfig, AuthConfig, BackendError, Caller, TaskBackend, TaskEvent, TaskQuery,
 };
 use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::{DynStore, MemoryStore, RunId};
@@ -573,6 +573,63 @@ async fn a_stream_reads_the_run_once_per_commit_not_once_per_poll() {
     // Every step is shorter than the 1 s cancel interval, so the watch normally reads nothing;
     // the 250 ms interval it used to share read the whole record ~10 times over the run.
     assert!(headers <= 3, "the cancel watch read {headers} headers");
+}
+
+/// `ListTasks` builds a task from the record the listing already returned: one count, one list and
+/// one lease read per runnable run at version 1 (the only row whose state can still turn from
+/// `submitted` to `working`), and no record read per task. A 50-task page was 1 count + 1 list +
+/// 50 views (two calls each) = 102 store calls; it is 52 now. The tasks are exactly what `GetTask`
+/// answers for the same runs.
+#[tokio::test]
+async fn a_listed_task_is_built_from_the_record_the_listing_has() {
+    let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let store: DynStore = faulty.clone();
+    let rig = Rig::front_only(store);
+    let caller = alice();
+    for n in 0..50 {
+        rig.backend
+            .submit(
+                caller.clone(),
+                user(&format!("task {n}")),
+                None,
+                Some(format!("ctx-{n}")),
+            )
+            .await
+            .expect("submit");
+    }
+    let before = (
+        faulty.calls(Method::CountRuns),
+        faulty.calls(Method::ListRuns),
+        faulty.calls(Method::LeaseUntil),
+        faulty.calls(Method::LoadRun),
+    );
+    let mut query = TaskQuery::new();
+    query.page_size = 50;
+    let page = rig.backend.list(&caller, &query).await.expect("list");
+    assert_eq!(page.tasks.len(), 50);
+    assert_eq!(
+        (
+            faulty.calls(Method::CountRuns) - before.0,
+            faulty.calls(Method::ListRuns) - before.1,
+            faulty.calls(Method::LeaseUntil) - before.2,
+            faulty.calls(Method::LoadRun) - before.3,
+        ),
+        (1, 1, 50, 0),
+        "one count, one page, one lease per submitted task, and no record read"
+    );
+    for task in &page.tasks {
+        let got = rig
+            .backend
+            .get(&caller, &task.id)
+            .await
+            .expect("get")
+            .expect("task");
+        assert_eq!(
+            serde_json::to_value(&got).expect("json"),
+            serde_json::to_value(task).expect("json"),
+            "the listed task is the task GetTask answers"
+        );
+    }
 }
 
 /// A file the agent shares reaches an A2A client as a standard artifact: one `raw` part with its

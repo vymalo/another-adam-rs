@@ -97,8 +97,12 @@ they are the state that ends the stream, so they wait for the client to read ins
 no subject's namespace is a prefix of another's), ordered by last update, newest first, id breaking ties, and continued by the
 `PageToken` of `adam-a2a` (the position of the last task; never an offset). The A2A state is derived, not stored (`failed` and
 `canceled` are both a failed run, `submitted` and `working` both a runnable one), so a `status` filter narrows by the run
-statuses its state can come from and each candidate is read as a task and kept only if its state is the one asked for, reading
-at most `MAX_SCAN` (500) runs per page: a rare filter returns a short page and a token that continues. **`totalSize` is exact for
+statuses its state can come from and each candidate is kept only if its state is the one asked for, reading
+at most `MAX_SCAN` (500) runs per page: a rare filter returns a short page and a token that continues. A candidate is built
+from the record the listing returned (`adam_runtime::view_from_record`), not read again: the state is already in it, and the
+lease is read only for a runnable run at version 1, the one row whose task state can still turn from `submitted` to
+`working` because a worker claimed it. A 50-task page is one count, one page and one lease read per submitted task.
+**`totalSize` is exact for
 no status filter and for `completed`, and an upper bound for the other states.** A run of another agent in the same store, an
 unreadable record and a record whose conversation id has no subject are not listed.
 
@@ -148,7 +152,11 @@ the snapshot's sessions object makes: a session that starts between the two may 
 `opened`, never missed), and a session that existed then says nothing. It lists again after at least 200 ms when the parent's
 record changed and at least every second (`SESSIONS_MIN_INTERVAL`, `SESSIONS_POLL`); a listing that fails is warned about and
 retried after the full second; and it lists once more before the final event. A session whose latest round the listing cannot
-read is left out until it can. Per session the diff is a pure function (`diff`) in the contract's order: new -> `opened`; the
+read is left out until it can. **A session whose listing row did not change is not read again**: the tracker keeps the row its
+`Seen` came from and skips the `view` (two queries and the full state of an open round) when the next listing returns the same
+row. The row is the version that matters — a commit moves `updated_at`, a new round moves `round` and `latestRun`, and the
+listing decides `state` and `closed` (the idle TTL) from the record and its clock — so anything that can change a `Seen`
+changes the row. Per session the diff is a pure function (`diff`) in the contract's order: new -> `opened`; the
 latest round's number grew and it is not a round that only closes -> `round`; the latest round left `working`, or waits for the
 person -> `reported`; the session turned closed -> `closed`. **`opened` carries the latest round**, which is not round 1 for a
 session first seen later (a session that began and went through rounds between two listings, or that a shifting page hid from
