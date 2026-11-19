@@ -504,6 +504,61 @@ async fn a_removed_variable_is_logged_once_at_startup() {
 
 // ------------------------------------------------------------ with a database
 
+/// The params of the `child-sessions/v1` entry of a served card, if it lists one.
+fn child_sessions_entry(card: &Value) -> Option<Value> {
+    card["capabilities"]["extensions"]
+        .as_array()?
+        .iter()
+        .find(|e| e["uri"] == adam_a2a::CHILD_SESSIONS_EXTENSION)
+        .map(|e| e["params"].clone())
+}
+
+/// What the card lists for the coder's two helpers, from their files' descriptions.
+fn helpers_entry(max_open: u32) -> Value {
+    let described = |name: &str| {
+        let file = plain_agent_dir().join(format!("agent/subagents/{name}.md"));
+        let text = std::fs::read_to_string(&file).unwrap();
+        let line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("description:"))
+            .unwrap();
+        // The files quote the description.
+        serde_json::from_str::<String>(line.trim()).unwrap()
+    };
+    json!({
+        "agents": [
+            {"name": "explorer", "description": described("explorer")},
+            {"name": "reviewer", "description": described("reviewer")},
+        ],
+        "maxOpen": max_open,
+    })
+}
+
+/// `SESSION_MAX_OPEN` is the card's `maxOpen`, on the roles that serve the card.
+#[tokio::test]
+async fn session_max_open_is_what_the_card_offers() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    for role in ["all", "control-plane"] {
+        let mut env = role_env(role, &db.url(), tmp.path());
+        env.push(("SESSION_MAX_OPEN".to_owned(), "8".to_owned()));
+        let mut p = Proc::spawn(&env);
+        let addr = p.ready().await;
+        let (_, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
+        assert_eq!(
+            child_sessions_entry(&common::json_of(&card)),
+            Some(helpers_entry(8)),
+            "{role}: {card}"
+        );
+        p.sigterm().await;
+        let status = p.exit_within(Duration::from_secs(15)).await;
+        assert_eq!(status.code(), Some(0), "{role}: {}", p.logs());
+    }
+    db.finish().await;
+}
+
 /// The process serves the card (URL from `PUBLIC_URL`) and `/healthz`, refuses
 /// unauthenticated calls, and stops on SIGTERM with exit code 0.
 #[tokio::test]
@@ -520,6 +575,13 @@ async fn serves_card_and_healthz_then_stops_cleanly_on_sigterm() {
     assert_eq!(status, 200, "{card}");
     assert!(card.contains(PUBLIC_URL), "{card}");
     assert_eq!(common::json_of(&card)["name"], "Adam", "{card}");
+    // The helpers of the root (`explorer`, `reviewer`) are offered to a person as sessions, with the
+    // deployment's default `maxOpen`.
+    assert_eq!(
+        child_sessions_entry(&common::json_of(&card)),
+        Some(helpers_entry(16)),
+        "{card}"
+    );
     let (status, _) = common::raw(addr, "POST", "/", None).await;
     assert_eq!(status, 401, "an unauthenticated call is refused");
     assert!(
@@ -627,6 +689,117 @@ async fn max_parallel_tool_calls_reaches_the_coders_agent() {
         let status = p.exit_within(Duration::from_secs(15)).await;
         assert_eq!(status.code(), Some(0), "{}", p.logs());
     }
+    db.finish().await;
+}
+
+/// A person's round of the coder's `explorer`, started on a control plane and worked by a worker in
+/// another process: the front registers only the helpers' starters, the worker has the model. The
+/// round has no workspace (slice 7 of ADR 0045 binds it to the parent's), so the model answers in
+/// text.
+#[tokio::test]
+async fn a_persons_explorer_round_started_on_a_control_plane_completes_on_the_worker() {
+    use a2a::{GetTaskRequest, SendMessageResponse};
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let model = MockServer::start().await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(Recording { seen: seen.clone() })
+        .mount(&model)
+        .await;
+
+    let mut front = Proc::spawn(&role_env(
+        "control-plane",
+        &db.url(),
+        &tmp.path().join("front"),
+    ));
+    let addr = front.ready().await;
+    front.notifying().await;
+    let mut worker_env = role_env("worker", &db.url(), &tmp.path().join("worker"));
+    worker_env.retain(|(k, _)| k != "MODEL_BASE_URL");
+    worker_env.push(("MODEL_BASE_URL".to_owned(), model.uri()));
+    let mut worker = Proc::spawn(&worker_env);
+    worker.ready().await;
+    worker.notifying().await;
+
+    let uri = adam_a2a::CHILD_SESSIONS_EXTENSION;
+    let client = common::a2a_client_activating(addr, A2A_TOKEN, uri).await;
+    let mut message = Message::new(Role::User, vec![Part::text("where is the config read?")]);
+    message.context_id = Some("ctx-1".to_owned());
+    message.metadata = Some(std::collections::HashMap::from([(
+        uri.to_owned(),
+        json!({"start": {"agent": "explorer", "description": "Find it", "keepOpen": false}}),
+    )]));
+    let sent = client
+        .send_message(&SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("the start is served: {e}\n{}", front.logs()));
+    let SendMessageResponse::Task(round) = sent else {
+        panic!("a task was expected")
+    };
+    assert!(
+        round.context_id.starts_with("ctx-1/s/"),
+        "{}",
+        round.context_id
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let done = loop {
+        let task = client
+            .get_task(&GetTaskRequest {
+                id: round.id.clone(),
+                history_length: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        if task.status.state == TaskState::Completed {
+            break task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the round did not complete: {task:?}\n{}\n{}",
+            front.logs(),
+            worker.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        done.metadata
+            .as_ref()
+            .and_then(|m| m.get(uri))
+            .map(|o| o["state"].clone()),
+        Some(json!("closed")),
+        "a round that was not kept open closes its session"
+    );
+    let first = seen.lock().unwrap()[0].clone();
+    assert!(
+        first.to_string().contains("where is the config read?"),
+        "{first}"
+    );
+    let system = first["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("explor"),
+        "the helper's own instructions: {system}"
+    );
+
+    worker.sigterm().await;
+    front.sigterm().await;
+    assert_eq!(
+        worker.exit_within(Duration::from_secs(15)).await.code(),
+        Some(0)
+    );
+    assert_eq!(
+        front.exit_within(Duration::from_secs(15)).await.code(),
+        Some(0)
+    );
     db.finish().await;
 }
 
@@ -809,6 +982,11 @@ async fn a_control_plane_serves_the_card_of_its_agent_folder() {
     assert_eq!(status, 200, "{card}");
     assert_eq!(common::json_of(&card)["name"], "Cody", "{card}");
     assert!(card.contains(PUBLIC_URL), "{card}");
+    assert_eq!(
+        child_sessions_entry(&common::json_of(&card)),
+        Some(helpers_entry(16)),
+        "a control plane lists the sessions too: {card}"
+    );
 
     let line = p
         .stdout()

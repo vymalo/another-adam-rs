@@ -14,6 +14,8 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::connect(url)`: a pool of `ADAM_PG_POOL_SIZE` connections (default 16, 2 to 65535, per
   process).
 * `PgStore::connect_with_pool_size(url, n)`: the same with an explicit size (2 to 65535).
+* `PgStore::connect_lazy(url)`: the same `ADAM_PG_POOL_SIZE` pool, opening no connection until first use, and `ping()` opens one, for a process that
+  checks its own configuration before it needs the database (`adam-service`'s `serve`).
 * `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).

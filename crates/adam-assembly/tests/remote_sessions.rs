@@ -30,6 +30,9 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 const TOKEN: &str = "tok-7f3a9c2e51d84b06";
+
+/// The time limit of a round in the tests that move the clock past it.
+const LIMIT: Duration = Duration::from_secs(3600);
 const VAR: &str = "BILLING_AGENT_TOKEN";
 
 // --- harness -------------------------------------------------------------------------------
@@ -408,6 +411,16 @@ impl Rig {
     /// The assembly of the root's files, with a wait timer of 30 ms and the remote's time limit
     /// `limit` when given.
     fn assemble(&self, limit: Option<Duration>) -> Assembly {
+        self.def(limit)
+            .bind(ToolSet::new().tool(gate(&self.remote, &self.open)))
+            .unwrap()
+            .wait_poll(Duration::from_millis(30))
+            .model(self.model.clone(), "default")
+            .unwrap()
+    }
+
+    /// The definition of the root's files, as a worker and a control plane both read it.
+    fn def(&self, limit: Option<Duration>) -> AgentDef {
         let owned = files(&self.root, &self.server.card_url());
         let refs: Vec<(&str, &str)> = owned
             .iter()
@@ -417,16 +430,41 @@ impl Rig {
         if let Some(limit) = limit {
             def = def.remote_timeout(limit);
         }
-        def.bind(ToolSet::new().tool(gate(&self.remote, &self.open)))
-            .unwrap()
-            .wait_poll(Duration::from_millis(30))
-            .model(self.model.clone(), "default")
-            .unwrap()
+        def
     }
 
     fn runtime(&self, store: &DynStore, limit: Option<Duration>) -> Runtime {
+        self.runtime_with_idle(store, limit, None)
+    }
+
+    /// [`runtime`](Self::runtime) whose sessions read closed after `idle` (the deployment's
+    /// `SESSION_IDLE_DAYS`, which every process takes the same).
+    fn runtime_with_idle(
+        &self,
+        store: &DynStore,
+        limit: Option<Duration>,
+        idle: Option<Duration>,
+    ) -> Runtime {
+        self.runtime_timed(store, limit, idle, None)
+    }
+
+    /// [`runtime_with_idle`](Self::runtime_with_idle) on a clock a test moves.
+    fn runtime_timed(
+        &self,
+        store: &DynStore,
+        limit: Option<Duration>,
+        idle: Option<Duration>,
+        clock: Option<&adam_runtime::ManualClock>,
+    ) -> Runtime {
+        let mut builder = Runtime::builder(store.clone());
+        if let Some(idle) = idle {
+            builder = builder.session_idle_ttl(idle);
+        }
+        if let Some(clock) = clock {
+            builder = builder.clock(clock.clone());
+        }
         self.assemble(limit)
-            .register(Runtime::builder(store.clone()))
+            .register(builder)
             .poll_interval(Duration::from_millis(20))
             .retry(RetryPolicy {
                 max_attempts: 4,
@@ -941,7 +979,10 @@ async fn cancelling_the_parent_sends_cancel_task() {
 async fn a_round_past_its_limit_cancels_the_remote_task() {
     for (backend, store) in stores().await {
         let rig = Rig::new(usize::MAX, false).await;
-        let rt = rig.runtime(&store, Some(Duration::from_millis(400)));
+        // The limit passes when the test moves the clock, once the remote has the task: a limit of
+        // wall time could pass before the send on a busy machine, and then there is no task to cancel.
+        let clock = adam_runtime::ManualClock::new();
+        let rt = rig.runtime_timed(&store, Some(LIMIT), None, Some(&clock));
         let parent = rig
             .start(&rt, |model, session| {
                 model
@@ -951,6 +992,11 @@ async fn a_round_past_its_limit_cancels_the_remote_task() {
             })
             .await;
         let worker = spawn_worker(&rt);
+        wait_for("the remote's task", || async {
+            (!rig.remote.made().is_empty()).then_some(())
+        })
+        .await;
+        clock.advance(LIMIT * 2);
         wait_done(&rt, parent).await;
         let made = rig.remote.made();
         wait_for("the CancelTask", || async {
@@ -1128,7 +1174,9 @@ async fn a_steer_the_remote_refuses_is_sent_as_the_next_task() {
 async fn a_round_started_without_a_limit_gives_up_at_the_remote_timeout() {
     for (backend, store) in stores().await {
         let rig = Rig::new(usize::MAX, false).await;
-        let rt = rig.runtime(&store, Some(Duration::from_millis(400)));
+        // The limit passes when the test moves the clock, once the remote has the task.
+        let clock = adam_runtime::ManualClock::new();
+        let rt = rig.runtime_timed(&store, Some(LIMIT), None, Some(&clock));
         let name = format!("{}/billing", rig.root);
         // As the A2A front starts a person's round: no time limit from the runtime.
         let round = rt
@@ -1140,6 +1188,11 @@ async fn a_round_started_without_a_limit_gives_up_at_the_remote_timeout() {
             .await
             .unwrap();
         let worker = spawn_worker(&rt);
+        wait_for("the remote's task", || async {
+            (!rig.remote.made().is_empty()).then_some(())
+        })
+        .await;
+        clock.advance(LIMIT * 2);
         let view = wait_for("the round to give up", || async {
             let view = rt.view(round).await.unwrap()?;
             (view.status == RunStatus::Failed).then_some(view)
@@ -1236,4 +1289,665 @@ async fn a_cancelled_round_repeats_a_send_only_when_it_does_not_know_the_task() 
     assert_eq!(rig.remote.submits().len(), 1);
     assert_eq!(rig.remote.made().len(), 1);
     assert_eq!(rig.remote.cancels(), [rig.remote.made()[0].0.clone()]);
+}
+
+// --- a person's session on a remote helper, a control plane and a worker --------------------
+
+/// The control plane serves the A2A front and registers only the starters of the helpers, so it
+/// knows no endpoint and no credential; the worker has the assembly and steps the rounds. Both run
+/// on one store.
+#[cfg(feature = "a2a")]
+mod split {
+    use super::*;
+    use a2a::Role as A2aRole;
+    use adam_a2a::CHILD_SESSIONS_EXTENSION;
+    use adam_a2a_runtime::RuntimeTaskBackend;
+    use adam_llm_agent::LlmStarter;
+    use adam_runtime::{BroadcastSink, ManualClock, SessionView, parse_session_conversation_id};
+    use std::time::Instant;
+
+    pub(super) struct Split {
+        pub backend: RuntimeTaskBackend,
+        pub worker: Option<common::Worker>,
+        pub alice: Caller,
+    }
+
+    pub(super) fn alice() -> Caller {
+        let mut caller = Caller::new("alice");
+        caller.extensions = vec![CHILD_SESSIONS_EXTENSION.to_owned()];
+        caller
+    }
+
+    pub(super) fn said(text: &str, context: Option<&str>, metadata: Value) -> Message {
+        let mut message = Message::new(A2aRole::User, vec![Part::text(text)]);
+        message.context_id = context.map(str::to_owned);
+        message.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            metadata,
+        )]));
+        message
+    }
+
+    pub(super) fn object(task: &Task) -> Value {
+        task.metadata
+            .as_ref()
+            .and_then(|m| m.get(CHILD_SESSIONS_EXTENSION))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    pub(super) async fn until(split: &Split, id: &str, state: TaskState) -> Task {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let task = split
+                .backend
+                .get(&split.alice, id)
+                .await
+                .unwrap()
+                .expect("the round");
+            if task.status.state == state {
+                return task;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {state:?}; last {:?}",
+                task.status.state
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    impl Split {
+        /// Stop the worker (what a test that moves the clock past the timers does, so that
+        /// only the control plane acts), and keep the control plane.
+        pub async fn stop_worker(&mut self) {
+            if let Some(worker) = self.worker.take() {
+                worker.stop().await;
+            }
+        }
+
+        pub async fn stop(mut self) {
+            self.stop_worker().await;
+        }
+
+        pub async fn new(rig: &Rig, store: &DynStore) -> Self {
+            Self::with_idle_ttl(rig, store, None).await
+        }
+
+        /// As [`with_idle_ttl`](Self::with_idle_ttl), with the rounds limited to `rounds`.
+        pub async fn with_max_rounds(rig: &Rig, store: &DynStore, rounds: u32) -> Self {
+            Self::build(rig, store, None, Some(rounds), None).await
+        }
+
+        /// The control plane reads a session closed after `idle` of nobody writing to it.
+        pub async fn with_idle_ttl(rig: &Rig, store: &DynStore, idle: Option<Duration>) -> Self {
+            Self::build(rig, store, idle, None, None).await
+        }
+
+        /// As [`with_idle_ttl`](Self::with_idle_ttl), on a clock the test moves: a session expires
+        /// when it says so and a timer is due when it says so, and nothing sleeps.
+        pub async fn with_clock(
+            rig: &Rig,
+            store: &DynStore,
+            idle: Duration,
+            clock: &ManualClock,
+        ) -> Self {
+            Self::build(rig, store, Some(idle), None, Some(clock)).await
+        }
+
+        async fn build(
+            rig: &Rig,
+            store: &DynStore,
+            idle: Option<Duration>,
+            rounds: Option<u32>,
+            clock: Option<&ManualClock>,
+        ) -> Self {
+            let worker_rt = rig.runtime_timed(store, None, idle, clock);
+            let events = BroadcastSink::default();
+            let mut def = rig.def(None);
+            if let Some(rounds) = rounds {
+                def = def.session_limits(adam_runtime::SessionLimits::new(16, 4, rounds).unwrap());
+            }
+            let sessions = def.child_sessions().expect("a root with a helper");
+            let mut builder = Runtime::builder(store.clone()).starter(LlmStarter::new(&rig.root));
+            if let Some(idle) = idle {
+                builder = builder.session_idle_ttl(idle);
+            }
+            if let Some(clock) = clock {
+                builder = builder.clock(clock.clone());
+            }
+            let control = def
+                .session_starters(builder)
+                .event_sink(events.clone())
+                .poll_interval(Duration::from_millis(10))
+                .build();
+            assert_eq!(
+                control.agent_names(),
+                [rig.root.clone(), format!("{}/billing", rig.root)],
+                "the control plane has starters and no agent"
+            );
+            let backend = RuntimeTaskBackend::new(control.clone(), events, rig.root.clone())
+                .with_poll_interval(Duration::from_millis(10))
+                .with_child_sessions(sessions);
+            Self {
+                backend,
+                worker: Some(spawn_worker(&worker_rt)),
+                alice: alice(),
+            }
+        }
+
+        pub async fn start(&self, text: &str, keep_open: bool) -> Task {
+            self.backend
+                .submit(
+                    self.alice.clone(),
+                    said(
+                        text,
+                        Some("ctx-1"),
+                        json!({"start": {"agent": "billing", "description": "billing",
+                                         "keepOpen": keep_open}}),
+                    ),
+                    None,
+                    Some("ctx-1".into()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("the start was refused: {e:?}"))
+        }
+    }
+
+    /// A round on a remote helper started on the control plane is stepped by the worker's round
+    /// agent: it sends the person's words to the remote and reports the remote's answer. Were the
+    /// control plane to register another starter for the helper, the worker could not read the
+    /// state it made and the round would not complete.
+    #[tokio::test]
+    async fn a_round_on_a_remote_helper_started_on_a_control_plane_is_worked_by_the_worker() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::new(&rig, &store).await;
+            let start = split.start("invoice 7", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            rig.remote.release();
+            let done = until(&split, &start.id, TaskState::Completed).await;
+            let answer = serde_json::to_string(&done).unwrap();
+            assert!(answer.contains("done: invoice 7"), "{backend}: {answer}");
+            assert_eq!(object(&done)["state"], "idle", "{backend}: kept open");
+            let submits = rig.remote.submits();
+            assert_eq!(submits.len(), 1, "{backend}");
+            assert_eq!(submits[0].text, "invoice 7", "{backend}");
+            split.stop().await;
+        }
+    }
+
+    /// The control plane holds no endpoint, so it cannot cancel the remote task itself. A cancel
+    /// of a round that closes its session (`keep_open: false`) still makes the worker send it.
+    #[tokio::test]
+    async fn cancelling_a_round_of_a_session_that_closes_with_it_cancels_the_remote_task() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::new(&rig, &store).await;
+            let start = split.start("invoice 7", false).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            let task = split.backend.cancel(&split.alice, &start.id).await.unwrap();
+            assert_eq!(task.status.state, TaskState::Canceled, "{backend}");
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            // The session is closed, and one closing round was made for it.
+            let task = split
+                .backend
+                .get(&split.alice, &start.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(object(&task)["state"], "closed", "{backend}");
+            split.stop().await;
+        }
+    }
+
+    /// A close that cancels, of a session that does not stay open, ends the remote task too.
+    #[tokio::test]
+    async fn closing_with_cancel_a_session_that_does_not_stay_open_cancels_the_remote_task() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::new(&rig, &store).await;
+            let start = split.start("invoice 7", false).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            let context = start.context_id.clone();
+            split
+                .backend
+                .submit(
+                    split.alice.clone(),
+                    said("stop", Some(&context), json!({"close": {"cancel": true}})),
+                    None,
+                    Some(context.clone()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: the close was refused: {e:?}"));
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            split.stop().await;
+        }
+    }
+
+    /// A cancel of a round of a session that stays open sends the remote `CancelTask` too, and the
+    /// session stays open: it is idle, not closed, and takes the next message as a new round.
+    #[tokio::test]
+    async fn cancelling_a_round_of_a_kept_open_session_cancels_the_remote_task_and_keeps_it_open() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::new(&rig, &store).await;
+            let start = split.start("invoice 7", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            split.backend.cancel(&split.alice, &start.id).await.unwrap();
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            // The cleanup round is done once the session is idle again, and it is still open.
+            let task = wait_for("the session idle", || async {
+                let task = split.backend.get(&split.alice, &start.id).await.ok()??;
+                (object(&task)["state"] == "idle").then_some(task)
+            })
+            .await;
+            assert_eq!(object(&task)["keepOpen"], true, "{backend}");
+            rig.remote.release();
+            let again = split
+                .backend
+                .submit(
+                    split.alice.clone(),
+                    said("invoice 8", Some(&start.context_id), json!({})),
+                    None,
+                    Some(start.context_id.clone()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: an open session takes a message: {e:?}"));
+            let done = until(&split, &again.id, TaskState::Completed).await;
+            assert!(
+                serde_json::to_string(&done)
+                    .unwrap()
+                    .contains("done: invoice 8"),
+                "{backend}"
+            );
+            split.stop().await;
+        }
+    }
+
+    /// A session on a remote helper that expires idle, with the remote task still open (it asked a
+    /// question and nobody answered), is followed by a closing round that cancels the task.
+    #[tokio::test]
+    async fn a_remote_session_that_expires_idle_has_its_remote_task_cancelled() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let clock = ManualClock::new();
+            let split = Split::with_clock(&rig, &store, HOUR, &clock).await;
+            let start = split.start("invoice [input]", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            rig.remote.release();
+            until(&split, &start.id, TaskState::Completed).await;
+            assert!(rig.remote.cancels().is_empty(), "{backend}: nothing yet");
+            clock.advance(2 * HOUR);
+            // Whoever looks at the session after it expired starts the cleanup.
+            wait_for("the CancelTask after the expiry", || async {
+                let _ = split.backend.get(&split.alice, &start.id).await;
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            split.stop().await;
+        }
+    }
+
+    /// Nobody reads the session again: the worker's own timer ends the remote task after the idle
+    /// TTL, as a question nobody answers must not stay open for good.
+    #[tokio::test]
+    async fn a_remote_session_nobody_reads_again_has_its_remote_task_cancelled_after_the_ttl() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let clock = ManualClock::new();
+            let split = Split::with_clock(&rig, &store, HOUR, &clock).await;
+            let start = split.start("invoice [input]", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            rig.remote.release();
+            until(&split, &start.id, TaskState::Completed).await;
+            // No request about the session from here on: only the remote is watched.
+            wait_for("the timer parked", || async {
+                wakes(timers(&store, &rig, &start.id).await.first()?)
+            })
+            .await;
+            clock.advance(2 * HOUR);
+            wait_for("the CancelTask with nobody reading", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            split.stop().await;
+        }
+    }
+
+    /// The round that cleans up after a cancel is ours: a person's session with room for two
+    /// rounds still takes its second after the first was cancelled.
+    #[tokio::test]
+    async fn a_cleanup_round_does_not_count_toward_the_rounds_of_a_session() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::with_max_rounds(&rig, &store, 2).await;
+            let start = split.start("invoice 7", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            split.backend.cancel(&split.alice, &start.id).await.unwrap();
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            wait_for("the session idle", || async {
+                let task = split.backend.get(&split.alice, &start.id).await.ok()??;
+                (object(&task)["state"] == "idle").then_some(())
+            })
+            .await;
+            rig.remote.release();
+            let send = |text: &'static str| {
+                split.backend.submit(
+                    split.alice.clone(),
+                    said(text, Some(&start.context_id), json!({})),
+                    None,
+                    Some(start.context_id.clone()),
+                )
+            };
+            let second = send("invoice 8")
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: the second round of two: {e:?}"));
+            until(&split, &second.id, TaskState::Completed).await;
+            let third = send("invoice 9").await;
+            assert!(
+                matches!(&third, Err(adam_a2a::BackendError::UnsupportedOperation(_))),
+                "{backend}: the limit still holds for the person's own rounds: {third:?}"
+            );
+            split.stop().await;
+        }
+    }
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    /// The timer runs of a session's rounds: runs of the helper that carry a `reap`.
+    async fn timers(store: &DynStore, rig: &Rig, session: &str) -> Vec<adam_core::RunRecord> {
+        let query = adam_core::RunQuery::new(
+            format!("{}/billing", rig.root),
+            adam_core::ConversationScope::Prefix(String::new()),
+            100,
+        );
+        store
+            .list_runs(&query)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|run| run.state["agent"]["reap"]["session"] == session)
+            .collect()
+    }
+
+    /// When the timer run is parked until, as it says itself.
+    fn wakes(timer: &adam_core::RunRecord) -> Option<chrono::DateTime<chrono::Utc>> {
+        serde_json::from_value(timer.state["agent_wake"].clone()).ok()
+    }
+
+    /// The session whose first round is `id`, read through `rt`, which asks nothing of it.
+    async fn session_of(rt: &Runtime, store: &DynStore, id: &str) -> SessionView {
+        let session = RunId(id.parse().unwrap());
+        let record = store.load_run(session).await.unwrap().expect("round 1");
+        let (parent, _) =
+            parse_session_conversation_id(record.conversation_id.as_deref().unwrap()).unwrap();
+        rt.session_view(&parent, session)
+            .await
+            .unwrap()
+            .expect("the session")
+    }
+
+    async fn run_status(store: &DynStore, run: RunId) -> RunStatus {
+        store.load_run(run).await.unwrap().expect("the run").status
+    }
+
+    /// A round that may leave its session open sets one timer, parked for the idle TTL and a child
+    /// of the round (so a cancel of the round reaches it); a round that ends a session that was
+    /// asked to close sets none.
+    #[tokio::test]
+    async fn a_timer_is_set_only_for_a_round_that_may_stay_open_and_waits_for_the_ttl() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let clock = ManualClock::new();
+            let split = Split::with_clock(&rig, &store, HOUR, &clock).await;
+            // A close is asked while the round works: the session closes when the round ends.
+            let closing = split.start("invoice 1", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let context = closing.context_id.clone();
+            split
+                .backend
+                .submit(
+                    split.alice.clone(),
+                    said("bye", Some(&context), json!({"close": {"cancel": false}})),
+                    None,
+                    Some(context.clone()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: the close was refused: {e:?}"));
+            rig.remote.release();
+            let round = RunId(closing.id.parse().unwrap());
+            wait_for("the round to end", || async {
+                (run_status(&store, round).await == RunStatus::Done).then_some(())
+            })
+            .await;
+            let kept = split.start("invoice 2", true).await;
+            until(&split, &kept.id, TaskState::Completed).await;
+
+            let timer = wait_for("the timer parked", || async {
+                let timers = timers(&store, &rig, &kept.id).await;
+                (timers.len() == 1 && wakes(&timers[0]).is_some()).then(|| timers[0].clone())
+            })
+            .await;
+            assert_eq!(
+                timer.parent_id,
+                Some(RunId(kept.id.parse().unwrap())),
+                "{backend}: a child of its round"
+            );
+            let parked_for = wakes(&timer).expect("parked until") - timer.created_at;
+            assert!(
+                parked_for >= chrono::Duration::seconds(3590),
+                "{backend}: parked for the idle TTL, not less: {parked_for}"
+            );
+            assert!(
+                timers(&store, &rig, &closing.id).await.is_empty(),
+                "{backend}: a session that closes with its round needs no timer"
+            );
+            split.stop().await;
+        }
+    }
+
+    /// The timer of a round is for that round: once a later round exists, it does nothing, and
+    /// the later round's own timer is the one that waits.
+    #[tokio::test]
+    async fn a_timer_of_an_earlier_round_does_nothing_once_a_later_round_exists() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let clock = ManualClock::new();
+            let split = Split::with_clock(&rig, &store, HOUR, &clock).await;
+            rig.remote.release();
+            let start = split.start("invoice 1", true).await;
+            until(&split, &start.id, TaskState::Completed).await;
+            clock.advance(HOUR / 2);
+            let again = split
+                .backend
+                .submit(
+                    split.alice.clone(),
+                    said("invoice 2", Some(&start.context_id), json!({})),
+                    None,
+                    Some(start.context_id.clone()),
+                )
+                .await
+                .unwrap();
+            until(&split, &again.id, TaskState::Completed).await;
+            // The first round's timer is due, the second's is not.
+            clock.advance(HOUR * 2 / 3);
+            let first = child_run_id(RunId(start.id.parse().unwrap()), "reap");
+            wait_for("the first timer to end", || async {
+                (run_status(&store, first).await == RunStatus::Done).then_some(())
+            })
+            .await;
+            let second = child_run_id(RunId(again.id.parse().unwrap()), "reap");
+            assert_ne!(
+                run_status(&store, second).await,
+                RunStatus::Done,
+                "{backend}"
+            );
+            let observer = rig.runtime_timed(&store, None, Some(HOUR), Some(&clock));
+            let view = session_of(&observer, &store, &start.id).await;
+            assert_eq!(view.round, 2, "{backend}: no closing round was started");
+            assert!(!view.header.expect("a header").closing, "{backend}");
+            assert!(rig.remote.cancels().is_empty(), "{backend}");
+            split.stop().await;
+        }
+    }
+
+    /// The timer closes the session when the session has expired as the process that reads it
+    /// counts, not when its own clock says so: a worker that keeps a session longer than the one
+    /// that set the timer looks again, and the closing round, once it starts, closes the session
+    /// and cancels the remote task.
+    #[tokio::test]
+    async fn a_timer_that_wakes_before_the_session_expires_looks_again_and_then_closes_it() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let clock = ManualClock::new();
+            let mut split = Split::with_clock(&rig, &store, HOUR, &clock).await;
+            let start = split.start("invoice [input]", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            rig.remote.release();
+            until(&split, &start.id, TaskState::Completed).await;
+            let due = wait_for("the timer parked", || async {
+                wakes(timers(&store, &rig, &start.id).await.first()?)
+            })
+            .await;
+            split.stop_worker().await;
+
+            // Another worker keeps sessions for two hours.
+            let observer = rig.runtime_timed(&store, None, Some(2 * HOUR), Some(&clock));
+            let worker = spawn_worker(&observer);
+            clock.advance(HOUR * 7 / 6);
+            let timer = wait_for("the timer to look and park again", || async {
+                let timer = timers(&store, &rig, &start.id).await.remove(0);
+                (timer.status == RunStatus::Done || wakes(&timer) != Some(due)).then_some(timer)
+            })
+            .await;
+            assert_ne!(
+                timer.status,
+                RunStatus::Done,
+                "{backend}: it must not close early"
+            );
+            let view = session_of(&observer, &store, &start.id).await;
+            assert!(!view.header.expect("a header").closing, "{backend}");
+            assert!(rig.remote.cancels().is_empty(), "{backend}");
+
+            clock.advance(2 * HOUR);
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            let view = wait_for("the closing round to end", || async {
+                let view = session_of(&observer, &store, &start.id).await;
+                (view.state == adam_runtime::SessionState::Closed).then_some(view)
+            })
+            .await;
+            let header = view.header.expect("a header");
+            assert!(header.closing && header.closed, "{backend}: {header:?}");
+            worker.stop().await;
+        }
+    }
+
+    /// A session that expired idle, with its remote task open and nobody to cancel it, is
+    /// followed by a closing round as soon as anything lists the sessions of its context, a
+    /// message to start another one included.
+    #[tokio::test]
+    async fn listing_the_sessions_of_a_context_cleans_up_an_expired_remote_one() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let clock = ManualClock::new();
+            let mut split = Split::with_clock(&rig, &store, HOUR, &clock).await;
+            let start = split.start("invoice [input]", true).await;
+            rig.remote.release();
+            until(&split, &start.id, TaskState::Completed).await;
+            split.stop_worker().await;
+            clock.advance(2 * HOUR);
+
+            split.start("invoice 2", true).await;
+            let observer = rig.runtime_timed(&store, None, Some(HOUR), Some(&clock));
+            let view = session_of(&observer, &store, &start.id).await;
+            assert_eq!(view.round, 2, "{backend}: the listing started the cleanup");
+            assert!(view.header.expect("a header").closing, "{backend}");
+        }
+    }
+
+    /// Closing an expired session whose remote task is still open answers with the round that ends
+    /// it, not with the round that expired.
+    #[tokio::test]
+    async fn closing_an_expired_remote_session_answers_with_the_round_that_cancels() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let clock = ManualClock::new();
+            let mut split = Split::with_clock(&rig, &store, HOUR, &clock).await;
+            let start = split.start("invoice [input]", true).await;
+            rig.remote.release();
+            until(&split, &start.id, TaskState::Completed).await;
+            split.stop_worker().await;
+            clock.advance(2 * HOUR);
+
+            let context = start.context_id.clone();
+            let answered = split
+                .backend
+                .submit(
+                    split.alice.clone(),
+                    said("bye", Some(&context), json!({"close": {"cancel": false}})),
+                    None,
+                    Some(context.clone()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: the close was refused: {e:?}"));
+            assert_ne!(
+                answered.id, start.id,
+                "{backend}: the answer is the round that cancels, not the expired one"
+            );
+        }
+    }
 }

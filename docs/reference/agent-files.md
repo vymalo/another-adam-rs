@@ -646,6 +646,8 @@ whose names are the enum of `agent`, and they are not given to a subagent. A sub
 (`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the five is refused at
 bind. A root whose subagents are all remote gets the five tools as well.
 
+**The same helpers are offered to a person.** `adam-agent` and `adam-coder` list `child-sessions/v1` on the card of a root with a subagent, so a client can open, talk to and close a session on any of them ([A2A server](a2a-server.md#child-sessions-child-sessionsv1)). The card's `maxOpen` is the effective `SESSION_MAX_OPEN`: `limits.max_open_sessions` of the root's file lowers it, never raises it. A root with no subagent lists nothing.
+
 ### The subagent tool
 
 * **Name and shape.** Named after the subagent. Input `{ "message": string }`, required. Description: the
