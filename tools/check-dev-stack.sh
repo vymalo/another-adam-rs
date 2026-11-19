@@ -19,7 +19,7 @@ cd "$root"
 failed=0
 fail() { echo "$1" >&2; failed=1; }
 
-# The two scans, as functions so that the probe below runs exactly what the tree scan runs.
+# The scans, as functions so that the probe below runs exactly what the tree scan runs.
 scan_engine() { grep -rni -- podman "$@"; }
 scan_scenarios() {
   grep -rnE 'default-env|broken-env|no-runtime|SCENARIO=devcontainer|\[mock:devcontainer\]' "$@"
