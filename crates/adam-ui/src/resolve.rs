@@ -42,7 +42,11 @@ use serde_json::{Map, Value};
 
 use crate::cache::CatalogCache;
 use crate::catalog::{Catalog, Claimed};
+#[cfg(feature = "thread-tools")]
 use crate::thread_tools::ThreadToolsClient;
+
+/// Why a catalog cannot be read again when this process has no thread tools.
+const NO_THREAD_TOOLS: &str = "it cannot be read again: this agent has no thread tools";
 
 /// What this process holds of the screen's catalog, before it asks anyone.
 enum Held {
@@ -66,7 +70,10 @@ pub(crate) enum Resolved {
 /// current one again.
 pub(crate) struct UiState {
     pub(crate) cache: CatalogCache,
-    pub(crate) client: Arc<ThreadToolsClient>,
+    /// How to read the catalog again; none in a build without thread tools, which keeps only what a
+    /// message carried.
+    #[cfg(feature = "thread-tools")]
+    pub(crate) client: Option<Arc<ThreadToolsClient>>,
 }
 
 /// `{catalogId, version, digest}` of a context entry.
@@ -90,10 +97,20 @@ fn claimed(entry: &Value) -> Option<Claimed> {
 }
 
 impl UiState {
+    #[cfg(feature = "thread-tools")]
     pub(crate) fn new(client: Arc<ThreadToolsClient>) -> Self {
         Self {
             cache: CatalogCache::new(),
-            client,
+            client: Some(client),
+        }
+    }
+
+    /// No way to read a catalog again: only the one a message carried is used.
+    pub(crate) fn without_thread_tools() -> Self {
+        Self {
+            cache: CatalogCache::new(),
+            #[cfg(feature = "thread-tools")]
+            client: None,
         }
     }
 
@@ -153,14 +170,25 @@ impl UiState {
         Held::Stale
     }
 
+    #[cfg(feature = "thread-tools")]
     fn keep(&self, catalog: Catalog) -> Resolved {
         let catalog = Arc::new(catalog);
         self.cache.insert(Arc::clone(&catalog));
         Resolved::Found(catalog)
     }
 
+    #[cfg(not(feature = "thread-tools"))]
+    #[allow(clippy::unused_async)] // the same signature as the build with thread tools
+    async fn refetch(&self, _context: &Map<String, Value>) -> Resolved {
+        Resolved::Unreadable(NO_THREAD_TOOLS.into())
+    }
+
+    #[cfg(feature = "thread-tools")]
     async fn refetch(&self, context: &Map<String, Value>) -> Resolved {
-        let grant = match self.client.grant(context) {
+        let Some(client) = &self.client else {
+            return Resolved::Unreadable(NO_THREAD_TOOLS.into());
+        };
+        let grant = match client.grant(context) {
             Ok(grant) => grant,
             Err(why) => {
                 tracing::debug!(
@@ -170,7 +198,7 @@ impl UiState {
                 return Resolved::Unreadable(format!("it cannot be read again: {}", why.reason()));
             }
         };
-        let fetched = match self.client.fetch_catalog(&grant, None).await {
+        let fetched = match client.fetch_catalog(&grant, None).await {
             Ok(fetched) => fetched,
             Err(error) => {
                 tracing::warn!(%error, "the screen's catalog could not be read again");
@@ -189,5 +217,36 @@ impl UiState {
                 Resolved::Unreadable(error.to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A message that names the current catalog without carrying it, and an endpoint that has it.
+    fn named_only() -> Map<String, Value> {
+        let context = json!({
+            CONTEXT_UI_REF: {"catalogId": "https://example.test/catalog", "version": 2, "digest": "sha256:00"},
+            adam_a2a_runtime::CONTEXT_THREAD_TOOLS: {
+                "url": "http://127.0.0.1:9/thread-tools", "token": "tok", "expiresAt": "2999-01-01T00:00:00Z"
+            },
+        });
+        context.as_object().cloned().unwrap_or_default()
+    }
+
+    /// Without thread tools nothing is read again, in a build with the feature (a `Ui::embedded`)
+    /// and in one without it, and the reason says so.
+    #[tokio::test]
+    async fn without_thread_tools_a_catalog_is_never_read_again() {
+        let state = UiState::without_thread_tools();
+        match state.resolve(&named_only()).await {
+            Resolved::Unreadable(reason) => assert_eq!(reason, NO_THREAD_TOOLS),
+            Resolved::Found(_) => panic!("a catalog was found with nothing to read it from"),
+            Resolved::NoCatalog => panic!("the message names a catalog"),
+        }
+        assert_eq!(state.cache.len(), 0);
     }
 }

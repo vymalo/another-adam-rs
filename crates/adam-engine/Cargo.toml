@@ -1,0 +1,25 @@
+[package]
+name = "adam-engine"
+description = "adam-rs embedded in an application: no server, no protocol, nothing on the network of its own (ADR 0047)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+
+# The embedded set (ADR 0047 decision 2): every crate below with its server parts turned off.
+# tools/embedded-deps/check.sh fails when this tree holds an HTTP server or client, a database
+# driver, the Kubernetes client, a TLS stack or the MCP client.
+[dependencies]
+adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0", default-features = false }
+adam-agent-fs.workspace = true
+adam-core.workspace = true
+adam-error.workspace = true
+adam-llm-agent.workspace = true
+adam-model.workspace = true
+adam-runtime.workspace = true
+adam-ui = { path = "../adam-ui", version = "0.1.0", default-features = false }
+
+[lints]
+workspace = true

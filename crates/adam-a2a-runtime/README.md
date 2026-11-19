@@ -528,7 +528,11 @@ reach the client.
 
 ## Features and environment
 
-No Cargo features, no environment variables at runtime.
+| Feature | Default | Effect |
+|---|---|---|
+| `push` | **yes** | `StorePushStore` and `RuntimeTaskBackend::push_store`, over `adam-a2a`'s `server` (its push delivery and the server it serves). Without it ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), the embedded set) the backend has no HTTP, TLS or A2A SDK server in its tree; `adam-a2a` is a dependency with `default-features = false`. The tests that start a server (`backend`, `steer`, `text_stream`, `usage`) say `required-features = ["push"]` |
+
+No environment variables at runtime.
 
 ## Tests
 

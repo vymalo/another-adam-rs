@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use a2a::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
 use adam_a2a::A2UI_MEDIA_TYPE;
-use adam_a2a::push::REPLACEABLE_ARTIFACT;
+use adam_a2a::REPLACEABLE_ARTIFACT;
 use adam_core::RunStatus;
 use adam_runtime::{Inbound, RunView};
 use serde_json::{Value, json};

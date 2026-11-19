@@ -40,6 +40,7 @@ mod files_in;
 mod ids;
 mod list;
 mod person;
+#[cfg(feature = "push")]
 mod push;
 mod session_events;
 mod steps;
@@ -65,6 +66,7 @@ pub use files_in::{MAX_INBOUND_IMAGE_BYTES, MAX_INBOUND_IMAGES};
 pub use ids::task_id_for;
 pub use list::MAX_SCAN;
 pub use person::{CONTEXT_PERSON, person_said};
+#[cfg(feature = "push")]
 pub use push::StorePushStore;
 pub use tier::CONTEXT_ACCESS_TIER;
 pub use usage::MAX_TOKEN_COUNT;
