@@ -603,7 +603,8 @@ some servers exit when the pid they were given is gone.
 (set them with `config.extraEnv`). A bad value is exit 78 ([errors](errors.md)).
 
 **Unverified** (*unverified*, 2026-11-17): the names of the servers' own settings (`cargo.buildScripts.enable`, `procMacro.enable`, `checkOnSave`,
-`cargo.targetDir` of rust-analyzer; `disableAutomaticTypingAcquisition` and `--tsserver-path` of typescript-language-server; `python.analysis` of
+`cargo.targetDir` of rust-analyzer; `disableAutomaticTypingAcquisition` and `tsserver.path` of typescript-language-server (6.1.0 has no
+`--tsserver-path` flag, and names the image's TypeScript by the `tsserver.path` initialization option); `python.analysis` of
 pyright; `buildFlags` of gopls): a name a server does not know is ignored, so a wrong one costs a weaker result. What was run on a real server:
 `rust-analyzer` 1.97.0 and `pyright-langserver` (Node) answered the gated suite of `tests/real_language_servers.rs` here (an error at its line, a
 definition, references); `typescript-language-server` and `gopls` were not installed here and have not been run. `dart language-server`
