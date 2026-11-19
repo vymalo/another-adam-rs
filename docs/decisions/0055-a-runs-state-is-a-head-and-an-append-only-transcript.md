@@ -132,6 +132,21 @@ commit" language is superseded.
 4. **The PostgreSQL upgrade gate.** The PostgreSQL half must gate on `stored < 6` (or check
    `to_regclass('<prefix>body')`), not on the blob step's `stored == Some(4)`: a database stamped 5 by
    S1/S2a has the blob tables but no head or body. The follow-up bumps `SCHEMA_VERSION` to 6.
+5. **The delta win holds across splitting commits, not across headless ones.** A commit that writes a
+   head appends only the delta. A **headless** commit (`deliver`, `cancel`, `park_again`, a failed
+   transition) writes no head, so the next split sees `head_version != version` and starts a new
+   generation with the whole transcript. The `head_version` gate stays: resolving the generation from
+   a stale head would be unsafe for a v4 step that changed the transcript. The same holds for a v4
+   commit. S3 makes those paths write the head they read, and the commit's win (no full `state`)
+   arrives there. Measured with a delivery-shaped commit between every step:
+   `p2-headless: steps=50 rows=1275 bytes=13288347 generations=50` (12.7 MB) against ~0.5 MB of
+   deltas for consecutive splits.
+6. **A duplicate slot belongs to this attempt only if its `writer` is this attempt.** Two attempts at
+   the same expected version can insert different messages at the same `(run, generation, idx)`;
+   MongoDB checks `count_documents({run_id, generation, idx in [start, len), writer != this writer})
+   == 0` on the duplicate path and answers `Conflict` (the runtime retries from the new head), and a
+   loser deletes its own rows and refs. The PostgreSQL follow-up does the same inside its
+   transaction.
 
 ## Consequences
 

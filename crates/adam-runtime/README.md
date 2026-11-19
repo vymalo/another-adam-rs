@@ -90,7 +90,12 @@ safe.
   the run v4. A bad split can never produce a head that does not reconstruct its state.
 * The body is **append-only per generation**: a normal commit writes only the rows after the old
   head's `len` and keeps the generation; a compaction (the new transcript does not start with the
-  previous one) writes all rows under a new generation. The head names `{generation, len}`. The store
+  previous one) writes all rows under a new generation. The delta win holds across **splitting**
+  commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed transition) writes no head,
+  so the next split compacts until S3, where those paths write the head they read; the `head_version`
+  gate stays, because a v4 step may have changed the transcript. Measured with a delivery between
+  every step: 50 × 10 KB writes 12.7 MB of body rows (1,275 rows, 50 generations) against ~0.5 MB of
+  deltas for consecutive splits. The head names `{generation, len}`. The store
   resolves the generation, writes the rows before the CAS with the attempt's `writer`, checks that
   all of them landed, and a commit that loses deletes its own rows and refs, so a head never names a
   partial generation and a loser cannot poison the next append. Every file artifact the head will

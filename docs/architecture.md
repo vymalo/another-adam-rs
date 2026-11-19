@@ -1041,7 +1041,11 @@ reference, and a `body` member naming one generation; the rows are the messages.
 
 A generation is **append-only**: a normal commit writes only the rows after the old head's `len` and
 keeps the generation; a compaction (the transcript no longer starts with the old one) writes all rows
-under a new generation. The store writes the rows **before** the CAS with the attempt's `writer`,
+under a new generation. The delta win holds across **splitting** commits, not across headless ones: a
+`deliver`, `cancel`, `park_again` or failed commit writes no head, so the next split sees a stale
+`head_version` and compacts until S3, where those paths write the head they read; the commit's win (no
+full `state`) arrives at S3. Measured with a delivery between every step: 50 × 10 KB writes 12.7 MB
+of body rows (1,275 rows, 50 generations) against ~0.5 MB of deltas for consecutive splits. The store writes the rows **before** the CAS with the attempt's `writer`,
 checks that all of them landed, and a commit that loses deletes its own rows and refs, so a loser
 cannot poison the next append. The runtime reconstructs `join(head, rows)` before every commit and
 refuses a split that does not equal the state, which keeps a bad split at `state` only. A commit that

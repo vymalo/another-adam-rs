@@ -33,8 +33,8 @@ trait at your rev: its doc comments are the contract.
    `lease_until`, `purge_finished`, then the listing (`list_runs` and `count_runs`: a caller's runs,
    newest update first, by keyset), the five push-notification methods (`push_put`, `push_list`,
    `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the **defaulted** methods:
-   the four blob ones (`keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs`; schema version 5, part
-   1: file bytes out of the run, content-addressed by `BlobId`) and the three body ones
+   the five blob ones (`keeps_blobs`, `blob_stored`, `put_blob`, `get_blob`, `purge_blobs`; schema
+   version 5, part 1: file bytes out of the run, content-addressed by `BlobId`) and the three body ones
    (`load_head`, which defaults to `load_run` and serves the v5 head only when
    `head_version == version`; `keeps_bodies`; `body_list`; `gc_body`; schema version 5, part 2: an
    append-only transcript per generation beside the head). A defaulted method left out of your
@@ -128,19 +128,25 @@ trait at your rev: its doc comments are the contract.
 * Blobs: `put_blob` is idempotent and **the bytes behind an id never change** (a second put under a
   taken digest writes nothing), the id is the SHA-256 of the bytes as 64 lower-case hex, and a
   commit's `RunUpdate.blobs` is a **delta** the store unions with what it already recorded — a
-  commit that names none keeps the earlier references. A blob a surviving run references is never
-  collected; `purge_blobs(before)` and `purge_finished` delete only unreferenced blobs older than
-  the cutoff.
+  commit that names none keeps the earlier references. `blob_stored(id)` is one indexed existence
+  check (the runtime checks it before it re-sends a file's bytes; the default `false` means "put
+  it"). A blob a surviving run references is never collected; `purge_blobs(before)` and
+  `purge_finished` delete only unreferenced blobs older than the cutoff.
 * Bodies: a generation is `(run, generation, idx)` and is **append-only**. `RunUpdate.body` is
   `{generation, rows, writer}`: `generation: None` appends `rows[old_len..]` to the current head's
   generation (or starts one when there is no head), `Some(new)` is a compaction and writes all rows
-  under `new`. Resolve the target, patch the head's `body` to `{generation, len}`, write the rows
-  **before** the CAS with the attempt's `writer`, and check that all of them landed (a duplicate key
-  is a row that is already there; a **write-concern** error is not a completeness answer). A commit
-  that loses the CAS deletes the rows and refs its `writer` added, but never a row or digest the
-  winner's head names. A commit with `head: None` leaves the stored head **and its `head_version`**
+  under `new`. Validate `rows[i].idx == i`, resolve the target, patch the head's `body` to
+  `{generation, len}` (`adam_core::set_head_body`; `head_body` reads it), write the rows **before**
+  the CAS with the attempt's `writer`, and check that all of them landed. A duplicate key is this
+  attempt's retry **only if the row's `writer` is this attempt**; a slot written by another attempt
+  at the same expected version is a `Conflict` (the runtime retries from the new head). A
+  **write-concern** error is not a completeness answer. A commit that loses the CAS deletes the
+  rows and refs its `writer` added, but never a row or digest the winner's head names — and a commit
+  with no body still cleans the refs it inserted. A commit with `head: None` leaves the stored head **and its `head_version`**
   alone; `load_head` serves the head only when `head_version == version`. Collect superseded
   generations after a grace period (`gc_body`, and `purge_finished` removes them with the run).
+  **Forward `gc_body` and `blob_stored` in every wrapper**: the trait defaults answer `0`/`false`,
+  so a wrapper that omits them collects nothing and re-puts every blob.
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also

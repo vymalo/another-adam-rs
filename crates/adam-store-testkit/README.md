@@ -30,16 +30,21 @@ after a commit that names a different one), a shared
   `BLOB_SUITE` lock, which the cases that purge take too); under nextest, where each test is its own
   process, `.config/nextest.toml` puts the same cases in one single-thread group. Runs are still
   isolated by agent name. `make` is the same `async fn() -> Option<DynStore>` as above.
-* `body_conformance!(make)` generates one `#[tokio::test]` per body case (9 cases: an append writes
+* `body_conformance!(make)` generates one `#[tokio::test]` per body case (10 cases: an append writes
   only the rows after the head's `len`, so a generation holds the transcript once; the generation
   is stable across appends; a compaction starts a new generation and `gc_body` collects the old one
   with an explicit cutoff; a lost CAS leaves only the winner's rows; a v4 first split writes the
-  whole transcript under one generation (named by the runtime or by the store); a retry with the
-  same writer adds no row; a purge removes the rows; an unknown generation is empty; a NUL in a head
-  and in a row is stored as U+FFFD). Every case asserts `keeps_bodies()`: a store that keeps none is
+  whole transcript under one generation (named by the runtime or by the store); the same transcript
+  committed again adds no row; a non-contiguous index is refused; a purge removes the rows; an
+  unknown generation is empty; a NUL in a head and in a row is stored as U+FFFD). Every case asserts `keeps_bodies()`: a store that keeps none is
   not given this suite. The purge and compaction cases take the `BLOB_SUITE` lock because
   `purge_finished` sweeps blobs in the same call. `make` is the same
   `async fn() -> Option<DynStore>` as above.
+* `headless_measurement!(make)` generates the `measure_the_headless_transcript` test: it runs
+  `counting::measure_headless_transcript` through `make`, prints its `p2-headless:` line (a
+  delivery-shaped commit between every split, so each split writes the whole transcript) and
+  asserts only that the workload ran. `make` is the same as above; a store that keeps no bodies
+  skips it.
 * `transcript_measurement!(make)` generates the `measure_the_transcript_write` test: it runs
   `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts
   only that the workload ran. `make` is the same `async fn() -> Option<DynStore>` as above; `None`
@@ -50,7 +55,8 @@ after a commit that names a different one), a shared
 * `counting::CountingStore`: wraps a `DynStore` and counts calls per `fault::Method` and the
   `state` bytes that cross it — every record read (`load_run`, `load_head`, `list_runs`,
   `claim_due`, `open_run_for_conversation`) and every successful `commit_run` write — through
-  `calls(method)`,
+  `calls(method)`, and forwards `gc_body`/`blob_stored` to the wrapped store (`GcBody`/`BlobStored`
+  calls),
   `state_bytes_read()`, `state_bytes_written()`, `max_commit_bytes()` and `reset()`. A commit that
   failed wrote nothing and is not counted; `migrate` is not counted, and neither is a record
   returned without its state (a `create_run` or `commit_run` echo). `run_header` is forwarded: an
@@ -70,7 +76,8 @@ after a commit that names a different one), a shared
   `fault::Method` and `fault::Mode` selecting the method and whether the
   operation is applied before the error is returned. `fault::Method` is **not** `#[non_exhaustive]`:
   a new variant breaks an exhaustive `match` on it (schema version 5 part 1 added `PutBlob`,
-  `GetBlob` and `PurgeBlobs`; part 2 added `LoadHead` and `BodyList`). `fault::is_injected`
+  `GetBlob` and `PurgeBlobs`; part 2 added `LoadHead`, `BodyList`, `GcBody` and `BlobStored`).
+  `fault::is_injected`
   tells an injected error from a real one.
 * `skipped`: re-export of `adam_core::testing::skipped`.
 

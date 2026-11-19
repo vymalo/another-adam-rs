@@ -120,9 +120,10 @@ key from a table that is empty on a version 4 database, so no row of `runs` is r
 listing-index step and gets the blob tables from the migration transaction that follows; the blob
 step itself only runs from version 4.
 
-`purge_finished` sweeps unreferenced blobs written before its cutoff in the same call (the run's
-references cascaded away), and `purge_blobs(before)` is the explicit knob for a host that reclaims
-bytes without purging runs. A blob a surviving run references is kept, however old it is.
+`blob_stored(id)` is one `SELECT EXISTS` on the digest: the runtime checks it before it re-sends a
+file's bytes, so a file an earlier commit uploaded is uploaded once. `purge_finished` sweeps
+unreferenced blobs written before its cutoff in the same call (the run's references cascaded away),
+and `purge_blobs(before)` is the explicit knob for a host that reclaims bytes without purging runs. A blob a surviving run references is kept, however old it is.
 
 `RunUpdate` gained the public field `blobs` — a delta the store unions; a commit that names none
 keeps the earlier ones — so **a hand-built `RunUpdate { .. }` literal stops compiling**: add

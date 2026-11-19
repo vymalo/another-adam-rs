@@ -30,6 +30,8 @@ accept the poll latency.
 * `MongoStore::gc_body(run, keep, before)`: delete the superseded body generations of `run` written before
   `before` (the commit path calls it with a one-hour grace; a test or an operator can pass its own
   cutoff).
+* `Store::blob_stored(id)`: one `find_one` on `_id` in `adam_blob`, so a split that names a file an
+  earlier commit uploaded does not send its bytes again.
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and returning it would convert the document back on every transition. `load_run`, the claim
   and the listings return the stored state; `journal_put` returns the stored payload (the loop
@@ -47,7 +49,8 @@ accept the poll latency.
   ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
 
 A commit reads the current document projected to the metadata it needs (`agent`, `conversation_id`,
-the version, the parent and the creation time): it never reads the state it is about to replace.
+the version, the parent and the creation time, and only the head's `body` — not its agent or
+artifacts): it never reads the state it is about to replace.
 `journal_put` inserts the entry and, when the run still exists, returns it as it was written; a
 duplicate key means an earlier writer won, and their entry is read back. A journaled step is two
 round trips rather than the four of read, check, insert, check. `lease_until` reads one field.
@@ -143,9 +146,11 @@ A commit resolves the generation: `RunUpdate.body.generation` names a new one (a
 first split), else the current head's, else a new UUID. It writes only the rows after the old head's
 `len` for an append (all rows for a new generation), **before** the CAS, in one unordered
 `insertMany` (duplicates ignored), then **checks completeness**: `inserted + duplicate_keys ==
-rows.len()`. A duplicate is a row that is already there (a retry of the same attempt); any other
-write error, and any **write-concern** error (the write may or may not have landed), aborts before
-the CAS — a head never names a generation that is missing a row. The refs go next, then the CAS,
+rows.len()`. A duplicate is this attempt's row only if its `writer` is this attempt: a slot written
+by **another** attempt at the same expected version is a `Conflict` (checked with `count_documents`
+over the attempted range, using `adam_body_generation`), and the runtime retries from the new head.
+Any other write error, and any **write-concern** error (the write may or may not have landed),
+aborts before the CAS — a head never names a generation that is missing a row. The refs go next, then the CAS,
 then the GC: the superseded generations of the run written more than an hour ago are deleted. A
 commit that loses the CAS deletes the rows and refs its `writer` added (but never a row or digest
 the winner's head names), so a loser cannot poison the next append. `load_head` reads the document

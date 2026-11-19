@@ -41,20 +41,24 @@ one is refused because the `adam-notify-postgres` listener holds a connection fo
 life); `connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A
 value that is not an integer in range fails the connect rather than falling back to 16.
 
-`keeps_blobs` / `put_blob` / `get_blob` / `purge_blobs` keep a file artifact's bytes **out of the
-run's state**, content-addressed by `BlobId` (their SHA-256, 64 lower-case hex; the digest is
+`keeps_blobs` / `blob_stored` / `put_blob` / `get_blob` / `purge_blobs` keep a file artifact's bytes
+**out of the run's state**, content-addressed by `BlobId` (their SHA-256, 64 lower-case hex; the digest is
 computed in `adam-runtime`, which has the hash dependency). A commit names the digests it **adds**
 (`RunUpdate.blobs`, a delta the store unions; a commit that names none keeps the earlier ones), and
 `purge_finished` deletes a blob once no surviving run references it and it is older than the cutoff;
-`purge_blobs(before)` is the same sweep on its own. A store that keeps no blobs leaves the bytes in
-the state, exactly as before. **A hand-built `RunUpdate { .. }` literal stops compiling** when it
+`purge_blobs(before)` is the same sweep on its own. `blob_stored(id)` is one indexed existence
+check: the runtime checks it before it re-sends a file's bytes, so a file an earlier commit uploaded
+is uploaded once. A store that keeps no blobs leaves the bytes in the state, exactly as before. **A hand-built `RunUpdate { .. }` literal stops compiling** when it
 gains the field: add `blobs: Vec::new()` or use `RunUpdate::new`.
 
 `keeps_bodies` / `body_list` / `gc_body` keep a run's **transcript** beside its head (ADR 0055). The
 expand release writes a v5 head and an append-only body generation beside the full v4 `state`, and
 serves neither: the runtime reads `state` exactly as before. A generation is `(run, generation, idx)`;
 `RunUpdate.body` is `{generation, rows, writer}`, where `generation: None` appends the rows after the
-head's `len` and `Some(new)` is a compaction. A commit with `head: None` leaves the stored head and
+head's `len` and `Some(new)` is a compaction. A duplicate slot is this attempt's retry only if the
+row's `writer` is this attempt; a slot another attempt wrote is a `Conflict`. The delta win holds
+across splitting commits: a headless commit (`deliver`, `cancel`, `park_again`, a failed one) makes
+the next split a compaction until S3, which writes the head those paths read. A commit with `head: None` leaves the stored head and
 its `head_version` alone (a delivery, a cancel or a park keeps the format it read), and `load_head`
 serves the head only when `head_version == version`. A store that keeps no bodies
 (`keeps_bodies()` is `false`, the default) answers `body_list` empty and ignores both fields, exactly
