@@ -14,5 +14,7 @@ pub mod git;
 pub mod redact;
 pub mod sandbox;
 pub mod shell;
+pub mod workspace;
 
 pub use redact::Redactor;
+pub use workspace::{CodeWorkspace, DynCodeWorkspace, Intent, Outcome, Place, Target};

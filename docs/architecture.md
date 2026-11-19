@@ -41,7 +41,7 @@ events, streamed text, a lease.
 
 An arrow means "depends on". Solid arrows are `[dependencies]`; dotted arrows are optional features.
 The picture is a selection: nearly every crate also depends on `adam-error`, and the test kits
-(`adam-store-testkit`, `adam-notify-testkit`, `adam-mcp-testkit`, `adam-agent-fixture`) are left out.
+(`adam-store-testkit`, `adam-notify-testkit`, `adam-mcp-testkit`, `adam-code-tools-testkit`, `adam-agent-fixture`) are left out.
 
 ```mermaid
 flowchart TB
@@ -209,6 +209,7 @@ classDiagram
 | `Clock` | `adam-runtime` | `SystemClock` | `ManualClock` |
 | `Agent`, `AgentStarter` | `adam-runtime` | `LlmAgent`/`LlmStarter`, `CoderAgent`/`CoderStarter` | test agents |
 | `Tool`, `ToolSource` | `adam-llm-agent` | the coder's tools, `FnTool`, MCP tools, `ThreadTools` (`adam-ui`) | test tools |
+| `CodeWorkspace` | `adam-code-tools` | `ToolEnv` (`adam-coder`: the slots of a run's workspace) | `DirWorkspace` (`adam-code-tools-testkit`, the reference of its conformance cases) |
 | `CodeHost` | `adam-workspace` | `GitHub` (feature `github`) | `MemoryCodeHost` (feature `test-util`) |
 | `GitCredentials` | `adam-workspace` | `ScopedToken`, `GitHubApp` (inside `HostScoped`), `StaticToken` | none needed |
 | `Environment` | `adam-workspace` | `Local`, `DevContainer` (`adam-devcontainer`), `KubeEnvironment` (`adam-env-kubernetes`) | stub Podman, CLI and API server in the tests |

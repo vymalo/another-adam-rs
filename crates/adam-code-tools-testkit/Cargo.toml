@@ -1,0 +1,23 @@
+[package]
+name = "adam-code-tools-testkit"
+description = "Conformance cases and a directory workspace for adam-code-tools' CodeWorkspace"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-code-tools = { path = "../adam-code-tools", version = "0.1.0", features = ["test-util"] }
+adam-llm-agent.workspace = true
+adam-runtime.workspace = true
+adam-workspace = { path = "../adam-workspace", version = "0.1.0", default-features = false }
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
