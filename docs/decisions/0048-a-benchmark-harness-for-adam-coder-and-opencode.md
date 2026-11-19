@@ -363,3 +363,65 @@ ADR 0052's slice B1, the first after the record and independent of the rest:
 
 The proof is that `bench doctor` and the dry run pass on a host with about 20 GB free. The table "Runs in" of `bench/README.md`
 ("the coder container; its commands in a devcontainer of the task image on the Podman service") changes with it.
+
+## Amended 2026-11-19: slice B1 is built (the bench on the host's runtime)
+
+The note above is built, with the changes ADR 0053 decision 12 makes:
+
+* `HostContainers` (`bench/lib/containers.mjs`) runs `docker run` on the host; `PodmanRemote` is gone, and so are the
+  three services `podman-1`, `podman-2` and `grader` from `bench/compose.yaml`. Every image is in the host's store
+  once, and an own task's image is used where `bench tasks build` made it. The compose file keeps the shared services
+  (postgres, the mock, the git server, the relays, the git sandboxes, the pushers); the harness starts the rest.
+* The coder is a host container of the task image, as uid 10001, with `adam-coder` and `adam-git` copied out of the
+  pinned coder image once and mounted read-only at `/opt/adam/bin`, the agent folder at `/etc/adam/agent`, the work
+  directory at `/work`, and `RUN_ENVIRONMENT=local` with `DEVCONTAINER_RUNTIME=off`: its commands run in that container,
+  which is the task image. The environment check, the base, the grading and the OpenCode arm are host containers of the
+  task image too.
+* Both arms run as uid 10001 and get the same CPU and memory from one setting (`bench/lib/runtime.mjs`: 4 CPU, 12 GB).
+  A task's own `cpus` and `memory_mb` are for its environment check and its grading, never for an arm.
+* `configFingerprint` gains `runtime` (the host, the store, the coder's linking, the uid and the limits), so a change in
+  the runtime changes what a pilot is bound to.
+* Gradings share one internal `verifier` network, which the harness makes because Compose makes no network that has no
+  service; a verifier that asks for the internet gets the `egress` network, alone, in its window. `grader-net` is gone.
+* `bench doctor` probes each selected task image: the coder binary with no configuration as uid 10001, exit 78 means it
+  starts, a loader error means it does not. Until the static musl coder (ADR 0053 slice 1) is in the pin, a Debian
+  bookworm task image is reported and refused for both arms. The pin's coder is linked against trixie's C library.
+* The bench's Postgres stays: moving it to a store service with SQLite is slice 6b.
+
+The table "Runs in" of `bench/README.md` and the stack's networks change with it. The proof is that
+`node --test "bench/test/*.test.mjs"`, `node tools/docs-check/check-docs.mjs` and `bench/dry-run.sh` pass on the owner's
+host (Docker 29.9.3 rootless, 2026-11-19); the dry run's phases and what it could not cover are in `bench/README.md`,
+"Unverified". *Unverified*: a bookworm task image (the probe refuses one until slice 1), a real OpenCode binary and a
+model key (neither was on the machine), and two slots at once with real task images.
+
+
+## Amended 2026-11-19: slice B1 is built (the bench on the host's runtime)
+
+The note above is built, with the changes ADR 0053 decision 12 makes:
+
+* `HostContainers` (`bench/lib/containers.mjs`) runs `docker run` on the host; `PodmanRemote` is gone, and so are the
+  three services `podman-1`, `podman-2` and `grader` from `bench/compose.yaml`. Every image is in the host's store
+  once, and an own task's image is used where `bench tasks build` made it. The compose file keeps the shared services
+  (postgres, the mock, the git server, the relays, the git sandboxes, the pushers); the harness starts the rest.
+* The coder is a host container of the task image, as uid 10001, with `adam-coder` and `adam-git` copied out of the
+  pinned coder image once and mounted read-only at `/opt/adam/bin`, the agent folder at `/etc/adam/agent`, the work
+  directory at `/work`, and `RUN_ENVIRONMENT=local` with `DEVCONTAINER_RUNTIME=off`: its commands run in that container,
+  which is the task image. The environment check, the base, the grading and the OpenCode arm are host containers of the
+  task image too.
+* Both arms run as uid 10001 and get the same CPU and memory from one setting (`bench/lib/runtime.mjs`: 4 CPU, 12 GB).
+  A task's own `cpus` and `memory_mb` are for its environment check and its grading, never for an arm.
+* `configFingerprint` gains `runtime` (the host, the store, the coder's linking, the uid and the limits), so a change in
+  the runtime changes what a pilot is bound to.
+* Gradings share one internal `verifier` network, which the harness makes because Compose makes no network that has no
+  service; a verifier that asks for the internet gets the `egress` network, alone, in its window. `grader-net` is gone.
+* `bench doctor` probes each selected task image: the coder binary with no configuration as uid 10001, exit 78 means it
+  starts, a loader error means it does not. Until the static musl coder (ADR 0053 slice 1) is in the pin, a Debian
+  bookworm task image is reported and refused for both arms. The pin's coder is linked against trixie's C library.
+* The bench's Postgres stays: moving it to a store service with SQLite is slice 6b.
+
+The table "Runs in" of `bench/README.md` and the stack's networks change with it. The proof, on the owner's host
+(Docker 29.9.3 rootless, 2026-11-19): `node --test "bench/test/*.test.mjs"` and
+`node tools/docs-check/check-docs.mjs` pass, and `BENCH_TEST_DOCKER=1 sh bench/dry-run.sh` passes its three phases (the
+environment checks; the six runs with grades 1, 1, 0 and their costs; the budget; the kill and resume). *Unverified*: a
+model key and a real endpoint (the scripted model only), a bookworm task image (the probe refuses one until slice 1), two
+slots at once with real task images, and the gated test with a local OpenCode binary (the dry run used the pinned package).

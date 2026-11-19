@@ -47,15 +47,14 @@ test('the README numbers are the code\'s', () => {
 });
 
 test('the README says what did not run, and no word of the market or a private value is in the slice\'s texts', () => {
-  assert.match(README, /Nothing that needs a container service has run/);
-  assert.match(README, /The dry run itself has not been run/);
+  assert.match(README, /The dry run passed on this machine/);
+  assert.match(README, /What the dry run did not cover/);
   const texts = [README, ADR, read('../compose.yaml'), read('../dry-run.sh')].join('\n');
   assert.doesNotMatch(texts, /\b(revenue|pricing strategy|customers?|competitors?|market share)\b/i);
 });
 
-test('the meter binds to the loopback unless told otherwise, in the code and in the README (finding 16)', () => {
+test('the meter binds on every interface for the bench, so the relay reaches the host, in the code and in the README', () => {
   const code = read('../lib/dryrun.mjs');
-  assert.match(code, /BENCH_METER_BIND \?\? '127\.0\.0\.1'/);
-  assert.doesNotMatch(code + read('../dry-run.sh'), /BENCH_METER_BIND(:-|\?\? )'0\.0\.0\.0'|:-0\.0\.0\.0/);
-  assert.match(README, /\*\*`127\.0\.0\.1` by default\*\*/);
+  assert.match(code, /BENCH_METER_BIND \?\? '0\.0\.0\.0'/);
+  assert.match(README, /\*\*`0\.0\.0\.0`\*\* for the bench/);
 });

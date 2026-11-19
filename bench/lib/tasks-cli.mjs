@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ConfigError, assertOutsideRepo, benchHome, loadConfig } from './config.mjs';
-import { PodmanRemote, ContainerError } from './containers.mjs';
+import { HostContainers, ContainerError } from './containers.mjs';
 import { checkTask } from './envcheck.mjs';
 import { findCheckCommand, lintStatement } from './lint.mjs';
 import { classifyPath, gitIn, mine } from './mine.mjs';
@@ -38,9 +38,9 @@ const USAGE = `usage: bench tasks <command>
   mine [--repo NAME] [--branch main] [--limit N]
                              candidate own tasks from the clones in the configuration -> $BENCH_HOME/tasks/own-candidates.json
   lint [ID...]               warn when an own statement names what only the gold change adds
-  build [ID...]              build the image of each own task (needs the Podman service)
+  build [ID...]              build the image of each own task (needs the host's container runtime)
   check [--source public|own] [--only ID,ID]
-                             gold passes three times and the empty patch fails three times (needs the Podman service)
+                             gold passes three times and the empty patch fails three times (needs the host's container runtime)
   select [--seed S] [--total N] [--source public|own|both]
                              write bench/tasks/public.lock.json and own.lock.json
 `;
@@ -155,7 +155,7 @@ async function cmdLint(config, p, argv, out) {
   return refused > 0 ? 1 : 0;
 }
 
-const containersOf = (config, make) => (make ? make(config) : new PodmanRemote(config.tasks.podman));
+const containersOf = (config, make) => (make ? make(config) : new HostContainers());
 
 async function cmdBuild(config, p, argv, out, make) {
   const containers = containersOf(config, make);

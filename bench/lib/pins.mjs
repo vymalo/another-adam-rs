@@ -29,5 +29,5 @@ export function loadPins(file = PINS_FILE) {
 
 export const PINS = loadPins();
 
-/** The coder image as compose and Podman name it: tag and digest. */
+/** The coder image as compose and the host name it: tag and digest. */
 export const coderRef = (pins = PINS) => `${pins.coder.image}:${pins.coder.tag}@${pins.coder.digest}`;

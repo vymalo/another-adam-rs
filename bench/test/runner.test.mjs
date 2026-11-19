@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { CALLS_PER_RUN } from '../lib/agent-script.mjs';
-import { hostGradeIO } from '../lib/grade.mjs';
 import { HarnessCrash, executeRun, runDirName, runPlan } from '../lib/runner.mjs';
 import { MODEL_ID, TEST_KEY } from './helpers.mjs';
 import { PER_CALL, fixture, history, spec } from './runnerfix.mjs';
@@ -183,7 +182,7 @@ test('finding 11: a coder that cannot be confirmed stopped makes the run infrast
   assert.deepEqual(history(f, 'hello-1-adam-max').slice(-3), ['Running', 'Interrupted', 'Failed_infra']);
 });
 
-test('finding 9: the slot\'s service is reaped and its volume emptied before every run, and again at the start of a plan', async (t) => {
+test('finding 9: the slot\'s containers are reaped and its work directory emptied before every run, and again at the start of a plan', async (t) => {
   const f = await fixture(t);
   f.slotContainers.listing = [{ image: 'leftover', imageId: 'x', labels: {}, names: ['old'] }];
   await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'opencode'), spec(f, 'fix-add-1', 'opencode')] });
@@ -219,24 +218,25 @@ test('finding 10: more than two upstream errors make a run infrastructure, which
   assert.match(out[0].reason, /^infra:(upstream-errors|last-call-failed)$/);
 });
 
-test('defect 8: a stack that has a service-backed grader IO grades through it', async (t) => {
-  const f = await fixture(t);
-  const deps = f.deps();
-  const staged = [];
-  const base = hostGradeIO(path.join(f.home, 'work'));
-  deps.stack = { ...deps.stack, graderIO: () => ({ stage: async (x) => (staged.push(x.task.id), base.stage(x)) }) };
-  await runPlan({ deps, plan: [spec(f, 'hello-1', 'opencode')] });
-  assert.equal(staged.length, 3, 'each of the three grading attempts staged through the stack\'s IO');
+test('a grading stages its files in a directory of the harness\'s own, on the verifier network its task names', async (t) => {
+  const f = await fixture(t, { verifier: 'default' });
+  await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'opencode')] });
+  assert.equal(f.grading.runs.length, 3);
+  const s = f.grading.runs[0];
+  assert.equal(s.network, 'verifier');
+  const logs = s.mounts.find((m) => m.target === '/logs/verifier');
+  assert.ok(logs.source.startsWith(path.join(f.home, 'work')), 'the logs directory is the harness\'s own');
+  assert.ok(s.mounts.some((m) => m.target === '/tests' && m.readOnly === true));
 });
 
 test('defects 2, 3 and 7: what was refused and the limits the run had are in the run record', async (t) => {
   const f = await fixture(t);
-  f.agents.opencode.record = { limits: 'service', outputRefused: ['events.jsonl'] };
+  f.agents.opencode.record = { limits: 'runtime', outputRefused: ['events.jsonl'] };
   f.agents.opencode.collectRefused = [{ name: 'tree/pipe', reason: 'not a plain file (type "6")' }];
   await runPlan({ deps: f.deps(), plan: [spec(f, 'hello-1', 'opencode')] });
   const n = f.ledger.fold().get('hello-1-opencode-max').result.notes;
-  assert.equal(n.limits, 'service');
+  assert.equal(n.limits, 'runtime');
   assert.deepEqual(n.refused, [{ name: 'tree/pipe', reason: 'not a plain file (type "6")' }, { name: 'events.jsonl', reason: 'a log that is not a plain file' }]);
   const meta = JSON.parse(fs.readFileSync(path.join(f.home, 'runs', runDirName('hello-1-opencode-max', 1), 'meta.json'), 'utf8'));
-  assert.equal(meta.notes.limits, 'service');
+  assert.equal(meta.notes.limits, 'runtime');
 });

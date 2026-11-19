@@ -1,20 +1,24 @@
-// The benchmark stack: bench/compose.yaml driven through `docker compose`, and each Podman service reached through
-// `docker compose exec` (no socket is published and no port is opened to it).
+// The benchmark stack: bench/compose.yaml driven through `docker compose`, and the containers the harness starts on
+// the host's Docker (lib/containers.mjs). A slot's work directory is a directory of the harness's on the host, mounted
+// at `/work` into the coder, the git sandbox, the OpenCode container and the helper that reads a tree.
 //
 // What the host trusts (bench/README.md): it runs no git in, reads no file from and deletes no file in a place a
-// container could write. What a container wrote comes out of a service as `tar -cf -` and is parsed with limits
-// (tarstream.mjs); what a container left is removed by a container, and checked to be gone.
+// container could write. A tree or a log comes out as `tar -cf -` from a helper container and is parsed with limits
+// (tarstream.mjs); what a container left is removed by a helper container, and checked to be gone. Directory names
+// under the work directory are read on the host (a name is not a file).
 //
 // A coder's per-run settings (its model address with the run's meter token, its A2A bearer) go in an env file of
 // mode 0600 that exists only while the coder is being created and is removed at the next start if a kill left it;
-// they are in no command line, no log event and no error message (`redact`). The Podman client runs inside the
-// service, so a mount source is a path as the service sees it.
+// they are in no command line, no log event and no error message (`redact`).
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
-import { PodmanRemote } from './containers.mjs';
-import { MAX_REWARD_BYTES, rewardOf } from './grade.mjs';
+import { HostContainers, buildRunArgs } from './containers.mjs';
+import { PINS, coderRef } from './pins.mjs';
+import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
 import { extractEntries, parseTar, pickFiles } from './tarstream.mjs';
 
 export class StackError extends Error {
@@ -24,21 +28,43 @@ export class StackError extends Error {
   }
 }
 
-export const PODMAN_URL = 'unix:///run/podman/podman.sock';
 export const SLOTS = 2;
 export const COMPOSE_TIMEOUT_MS = 2 * 60 * 1000;
+export const DEFAULT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const SAFE_VALUE = /^[^\n\r\0$"'\\]*$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/** The services a start brings up, for `slots` slots. */
+/** The services a start brings up, for `slots` slots. The arms and the grading are host containers, not services. */
 export const serviceNames = (slots = SLOTS) => [
   'postgres',
   'mock-github',
   'git-server',
   'pub-git',
-  'grader',
-  ...Array.from({ length: slots }, (_, i) => [`podman-${i + 1}`, `gitbox-${i + 1}`, `meter-${i + 1}`, `pub-coder-${i + 1}`]).flat(),
+  ...Array.from({ length: slots }, (_, i) => [`gitbox-${i + 1}`, `meter-${i + 1}`, `pub-coder-${i + 1}`]).flat(),
 ];
+
+/** The settings every coder of a slot gets; the run's own (model address, bearer, window) come from `startCoder`. Pure. */
+export function coderEnvironment({ slot, publicUrl, databaseUrl, imagePath = DEFAULT_PATH }) {
+  return {
+    MODEL_API_KEY: 'bench-dummy-key', // the meter holds the real key
+    MODEL: 'bench-model',
+    WORKSPACE_ROOT: '/work',
+    WORKSPACE_SWEEP_SECS: '0',
+    ALLOWED_REPO_HOSTS: 'git-server',
+    ALLOW_LOCAL_REPOS: 'true',
+    GITHUB_API_URL: 'http://mock-github:8080',
+    GITHUB_TOKEN: 'bench-dummy-token',
+    ADAM_AGENT_DIR: '/etc/adam/agent',
+    RUN_ENVIRONMENT: 'local',
+    DEVCONTAINER_RUNTIME: 'off',
+    GIT_SANDBOX_SOCKET: '/work/.gitbox/git.sock',
+    LISTEN_ADDR: '0.0.0.0:8080',
+    DATABASE_URL: databaseUrl,
+    PUBLIC_URL: publicUrl,
+    DEVCONTAINER_DEPLOYMENT_ID: `bench-slot-${slot}`,
+    PATH: `/opt/adam/bin:${imagePath}`,
+  };
+}
 
 /** Run a program and collect its output. Never throws; a program that is missing is exit 127. */
 export function runCommand(file, args, { env, input, timeoutMs = 0, cwd } = {}) {
@@ -89,8 +115,9 @@ export function secretsOf(value) {
 }
 
 /**
- * Gradings share a service; a window with the internet is alone on it. A writer that is waiting holds back new readers, so
- * a pull is not starved by a stream of gradings. Both release in a `finally`: a failure never leaves the service locked.
+ * Gradings share the verifier network; a window with the internet is alone. A writer that is waiting holds back new
+ * readers, so a pull is not starved by a stream of gradings. Both release in a `finally`: a failure never leaves the
+ * lock held.
  */
 export class RWLock {
   #readers = 0;
@@ -141,23 +168,24 @@ export class Stack {
   /**
    * @param {object} o
    * @param {string} o.composeFile
-   * @param {string} o.home       $BENCH_HOME: the harness's own, never mounted into an agent's service
-   * @param {string} o.tasksDir   the repository's bench/tasks, shared read-only with the grader
-   * @param {string} o.seccomp    the absolute path of dev/podman/seccomp.json
+   * @param {string} o.home       $BENCH_HOME: the harness's own, never mounted into a container that runs an agent
    * @param {number} o.meterPort  where the harness's meter listens on the host
+   * @param {string} [o.coderImage] the pinned coder image, the source of the coder's binaries and the helpers' tools
    */
-  constructor({ composeFile, home, tasksDir, seccomp, meterPort, agentDir = null, project = 'adam-bench', ports = {}, slots = SLOTS, exec = runCommand, execBuf = runBuffer, spawn: spawnFn = execFile, log = () => {}, baseEnv = process.env }) {
-    for (const [name, p] of [['composeFile', composeFile], ['home', home], ['tasksDir', tasksDir], ['seccomp', seccomp]]) {
+  constructor({ composeFile, home, meterPort, coderImage = coderRef(PINS), agentDir = null, project = 'adam-bench', ports = {}, slots = SLOTS, exec = runCommand, execBuf = runBuffer, spawn: spawnFn = execFile, log = () => {}, baseEnv = process.env, meterHost = null }) {
+    for (const [name, p] of [['composeFile', composeFile], ['home', home]]) {
       if (!path.isAbsolute(p)) throw new StackError(`${name} must be an absolute path`);
     }
     if (!/^[a-z0-9][a-z0-9_-]*$/.test(project)) throw new StackError('the project name is not plain');
     if (!Number.isInteger(meterPort) || meterPort < 1 || meterPort > 65535) throw new StackError('the meter port is not a port');
-    Object.assign(this, { composeFile, home, tasksDir, seccomp, meterPort, agentDir, project, slots, exec, execBuf, spawn: spawnFn, log });
+    Object.assign(this, { composeFile, home, meterPort, coderImage, agentDir, project, slots, exec, execBuf, spawn: spawnFn, log });
     this.ports = { git: ports.git ?? 18083, coder: { 1: ports.coder1 ?? 18081, 2: ports.coder2 ?? 18082 } };
     this.stackDir = path.join(home, 'stack');
     this.baseEnv = baseEnv;
+    this.meterAddress = meterHost;
     this.secrets = new Set();
     this.gates = new Map();
+    this.imageEnvCache = null;
   }
 
   /** One lock for each service whose network is opened for a window: its windows and its gradings are told apart by it. */
@@ -177,29 +205,51 @@ export class Stack {
     return path.join(this.home, 'slots', String(slot));
   }
 
+  /** The slot's work directory on the host; the containers mount it at `/work`. */
+  workRoot(slot) {
+    this.slotService('work', slot);
+    return path.join(this.home, 'work', String(slot));
+  }
+
   /** The meter's name for the containers of a slot. */
   meterHost(slot) {
     return this.slotService('meter', slot);
   }
 
+  /** The host's own address, as a container on the egress network reaches it: the source of the default route. */
+  meterHostAddress() {
+    if (this.meterAddress) return this.meterAddress;
+    try {
+      const r = execFileSync('ip', ['-4', 'route', 'get', '1.1.1.1'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const m = /\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b/.exec(r);
+      if (m && !m[1].startsWith('127.')) return (this.meterAddress = m[1]);
+    } catch {
+      // no `ip`: fall back to the interfaces
+    }
+    for (const list of Object.values(os.networkInterfaces())) for (const a of list ?? []) if (a.family === 'IPv4' && !a.internal && !a.address.startsWith('127.')) return (this.meterAddress = a.address);
+    return (this.meterAddress = '127.0.0.1');
+  }
+
   /** The environment of every compose call: what the file's `${...}` need, and nothing of the model's. */
   composeEnv() {
-    const keep = ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'XDG_RUNTIME_DIR'];
-    const env = {};
-    for (const k of keep) if (this.baseEnv[k] !== undefined) env[k] = this.baseEnv[k];
+    const env = this.dockerEnv();
     Object.assign(env, {
-      BENCH_HOME: this.home,
-      BENCH_TASKS_DIR: this.tasksDir,
-      BENCH_STACK_DIR: this.stackDir,
-      BENCH_AGENT_DIR: this.agentDir ?? path.join(this.stackDir, 'no-agent'),
+      BENCH_WORK_1_DIR: this.workRoot(1),
+      BENCH_WORK_2_DIR: this.workRoot(2),
+      BENCH_METER_HOST: this.meterHostAddress(),
       BENCH_METER_PORT: String(this.meterPort),
       BENCH_GIT_PORT: String(this.ports.git),
       BENCH_CODER_1_PORT: String(this.ports.coder[1]),
       BENCH_CODER_2_PORT: String(this.ports.coder[2]),
-      BENCH_SLOT_1_DIR: this.slotDir(1),
-      BENCH_SLOT_2_DIR: this.slotDir(2),
-      PODMAN_SECCOMP: this.seccomp,
     });
+    return env;
+  }
+
+  /** The environment the docker CLI gets: what finds the daemon, and none of the model's variables. */
+  dockerEnv() {
+    const keep = ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'XDG_RUNTIME_DIR'];
+    const env = {};
+    for (const k of keep) if (this.baseEnv[k] !== undefined) env[k] = this.baseEnv[k];
     return env;
   }
 
@@ -215,6 +265,11 @@ export class Stack {
       throw new StackError(`docker compose ${args[0]} ${r.timedOut ? 'timed out' : `failed (exit ${r.exitCode})`}: ${why}`);
     }
     return r.stdout;
+  }
+
+  /** A docker call outside compose: the coder, a probe, a network. */
+  async docker(args, { timeoutMs = 120_000, input } = {}) {
+    return this.exec('docker', args, { env: this.dockerEnv(), input, timeoutMs });
   }
 
   /** An env file a kill left behind holds a bearer and a run token: remove them. Returns the names removed. */
@@ -233,80 +288,137 @@ export class Stack {
     return gone;
   }
 
-  /** Make the directories the compose file binds, then start the shared services and every Podman service. */
+  /** Make the directories the compose file binds and the harness's work directories, then start the shared services. */
   async up() {
     fs.mkdirSync(this.stackDir, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(path.join(this.stackDir, 'no-agent'), { recursive: true });
-    for (let slot = 1; slot <= this.slots; slot++) fs.mkdirSync(this.slotDir(slot), { recursive: true, mode: 0o755 });
+    for (let slot = 1; slot <= this.slots; slot++) {
+      fs.mkdirSync(this.workRoot(slot), { recursive: true, mode: 0o777 });
+      fs.chmodSync(this.workRoot(slot), 0o777);
+      fs.mkdirSync(this.slotDir(slot), { recursive: true, mode: 0o755 });
+    }
     this.removeStaleEnvFiles();
     await this.compose(['up', '-d', '--wait', '--build', ...serviceNames(this.slots)], { timeoutMs: 15 * 60 * 1000 });
+    // Compose does not make a network that has no service; the gradings need theirs.
+    await this.ensureNetwork('verifier');
   }
 
   async down({ volumes = false } = {}) {
+    // The arms and the coder are host containers, not compose services: a killed harness leaves them.
+    for (let slot = 1; slot <= this.slots; slot++) {
+      await this.containers(slot).reapAll().catch(() => {});
+      await this.coderContainers(slot).reapAll().catch(() => {});
+    }
+    await this.graderContainers().reapAll().catch(() => {});
     await this.compose(['down', '--remove-orphans', ...(volumes ? ['--volumes'] : [])], { timeoutMs: 5 * 60 * 1000 });
+    await this.docker(['network', 'rm', `${this.project}_verifier`]).catch(() => {});
   }
 
-  /** Run `script` with `sh -c` inside a service. Returns stdout. */
+  /** `adam-bench_verifier` (internal): made here, because no compose service is on it. Returns its name. */
+  async ensureNetwork(name) {
+    const full = `${this.project}_${name}`;
+    const inspect = await this.docker(['network', 'inspect', full], { timeoutMs: 60_000 });
+    if (inspect.exitCode === 0) return full;
+    const created = await this.docker(['network', 'create', '--internal', full], { timeoutMs: 60_000 });
+    if (created.exitCode !== 0 && !/already exists/.test(created.stderr)) throw new StackError(`the ${full} network could not be made (exit ${created.exitCode}): ${created.stderr.trim()}`);
+    return full;
+  }
+
+  /** Run `script` with `sh -c` inside a compose service. Returns stdout. */
   async execIn(service, script, { timeoutMs = 120_000 } = {}) {
     return this.compose(['exec', '-T', service, 'sh', '-c', script], { timeoutMs });
-  }
-
-  /** A program's stdout, as bytes, from inside a service. */
-  async streamFrom(service, argv, { maxBytes, timeoutMs = COMPOSE_TIMEOUT_MS } = {}) {
-    const r = await this.execBuf('docker', this.composeArgs(['exec', '-T', service, ...argv]), { env: this.composeEnv(), timeoutMs, maxBytes });
-    if (r.over) throw new StackError('the output of a container is larger than the limit');
-    return r;
   }
 
   /** An empty database for the slot's coder (the coder migrates it itself at start). */
   async resetDatabase(slot) {
     const db = `adam_bench_${this.slotService('db', slot).slice(3)}`;
-    const sql = `DROP DATABASE IF EXISTS ${db} WITH (FORCE); CREATE DATABASE ${db};`;
-    await this.compose(['exec', '-T', 'postgres', 'psql', '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+    // Two statements: psql sends each -c in its own transaction, and DROP DATABASE cannot run inside one.
+    await this.compose(['exec', '-T', 'postgres', 'psql', '-U', 'postgres', '-v', 'ON_ERROR_STOP=1', '-c', `DROP DATABASE IF EXISTS ${db} WITH (FORCE)`, '-c', `CREATE DATABASE ${db}`]);
   }
 
-  /** The slot's work volume as it is when the coder first starts: nothing of an earlier run but the sandbox's directory. */
+  /** A helper container of the coder image, as uid 10001, with the slot's work directory at `/work`. */
+  async helper(slot, script, { readOnly = false, timeoutMs = 120_000, user = runtimeUser() } = {}) {
+    return this.containers(slot).run({
+      image: this.coderImage,
+      script,
+      network: 'none',
+      user,
+      mounts: [{ source: this.workRoot(slot), target: '/work', readOnly }],
+      timeoutMs,
+    });
+  }
+
+  /** The slot's work directory as it is when the coder first starts: nothing of an earlier run but the sandbox's directory. */
   async resetWork(slot) {
-    const service = this.slotService('podman', slot);
-    await this.execIn(service, 'find /work -mindepth 1 -maxdepth 1 ! -name .gitbox -exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox');
+    // root inside the helper is the host user under rootless Docker: it can remove the harness's own directories,
+    // whatever user wrote in them; the helper mounts the work directory only.
+    const r = await this.helper(slot, 'find /work -mindepth 1 -maxdepth 1 ! -name .gitbox -exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox && chmod 777 /work/workspaces', { user: '0:0' });
+    if (r.exitCode !== 0) throw new StackError(`the work directory of slot ${slot} could not be emptied (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
     const left = (await this.listDir(slot, '/work')).filter((n) => !['workspaces', '.gitbox'].includes(n));
     if (left.length > 0) throw new StackError(`the work volume still holds ${left.join(', ')}`);
   }
 
-  /** The names in a directory of the slot's volume, as the service sees it. */
-  async listDir(slot, dir) {
+  /** The names in a directory of the slot's work directory. A name is not a file: nothing is opened here. */
+  async listDir(slot, dir, { dirsOnly = false } = {}) {
     if (!/^\/work(\/[A-Za-z0-9._-]+)*$/.test(dir) || dir.split('/').some((p) => p === '.' || p === '..')) throw new StackError('the directory is not a plain path on the work volume');
-    const out = await this.execIn(this.slotService('podman', slot), `ls -1A ${dir} 2>/dev/null || true`);
-    return out.split('\n').filter(Boolean);
+    const rel = dir === '/work' ? '' : dir.slice('/work/'.length);
+    try {
+      return fs
+        .readdirSync(path.join(this.workRoot(slot), rel), { withFileTypes: true })
+        .filter((e) => !dirsOnly || e.isDirectory())
+        .map((e) => e.name)
+        .sort();
+    } catch (e) {
+      if (e.code === 'ENOENT') return [];
+      throw e;
+    }
   }
 
-  /** Make a directory of the volume (`remove: false`) or remove one and check it is gone, in the service, as its owner. */
+  /** Make a directory of the work directory (`remove: false`) or remove one and check it is gone, as uid 10001. */
   async workDir(slot, dir, { remove = false } = {}) {
     if (!/^\/work\/[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/.test(dir)) throw new StackError('the directory is not directly under /work');
-    const service = this.slotService('podman', slot);
-    if (!remove) return void (await this.execIn(service, `mkdir -p ${dir} && chmod 777 ${dir}`)); // an image's user may not be the service's
-    await this.execIn(service, `chmod -R u+rwX ${dir} 2>/dev/null; rm -rf ${dir}; test ! -e ${dir}`);
+    if (!remove) {
+      fs.mkdirSync(this.workRoot(slot), { recursive: true, mode: 0o777 });
+      const rel = dir.slice('/work/'.length).split('/');
+      let host = this.workRoot(slot);
+      for (const part of rel) {
+        host = path.join(host, part);
+        if (!fs.existsSync(host)) {
+          fs.mkdirSync(host, { mode: 0o777 });
+          fs.chmodSync(host, 0o777);
+        }
+      }
+      return;
+    }
+    const r = await this.helper(slot, `chmod -R u+rwX ${dir} 2>/dev/null; rm -rf ${dir}; test ! -e ${dir}`, { user: '0:0' });
+    if (r.exitCode !== 0) throw new StackError(`the directory ${dir} could not be removed (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
   }
 
-  /** The files of a directory of the volume that the harness asked for by name, through a tar stream. Returns { files, refused }. */
+  /** A program's stdout, as bytes, from a helper container that mounts the work directory read-only. */
+  async streamFrom(slot, argv, { maxBytes, timeoutMs = COMPOSE_TIMEOUT_MS } = {}) {
+    const r = await this.execBuf('docker', ['run', '--rm', '--pull=never', '--network=none', '--user', runtimeUser(), '--entrypoint', '/bin/tar', '-v', `${this.workRoot(slot)}:/work:ro`, this.coderImage, ...argv], { env: this.dockerEnv(), timeoutMs, maxBytes });
+    if (r.over) throw new StackError('the output of a container is larger than the limit');
+    return r;
+  }
+
+  /** The files of a directory of the work directory that the harness asked for by name, through a tar stream. Returns { files, refused }. */
   async readFiles(slot, dir, names, { maxFileBytes = 64 * 1024 * 1024 } = {}) {
     if (!/^\/work\/[A-Za-z0-9._/-]+$/.test(dir) || dir.split('/').some((p) => p === '..')) throw new StackError('the directory is not a plain path on the work volume');
-    const r = await this.streamFrom(this.slotService('podman', slot), ['tar', '--format=posix', '-cf', '-', '--ignore-failed-read', '-C', dir, ...names], { maxBytes: names.length * maxFileBytes + 1024 * 1024 });
+    const r = await this.streamFrom(slot, ['--format=posix', '-cf', '-', '--ignore-failed-read', '-C', dir, ...names], { maxBytes: names.length * maxFileBytes + 1024 * 1024 });
     return pickFiles(parseTar(r.stdout, { allowSymlinks: true, maxFileBytes }), names);
   }
 
-  /** A tree of the volume (never its top-level `.git`) into `dest`, which the harness owns, through a tar stream. */
+  /** A tree of the work directory (never its top-level `.git`) into `dest`, which the harness owns, through a tar stream. */
   async extractTree(slot, dir, dest, limits = {}) {
     if (!/^\/work\/workspaces\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(dir) && !/^\/work\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(dir)) throw new StackError('the tree is not a worktree of the volume');
     fs.rmSync(dest, { recursive: true, force: true });
-    const r = await this.streamFrom(this.slotService('podman', slot), ['tar', '--format=posix', '-cf', '-', '--exclude=./.git', '-C', dir, '.'], { maxBytes: limits.maxBytes ?? 512 * 1024 * 1024 });
+    const r = await this.streamFrom(slot, ['--format=posix', '-cf', '-', '--exclude=./.git', '-C', dir, '.'], { maxBytes: limits.maxBytes ?? 512 * 1024 * 1024 });
     if (r.exitCode !== 0) throw new StackError(`the tree could not be read (exit ${r.exitCode})`);
     const entries = parseTar(r.stdout, { allowSymlinks: true, ...limits });
     extractEntries(entries, dest);
     return { refused: entries.refused }; // a FIFO, a device or a file over its cap: skipped, and recorded
   }
 
-  /** A base repository of the slot's volume on the git server, pushed by a one-shot container with no secret. */
+  /** A base repository of the slot's work directory on the git server, pushed by a one-shot container with no secret. */
   async pushBase(slot, script) {
     await this.compose(['run', '--rm', '-T', '--no-deps', this.slotService('pusher', slot), script], { timeoutMs: 5 * 60 * 1000 });
   }
@@ -317,31 +429,127 @@ export class Stack {
     await this.compose(['exec', '-T', 'git-server', 'sh', '-c', `rm -rf /srv/git/bench/${name}.git; test ! -e /srv/git/bench/${name}.git`]);
   }
 
-  /** Recreate the slot's coder with the run's settings (`env`: KEY -> value). The env file is gone when this returns. */
-  async startCoder(slot, env) {
-    const service = this.slotService('coder', slot);
+  /** The coder's binaries, copied out of the pinned coder image once (never run there). */
+  async ensureCoderFiles() {
+    const dir = path.join(this.stackDir, 'coder-bin');
+    const marker = path.join(dir, '.image');
+    try {
+      if (fs.readFileSync(marker, 'utf8').trim() === this.coderImage) return dir;
+    } catch {
+      // not made yet
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    await this.host().extract(this.coderImage, ['/usr/local/bin/adam-coder', '/usr/local/bin/adam-git'], dir);
+    for (const f of ['adam-coder', 'adam-git']) {
+      try {
+        fs.chmodSync(path.join(dir, f), 0o755);
+      } catch {
+        throw new StackError(`the coder's ${f} could not be copied out of ${this.coderImage}: pull the image and retry`);
+      }
+    }
+    fs.writeFileSync(marker, `${this.coderImage}\n`);
+    return dir;
+  }
+
+  /** The coder image's own environment (its PATH): a coder in a task image keeps the task's tools. */
+  async coderImageEnv() {
+    this.imageEnvCache ??= await this.host().imageEnv(this.coderImage);
+    return this.imageEnvCache;
+  }
+
+  /**
+   * Start the slot's coder: a container of the task image, as uid 10001, with the coder's binaries and agent folder
+   * mounted read-only and `RUN_ENVIRONMENT=local`, so its commands run in that container. The run's settings go in
+   * an env file of mode 0600 that is gone when this returns. The coder is up when its A2A port answers.
+   */
+  async startCoder(slot, env, { image } = {}) {
+    const name = this.slotService('coder', slot);
+    if (typeof image !== 'string' || !/@sha256:[0-9a-f]{64}$/.test(image)) throw new StackError('the coder starts from the task image, named by digest');
+    if (!this.agentDir) throw new StackError('the coder needs its agent folder: set the stack\'s agentDir before startCoder');
+    const imageEnv = await this.coderImageEnv();
+    const settings = {
+      ...coderEnvironment({ slot, publicUrl: this.coderUrl(slot), databaseUrl: `postgres://postgres:postgres@postgres:5432/adam_bench_${slot}`, imagePath: imageEnv.PATH ?? DEFAULT_PATH }),
+      ...env,
+    };
     const lines = [];
-    for (const [k, v] of Object.entries(env)) {
+    for (const [k, v] of Object.entries(settings)) {
       if (!ENV_KEY.test(k) || typeof v !== 'string' || !SAFE_VALUE.test(v)) throw new StackError(`the setting ${k} is not plain (no line break, $, quote or backslash)`);
       lines.push(`${k}=${v}`);
       if (/BEARER|KEY|TOKEN|URL/.test(k)) for (const s of secretsOf(v)) this.secrets.add(s);
     }
+    const files = await this.ensureCoderFiles();
     fs.mkdirSync(this.stackDir, { recursive: true, mode: 0o700 });
     const file = path.join(this.stackDir, `slot-${slot}.env`);
     fs.writeFileSync(file, `${lines.join('\n')}\n`, { mode: 0o600 });
     try {
-      await this.compose(['up', '-d', '--force-recreate', '--no-deps', '--wait', service], { timeoutMs: 10 * 60 * 1000 });
+      // A killed harness may have left a coder with this name.
+      await this.docker(['rm', '-f', name]).catch(() => {});
+      const args = buildRunArgs(
+        {
+          image,
+          detach: true,
+          name,
+          network: `${this.project}_slot-${slot}`,
+          user: runtimeUser(),
+          ...runtimeLimits(),
+          labels: { 'bench.project': this.project, 'bench.slot': String(slot), 'bench.role': 'coder' },
+          envFile: file,
+          mounts: [
+            { source: this.workRoot(slot), target: '/work' },
+            { source: this.agentDir, target: '/etc/adam/agent', readOnly: true },
+            { source: files, target: '/opt/adam/bin', readOnly: true },
+          ],
+          entrypoint: '/opt/adam/bin/adam-coder',
+        },
+        { name },
+      );
+      const r = await this.docker(args, { timeoutMs: 120_000 });
+      if (r.exitCode !== 0) throw new StackError(`the coder of slot ${slot} did not start (exit ${r.exitCode}): ${redact(r.stderr.trim().split('\n').slice(-3).join(' | '), this.secrets)}`);
+      await this.waitForCoder(slot, name);
     } finally {
       fs.rmSync(file, { force: true });
     }
   }
 
+  /** Wait until the coder's A2A port answers, or say why it stopped; a container that exits is the reason. */
+  async waitForCoder(slot, name, { timeoutMs = 120_000 } = {}) {
+    const port = this.ports.coder[slot];
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const state = await this.docker(['inspect', '--format', '{{.State.Status}}', name], { timeoutMs: 30_000 });
+      if (state.exitCode !== 0) throw new StackError(`the coder of slot ${slot} is gone: ${redact(state.stderr.trim(), this.secrets)}`);
+      if (!['running', 'created'].includes(state.stdout.trim())) {
+        const logs = await this.docker(['logs', '--tail', '20', name], { timeoutMs: 30_000 });
+        throw new StackError(`the coder of slot ${slot} ended (${state.stdout.trim()}): ${redact(`${logs.stdout}${logs.stderr}`.trim().split('\n').slice(-4).join(' | '), this.secrets)}`);
+      }
+      if (await this.portAnswers(port)) return;
+      if (Date.now() > deadline) throw new StackError(`the coder of slot ${slot} did not answer on 127.0.0.1:${port} in ${Math.round(timeoutMs / 1000)} s`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  /** Any HTTP answer on the loopback port means the coder listens; the status does not matter. */
+  portAnswers(port) {
+    return new Promise((resolve) => {
+      const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: 1000 }, (res) => {
+        res.resume();
+        resolve(true);
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(false);
+      });
+      req.on('error', () => resolve(false));
+    });
+  }
+
   /** Stop and remove the slot's coder, and confirm it. */
   async stopCoder(slot) {
-    const service = this.slotService('coder', slot);
-    await this.compose(['rm', '-sf', service], { timeoutMs: 2 * 60 * 1000 });
-    const still = (await this.compose(['ps', '-aq', service])).trim();
-    if (still !== '') throw new StackError(`the coder of slot ${slot} is not stopped`);
+    const name = this.slotService('coder', slot);
+    await this.docker(['rm', '-f', name], { timeoutMs: 2 * 60 * 1000 });
+    const still = await this.docker(['ps', '-aq', '--filter', `name=^${name}$`], { timeoutMs: 60_000 });
+    if (still.stdout.trim() !== '') throw new StackError(`the coder of slot ${slot} is not stopped`);
   }
 
   coderUrl(slot) {
@@ -349,102 +557,46 @@ export class Stack {
     return `http://127.0.0.1:${this.ports.coder[slot]}/`;
   }
 
-  /** The Podman client of a slot's service (or `grader`): `podman --remote` run inside it through `docker compose exec`. */
-  containersIn(service) {
-    const exec = (bin, args, opts, cb) => this.spawn('docker', this.composeArgs(['exec', '-T', service, bin, ...args]), { ...opts, env: this.composeEnv() }, cb);
-    return new PodmanRemote({ bin: 'podman', url: PODMAN_URL, exec });
+  /** A HostContainers over this stack's promise-returning exec (the tests' fake is async too). */
+  host(labels = {}, aliases = {}) {
+    return new HostContainers({
+      labels,
+      prefix: `${this.project}_`,
+      aliases,
+      invoke: (args, { timeoutMs, input }) => this.exec('docker', args, { env: this.dockerEnv(), timeoutMs, input }),
+    });
   }
 
+  /** The host containers of a slot's runs: only theirs are listed and reaped (`bench.slot`, `bench.role=run`). */
   containers(slot) {
-    return this.containersIn(this.slotService('podman', slot));
+    this.slotService('work', slot);
+    return this.host({ 'bench.project': this.project, 'bench.slot': String(slot), 'bench.role': 'run' }, { slot: `${this.project}_slot-${slot}` });
   }
 
-  /** The Podman client of the service that grades: no agent runs there. */
+  /** The coder container of a slot, for the check that the run's image was the task's. */
+  coderContainers(slot) {
+    this.slotService('coder', slot);
+    return this.host({ 'bench.project': this.project, 'bench.slot': String(slot), 'bench.role': 'coder' });
+  }
+
+  /** The containers that grade: no agent runs under these labels. */
   graderContainers() {
-    return this.containersIn('grader');
+    return this.host({ 'bench.project': this.project, 'bench.role': 'grader' });
   }
 
-  /** Put files into a directory of a service: a tar of the host's own files, given on stdin. */
-  async putTar(service, dir, srcDir, names) {
-    const tar = execFileSync('tar', ['-cf', '-', '-C', srcDir, ...names], { maxBuffer: 1024 * 1024 * 1024 });
-    await this.compose(['exec', '-T', service, 'tar', '-xf', '-', '-C', dir], { input: tar, timeoutMs: 5 * 60 * 1000 });
+  /** Containers that neither arm owns (a probe): their labels keep them out of a reap of a slot or the grader. */
+  hostContainers() {
+    return this.host({ 'bench.project': this.project, 'bench.role': 'probe' });
   }
 
-  /**
-   * Where a grading's files live, for `gradeOnce`: a directory of the grader's own, `/grade/<id>`, made for one grading. The tests
-   * and the patch go in as tar streams and are mounted read-only into the grading container; its logs directory comes
-   * out as a tar stream (the reward, a regular file of at most 16 bytes, or nothing); the directory is removed inside
-   * the service. The grader mounts no directory of the host.
-   */
-  graderIO() {
-    const stack = this;
-    return {
-      async stage({ task, patchFile }) {
-        const base = `/grade/${crypto.randomBytes(8).toString('hex')}`;
-        await stack.execIn('grader', `mkdir -p ${base}/logs ${base}/tests ${base}/patch && chmod 777 ${base}/logs`);
-        const mounts = [
-          { source: `${base}/tests`, target: '/tests', readOnly: true },
-          { source: `${base}/logs`, target: '/logs/verifier' },
-        ];
-        await stack.putTar('grader', `${base}/tests`, path.join(task.dir, 'tests'), ['.']);
-        if (patchFile) {
-          const name = path.basename(patchFile);
-          if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new StackError('the patch file name is not plain');
-          await stack.putTar('grader', `${base}/patch`, path.dirname(path.resolve(patchFile)), [name]);
-          mounts.push({ source: `${base}/patch/${name}`, target: '/patch/model.patch', readOnly: true });
-        }
-        return {
-          mounts,
-          async readReward() {
-            const r = await stack.streamFrom('grader', ['tar', '--format=posix', '-cf', '-', '--ignore-failed-read', '-C', `${base}/logs`, 'reward.txt'], { maxBytes: 1024 * 1024 });
-            const { files, refused } = pickFiles(parseTar(r.stdout, { allowSymlinks: true, maxFileBytes: MAX_REWARD_BYTES }), ['reward.txt']);
-            if (refused.length > 0) return { reward: 'invalid', stale: false };
-            return { reward: files.has('reward.txt') ? rewardOf(files.get('reward.txt').toString('utf8')) : null, stale: false };
-          },
-          async remove() {
-            await stack.execIn('grader', `chmod -R u+rwX ${base} 2>/dev/null; rm -rf ${base}; test ! -e ${base}`);
-          },
-        };
-      },
-    };
-  }
-
-  /** Put an image archive the harness made on its own side into a Podman service (`podman-<slot>` or `grader`), and remove the copy. */
-  async loadImage(service, hostFile) {
-    const inside = '/tmp/bench-own-image.tar';
-    await this.compose(['cp', hostFile, `${service}:${inside}`], { timeoutMs: 10 * 60 * 1000 });
-    try {
-      await this.containersIn(service).load(inside);
-    } finally {
-      await this.execIn(service, `rm -f ${inside}`).catch(() => {});
-    }
-  }
-
-  /** Give a Podman service the internet while `fn` runs (a task image is pulled, a verifier needs the network), and take it away after. */
-  async withEgress(service, fn) {
-    const id = (await this.compose(['ps', '-q', service])).trim();
-    if (!/^[0-9a-f]{12,64}$/.test(id)) throw new StackError(`the ${service} service is not running`);
-    const network = `${this.project}_egress`;
-    const docker = async (verb) => {
-      const r = await this.exec('docker', ['network', verb, network, id], { env: this.composeEnv(), timeoutMs: 60_000 });
-      if (r.exitCode !== 0 && !/already|not connected/.test(r.stderr)) throw new StackError(`docker network ${verb} failed (exit ${r.exitCode})`);
-    };
-    await docker('connect');
-    try {
-      return await fn();
-    } finally {
-      await docker('disconnect');
-    }
-  }
-
+  /** A pull from the host: the internet is the host's, so only the slot's lock is kept (one pull at a time). */
   pullWindow(slot, fn) {
-    const service = this.slotService('podman', slot);
-    return this.gate(service).exclusive(() => this.withEgress(service, fn));
+    return this.gate(this.slotService('slot', slot)).exclusive(fn);
   }
 
-  /** The grader's window: alone on the grader, so no grading of an agent's patch ever has a route out. */
+  /** A grading whose verifier needs the internet: alone, on the egress network (its container is started with it). */
   graderWindow(fn) {
-    return this.gate('grader').exclusive(() => this.withEgress('grader', fn));
+    return this.gate('grader').exclusive(fn);
   }
 
   /** A grading with no network: it runs with others, never while a window is open. */

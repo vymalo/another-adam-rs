@@ -221,7 +221,7 @@ test('R19: a pilot killed after it removed the old proposal and before it wrote 
 });
 
 /** What realHarness needs, with every outside thing a fake that records what was done to it. */
-function realParts(t, { tasks, upFails = false, origin = new FakeContainers() } = {}) {
+function realParts(t, { tasks, upFails = false } = {}) {
   const home = tmp(t);
   const log = [];
   const slotContainers = new FakeContainers();
@@ -235,11 +235,10 @@ function realParts(t, { tasks, upFails = false, origin = new FakeContainers() } 
     graderWindow: async (fn) => fn(),
     containers: () => slotContainers,
     graderContainers: () => graderContainers,
-    loadImage: async (service) => log.push(`load ${service}`),
   };
   const meter = { listen: async () => ({}), close: async () => log.push('meter closed') };
   const config = normalizeConfig(rawConfig({ concurrency: 2 }));
-  const inject = { load: () => ({ tasks }), makeStack: () => stack, makeMeter: () => meter, makeOrigin: () => origin };
+  const inject = { load: () => ({ tasks }), makeStack: () => stack, makeMeter: () => meter };
   const env = { BENCH_HOME: home, HOME: home };
   return { env, config, inject, log, home, slotContainers, graderContainers };
 }
@@ -251,18 +250,17 @@ test('R14: a failure after the meter listens closes the meter, brings the stack 
   Ledger.open(path.join(p.home, 'ledger.jsonl')).close(); // the lock was released
 });
 
-test('R14: every own image is put on every slot and on the grader before anything is spent, and a missing one stops the start', async (t) => {
+test('R14: every own image is in the host\'s store before anything is spent, and a missing one stops the start', async (t) => {
   const own = { id: 'demo-2', source: 'own', image: { ref: 'adam-bench-own/demo-2:abc' } };
-  const origin = new FakeContainers();
-  origin.images = new Set([own.image.ref]);
-  const p = realParts(t, { tasks: [own], origin });
+  const p = realParts(t, { tasks: [own] });
+  p.slotContainers.images = new Set([own.image.ref]);
+  p.graderContainers.images = new Set([own.image.ref]);
   const h = await realHarness({ env: p.env, config: p.config, log: () => {}, sharedPrompt: 'shared', inject: p.inject });
-  assert.deepEqual(p.log.filter((l) => l.startsWith('load')).sort(), ['load grader', 'load podman-1', 'load podman-2']);
-  assert.equal(origin.saved.length, 1, 'saved once, however many services load it');
+  assert.deepEqual(p.slotContainers.pulled, [], 'the own image is already in the store');
   assert.equal(h.deps.agents.opencode.sharedPrompt, 'shared', 'OpenCode is given the shared prompt');
   await h.close();
-  const q = realParts(t, { tasks: [own], origin: new FakeContainers() });
-  await assert.rejects(realHarness({ env: q.env, config: q.config, log: () => {}, sharedPrompt: 'shared', inject: q.inject }), /on no service/);
+  const q = realParts(t, { tasks: [own] });
+  await assert.rejects(realHarness({ env: q.env, config: q.config, log: () => {}, sharedPrompt: 'shared', inject: q.inject }), /build it with bench tasks build/);
   assert.ok(q.log.includes('meter closed') && q.log.includes('stack down'));
 });
 

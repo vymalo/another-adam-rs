@@ -9,11 +9,11 @@
 # run over its budget ends budget_hit; a harness killed in the middle of a run starts again and re-runs only the
 # interrupted run (bench/README.md, "The dry run"). It brings the stack of bench/compose.yaml up and, when it ends,
 # takes it down with its volumes. It needs Docker with the compose plugin, Node 22 or newer, and what
-# `node bench/bin/bench.mjs doctor` checks. Nothing here has run where it was written: no container service was there.
+# `node bench/bin/bench.mjs doctor` checks. Nothing here has run where it was written: no container runtime was there.
 #
-# Environment: BENCH_HOME (default: a new temporary directory, removed at the end), BENCH_METER_BIND (default: the
-# address of Docker's default bridge, which the stack's relay reaches through the host gateway; 127.0.0.1 when that
-# cannot be read, and under rootless Docker, where the host gateway is another address, set it yourself),
+# Environment: BENCH_HOME (default: a new temporary directory, removed at the end), BENCH_METER_BIND (default:
+# 0.0.0.0, which the stack's relay reaches through the host gateway; under rootless Docker the bridge gateway is not
+# the host's address, so the meter listens on every interface and its paths still require a run token),
 # BENCH_METER_PORT (18090), BENCH_GIT_PORT (18083), BENCH_CODER_1_PORT (18081), BENCH_CODER_2_PORT (18082).
 set -eu
 
@@ -46,15 +46,11 @@ fi
 chmod 755 "$BENCH_HOME"
 export BENCH_HOME
 if [ -z "${BENCH_METER_BIND:-}" ]; then
-  BENCH_METER_BIND=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
-  BENCH_METER_BIND=${BENCH_METER_BIND:-127.0.0.1}
+  # A relay reaches the host through the host's own address; the meter listens on every interface, and only a
+  # request with a run token reaches the model.
+  BENCH_METER_BIND=0.0.0.0
 fi
 export BENCH_METER_BIND
-
-# Ubuntu 24.04 hosts stop a rootless Podman from making a user namespace (dev/podman/README.md).
-if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1 ]; then
-  echo "bench dry run: kernel.apparmor_restrict_unprivileged_userns is 1; run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" >&2
-fi
 
 cleanup() {
   status=$?

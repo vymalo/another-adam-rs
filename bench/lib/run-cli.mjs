@@ -17,13 +17,13 @@ import { OpenCodeAgent } from './agents/opencode.mjs';
 import { MIN_PER_ARM, BudgetError, assertLedgerBound, configFingerprint, confirmProposal, digestKey, pilotEstimate, proposalBody, renderEstimate, requireConfirmed } from './budget.mjs';
 import { CapBook } from './cap.mjs';
 import { ConfigError, assertOutsideRepo, benchHome, loadConfig } from './config.mjs';
-import { PodmanRemote } from './containers.mjs';
 import { formatUSD } from './cost.mjs';
-import { ensureImage, once } from './images.mjs';
+import { once } from './images.mjs';
 import { Ledger, readLedger } from './ledger.mjs';
 import { createMeter } from './meter.mjs';
 import { buildBlocks, specsOf } from './plan.mjs';
-import { PINS, coderRef } from './pins.mjs';
+import { PINS } from './pins.mjs';
+import { RUNTIME } from './runtime.mjs';
 import { readSharedPrompt } from './shared-prompt.mjs';
 import { buildReport } from './report.mjs';
 import { advance, regradeInvalid } from './runner.mjs';
@@ -101,7 +101,7 @@ export function loadSelected(config, p) {
  */
 export async function realHarness({ env, config, log, sharedPrompt, inject = {} }) {
   if (typeof sharedPrompt !== 'string' || sharedPrompt === '') throw new Error('the shared system prompt is required: both agents are given the same one');
-  const { load = loadSelected, makeStack = (o) => new Stack(o), makeMeter = createMeter, makeOrigin = () => new PodmanRemote(config.tasks.podman) } = inject;
+  const { load = loadSelected, makeStack = (o) => new Stack(o), makeMeter = createMeter } = inject;
   const home = benchHome(env);
   assertOutsideRepo(home, 'BENCH_HOME');
   if (config.concurrency > SLOTS) throw new ConfigError('concurrency', `the stack has ${SLOTS} slots`);
@@ -114,12 +114,10 @@ export async function realHarness({ env, config, log, sharedPrompt, inject = {} 
   try {
     const book = CapBook.fromFold(config.capMicro, ledger.fold());
     meter = makeMeter({ config, ledger, book, env });
-    await meter.listen(Number(env.BENCH_METER_PORT ?? 18090), env.BENCH_METER_BIND ?? '127.0.0.1');
+    await meter.listen(Number(env.BENCH_METER_PORT ?? 18090), env.BENCH_METER_BIND ?? '0.0.0.0');
     stack = makeStack({
       composeFile: path.join(BENCH_DIR, 'compose.yaml'),
       home,
-      tasksDir: path.join(BENCH_DIR, 'tasks'),
-      seccomp: path.join(REPO_DIR, 'dev', 'podman', 'seccomp.json'),
       meterPort: Number(env.BENCH_METER_PORT ?? 18090),
       ports: { git: Number(env.BENCH_GIT_PORT ?? 18083), coder1: Number(env.BENCH_CODER_1_PORT ?? 18081), coder2: Number(env.BENCH_CODER_2_PORT ?? 18082) },
       baseEnv: env,
@@ -127,35 +125,26 @@ export async function realHarness({ env, config, log, sharedPrompt, inject = {} 
     });
     await stack.up();
     const slots = config.concurrency;
-    for (let slot = 1; slot <= slots; slot++) await stack.pullWindow(slot, () => stack.containers(slot).pull(coderRef(PINS)));
-    await stack.graderWindow(() => stack.graderContainers().pull(coderRef(PINS)));
 
-    // A task image is made present on a slot's service once, and on the grader once, with the internet only for the window of a
-    // pull. `once` keeps the in-flight promise, so two slots never pull the same image twice. An own task's image was built where
-    // `bench tasks build` ran: it is saved from there into an archive the harness makes itself and loaded into the service.
+    // An image is made present once per slot and once for the grading, from the host's own store: the host pulls a
+    // public image, and an own image was built here by `bench tasks build`. `once` keeps the in-flight promise, so two
+    // slots never pull the same image twice.
     const first = once();
-    const origin = makeOrigin();
-    const archives = path.join(home, 'archives');
-    const archiveOf = (ref) => path.join(archives, `${ref.replace(/[^A-Za-z0-9._-]/g, '_')}.tar`);
-    const putOwn = (ref, target, service, window) =>
-      ensureImage({
-        ref,
-        source: { hasImage: (r) => origin.hasImage(r), save: (r, f) => first(`save|${r}`, () => (fs.mkdirSync(archives, { recursive: true }), origin.save(r, f))) },
-        target,
-        archive: archiveOf(ref),
-        load: (file) => window(() => stack.loadImage(service, file)),
-      });
     const pullImage = (slot, task) =>
-      first(`slot${slot}|${task.image.ref}`, () =>
-        task.source === 'own'
-          ? putOwn(task.image.ref, stack.containers(slot), `podman-${slot}`, (fn) => fn())
-          : stack.pullWindow(slot, () => stack.containers(slot).pull(task.image.ref)),
-      );
+      first(`slot${slot}|${task.image.ref}`, async () => {
+        const containers = stack.containers(slot);
+        if (await containers.hasImage(task.image.ref)) return;
+        if (task.source === 'own') throw new SelectionError(`the own task image ${task.image.ref} is not in the host's store: build it with bench tasks build`);
+        await stack.pullWindow(slot, () => containers.pull(task.image.ref));
+      });
     const pullGraderImage = (task) =>
-      first(`grader|${task.image.ref}`, () =>
-        task.source === 'own' ? putOwn(task.image.ref, stack.graderContainers(), 'grader', (fn) => fn()) : stack.graderWindow(() => stack.graderContainers().pull(task.image.ref)),
-      );
-    // Before any money is spent: every own image is on every slot and on the grader.
+      first(`grader|${task.image.ref}`, async () => {
+        const containers = stack.graderContainers();
+        if (await containers.hasImage(task.image.ref)) return;
+        if (task.source === 'own') throw new SelectionError(`the own task image ${task.image.ref} is not in the host's store: build it with bench tasks build`);
+        await stack.graderWindow(() => containers.pull(task.image.ref));
+      });
+    // Before any money is spent: every own image is in the host's store.
     for (const task of tasks.filter((t) => t.source === 'own')) {
       for (let slot = 1; slot <= slots; slot++) await pullImage(slot, task);
       await pullGraderImage(task);
@@ -209,6 +198,7 @@ const setupRecord = (config, ctx) => ({
   adamRevision: ctx.pins.coder.revision,
   opencodeVersion: ctx.pins.opencode.version,
   opencodeIntegrity: ctx.pins.opencode.integrity,
+  runtime: RUNTIME,
   limits: config.limits,
 });
 

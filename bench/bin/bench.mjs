@@ -4,8 +4,8 @@
 //   bench config            check the configuration and print what may be shown of it
 //   bench report            build report.md from the ledger
 //   bench tasks <fetch|mine|lint|build|check|select>   task sources and the environment check
-//   bench doctor [--start]  what the machine must have; which fallback to use when nested Podman does not work
-//   bench dry-run [--phase P] [--down]   the whole path on a scripted model, no money (needs a container service)
+//   bench doctor [--start]  what the machine must have, and whether the coder starts in each selected task image
+//   bench dry-run [--phase P] [--down]   the whole path on a scripted model, no money (needs a container runtime)
 //   bench pilot | confirm | run | regrade   the pilot, the owner's confirmation, the full run, grading again
 //
 // Exit codes: 0 done, 1 a check failed, 64 usage, 78 bad configuration.
@@ -15,13 +15,13 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ConfigError, EXIT_CONFIG, assertOutsideRepo, benchHome, configPath, describeConfig, loadConfig } from '../lib/config.mjs';
 import { doctor, renderDoctor } from '../lib/doctor.mjs';
-import { BENCH_DIR, REPO_DIR, runDryRun } from '../lib/dryrun.mjs';
+import { BENCH_DIR, runDryRun } from '../lib/dryrun.mjs';
 import { LedgerError, readLedger } from '../lib/ledger.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { ReportError, buildReport } from '../lib/report.mjs';
 import { Stack } from '../lib/stack.mjs';
-import { runCli } from '../lib/run-cli.mjs';
-import { runTasks } from '../lib/tasks-cli.mjs';
+import { runCli, loadSelected } from '../lib/run-cli.mjs';
+import { paths, runTasks } from '../lib/tasks-cli.mjs';
 
 const USAGE = `usage: bench <command>
 
@@ -30,8 +30,8 @@ const USAGE = `usage: bench <command>
                                   build the report from the ledger (default $BENCH_HOME/report.md)
   tasks fetch|mine|lint|build|check|select
                                   task sources, the environment check and selection (bench tasks --help)
-  doctor [--start]                what the machine must have (Docker, user namespaces, disk, the coder image); --start
-                                  brings the stack up and runs a container in each Podman service; says which fallback to use
+  doctor [--start]                what the machine must have (Docker, disk, the coder image, the coder in each selected
+                                  task image); --start brings the shared services up and runs a container on the host
   dry-run [--phase all|grades|budget|resume] [--down]
                                   both agents on three self-test tasks and a scripted model: grades, cost, budget, kill and resume
   pilot [--blocks N]              the first blocks of the plan (default 5) with the configuration's per-run budget; prints the
@@ -81,12 +81,20 @@ async function doctorCommand(argv, env) {
   const stack = new Stack({
     composeFile: path.join(BENCH_DIR, 'compose.yaml'),
     home,
-    tasksDir: path.join(BENCH_DIR, 'tasks'),
-    seccomp: path.join(REPO_DIR, 'dev', 'podman', 'seccomp.json'),
     meterPort: Number(env.BENCH_METER_PORT ?? 18090),
     baseEnv: env,
   });
-  const result = await doctor({ home, pins: PINS, stack, start: values.start === true });
+  // The selected tasks are what the coder probe runs on; a configuration that is absent or a selection that is not
+  // made yet is a warning, never a reason for the doctor to fail.
+  let tasks = [];
+  let taskError = null;
+  try {
+    const config = loadConfig({ env });
+    tasks = loadSelected(config, paths(env)).tasks;
+  } catch (e) {
+    if (env.BENCH_CONFIG || fs.existsSync(configPath(env))) taskError = e.message;
+  }
+  const result = await doctor({ home, pins: PINS, stack, start: values.start === true, tasks, taskError, containers: stack.hostContainers() });
   process.stdout.write(`${renderDoctor(result)}\n`);
   return result.exitCode;
 }

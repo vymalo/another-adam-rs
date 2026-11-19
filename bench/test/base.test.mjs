@@ -56,6 +56,7 @@ test('the base script refuses a path that is not plain', () => {
 /** What the real stack does for the base: the container's tree comes out as a tar stream into a directory the host owns. */
 function fakeStack(produced, calls) {
   return {
+    workRoot: (slot) => `/tmp/bench-work-${slot}`,
     workDir: async (slot, dir, o) => calls.push(['workDir', slot, dir, Boolean(o?.remove)]),
     extractTree: async (slot, dir, dest) => {
       calls.push(['extractTree', slot, dir]);

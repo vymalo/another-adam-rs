@@ -42,7 +42,8 @@ export function baseScript({ workdir, out = '/out', scratch = '/tmp/bench-base' 
     `git clone -q --bare "$W" ${out}/base.git`,
     `mkdir ${out}/tree`,
     `tar --exclude=./.git -cf - . | tar -xf - -C ${out}/tree`,
-    `chmod -R a+rX ${out}`,
+    // The work directory is the host's, owned by the host user: a container as uid 10001 cannot chmod it.
+    `chmod -R a+rX ${out} 2>/dev/null || true`,
   ].join('\n');
 }
 
@@ -60,7 +61,7 @@ export async function prepareBase({ containers, stack, slot, task, hostRoot, tim
     image: task.image.ref,
     script: baseScript({ workdir: task.workdir }),
     workdir: '/',
-    mounts: [{ source: BASE_DIR, target: '/out' }],
+    mounts: [{ source: path.join(stack.workRoot(slot), 'bench-base'), target: '/out' }],
     network: 'none',
     timeoutMs,
   });
