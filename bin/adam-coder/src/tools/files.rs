@@ -318,7 +318,7 @@ fn locate_for_write(
     })
 }
 
-/// Largest file `read_file` pages: counting its lines reads all of it.
+/// Largest file `read_file` pages: counting its lines reads all of it, once.
 const READ_MAX_FILE: u64 = 512 * 1024 * 1024;
 
 /// What the model is told when `shown` is not there ([`closest_paths`] may add to it).
@@ -387,8 +387,9 @@ impl<R: Read> Read for StopRead<'_, R> {
 /// One page of `rel` under `root`: its lines behind their numbers and the final line of
 /// [`paging`](adam_llm_agent::paging) (see the tool).
 ///
-/// **The whole file is read to count its lines** (a file is at most [`READ_MAX_FILE`]): a page of a
-/// big file costs as much as the file, whatever its offset.
+/// A page is **one pass** over the file and keeps only the page: the final line gives the exact
+/// number of lines left (or the file's total), so every line is counted; the lines outside the
+/// page are counted as they go and never stored. A file is at most [`READ_MAX_FILE`].
 #[cfg(test)]
 fn read_in(
     root: &SlotDir,
@@ -409,7 +410,19 @@ fn read_in_until(
 ) -> Result<String, String> {
     let (offset, limit) = paging::window_args(offset, limit, paging::PAGE_LINES)?;
     let (file, meta) = open_for_read(root, rel)?;
-    let shown = rel.trim();
+    page_open(file, meta, rel.trim(), offset, limit, stop)
+}
+
+/// The page of an open file: the checks a read makes before it pages, and the paging itself (one
+/// pass, the page only: see [`read_in`]).
+fn page_open(
+    file: impl Read,
+    meta: Meta,
+    shown: &str,
+    offset: i64,
+    limit: u32,
+    stop: &AtomicBool,
+) -> Result<String, String> {
     if meta.is_dir() {
         return Err(format!(
             "`{shown}` is a directory: list it with list_files (`{{\"path\":\"{shown}\"}}`)"
@@ -1081,9 +1094,10 @@ fn push_row(
 /// The page of `reader`: the first [`READ_FILES_LINES`] lines (at most [`READ_FILES_PAGE_BYTES`]
 /// of rows) behind the numbers and tabs `read_file` uses, and how many lines the file has.
 ///
-/// The whole stream is read, to count its lines, and every byte of it is checked: a NUL is
-/// [`Unreadable::Binary`] and a byte that is not UTF-8 is [`Unreadable::NotUtf8`]. A line over
-/// [`paging::MAX_LINE_CHARS`] characters is cut and says how long it was, as `read_file` cuts one.
+/// The whole stream is read **once**, to count its lines and to check every byte: a NUL is
+/// [`Unreadable::Binary`] and a byte that is not UTF-8 is [`Unreadable::NotUtf8`]; only the page's
+/// rows are kept. A line over [`paging::MAX_LINE_CHARS`] characters is cut and says how long it
+/// was, as `read_file` cuts one.
 fn page_in(mut reader: impl io::BufRead, stop: &AtomicBool) -> Result<Paged, Unreadable> {
     let mut rows = String::new();
     let mut total: u64 = 0;
@@ -2641,6 +2655,81 @@ mod tests {
         assert!(next.starts_with("  2001\tline 2001\n"), "{next}");
         let last = read_in(dir.path(), "big.txt", Some(4001), None).unwrap();
         assert!(last.ends_with("[end: 5000 lines]"), "{last}");
+    }
+
+    /// A reader that counts the bytes it gives out: a page must read the file once.
+    struct Counted<'a, R> {
+        inner: R,
+        bytes: &'a std::cell::Cell<u64>,
+    }
+
+    impl<R: Read> Read for Counted<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.bytes.set(self.bytes.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    /// A page of a 20 MB file is **one pass**, whatever the offset: the exact `[more]`/`[end]` line
+    /// needs every line counted, so the whole file is read, but only the page is kept and no byte
+    /// is read twice.
+    #[test]
+    fn a_page_reads_the_file_once_whatever_the_offset() {
+        let dir = root();
+        let lines = 200_000usize;
+        let text: String = (1..=lines).map(|i| format!("{i:099}\n")).collect();
+        fs::write(dir.path().join("big.txt"), &text).unwrap();
+        let size = fs::metadata(dir.path().join("big.txt")).unwrap().len();
+        assert_eq!(size, 20_000_000, "20 MB of 100-byte lines");
+        let slot = open(dir.path()).unwrap();
+        for (offset, rows, first, last) in [
+            (
+                1i64,
+                478usize,
+                1u64,
+                "[more: 199522 lines left; next page: offset=479]",
+            ),
+            (
+                100_001,
+                478,
+                100_001,
+                "[more: 99522 lines left; next page: offset=100479]",
+            ),
+            (199_600, 401, 199_600, "[end: 200000 lines]"),
+            (-2, 2, 199_999, "[end: 200000 lines]"),
+        ] {
+            let (file, meta) = open_for_read(&slot, "big.txt").unwrap();
+            let bytes = std::cell::Cell::new(0);
+            let counted = Counted {
+                inner: file,
+                bytes: &bytes,
+            };
+            let page = page_open(
+                counted,
+                meta,
+                "big.txt",
+                offset,
+                paging::PAGE_LINES,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(
+                bytes.get(),
+                size,
+                "offset {offset}: the file is read once, not twice"
+            );
+            assert_eq!(
+                page.lines().count(),
+                rows + 1,
+                "offset {offset}: the page and its last line"
+            );
+            assert_eq!(page.rsplit('\n').next().unwrap(), last, "offset {offset}");
+            assert!(
+                page.starts_with(&format!("{first:>6}\t{first:099}\n")),
+                "offset {offset}: the page starts at the line it was asked for"
+            );
+        }
     }
 
     #[test]
