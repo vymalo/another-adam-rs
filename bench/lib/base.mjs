@@ -98,7 +98,10 @@ export async function makeContainerBase({ containers, stack, slot, task, timeout
     network: 'none',
     timeoutMs,
   });
-  if (r.exitCode !== 0) throw new Error(`the base of task ${task.id} could not be made (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
+  if (r.exitCode !== 0) {
+    const lines = r.stderr.trim().split('\n').filter(Boolean);
+    throw new Error(`the base of task ${task.id} could not be made (exit ${r.exitCode}): ${[lines[0], ...lines.slice(-2)].filter(Boolean).join(' | ')}`);
+  }
 }
 
 /** Rebuild the host's own repository of the base from a tar stream of the slot's `tree` (patch collection reads it). */
