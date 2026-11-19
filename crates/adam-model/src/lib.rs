@@ -76,12 +76,17 @@
 #![warn(missing_docs)]
 
 mod client;
+mod credentials;
 mod error;
 mod mock;
 mod types;
 
 pub use adam_error::{Classify, ErrorClass};
 pub use client::{DynModel, ModelClient};
+pub use credentials::{
+    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, ModelCredentials,
+    Rejection, RenewingCredentials, StaticBearer,
+};
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
 pub use types::{

@@ -162,6 +162,9 @@ classDiagram
     class ModelClient { <<interface>> }
     ModelClient <|.. OpenAiCompatible
     ModelClient <|.. MockModel
+    class ModelCredentials { <<interface>> }
+    ModelCredentials <|.. StaticBearer
+    ModelCredentials <|.. RenewingCredentials
     class TaskBackend { <<interface>> }
     TaskBackend <|.. RuntimeTaskBackend
     TaskBackend <|.. InMemoryBackend
@@ -193,6 +196,7 @@ classDiagram
 |---|---|---|---|
 | `Store` | `adam-core` | `PgStore`, `MongoStore` | `MemoryStore` (reference), `FaultyStore` (testkit) |
 | `ModelClient` | `adam-model` | `OpenAiCompatible` (`adam-model-openai`) | `MockModel` |
+| `ModelCredentials` | `adam-model` | `StaticBearer` (`MODEL_API_KEY`); a host's own: a renewed token, a proof, an injector's tag ([ADR 0058](decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)) | `RenewingCredentials` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` (`adam-a2a-runtime`) | `InMemoryBackend` (feature `test-util`) |
 | `PushStore` | `adam-a2a` | `StorePushStore` (`adam-a2a-runtime`, over the `Store`) | `InMemoryPushStore` (feature `test-util`) |
 | `Notifier`, `EventSink` | `adam-runtime` | `PgNotifier`, `PgEventSink` (`adam-notify-postgres`), `BroadcastSink` (in process) | `LocalNotifier`, `NoopSink`, `CollectingSink` |
