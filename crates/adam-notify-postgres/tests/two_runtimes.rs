@@ -170,7 +170,10 @@ async fn node(env: &Env, role: Role<'_>) -> Node {
     let local = BroadcastSink::default();
     let notify = PgNotify::new(notify_pool, local.clone())
         .with_channel_prefix(&env.channels)
-        .expect("channel prefix");
+        .expect("channel prefix")
+        // An ambient NOTIFY_LOCAL_ONLY must not silence the events this test
+        // expects to cross.
+        .local_only(false);
     let builder = Runtime::builder(store)
         .event_sink(notify.event_sink())
         .notifier(notify.notifier())
