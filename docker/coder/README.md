@@ -27,14 +27,15 @@ Stage 2 is the workspace image
 uid 10001, keeps its files in `/work` and its entrypoint is `tini -- adam-coder`. The base stays a glibc
 image because the tools in it need one; the binaries do not.
 
-Static linking brings no certificates: the binaries read the system's CA bundle for HTTPS, so an image that
-runs them without one cannot reach an HTTPS gateway, GitHub or a git remote.
+Static linking brings no certificates: the binaries that speak HTTPS (`adam-coder`, `adam-agent`,
+`adam-kube-exec`) read the system's CA bundle, so an image that runs them without one cannot reach an HTTPS
+gateway, GitHub or a git remote.
 
 ## Tests
 
 | Script | What it checks |
 |---|---|
-| `test/static-smoke.sh <image>` | `file` says each binary is static, and each starts in `debian:bookworm-slim` and Alpine as uid 10001, ending on its configuration error (78; 64 for `adam-kube-exec`), never a loader error |
+| `test/static-smoke.sh <image>` | `file` says each binary is static, the image's default user is 10001, and each starts in `debian:bookworm-slim` and Alpine as uid 10001, ending on its configuration error (78; 64 for `adam-kube-exec`), never a loader error |
 | `test/container-smoke.sh <image>` | the coder starts under tini, serves A2A fail-closed and takes a task to completion against a stub model (needs a Postgres) |
 | `test/agent-smoke.sh <image>` | the same image with `--entrypoint tini -- adam-agent` |
 | `test/http-smoke.sh <image>` | the HTTP+JSON binding, `/docs` and `/openapi.json` |

@@ -9,10 +9,11 @@
 # Linux image whatever its C library (ADR 0052 decision 10: the bench starts
 # the coder from each task image). This script takes the binaries from the image
 # and, for each, checks that `file` says statically linked (or static-pie
-# linked), and that it runs in debian:bookworm-slim and alpine:3.22 as uid 10001
-# with no configuration, ending on its own configuration error (78; 64 for
-# adam-kube-exec) instead of a loader error. It also checks that each binary
-# carries mimalloc, its global allocator. Needs docker, `file` and `grep`.
+# linked), that the image itself defaults to uid 10001, and that each binary runs
+# in debian:bookworm-slim and alpine:3.22 as uid 10001 with no configuration,
+# ending on its own configuration error (78; 64 for adam-kube-exec) instead of a
+# loader error. It also checks that each binary carries mimalloc, its global
+# allocator. Needs docker, `file` and `grep`.
 set -eu
 
 if [ "$#" -ne 1 ]; then
@@ -62,6 +63,14 @@ fail=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
 
+# The image's own user: the deployment starts it without `--user`, so the runs
+# below cannot prove the image's default by passing the flag themselves.
+user=$(docker image inspect --format '{{.Config.User}}' "$image")
+case $user in
+  10001|10001:10001) ok "the image runs as uid 10001 (USER $user)" ;;
+  *) bad "the image's default user is '${user:-root}', expected 10001" ;;
+esac
+
 for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git; do
   out=$(file -b "$work/$binary")
   case $out in
@@ -85,9 +94,21 @@ for base in \
   for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git; do
     want=$(exit_code "$binary")
     code=0
+    # The uid is read inside the container: passing `--user` proves only what the
+    # flag says, and a mutant that passes 0:0 still reaches the configuration check.
+    # shellcheck disable=SC2016 # $0 and $(id -u) expand in the container's shell.
     out=$(timeout 20 docker run --rm --user 10001:10001 --network none \
       --mount "type=bind,src=$work/$binary,dst=/bin/$binary,readonly" \
-      --entrypoint "/bin/$binary" "$base" 2>&1) || code=$?
+      --entrypoint /bin/sh "$base" \
+      -c 'uid=$(id -u) || exit 97; echo "uid=$uid"; test "$uid" = 10001 || exit 99; exec "/bin/$0"' \
+      "$binary" 2>&1) || code=$?
+    case $out in
+      *"uid=10001"*) ;;
+      *)
+        bad "$binary in $base did not run as uid 10001: $out"
+        continue
+        ;;
+    esac
     if [ "$code" -ne "$want" ]; then
       bad "$binary in $base exited $code, expected $want: $out"
       continue

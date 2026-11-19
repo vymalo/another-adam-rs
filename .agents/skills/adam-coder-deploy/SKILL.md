@@ -170,8 +170,9 @@ Then the compose scenarios of the `image` job in `.github/workflows/coder.yml`
 * A new GHCR package is private until its owner makes it public: check an anonymous pull before
   a deployment points at it (`adam-upgrade` has the token and manifest request).
 * The build context is the repository root, not `docker/coder`.
-* The binaries are static (musl), but their TLS roots are not: each reads the system's CA bundle, so an
-  image that runs the coder without CA certificates cannot reach an HTTPS gateway, GitHub or a git remote.
+* The binaries are static (musl), but their TLS roots are not: `adam-coder`, `adam-agent` and
+  `adam-kube-exec` read the system's CA bundle, so an image that runs the coder without CA certificates cannot
+  reach an HTTPS gateway, GitHub or a git remote.
 * A musl build needs `musl-gcc` in the builder (`musl-tools`); a missing one fails in `aws-lc-sys` or
   `mimalloc`'s C sources, not in Rust code.
 * A workspace base tag that is a placeholder (`...PENDING`) makes the workflow skip the build

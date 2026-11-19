@@ -86,9 +86,9 @@ a deployment without run pods that sets `GIT_SANDBOX_SOCKET` runs the server its
 headless browser), pinned by an immutable tag, with those binaries, the devcontainer CLI and Podman's remote client
 added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is
 `tini -- adam-coder` (`tini` forwards SIGTERM and reaps children). Tags are `sha-<7>` of the commit. The binaries are smoke-tested in CI
-(`docker/coder/test/`). Static linking brings no certificates: each binary still reads the system's CA bundle
-for HTTPS (the `workspace` base has one), so an image that runs the coder without one cannot reach the model
-gateway, GitHub or a git remote.
+(`docker/coder/test/`). Static linking brings no certificates: the binaries that speak HTTPS (`adam-coder`,
+`adam-agent`, `adam-kube-exec`) still read the system's CA bundle for HTTPS (the `workspace` base has one), so
+an image that runs the coder without one cannot reach the model gateway, GitHub or a git remote.
 
 The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into the binaries. The agent card then says
 which build answers: `version` is `<crate version>+<first 7>` and the `build/v1` extension carries the whole revision
