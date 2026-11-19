@@ -226,6 +226,7 @@ impl Tool for ReadsCatalog {
         let at = ctx
             .context("catalog")
             .map(|value| std::ptr::from_ref(value) as usize);
+        assert!(at.is_some(), "the catalog is in the context of every call");
         self.seen.lock().unwrap().push(at.unwrap_or(0));
         Ok(ToolOutput::text("ok"))
     }

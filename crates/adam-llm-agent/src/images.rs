@@ -58,6 +58,11 @@ pub const MAX_RUN_JOURNALED_IMAGE_BYTES: usize = adam_runtime::MAX_RUN_FILE_BYTE
 /// The most bytes of images a scope keeps on a volume ([`KeptImages`] says it again for its own).
 pub const MAX_SCOPE_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The most bytes of verified images one process keeps in memory for later requests
+/// ([`ImageCache`]): one scope's room, and not a byte more whatever the number of conversations
+/// the process serves.
+pub(crate) const MAX_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// An image as an inbound message carries it: base64 `data`, and what the sender says of it. Its
 /// type and its name are checked, never trusted. Its `Debug` says how long the data is and never
 /// prints it.
@@ -618,11 +623,12 @@ pub(crate) struct ImagePolicy {
 /// every later request of the same scope wants, so a turn reads (and hashes) a file once, not once
 /// per model call. A hash the cache has never seen in this scope is still read and checked, so a
 /// reference cannot reach another conversation's bytes through the cache. Bounded by
-/// [`MAX_SCOPE_IMAGE_BYTES`] in all (what one scope may hold on a volume); the oldest entry goes
-/// first.
+/// [`MAX_IMAGE_CACHE_BYTES`] in all; the oldest entry goes first.
 #[derive(Debug, Default)]
 pub(crate) struct ImageCache {
-    bytes: HashMap<(String, String), Arc<[u8]>>,
+    /// By scope, then by SHA-256: a lookup with `&str` allocates nothing, so a turn that finds
+    /// every image here does not copy a scope or a hash.
+    bytes: HashMap<String, HashMap<String, Arc<[u8]>>>,
     order: VecDeque<(String, String)>,
     total: usize,
     #[cfg(test)]
@@ -638,8 +644,11 @@ impl ImageCache {
 
     /// The bytes checked for `sha256` in `scope`, if they were read before.
     fn get(&mut self, scope: &str, sha256: &str) -> Option<Arc<[u8]>> {
-        let key = (scope.to_owned(), sha256.to_owned());
-        let bytes = self.bytes.get(&key).cloned();
+        let bytes = self
+            .bytes
+            .get(scope)
+            .and_then(|images| images.get(sha256))
+            .cloned();
         #[cfg(test)]
         {
             if bytes.is_some() {
@@ -652,19 +661,27 @@ impl ImageCache {
     }
 
     fn insert(&mut self, scope: &str, sha256: String, bytes: Arc<[u8]>) {
-        let key = (scope.to_owned(), sha256);
-        if self.bytes.contains_key(&key) {
+        let images = match self.bytes.get_mut(scope) {
+            Some(images) => images,
+            None => self.bytes.entry(scope.to_owned()).or_default(),
+        };
+        if images.contains_key(&sha256) {
             return;
         }
         self.total = self.total.saturating_add(bytes.len());
-        self.bytes.insert(key.clone(), bytes);
-        self.order.push_back(key);
-        while self.total > MAX_SCOPE_IMAGE_BYTES as usize {
-            let Some(oldest) = self.order.pop_front() else {
+        images.insert(sha256.clone(), bytes);
+        self.order.push_back((scope.to_owned(), sha256));
+        while self.total > MAX_IMAGE_CACHE_BYTES {
+            let Some((scope, sha256)) = self.order.pop_front() else {
                 break;
             };
-            if let Some(gone) = self.bytes.remove(&oldest) {
-                self.total = self.total.saturating_sub(gone.len());
+            if let Some(images) = self.bytes.get_mut(&scope) {
+                if let Some(gone) = images.remove(&sha256) {
+                    self.total = self.total.saturating_sub(gone.len());
+                }
+                if images.is_empty() {
+                    self.bytes.remove(&scope);
+                }
             }
         }
     }
@@ -711,8 +728,8 @@ pub(crate) async fn image_data(
     if wanted.is_empty() {
         return data;
     }
-    // The images of one request are read at the same time: one blocking read each, and a
-    // sequential loop would make a request with eight images wait for eight reads.
+    // The misses of one request are read with `join_all`: an async keeper's reads may overlap; a
+    // keeper that blocks its task runs them one after another and neither gains nor loses.
     let loaded: Vec<Option<Vec<u8>>> = match store {
         Some(store) => {
             let store = store.clone();

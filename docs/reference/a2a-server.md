@@ -509,7 +509,7 @@ stateDiagram-v2
     Admitted --> Kept: keep (store or state)
     Kept --> Sent: every request names it
     Sent --> StandIn: the settings changed (for_sending), or the provider refused the request (refused_with_images)
-    Sent --> NotLoaded: the bytes are gone or fail their hash (image_data)
+    Sent --> NotLoaded: the first read fails: gone, or the hash does not match (image_data)
     NotLoaded --> Sent: the bytes are back
     Sent --> Removed: shortening of an old tool result
     Sent --> Summarised: compaction drops its turn
@@ -518,7 +518,7 @@ stateDiagram-v2
     Summarised --> [*]
 ```
 
-The states that are lines: `StandIn` is written once into the history (the record says why); a change of the **settings** (`for_sending`) is said in every request and recorded nowhere, and `NotLoaded` is the client's line `could not be loaded; read it again`, for bytes that are gone or fail their hash and for nothing else.
+The states that are lines: `StandIn` is written once into the history (the record says why); a change of the **settings** (`for_sending`) is said in every request and recorded nowhere, and `NotLoaded` is the client's line `could not be loaded; read it again`, for bytes that are gone or fail their hash on the first read of a process and for nothing else.
 
 * **Admitted once, recorded.** The decision is a journaled step per message (`image:start` for the start message, `image:<message id>` for a later one) and lives in the history as an `ImageRef` (SHA-256, type, size, dimensions, origin), so a replay, another worker and every later turn send the same images and each request's prompt starts with the one before it. A message with no picture is read as it always was.
 * **The size is read from the header** (`adam_runtime::image_size`: PNG, JPEG, GIF, WebP; a hand-written reader with bounded loops). An image is never decoded or resized.
@@ -527,9 +527,12 @@ The states that are lines: `StandIn` is written once into the history (the recor
   | Agent | The bytes are in | Until | Bound |
   |---|---|---|---|
   | any | the inbound message in the inbox, and `Conversation::pending_images` for the start message | the first step that reads it | 4 images and 2 MiB a message |
+  | any (what a request read) | the process's memory, by scope and SHA-256 (`ImageCache`) | the life of the process; the oldest entry goes first | 64 MiB a process |
   | the coder (it has an `ImageStore`) | files on its volume, per conversation | the janitor removes the scope ([the coder](coder-agent.md#images)) | 4 MiB an image, 64 MiB a scope; **nothing in the journal and nothing in the state** after the first step |
   | a folder agent (no store) | the run's state, base64, and the journal of the tool step that kept them (as a kept output) | the state: until no message names the image; the journal: for good | the state: the 4 MiB it shares with kept outputs; the journal: `MAX_RUN_JOURNALED_IMAGE_BYTES` (6 MiB, a run's budget of file bytes) over the whole run, never freed by a shortening or a compaction, then an image is a line that says the run has kept as many image bytes as it may |
   | a tool's image with `files: true` (MCP) | also a file artifact, journaled as every artifact is, with the same SHA-256 | as an artifact | the artifact bounds |
+
+  The **first read of a `(scope, SHA-256)` in a process** reads the bytes and checks the hash (a keeper checks its own too); the checked bytes are the row above, and later requests of the same scope send them without reading the file again. A file changed after that first read is not re-read.
 
   A request resends every image the history holds, so `MODEL_IMAGE_MAX_BYTES` times `MODEL_IMAGE_MAX_COUNT` may be at most 32 MiB (over it is exit 78).
 * **What is sent follows the settings now.** Whether an image is sent is decided each time a request is built, from the reference and the deployment's settings, and nothing about it is recorded: an image whose source is no longer in `MODEL_IMAGE_SOURCES`, that is over the byte limit now, or for a model that no longer sees, is a line that says the true reason (`this deployment no longer sends images from mcp`, `it is over the 1.0 MiB this deployment sends`, `this model cannot see images`). While the settings stay every request says the same, so the prefix holds; **a change of settings changes the prompt once**.

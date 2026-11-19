@@ -212,9 +212,12 @@ pub(crate) struct Chars {
 }
 
 impl Chars {
-    /// The total characters of `messages`. A history of one run only ever grows between two counts
-    /// (a shortening rewrites messages in place and leaves the count here), so only the messages
-    /// past the last count are walked; a shorter history (a compaction) is counted in full.
+    /// The total characters of `messages`. A history of one run only ever grows between two counts,
+    /// so only the messages past the last count are walked; a shorter history (a compaction) is
+    /// counted in full. A rewrite that changes a message in place without changing the count -
+    /// `record_shortenings` itself, the start message's images in `LlmAgent::admit_images`, and the
+    /// images of a refused request in `Conversation::replace_unsent_images` - leaves this count
+    /// stale: `record_shortenings` updates it, and the other two call `LlmAgent::forget_chars`.
     pub(crate) fn total(&mut self, messages: &[Message]) -> usize {
         if self.len <= messages.len() {
             self.chars += messages[self.len..]
@@ -230,10 +233,12 @@ impl Chars {
 }
 
 /// The character count of each run's history as this worker last made it, so a turn counts only
-/// what it appended since. An entry is used only for the history it counted: a run whose
-/// `shortenings` or `compactions` changed was rewritten by someone else (another worker, a
-/// takeover), and its first turn is always counted in full, so a run id the store reuses after a
-/// purge never reads another run's total.
+/// what it appended since. The guard covers the two changes that rewrite the history and record
+/// it: `shortenings` and `compactions` must be the same. A message rewritten in place without
+/// either counter moving - the start message's images, a refused request's images - is not seen by
+/// the guard; those rewrites call `LlmAgent::forget_chars` in the process that makes them. A run's
+/// first turn is always counted in full, so a run id the store reuses after a purge never reads
+/// another run's total.
 #[derive(Debug, Default)]
 pub(crate) struct RunChars {
     entries: HashMap<RunId, (Chars, usize, usize)>,

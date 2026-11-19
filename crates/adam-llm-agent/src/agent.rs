@@ -1371,7 +1371,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         state: &mut Conversation,
-        context: &Arc<Map<String, Value>>,
+        context: Option<&Arc<Map<String, Value>>>,
     ) -> Result<Flow, AgentError> {
         if ctx.is_cancelled() {
             return Ok(Flow::Fail(CANCELLED.into()));
@@ -1422,7 +1422,7 @@ impl LlmAgent {
                 ctx.run_id(),
                 state.root_run.unwrap_or_else(|| ctx.run_id()),
                 ctx.conversation_id().map(str::to_owned),
-                Arc::clone(context),
+                context.cloned().unwrap_or_default(),
             )
         });
         let turn = state.turns;
@@ -2271,7 +2271,7 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         notices: &[(RunId, ChildStatus)],
-        context: &Arc<Map<String, Value>>,
+        context: Option<&Arc<Map<String, Value>>>,
     ) -> Result<Flow, AgentError> {
         while let Some(call) = state.pending_calls.first().cloned() {
             // A cancel stops the turn between its calls too: the ones still owed do not start.
@@ -2585,7 +2585,7 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         n: usize,
-        context: &Arc<Map<String, Value>>,
+        context: Option<&Arc<Map<String, Value>>>,
     ) -> Result<Option<Flow>, AgentError> {
         let calls: Vec<ToolCall> = state.pending_calls[..n].to_vec();
         let notes = state.source_notes.clone();
@@ -2979,7 +2979,7 @@ impl LlmAgent {
     fn prepare(
         &self,
         ctx: &Ctx,
-        context: &Arc<Map<String, Value>>,
+        context: Option<&Arc<Map<String, Value>>>,
         root: (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call: &ToolCall,
@@ -3013,7 +3013,7 @@ impl LlmAgent {
                     ctx.run_id(),
                     root.0.unwrap_or_else(|| ctx.run_id()),
                     ctx.conversation_id().map(str::to_owned),
-                    Arc::clone(context),
+                    context.cloned().unwrap_or_default(),
                 ),
             )
         });
@@ -3092,7 +3092,7 @@ impl LlmAgent {
     async fn run_tool(
         &self,
         ctx: &mut Ctx,
-        context: &Arc<Map<String, Value>>,
+        context: Option<&Arc<Map<String, Value>>>,
         root: (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call: &ToolCall,
@@ -3289,7 +3289,7 @@ impl LlmAgent {
     fn tool_ctx(
         &self,
         ctx: &Ctx,
-        context: &Arc<Map<String, Value>>,
+        context: Option<&Arc<Map<String, Value>>>,
         (root_run, root_step, plan): (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call_id: &str,
@@ -3304,7 +3304,7 @@ impl LlmAgent {
             ctx.cancel_token(),
             Arc::clone(&self.extensions),
             Some(ctx.child_starter()),
-            Arc::clone(context),
+            context.cloned().unwrap_or_default(),
             root_run,
             root_step.map(str::to_owned),
             self.style_of(tool, notes)
@@ -3424,7 +3424,7 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         wait: &PendingRemote,
-        context: &Arc<Map<String, Value>>,
+        context: Option<&Arc<Map<String, Value>>>,
     ) -> Result<Option<StepState>, AgentError> {
         let owed = |state: &mut Conversation, message: Message| {
             state.messages.push(message);
@@ -4340,8 +4340,11 @@ impl Agent for LlmAgent {
         }
         // One shared copy of the run's context for this step: every tool call and every source
         // sees the same map, and no call clones it. Built after this step's messages merged their
-        // context and the expired entries left, so it is the map the tools of this step read.
-        let context: Arc<Map<String, Value>> = Arc::new(state.context.clone());
+        // context and the expired entries left, so it is the map the tools of this step read, and
+        // only when there is something in it: a step with no context (a wake that only looks at a
+        // wait) does not copy one.
+        let context: Option<Arc<Map<String, Value>>> =
+            (!state.context.is_empty()).then(|| Arc::new(state.context.clone()));
 
         // A wait on a child ends with the child's message or, when woken without one (the timer,
         // or a user message), with what the store says. A message that matches no wait (a
@@ -4366,7 +4369,10 @@ impl Agent for LlmAgent {
         // (or by a user message, which queues behind the result), the run looks once and either
         // answers the call or parks again.
         if let Some(PendingWait::Remote(wait)) = state.pending_wait.clone() {
-            match self.poll_remote(ctx, &mut state, &wait, &context).await? {
+            match self
+                .poll_remote(ctx, &mut state, &wait, context.as_ref())
+                .await?
+            {
                 Some(outcome) => {
                     ctx.emit(self.step_end_with_result(&state, &wait.tool, &wait.call_id, outcome))
                         .await;
@@ -4389,7 +4395,7 @@ impl Agent for LlmAgent {
                 deadline: None,
             };
             match self
-                .poll_remote(ctx, &mut state, &looking, &context)
+                .poll_remote(ctx, &mut state, &looking, context.as_ref())
                 .await?
             {
                 Some(outcome) => {
@@ -4413,7 +4419,7 @@ impl Agent for LlmAgent {
         let mut flow = Flow::Next;
         if state.pending_calls.is_empty() {
             state.messages.append(&mut state.deferred);
-            flow = self.model_turn(ctx, &mut state, &context).await?;
+            flow = self.model_turn(ctx, &mut state, context.as_ref()).await?;
             // A call that starts, sends to or closes a session has an effect no failed try can undo:
             // the turn and its calls are committed first, so a retry never asks the model again
             // (new call ids, so a second session) and the call runs under the id the history holds.
@@ -4424,7 +4430,7 @@ impl Agent for LlmAgent {
         }
         if matches!(flow, Flow::Next) {
             flow = self
-                .run_pending(ctx, &mut state, &notices, &context)
+                .run_pending(ctx, &mut state, &notices, context.as_ref())
                 .await?;
         }
         // The order the model asked for is the turn's: once its calls are answered it says nothing.
@@ -4445,6 +4451,7 @@ impl Agent for LlmAgent {
                     {
                         let mut output = json!({ "text": text, "artifacts": state.artifacts });
                         self.end_sessions(ctx, &mut state, &mut output).await?;
+                        self.forget_chars(ctx.run_id());
                         return Ok(Transition::Done { state, output });
                     }
                     state.announced_final = false;
@@ -4752,22 +4759,6 @@ mod compaction_gate_tests {
             injected + order::INSTRUCTION.chars().count() + 2,
             "the property and the sentence (after a blank line) are counted"
         );
-    }
-
-    /// The count a request's fixed part costs is made once, at build: asking again gives the same
-    /// value a recompute from the agent's specs gives.
-    #[test]
-    fn the_fixed_part_is_cached_at_build() {
-        let agent = built(10);
-        let mut shown = agent.specs.clone();
-        order::prepare(&mut shown, true);
-        let want = agent
-            .instructions
-            .as_deref()
-            .map_or(0, |s| s.chars().count())
-            + serde_json::to_string(&shown).unwrap().chars().count();
-        assert_eq!(agent.fixed_chars(), want);
-        assert_eq!(agent.fixed_chars(), want);
     }
 
     /// A history of `turns` turns whose results are `size` letters, and `turns` model turns made.

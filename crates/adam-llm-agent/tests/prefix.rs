@@ -1748,23 +1748,30 @@ async fn the_bytes_of_an_image_are_read_once_for_the_run() {
 
 /// The bytes of an image changed between two turns are the bytes already checked for its hash: the
 /// reference stays in the request, the bytes it names are sent from the cache, and what was written
-/// over the file is never sent.
+/// over the file is never sent. The file is read once, not again after the change.
 #[tokio::test]
 async fn an_image_changed_between_turns_is_sent_from_the_bytes_already_checked() {
-    let images = Arc::new(MemoryImages::new());
-    let rig = Rig::seeing(0, limits(8), {
-        let images = images.clone();
-        move |b| b.state(Arc::new(ImageStore(images))).tool(Snap)
+    let keeper = Arc::new(Counting {
+        inner: MemoryImages::new(),
+        loads: AtomicUsize::new(0),
     });
-    rig.mock.push_tool_calls(vec![snap(1)]).push_text("done");
+    let rig = Rig::seeing(0, limits(8), {
+        let keeper = keeper.clone();
+        move |b| b.state(Arc::new(ImageStore(keeper))).tool(Big)
+    });
+    rig.mock
+        .push_tool_calls(vec![call("c1", "big", json!({"n": 10}))])
+        .push_text("done");
     {
-        let (images, arm) = (images.clone(), rig.arm.clone());
+        let (keeper, arm) = (keeper.clone(), rig.arm.clone());
         rig.after_each_call(move |n| {
             if n == 0 {
                 let run = arm.run.lock().unwrap().unwrap();
                 let sha = adam_llm_agent::sha256_hex(&png(64, 64, 4));
                 let scope = adam_llm_agent::image_scope(None, &run.to_string());
-                images.tamper(&scope, &sha, b"changed behind its back");
+                keeper
+                    .inner
+                    .tamper(&scope, &sha, b"changed behind its back");
             }
         });
     }
@@ -1773,13 +1780,9 @@ async fn an_image_changed_between_turns_is_sent_from_the_bytes_already_checked()
     let (requests, _) = rig.finish(run).await;
     assert_eq!(requests[0].image_data.len(), 1);
     // The reference is still in the second request, and its bytes are the ones the first request
-    // checked: the changed file is not served.
-    assert_eq!(images_of(&requests[1].messages).len(), 2);
-    assert_eq!(
-        requests[1].image_data.len(),
-        2,
-        "the person's bytes are the checked ones; the tool's image has its own"
-    );
+    // checked: the changed file is not served, and it is not read again.
+    assert_eq!(images_of(&requests[1].messages).len(), 1);
+    assert_eq!(requests[1].image_data.len(), 1);
     let person = adam_llm_agent::sha256_hex(&png(64, 64, 4));
     let bytes = requests[1]
         .image_data
@@ -1787,6 +1790,11 @@ async fn an_image_changed_between_turns_is_sent_from_the_bytes_already_checked()
         .expect("the person's bytes");
     assert_eq!(bytes.as_ref(), png(64, 64, 4).as_slice());
     assert_ne!(bytes.as_ref(), b"changed behind its back");
+    assert_eq!(
+        keeper.loads.load(SeqCst),
+        1,
+        "the file was read once, before the change"
+    );
 }
 
 /// A request the provider refuses for itself, with images no earlier request carried: they are
