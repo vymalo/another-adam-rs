@@ -136,6 +136,10 @@ pub enum RemoteAuthProblem {
     /// The value cannot be a bearer token: it has whitespace or a control character inside it, a
     /// character outside printable ASCII, or is not valid Unicode.
     NotAToken,
+    /// Not given through [`AgentDef::env`](crate::AgentDef::env), and the
+    /// [`AgentDef::secrets`](crate::AgentDef::secrets) source gives no value for it, set or not
+    /// (an embedded engine whose host did not give it).
+    Refused,
 }
 
 impl fmt::Display for RemoteAuthProblem {
@@ -144,6 +148,7 @@ impl fmt::Display for RemoteAuthProblem {
             Self::Missing => "it is not set",
             Self::Empty => "it is empty",
             Self::NotAToken => "its value is not a bearer token (printable ASCII, no whitespace)",
+            Self::Refused => "this host gives no value for it",
         })
     }
 }

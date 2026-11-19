@@ -17,6 +17,10 @@ pub enum VarProblem {
     /// expands to nothing (`Authorization: Bearer ` with the token gone) is a mistake, not a
     /// header.
     Empty,
+    /// Not in [`Env`](crate::Env), and its [`SecretSource`](adam_core::SecretSource) gives no
+    /// value for it, set or not (an embedded engine whose host did not give it), and the reference
+    /// has no `:-default`.
+    Refused,
 }
 
 impl fmt::Display for VarProblem {
@@ -25,6 +29,7 @@ impl fmt::Display for VarProblem {
             Self::Missing => "is not set",
             Self::NotUnicode => "is not valid Unicode",
             Self::Empty => "is empty",
+            Self::Refused => "is not given by this host",
         })
     }
 }

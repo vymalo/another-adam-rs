@@ -21,6 +21,7 @@ use a2a_client::jsonrpc::JsonRpcTransportFactory;
 use a2a_client::rest::RestTransportFactory;
 use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use adam_agent_fs::{RemoteAgent, RemoteAuth};
+use adam_core::{DynSecretSource, ProcessEnv, SecretError};
 use adam_llm_agent::{
     RemotePoll, StepIcon, StepKind, StepStyle, Tool, ToolCtx, ToolError, ToolOutput,
 };
@@ -58,8 +59,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// [`AgentDef`](crate::AgentDef) and used at bind.
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteSettings {
-    /// Values for environment variables, taken before the process environment.
+    /// Values for environment variables, taken before `secrets`.
     pub(crate) env: Arc<BTreeMap<String, SecretString>>,
+    /// Where a name with no value in `env` is asked: the process environment unless the host
+    /// says otherwise (ADR 0047).
+    pub(crate) secrets: DynSecretSource,
     /// Allow `http` to hosts that are not this machine.
     pub(crate) allow_insecure: bool,
     /// How long a parent waits for a remote task.
@@ -70,6 +74,7 @@ impl Default for RemoteSettings {
     fn default() -> Self {
         Self {
             env: Arc::default(),
+            secrets: Arc::new(ProcessEnv),
             allow_insecure: false,
             max_wait: DEFAULT_MAX_WAIT,
         }
@@ -77,8 +82,8 @@ impl Default for RemoteSettings {
 }
 
 impl RemoteSettings {
-    /// The token of `bearer:var`: the value given in code, else the process environment. Trimmed,
-    /// and refused when it could not be sent as a bearer token.
+    /// The token of `bearer:var`: the value given in code, else the secret source. Trimmed, and
+    /// refused when it could not be sent as a bearer token.
     fn token(&self, origin: &Origin, var: &str) -> Result<SecretString, Error> {
         let fail = |problem| Error::RemoteAuth {
             origin: origin.clone(),
@@ -87,14 +92,11 @@ impl RemoteSettings {
         };
         let raw = match self.env.get(var) {
             Some(value) => value.expose_secret().to_owned(),
-            None => match std::env::var(var) {
-                Ok(value) => value,
-                Err(std::env::VarError::NotPresent) => {
-                    return Err(fail(RemoteAuthProblem::Missing));
-                }
-                Err(std::env::VarError::NotUnicode(_)) => {
-                    return Err(fail(RemoteAuthProblem::NotAToken));
-                }
+            None => match self.secrets.secret(var) {
+                Ok(value) => value.expose_secret().to_owned(),
+                Err(SecretError::Missing) => return Err(fail(RemoteAuthProblem::Missing)),
+                Err(SecretError::Refused) => return Err(fail(RemoteAuthProblem::Refused)),
+                Err(SecretError::NotUnicode) => return Err(fail(RemoteAuthProblem::NotAToken)),
             },
         };
         let token = raw.trim();
@@ -911,6 +913,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_source_that_refuses_every_name_refuses_a_token_the_process_has() {
+        // `PATH` is in every process environment, and a refusing source still does not give it.
+        let a = agent("https://billing.example.com/card", Some("PATH"));
+        let refusing = RemoteSettings {
+            secrets: Arc::new(adam_core::NoSecrets),
+            ..settings(&[])
+        };
+        let error = RemoteSubagentTool::bind(&origin(), &a, &refusing).unwrap_err();
+        let Error::RemoteAuth { var, problem, .. } = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(
+            (var.as_str(), *problem),
+            ("PATH", RemoteAuthProblem::Refused)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("this host gives no value for it"),
+            "{error}"
+        );
+        // A value given in code is given: the source is asked only for the others.
+        let given = RemoteSettings {
+            secrets: Arc::new(adam_core::NoSecrets),
+            ..settings(&[("PATH", "tok")])
+        };
+        let tool = RemoteSubagentTool::bind(&origin(), &a, &given).unwrap();
+        assert_eq!(tool.endpoint.token.as_ref().unwrap().expose_secret(), "tok");
     }
 
     #[test]

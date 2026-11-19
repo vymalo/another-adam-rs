@@ -7,30 +7,53 @@ use std::fmt;
 use std::sync::Arc;
 
 use adam_agent_fs::{EnvRef, Segment, split_env_references};
+use adam_core::{DynSecretSource, ProcessEnv, SecretError};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::error::{Error, VarProblem};
 use crate::redact::Redactor;
 
-/// Values for environment variables, taken before the process environment. A composition root
-/// that fetches its secrets from a vault gives them here and never puts them in the environment.
-/// The values are held as secrets: `Debug` shows the names only.
+/// Values for environment variables, taken before the [`SecretSource`](adam_core::SecretSource)
+/// (the process environment unless [`Env::source`] says otherwise). A composition root that
+/// fetches its secrets from a vault gives them here and never puts them in the environment. The
+/// values are held as secrets: `Debug` shows the names only.
 ///
 /// ```
 /// use adam_mcp::Env;
 ///
 /// let env = Env::new().var("LINEAR_API_TOKEN", "lin_api_example");
-/// assert_eq!(format!("{env:?}"), r#"Env { names: ["LINEAR_API_TOKEN"] }"#);
+/// assert_eq!(
+///     format!("{env:?}"),
+///     r#"Env { names: ["LINEAR_API_TOKEN"], source: ProcessEnv }"#
+/// );
 /// ```
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Env {
     values: Arc<BTreeMap<String, SecretString>>,
+    source: DynSecretSource,
+}
+
+impl Default for Env {
+    fn default() -> Self {
+        Self {
+            values: Arc::default(),
+            source: Arc::new(ProcessEnv),
+        }
+    }
 }
 
 impl Env {
     /// No values: only the process environment.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Ask `source` for a name that has no value here, instead of the process environment
+    /// (ADR 0047: an embedded engine's [`NoSecrets`](adam_core::NoSecrets) refuses every name).
+    #[must_use]
+    pub fn source(mut self, source: DynSecretSource) -> Self {
+        self.source = source;
+        self
     }
 
     /// Give `name` the value `value`.
@@ -43,7 +66,10 @@ impl Env {
     /// The values `adam-assembly` keeps for [`AgentDef::env`](https://docs.rs/adam-assembly), so
     /// one set of secrets serves the remote subagents and the MCP servers of an agent.
     pub fn from_values(values: Arc<BTreeMap<String, SecretString>>) -> Self {
-        Self { values }
+        Self {
+            values,
+            ..Self::default()
+        }
     }
 }
 
@@ -51,6 +77,7 @@ impl fmt::Debug for Env {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Env")
             .field("names", &self.values.keys().collect::<Vec<_>>())
+            .field("source", &self.source)
             .finish()
     }
 }
@@ -121,23 +148,24 @@ impl<'a> Expander<'a> {
             problem,
         };
         let set = match self.env.values.get(&reference.name) {
-            Some(value) => Some(value.expose_secret().to_owned()),
-            None => match std::env::var(&reference.name) {
-                Ok(value) => Some(value),
-                Err(std::env::VarError::NotPresent) => None,
-                Err(std::env::VarError::NotUnicode(_)) => {
-                    return Err(fail(VarProblem::NotUnicode));
-                }
+            Some(value) => Ok(value.expose_secret().to_owned()),
+            None => match self.env.source.secret(&reference.name) {
+                Ok(value) => Ok(value.expose_secret().to_owned()),
+                Err(SecretError::Missing) => Err(VarProblem::Missing),
+                Err(SecretError::Refused) => Err(VarProblem::Refused),
+                Err(SecretError::NotUnicode) => return Err(fail(VarProblem::NotUnicode)),
             },
         };
         // POSIX `:-`: the default stands for a variable that is unset *or empty*. Without a
-        // default, an empty variable expands to nothing, as in a shell, except in a header.
+        // default, an empty variable expands to nothing, as in a shell, except in a header. A
+        // name the source refuses is not given, like an unset one: the file's default is text of
+        // the file, not a secret.
         match (set, &reference.default) {
-            (Some(value), _) if !value.is_empty() => Ok(Value::Variable(value)),
+            (Ok(value), _) if !value.is_empty() => Ok(Value::Variable(value)),
             (_, Some(default)) => Ok(Value::Default(default.clone())),
-            (Some(_), None) if forbid_empty => Err(fail(VarProblem::Empty)),
-            (Some(_), None) => Ok(Value::Variable(String::new())),
-            (None, None) => Err(fail(VarProblem::Missing)),
+            (Ok(_), None) if forbid_empty => Err(fail(VarProblem::Empty)),
+            (Ok(_), None) => Ok(Value::Variable(String::new())),
+            (Err(problem), None) => Err(fail(problem)),
         }
     }
 }
@@ -172,6 +200,63 @@ mod tests {
         assert_eq!(from_process, format!("p={process}!"));
         // Text without references passes through, and so does a lone `$`.
         assert_eq!(expand(&Env::new(), "cost $5 {x}").unwrap().0, "cost $5 {x}");
+    }
+
+    /// A source that gives one name and says `Missing` for every other, to show it is asked.
+    #[derive(Debug)]
+    struct Vault;
+
+    impl adam_core::SecretSource for Vault {
+        fn secret(&self, name: &str) -> Result<SecretString, SecretError> {
+            match name {
+                "VAULT_TOKEN" => Ok(SecretString::from("from-vault")),
+                _ => Err(SecretError::Missing),
+            }
+        }
+    }
+
+    #[test]
+    fn a_source_that_refuses_every_name_refuses_one_the_process_has() {
+        let env = Env::new().source(Arc::new(adam_core::NoSecrets));
+        // `PATH` is in every process environment, and still not given.
+        let error = expand(&env, "p=${PATH}").unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Var { var, problem: VarProblem::Refused, .. } if var == "PATH"
+        ));
+        assert!(
+            error.to_string().contains("is not given by this host"),
+            "{error}"
+        );
+        // The file's default is text of the file, and stands for a name that is not given.
+        assert_eq!(expand(&env, "${PATH:-fallback}").unwrap().0, "fallback");
+        // A value given in code is given: the source is asked only for the others.
+        let given = env.clone().var("PATH", "from-code");
+        assert_eq!(expand(&given, "p=${PATH}").unwrap().0, "p=from-code");
+        // `from_values` keeps the process environment; `source` replaces it.
+        let process = Env::from_values(Arc::default());
+        assert_eq!(
+            format!("{process:?}"),
+            "Env { names: [], source: ProcessEnv }"
+        );
+    }
+
+    #[test]
+    fn the_source_is_asked_for_a_name_with_no_value_here() {
+        let env = Env::new().source(Arc::new(Vault));
+        let (out, redactor) = expand(&env, "t=${VAULT_TOKEN}").unwrap();
+        assert_eq!(out, "t=from-vault");
+        // What the source gave is hidden like any variable's value.
+        assert_eq!(redactor.scrub("said from-vault"), "said [REDACTED]");
+        // Its `Missing` is the reference's, with or without a default.
+        assert!(matches!(
+            expand(&env, "${PATH}").unwrap_err(),
+            Error::Var {
+                problem: VarProblem::Missing,
+                ..
+            }
+        ));
+        assert_eq!(expand(&env, "${PATH:-d}").unwrap().0, "d");
     }
 
     #[test]

@@ -291,12 +291,23 @@ impl AgentDef {
 
     /// Give an environment variable a value here, in code, for the agent files that read one:
     /// `auth: bearer:BILLING_TOKEN` on a remote subagent reads `BILLING_TOKEN`. A value given here
-    /// wins over the process environment, so a composition root that fetches its secrets from a
+    /// wins over the [`secrets`](Self::secrets) source (the process environment by default), so a composition root that fetches its secrets from a
     /// vault (or a test) does not have to put them in the environment. The value is held as a
     /// secret: it is not shown by `Debug`, and no error carries it.
     #[must_use]
     pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.remote.env).insert(name.into(), SecretString::from(value.into()));
+        self
+    }
+
+    /// Where a variable that agent files name and [`env`](Self::env) does not give is asked: the
+    /// process environment by default, which is a server's. An application that embeds adam gives
+    /// its own source, or [`NoSecrets`](adam_core::NoSecrets), which refuses every name (ADR 0047,
+    /// decision 5). It serves the bearer tokens of remote subagents and the `${VAR}` of the
+    /// `mcp.json` files alike.
+    #[must_use]
+    pub fn secrets(mut self, source: adam_core::DynSecretSource) -> Self {
+        self.remote.secrets = source;
         self
     }
 
@@ -458,7 +469,8 @@ impl AgentDef {
     /// [`Error::Mcp`], naming the agent and its `mcp.json`, for the first server that fails.
     #[cfg(feature = "mcp")]
     pub async fn connect_mcp(mut self, policy: &adam_mcp::McpPolicy) -> Result<Self, Error> {
-        let env = adam_mcp::Env::from_values(Arc::clone(&self.remote.env));
+        let env = adam_mcp::Env::from_values(Arc::clone(&self.remote.env))
+            .source(Arc::clone(&self.remote.secrets));
         let mut agents = Vec::new();
         mcp::local_agents(&self.manifest, &self.manifest.name, &mut agents);
         let mut connected = Vec::new();
