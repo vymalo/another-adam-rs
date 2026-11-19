@@ -578,3 +578,22 @@ test('C: only the relays publish ports, and only on the loopback', compose, () =
   assert.deepEqual(published, ['pub-coder-1', 'pub-coder-2', 'pub-git']);
   for (const n of published) for (const port of config.services[n].ports) assert.equal(port.host_ip, '127.0.0.1', n);
 });
+
+test('BENCH_COMPOSE_BUILD=0 starts the stack without --build; unset or 1 keeps it; any other value is refused', async (t) => {
+  const off = makeStack(t, { baseEnv: { BENCH_COMPOSE_BUILD: '0' } });
+  await off.stack.up();
+  assert.deepEqual(composeArgs(off.calls[0]), ['up', '-d', '--wait', ...serviceNames(2)]);
+  for (const env of [{}, { BENCH_COMPOSE_BUILD: '1' }]) {
+    const on = makeStack(t, { baseEnv: env });
+    await on.stack.up();
+    assert.ok(composeArgs(on.calls[0]).includes('--build'));
+  }
+  assert.throws(() => makeStack(t, { baseEnv: { BENCH_COMPOSE_BUILD: 'no' } }), StackError);
+});
+
+test('the images compose builds are the ones the stack lists: every service with a build in compose.yaml, named <project>-<service>', (t) => {
+  const text = fs.readFileSync(COMPOSE, 'utf8');
+  const built = [...text.matchAll(/^ {2}([a-z0-9-]+):\n(?: {4}.*\n)*? {4}build:/gm)].map((m) => `adam-bench-${m[1]}`);
+  assert.deepEqual(makeStack(t).stack.builtImages(), built);
+  assert.deepEqual(built, ['adam-bench-git-server']);
+});

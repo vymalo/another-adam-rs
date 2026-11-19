@@ -297,6 +297,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-code-tools"
+version = "0.1.0"
+dependencies = [
+ "adam-llm-agent",
+ "adam-runtime",
+ "adam-workspace",
+ "aho-corasick",
+ "async-trait",
+ "base64 0.22.1",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "adam-coder"
 version = "0.1.0"
 dependencies = [
@@ -306,6 +323,7 @@ dependencies = [
  "adam-a2a",
  "adam-a2a-runtime",
  "adam-agent-fs",
+ "adam-code-tools",
  "adam-core",
  "adam-devcontainer",
  "adam-env-kubernetes",
@@ -321,7 +339,6 @@ dependencies = [
  "adam-store-testkit",
  "adam-ui",
  "adam-workspace",
- "aho-corasick",
  "anyhow",
  "async-trait",
  "axum",
@@ -356,6 +373,7 @@ dependencies = [
  "adam-error",
  "async-trait",
  "jiff",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
@@ -500,6 +518,7 @@ name = "adam-mcp"
 version = "0.1.0"
 dependencies = [
  "adam-agent-fs",
+ "adam-core",
  "adam-error",
  "adam-llm-agent",
  "adam-mcp-testkit",
