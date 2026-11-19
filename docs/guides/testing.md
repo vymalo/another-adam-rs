@@ -52,7 +52,6 @@ They are gated apart, so `ADAM_TEST_REQUIRE_DB=1` does not turn them on.
 
 | Suite | Switch | Needs |
 |---|---|---|
-| devcontainer | `ADAM_TEST_DEVCONTAINER=1` (`ADAM_TEST_REQUIRE_DEVCONTAINER=1` to fail instead of skip) | a rootless Podman service |
 | Kubernetes run pods (`adam-env-kubernetes`) | `ADAM_TEST_KUBECONFIG` (`ADAM_TEST_REQUIRE_KUBERNETES=1`) | a cluster; CI's `run-pods` job makes a `kind` cluster (the node image `ci.yml` pins, whose network plugin enforces `NetworkPolicy`) and runs `deploy/coder/tests/kind-run-pods.sh`, which you can run with `kind`: the cluster test, then the run pods' network policy and the egress proxy ([ADR 0042](../decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md); it fails where a policy is not enforced unless `ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1`), then the git sandbox ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md), open decision 6): a pod made from the chart's own StatefulSet, with canaries for the secrets of the coder container, shows that the sandbox container has no token, Secret or view of the coder's processes, that a commit through its socket works, and that a scratch project whose `.git/config` names a clean filter and an fsmonitor runs them in the sandbox, with a marker that holds no canary, where plain git in the coder container (the control) reads them all; it builds `adam-egress`, `adam-git-sandbox` and `adam-git` with cargo and needs `docker`, `kubectl`, `helm` and `python3` |
 | git under a run pod's mounts (ADR 0041) | `ADAM_TEST_REQUIRE_MOUNTS=1` to fail instead of skip | root, `unshare` and `setpriv`: `sudo sh deploy/coder/tests/git-in-run-pod.sh` builds the pod's view with bind mounts (the read-only `HEAD`, `commondir`, `gitdir` and `logs` of the worktree's directory included: it tries to write, rename over, replace and remove them; and each slot as a mount of its own: it tries to rename, remove and exchange it and expects `EBUSY`) and runs real git in it |
 | the real language servers (ADR 0044 slice 17) | `ADAM_TEST_LANGUAGE_SERVERS=1` (`ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` to fail instead of skip) | `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls` and `dart` on `PATH` (each language is skipped without its server): [below](#the-language-server-tools). The `image` job of `.github/workflows/coder.yml` runs it in the built coder image |
@@ -74,10 +73,9 @@ process carrying the run's marker is left). Before the end, the same probe must 
 | Environment | Test | Run it | CI |
 |---|---|---|---|
 | Local | `adam-workspace/tests/stdio_framing.rs` | `cargo test -p adam-workspace --test stdio_framing` (always runs, about 20 s) | the normal test job |
-| Devcontainer | the end of `adam-devcontainer/tests/podman.rs` (after the `kill` check; its verdict comes after the teardown) | gated like that test: `ADAM_TEST_DEVCONTAINER=1`, see [`dev/podman/README.md`](../../dev/podman/README.md) | `devcontainer` job, 90 s of silence |
 | Run pod | the last scenario of `adam-env-kubernetes/tests/cluster.rs`, through `adam-kube-exec` | `sh deploy/coder/tests/kind-run-pods.sh` (`ADAM_TEST_STDIO_SILENCE_SECS` to change its 90 s) | `run-pods` job |
 
-A step that fails in the devcontainer or the pod is a finding about that environment, not a flaky test.
+A step that fails in the pod is a finding about that environment, not a flaky test.
 
 ## The language server tools
 
@@ -135,7 +133,7 @@ superuser, for its reconnect test). See [Store adapters](../reference/store-adap
 
 Scripts in `dev/` drive the compose stack through A2A and assert the whole chain on the mocks. Each script's
 header lists its steps and variables. CI runs them in `.github/workflows/coder.yml` ("Compose e2e") on the image
-it has just built: a pull request runs the seven default coder scenarios and two App-mode ones (all 23 when it
+it has just built: a pull request runs the seven default coder scenarios and two App-mode ones (all 19 when it
 carries the `e2e-full` label or changes `dev/`, `docker/coder/` or `compose.yaml`), main and a manual `workflow_dispatch` run all of
 them. Start the stack first:
 
@@ -146,7 +144,6 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 | Script | What it proves |
 |---|---|
 | `sh dev/coder-e2e.sh` | one task ends in a pushed branch and one pull request; the `checks`, `branch` and `pull_request` artifacts; GitHub read over MCP with the coder's credentials of each call. Variants: `SCENARIO=files` (the coder reads a file first), `scratch` (no repository named, then published), `second-repo` and `create-repo` (each with `ANSWER=yes` or `no`: consent is asked and honoured), `GITHUB_AUTH=app` (with `-f dev/compose.github-app.yaml`) |
-| `SCENARIO=devcontainer\|default-env\|broken-env\|no-runtime sh dev/coder-e2e.sh` | the repository's own devcontainer is the environment, a repository without one gets the default image, a broken file is refused and the person decides, a stopped Podman service is a step that says so. Needs `-f dev/compose.devcontainer.yaml` |
 | `sh dev/greeting-e2e.sh` | "hi" gets a greeting built from the folder's persona lines, streamed, and its one model call reported over `usage/v1` (the task carries the totals); the same task goes on to a pull request; a restart on an edited folder changes the answer |
 | `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text |
 | `sh dev/agent-e2e.sh` | the general agent answers "hi" in role; a restart on an edited folder changes the card and the answer |
@@ -154,8 +151,7 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 | `sh dev/painter-e2e.sh` | the painter folder: the instructions of its image MCP server reach the model, the picture is a shared `image/png` file the words name, and the server's prompt is the command `images__scene` (it starts `mock-image-mcp` and restarts `agent` on a copy of the folder with `AGENT_MCP_ALLOW_INSECURE=true`) |
 
 How the scripted models and mocks work, and how to change a script: [the local stack](../reference/dev-stack.md).
-Exit and assertion details are in each script's header; `PRELOAD_FROM_DOCKER=1` and `COMPOSE_CMD` are
-documented in `dev/coder-e2e.sh`.
+Exit and assertion details are in each script's header.
 
 ## Other checks
 
