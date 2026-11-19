@@ -88,9 +88,13 @@ safe.
 * **The reconstruction check** runs before every commit that splits: `join(head, rows)` is compared
   with the state about to be written, and a mismatch writes `state` only, logs an error, and leaves
   the run v4. A bad split can never produce a head that does not reconstruct its state.
-* The body set is `(run, commit, idx)`; a head names one set and carries its row count. The store
-  writes the rows before the CAS and (MongoDB) checks that all of them landed, so a head never names
-  a partial set.
+* The body is **append-only per generation**: a normal commit writes only the rows after the old
+  head's `len` and keeps the generation; a compaction (the new transcript does not start with the
+  previous one) writes all rows under a new generation. The head names `{generation, len}`. The store
+  resolves the generation, writes the rows before the CAS with the attempt's `writer`, checks that
+  all of them landed, and a commit that loses deletes its own rows and refs, so a head never names a
+  partial generation and a loser cannot poison the next append. Every file artifact the head will
+  name is uploaded first: a failed put refuses the head, and the commit writes the state only.
 * `tests/common/v4.rs` is a frozen copy of the v4 envelope; the suite decodes every `state` written
   and asserts a v5 head is **not** one. The contract release (S3) inverts that assertion.
 
@@ -585,15 +589,16 @@ Two cases pin the read path: `a_header_is_one_store_call` (`Runtime::header` is 
 nor the lease beside it) and `the_cancel_watch_polls_at_its_own_interval` (a 2.5 s step at a 1 s cancel interval reads the
 header about twice, not once per 20 ms worker poll; the watch reads no state at all).
 
-Four cases pin the shadow: `a_step_that_splits_writes_the_head_and_the_body_beside_the_state` (the recorded commit
-has a `v: 5` head naming the body set, the rows are ordered, and `state` is still the whole v4 envelope),
-`a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a deliberately wrong split is refused: no head, no
-rows, the run stays v4), `every_state_written_is_a_v4_envelope_and_a_head_is_not_one` (the frozen `tests/common/v4.rs`
-decodes every state a create, a step, a delivery and a finish wrote, and rejects the head) and
-`the_view_reads_the_state_and_never_the_head` (a `CountingStore`: one `load_run`, no `load_head`, no `body_list`, and the
-whole agent state in the view). `a_run_seeded_with_a_file_uploads_it_before_the_head_names_it` pins the `rev == 0`
-upload: a run created with a file artifact in its state references and uploads its digest on the first commit, and the
-head it writes names that digest.
+Five cases pin the shadow: `a_step_that_splits_writes_the_head_and_the_body_beside_the_state` (the first commit
+writes a `v: 5` head and starts a generation, the done commit appends to it, one generation holds the transcript, and
+`state` is still the whole v4 envelope), `a_split_that_does_not_reconstruct_the_state_writes_the_state_only` (a
+deliberately wrong split is refused: no head, no rows, the run stays v4), `every_state_written_is_a_v4_envelope_and_a_head_is_not_one`
+(the frozen `tests/common/v4.rs` decodes every state a create, a step, a delivery and a finish wrote, and rejects the
+head), `the_view_reads_the_state_and_never_the_head` (a `CountingStore`: one `load_run`, no `load_head`, no `body_list`,
+and the whole agent state in the view) and `a_pre_e_file_artifact_is_uploaded_before_the_head_names_it` (a run created
+directly with a file artifact in its state but no blob uploads and references its digest on the first commit, and the
+head names it). `a_split_whose_file_is_not_stored_writes_the_state_only` pins the other side: a failed `put_blob`
+refuses the head, and the commit writes the state only.
 
 | Variable | Meaning |
 |---|---|

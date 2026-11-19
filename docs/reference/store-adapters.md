@@ -50,15 +50,16 @@ computed in `adam-runtime`, which has the hash dependency). A commit names the d
 the state, exactly as before. **A hand-built `RunUpdate { .. }` literal stops compiling** when it
 gains the field: add `blobs: Vec::new()` or use `RunUpdate::new`.
 
-`keeps_bodies` / `body_list` keep a run's **transcript** beside its head (ADR 0055). The expand
-release writes a v5 head and the rows it names beside the full v4 `state`, and serves neither: the
-runtime reads `state` exactly as before. A body set is `(run, commit, idx)`, and `RunUpdate.body` is
-the set one commit writes; `RunUpdate.head` is the head that names it. A commit with `head: None`
-leaves the stored head and its `head_version` alone (a delivery, a cancel or a park keeps the format
-it read), and `load_head` serves the head only when `head_version == version`. A store that keeps no
-bodies (`keeps_bodies()` is `false`, the default) answers `body_list` empty and ignores both fields,
-exactly as before. **A hand-built `RunUpdate { .. }` literal stops compiling**: add
-`head: None, body: None` or use `RunUpdate::new`.
+`keeps_bodies` / `body_list` / `gc_body` keep a run's **transcript** beside its head (ADR 0055). The
+expand release writes a v5 head and an append-only body generation beside the full v4 `state`, and
+serves neither: the runtime reads `state` exactly as before. A generation is `(run, generation, idx)`;
+`RunUpdate.body` is `{generation, rows, writer}`, where `generation: None` appends the rows after the
+head's `len` and `Some(new)` is a compaction. A commit with `head: None` leaves the stored head and
+its `head_version` alone (a delivery, a cancel or a park keeps the format it read), and `load_head`
+serves the head only when `head_version == version`. A store that keeps no bodies
+(`keeps_bodies()` is `false`, the default) answers `body_list` empty and ignores both fields, exactly
+as before. **A hand-built `RunUpdate { .. }` literal stops compiling**: add `head: None, body: None`
+or use `RunUpdate::new`.
 
 Creating a run with a deterministic id gives idempotent "fire once" semantics, for example one run per
 cron tick across all replicas. A second message on a conversation that has an open run gets
@@ -81,10 +82,10 @@ cron tick across all replicas. A second message on a conversation that has an op
 | State | `JSONB` (queryable with SQL) | real BSON document (queryable with dot paths) |
 | Blobs (schema version 5, part 1): put, get | `INSERT .. ON CONFLICT (digest) DO NOTHING` into `blob`; one primary-key `SELECT` | `insertOne` on `_id = <digest>`; a duplicate key is a no-op; one `find_one` |
 | A commit's blob references | the CAS and `INSERT .. SELECT unnest($digests) ON CONFLICT DO NOTHING` in **one transaction** | one unordered `insertMany` **before** the CAS; a lost CAS leaves rows nothing names, deleted with the run's purge |
-| Blob GC | `DELETE .. WHERE created_at < $cutoff AND NOT EXISTS (a run_blob row)`, in batches; run references cascade with the run. The sweep and a commit's ref insert are **not one transaction**: under `READ COMMITTED` an uncommitted ref is invisible, so a sweep can collect a blob a commit is about to name; S2a's single CTE closes it | the same sweep in a loop; run references are deleted with the run. Its find-then-delete has the same uncommitted-ref window, closed by S2a's insert, completeness check, then CAS ([ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), decision 3) |
+| Blob GC | `DELETE .. WHERE created_at < $cutoff AND NOT EXISTS (a run_blob row)`, in batches; run references cascade with the run. The sweep and a commit's ref insert are **not one transaction**: under `READ COMMITTED` an uncommitted ref is invisible, so a sweep can collect a blob a commit is about to name; the PostgreSQL follow-up (after #361) closes it with one data-modifying CTE | the same sweep in a loop; run references are deleted with the run. Its find-then-delete has the same uncommitted-ref window, closed by the insert, completeness check, then CAS ([ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), decision 3) |
 | Blob references deleted with their run | `ON DELETE CASCADE` | deleted by the purge before the run document |
-| Transcript rows (schema version 5, part 2): a commit's rows, `body_list` | **not in this slice**: the PostgreSQL store keeps `keeps_bodies() == false`, writes no row and answers `body_list` empty (the columns, the `adam_body` table and the one-transaction CTE are the PostgreSQL half, after #361) | one unordered `insertMany` **before** the CAS, then the completeness check (`inserted + duplicate_keys == rows.len()`); a partial set aborts the commit. Superseded sets are collected an hour later (`gc_body`) |
-| The head (schema version 5, part 2): `head`, `head_version`, `load_head` | **not in this slice**: the trait default (`load_head` = `load_run`) answers, and a commit's `head` is ignored | `head` and `head_version` on the run document; `load_head` serves the head only when `head_version == version`, else the whole state; a headless commit leaves both alone |
+| Transcript rows (schema version 5, part 2): a commit's delta, `body_list`, `gc_body` | **deferred**: the PostgreSQL store keeps `keeps_bodies() == false`, writes no row and answers `body_list` empty (the columns, the `adam_body` table and the one-transaction CTE are the PostgreSQL follow-up, after #361) | a generation is append-only: one unordered `insertMany` of the rows after the old head's `len` **before** the CAS, the completeness check (`inserted + duplicate_keys == rows.len()`, a write-concern error aborts), and a lost CAS deletes the attempt's `writer` rows and refs. A compaction writes all rows under a new generation; the old one is collected an hour later (`gc_body`) |
+| The head (schema version 5, part 2): `head`, `head_version`, `load_head` | **deferred**: the trait default (`load_head` = `load_run`) answers, and a commit's `head` is ignored | `head` and `head_version` on the run document; the store patches the head's `body` to `{generation, len}`; `load_head` serves the head only when `head_version == version`, else the whole state; a headless commit leaves both alone |
 | Body rows deleted with their run | — | deleted by the purge with the journal and the references |
 | `run_header`: a run without its state, with its lease | one primary-key statement selecting the header columns and `lease_until`, never `state` | one `find_one` projected to the header and `lease_until` |
 | Transactions | none held across calls; a commit that names blobs opens one for its two statements | none (single-document writes only) |

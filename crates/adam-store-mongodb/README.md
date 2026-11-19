@@ -135,19 +135,22 @@ A commit that writes a head sets both; a commit that does not (a delivery, a can
 both alone, so the head becomes stale (`head_version < version`) and `load_head` serves the whole
 `state` instead.
 
-`<prefix>body` holds the transcript: `_id = "<run>:<commit>:<idx>"`, `run_id`, `commit_id` (both
-binary UUIDs), `idx` (int), `message` (BSON through the codec) and `written_at`. Indexes:
-`adam_body_run` (`run_id, commit_id, idx`) for reading a set in order, `adam_body_gc`
-(`written_at`) for the sweep.
+`<prefix>body` holds the transcript, **append-only per generation**: `_id =
+"<run>:<generation>:<idx>"`, `run_id`, `generation` and `writer` (binary UUIDs), `idx` (int),
+`message` (BSON through the codec) and `written_at`. Indexes: `adam_body_run` (`run_id,
+generation, idx`) for reading a generation in order, `adam_body_gc` (`written_at`) for the sweep.
 
-A commit with rows inserts them **before** the CAS, in one unordered `insertMany` (duplicates
-ignored), then **checks completeness**: `inserted + duplicate_keys == rows.len()`. A duplicate is a
-row that is already there (a retry of the same attempt reuses the commit id); any other write error
-means a row is missing, and the commit aborts before the CAS — a head never names a partial set. The
-refs go next, then the CAS, then the GC: the superseded sets of the run written more than an hour
-ago are deleted. A commit that loses the CAS leaves rows no head names; they are ignored and
-collected by the GC, or deleted with the run's purge. `load_head` reads the document once and serves
-the head only when `head_version == version`.
+A commit resolves the generation: `RunUpdate.body.generation` names a new one (a compaction, or a
+first split), else the current head's, else a new UUID. It writes only the rows after the old head's
+`len` for an append (all rows for a new generation), **before** the CAS, in one unordered
+`insertMany` (duplicates ignored), then **checks completeness**: `inserted + duplicate_keys ==
+rows.len()`. A duplicate is a row that is already there (a retry of the same attempt); any other
+write error, and any **write-concern** error (the write may or may not have landed), aborts before
+the CAS — a head never names a generation that is missing a row. The refs go next, then the CAS,
+then the GC: the superseded generations of the run written more than an hour ago are deleted. A
+commit that loses the CAS deletes the rows and refs its `writer` added (but never a row or digest
+the winner's head names), so a loser cannot poison the next append. `load_head` reads the document
+once and serves the head only when `head_version == version`.
 
 `purge_finished` deletes the purged runs' body rows with their journal and references. The body
 methods are **defaulted** on `Store`; `RunUpdate` gained the public fields `head` and `body`, so a

@@ -36,9 +36,9 @@ trait at your rev: its doc comments are the contract.
    the four blob ones (`keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs`; schema version 5, part
    1: file bytes out of the run, content-addressed by `BlobId`) and the three body ones
    (`load_head`, which defaults to `load_run` and serves the v5 head only when
-   `head_version == version`; `keeps_bodies`; `body_list`; schema version 5, part 2: the transcript
-   beside the head). A defaulted method left out of your implementation answers for your store with
-   the trait's "I keep none" answer.
+   `head_version == version`; `keeps_bodies`; `body_list`; `gc_body`; schema version 5, part 2: an
+   append-only transcript per generation beside the head). A defaulted method left out of your
+   implementation answers for your store with the trait's "I keep none" answer.
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
    `StoreError::corrupt_source(e)`; callers decide from the error class, never from the variant.
@@ -131,13 +131,16 @@ trait at your rev: its doc comments are the contract.
   commit that names none keeps the earlier references. A blob a surviving run references is never
   collected; `purge_blobs(before)` and `purge_finished` delete only unreferenced blobs older than
   the cutoff.
-* Bodies: a body set is `(run, commit, idx)` and `RunUpdate.body` is the set one commit writes; write
-  the rows **before** the CAS and check that all of them landed (a duplicate key is a row that is
-  already there, from a retry of the same attempt), so a head never names a partial set. A commit
-  with `head: None` leaves the stored head **and its `head_version`** alone; `load_head` serves the
-  head only when `head_version == version`. A commit that loses the CAS leaves rows no head names:
-  ignore them, and collect the superseded sets after a grace period (`purge_finished` removes them
-  with the run).
+* Bodies: a generation is `(run, generation, idx)` and is **append-only**. `RunUpdate.body` is
+  `{generation, rows, writer}`: `generation: None` appends `rows[old_len..]` to the current head's
+  generation (or starts one when there is no head), `Some(new)` is a compaction and writes all rows
+  under `new`. Resolve the target, patch the head's `body` to `{generation, len}`, write the rows
+  **before** the CAS with the attempt's `writer`, and check that all of them landed (a duplicate key
+  is a row that is already there; a **write-concern** error is not a completeness answer). A commit
+  that loses the CAS deletes the rows and refs its `writer` added, but never a row or digest the
+  winner's head names. A commit with `head: None` leaves the stored head **and its `head_version`**
+  alone; `load_head` serves the head only when `head_version == version`. Collect superseded
+  generations after a grace period (`gc_body`, and `purge_finished` removes them with the run).
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also

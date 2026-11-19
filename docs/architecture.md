@@ -901,12 +901,14 @@ never shown as `submitted` again. A front that holds only the starter claims not
 
 ## Data: the run store
 
-Seven tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
+Six tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
 the schema version: `push` holds A2A push-notification configurations (schema version 3), `blob`
 and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1), and
-`body` holds a run's transcript beside the `head` and `head_version` columns of `runs` (schema version
-5, part 2). `state` is JSONB in Postgres and a real BSON document in MongoDB; in the expand release it
-is still the complete v4 envelope.
+`body` holds a run's transcript beside the `head` and `head_version` of a run document (schema version
+5, part 2). **The head and the body are MongoDB's now**: the PostgreSQL columns, `adam_body` and
+`body_list` are the follow-up after #361, and `PgStore` keeps `keeps_bodies() == false` until then.
+`state` is JSONB in Postgres and a real BSON document in MongoDB; in the expand release it is still
+the complete v4 envelope.
 
 ```mermaid
 erDiagram
@@ -923,7 +925,7 @@ erDiagram
         uuid parent_id "null: not a child run"
         text status "runnable, parked, done, failed"
         jsonb state "the Envelope"
-        jsonb head "the v5 head; null on a v4 run"
+        jsonb head "the v5 head (MongoDB now; PostgreSQL after #361)"
         bigint head_version "the version the head was written at"
         timestamptz wake_at
         timestamptz sched_at "derived: when it is due"
@@ -992,8 +994,8 @@ erDiagram
 | `push (agent, next_attempt_at, run_id, id)` where active | claiming due push configs |
 | `blob (created_at)` | blob GC: unreferenced blobs older than the cutoff |
 | `run_blob (digest)` | blob GC: does any run still reference this digest |
-| `body (run_id, commit_id, idx)` | reading one body set in order, and the GC's "which sets of this run" |
-| `body (written_at)` | body GC: superseded sets older than the cutoff |
+| `body (run_id, generation, idx)` | reading one generation in order, and the GC's "which generations of this run" (MongoDB now) |
+| `body (written_at)` | body GC: superseded generations older than the cutoff (MongoDB now) |
 
 MongoDB keeps the same fields in `adam_runs` (`_id` is the run's UUID) plus `open_key` (a plain unique
 index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_list`
@@ -1024,26 +1026,28 @@ the bytes too until the contract release, so a reader of the old format still re
 
 ### The head and the body (schema version 5, part 2)
 
-The expand release writes a **head** and a **body set** beside `state`, and reads neither: the read
-path (`Runtime::view`, `load_run`, `claim_due`, `list_runs`) is unchanged in this slice, and
-`Store::load_head` exists for the tests (the read path is the next slice). The head is the envelope
-with `v: 5`, `agent` reduced to the agent's head, file artifacts by reference, and a `body` member
-naming one set; the rows are the messages.
+The expand release writes a **head** and a **body generation** beside `state`, and reads neither:
+the read path (`Runtime::view`, `load_run`, `claim_due`, `list_runs`) is unchanged in this slice, and
+`Store::load_head` exists for the tests (the read path is the next slice). MongoDB keeps both now; the
+PostgreSQL half is the follow-up after #361, and `PgStore` keeps `keeps_bodies() == false` until then.
+The head is the envelope with `v: 5`, `agent` reduced to the agent's head, file artifacts by
+reference, and a `body` member naming one generation; the rows are the messages.
 
 | Where | What it holds |
 |---|---|
 | `state` (`v: 1`) | the whole run, unchanged in the expand release: the shape a v4 process steps |
-| `head` (`v: 5`) | `agent` without its messages, `inbox`, `seq`, `attempt`, `rev`, `output`, `error`, `artifacts` (files by `digest` and `size`), `deadline`, `limit_secs`, `remaining_secs`, `agent_wake`, `hb`, and `body: {commit, len}` |
-| `adam_body` | one row per message, keyed `(run_id, commit_id, idx)`, with `written_at` for the GC |
+| `head` (`v: 5`) | `agent` without its messages, `inbox`, `seq`, `attempt`, `rev`, `output`, `error`, `artifacts` (files by `digest` and `size`), `deadline`, `limit_secs`, `remaining_secs`, `agent_wake`, `hb`, and `body: {generation, len}` |
+| `adam_body` | one row per message, keyed `(run_id, generation, idx)`, with `written_at` for the GC (MongoDB now) |
 
-A commit that splits writes the rows **before** the CAS and checks that all of them landed, so a head
-never names a partial set. The commit picks a new `commit` UUID per step attempt, so a retry of that
-attempt reuses the set and a lost CAS leaves rows no head names (ignored, and collected an hour after
-they were superseded). The runtime reconstructs `join(head, rows)` before every commit and refuses a
-split that does not equal the state, which keeps a bad split at `state` only. A commit that does not
-split (a delivery, a cancel, a park) leaves the stored head and its version alone; `load_head` serves
-the head only when `head_version == version`. **The contract release (S3) stops writing `state`**;
-until then, the expand release pays for both representations.
+A generation is **append-only**: a normal commit writes only the rows after the old head's `len` and
+keeps the generation; a compaction (the transcript no longer starts with the old one) writes all rows
+under a new generation. The store writes the rows **before** the CAS with the attempt's `writer`,
+checks that all of them landed, and a commit that loses deletes its own rows and refs, so a loser
+cannot poison the next append. The runtime reconstructs `join(head, rows)` before every commit and
+refuses a split that does not equal the state, which keeps a bad split at `state` only. A commit that
+does not split (a delivery, a cancel, a park) leaves the stored head and its version alone;
+`load_head` serves the head only when `head_version == version`. **The contract release (S3) stops
+writing `state`**; until then, the expand release pays for both representations.
 
 `Conversation` (`crates/adam-llm-agent/src/conversation.rs`) has `messages`, `turns`, `tool_calls`,
 `usage`, `pending_calls`, `pending_wait` (a question for the user, a child run or a remote task),

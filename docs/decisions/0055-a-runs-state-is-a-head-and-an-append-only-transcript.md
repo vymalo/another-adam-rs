@@ -2,9 +2,10 @@
 
 Status: **Accepted** (2026-11-19). The owner's decision: option 2 of the optimisation review's P2 (an
 append-only transcript, one row per message, a head-only `state`) plus option 1 (file bytes out of the
-state into a content-addressed blob store). Schema version 5. Nothing of the decision is built yet
-(S0's measurement tooling landed 2026-11-19); it follows the I/O-layer pull request, which does not
-change the state schema.
+state into a content-addressed blob store). Schema version 5. *Amended 2026-11-19 (S1, S2a)*: the blob
+half (S1) and the non-PostgreSQL shadow (S2a) are built; the body is append-only **per generation**
+(the S2a amendment below); the PostgreSQL head/body half is pending #361. It follows the I/O-layer
+pull request, which does not change the state schema.
 
 ## Context
 
@@ -41,13 +42,15 @@ Two constraints decide the shape of the fix, and neither is in the review:
    `claim_due` and `purge_finished` keep theirs. A store that keeps neither bodies nor blobs behaves
    exactly as it does today.
 3. **The atomic boundary does not move.** The CAS stays on `version`. Body rows are written **before**
-   the head that names them; rows no head names are ignored and collected. PostgreSQL does it in one
-   data-modifying CTE (rows, refs, GC and the CAS in one transaction). MongoDB has no cross-document
-   transaction by default, so it inserts the rows, checks that every row was inserted, then CASes; a
-   partial insert aborts before the CAS.
-4. **A body set is keyed `(run, commit, idx)`, not `(run, seq)`.** A commit's transcript is a set the
-   head names, because a later commit may rewrite an early message (compaction); `(run, idx)` alone
-   would let a losing writer overwrite the winner's row at the same index.
+   the head that names them; a commit that loses deletes the rows its `writer` inserted (amended in
+   S2a). PostgreSQL does it in one data-modifying CTE (rows, refs, GC and the CAS in one transaction).
+   MongoDB has no cross-document transaction by default, so it inserts the rows, checks that every row
+   was inserted, then CASes; a partial insert aborts before the CAS.
+4. **The body is append-only per generation, keyed `(run, generation, idx)`.** A normal commit appends
+   the rows after the old head's `len`; a compaction (a transcript that no longer starts with the old
+   one) writes the whole transcript under a new generation, and the old one is collected after a grace
+   period. The head names `{generation, len}`. `(run, idx)` alone would let a losing writer overwrite
+   the winner's row at the same index, which the `writer` cleanup closes (amended in S2a).
 5. **The split is declared by the agent.** `Agent::split`/`join` and `AgentStarter::split`/`join`,
    defaulted to "no split", with the invariant `join(split(s)) == s` pinned by a conformance test. A
    wrapper that does not delegate them keeps its runs in the old format; the doc says so, as it already
@@ -76,7 +79,7 @@ a later cleanup.
 |---|---|---|
 | **S0 — measure** | `CountingStore` in the testkit; the 50 × 10 KB test in today's shape, asserting `total < 50 × 20 KB` and **recorded red**; `dev/p2-measure.sh` for `pg_relation_size`, `pg_stat_wal` and Mongo `collStats` | the test fails on `main` with the recorded number; the script prints the baseline |
 | **S1 — blobs** | `BlobId`, `keeps_blobs`/`put_blob`/`get_blob`, `purge_blobs`; schema v5 part 1; the three implementations; `blob_conformance!`; the runtime uploads file artifacts and passes `RunUpdate.blobs`; `state` unchanged. The blob sweep and a commit's ref insert are **not one transaction**: an uncommitted ref is invisible to the sweep, which S2a's CTE closes (see the S1 amendment) | blob conformance on Memory/Postgres/Mongo; a 4 MiB file round-trips; the v4 fixture still decodes every `state` |
-| **S2a — the shadow** | `Agent`/`AgentStarter::split`/`join`, `Conversation`'s split, the `Head` type, schema v5 part 2, `RunUpdate.head/body`; the step path writes the head and rows; **nothing reads the head**; a run seeded from a prior run's state gets its artifact references at create (see the S1 amendment) | `split/join` conformance; the per-commit reconstruction check; every runtime test green; the v4 fixture green |
+| **S2a — the shadow** | `Agent`/`AgentStarter::split`/`join`, `Conversation`'s split, the `Head` type, schema v5 part 2, `RunUpdate.head/body`; the step path writes the head and the **delta** of an append-only generation (a compaction starts a new one); **nothing reads the head**; the non-PostgreSQL half only (the PostgreSQL head/body half is the follow-up after #361) | `split/join` conformance; the per-commit reconstruction check; the body conformance (append/compaction/lost CAS/purge); every runtime test green; the v4 fixture green |
 | **S2b — the view** | `load_head`, `Stored` (`v1`/`v5`), `Runtime::view` on the head, `RunView.state` = the head, `RunView.artifacts: Vec<ArtifactRef>`, `Runtime::state`/`artifact_bytes`, the A2A blob read and cache | the read-counting test; every A2A test; the write measurement still shows the old cost |
 | **S3 — contract** | `state = null` on every commit; `load_run`, `claim_due`, `open_run` and `list_runs` return the head; the step path joins; `deliver`, `cancel_run` and `park_again` write the head they read; `start_continuing`/`on_cancelled` join; the v4 fixture test inverted to assert the documented failure | the 50 × 20 KB test green; `pg_relation_size`/WAL green; the "v4 cannot read a v5 run" test |
 | **S4 — later** | drop the v4 `Envelope` read path and the `state` column, after every live run is v5 | — |
@@ -99,8 +102,8 @@ is retained size including bloat, and `pg_stat_wal.wal_bytes` is the bytes writt
    same call, delete a blob no `adam_run_blob` row names. Under PostgreSQL's `READ COMMITTED` (and in
    MongoDB's find-then-delete) a reference another commit is inserting at that moment is invisible, so
    the sweep can collect a blob that commit is about to name. In S1 this only costs the copy in the
-   expand release, because the run's `state` still carries the bytes; S2a's data-modifying CTE (decision
-   3) writes the refs, the GC and the CAS in one statement and closes the window.
+   expand release, because the run's `state` still carries the bytes; the PostgreSQL follow-up after
+   #361 writes the refs, the GC and the CAS in one statement and closes the window.
 2. **A run seeded from a prior run's state has no reference until its first commit.** `create_run`
    takes no blobs, and the runtime's upload writes the blob, not a reference. A session round started
    from the previous round's state therefore names artifacts no `adam_run_blob` row holds; if the prior
@@ -108,10 +111,32 @@ is retained size including bloat, and `pg_stat_wal.wal_bytes` is the bytes writt
    state still carries. S2a either writes the references at create or makes the sweep read the state;
    S1 does not widen `create_run`.
 
+*Amended 2026-11-19 (S2a)*: the body is **append-only per generation**, and the earlier "one set per
+commit" language is superseded.
+
+1. **A normal commit writes the delta.** `Conversation::split` returns the whole transcript, but a
+   commit whose rows start with the previous transcript passes `BodyWrite { generation: None }`; the
+   store appends only `rows[old_len..]` to the current generation. The head names
+   `{generation, len}`. The write win therefore holds in the expand release: commit `t` writes `b`
+   bytes, not `t·b`. The first design (a new set per commit) would have written the whole transcript
+   every commit, and S3's `< 50 × 20 KB` gate would have been unreachable.
+2. **A compaction bumps the generation.** When the new transcript does not start with the previous one
+   (a shortening, a dropped turn), the runtime passes `BodyWrite { generation: Some(new) }`; the store
+   writes all rows under `new` and collects the old generation after a grace period (`gc_body`). A
+   first split of a v4 run also starts a generation.
+3. **A loser cleans up after itself.** The runtime fixes one `writer` UUID per step attempt. The store
+   inserts the rows with it before the CAS, and a commit that loses deletes the rows and references
+   that `writer` added (never a row or digest the winner's head names), so a loser cannot poison the
+   next append.
+4. **The PostgreSQL upgrade gate.** The PostgreSQL half must gate on `stored < 6` (or check
+   `to_regclass('<prefix>body')`), not on the blob step's `stored == Some(4)`: a database stamped 5 by
+   S1/S2a has the blob tables but no head or body. The follow-up bumps `SCHEMA_VERSION` to 6.
+
 ## Consequences
 
-* The quadratic write is gone: a commit writes one message plus a head, not the transcript. The
-  corrected 20× at 40 turns and 50× at 100 become ~1×. The read of a status becomes one small row.
+* The quadratic write is gone: a commit writes one message plus a head, not the transcript (amended
+  S2a: the append-only generation is what makes this true in the expand release too). The corrected
+  20× at 40 turns and 50× at 100 become ~1×. The read of a status becomes one small row.
 * **Breaking:** `RunView.artifacts` becomes `Vec<ArtifactRef>` (bytes by reference,
   `Runtime::artifact_bytes` to fetch), and `RunView.state` is the agent's head, not the whole state
   (`Runtime::state(run)` is the joined state). Every in-repo consumer already reads only head members;

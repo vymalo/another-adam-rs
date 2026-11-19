@@ -16,7 +16,7 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `load_head` (a run as an observer reads it: the head when it is current, else the state; defaults to `load_run`), `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs, body rows and blob references of the runs it purges, and collects unreferenced blobs), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*), the four **blob** methods `keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs` (see *File bytes*), and the two **body** methods `keeps_bodies`, `body_list` (see *Transcripts*) |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `load_head` (a run as an observer reads it: the head when it is current, else the state; defaults to `load_run`), `run_header` (a run without its state, from one projected read where the adapter can), `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs, body rows and blob references of the runs it purges, and collects unreferenced blobs), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*), the four **blob** methods `keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs` (see *File bytes*), and the three **body** methods `keeps_bodies`, `body_list`, `gc_body` (see *Transcripts*) |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
 | `BodyRow`, `BodyWrite` | one transcript row (`idx`, `message`) and the set a commit writes (`commit`, `rows`), keyed `(run, commit, idx)` in the store (see *Transcripts*) |
@@ -135,12 +135,16 @@ head; `state` is still the whole envelope, and the runtime reads neither in this
 | Method | What |
 |---|---|
 | `keeps_bodies()` | whether the store keeps a transcript beside the head (`body_list`, `RunUpdate::body`). `false` (the default) means `RunUpdate::state` is the whole run, exactly as before |
-| `body_list(run, commit)` | the rows of the body set `commit`, ordered by `idx`; empty when the set does not exist. A store that keeps none answers empty |
+| `body_list(run, generation)` | the rows of one generation, ordered by `idx`; empty when it does not exist. A store that keeps none answers empty |
+| `gc_body(run, keep_generation, before)` | delete the superseded generations of `run` written before `before`; returns how many rows. The generation a head names is never collected. A store that keeps none answers `0` |
 | `load_head(id)` | the run as an **observer** reads it: its `state` is the v5 head when the store has a current one (`head_version == version`), and the whole state otherwise. Defaults to `load_run`, so a store that keeps no head answers exactly as it does today. Nothing in the runtime calls it in the expand release: the tests do, and the read path (S2b) will |
 
-`BodyRow { idx, message }` is one row and `BodyWrite { commit, rows }` the set one commit writes: a
-set is `(run, commit, idx)`, and a new commit picks a new `commit` UUID, so a commit that loses the
-version CAS leaves rows no head names rather than overwriting the winner's rows at the same index.
+`BodyRow { idx, message }` is one row; `BodyWrite { generation, rows, writer }` is what a commit
+writes. A generation is **append-only**: `generation: None` appends `rows[old_len..]` to the current
+head's generation (or starts one when there is no head), and `Some(new)` is a compaction that writes
+the whole transcript under `new`. `writer` is the attempt's id: a commit that loses the CAS deletes
+the rows (and references) that writer added, so a loser cannot poison the next append. The head names
+`{generation, len}`; the store resolves the generation and patches the head.
 
 `RunUpdate` gained two public fields: `head: Option<Value>` (the v5 head this commit writes; `None`
 leaves the stored head and its version alone, so a delivery or a cancel keeps the format it read) and
@@ -148,7 +152,7 @@ leaves the stored head and its version alone, so a delivery or a cancel keeps th
 `RunUpdate { .. }` literal stops compiling**: add `head: None, body: None` or use
 `RunUpdate::new(..)`, which keeps its signature and sets both, and the `.head(..)` / `.body(..)`
 builders. A commit that writes rows writes them **before** the CAS, and an adapter checks that all
-of them landed: a head must never name a set that is missing a row.
+of them landed: a head must never name a generation that is missing a row.
 
 `purge_finished` keeps its signature and extends its contract: a run's body rows go with it.
 
