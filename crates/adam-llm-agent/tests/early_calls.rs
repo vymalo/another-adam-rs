@@ -646,7 +646,7 @@ async fn a_call_that_conflicts_with_an_earlier_refused_call_waits_for_it() {
     ]);
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (_, view) = h.run(agent, "go").await;
+    let (run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     let events = log.events.lock().unwrap().clone();
     let start = |id: &str| {
@@ -659,6 +659,8 @@ async fn a_call_that_conflicts_with_an_earlier_refused_call_waits_for_it() {
         start("c2") < start("c3"),
         "c3 conflicts with c2 and must not run before it: {events:?}"
     );
+    // c2 itself waited for the turn: the premise (c1 still running when the turn arrived) held.
+    assert_waited_for_the_turn(&h, run, "c2");
     assert_eq!(log.starts("c2"), 1);
     assert_eq!(log.starts("c3"), 1);
 }
