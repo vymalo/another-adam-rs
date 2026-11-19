@@ -1,0 +1,16 @@
+{
+  "id": "confload-6",
+  "repo": "confload",
+  "clone": "confload",
+  "commit": "899ad5f2786c3361a48f9347f22591e4f89d0e53",
+  "base": "749f0b9049b95649a2d627a77f749e9f9ef418a0",
+  "language": "javascript",
+  "testCommand": "node --test",
+  "toolchain": {
+    "run": [
+      "command -v git >/dev/null || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*)",
+      "id -u 10001 >/dev/null 2>&1 || useradd -u 10001 -U -m -s /bin/bash agent",
+      "install -d -o 10001 -g 10001 /work /work/workspaces"
+    ]
+  }
+}

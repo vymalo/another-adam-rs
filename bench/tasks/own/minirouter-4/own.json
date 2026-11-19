@@ -1,0 +1,16 @@
+{
+  "id": "minirouter-4",
+  "repo": "minirouter",
+  "clone": "minirouter",
+  "commit": "54541d95f7480e4a61311d18129d933dbebdef77",
+  "base": "889278f2635203b58e229583747b7ad1f0bab120",
+  "language": "javascript",
+  "testCommand": "node --test",
+  "toolchain": {
+    "run": [
+      "command -v git >/dev/null || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*)",
+      "id -u 10001 >/dev/null 2>&1 || useradd -u 10001 -U -m -s /bin/bash agent",
+      "install -d -o 10001 -g 10001 /work /work/workspaces"
+    ]
+  }
+}

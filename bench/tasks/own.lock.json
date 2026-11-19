@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "source": "own",
+  "seed": "1",
+  "tasks": [
+    {
+      "id": "confload-6",
+      "repo": "confload",
+      "checksum": "44b6384a8d838cada6de5835eb49f5a1468a8fda3829fafd99a4ed7a47f596e7",
+      "image": "sha256:3f4e8ffc81901cb8916584d6aa18b639de7a5adc111254a5c77a2b9f89d20581"
+    },
+    {
+      "id": "durations-3",
+      "repo": "durations",
+      "checksum": "839010b244cdc77dca84c1c58a23ba96144991f0bd7fbd157b8a0144e16514c9",
+      "image": "sha256:6fdeea6fb342db551cfe6984c6df828803bdb72fe531d9e221776328742e0a6a"
+    },
+    {
+      "id": "invoicer-7",
+      "repo": "invoicer",
+      "checksum": "63191a2c77545b1e45e42cb26321f8b41d44a51da56af22aa291d71c63904b98",
+      "image": "sha256:625329c5261622850a0761b04955d879e654892f22c6f752620d913a5c39a611"
+    },
+    {
+      "id": "minirouter-4",
+      "repo": "minirouter",
+      "checksum": "c0bbdaf51084ca9a7602492af9f3af7bec0f20294cffcd05425ef7ddea5610b3",
+      "image": "sha256:030b96373ef08908443503dbac31e8cd40455f1098247c0d014d0ebce715ab26"
+    },
+    {
+      "id": "tasklog-5",
+      "repo": "tasklog",
+      "checksum": "32255e9a7a9abd0bdee0be5634c933c5ebd8dc3491ed45e069eb8d8e15a1d645",
+      "image": "sha256:33e20db76aefa2ebf71f3bec07449458d0b5193332b0d35aa8777213aedad27b"
+    },
+    {
+      "id": "textkit-2",
+      "repo": "textkit",
+      "checksum": "28dc5827e62a4a0930f0b6742371597e18cef47f51810141d8d7033d9c70b162",
+      "image": "sha256:b38b99cc475b3eea6629900e4e15418c6b150ed7b1a37183009ed06f432fac73"
+    }
+  ]
+}
