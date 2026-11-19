@@ -36,7 +36,9 @@ this crate removed, only later.
 | `.run(stop)` | drives the publisher and the listener until `stop` resolves; `Ok` only on stop |
 | `.wait_listening()` | resolves once `LISTEN` is active on the current connection |
 | `.local_only(bool)` | keep this process's events local: no encoding, no outbox, no `NOTIFY` (see *Features and environment*); call it first |
+| `.statements_sent()` | how many `pg_notify` statements this instance issued, a batch counting once (tests, metrics) |
 | `MAX_PAYLOAD_BYTES` | 7 999 |
+| `MAX_BATCH_ITEMS` | 32: the most items one `pg_notify` statement carries |
 | `NotifyError` | `InvalidPrefix` and `InvalidLocalOnly` (`Invalid`), `AlreadyRunning` (`Internal`), `PoolClosed` (`Rejected`); `#[non_exhaustive]`, `Classify` |
 
 ```rust
@@ -123,12 +125,17 @@ stateDiagram-v2
 * **Publisher.** `emit` and `publish` put the encoded item on a queue of 1 024
   with `try_send` and return: they never block and never fail. A full queue
   drops the item and warns (the first drop, then every thousandth). One task
-  drains the queue in order with `SELECT pg_notify($1, $2)` on the pool, one at a
-  time, so one process's notifications keep their order (and `NOTIFY` delivers
-  in commit order). A failed `pg_notify` drops its item and warns the same way.
-  When `stop` resolves, the items still queued are sent for up to
-  `DRAIN_ON_STOP` (2 s) before `run` returns; what cannot be sent in that time
-  is dropped, as any notification may be.
+  drains the queue in order with one statement per batch,
+  `SELECT pg_notify(channel, payload) FROM unnest($1::text[], $2::text[])` on the
+  pool: the item it just received plus whatever is already queued, at most
+  `MAX_BATCH_ITEMS` (32), and it never waits for a batch to fill. A burst of N
+  queued items is ⌈N/32⌉ round trips instead of N, and the notifications keep
+  the queue's order (`NOTIFY` delivers in commit order, and one statement's rows
+  are evaluated in row order). A failed statement drops the items in that batch
+  and warns the same way; nothing is retried. When `stop` resolves, the items
+  still queued are sent the same way, for up to `DRAIN_ON_STOP` (2 s) before
+  `run` returns; what cannot be sent in that time is dropped, as any
+  notification may be.
 * **Listener.** `PgListener::connect_with(&pool)` then `LISTEN` on both channels.
   Only after `LISTEN` is active does it mark itself listening and broadcast
   `Delivery::Resync`, so subscribers catch up after the gap has closed. When sqlx
@@ -147,6 +154,9 @@ stateDiagram-v2
 * **At most once, in order per publisher, best effort.** A notification may be
   lost (nobody listening, a reconnect, a full queue, an oversize event); none is
   duplicated by this crate. Nothing in the runtime depends on one arriving.
+  PostgreSQL folds identical channel-and-payload pairs of one transaction into
+  one, so a batch that carries the same payload twice delivers it once; a
+  duplicate is indistinguishable from the first and nothing counts them.
 * **Events do not echo and are not re-published.**
 * **Events are not replayable.** After a gap the durable record
   (`Runtime::view`) is the truth; that is what the SSE subscription polls. The only memory is the
@@ -173,8 +183,9 @@ forwarded to `sqlx`.
 
 | File | What |
 |---|---|
-| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step, the largest piece of streamed text and the largest usage report fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes, local-only (100 events reach the local sink and nothing is queued; the variable's spellings, a bad one fails `run`). Offline |
+| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step, the largest piece of streamed text and the largest usage report fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes, batching (the cap, the order and the channel of each item), local-only (100 events reach the local sink and nothing is queued; the variable's spellings, a bad one fails `run`). Offline |
 | `tests/conformance.rs` | `adam-notify-testkit`'s `notifier_conformance!` with two `PgNotify` on separate pools, plus one case at the exact 7 999-byte limit |
+| `tests/batching.rs` | one statement per queued batch, counted by `statements_sent` (a full batch is 1, two batches and a remainder 3), and 100 queued events arriving in queue order across batches |
 | `tests/two_runtimes.rs` | a front (starter only) and a worker, each with its own pools, `PgNotify` and `Runtime`, poll interval 30 s: a start and a deliver wake an idle worker; a step's `Progress` reaches the front exactly once and before the `Parked` status; a cancel reaches the step within 2 s; terminating the listener's backend gives a `Resync` within 5 s, a run started meanwhile completes, and a later signal arrives |
 
 | Variable | Meaning |
@@ -197,8 +208,11 @@ ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/adam_test \
   16.13 server:* a payload must be shorter than 8000 bytes (`pg_notify` with 8000
   bytes fails with `payload string too long`, 7 999 succeeds, which
   `tests/conformance.rs` asserts); notifications are delivered on commit, in commit
-  order; identical payloads of one transaction are folded into one (each item
-  here is its own statement, so this crate does not depend on it).
+  order; identical payloads of one transaction are folded into one, so the same
+  payload twice in one batch arrives once (events are a latency hint and a
+  duplicate is indistinguishable, so nothing depends on the count); a statement's
+  rows are evaluated in row order, which is what keeps a batch in queue order
+  (`tests/batching.rs`).
 * *Verified 2026-09-29, `sqlx-postgres` 0.9.0 source:* `PgListener::connect_with`
   takes one pooled connection; with `eager_reconnect` on (the default) a lost
   connection makes `try_recv` reconnect, `LISTEN` again and return `Ok(None)`;

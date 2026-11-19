@@ -42,12 +42,13 @@
 //!
 //! # Running
 //!
-//! [`PgNotify::run`] drives one publisher (a queue of 1024 drained with
-//! `SELECT pg_notify(..)` on the pool, one at a time, in order) and one
-//! listener, until `stop` resolves. **The listener holds one connection of the
-//! pool for as long as `run` runs**, and `LISTEN` needs a session, so connect
-//! directly or through a session-mode pooler, not a transaction-mode one. The
-//! publisher never blocks the caller: a full queue drops the item.
+//! [`PgNotify::run`] drives one publisher (a queue of 1024 drained with one
+//! `SELECT pg_notify(..)` statement per batch of up to [`MAX_BATCH_ITEMS`], in
+//! order) and one listener, until `stop` resolves. **The listener holds one
+//! connection of the pool for as long as `run` runs**, and `LISTEN` needs a
+//! session, so connect directly or through a session-mode pooler, not a
+//! transaction-mode one. The publisher never blocks the caller: a full queue
+//! drops the item.
 //!
 //! A process whose events no one else needs (a single replica) can keep them
 //! local: set `NOTIFY_LOCAL_ONLY` (`true`/`1`, default `false`) and
@@ -84,6 +85,10 @@ pub use crate::wire::MAX_PAYLOAD_BYTES;
 /// How long [`PgNotify::run`] keeps sending the items still queued when its
 /// `stop` resolves.
 pub const DRAIN_ON_STOP: Duration = Duration::from_secs(2);
+
+/// The most items one `pg_notify` statement carries: a batch is one round trip,
+/// and a statement of 32 payloads of at most [`MAX_PAYLOAD_BYTES`] stays small.
+pub const MAX_BATCH_ITEMS: usize = 32;
 
 /// The variable that keeps this process's events local: `true`/`1` or
 /// `false`/`0` (ASCII case ignored), absent is `false`. Read by
@@ -136,6 +141,8 @@ struct Inner {
     listening: watch::Sender<bool>,
     dropped: AtomicU64,
     failed: AtomicU64,
+    /// `pg_notify` statements issued, a batch counting once.
+    statements: AtomicU64,
 }
 
 /// Whether the `n`th occurrence of something noisy deserves a log line: the
@@ -183,6 +190,20 @@ fn local_only_from(lookup: impl Fn(&str) -> Option<OsString>) -> (bool, Option<S
 
 fn local_only_from_env() -> (bool, Option<String>) {
     local_only_from(|name| std::env::var_os(name))
+}
+
+/// The item just received plus whatever else is already queued, up to
+/// [`MAX_BATCH_ITEMS`], in queue order. Never waits for the batch to fill.
+fn take_batch(first: Outgoing, outbox: &mut mpsc::Receiver<Outgoing>) -> Vec<Outgoing> {
+    let mut batch = Vec::with_capacity(MAX_BATCH_ITEMS);
+    batch.push(first);
+    while batch.len() < MAX_BATCH_ITEMS {
+        match outbox.try_recv() {
+            Ok(item) => batch.push(item),
+            Err(_) => break,
+        }
+    }
+    batch
 }
 
 impl PgNotify {
@@ -267,6 +288,7 @@ impl PgNotify {
                 listening: watch::channel(false).0,
                 dropped: AtomicU64::new(0),
                 failed: AtomicU64::new(0),
+                statements: AtomicU64::new(0),
             }),
         }
     }
@@ -296,6 +318,13 @@ impl PgNotify {
         let mut listening = self.inner.listening.subscribe();
         // The sender lives in `self`, so the wait cannot see it closed.
         let _ = listening.wait_for(|on| *on).await;
+    }
+
+    /// How many `pg_notify` statements this instance has issued: one per batch,
+    /// up to [`MAX_BATCH_ITEMS`] items each. A counter for tests and for a
+    /// process's own metric, not a durable count.
+    pub fn statements_sent(&self) -> u64 {
+        self.inner.statements.load(Relaxed)
     }
 
     /// Publish queued items and listen for others', until `stop` resolves.
@@ -394,7 +423,7 @@ impl Inner {
         }
     }
 
-    /// Send queued items, one `pg_notify` at a time, in order, until `stopped`;
+    /// Send queued items, one statement per batch, in order, until `stopped`;
     /// then send what is left for at most [`DRAIN_ON_STOP`]. A send is never
     /// cut short by the stop: it runs in the arm, after the `select!`.
     async fn publish_loop(
@@ -408,7 +437,7 @@ impl Inner {
                 // Drop the watch guard inside, so the future stays `Send`.
                 () = async { drop(stopped.wait_for(|stopped| *stopped).await); } => break,
                 item = outbox.recv() => match item {
-                    Some(item) => self.send(item).await,
+                    Some(item) => self.send(take_batch(item, outbox)).await,
                     // The sender lives in `self`; unreachable, but never spin.
                     None => break,
                 },
@@ -417,13 +446,15 @@ impl Inner {
         self.drain(outbox, DRAIN_ON_STOP).await;
     }
 
-    /// Send what is already queued, in order, for at most `within`.
+    /// Send what is already queued, one statement per batch, in order, for at
+    /// most `within`.
     async fn drain(&self, outbox: &mut mpsc::Receiver<Outgoing>, within: Duration) {
         let sending = async {
             let mut sent = 0_usize;
-            while let Ok(item) = outbox.try_recv() {
-                self.send(item).await;
-                sent += 1;
+            while let Ok(first) = outbox.try_recv() {
+                let batch = take_batch(first, outbox);
+                sent += batch.len();
+                self.send(batch).await;
             }
             sent
         };
@@ -436,20 +467,39 @@ impl Inner {
         }
     }
 
-    /// One `pg_notify`; a failure drops the item.
-    async fn send(&self, item: Outgoing) {
-        let channel = if item.signals {
-            &self.signals_channel
-        } else {
-            &self.events_channel
-        };
-        let sent = sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(channel)
-            .bind(&item.payload)
-            .execute(&self.pool)
-            .await;
+    /// The two `text[]` columns of one statement: the channel and the payload of
+    /// each item, in queue order.
+    fn columns(&self, items: Vec<Outgoing>) -> (Vec<String>, Vec<String>) {
+        let mut channels = Vec::with_capacity(items.len());
+        let mut payloads = Vec::with_capacity(items.len());
+        for item in items {
+            channels.push(if item.signals {
+                self.signals_channel.clone()
+            } else {
+                self.events_channel.clone()
+            });
+            payloads.push(item.payload);
+        }
+        (channels, payloads)
+    }
+
+    /// One `pg_notify` statement for a whole batch; a failure drops the items in
+    /// it. PostgreSQL delivers the notifications in row order, and folds
+    /// identical channel-and-payload pairs of one statement into one.
+    async fn send(&self, items: Vec<Outgoing>) {
+        debug_assert!(!items.is_empty(), "a batch has at least one item");
+        let (channels, payloads) = self.columns(items);
+        let count = channels.len();
+        let sent = sqlx::query(
+            "SELECT pg_notify(channel, payload) FROM unnest($1::text[], $2::text[]) AS t(channel, payload)",
+        )
+        .bind(channels)
+        .bind(payloads)
+        .execute(&self.pool)
+        .await;
+        self.statements.fetch_add(1, Relaxed);
         if let Err(e) = sent {
-            let n = self.failed.fetch_add(1, Relaxed) + 1;
+            let n = self.failed.fetch_add(count as u64, Relaxed) + count as u64;
             if should_log(n) {
                 tracing::warn!(error = %e, failed = n, "pg_notify failed, dropping (best effort)");
             }
@@ -878,5 +928,54 @@ mod tests {
             "no outbox entry with the flag on"
         );
         assert_eq!(n.inner.dropped.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_takes_what_is_queued_up_to_the_cap() {
+        let (tx, mut rx) = mpsc::channel(2 * MAX_BATCH_ITEMS);
+        for i in 0..2 * MAX_BATCH_ITEMS {
+            tx.send(Outgoing {
+                signals: false,
+                payload: format!("{i}"),
+            })
+            .await
+            .expect("queue");
+        }
+        let first = take_batch(rx.try_recv().expect("one"), &mut rx);
+        assert_eq!(first.len(), MAX_BATCH_ITEMS);
+        assert_eq!(first[0].payload, "0");
+        assert_eq!(
+            first[MAX_BATCH_ITEMS - 1].payload,
+            (MAX_BATCH_ITEMS - 1).to_string()
+        );
+        let second = take_batch(rx.try_recv().expect("one"), &mut rx);
+        assert_eq!(second.len(), MAX_BATCH_ITEMS);
+        assert_eq!(
+            second[MAX_BATCH_ITEMS - 1].payload,
+            (2 * MAX_BATCH_ITEMS - 1).to_string()
+        );
+        assert!(rx.try_recv().is_err(), "exactly what was queued, no wait");
+    }
+
+    #[tokio::test]
+    async fn a_batch_keeps_its_order_and_each_items_channel() {
+        let (n, _) = notify();
+        let batch = vec![
+            Outgoing {
+                signals: false,
+                payload: "e1".into(),
+            },
+            Outgoing {
+                signals: true,
+                payload: "s1".into(),
+            },
+            Outgoing {
+                signals: false,
+                payload: "e2".into(),
+            },
+        ];
+        let (channels, payloads) = n.inner.columns(batch);
+        assert_eq!(channels, ["adam_events", "adam_signals", "adam_events"]);
+        assert_eq!(payloads, ["e1", "s1", "e2"]);
     }
 }
