@@ -9,7 +9,7 @@
 use std::future::Future;
 use std::process::ExitCode;
 
-use adam_coder::{Config, Redactor, exit_code};
+use adam_coder::{Config, Redactor, RedactorFromConfig, exit_code};
 use anyhow::Context as _;
 
 /// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
