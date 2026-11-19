@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { test } from 'node:test';
 import { coderProbe, doctor, osRelease, renderDoctor } from '../lib/doctor.mjs';
-import { FakeContainers } from '../lib/containers.mjs';
+import { FakeContainers, HostContainers } from '../lib/containers.mjs';
 import { PINS, coderRef } from '../lib/pins.mjs';
+import { tmp } from './helpers.mjs';
 
 const GB = 1024 ** 3;
 const INFO = (over = {}) => JSON.stringify({ ServerVersion: '29.9.2', SecurityOptions: ['name=seccomp,profile=builtin'], CgroupVersion: '2', DockerRootDir: '/var/lib/docker', ...over });
@@ -205,4 +207,100 @@ test('renderDoctor prints one line per check and its fix', async () => {
   const text = renderDoctor(r);
   assert.match(text, /^FAIL docker daemon:/m);
   assert.match(text, /^     fix: /m);
+});
+
+// ---- the environment of every docker child the doctor starts: an allow-list, never the key ----
+
+const SENTINEL = 'sk-sentinel-do-not-leak';
+const OTHER_SECRET = 'another-sentinel-value-0123456789';
+
+/** Set variables for one test and put them back, so a leak is visible in the process's own environment. */
+function withEnv(t, vars) {
+  const before = {};
+  for (const [k, v] of Object.entries(vars)) {
+    before[k] = process.env[k];
+    process.env[k] = v;
+  }
+  t.after(() => {
+    for (const [k, v] of Object.entries(before)) (v === undefined ? delete process.env[k] : (process.env[k] = v));
+  });
+}
+
+/** What the fake docker answers for one argv: the doctor's own commands, and the two probes of a task image. */
+function dockerAnswer(args) {
+  const key = args.join(' ');
+  if (key.startsWith('compose version')) return { exitCode: 0, stdout: '2.40.0\n', stderr: '' };
+  if (key.startsWith('info')) return { exitCode: 0, stdout: INFO(), stderr: '' };
+  if (key.startsWith('image inspect')) return { exitCode: 0, stdout: JSON.stringify([`${PINS.coder.image}@${PINS.coder.digest}`]), stderr: '' };
+  if (args.includes('/bin/cat')) return { exitCode: 0, stdout: 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\n', stderr: '' };
+  return { exitCode: 78, stdout: '', stderr: '' };
+}
+
+test('the model key is not in the environment of any docker child the doctor starts, and the allow-list still reaches it', async (t) => {
+  const seenFile = `${tmp(t)}/children.jsonl`;
+  withEnv(t, { BENCH_MODEL_API_KEY: SENTINEL, ANTHROPIC_API_KEY: OTHER_SECRET, HTTPS_PROXY: 'http://user:pw@proxy.example.test:3128', HOME: '/home/bench-test', DOCKER_HOST: 'unix:///run/user/1000/docker.sock', XDG_RUNTIME_DIR: '/run/user/1000' });
+  // A child with no `env` inherits the process's; one with an `env` sees only that. Write what each child would see.
+  const record = (args, opts) => fs.appendFileSync(seenFile, `${JSON.stringify({ args, env: opts?.env ?? process.env })}\n`);
+  const exec = async (file, args, opts) => {
+    record(args, opts);
+    return dockerAnswer(args);
+  };
+  const dockerExec = (bin, args, opts, cb) => {
+    record(args, opts);
+    const a = dockerAnswer(args);
+    cb(a.exitCode === 0 ? null : Object.assign(new Error(`exit ${a.exitCode}`), { code: a.exitCode }), a.stdout, a.stderr);
+    return { stdin: { end() {}, on() {} } };
+  };
+  const containers = new HostContainers({ exec: dockerExec });
+  const r = await run({ exec, containers }, { tasks: [TASK], stack: probeStack(containers) });
+  const rows = fs.readFileSync(seenFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const verbs = rows.map((row) => row.args.slice(0, 2).join(' '));
+  assert.ok(verbs.includes('compose version'), 'the doctor asked the compose plugin');
+  assert.ok(verbs.includes('image inspect'), 'the doctor looked for the coder image');
+  assert.ok(rows.some((row) => row.args[0] === 'info'), 'the doctor asked the daemon');
+  assert.ok(rows.some((row) => row.args[0] === 'run'), 'a probe ran');
+  for (const row of rows) {
+    assert.equal(row.env.BENCH_MODEL_API_KEY, undefined, `the key reaches: docker ${row.args[0]}`);
+    assert.equal(row.env.ANTHROPIC_API_KEY, undefined, `another secret reaches: docker ${row.args[0]}`);
+    assert.equal(row.env.HTTPS_PROXY, undefined, `the proxy reaches: docker ${row.args[0]}`);
+    assert.equal(row.env.PATH, process.env.PATH, `PATH is missing: docker ${row.args[0]}`);
+    assert.equal(row.env.HOME, '/home/bench-test', `HOME is missing: docker ${row.args[0]}`);
+    assert.equal(row.env.DOCKER_HOST, 'unix:///run/user/1000/docker.sock', `DOCKER_HOST is missing: docker ${row.args[0]}`);
+    assert.equal(row.env.XDG_RUNTIME_DIR, '/run/user/1000', `XDG_RUNTIME_DIR is missing: docker ${row.args[0]}`);
+  }
+  assert.equal(by(r, 'task image hello').status, 'ok');
+  assert.match(by(r, 'task image hello').detail, /trixie/);
+  assert.doesNotMatch(renderDoctor(r), new RegExp(`${SENTINEL}|${OTHER_SECRET}`));
+});
+
+test('a probe that echoes its environment cannot put the key in the doctor\'s report', async (t) => {
+  withEnv(t, { BENCH_MODEL_API_KEY: SENTINEL, ANTHROPIC_API_KEY: OTHER_SECRET });
+  const exec = async (file, args) => dockerAnswer(args);
+  const dockerExec = (bin, args, opts, cb) => {
+    const env = opts?.env ?? process.env;
+    if (args[0] === 'run' && !args.includes('/bin/cat')) {
+      const leak = Object.keys(env).filter((k) => /KEY|TOKEN|SECRET|PROXY/i.test(k)).map((k) => `${k}=${env[k]}`).join('\n');
+      cb(Object.assign(new Error('exec format error'), { code: 126 }), '', leak || 'exec format error');
+      return { stdin: { end() {}, on() {} } };
+    }
+    const a = dockerAnswer(args);
+    cb(a.exitCode === 0 ? null : Object.assign(new Error(`exit ${a.exitCode}`), { code: a.exitCode }), a.stdout, a.stderr);
+    return { stdin: { end() {}, on() {} } };
+  };
+  const containers = new HostContainers({ exec: dockerExec });
+  const r = await run({ exec, containers }, { tasks: [TASK], stack: probeStack(containers) });
+  assert.doesNotMatch(renderDoctor(r), new RegExp(`${SENTINEL}|${OTHER_SECRET}`));
+  assert.doesNotMatch(JSON.stringify(r), new RegExp(`${SENTINEL}|${OTHER_SECRET}`));
+  assert.equal(by(r, 'task image hello').status, 'fail');
+  assert.match(by(r, 'task image hello').detail, /exec format error/);
+});
+
+test('a probe that times out is unclear, and the doctor still reports the image', async () => {
+  const timed = new FakeContainers({ onRun: () => ({ exitCode: 137, timedOut: true }) });
+  const p = await coderProbe({ containers: timed, image: TASK.image.ref, filesDir: '/h/bin', timeoutMs: 5 });
+  assert.equal(p.starts, null);
+  assert.equal(timed.runs[0].timeoutMs, 5);
+  const r = await run(machine(), { tasks: [TASK], containers: timed, stack: probeStack(timed) });
+  assert.equal(by(r, 'task image hello').status, 'warn');
+  assert.match(by(r, 'task image hello').detail, /unclear/);
 });

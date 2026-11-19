@@ -36,6 +36,16 @@ const SAFE_PATH = /^\/[A-Za-z0-9._/@+=-]*$/;
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const SAFE_ARG = /^[^\n\0]*$/;
 
+/** What a `docker` child needs to find the daemon; nothing else of the harness's environment reaches it. */
+export const DOCKER_ENV_KEEP = ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'XDG_RUNTIME_DIR'];
+
+/** The environment of a `docker` child: the allow-list above, taken from `baseEnv`. Pure. */
+export function dockerEnv(baseEnv = process.env) {
+  const env = {};
+  for (const k of DOCKER_ENV_KEEP) if (baseEnv[k] !== undefined) env[k] = baseEnv[k];
+  return env;
+}
+
 const labelArgs = (labels) => {
   const out = [];
   for (const [k, v] of Object.entries(labels ?? {})) {
@@ -135,8 +145,9 @@ export class HostContainers {
    * @param {string} [o.prefix]     a logical network name becomes `<prefix><name>`
    * @param {object} [o.aliases]    logical network name -> final name
    * @param {string[]} [o.filters]  the `ps` filters that select this instance's containers (default: its labels)
+   * @param {object} [o.env]        the environment of the `docker` child (default: the allow-list of `dockerEnv`)
    */
-  constructor({ bin = 'docker', exec = execFile, invoke = null, labels = {}, prefix = '', aliases = {}, filters = null } = {}) {
+  constructor({ bin = 'docker', exec = execFile, invoke = null, labels = {}, prefix = '', aliases = {}, filters = null, env = dockerEnv() } = {}) {
     this.bin = bin;
     this.exec = exec;
     this.invoke = invoke;
@@ -144,6 +155,7 @@ export class HostContainers {
     this.prefix = prefix;
     this.aliases = aliases;
     this.filters = filters ?? Object.entries(labels).map(([k, v]) => `label=${k}=${v}`);
+    this.env = env;
   }
 
   #network(name) {
@@ -159,7 +171,7 @@ export class HostContainers {
   #call(args, { timeoutMs = 0, maxBuffer = 64 * 1024 * 1024, input = '' } = {}) {
     if (this.invoke) return Promise.resolve().then(() => this.invoke(args, { timeoutMs, input }));
     return new Promise((resolve) => {
-      const child = this.exec(this.bin, args, { timeout: timeoutMs, maxBuffer, killSignal: 'SIGKILL', encoding: 'utf8' }, (err, stdout, stderr) => {
+      const child = this.exec(this.bin, args, { env: this.env, timeout: timeoutMs, maxBuffer, killSignal: 'SIGKILL', encoding: 'utf8' }, (err, stdout, stderr) => {
         const timedOut = Boolean(err && err.killed);
         resolve({ exitCode: err ? (typeof err.code === 'number' ? err.code : 125) : 0, stdout: stdout ?? '', stderr: stderr ?? '', timedOut });
       });

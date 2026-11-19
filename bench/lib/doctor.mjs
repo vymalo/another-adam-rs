@@ -8,6 +8,7 @@
 // does not, and such an image is refused for both arms. Each check is { name, status: 'ok' | 'warn' | 'fail', detail,
 // fix? }; the exit code is 1 when any check fails. Nothing is started unless `start` is set.
 import fs from 'node:fs';
+import { dockerEnv } from './containers.mjs';
 import { probeLimits } from './limits.mjs';
 import { coderRef } from './pins.mjs';
 import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
@@ -83,7 +84,7 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
   const checks = [];
   const run = async (file, args) => {
     try {
-      return await exec(file, args, {});
+      return await exec(file, args, { env: dockerEnv(env) });
     } catch {
       return { exitCode: 127, stdout: '', stderr: '' };
     }

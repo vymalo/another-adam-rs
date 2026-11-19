@@ -375,6 +375,7 @@ environment. So one principle holds everywhere:
 | the base of a task | made in the slot's work directory by the task image for each run, because `/work/bench-base` is shared by every task; the host builds its own repository from a tar of the tree once per (task, image, workdir) and reuses it (under `$BENCH_HOME`); adam's copy is pushed to the git server by a one-shot container with no secret |
 | the pushed branches | `git ls-remote` of an `http://` address on the loopback, run in a new empty directory that is not a repository, with discovery stopped and only plain http allowed |
 | the environment of a host git | an allow-list (`PATH`, locale, temp directory); the model's key, a proxy and any credential are not in it. The clone and the fetch of the upstream tasks run in it too (`lib/upstream.mjs`), so an upstream cannot see the key |
+| the environment of a `docker` child | the same allow-list everywhere (`lib/containers.mjs` `dockerEnv`): `PATH`, `HOME`, `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `XDG_RUNTIME_DIR`. The stack's compose calls and host containers, `bench tasks` and every probe of `bench doctor` use it, so the model's key and the rest of the harness's environment cannot reach a container with `-e`, a crash dump or `ps e` |
 | a token | never on a command line: the coder's settings are in a 0600 file removed once the coder exists, OpenCode's configuration goes in on stdin |
 
 ## The stack
@@ -814,7 +815,9 @@ not refused by it. The output names the distribution and the error. With
 `--start` it brings the stack up and runs a container of the coder image on the host, for each slot and for the grading,
 and asks the runtime whether it takes the arms' limits (a refusal is a warning: both arms still get the same setting).
 Compose 2.24 or newer and an x64 machine are required. The exit is 1 when a check fails, which includes a task image the
-coder cannot start in.
+coder cannot start in. Every `docker` child it starts — the compose plugin, the daemon query, the image inspection and
+both probes — gets the same allow-list as the stack (`dockerEnv` in `lib/containers.mjs`), never the model's key
+(`bench/test/doctor.test.mjs`).
 
 ## The dry run
 

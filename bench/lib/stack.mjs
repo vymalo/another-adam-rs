@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { HostContainers, buildRunArgs } from './containers.mjs';
+import { HostContainers, buildRunArgs, dockerEnv } from './containers.mjs';
 import { PINS, coderRef } from './pins.mjs';
 import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
 import { extractEntries, parseTar, pickFiles } from './tarstream.mjs';
@@ -247,10 +247,7 @@ export class Stack {
 
   /** The environment the docker CLI gets: what finds the daemon, and none of the model's variables. */
   dockerEnv() {
-    const keep = ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'XDG_RUNTIME_DIR'];
-    const env = {};
-    for (const k of keep) if (this.baseEnv[k] !== undefined) env[k] = this.baseEnv[k];
-    return env;
+    return dockerEnv(this.baseEnv);
   }
 
   composeArgs(args) {
