@@ -502,7 +502,6 @@ if [ "$scenario" = files ] || [ "$scratchlike" = 1 ]; then
   fi
 fi
 
-
 # --- artifacts ---------------------------------------------------------------------
 artifact() { # artifact <name> <jq path under .parts[0].data> -> value ("" if absent)
   jq -r --arg n "$1" "select(.result.artifactUpdate.artifact.name == \$n) | .result.artifactUpdate.artifact.parts[0].data | $2 // empty" "$every_event" | tail -n 1
