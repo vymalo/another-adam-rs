@@ -126,6 +126,7 @@ dependencies = [
  "chrono",
  "futures",
  "jsonschema",
+ "memchr",
  "reqwest",
  "rustls-pki-types",
  "ryu-js",

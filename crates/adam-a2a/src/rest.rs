@@ -35,6 +35,9 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+
+use crate::server::{SendMessage, full_body};
 
 /// One route of the HTTP+JSON binding: what `rest_router` serves, as the OpenAPI document names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,16 +173,17 @@ pub(crate) fn message_extensions(path: &str, body: &[u8]) -> Vec<String> {
     if !is_send_path(path) {
         return Vec::new();
     }
-    let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return Vec::new();
-    };
-    request["message"]["extensions"]
-        .as_array()
-        .map(|uris| {
-            uris.iter()
-                .filter_map(|u| u.as_str().map(str::to_owned))
-                .collect()
-        })
+    /// The body of a send, read for the extensions its message names: the parts are skipped, never
+    /// built into a `serde_json::Value` (a body is up to 10 MiB of base64 file bytes).
+    #[derive(Deserialize)]
+    struct SendBody {
+        #[serde(default)]
+        message: Option<SendMessage>,
+    }
+    serde_json::from_slice::<SendBody>(body)
+        .ok()
+        .and_then(|body| body.message)
+        .map(|message| message.extensions)
         .unwrap_or_default()
 }
 
@@ -316,10 +320,13 @@ pub(crate) async fn rejections(request: Request, next: Next) -> Response {
 /// `taskPushNotificationConfig`.
 fn names_legacy_push_config(body: &[u8]) -> bool {
     const LEGACY: &[u8] = b"\"pushNotificationConfig\"";
-    if !body.windows(LEGACY.len()).any(|w| w == LEGACY) {
+    if memchr::memmem::find(body, LEGACY).is_none() {
         return false;
     }
-    let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
+    // A body that names the member is still read whole, into a `Value` of up to the SDK's 10 MiB:
+    // the check needs the configuration's shape, and the needle is rare (a normal send never
+    // contains it, and the SDK reads the whole body anyway).
+    let Some(request) = full_body(body) else {
         return false;
     };
     let configuration = &request["configuration"];
@@ -346,15 +353,101 @@ mod tests {
         }
     }
 
+    /// What the echo read before the typed parse: `message.extensions` of a send body indexed as a
+    /// `serde_json::Value`.
+    fn as_value(path: &str, body: &[u8]) -> Vec<String> {
+        if !is_send_path(path) {
+            return Vec::new();
+        }
+        let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Vec::new();
+        };
+        request["message"]["extensions"]
+            .as_array()
+            .map(|uris| {
+                uris.iter()
+                    .filter_map(|u| u.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn message_extensions_are_read_only_from_a_send() {
-        let body = br#"{"message":{"extensions":["urn:a","urn:b"]}}"#;
+    fn the_extensions_read_are_the_ones_a_value_read_gave() {
+        for body in [
+            r#"{"message":{"extensions":["urn:a","urn:b"]}}"#,
+            r#"{"message":{"extensions":[]}}"#,
+            // An element that is not a string is skipped, as indexing the array did.
+            r#"{"message":{"extensions":["urn:a",7,null,{"x":1},["y"]]}}"#,
+            r#"{"message":{"extensions":"urn:a"}}"#,
+            r#"{"message":{"extensions":null}}"#,
+            r#"{"message":"x"}"#,
+            r#"{"message":null}"#,
+            r#"{}"#,
+            r#"[]"#,
+            r#"{"message":{}}"#,
+            // A duplicate member: a `Value` takes the last, the typed read refuses the body, and
+            // here both end in no extensions (the SDK refuses the duplicate too, see below).
+            r#"{"message":{"extensions":["urn:a"]},"message":{}}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                message_extensions("/message:send", body.as_bytes()),
+                as_value("/message:send", body.as_bytes()),
+                "{body}"
+            );
+        }
+        // Not a send path: no message of a request is read.
+        assert!(
+            message_extensions("/tasks", br#"{"message":{"extensions":["urn:a"]}}"#).is_empty()
+        );
+        // The one shape where the two differ: a duplicate `message` whose last member has
+        // extensions. The typed read refuses the body (empty), a `Value` read takes the last; the
+        // SDK's own extractor refuses the duplicate field too, so the request is an error either
+        // way.
+        assert!(
+            message_extensions(
+                "/message:send",
+                br#"{"message":{},"message":{"extensions":["urn:b"]}}"#
+            )
+            .is_empty()
+        );
+    }
+
+    /// A send body is up to the SDK's 10 MiB of base64 file parts: reading the extensions must not
+    /// build a `serde_json::Value` of them. The counter is the one full parse the binding has
+    /// ([`names_legacy_push_config`]), and its second half proves the counter can move.
+    #[test]
+    fn a_large_send_body_is_read_without_building_a_value() {
+        let raw = "QUJD".repeat(1024 * 1024);
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "m",
+                "role": "ROLE_USER",
+                "parts": [{"raw": raw}],
+                "extensions": ["urn:a", "urn:b"],
+            },
+        })
+        .to_string();
+        assert!(body.len() > 4 * 1024 * 1024, "{}", body.len());
+        let before = crate::server::work::parsed_fully();
         assert_eq!(
-            message_extensions("/message:send", body),
+            message_extensions("/message:send", body.as_bytes()),
             ["urn:a", "urn:b"]
         );
-        assert!(message_extensions("/tasks", body).is_empty());
-        assert!(message_extensions("/message:send", b"not json").is_empty());
+        assert_eq!(
+            crate::server::work::parsed_fully(),
+            before,
+            "the send body was not built into a Value"
+        );
+
+        assert!(names_legacy_push_config(
+            br#"{"configuration":{"pushNotificationConfig":{"url":"x"}}}"#
+        ));
+        assert!(
+            crate::server::work::parsed_fully() > before,
+            "the full parse of the legacy check is counted"
+        );
     }
 
     #[test]

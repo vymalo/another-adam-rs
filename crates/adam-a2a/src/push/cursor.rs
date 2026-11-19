@@ -44,6 +44,11 @@ pub struct PushCursor {
     /// replaced under its id from one the webhook has.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub revisions: BTreeMap<String, String>,
+    /// A cheap fingerprint of the content each revision was taken of, by id: what lets a poll tell
+    /// an artifact that is what it was from one that changed, without canonicalising and digesting
+    /// it again. A hint, never the truth: when it differs, [`revision`] is computed and decides.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fingerprints: BTreeMap<String, String>,
     /// The event being delivered: sent, not acknowledged, to be sent again as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<StreamResponse>,
@@ -110,21 +115,116 @@ fn sorted(value: serde_json::Value) -> serde_json::Value {
 /// canonical JSON (members of every object in sorted order), so the same artifact read back from the
 /// store, or written by another build, digests the same.
 fn revision(artifact: &a2a::Artifact) -> String {
+    #[cfg(test)]
+    work::hashed();
     let canonical = serde_json::to_value((&artifact.name, &artifact.parts))
         .map(sorted)
         .and_then(|v| serde_json::to_vec(&v))
         .unwrap_or_default();
-    Sha256::digest(&canonical)
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex8(&Sha256::digest(&canonical))
+}
+
+/// The first eight bytes of `digest`, as hex: the width of a [`revision`] and a [`fingerprint`].
+fn hex8(digest: &[u8]) -> String {
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A cheap fingerprint of an artifact's content: a digest of its name and parts as they are held
+/// (a file's bytes themselves, not their base64), so a poll can tell an artifact that is what it
+/// was from one that changed without canonicalising it to JSON and digesting that. Every member
+/// [`revision`] covers is covered here too (a new member of [`a2a::Part`] must be added here); a
+/// fingerprint is a hint, and a hint that differs only makes the poll compute the digest.
+fn fingerprint(artifact: &a2a::Artifact) -> String {
+    use a2a::PartContent;
+
+    /// Writes a `Value`'s JSON into the hasher without building a string of it.
+    struct Sink<'a>(&'a mut Sha256);
+
+    impl std::io::Write for Sink<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A string with its length, so that `("ab", "c")` and `("a", "bc")` differ.
+    fn text(hasher: &mut Sha256, text: &str) {
+        hasher.update((text.len() as u64).to_le_bytes());
+        hasher.update(text.as_bytes());
+    }
+
+    fn optional(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                text(hasher, value);
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    optional(&mut hasher, artifact.name.as_deref());
+    hasher.update((artifact.parts.len() as u64).to_le_bytes());
+    for part in &artifact.parts {
+        match &part.content {
+            PartContent::Text(content) => {
+                hasher.update([0]);
+                text(&mut hasher, content);
+            }
+            PartContent::Raw(bytes) => {
+                hasher.update([1]);
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(bytes);
+            }
+            PartContent::Url(url) => {
+                hasher.update([2]);
+                text(&mut hasher, url);
+            }
+            PartContent::Data(value) => {
+                hasher.update([3]);
+                let _ = serde_json::to_writer(&mut Sink(&mut hasher), value);
+            }
+        }
+        optional(&mut hasher, part.filename.as_deref());
+        optional(&mut hasher, part.media_type.as_deref());
+        match &part.metadata {
+            Some(metadata) if !metadata.is_empty() => {
+                hasher.update([1]);
+                // A map of the SDK is a `HashMap`: the order it iterates in must not decide.
+                let mut keys: Vec<&str> = metadata.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                hasher.update((keys.len() as u64).to_le_bytes());
+                for key in keys {
+                    text(&mut hasher, key);
+                    let _ = serde_json::to_writer(&mut Sink(&mut hasher), &metadata[key]);
+                }
+            }
+            _ => hasher.update([0]),
+        }
+    }
+    hex8(&hasher.finalize())
 }
 
 impl PushCursor {
     /// The cursor of a config created while the task is `task`: what the task already says is
     /// not news to the webhook, only what changes after.
     pub fn baseline(task: &Task) -> Self {
+        let mut revisions = BTreeMap::new();
+        let mut fingerprints = BTreeMap::new();
+        for artifact in task
+            .artifacts
+            .iter()
+            .flatten()
+            .filter(|artifact| replaceable(artifact))
+        {
+            revisions.insert(artifact.artifact_id.clone(), revision(artifact));
+            fingerprints.insert(artifact.artifact_id.clone(), fingerprint(artifact));
+        }
         Self {
             status: Some(status_key(&task.status)),
             artifacts: task
@@ -133,13 +233,8 @@ impl PushCursor {
                 .flatten()
                 .map(|a| a.artifact_id.clone())
                 .collect(),
-            revisions: task
-                .artifacts
-                .iter()
-                .flatten()
-                .filter(|a| replaceable(a))
-                .map(|a| (a.artifact_id.clone(), revision(a)))
-                .collect(),
+            revisions,
+            fingerprints,
             pending: None,
             failing_since: None,
         }
@@ -149,17 +244,18 @@ impl PushCursor {
     ///
     /// The pending event first; otherwise the first artifact the webhook has not been told of; then
     /// the status, if it is not the one the webhook was told.
-    pub fn next_event(&self, task: &Task) -> Option<StreamResponse> {
+    pub fn next_event(&mut self, task: &Task) -> Option<StreamResponse> {
         if let Some(pending) = &self.pending {
             return Some(pending.clone());
         }
-        if let Some(artifact) = task.artifacts.iter().flatten().find(|a| {
-            !self.artifacts.contains(&a.artifact_id)
-                || self
-                    .revisions
-                    .get(&a.artifact_id)
-                    .is_some_and(|told| *told != revision(a))
-        }) {
+        let mut news = None;
+        for artifact in task.artifacts.iter().flatten() {
+            if self.news(artifact) {
+                news = Some(artifact);
+                break;
+            }
+        }
+        if let Some(artifact) = news {
             return Some(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
                 task_id: task.id.clone(),
                 context_id: task.context_id.clone(),
@@ -180,6 +276,31 @@ impl PushCursor {
         None
     }
 
+    /// Whether `artifact` is news: one the webhook was never told of, or one whose content differs
+    /// from the digest it was told under its id. A content that matches its fingerprint is what the
+    /// digest was taken of; only a fingerprint that differs recomputes the digest (and a cursor
+    /// stored before fingerprints existed is given one here, once).
+    fn news(&mut self, artifact: &a2a::Artifact) -> bool {
+        let id = &artifact.artifact_id;
+        if !self.artifacts.contains(id) {
+            return true;
+        }
+        let Some(told) = self.revisions.get(id).cloned() else {
+            // An id the webhook was told of, with nothing recorded: told (a cursor from before
+            // digests).
+            return false;
+        };
+        let now = fingerprint(artifact);
+        if self.fingerprints.get(id).is_some_and(|hint| *hint == now) {
+            return false;
+        }
+        if revision(artifact) == told {
+            self.fingerprints.insert(id.clone(), now);
+            return false;
+        }
+        true
+    }
+
     /// The webhook acknowledged `event`: it is told now, and nothing is pending.
     pub fn acknowledge(&mut self, event: &StreamResponse) {
         match event {
@@ -192,6 +313,8 @@ impl PushCursor {
                 if replaceable(&update.artifact) {
                     self.revisions
                         .insert(id.clone(), revision(&update.artifact));
+                    self.fingerprints
+                        .insert(id.clone(), fingerprint(&update.artifact));
                 }
             }
             StreamResponse::Task(task) => *self = Self::baseline(task),
@@ -212,6 +335,28 @@ impl PushCursor {
 /// terminal, so nothing more will happen to it.
 pub fn is_final(task: &Task) -> bool {
     task.status.state.is_terminal()
+}
+
+/// What digesting an artifact costs, for the test that proves a poll of an artifact that did not
+/// change does not digest it again (and that a backfilled cursor stays backfilled through the
+/// store, which `deliverer`'s test checks). Thread-local: the tests run in parallel, each on its own
+/// thread.
+#[cfg(test)]
+pub(crate) mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DIGESTS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn hashed() {
+        DIGESTS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Canonical digests taken on this thread so far.
+    pub(crate) fn digests() -> u64 {
+        DIGESTS.with(Cell::get)
+    }
 }
 
 #[cfg(test)]
@@ -259,7 +404,7 @@ mod tests {
     #[test]
     fn a_new_config_hears_only_what_changes_after_it() {
         let start = task(TaskState::Submitted, None, &[]);
-        let cursor = PushCursor::baseline(&start);
+        let mut cursor = PushCursor::baseline(&start);
         assert!(cursor.next_event(&start).is_none(), "nothing changed");
         let mut later = task(TaskState::Working, None, &[]);
         later.status.timestamp = None;
@@ -321,12 +466,10 @@ mod tests {
     #[test]
     fn the_cursor_survives_the_store() {
         let mut cursor = PushCursor::baseline(&task(TaskState::Working, Some("x"), &["a"]));
-        cursor.fail(
-            cursor
-                .next_event(&task(TaskState::Completed, None, &["a"]))
-                .unwrap(),
-            Utc::now(),
-        );
+        let event = cursor
+            .next_event(&task(TaskState::Completed, None, &["a"]))
+            .unwrap();
+        cursor.fail(event, Utc::now());
         let back: PushCursor =
             serde_json::from_value(serde_json::to_value(&cursor).unwrap()).unwrap();
         assert_eq!(back, cursor);
@@ -446,5 +589,75 @@ mod revision_tests {
             revision(&with(serde_json::json!({"a": 1, "b": {"c": 2, "d": 3}}))),
             revision(&with(serde_json::json!({"b": {"d": 3, "c": 2}, "a": 1})))
         );
+    }
+
+    /// The digest is what a cursor in a store already holds: changing its shape would re-deliver
+    /// every replaceable artifact once, on every replica.
+    #[test]
+    fn the_revision_digest_is_what_it_always_was() {
+        assert_eq!(revision(&artifact("plan", "A", true)), "e0f52366613937e0");
+    }
+
+    /// A poll of an artifact that is what it was compares a fingerprint, not the canonical JSON:
+    /// ten polls of a 1 MiB artifact digest nothing, and a change of the same length is still news.
+    #[test]
+    fn a_poll_of_an_unchanged_replaceable_artifact_does_not_digest_it_again() {
+        let big = |first: &str| {
+            let mut text = String::with_capacity(1024 * 1024);
+            text.push_str(first);
+            text.push_str(&"x".repeat(1024 * 1024 - 1));
+            artifact("plan", &text, true)
+        };
+        let a = task_of(vec![big("A")]);
+        let mut cursor = PushCursor::baseline(&a);
+        let before = work::digests();
+        for _ in 0..10 {
+            assert!(cursor.next_event(&a).is_none(), "nothing changed");
+        }
+        assert_eq!(
+            work::digests(),
+            before,
+            "an unchanged artifact is not digested"
+        );
+        assert_eq!(cursor.fingerprints.len(), 1, "the baseline recorded one");
+
+        // The same length, other content: the fingerprint differs, and the digest decides.
+        let b = task_of(vec![big("B")]);
+        let event = cursor.next_event(&b).expect("B replaced A");
+        assert!(matches!(event, StreamResponse::ArtifactUpdate(_)));
+        assert_eq!(
+            work::digests(),
+            before + 1,
+            "a changed artifact is digested"
+        );
+        cursor.acknowledge(&event);
+        assert!(cursor.next_event(&b).is_none());
+        let after = work::digests();
+        assert!(cursor.next_event(&b).is_none());
+        assert_eq!(work::digests(), after, "and not again on the next poll");
+    }
+
+    /// A cursor written before fingerprints existed has the digest but not the fingerprint: the
+    /// first poll digests once, finds the content it was told, and records the fingerprint.
+    #[test]
+    fn a_cursor_stored_before_fingerprints_records_one_on_its_first_poll() {
+        let a = task_of(vec![artifact("plan-x", "A", true)]);
+        let stored = serde_json::json!({
+            "status": status_key(&a.status),
+            "artifacts": ["plan-x"],
+            "revisions": {"plan-x": revision(&artifact("plan-x", "A", true))},
+        });
+        let mut cursor: PushCursor = serde_json::from_value(stored).unwrap();
+        assert!(cursor.fingerprints.is_empty());
+        let before = work::digests();
+        assert!(cursor.next_event(&a).is_none());
+        assert_eq!(work::digests(), before + 1, "the digest decides once");
+        assert_eq!(
+            cursor.fingerprints.len(),
+            1,
+            "and the fingerprint is recorded"
+        );
+        assert!(cursor.next_event(&a).is_none());
+        assert_eq!(work::digests(), before + 1, "then it is cheap");
     }
 }

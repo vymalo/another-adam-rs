@@ -30,6 +30,8 @@ async-trait.workspace = true
 axum.workspace = true
 chrono.workspace = true
 futures.workspace = true
+# Finds the legacy push config name in a request body without scanning it twice (server, rest).
+memchr.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

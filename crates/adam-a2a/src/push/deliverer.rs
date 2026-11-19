@@ -405,4 +405,136 @@ mod tests {
         assert!(o.backoff(3, 199) <= Duration::from_millis(4800));
         assert!(o.backoff(3, 199) >= Duration::from_secs(4));
     }
+
+    /// A cursor written by the previous build has the digest but no fingerprint. It survives the
+    /// store: the first round backfills the fingerprint and commits it, so the second round — which
+    /// claims the cursor back — does not digest the artifact again.
+    #[tokio::test]
+    async fn a_legacy_cursor_is_digested_once_across_two_rounds_through_the_store() {
+        use std::collections::HashMap;
+
+        use a2a::{Artifact, Part, Task, TaskPushNotificationConfig, TaskState, TaskStatus};
+        use futures::StreamExt as _;
+        use serde_json::json;
+
+        use crate::push::cursor::work;
+        use crate::push::{
+            InMemoryPushStore, NewPushConfig, PushPolicy, PushSender, PushStore,
+            REPLACEABLE_ARTIFACT,
+        };
+        use crate::{BackendError, Caller, TaskBackend, TaskEvent};
+
+        /// The one task the deliverer reads; it never writes.
+        struct OneTask(Task);
+
+        #[async_trait::async_trait]
+        impl TaskBackend for OneTask {
+            async fn submit(
+                &self,
+                _caller: Caller,
+                _message: a2a::Message,
+                _task_id: Option<String>,
+                _context_id: Option<String>,
+            ) -> Result<Task, BackendError> {
+                Err(BackendError::internal("a deliverer only reads"))
+            }
+
+            async fn get(
+                &self,
+                _caller: &Caller,
+                _task_id: &str,
+            ) -> Result<Option<Task>, BackendError> {
+                Ok(Some(self.0.clone()))
+            }
+
+            async fn cancel(&self, _caller: &Caller, _task_id: &str) -> Result<Task, BackendError> {
+                Err(BackendError::internal("a deliverer only reads"))
+            }
+
+            fn subscribe(
+                &self,
+                _caller: &Caller,
+                _task_id: &str,
+            ) -> futures::stream::BoxStream<'static, Result<TaskEvent, BackendError>> {
+                futures::stream::empty().boxed()
+            }
+        }
+
+        let task = Task {
+            id: "t".into(),
+            context_id: "c".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: Some(vec![Artifact {
+                artifact_id: "plan-x".into(),
+                name: Some("plan".into()),
+                description: None,
+                parts: vec![Part::text("A")],
+                metadata: Some(HashMap::from([(
+                    REPLACEABLE_ARTIFACT.to_owned(),
+                    json!(true),
+                )])),
+                extensions: None,
+            }]),
+            history: None,
+            metadata: None,
+        };
+        // What a worker of the previous build wrote: the digest, and no fingerprint.
+        let mut cursor = PushCursor::baseline(&task);
+        cursor.fingerprints.clear();
+
+        let store = Arc::new(InMemoryPushStore::new());
+        store
+            .put(NewPushConfig {
+                task_id: task.id.clone(),
+                id: "c1".into(),
+                owner: "token-0".into(),
+                config: TaskPushNotificationConfig {
+                    url: "https://hooks.example.com/x".into(),
+                    id: Some("c1".into()),
+                    task_id: task.id.clone(),
+                    token: None,
+                    authentication: None,
+                    tenant: None,
+                },
+                cursor,
+            })
+            .await
+            .unwrap();
+        let sender = PushSender::new(
+            PushPolicy::new(["hooks.example.com"]).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let deliverer = PushDeliverer::new(
+            Arc::new(OneTask(task)),
+            store.clone(),
+            sender,
+            PushDeliveryOptions::new().with_poll_interval(Duration::from_millis(1)),
+        );
+
+        let before = work::digests();
+        assert!(deliverer.round().await, "the config is due");
+        assert_eq!(
+            work::digests(),
+            before + 1,
+            "a legacy cursor digests the artifact once"
+        );
+        assert_eq!(
+            store.records()[0].cursor.fingerprints.len(),
+            1,
+            "the fingerprint is committed with the progress"
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(deliverer.round().await, "the config is due again");
+        assert_eq!(
+            work::digests(),
+            before + 1,
+            "the cursor claimed back from the store is not digested again"
+        );
+    }
 }
