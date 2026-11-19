@@ -19,6 +19,8 @@ use adam_runtime::{CancelToken, Emitter, MAX_TEXT_DELTA_BYTES, RunEvent, floor_b
 use futures::StreamExt;
 use tokio::time::{Instant, sleep_until};
 
+use crate::agent::Early;
+
 /// The longest text waits before it is sent. The contract (`text-stream/v1`) asks agents for a chunk
 /// at most every 100 ms or every 200 bytes, whichever comes first.
 pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
@@ -167,6 +169,10 @@ impl From<ModelError> for StreamStop {
 /// assembled response (the stream's last item) and the id of the stream the words were sent as, if
 /// any were.
 ///
+/// A tool call whose arguments are complete ([`ModelDelta::ToolCallComplete`]) is given to `early`,
+/// which starts it beside the stream if the turn allows it (ADR 0049, amended), and whose calls are
+/// polled here so that they run while the model is still writing.
+///
 /// A failure is the failure of the call, whether the model's client gave it before the first byte or
 /// in the middle of the answer, so the caller treats it as it treats a failed
 /// [`ModelClient::complete`](adam_model::ModelClient::complete); a stream that was open says it is
@@ -174,17 +180,21 @@ impl From<ModelError> for StreamStop {
 ///
 /// `cancel` is the run's: when it fires, at any point (the request still being made, the answer
 /// still coming, the model silent in the middle of it) the request and the stream are dropped at
-/// once, an open stream says it is abandoned, and the call is [`StreamStop::Cancelled`].
+/// once, an open stream says it is abandoned, and the call is [`StreamStop::Cancelled`]. The calls
+/// `early` started are not waited for here: the caller settles them, with `TOOL_STOP_GRACE` on a
+/// cancel.
 ///
 /// `new_stream` makes the id of the stream of words, called when the first word that is not blank
 /// arrives, and `new_reasoning_stream` the id of the stream of reasoning, called when the first
 /// reasoning that is not blank does. The reasoning stream ends (`last`) when the words, a tool call
 /// or the end of the answer begin, so it is always over before the words of its turn are.
+#[allow(clippy::too_many_arguments)] // one stream's pieces, handed over once
 pub(crate) async fn stream_response(
     model: &DynModel,
     request: ModelRequest,
     emitter: &Emitter,
     cancel: &CancelToken,
+    early: Option<&mut Early<'_>>,
     new_stream: impl FnOnce() -> String + Send + 'static,
     new_reasoning_stream: impl FnOnce() -> String + Send + 'static,
 ) -> Result<Streamed, StreamStop> {
@@ -198,32 +208,56 @@ pub(crate) async fn stream_response(
         words: Lane::new(Kind::Words, Box::new(new_stream)),
         reasoning: Lane::new(Kind::Reasoning, Box::new(new_reasoning_stream)),
     };
+    let mut early = early;
     loop {
-        let next = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
+        // The calls that started beside the stream are polled here: a future does nothing until it
+        // is polled, so this is what makes them run while the model writes. The future is dropped
+        // with the block, so `early` is free for the branch that announces a call.
+        let wake = {
+            let polled = async {
+                match early.as_deref_mut() {
+                    Some(early) if early.is_running() => early.next().await,
+                    _ => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(polled);
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => Wake::Cancel,
+                () = sleep_until_due(sender.deadline()) => Wake::Due,
+                () = &mut polled => Wake::Early,
+                item = deltas.next() => Wake::Item(item),
+            }
+        };
+        match wake {
+            Wake::Cancel => {
                 sender.abandon().await;
                 return Err(StreamStop::Cancelled);
             }
-            () = sleep_until_due(sender.deadline()) => {
+            Wake::Due => {
                 sender.tick().await;
                 continue;
             }
-            item = deltas.next() => item,
-        };
-        match next {
-            Some(Ok(ModelDelta::Reasoning(thought))) => {
+            // A call of the turn finished: its result waits for the turn (see `Early`).
+            Wake::Early => continue,
+            Wake::Item(Some(Ok(ModelDelta::Reasoning(thought)))) => {
                 sender.reasoning.push(emitter, &thought).await
             }
-            Some(Ok(ModelDelta::Text(text))) => {
+            Wake::Item(Some(Ok(ModelDelta::Text(text)))) => {
                 // The reasoning is over once the words begin.
                 sender.reasoning.finish(emitter, None).await;
                 sender.words.push(emitter, &text).await;
             }
-            Some(Ok(ModelDelta::ToolCallStarted { .. })) => {
+            Wake::Item(Some(Ok(ModelDelta::ToolCallStarted { .. }))) => {
                 sender.reasoning.finish(emitter, None).await;
             }
-            Some(Ok(ModelDelta::Finished(response))) => {
+            Wake::Item(Some(Ok(ModelDelta::ToolCallComplete(call)))) => {
+                sender.reasoning.finish(emitter, None).await;
+                if let Some(early) = early.as_deref_mut() {
+                    early.announce(call).await;
+                }
+            }
+            Wake::Item(Some(Ok(ModelDelta::Finished(response)))) => {
                 sender
                     .reasoning
                     .finish(
@@ -240,11 +274,13 @@ pub(crate) async fn stream_response(
                     stream: sender.words.stream,
                 });
             }
-            Some(Err(error)) => {
+            // A delta a later version of the port adds: this build does nothing with it.
+            Wake::Item(Some(Ok(_))) => {}
+            Wake::Item(Some(Err(error))) => {
                 sender.abandon().await;
                 return Err(StreamStop::Failed(error));
             }
-            None => {
+            Wake::Item(None) => {
                 sender.abandon().await;
                 return Err(StreamStop::Failed(ModelError::transient(
                     "the model's stream ended without a final message",
@@ -252,6 +288,18 @@ pub(crate) async fn stream_response(
             }
         }
     }
+}
+
+/// What woke the stream's loop.
+enum Wake {
+    /// The run was cancelled.
+    Cancel,
+    /// Text that waited has waited long enough.
+    Due,
+    /// A call that started beside the stream finished.
+    Early,
+    /// The next item of the model's stream.
+    Item(Option<Result<ModelDelta, ModelError>>),
 }
 
 /// Says the reasoning of an answer that was **not** streamed (`stream_text` off, or a client that
@@ -597,6 +645,7 @@ mod tests {
             ModelRequest::new("m"),
             &emitter,
             &CancelToken::new(),
+            None,
             || "s1".to_owned(),
             || "r1".to_owned(),
         )
@@ -700,6 +749,7 @@ mod tests {
             ModelRequest::new("m"),
             &emitter,
             &CancelToken::new(),
+            None,
             || "s1".to_owned(),
             || "r1".to_owned(),
         )
@@ -850,6 +900,7 @@ mod tests {
                     ModelRequest::new("m"),
                     &emitter,
                     &CancelToken::new(),
+                    None,
                     || "s1".to_owned(),
                     || "r1".to_owned(),
                 )
@@ -895,6 +946,7 @@ mod tests {
                     ModelRequest::new("m"),
                     &emitter,
                     &cancel,
+                    None,
                     || "s1".to_owned(),
                     || "r1".to_owned(),
                 )
@@ -953,6 +1005,7 @@ mod tests {
                 ModelRequest::new("m"),
                 &emitter,
                 &cancel,
+                None,
                 || "s1".to_owned(),
                 || "r1".to_owned(),
             ),

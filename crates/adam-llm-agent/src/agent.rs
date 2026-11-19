@@ -12,10 +12,11 @@ use adam_model::{
     ToolChoice, ToolSpec,
 };
 use adam_runtime::{
-    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, ChildStarter,
-    ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE, RUN_FINISHED_KIND,
-    ReservedStep, RunEvent, SESSION_CLOSE_KIND, SandboxUsage, SessionState, SessionSummary,
-    StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent, UsageTotals, child_run_id,
+    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_REPORTED_KIND, CancelToken,
+    ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES, MAX_SESSION_PAGE,
+    RUN_FINISHED_KIND, ReservedStep, RunEvent, SESSION_CLOSE_KIND, SandboxUsage, SessionState,
+    SessionSummary, StepEvent, StepIcon, StepKind, StepState, Transition, UsageEvent, UsageTotals,
+    child_run_id,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -214,6 +215,32 @@ struct Prepared {
     unjournaled: Arc<Mutex<SandboxUsage>>,
 }
 
+/// What a tool call's context is made from: the `Ctx` it is taken from does not exist inside
+/// [`Ctx::step`], where a call that starts while the model writes is prepared.
+#[derive(Clone)]
+struct CtxFacts {
+    run: RunId,
+    conversation_id: Option<String>,
+    attempt: u32,
+    emitter: Emitter,
+    cancel: CancelToken,
+    child_starter: ChildStarter,
+}
+
+impl CtxFacts {
+    /// The six things a call's context needs from the transition's `Ctx`.
+    fn of(ctx: &Ctx) -> Self {
+        Self {
+            run: ctx.run_id(),
+            conversation_id: ctx.conversation_id().map(str::to_owned),
+            attempt: ctx.attempt(),
+            emitter: ctx.emitter(),
+            cancel: ctx.cancel_token(),
+            child_starter: ctx.child_starter(),
+        }
+    }
+}
+
 /// How a call of a segment ended.
 enum Finished {
     /// The call took no step (bad arguments, a tool nobody has): what the model is told.
@@ -224,6 +251,17 @@ enum Finished {
         unjournaled: Arc<Mutex<SandboxUsage>>,
         live: Live,
     },
+}
+
+/// One call of a segment, as the drive loop takes it.
+enum Slot {
+    /// The call takes no step: the model is told why.
+    Shortcut,
+    /// The call runs in this transition's task.
+    Fresh(Box<Prepared>, ReservedStep),
+    /// The call started while the model wrote: its work is done (or still running), and its step
+    /// records the outcome it gave.
+    Started(Box<Finished>, ReservedStep),
 }
 
 /// What was said about the end of a call's step as it happened, so that applying the result says it
@@ -246,6 +284,302 @@ struct CallFacts {
     kept_left: usize,
     /// What the run admits as images from now on: the gate for this model and what the history holds.
     images: ImageGate,
+}
+
+/// What the calls of a turn that starts while the model writes need from the run, owned: taken
+/// from the state and the `Ctx` before [`Ctx::step`], which is where they start.
+struct EarlyFacts {
+    ctx: CtxFacts,
+    /// The step's one shared copy of the run's context: every call of the turn reads the same map.
+    context: Option<Arc<Map<String, Value>>>,
+    root: (Option<RunId>, Option<String>, Option<Plan>),
+    kept: Arc<BTreeMap<String, String>>,
+    kept_left: usize,
+    files_used: u64,
+    images: ImageGate,
+    output_cut: bool,
+    turn: crate::early::Turn,
+    /// The committed `repeats` of the run, for the doom-loop decision of the first call.
+    repeats: Option<Repeats>,
+}
+
+/// The calls of a turn that started while the model was still writing (ADR 0049, amended
+/// 2026-11-18): their work runs beside the stream, and the turn hands it to their journaled steps
+/// once it is recorded.
+///
+/// A started call's `running` step event is said when it starts and its end when it finishes, both
+/// while the stream goes on; its result is held here until the turn's step is written. Nothing is
+/// journaled before the turn: a crash loses the results, and the replay asks the model again and
+/// runs the calls again (at-least-once, ADR 0049 decision 8).
+pub(crate) struct Early<'a> {
+    agent: &'a LlmAgent,
+    facts: EarlyFacts,
+    /// What the sources said of the tools they offered for this turn.
+    notes: Vec<ToolNote>,
+    /// The tools whose own schema has an `after_previous`: the loop does not read one for them.
+    own_order: Vec<String>,
+    /// The calls that started, in the order they started, with their position in the turn.
+    started: Vec<(usize, ToolCall)>,
+    /// What each started call shares, while it runs: `None` once it has finished.
+    accesses: Vec<Option<ToolAccess>>,
+    /// What each call the gate refused shares: it runs at the turn (when it runs at all), after
+    /// every early call, so a later call that conflicts with it cannot start early either.
+    waiting: Vec<ToolAccess>,
+    /// Their work, by position in `started`.
+    running: FuturesUnordered<BoxFuture<'static, (usize, Finished)>>,
+    /// The results that came back while the stream went on, by position in `started`.
+    done: Vec<Option<Finished>>,
+    /// The context of the first started call: the budgets of a segment are one for all its calls.
+    head: Option<ToolCtx>,
+    /// The gate of the turn.
+    gate: crate::early::Gate,
+    /// How many calls of the turn the client announced.
+    seen: usize,
+    /// A started call failed transiently: no call starts after it (ADR 0049 decision 9).
+    failed: bool,
+}
+
+impl<'a> Early<'a> {
+    fn new(
+        agent: &'a LlmAgent,
+        facts: EarlyFacts,
+        notes: Vec<ToolNote>,
+        own_order: Vec<String>,
+    ) -> Self {
+        let gate = crate::early::Gate::new(
+            facts.turn,
+            facts.repeats.as_ref().map(|repeats| repeats.key.clone()),
+        );
+        Self {
+            agent,
+            facts,
+            notes,
+            own_order,
+            started: Vec::new(),
+            accesses: Vec::new(),
+            waiting: Vec::new(),
+            running: FuturesUnordered::new(),
+            done: Vec::new(),
+            head: None,
+            gate,
+            seen: 0,
+            failed: false,
+        }
+    }
+
+    /// The root, root step and plan of the run, as [`prepare`](LlmAgent::prepare) takes them.
+    fn root(&self) -> (Option<RunId>, Option<&str>, Option<&Plan>) {
+        (
+            self.facts.root.0,
+            self.facts.root.1.as_deref(),
+            self.facts.root.2.as_ref(),
+        )
+    }
+
+    /// Whether a started call is still running.
+    pub(crate) fn is_running(&self) -> bool {
+        !self.running.is_empty()
+    }
+
+    /// A call's arguments are whole: start it if the gate admits it, and say that it runs. A call
+    /// the gate refuses waits for the turn, exactly as before.
+    pub(crate) async fn announce(&mut self, mut call: ToolCall) {
+        let index = self.seen;
+        self.seen += 1;
+        if self.facts.ctx.cancel.is_cancelled() {
+            self.gate.cancel();
+        }
+        if self.failed {
+            return;
+        }
+        // The loop takes `after_previous` out before anything else sees the call; the gate reads it
+        // first (on the call as the model sent it) and decides.
+        let own = self.own_order.contains(&call.name);
+        let after_previous = if own {
+            order::Order::Plain
+        } else {
+            order::take(&mut call.arguments)
+        };
+        let key = call_key(&call);
+        let access = self.agent.access_of(&call);
+        let shortcut = self.agent.shortcut(&call, self.facts.output_cut).is_some();
+        let doom_loop = index == 0 && doom_loop_would_refuse(self.facts.repeats.as_ref(), &key);
+        let conflicts = self
+            .accesses
+            .iter()
+            .flatten()
+            .chain(self.waiting.iter())
+            .any(|running| running.conflicts(&access));
+        let admitted = self.gate.admits(
+            index,
+            &crate::early::Candidate {
+                after_previous,
+                shortcut,
+                access: &access,
+                key: &key,
+                doom_loop,
+                running: self.running.len(),
+                conflicts,
+            },
+        );
+        if !admitted {
+            // It runs at the turn, after every early call: a later call that conflicts with it
+            // must wait for it too.
+            self.waiting.push(access);
+            return;
+        }
+        let silent = self
+            .agent
+            .source_note(&self.notes, &call.name)
+            .is_some_and(|note| note.reports_step);
+        say_with(
+            &self.facts.ctx.emitter,
+            silent,
+            self.agent.start_event(&call, &self.notes),
+        )
+        .await;
+        let facts = CallFacts {
+            files_used: self.facts.files_used,
+            output_cut: self.facts.output_cut,
+            kept: Arc::clone(&self.facts.kept),
+            kept_left: self.facts.kept_left,
+            images: self.facts.images.clone(),
+        };
+        let mut prepared = self.agent.prepare(
+            &self.facts.ctx,
+            self.facts.context.as_ref(),
+            self.root(),
+            &self.notes,
+            &call,
+            facts,
+        );
+        match &self.head {
+            Some(head) => prepared.tool_ctx = prepared.tool_ctx.sharing_budgets_of(head),
+            None => self.head = Some(prepared.tool_ctx.clone()),
+        }
+        let i = self.started.len();
+        let work = self.agent.early_work(
+            i,
+            call.clone(),
+            self.notes.clone(),
+            self.facts.ctx.emitter.clone(),
+            prepared,
+        );
+        self.started.push((index, call));
+        self.accesses.push(Some(access));
+        self.done.push(None);
+        self.running.push(work);
+    }
+
+    /// Poll the started calls, keeping the one that finished: the stream goes on while they run.
+    pub(crate) async fn next(&mut self) {
+        if let Some((i, finished)) = self.running.next().await {
+            if let Finished::Ran { outcome, .. } = &finished {
+                self.failed |= transient_failure(&self.started[i].1, outcome).is_some();
+            }
+            self.accesses[i] = None;
+            self.done[i] = Some(finished);
+        }
+    }
+
+    /// The results of the started calls, in the order of `calls`, and the context of the first of
+    /// them (whose budgets the segment's other calls share); `None` when one of them is not the
+    /// turn's call at that position, in which case the batch is dropped whole (it was computed from
+    /// calls that no longer exist). Waits for the calls still running, within their own time limits.
+    async fn take(
+        &mut self,
+        calls: &[ToolCall],
+    ) -> Option<(Option<ToolCtx>, Vec<Option<Finished>>)> {
+        self.finish_all().await;
+        let matched = self
+            .started
+            .iter()
+            .all(|(index, call)| calls.get(*index) == Some(call));
+        let mut results: Vec<Option<Finished>> = (0..calls.len()).map(|_| None).collect();
+        if matched {
+            for (i, (index, _)) in self.started.iter().enumerate() {
+                results[*index] = self.done[i].take();
+            }
+        }
+        let head = self.head.take();
+        self.started.clear();
+        self.accesses.clear();
+        self.waiting.clear();
+        self.done.clear();
+        matched.then_some((head, results))
+    }
+
+    /// The result of the single call of the turn's first segment, when the segment is one call
+    /// (`calls[0]`); `None` when the batch is not exactly it. Either way the batch is forgotten:
+    /// a segment of several is taken by [`take`](Self::take).
+    async fn take_one(&mut self, call: &ToolCall) -> Option<Finished> {
+        self.finish_all().await;
+        let taken = match self.started.as_slice() {
+            [(0, started)] if started == call => self.done[0].take(),
+            _ => None,
+        };
+        self.started.clear();
+        self.accesses.clear();
+        self.waiting.clear();
+        self.done.clear();
+        self.head = None;
+        taken
+    }
+
+    /// Wait for the calls still running, keeping their results. A cancel is the run's token, the
+    /// parent of each call's: the loop waits [`TOOL_STOP_GRACE`] at most for them and then drops
+    /// their futures (ADR 0049 decision 10).
+    async fn finish_all(&mut self) {
+        let cancel = self.facts.ctx.cancel.clone();
+        let mut cancelled = cancel.is_cancelled();
+        let mut grace: Option<Pin<Box<tokio::time::Sleep>>> =
+            cancelled.then(|| Box::pin(tokio::time::sleep(TOOL_STOP_GRACE)) as Pin<Box<_>>);
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled(), if !cancelled => {
+                    cancelled = true;
+                    grace = Some(Box::pin(tokio::time::sleep(TOOL_STOP_GRACE)));
+                }
+                () = async {
+                    match grace.as_mut() {
+                        Some(sleep) => sleep.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // The calls that were running did not stop in time: their futures are dropped.
+                    self.running = FuturesUnordered::new();
+                    break;
+                }
+                next = self.running.next() => match next {
+                    Some((i, finished)) => {
+                        if let Finished::Ran { outcome, .. } = &finished {
+                            self.failed |= transient_failure(&self.started[i].1, outcome).is_some();
+                        }
+                        self.accesses[i] = None;
+                        self.done[i] = Some(finished);
+                    }
+                    None => break,
+                },
+            }
+        }
+    }
+
+    /// Wait for the calls still running and forget everything: their results are not used.
+    async fn drain(&mut self) {
+        self.finish_all().await;
+        self.started.clear();
+        self.accesses.clear();
+        self.waiting.clear();
+        self.done.clear();
+        self.head = None;
+    }
+
+    /// The transition ends before the batch is used (a cancel, a stream error, a turn over its
+    /// tool-call limit): wait for the calls still running and drop their results.
+    async fn settle(&mut self) {
+        self.drain().await;
+    }
 }
 
 /// What the model is asked in the closing turn, the last model call of a run that reached
@@ -1522,9 +1856,9 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         context: Option<&Arc<Map<String, Value>>>,
-    ) -> Result<Flow, AgentError> {
+    ) -> Result<(Flow, Option<Early<'_>>), AgentError> {
         if ctx.is_cancelled() {
-            return Ok(Flow::Fail(CANCELLED.into()));
+            return Ok((Flow::Fail(CANCELLED.into()), None));
         }
         // The run was reopened after its closing answer. With no message since (the answer is still
         // the last one), it ends with exactly that output again and calls no model. A message that
@@ -1535,7 +1869,7 @@ impl LlmAgent {
             if let Some(answer) = &hit.answer
                 && matches!(state.messages.last(), Some(Message::Assistant { .. }))
             {
-                return Ok(Flow::Done(answer.clone()));
+                return Ok((Flow::Done(answer.clone()), None));
             }
             hit.answered = false;
             hit.answer = None;
@@ -1605,9 +1939,38 @@ impl LlmAgent {
         if turn == 0 && state.chain_started.is_none() {
             state.chain_started = Some(ctx.now());
         }
+        // What a call of this turn is made from, taken once: the report's tool context and the calls
+        // that may start while the model writes read the same snapshot.
+        let ctx_facts = CtxFacts::of(ctx);
         let report_plan = (self.session_reports && !closing && (turn == 0 || state.sessions_open))
-            .then(|| self.report_plan(ctx, state, context))
+            .then(|| self.report_plan(&ctx_facts, state, context))
             .flatten();
+        // The calls of this turn may start while the model is still writing (ADR 0049, amended):
+        // what they need is taken from the state and the `Ctx` now, because neither is at hand
+        // inside `Ctx::step`. The batch is handed back through the slot however the step ends.
+        let early_facts = EarlyFacts {
+            ctx: ctx_facts,
+            // The step's one shared copy, not a clone of the map: a started call reads the same
+            // context as the calls that run at the turn.
+            context: context.cloned(),
+            root: (state.root_run, state.root_step.clone(), state.plan.clone()),
+            kept: Arc::clone(&state.kept_outputs),
+            kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
+            files_used: files_kept(&state.artifacts),
+            images: self.image_gate(state),
+            output_cut: state.output_cut,
+            turn: crate::early::Turn {
+                limit: self.max_parallel,
+                closing,
+                cancelled: false,
+                tool_calls: state.tool_calls,
+                max_tool_calls: self.limits.max_tool_calls,
+            },
+            repeats: state.repeats.clone(),
+        };
+        let early_slot: Arc<Mutex<Option<Early<'_>>>> = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&early_slot);
+        let agent = self;
         let recorded: Result<Recorded, ModelFailure> = ctx
             .step(&format!("model:{turn}"), move || async move {
                 if !named.is_empty() {
@@ -1653,16 +2016,23 @@ impl LlmAgent {
                 // The words go out while they are written, under an id made here, inside the step, and
                 // recorded with the answer: a replay calls no model and sends no pieces, but it knows
                 // which stream the words were, so it says them whole under the same id.
+                // The notes are this turn's (a source's listing, read above): a source's call
+                // reports and is labelled as the turn says, not as the turn before it did.
+                let mut early = Early::new(agent, early_facts, notes.clone(), own_order.clone());
                 let streamed = text_stream::stream_response(
                     &model,
                     request,
                     &emitter,
                     &cancel,
+                    Some(&mut early),
                     move || stream_id(run, turn),
                     move || reasoning_stream_id(run, turn),
                 )
-                .await
-                .map_err(ModelFailure::from)?;
+                .await;
+                // The batch goes back to the turn, whatever the stream did with it: the calls that
+                // started are the turn's to settle (their steps are written only after it).
+                *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(early);
+                let streamed = streamed.map_err(ModelFailure::from)?;
                 Ok(Recorded {
                     response: unthought(&emitter, run, turn, true, streamed.response).await,
                     stream: streamed.stream,
@@ -1675,6 +2045,10 @@ impl LlmAgent {
                 })
             })
             .await?;
+        let early = early_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         // The call completed (the provider answered): it is reported, every time this step is
         // passed, under the id its record holds, so a replay says the same report again. A
         // cancelled turn's call is reported too: it was made, though the turn is not kept.
@@ -1691,7 +2065,7 @@ impl LlmAgent {
         // already `Failed` in the store (that is what told the token), so this result is dropped
         // by the worker's commit.
         if ctx.is_cancelled() {
-            return Ok(Flow::Fail(CANCELLED.into()));
+            return Ok((Flow::Fail(CANCELLED.into()), early));
         }
         let answered_stale: bool;
         let mut seen_at: usize;
@@ -1730,6 +2104,11 @@ impl LlmAgent {
             // A recorded error is replayed forever on crash-replay, but a
             // transient retry starts at a fresh seq, so it calls again.
             Err(f) if f.retryable => {
+                // The started calls end within their limits; their results are not used, and the
+                // retry asks the model again.
+                if let Some(mut early) = early {
+                    early.settle().await;
+                }
                 let error = AgentError::transient(format!("model call failed: {}", f.message));
                 return Err(match f.retry_after_ms {
                     // The provider said how long to wait: the runtime waits
@@ -1740,7 +2119,9 @@ impl LlmAgent {
             }
             // The provider rejected the prompt as too long: the history is compacted once, in the
             // next transition, and the turn is tried again.
-            Err(f) if f.context_length => return Ok(self.rejected_as_too_long(state, &f.message)),
+            Err(f) if f.context_length => {
+                return Ok((self.rejected_as_too_long(state, &f.message), early));
+            }
             // The provider refused the request itself: if images no earlier request carried are in
             // it, they may be why.
             Err(f) if f.refused => {
@@ -1749,9 +2130,14 @@ impl LlmAgent {
                     // Images left the history in place: count it afresh next turn.
                     self.forget_chars(run);
                 }
-                return Ok(flow);
+                return Ok((flow, early));
             }
-            Err(f) => return Ok(Flow::Fail(format!("model call failed: {}", f.message))),
+            Err(f) => {
+                return Ok((
+                    Flow::Fail(format!("model call failed: {}", f.message)),
+                    early,
+                ));
+            }
         };
 
         let ModelResponse {
@@ -1771,8 +2157,9 @@ impl LlmAgent {
             messages: seen_at,
         });
         if !matches!(message, Message::Assistant { .. }) {
-            return Ok(Flow::Fail(
-                "model call failed: the response is not an assistant message".into(),
+            return Ok((
+                Flow::Fail("model call failed: the response is not an assistant message".into()),
+                early,
             ));
         }
         state.turns += 1;
@@ -1794,7 +2181,7 @@ impl LlmAgent {
                 turn,
                 "the recorded answer predates a message the run has read: the model answers again"
             );
-            return Ok(Flow::Next);
+            return Ok((Flow::Next, early));
         }
         // A message that reached the run while the model wrote its answer has not been read by it:
         // the answer is not the last word, and the run takes another turn instead of ending
@@ -1847,28 +2234,31 @@ impl LlmAgent {
                 turn,
                 "a message arrived while the model answered: the run takes another turn"
             );
-            return Ok(Flow::Next);
+            return Ok((Flow::Next, early));
         }
         if let Some(limit) = state.limit.as_ref().map(|hit| hit.limit) {
             let said = state.announced.clone().unwrap_or(text);
             if said.trim().is_empty() {
-                return Ok(Flow::Fail(self.limit_message(state, limit)));
+                return Ok((Flow::Fail(self.limit_message(state, limit)), early));
             }
             let output = limited_output(state, limit, said, finish == FinishReason::Length, stream);
             if let Some(hit) = &mut state.limit {
                 hit.answered = true;
                 hit.answer = Some(output.clone());
             }
-            return Ok(Flow::Done(output));
+            return Ok((Flow::Done(output), early));
         }
         if calls.is_empty() {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
             // without one, the words that end the turn are.
             if let Some(announced) = state.announced.clone() {
-                return Ok(Flow::Done(json!({
-                    "text": announced,
-                    "artifacts": state.artifacts,
-                })));
+                return Ok((
+                    Flow::Done(json!({
+                        "text": announced,
+                        "artifacts": state.artifacts,
+                    })),
+                    early,
+                ));
             }
             let mut output = json!({
                 "text": text,
@@ -1882,7 +2272,7 @@ impl LlmAgent {
             if let Some(stream) = stream {
                 output["stream"] = json!(stream);
             }
-            return Ok(Flow::Done(output));
+            return Ok((Flow::Done(output), early));
         }
 
         let requested = u32::try_from(calls.len()).unwrap_or(u32::MAX);
@@ -1904,13 +2294,13 @@ impl LlmAgent {
                 answered: false,
                 answer: None,
             });
-            return Ok(Flow::Next);
+            return Ok((Flow::Next, early));
         }
         state.tool_calls += requested;
         let (calls, ordered_calls) = ordered_by_the_model(calls, &own_order);
         state.pending_calls = calls;
         state.ordered_calls = ordered_calls;
-        Ok(Flow::Next)
+        Ok((Flow::Next, early))
     }
 
     /// The budget of the history, in tokens (see [`compaction::budget`]).
@@ -2271,7 +2661,7 @@ impl LlmAgent {
     /// tools to read them with.
     fn report_plan(
         &self,
-        ctx: &Ctx,
+        ctx: &CtxFacts,
         state: &Conversation,
         context: Option<&Arc<Map<String, Value>>>,
     ) -> Option<ReportPlan> {
@@ -2302,8 +2692,8 @@ impl LlmAgent {
             paged: tool.paged(),
             tool,
             tool_ctx,
-            starter: ctx.child_starter(),
-            me: ctx.run_id(),
+            starter: ctx.child_starter.clone(),
+            me: ctx.run,
             agents: Arc::clone(&self.session_agents),
             reported: state.reported_rounds.clone(),
             in_history,
@@ -2569,6 +2959,7 @@ impl LlmAgent {
         state: &mut Conversation,
         notices: &[(RunId, ChildStatus)],
         context: Option<&Arc<Map<String, Value>>>,
+        early: &mut Option<Early<'_>>,
     ) -> Result<Flow, AgentError> {
         while let Some(call) = state.pending_calls.first().cloned() {
             // A cancel stops the turn between its calls too: the ones still owed do not start.
@@ -2578,7 +2969,10 @@ impl LlmAgent {
             // The calls that run beside this one: none unless the schedule puts several together.
             let together = self.together(state);
             if together >= 2 {
-                match self.run_segment(ctx, state, together, context).await? {
+                match self
+                    .run_segment(ctx, state, together, context, early)
+                    .await?
+                {
                     Some(flow) => return Ok(flow),
                     None => continue,
                 }
@@ -2586,11 +2980,8 @@ impl LlmAgent {
             // `doom_loop`: the third call in a row with the same tool, the same arguments and the
             // same result as the two before it does not run. Decided from the committed state alone.
             let key = call_key(&call);
-            if let Some(repeats) = &mut state.repeats
-                && repeats.key == key
-                && (repeats.count >= DOOM_LOOP_AFTER
-                    || repeats.failing >= DOOM_LOOP_AFTER
-                    || repeats.marked >= DOOM_LOOP_AFTER)
+            if doom_loop_would_refuse(state.repeats.as_ref(), &key)
+                && let Some(repeats) = &mut state.repeats
             {
                 repeats.refused += 1;
                 let ending = repeats.refused >= DOOM_LOOP_REFUSALS;
@@ -2649,6 +3040,11 @@ impl LlmAgent {
                 state.sessions_open = true;
             }
             let used = files_kept(&state.artifacts);
+            // A call that started while the model wrote: its work is done, and its step records it.
+            let started = match early.as_mut() {
+                Some(early) => early.take_one(&call).await,
+                None => None,
+            };
             let (result, reported) = self
                 .run_tool(
                     ctx,
@@ -2667,6 +3063,7 @@ impl LlmAgent {
                         kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                         images: self.image_gate(state),
                     },
+                    started,
                 )
                 .await?;
             state.sandbox_usage.merge(&reported);
@@ -2889,9 +3286,20 @@ impl LlmAgent {
         state: &mut Conversation,
         n: usize,
         context: Option<&Arc<Map<String, Value>>>,
+        early: &mut Option<Early<'_>>,
     ) -> Result<Option<Flow>, AgentError> {
         let calls: Vec<ToolCall> = state.pending_calls[..n].to_vec();
         let notes = state.source_notes.clone();
+        // The calls that started while the model wrote: their work is done or still running. A
+        // batch that is not this turn's calls is dropped whole, and every call runs here as today.
+        let taken = match early.as_mut() {
+            Some(early) => early.take(&calls).await,
+            None => None,
+        };
+        let (mut first, mut started) = match taken {
+            Some((head, results)) => (head, results),
+            None => (None, (0..n).map(|_| None).collect()),
+        };
         let accesses: Vec<ToolAccess> = calls.iter().map(|c| self.access_of(c)).collect();
         let shortcuts: Vec<Option<String>> = calls
             .iter()
@@ -2919,25 +3327,12 @@ impl LlmAgent {
             state.root_step.as_deref(),
             state.plan.as_ref(),
         );
-        let mut first: Option<ToolCtx> = None;
-        let mut slots: Vec<Option<(Option<Prepared>, Option<ReservedStep>)>> =
-            Vec::with_capacity(n);
+        let facts_of_ctx = CtxFacts::of(ctx);
+        let mut slots: Vec<Option<Slot>> = Vec::with_capacity(n);
         for (i, call) in calls.iter().enumerate() {
             if shortcuts[i].is_some() {
-                slots.push(Some((None, None)));
+                slots.push(Some(Slot::Shortcut));
                 continue;
-            }
-            let facts = CallFacts {
-                files_used: used,
-                output_cut: state.output_cut,
-                kept: Arc::clone(&state.kept_outputs),
-                kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
-                images: self.image_gate(state),
-            };
-            let mut one = self.prepare(ctx, context, root, &notes, call, facts);
-            match &first {
-                Some(head) => one.tool_ctx = one.tool_ctx.sharing_budgets_of(head),
-                None => first = Some(one.tool_ctx.clone()),
             }
             let step = steps.next().ok_or_else(|| {
                 AgentError::permanent("a call of a segment has no reserved step".to_owned())
@@ -2948,7 +3343,23 @@ impl LlmAgent {
                 seqs[i],
                 "the seq a sequential loop gives call {i}"
             );
-            slots.push(Some((Some(one), Some(step))));
+            if let Some(finished) = started[i].take() {
+                slots.push(Some(Slot::Started(Box::new(finished), step)));
+                continue;
+            }
+            let facts = CallFacts {
+                files_used: used,
+                output_cut: state.output_cut,
+                kept: Arc::clone(&state.kept_outputs),
+                kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
+                images: self.image_gate(state),
+            };
+            let mut one = self.prepare(&facts_of_ctx, context, root, &notes, call, facts);
+            match &first {
+                Some(head) => one.tool_ctx = one.tool_ctx.sharing_budgets_of(head),
+                None => first = Some(one.tool_ctx.clone()),
+            }
+            slots.push(Some(Slot::Fresh(Box::new(one), step)));
         }
 
         let emitter = ctx.emitter();
@@ -2966,21 +3377,37 @@ impl LlmAgent {
                 grace = Some(Box::pin(tokio::time::sleep(TOOL_STOP_GRACE)));
             }
             for i in queue.ready() {
-                let Some((prepared, step)) = slots[i].take() else {
+                let Some(slot) = slots[i].take() else {
                     continue;
                 };
-                running.push(
-                    self.drive(
-                        i,
-                        &calls[i],
-                        &notes,
-                        &emitter,
-                        shortcuts[i].clone(),
-                        prepared,
-                        step,
-                    )
-                    .boxed(),
-                );
+                let work = match slot {
+                    Slot::Shortcut => self
+                        .drive(
+                            i,
+                            &calls[i],
+                            &notes,
+                            &emitter,
+                            shortcuts[i].clone(),
+                            None,
+                            None,
+                        )
+                        .boxed(),
+                    Slot::Fresh(prepared, step) => self
+                        .drive(
+                            i,
+                            &calls[i],
+                            &notes,
+                            &emitter,
+                            None,
+                            Some(*prepared),
+                            Some(step),
+                        )
+                        .boxed(),
+                    Slot::Started(finished, step) => {
+                        self.record_early(i, &calls[i], finished, step)
+                    }
+                };
+                running.push(work);
             }
             if running.is_empty() {
                 break;
@@ -3109,6 +3536,50 @@ impl LlmAgent {
         )
     }
 
+    /// A call that started while the model wrote: its step records the outcome the call gave (its
+    /// work is done, or still running), and a transient failure fails the transition, as a call the
+    /// turn ran does.
+    fn record_early(
+        &self,
+        i: usize,
+        call: &ToolCall,
+        finished: Box<Finished>,
+        step: ReservedStep,
+    ) -> BoxFuture<'static, (usize, Result<Finished, AgentError>)> {
+        let call = call.clone();
+        async move {
+            let Finished::Ran {
+                outcome,
+                unjournaled,
+                live,
+            } = *finished
+            else {
+                return (
+                    i,
+                    Err(AgentError::permanent(
+                        "a call that started early has no outcome".to_owned(),
+                    )),
+                );
+            };
+            let journaled: Result<ToolOutput, ToolError> =
+                match step.run(move || async move { *outcome }).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => return (i, Err(error)),
+                };
+            let failure = transient_failure(&call, &journaled);
+            let finished = Finished::Ran {
+                outcome: Box::new(journaled),
+                unjournaled,
+                live,
+            };
+            match failure {
+                Some(error) => (i, Err(error)),
+                None => (i, Ok(finished)),
+            }
+        }
+        .boxed()
+    }
+
     #[tracing::instrument(skip_all, fields(run = %emitter.run_id(), tool = %call.name, call_id = %call.id))]
     async fn drive_one(
         &self,
@@ -3147,7 +3618,31 @@ impl LlmAgent {
         let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
         let outcome: Result<ToolOutput, ToolError> = step.run(move || work).await?;
         // How it ended, said now; `conclude` says it again only if applying the result changes it.
-        let live = match &outcome {
+        let live = self.say_outcome(call, notes, emitter, &outcome).await;
+        if let Some(error) = transient_failure(call, &outcome) {
+            return Err(error);
+        }
+        Ok(Finished::Ran {
+            outcome: Box::new(outcome),
+            unjournaled,
+            live,
+        })
+    }
+
+    /// What a call's outcome says about its step's end, said **now**, as it happens: the end event,
+    /// and what applying the result may change (so that it is said again only then). A transient
+    /// failure is said too, and the transition fails after it ([`transient_failure`]).
+    async fn say_outcome(
+        &self,
+        call: &ToolCall,
+        notes: &[ToolNote],
+        emitter: &Emitter,
+        outcome: &Result<ToolOutput, ToolError>,
+    ) -> Live {
+        let silent = self
+            .source_note(notes, &call.name)
+            .is_some_and(|n| n.reports_step);
+        match outcome {
             // Rounds are reported only by a call that runs alone (the loop reads them in a step of
             // its own, which a segment cannot place between the calls).
             Ok(output) if reports_rounds(output) => {
@@ -3217,10 +3712,7 @@ impl LlmAgent {
                     ),
                 )
                 .await;
-                return Err(AgentError::transient(format!(
-                    "tool `{}` failed: {reason}",
-                    call.name
-                )));
+                Live { said: None }
             }
             // A call that asks or waits cannot run beside others: the model is told to call it
             // alone (a tool that can do it must say `Alone`).
@@ -3239,12 +3731,36 @@ impl LlmAgent {
                 .await;
                 Live { said: None }
             }
-        };
-        Ok(Finished::Ran {
-            outcome: Box::new(outcome),
-            unjournaled,
-            live,
-        })
+        }
+    }
+
+    /// The work of a call that started while the model was still writing: run it, and say how it
+    /// ended as it happens. The turn's step records the outcome ([`Self::run_segment`]).
+    fn early_work(
+        &self,
+        i: usize,
+        call: ToolCall,
+        notes: Vec<ToolNote>,
+        emitter: Emitter,
+        prepared: Prepared,
+    ) -> BoxFuture<'static, (usize, Finished)> {
+        let agent = self.clone();
+        async move {
+            let unjournaled = prepared.unjournaled.clone();
+            let note = agent.source_note(&notes, &call.name).cloned();
+            let work = agent.step_work(&call, note.as_ref(), prepared);
+            let outcome = work.await;
+            let live = agent.say_outcome(&call, &notes, &emitter, &outcome).await;
+            (
+                i,
+                Finished::Ran {
+                    outcome: Box::new(outcome),
+                    unjournaled,
+                    live,
+                },
+            )
+        }
+        .boxed()
     }
 
     /// What the model is told for a call that takes no journal step: its arguments were not JSON, or
@@ -3282,7 +3798,7 @@ impl LlmAgent {
     /// What a call needs to run, made from the `Ctx` while it can still be read.
     fn prepare(
         &self,
-        ctx: &Ctx,
+        ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
         root: (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
@@ -3297,7 +3813,7 @@ impl LlmAgent {
             ..
         } = facts;
         let note = self.source_note(notes, &call.name);
-        let root_run = root.0.unwrap_or_else(|| ctx.run_id()).to_string();
+        let root_run = root.0.unwrap_or(ctx.run).to_string();
         let tool_ctx = self
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
             .with_note(note.cloned())
@@ -3305,7 +3821,7 @@ impl LlmAgent {
             .with_kept(kept_left, kept)
             .with_images(
                 images,
-                image_scope(ctx.conversation_id(), &root_run),
+                image_scope(ctx.conversation_id.as_deref(), &root_run),
                 root_run,
             );
         // What a source holds back is refused here too, inside the step that records the answer:
@@ -3314,9 +3830,9 @@ impl LlmAgent {
             (
                 self.sources.clone(),
                 SourceCtx::new(
-                    ctx.run_id(),
-                    root.0.unwrap_or_else(|| ctx.run_id()),
-                    ctx.conversation_id().map(str::to_owned),
+                    ctx.run,
+                    root.0.unwrap_or(ctx.run),
+                    ctx.conversation_id.clone(),
                     context.cloned().unwrap_or_default(),
                 ),
             )
@@ -3393,6 +3909,7 @@ impl LlmAgent {
     }
 
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), tool = %call.name, call_id = %call.id))]
+    #[allow(clippy::too_many_arguments)] // one call's pieces, handed over once
     async fn run_tool(
         &self,
         ctx: &mut Ctx,
@@ -3401,8 +3918,40 @@ impl LlmAgent {
         notes: &[ToolNote],
         call: &ToolCall,
         facts: CallFacts,
+        started: Option<Finished>,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let files_used = facts.files_used;
+        // A call that started while the model wrote: its work is done, so the step records what it
+        // gave, and its end was said as it happened.
+        if let Some(finished) = started {
+            let Finished::Ran {
+                outcome,
+                unjournaled,
+                live,
+            } = finished
+            else {
+                return Err(AgentError::permanent(
+                    "a call that started early has no outcome".to_owned(),
+                ));
+            };
+            let outcome: Result<ToolOutput, ToolError> = ctx
+                .step(
+                    &format!("tool:{}", call.id),
+                    move || async move { *outcome },
+                )
+                .await?;
+            return self
+                .conclude(
+                    ctx,
+                    notes,
+                    call,
+                    outcome,
+                    &unjournaled,
+                    files_used,
+                    Some(live),
+                )
+                .await;
+        }
         // The system behind the source reports each call itself: the agent reports no step of its own.
         let silent = self
             .source_note(notes, &call.name)
@@ -3426,7 +3975,7 @@ impl LlmAgent {
             .await;
             return Ok((ToolResult::error(&call.id, said), SandboxUsage::new()));
         }
-        let prepared = self.prepare(ctx, context, root, notes, call, facts);
+        let prepared = self.prepare(&CtxFacts::of(ctx), context, root, notes, call, facts);
         let unjournaled = prepared.unjournaled.clone();
         let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
         let outcome: Result<ToolOutput, ToolError> =
@@ -3592,7 +4141,7 @@ impl LlmAgent {
     /// run's inbound `context`.
     fn tool_ctx(
         &self,
-        ctx: &Ctx,
+        ctx: &CtxFacts,
         context: Option<&Arc<Map<String, Value>>>,
         (root_run, root_step, plan): (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
@@ -3600,14 +4149,14 @@ impl LlmAgent {
         tool: &str,
     ) -> ToolCtx {
         ToolCtx::new(
-            ctx.conversation_id().map(str::to_owned),
-            ctx.attempt(),
+            ctx.conversation_id.clone(),
+            ctx.attempt,
             call_id.to_owned(),
             tool.to_owned(),
-            ctx.emitter(),
-            ctx.cancel_token(),
+            ctx.emitter.clone(),
+            ctx.cancel.clone(),
             Arc::clone(&self.extensions),
-            Some(ctx.child_starter()),
+            Some(ctx.child_starter.clone()),
             context.cloned().unwrap_or_default(),
             root_run,
             root_step.map(str::to_owned),
@@ -3766,7 +4315,7 @@ impl LlmAgent {
         };
         let tool_ctx = self
             .tool_ctx(
-                ctx,
+                &CtxFacts::of(ctx),
                 context,
                 (
                     state.root_run,
@@ -4299,7 +4848,7 @@ fn canonical(value: &Value, out: &mut String) {
 
 /// The tool name and the canonical arguments of a call, hashed (the raw text for arguments that
 /// were not JSON).
-fn call_key(call: &ToolCall) -> String {
+pub(crate) fn call_key(call: &ToolCall) -> String {
     match &call.invalid_arguments {
         Some(raw) => fnv_hex(&[&call.name, "raw", raw]),
         None => {
@@ -4308,6 +4857,33 @@ fn call_key(call: &ToolCall) -> String {
             fnv_hex(&[&call.name, "json", &text])
         }
     }
+}
+
+/// The transition a transient tool failure fails: the step's record is abandoned with the try, and
+/// the retry runs the turn's calls again (ADR 0049 decision 9). The end of the call was said as it
+/// happened, by [`LlmAgent::say_outcome`].
+fn transient_failure(
+    call: &ToolCall,
+    outcome: &Result<ToolOutput, ToolError>,
+) -> Option<AgentError> {
+    match outcome {
+        Err(ToolError::Transient(reason)) => Some(AgentError::transient(format!(
+            "tool `{}` failed: {reason}",
+            call.name
+        ))),
+        _ => None,
+    }
+}
+
+/// Whether `doom_loop` would refuse a call of `key` now, from the committed state alone: the third
+/// call in a row with the same tool, the same arguments and the same result does not run.
+fn doom_loop_would_refuse(repeats: Option<&Repeats>, key: &str) -> bool {
+    repeats.is_some_and(|repeats| {
+        repeats.key == key
+            && (repeats.count >= DOOM_LOOP_AFTER
+                || repeats.failing >= DOOM_LOOP_AFTER
+                || repeats.marked >= DOOM_LOOP_AFTER)
+    })
 }
 
 /// Count the answer of a call that ran: one more in a row when its key and its result are those of
@@ -4722,21 +5298,34 @@ impl Agent for LlmAgent {
         // Owed tool results (the run was parked on a question) come first;
         // otherwise this step is a fresh model turn.
         let mut flow = Flow::Next;
+        let mut early: Option<Early<'_>> = None;
         if state.pending_calls.is_empty() {
             state.messages.append(&mut state.deferred);
-            flow = self.model_turn(ctx, &mut state, context.as_ref()).await?;
+            let (next, batch) = self.model_turn(ctx, &mut state, context.as_ref()).await?;
+            flow = next;
+            early = batch;
             // A call that starts, sends to or closes a session has an effect no failed try can undo:
             // the turn and its calls are committed first, so a retry never asks the model again
             // (new call ids, so a second session) and the call runs under the id the history holds.
             if matches!(flow, Flow::Next) && state.pending_calls.iter().any(|c| has_effect(&c.name))
             {
+                // The calls that started while the model wrote are not this transition's to keep.
+                if let Some(mut batch) = early.take() {
+                    batch.settle().await;
+                }
                 return Ok(Transition::Continue(state));
             }
         }
         if matches!(flow, Flow::Next) {
             flow = self
-                .run_pending(ctx, &mut state, &notices, context.as_ref())
+                .run_pending(ctx, &mut state, &notices, context.as_ref(), &mut early)
                 .await?;
+        }
+        // Whatever the turn did not use (a limit answered its calls, a barrier came first, a stream
+        // error, a cancel): the calls that started end within their limits, and their results are
+        // dropped. On a cancel the run's token has fired, so the wait is TOOL_STOP_GRACE at most.
+        if let Some(mut left) = early {
+            left.settle().await;
         }
         // The order the model asked for is the turn's: once its calls are answered it says nothing.
         if state.pending_calls.is_empty() {

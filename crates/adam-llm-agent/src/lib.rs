@@ -139,6 +139,7 @@ mod access;
 mod agent;
 mod compaction;
 mod conversation;
+mod early;
 mod fn_tool;
 mod history;
 mod images;

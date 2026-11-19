@@ -658,6 +658,14 @@ sequenceDiagram
   waits for every call before it and holds the ones after it. A tool that declares nothing is `Alone`, so a loop of such tools is
   sequential (adam-coder's classes are in [the coder reference](reference/coder-agent.md#calls-at-the-same-time)). A cancel stops new starts and waits up to 5 s for the running calls; a transient failure stops new
   starts, waits for the running ones and retries the transition.
+* **A call starts while the model writes.** The model's client says `ModelDelta::ToolCallComplete` when a call's arguments
+  are whole, and the loop starts that call beside the stream, before the turn is recorded (`src/early.rs` is the pure
+  gate, `Early` in `src/agent.rs` the batch of started calls). Only a call in the first segment that is no barrier, does not
+  conflict with one already running or with an earlier call of the turn that did not start early, leaves room under
+  `max_tool_calls` and is not a `doom_loop` refusal starts; every
+  other call waits for the turn. The turn is still journaled first: `model:N` when the stream ends, then `tool:<call id>`
+  at the seqs a sequential loop writes, so a crash mid-stream writes nothing and the replay asks the model again. A stream
+  error waits for the started calls and retries the turn; a cancel waits `TOOL_STOP_GRACE` for them.
 * **Replay is safe, effects are at-least-once.** The effect runs before its outcome is written, so a
   crash in between runs it again. Tools must be safe to repeat.
 * **Waking is polling plus hints.** An idle worker sleeps at most one poll interval; `start` and
