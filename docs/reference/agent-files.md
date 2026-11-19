@@ -264,6 +264,13 @@ The prompts of an agent's MCP servers are commands too, named `<server>__<prompt
   `files: true` (an adam extension, a boolean, default `false`) shares the images, audio clips and blobs of the
   server's results as files of the run ([below](#files-from-a-server-files-true)). `timeoutSecs` and
   `connectTimeoutSecs`, `instructions` and `prompts` (adam extensions) are [below](#timeouts-instructions-and-prompts).
+* `when: { "keywords": ["…"] }` (an adam extension) loads the server's tools **only when the run's task
+  mentions one of its keywords**, ignoring case; a server without `when` is loaded for every run. The test is
+  made once, from the words of the run's first message, before its first model call, and never again:
+  the tools the model is shown do not move during a run ([below](#a-server-loaded-only-when-the-task-asks-when)).
+  `paths` is **not** supported in this version and is ignored with a warning: the coder has no checkout before
+  its first model call (`prepare_workspace` is a tool), so a path glob would have nothing to match. A `when`
+  still needs `keywords`; one without is a load error and the server is left out.
 * `${VAR}` and `${VAR:-default}` are expanded **at startup only**. A missing variable without a default
   fails startup (fail closed). `build.rs` records the names and never the values.
 * stdio servers spawn processes: allowed only when the composition root opts in (`McpPolicy::allow_stdio`).
@@ -806,6 +813,33 @@ stateDiagram-v2
 
 * **Per agent.** An agent's MCP tools come only from the `mcp.json` in its own directory; a subagent inherits
   none, and two directories may each name a server `linear`, connected apart.
+
+#### A server loaded only when the task asks (`when`)
+
+A server entry may say `"when": { "keywords": ["linear", "ticket"] }`. Its tools are then **loaded only for a
+run whose task mentions one of the keywords**, ignoring case; a server without `when` is eager and loaded for
+every run, as before the key existed.
+
+* **The task** is the first part of the run's first message: the words the person sent
+  (`Conversation::task`). A run that continues another carries that first message, so it selects the same
+  servers as the run before, whatever its new message says. A message with no words (an empty one, or images
+  only) matches nothing: only the eager servers are loaded.
+* **When it is decided.** Before the run's first model call, from the task alone, and never again. The tools
+  array is the same bytes at every request of the run, so the cached prefix holds ([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md),
+  decision 1). The decision is **recomputed** from the run's state at each turn, not stored: the state
+  already holds the task, and a stored field would be a second place where the same decision lives.
+* **What is withheld.** An unselected server's tools are not shown, and a call to one (the model may name a
+  tool it was not shown) is refused with a result that says the tool is not loaded for this run and names the
+  server and its keywords. Its instructions are not in the agent's prompt either: they are appended for a
+  turn only when the run loads the server, and each set is still bounded at 8 KiB. The eager servers'
+  instructions stay in the prompt, after the agent's own text and before its skills; a loaded triggered
+  server's come after the prompt and the skills.
+* **No `paths` in this version.** The coder has no checkout before its first model call
+  (`prepare_workspace` is a tool), so a path glob would have nothing to match. `when.paths` is ignored with a
+  warning at load; a `when` with no `keywords` is a load error, because the server would never load.
+* **Keywords.** 1 to 16, each 1 to 64 characters, no control or format character; the match is a
+  case-insensitive substring, so a plural or a possessive still matches. A `when` with no keyword is a load
+  error and the server is left out (it would never load: leave `when` out to load it for every run).
 * **Fail closed at startup.** `AgentDef::connect_mcp` finds everything that can be wrong before the first
   model call: a `${VAR}` with no value, `type: sse`, a stdio server the policy forbids, a plain-http URL to
   another machine, a URL with credentials or a `${VAR}`, a bad header, a server that is down or refuses the
@@ -831,7 +865,7 @@ stateDiagram-v2
 
 ### Timeouts, instructions and prompts
 
-Five optional keys of a server entry, in `mcp.json` and in the deployment's extra file
+Six optional keys of a server entry, in `mcp.json` and in the deployment's extra file
 (`ADAM_EXTRA_MCP_FILE`).
 
 | Key | Meaning | Default |
@@ -841,6 +875,7 @@ Five optional keys of a server entry, in `mcp.json` and in the deployment's extr
 | `instructions` | `false` leaves out the text the server returns when it initializes | on |
 | `prompts` | `false` stops the server's prompts from becoming commands | on |
 | `parallel` | `false` makes the calls of this server's tools run one at a time, alone in their turn; by default they run at the same time as the turn's other calls, up to `MAX_PARALLEL_TOOL_CALLS` ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)). **Folder agents change behaviour here:** MCP tools now run at the same time by default; a server with a session (a browser, a cursor, a file being written then read) needs `"parallel": false` in mcp.json before you take this revision. | on |
+| `when` | `{ "keywords": ["…"] }`: the server's tools and its instructions reach a run only when the run's task mentions one of the keywords (see [below](#a-server-loaded-only-when-the-task-asks-when)); `paths` is not supported and is ignored with a warning | eager (no `when`) |
 
 * **Seconds.** A whole number, at least 1. Zero, a negative or a fractional number, or text refuses that server
   when the file is loaded (`path: error: ...`).
