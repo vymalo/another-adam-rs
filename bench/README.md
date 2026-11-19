@@ -394,7 +394,8 @@ the git sandbox, the pusher): no other image is added to the dev stack's postgre
 The coder, the OpenCode arm and the grading are **host containers** the harness starts with `docker run`: the coder from
 the task image, with `--env-file` (mode 0600), `--user 10001:10001`, the runtime's limits, its binaries and agent folder
 mounted read-only, and `RUN_ENVIRONMENT=local`; the OpenCode arm and the grading from the task image, with the work
-directory at `/work`. The coder joins the slot's internal network; `pub-coder-N` publishes its A2A port on the loopback.
+directory at `/work`. The coder and the OpenCode arm join the slot's internal network; `pub-coder-N` publishes the
+coder's A2A port on the loopback.
 
 **Networks** (all internal but `egress`; a test over the rendered file holds each member list):
 
@@ -445,7 +446,7 @@ them equal.
 | Runs in | a coder container of the task image on the host's Docker (`RUN_ENVIRONMENT=local`), its binaries and agent folder mounted read-only | a container of the task image on the host's Docker |
 | Working copy | its worktree `/work/workspaces/<run>/<slot>` of the base on the git server (a repository of this run's own) | a clone of the same base at `/work/workspaces/oc-<run>-a<n>/<slot>` |
 | Statement | one line (`In <repository> (base branch main), do this task:`) and the statement | the statement, byte for byte, on stdin |
-| Network | the slot's, through the meter | the slot's: the meter and nothing else |
+| Network | the slot's: the meter, the git server, postgres and the mock (the coder's own network) | the slot's: the same network as the coder's, the meter and the stack's shared services |
 | Ends | polling `GetTask` every 10 s | the container's status, or the time limit |
 | Usage it reports | `usage/v1` totals of the task | `step_finish` events and `opencode session export` |
 
@@ -802,8 +803,9 @@ deletes the file first, so an old yes never covers a new pilot.
 plugin, whether the daemon is rootless, free disk (a failure under 20 GB, a warning under 100 GB, in `$BENCH_HOME` and in
 Docker's root) and the coder image by digest. **For each selected task image** it runs the coder's binary with no
 configuration as uid 10001 in that image: exit 78 means the coder starts (it refuses an empty configuration), a loader
-error means the image cannot load it. Until the static coder (ADR 0053 slice 1) is in the pin, a task image built on
-Debian bookworm is reported and **refused for both arms**; the output names the distribution and the loader's error. With
+error or another architecture means the image cannot run it. The coder's binaries are static (musl, ADR 0053 decision 11),
+so the image's C library is not the question: a Debian bookworm task image starts the coder as well as a trixie one, and an
+image that cannot run the binary at all is **refused for both arms**. The output names the distribution and the error. With
 `--start` it brings the stack up and runs a container of the coder image on the host, for each slot and for the grading,
 and asks the runtime whether it takes the arms' limits (a refusal is a warning: both arms still get the same setting).
 Compose 2.24 or newer and an x64 machine are required. The exit is 1 when a check fails, which includes a task image the
@@ -855,7 +857,8 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
 ## Unverified
 
 * **What the dry run did not cover:** a model key and a real endpoint (the scripted model is the only server the tests
-  have seen), a bookworm task image (the probe refuses one until the static coder lands), two slots at once with real task
+  have seen), a bookworm task image (the probe's rule is tested on fakes; the dry run's images are built from the
+  workspace base), two slots at once with real task
   images, and `bench doctor --start` (the probe and the stack's `up` ran, not that command). The probe, the stack, the
   coder in the trixie self image, both arms with the pinned OpenCode binary, the grading, the budget and the kill/resume
   did run.

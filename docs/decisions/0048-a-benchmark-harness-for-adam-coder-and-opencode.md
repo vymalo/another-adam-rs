@@ -396,8 +396,13 @@ The note above is built, with the changes ADR 0053 decision 12 makes:
 * Gradings share one internal `verifier` network, which the harness makes because Compose makes no network that has no
   service; a verifier that asks for the internet gets the `egress` network, alone, in its window. `grader-net` is gone.
 * `bench doctor` probes each selected task image: the coder binary with no configuration as uid 10001, exit 78 means it
-  starts, a loader error means it does not. Until the static musl coder (ADR 0053 slice 1) is in the pin, a Debian
-  bookworm task image is reported and refused for both arms. The pin's coder is linked against trixie's C library.
+  starts, a loader error or another architecture means it does not, and such an image is refused for both arms. The
+  coder's binaries are static (ADR 0053 decision 11, #201), so a Debian bookworm task image starts the coder as well as a
+  trixie one; `bench/pins.json` still names the build before that change, so the probe reports what the pinned image does
+  until the pin moves (slice 6b, the pin's owner).
+* The two arms now share the slot's network: the coder's commands run in the coder container, which needs the git server,
+  postgres and the mock, and OpenCode's container joins the same network so the arms are given the same reach. The old
+  rule that a task's commands reach the meter and nothing else no longer holds, and is not claimed.
 * The bench's Postgres stays: moving it to a store service with SQLite is slice 6b.
 
 The table "Runs in" of `bench/README.md` and the stack's networks change with it. The proof is that
