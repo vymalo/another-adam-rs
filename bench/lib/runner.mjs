@@ -13,11 +13,11 @@
 // graded again.
 import fs from 'node:fs';
 import path from 'node:path';
-import { prepareBase } from './base.mjs';
+import { BaseCache, BASE_NAME, baseKey } from './base.mjs';
 import { CapBook } from './cap.mjs';
 import { callStats, classifyRun } from './classify.mjs';
 import { gradePatch, hostGradeIO } from './grade.mjs';
-import { resumeActions, resumeRecords } from './ledger.mjs';
+import { foldRecords, resumeActions, resumeRecords } from './ledger.mjs';
 
 /** Thrown by a test hook to stand for a killed harness: nothing is written and nothing is cleaned up. */
 export class HarnessCrash extends Error {
@@ -29,6 +29,9 @@ export class HarnessCrash extends Error {
 
 const SAFE_ID = /[^A-Za-z0-9._-]/g;
 export const runDirName = (run, attempt) => `${run.replace(SAFE_ID, '-')}-a${attempt}`;
+
+/** The bases this process has made, per (task, image): a second run of a task reuses the slot's copy and the host's. */
+const bases = new BaseCache();
 
 /**
  * @typedef {object} Deps
@@ -47,8 +50,9 @@ export const runDirName = (run, attempt) => `${run.replace(SAFE_ID, '-')}-a${att
  */
 
 function stateRecord(deps, run, state, extra = {}) {
-  deps.ledger.append({ kind: 'state', run, state, ...extra });
+  const record = deps.ledger.append({ kind: 'state', run, state, ...extra });
   deps.afterState?.(run, state);
+  return record;
 }
 
 async function gradeSaved({ deps, task, patchPath }) {
@@ -131,8 +135,16 @@ export async function executeRun({ deps, spec, attempt }) {
     // A coder from a killed harness would still write the work directory the base is made in.
     if (stack.stopCoder) await stack.stopCoder(spec.slot).catch(() => {});
     await deps.pullImage?.(spec.slot, task);
-    await stack.resetWork(spec.slot);
-    const base = await (deps.prepareBase ?? prepareBase)({ containers, stack, slot: spec.slot, task, hostRoot: path.join(paths.scratch, 'base') });
+    await stack.resetWork(spec.slot, { keep: [BASE_NAME] });
+    const base = await (deps.prepareBase ?? ((o) => bases.prepare(o)))({
+      containers,
+      stack,
+      slot: spec.slot,
+      task,
+      // The host's repository of a task's base outlives the run (whose scratch is removed at cleanup): one directory per
+      // (task, image), reused by every run of it in this process.
+      hostRoot: path.join(deps.home, 'bases', baseKey(task)),
+    });
     const { token } = meter.openRun({ run, attempt, arm: spec.arm });
     opened.meter = true;
     ctx = {
@@ -264,10 +276,13 @@ export async function resumeLedger({ deps, slots }) {
 }
 
 /** Take one spec as far as the ledger says it should go: plan it if new, run it if Planned, grade it if Grading. */
-export async function advance({ deps, spec }) {
-  let view = deps.ledger.fold().get(spec.run);
+export async function advance({ deps, spec, folded }) {
+  // `folded` is the caller's map, folded once: a plan of n runs would otherwise replay every record of every earlier run
+  // (twice: once to look, once after the Planned record) and allocate a view per run each time.
+  const views = folded ?? deps.ledger.fold();
+  let view = views.get(spec.run);
   if (!view) {
-    stateRecord(deps, spec.run, 'Planned', {
+    const planned = stateRecord(deps, spec.run, 'Planned', {
       task: spec.task.id,
       agent: spec.agent,
       arm: spec.arm,
@@ -277,7 +292,10 @@ export async function advance({ deps, spec }) {
       ...(deps.digest ? { digest: deps.digest } : {}),
       ...(spec.phase ? { phase: spec.phase } : {}),
     });
-    view = deps.ledger.fold().get(spec.run);
+    // The run is new, so the fold of the one record just written is its whole view: no ledger replay, and the map stays
+    // current for the next spec (and for a caller that reads it between runs).
+    view = foldRecords([planned]).get(spec.run);
+    views.set(spec.run, view);
   }
   if (view.state === 'Grading') return { run: spec.run, ...(await regradeRun({ deps, spec, attempt: view.attempt })) };
   if (view.state === 'Planned') return { run: spec.run, ...(await executeRun({ deps, spec, attempt: view.attempt })) };
@@ -290,8 +308,9 @@ export async function advance({ deps, spec }) {
  */
 export async function runPlan({ deps, plan }) {
   await resumeLedger({ deps, slots: new Set(plan.map((s) => s.slot)) });
+  const folded = deps.ledger.fold();
   const outcomes = [];
-  for (const spec of plan) outcomes.push(await advance({ deps, spec }));
+  for (const spec of plan) outcomes.push(await advance({ deps, spec, folded }));
   return outcomes;
 }
 

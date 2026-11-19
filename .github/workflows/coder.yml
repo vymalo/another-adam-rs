@@ -6,7 +6,9 @@ name: coder
 # ci.yml; this workflow covers what only the image and the chart can show.
 #
 # The image is built on pull requests too and smoke-tested as a container (a
-# Postgres service, a stub model, a real start under tini), then run through
+# Postgres service, a stub model, a real start under tini), its six binaries are
+# checked to be static and to start in debian:bookworm-slim and alpine
+# (docker/coder/test/static-smoke.sh, ADR 0053 decision 11), then run through
 # the compose stack (scripted models, a git remote, a mock GitHub) with a task
 # that must end in a branch and one pull request (dev/coder-e2e.sh; also a task that names no
 # repository, which ends in a pull request on a repository named later; and all of them again with
@@ -30,7 +32,10 @@ name: coder
 # answers (dev/coder-choices-e2e.sh), and the same service on the researcher folder answers with
 # source cards and a graph on a screen that draws them (dev/agent-cards-e2e.sh), and on the painter folder
 # it makes a picture with an image MCP server and shares it as a file (dev/painter-e2e.sh). There is no second
-# image. On main the very image that passed is the one pushed.
+# image. A pull request runs the seven default coder scenarios and two of the App-mode ones; one that carries the
+# e2e-full label, or changes dev/, docker/coder/ or compose.yaml, runs all 23. main and a manual dispatch run all of
+# them (the work environments, the other agent folders and the other five App scenarios).
+# On main the very image that passed is the one pushed.
 #
 # The bump follows the pattern of vymalo/another-agentic-system#11 (deploy-bump):
 # set the image tag in the chart's values.yaml to `sha-<first 7 of the commit>`
@@ -57,6 +62,8 @@ on:
       - compose.yaml
       - dev/**
       - .github/workflows/coder.yml
+  # The full compose e2e on demand, without a commit to main.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -250,10 +257,12 @@ jobs:
     name: build, smoke-test and push the image
     needs: [helm, dockerfile, scripts]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
+      # The full e2e is chosen from the pull request's labels and changed files.
+      pull-requests: read
     outputs:
       pushed: ${{ steps.guard.outputs.push }}
     services:
@@ -307,6 +316,13 @@ jobs:
             ADAM_BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
+      # ADR 0053 decision 11: the six binaries are static and start in an image with a different C
+      # library (debian:bookworm-slim and alpine), as uid 10001 with no configuration, ending on their
+      # own configuration error. That is what lets the bench start the coder from any task image
+      # (ADR 0052 decision 10).
+      - name: The six binaries are static and start in a foreign image
+        if: steps.guard.outputs.ready == 'true'
+        run: sh docker/coder/test/static-smoke.sh coder:smoke
       - name: Container smoke test
         if: steps.guard.outputs.ready == 'true'
         env:
@@ -319,6 +335,29 @@ jobs:
         env:
           EXPECT_REVISION: ${{ github.sha }}
         run: sh docker/coder/test/agent-smoke.sh coder:smoke
+      # The gated suite of the real language servers (ADR 0044 slice 17), in the image that was just
+      # built: its workspace base carries rust-analyzer, typescript-language-server, pyright-langserver
+      # and gopls (another-agentic-images#15), and the Dart server comes with the base's Flutter SDK.
+      # The checkout is mounted read-only; cargo writes its target and CARGO_HOME under /tmp, with
+      # debug info off and no incremental artifacts to keep the target small on the runner's disk.
+      # ADAM_TEST_REQUIRE_LANGUAGE_SERVERS turns a server that is not on PATH into a failure: a skip
+      # would prove nothing about the image.
+      - name: Real language servers, in the image
+        if: steps.guard.outputs.ready == 'true'
+        run: |
+          set -eu
+          docker run --rm --entrypoint cargo \
+            --user 10001:10001 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/src,readonly" \
+            --workdir /src \
+            --env CARGO_TARGET_DIR=/tmp/target \
+            --env CARGO_HOME=/tmp/cargo \
+            --env CARGO_PROFILE_DEV_DEBUG=0 \
+            --env CARGO_INCREMENTAL=0 \
+            --env ADAM_TEST_LANGUAGE_SERVERS=1 \
+            --env ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1 \
+            coder:smoke \
+            test -p adam-coder --test real_language_servers --features adam-llm-agent/schema --locked
       # The image that just passed, in the compose stack: the coder gets a task
       # over A2A, its scripted model drives prepare -> write the file
       # -> checks -> commit and push -> pull request, and dev/coder-e2e.sh
@@ -331,10 +370,33 @@ jobs:
       # the same three again with the coder as a GitHub App installation.
       # The job's own Postgres service holds 5432, so the stack's Postgres
       # moves to POSTGRES_PORT.
+      # A pull request runs the default and the first App scenarios; the full set when it carries the e2e-full label
+      # or changes the compose stack (dev/, docker/coder/ or compose.yaml). main and workflow_dispatch run everything.
+      - name: Does this pull request need the full compose e2e?
+        id: e2e
+        if: github.event_name == 'pull_request' && steps.guard.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        # bash with pipefail: a gh failure is not hidden by grep, and grep reads to EOF (no -q) so a multi-page
+        # pull request cannot SIGPIPE the producer.
+        shell: bash
+        run: |
+          set -eu
+          full=false
+          if printf '%s' "$LABELS" | grep -Eq '"e2e-full"'; then
+            full=true
+          fi
+          if gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.number }}/files" \
+              --jq '.[].filename' | grep -Eq '^(dev/|docker/coder/|compose\.yaml$)'; then
+            full=true
+          fi
+          echo "full=$full" >> "$GITHUB_OUTPUT"
       - name: Compose e2e
         if: steps.guard.outputs.ready == 'true'
         env:
           POSTGRES_PORT: "15432"
+          E2E_FULL: ${{ github.event_name != 'pull_request' || steps.e2e.outputs.full == 'true' }}
         run: |
           set -eu
           docker tag coder:smoke adam-rs/coder:dev
@@ -357,45 +419,49 @@ jobs:
           # a no it sees none.
           SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
           SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
-          # The work environments: the stack again with a rootless Podman service beside the coder
-          # (dev/compose.devcontainer.yaml), and the coder pointed at it. Ubuntu 24.04 stops unprivileged user
-          # namespaces under AppArmor, which a rootless Podman needs; where the key does not exist there is
-          # nothing to set. Without it the coder falls back to its own container, and these scenarios say so.
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # Everything below needs the devcontainer override and the other agent folders. A pull request skips it:
+          # the two App scenarios after it still prove the App path and the file tools.
+          if [ "$E2E_FULL" = "true" ]; then
+            # The work environments: the stack again with a rootless Podman service beside the coder
+            # (dev/compose.devcontainer.yaml), and the coder pointed at it. Ubuntu 24.04 stops unprivileged user
+            # namespaces under AppArmor, which a rootless Podman needs; where the key does not exist there is
+            # nothing to set. Without it the coder falls back to its own container, and these scenarios say so.
+            if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+            export COMPOSE_CMD="docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app"
+            $COMPOSE_CMD build podman
+            $COMPOSE_CMD up -d --no-build --wait podman coder
+            # local/devbox ships devbox-tool, which only its devcontainer has: run_command, run and run_checks
+            # all run there, the pull request is for what they made, and the run's container
+            # and its image are gone after the sweep.
+            SCENARIO=devcontainer sh dev/coder-e2e.sh
+            # local/sandbox has no devcontainer: the default environment (not the coder's own image).
+            SCENARIO=default-env sh dev/coder-e2e.sh
+            # local/devbox-broken asks for privileged and tries an initializeCommand: refused, the person decides.
+            SCENARIO=broken-env sh dev/coder-e2e.sh
+            # The service stopped: the run goes on in the coder's own container, with a step that says so.
+            SCENARIO=no-runtime sh dev/coder-e2e.sh
+            # The plain stack again (the scripts below restart the coder without the override).
+            docker compose --profile app up -d --no-build --wait coder
+            # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
+            sh dev/greeting-e2e.sh
+            # The general agent: "hi" answered in role by its folder, and an edited folder changes the
+            # answer after a restart (it restarts `agent` on an edited copy).
+            sh dev/agent-e2e.sh
+            # The coder asks three questions as one form (the screen's catalog in the message's
+            # metadata), the answers come back as one A2UI action, and it goes on; on a screen it
+            # cannot read, the options are text.
+            sh dev/coder-choices-e2e.sh
+            # The researcher folder on the same service (it restarts `agent` on a copy of it and the model
+            # mock-researcher, and puts the default back): sources as cards and a graph on a screen with
+            # catalog version 3, words only on one without Cards or without a catalog.
+            sh dev/agent-cards-e2e.sh
+            # The painter folder (it restarts `agent` on a copy of it, the model mock-painter and plain
+            # http to the image server, and puts the default back): the instructions of the image server
+            # reach the model, the picture is a shared file, and the server's prompt is a command.
+            sh dev/painter-e2e.sh
           fi
-          export COMPOSE_CMD="docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app"
-          $COMPOSE_CMD build podman
-          $COMPOSE_CMD up -d --no-build --wait podman coder
-          # local/devbox ships devbox-tool, which only its devcontainer has: run_command, run and run_checks
-          # all run there, the pull request is for what they made, and the run's container
-          # and its image are gone after the sweep.
-          SCENARIO=devcontainer sh dev/coder-e2e.sh
-          # local/sandbox has no devcontainer: the default environment (not the coder's own image).
-          SCENARIO=default-env sh dev/coder-e2e.sh
-          # local/devbox-broken asks for privileged and tries an initializeCommand: refused, the person decides.
-          SCENARIO=broken-env sh dev/coder-e2e.sh
-          # The service stopped: the run goes on in the coder's own container, with a step that says so.
-          SCENARIO=no-runtime sh dev/coder-e2e.sh
-          # The plain stack again (the scripts below restart the coder without the override).
-          docker compose --profile app up -d --no-build --wait coder
-          # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
-          sh dev/greeting-e2e.sh
-          # The general agent: "hi" answered in role by its folder, and an edited folder changes the
-          # answer after a restart (it restarts `agent` on an edited copy).
-          sh dev/agent-e2e.sh
-          # The coder asks three questions as one form (the screen's catalog in the message's
-          # metadata), the answers come back as one A2UI action, and it goes on; on a screen it
-          # cannot read, the options are text.
-          sh dev/coder-choices-e2e.sh
-          # The researcher folder on the same service (it restarts `agent` on a copy of it and the model
-          # mock-researcher, and puts the default back): sources as cards and a graph on a screen with
-          # catalog version 3, words only on one without Cards or without a catalog.
-          sh dev/agent-cards-e2e.sh
-          # The painter folder (it restarts `agent` on a copy of it, the model mock-painter and plain
-          # http to the image server, and puts the default back): the instructions of the image server
-          # reach the model, the picture is a shared file, and the server's prompt is a command.
-          sh dev/painter-e2e.sh
           # The same coder scenarios again, the coder now a GitHub App installation instead of a token
           # (dev/compose.github-app.yaml: an init service makes a throwaway key, GITHUB_TOKEN is off).
           # Last, because the scripts above restart the coder without the override. Each asserts that
@@ -407,11 +473,13 @@ jobs:
           # also asserts the installation lookup, which the coder then keeps.
           EXPECT_INSTALLATION_LOOKUP=1 sh dev/coder-e2e.sh
           SCENARIO=files sh dev/coder-e2e.sh
-          SCENARIO=scratch sh dev/coder-e2e.sh
-          SCENARIO=second-repo ANSWER=yes sh dev/coder-e2e.sh
-          SCENARIO=second-repo ANSWER=no sh dev/coder-e2e.sh
-          SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
-          SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
+          if [ "$E2E_FULL" = "true" ]; then
+            SCENARIO=scratch sh dev/coder-e2e.sh
+            SCENARIO=second-repo ANSWER=yes sh dev/coder-e2e.sh
+            SCENARIO=second-repo ANSWER=no sh dev/coder-e2e.sh
+            SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
+            SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
+          fi
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
         run: docker compose -f compose.yaml -f dev/compose.github-app.yaml -f dev/compose.devcontainer.yaml --profile app logs --no-color

@@ -347,13 +347,18 @@ export class Stack {
     });
   }
 
-  /** The slot's work directory as it is when the coder first starts: nothing of an earlier run but the sandbox's directory. */
-  async resetWork(slot) {
+  /**
+   * The slot's work directory as it is when the coder first starts: nothing of an earlier run but the sandbox's directory
+   * and the names `keep` lists (a task's base, which is derived from its image and validated by its own marker).
+   */
+  async resetWork(slot, { keep = [] } = {}) {
+    if (!keep.every((n) => /^[A-Za-z0-9._-]+$/.test(n))) throw new StackError('a kept name is not plain');
+    const kept = keep.map((n) => `! -name ${n} `).join('');
     // root inside the helper is the host user under rootless Docker: it can remove the harness's own directories,
     // whatever user wrote in them; the helper mounts the work directory only.
-    const r = await this.helper(slot, 'find /work -mindepth 1 -maxdepth 1 ! -name .gitbox -exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox && chmod 777 /work/workspaces', { user: '0:0' });
+    const r = await this.helper(slot, `find /work -mindepth 1 -maxdepth 1 ! -name .gitbox ${kept}-exec rm -rf {} + ; mkdir -p /work/workspaces /work/.gitbox && chmod 777 /work/workspaces`, { user: '0:0' });
     if (r.exitCode !== 0) throw new StackError(`the work directory of slot ${slot} could not be emptied (exit ${r.exitCode}): ${r.stderr.trim().split('\n').slice(-2).join(' | ')}`);
-    const left = (await this.listDir(slot, '/work')).filter((n) => !['workspaces', '.gitbox'].includes(n));
+    const left = (await this.listDir(slot, '/work')).filter((n) => !['workspaces', '.gitbox', ...keep].includes(n));
     if (left.length > 0) throw new StackError(`the work volume still holds ${left.join(', ')}`);
   }
 

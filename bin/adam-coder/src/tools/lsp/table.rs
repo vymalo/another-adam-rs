@@ -45,6 +45,13 @@ pub enum Language {
     Dart,
 }
 
+/// The `tsserver.js` of the image's own TypeScript: Node from nodejs.org is extracted under
+/// `/usr/local`, and `npm install -g typescript` puts the package there (the workspace image's
+/// `toolchains/install.sh`). `typescript-language-server` 6.1.0 has no `--tsserver-path` flag; it
+/// takes the path as the `tsserver.path` initialization option, validates it, and falls back to the
+/// workspace's TypeScript and then its own when an environment has no such file.
+const IMAGE_TSSERVER_PATH: &str = "/usr/local/lib/node_modules/typescript/lib/tsserver.js";
+
 impl Language {
     /// Every language, in the order the table lists them.
     pub const ALL: [Self; 5] = [
@@ -139,7 +146,10 @@ impl Language {
             // package is fetched to type a project's imports.
             Self::TypeScript => Settings {
                 sections: json!({"typescript": {"disableAutomaticTypeAcquisition": true}}),
-                options: json!({"disableAutomaticTypingAcquisition": true}),
+                options: json!({
+                    "disableAutomaticTypingAcquisition": true,
+                    "tsserver": {"path": IMAGE_TSSERVER_PATH},
+                }),
             },
             Self::Python => Settings {
                 sections: json!({
@@ -229,12 +239,11 @@ impl ServerTable {
             entries: [
                 spec("rust-analyzer", "exec rust-analyzer", true, &[]),
                 // The image's own TypeScript, never the project's `node_modules` (which is code the
-                // project chose): found next to the global packages, else the server's own.
+                // project chose): named by `tsserver.path` in the initialization options
+                // (`Language::settings`), because 6.1.0 has no `--tsserver-path` flag.
                 spec(
                     "typescript-language-server",
-                    "tsserver=\"$(npm root -g 2>/dev/null)/typescript/lib/tsserver.js\"; \
-                     if [ -f \"$tsserver\" ]; then exec typescript-language-server --stdio \
-                     --tsserver-path \"$tsserver\"; fi; exec typescript-language-server --stdio",
+                    "exec typescript-language-server --stdio",
                     false,
                     &[],
                 ),
@@ -338,6 +347,28 @@ mod tests {
         let write = Language::Rust.settings(Mode::Full, "").options;
         assert!(write["cargo"].get("buildScripts").is_none());
         assert!(write.get("procMacro").is_none());
+    }
+
+    /// `typescript-language-server` 6.1.0 (the image's) has no `--tsserver-path`: it exits with
+    /// "unknown option '--tsserver-path'" and the tools answer nothing (the first run of
+    /// `real_language_servers` in the built image found it). The image's own TypeScript is named by
+    /// the `tsserver.path` initialization option, which the server validates and falls back from;
+    /// the launch is the plain `--stdio` the image's own check runs.
+    #[test]
+    fn the_typescript_server_names_the_images_typescript_by_an_option_not_a_flag() {
+        let table = ServerTable::production();
+        let spec = table.get(Language::TypeScript);
+        assert!(
+            !spec.launch.contains("--tsserver-path"),
+            "typescript-language-server 6.1.0 has no --tsserver-path: {}",
+            spec.launch
+        );
+        assert_eq!(spec.launch, "exec typescript-language-server --stdio");
+        let options = Language::TypeScript.settings(Mode::Full, "").options;
+        assert_eq!(
+            options["tsserver"]["path"], "/usr/local/lib/node_modules/typescript/lib/tsserver.js",
+            "the image's own TypeScript, never the project's node_modules"
+        );
     }
 
     #[test]

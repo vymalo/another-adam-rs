@@ -4,11 +4,10 @@
 //!
 //! Gated, like the tests that need a database (Rule 7): without `ADAM_TEST_LANGUAGE_SERVERS=1` they
 //! do nothing and say so; with it, a language whose server is not on `PATH` is skipped, and
-//! `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` turns every skip into a failure (it implies the gate). **No
-//! CI job runs them yet**: the coder image is not built on the workspace image that has the four
-//! servers (vymalo/another-agentic-images#15) until its pin is bumped, and the images repository has
-//! its own check of the servers. What is proved on every run is `language_servers.rs`, over a
-//! scripted server.
+//! `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` turns every skip into a failure (it implies the gate). **CI
+//! runs them in the built image**: the `image` job of `.github/workflows/coder.yml` sets both
+//! variables, so a server the workspace base lacks fails the job. What is proved on every run is
+//! `language_servers.rs`, over a scripted server.
 //!
 //! ```sh
 //! ADAM_TEST_LANGUAGE_SERVERS=1 cargo test --workspace --locked -- real_

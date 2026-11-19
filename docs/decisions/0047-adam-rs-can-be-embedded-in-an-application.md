@@ -14,6 +14,15 @@ we can implement an adapter for cratestack"*. Builds on [ADR 0001](0001-library-
 
 *Amended 2026-11-18 ([ADR 0050](0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md)):* decision 6's `ApprovalPolicy` is served by a deciding hook at `tool.before` that returns `Ask`, decided inside the call's step rather than before it, so the decision is recorded with the step and a replay never asks again. Slice 5 becomes an adapter over ADR 0050's approvals (its slice H8).
 
+*Amended 2026-11-19 ([ADR 0053](0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)), an owner decision:*
+decision 3 is built differently. `adam-store-postgres` and `adam-notify-postgres` leave `sqlx` for `tokio-postgres`, so
+`adam-store-sqlite` joins **the main workspace** (no workspace of its own), and it is plain `rusqlite` with bundled SQLite,
+**not built on cratestack**: the `Store`'s statements are hand-written SQL that the embedded facade does not generate, and the
+facade would bring its schema macro and Rust 1.98 to the phone's path. It keeps the `rusqlite` minor that `cratestack-rusqlite`
+uses, so an application whose own state is on cratestack links one `sqlite3`. The rest of decision 3 (the conformance suite, one
+writer, immediate transactions, WAL, `LocalNotifier`, the lock file) and decision 2's check on `adam-engine` stand. Slice 3 here is
+ADR 0053's slice 3.
+
 ## Context
 
 A program that links adam-rs today takes `adam-service` (an HTTP server, Postgres, an OpenAI client, configuration read

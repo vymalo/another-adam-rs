@@ -25,9 +25,14 @@ trait at your rev: its doc comments are the contract.
 ## Procedure
 
 1. **Read the trait**: `crates/adam-core/src/store/mod.rs`, `pub trait Store`: `migrate`,
-   `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`),
-   `open_run_for_conversation`, `journal_get`, `journal_put` (first writer wins),
-   `journal_list`, `claim_due`, `renew_lease`, `release_lease`, `lease_until`, `purge_finished`.
+   `create_run`, `load_run`, `run_header` (a run without its state; **defaulted** to
+   `lease_until` + `load_run`, so overriding it is optional — override it with a projection that
+   never reads the state, as both shipped adapters do, and pass `run_header_matches_the_record`),
+   `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`,
+   `journal_put` (first writer wins), `journal_list`, `claim_due`, `renew_lease`, `release_lease`,
+   `lease_until`, `purge_finished`, then the listing (`list_runs` and `count_runs`: a caller's runs,
+   newest update first, by keyset) and the five push-notification methods (`push_put`, `push_list`,
+   `push_delete`, `push_claim_due`, `push_commit`; schema version 3).
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
    `StoreError::corrupt_source(e)`; callers decide from the error class, never from the variant.
@@ -51,9 +56,11 @@ trait at your rev: its doc comments are the contract.
    adam_store_testkit::store_conformance!(make_store);
    ```
 
-   `store_conformance!` generates one `#[tokio::test]` per case (28 at the time of writing) and
+   `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
    calls `migrate` first. `None` skips the suite. Cases isolate themselves with a unique agent
-   name, so they run in parallel on one shared database.
+   name, so they run in parallel on one shared database. `counting::measure_transcript_write` is a
+   measurement helper, not a conformance case: it runs one 50-commit transcript and prints the
+   bytes, and it asserts nothing.
 5. **In CI set `ADAM_TEST_REQUIRE_DB=1`**: a suite whose database variable is unset then fails
    instead of skipping (`adam_core::testing::test_env`), so a typo cannot turn CI green.
 6. **After a trait change in adam-rs** (a method added or a signature changed): implement it in

@@ -5,9 +5,15 @@ default) or as a front Deployment plus a worker StatefulSet (`topology: split`),
 own CloudNativePG database or an existing one (see [Database](#database)), for the `netcup-k8s`
 cluster.
 
+The image (`docker/coder/Dockerfile`) carries six static binaries — `adam-coder`, `adam-agent`, `adam-kube-exec`,
+`adam-egress`, `adam-git-sandbox` and `adam-git` — built for `x86_64-unknown-linux-musl` with `mimalloc` as the
+allocator ([ADR 0053](../../docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
+decision 11), so they start in any x86-64 Linux image whatever its C library. The runtime base is still the
+`workspace` image, and the paths are unchanged (`/usr/local/bin`).
+
 | Object | What |
 |---|---|
-| `StatefulSet` | `replicaCount` replicas (1 by default; the worker with `topology: split`), `work` at `/work`: a PVC per pod on `longhorn` by default (mirrors and worktrees persist), or one shared claim, see [Workspace placement](#workspace-placement); `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz`; on the roles that run workers, the GitHub MCP server as a native sidecar, see [The GitHub MCP server](#the-github-mcp-server-a-sidecar), and, with `runPods.enabled`, the git sandbox as another, see [The git sandbox](#the-git-sandbox) |
+| `StatefulSet` | `replicaCount` replicas (1 by default; the worker with `topology: split`), started together (`podManagementPolicy: Parallel`: a worker's identity is its pod name and no ordinal owns anything, so no ordinal ordering; a scale-down deletes every removed worker at once, and a per-pod volume keeps the runs it owned stranded), `work` at `/work`: a PVC per pod on `longhorn` by default (mirrors and worktrees persist), or one shared claim, see [Workspace placement](#workspace-placement); `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz`; on the roles that run workers, the GitHub MCP server as a native sidecar, see [The GitHub MCP server](#the-github-mcp-server-a-sidecar), and, with `runPods.enabled`, the git sandbox as another, see [The git sandbox](#the-git-sandbox) |
 | `PersistentVolumeClaim` | `workspace.placement` `shared` or `affinity` without `workspace.sharedVolume.existingClaim` only: `<release>-coder-work`, ReadWriteMany, kept on `helm uninstall` |
 | `Deployment` | `topology: split` only: the front (`<release>-coder-front`), `ROLE=control-plane`, no volume, `front.replicas` replicas |
 | `PodDisruptionBudget` | `topology: split` with `front.replicas` above 1: `minAvailable: 1` for the front |
@@ -309,6 +315,14 @@ binary as `WORKSPACE_PLACEMENT` (`bin/adam-coder/README.md`, "Workspace placemen
   needs `kubectl delete statefulset <release>-coder --cascade=orphan` before `helm upgrade`. The
   old per-pod PVCs stay, and their worktrees are not visible on the shared volume. Moving
   between `isolated` and empty, or `shared` and `affinity`, only adds or removes the env.
+* **Upgrading from chart 0.4.x or earlier needs one extra step.** `podManagementPolicy` is immutable, and 0.5.0
+  sets `Parallel` where 0.4.x set `OrderedReady`: every existing release, `replicaCount: 1` included, gets a 422
+  (`updates to statefulset spec ...: Forbidden`) from `helm upgrade`, and Argo CD or Flux stays `OutOfSync`. Delete
+  the StatefulSet once, keeping its pods, and upgrade; the new pods adopt the volumes:
+  `kubectl delete statefulset <release>-coder --cascade=orphan` then `helm upgrade ...`. A fresh install needs
+  nothing, and the upgrade does not interrupt a run in flight. The render also changes the `helm.sh/chart` label on
+  every object, which changes the checksums of the ConfigMaps it labels (`run-pod`, `egress-allow`, and `extra-mcp`
+  when any `mcp.*` value is set), so the coder and egress proxy pods roll once.
 * Moving a running release from empty to a pinning placement is safe for runs in flight: a
   run with no owner is claimed, and so owned, by the first worker that steps it.
 
@@ -607,8 +621,9 @@ on the cluster.
 
 ## Push notifications and the card's signature (`a2a.*`)
 
-Two optional features of the A2A server, **both off by default**; with both off the render is byte for byte what it was
-(`tests/golden/combined.yaml`; the chart version moved to 0.4.0, the one line that differs). They belong to the pod that serves A2A: the StatefulSet with `topology: combined`, the front
+Two optional features of the A2A server, **both off by default**; with both off they add nothing
+(`tests/golden/combined.yaml` is the default render, which since 0.5.0 carries `podManagementPolicy: Parallel` and the
+`helm.sh/chart: coder-0.5.0` label). They belong to the pod that serves A2A: the StatefulSet with `topology: combined`, the front
 Deployment with `topology: split` (the worker renders none of it). Design and what a client sees:
 [ADR 0030](../../docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md),
 [the A2A server](../../docs/reference/a2a-server.md#push-notifications).
@@ -661,7 +676,7 @@ What it renders, and why each is there:
 | Object | What |
 |---|---|
 | `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, no model key and no Secret reference (ADR 0038), the coder's workspace claim at `/work` **whole, which the coder replaces by the run's own mounts** ([below](#what-a-run-pod-sees)), and an init container that copies `adam-exec`, alone, out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations and narrows the `/work` mount; it refuses to start when the run container does not mount a volume at its `WORKSPACE_ROOT` once and whole; a changed template is a deploy (a checksum annotation) |
-| `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot. `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
+| `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot (`runPods.waitSecs`, refused below `runPods.idleSecs + 62`). `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
 | `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is a projected volume mounted in the coder container alone: the pod automounts none, so neither the git sandbox nor the GitHub MCP sidecar has it; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
 | `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references **any Secret a container can read** (a `secretKeyRef`, or a Secret by `envFrom`: since ADR 0038 a run pod reads none, so the policy no longer names the ExternalSecret's Secret or a key), names a pull secret the chart did not render (`imagePullSecrets` of the values, none by default; a ServiceAccount you name with `runPods.serviceAccount.name` must carry no pull secret that is not in that value, because the cluster adds a ServiceAccount's pull secrets to the pod before the policy looks), is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
 | `NetworkPolicy` `<release>-coder-run-pods` | **deny by default** ([ADR 0042](../../docs/decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)): no ingress; egress to DNS, to the egress proxy's pods on TCP 3128 and to `networkPolicy.extraEgress` (an in-cluster target such as a model gateway), and nothing else. There is no rule for the internet and no value that adds one: `networkPolicy.enabled: false` is refused. No rule names an IPv6 range, so IPv6 egress is denied |
@@ -669,7 +684,9 @@ What it renders, and why each is there:
 | `Deployment`, `Service`, `ServiceAccount`, `ConfigMap`, `PodDisruptionBudget`, `NetworkPolicy` `<release>-coder-egress` | **the egress proxy**, the one way out of a run pod: [below](#the-egress-proxy) |
 
 The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_POD_NAMESPACE` (its own, by the downward API), `RUN_POD_INSTANCE` (the release),
-`RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.92 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (600), a
+`RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.92 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (1020: it
+outlasts the idle life, the 60 s sweep and the 2 s delete grace — 900 + 60 + 2 — so a run never gives up while a slot is about to free; the chart refuses a
+smaller wait, and when nothing frees it stalls the whole 1020 s, 17 minutes, before the tool fails), a
 `WORKER_ID` from the pod name (a worker sweeps only its own idle pods), the ServiceAccount, `GIT_SANDBOX_SOCKET` (the socket of [the git sandbox](#the-git-sandbox)), and **`runPods.coderResources`
 (a 1Gi memory limit) instead of `resources`** (6Gi), which is untouched while run pods are off. Set `runPods.coderResources: null` to keep `resources`. The git that
 used to run in the coder's memory runs in the sandbox now, which has a memory limit of its own (`runPods.gitSandbox.resources`, 1Gi).
@@ -852,7 +869,7 @@ other). The `split` front and a control plane run none and get none.
   while the cache is on.
 * Installed binaries (`cargo install`) stay private in the home. Nothing prunes the volume: size it, and clean it
   (`pnpm store prune`, `npm cache verify`) if it fills.
-* The image must have the caches under `/cache`: `image.tag` and `runPods.image` are on `1.98.1-e6a528f` or later of the
+* The image must have the caches under `/cache`: `image.tag` and `runPods.image` are on `1.98.1-8c297d3` or later of the
   workspace image. An older image mounts a volume no tool uses.
 
 Checked by `tests/render-check.sh` (the claim and the mounts, the policy, the refusals; the render with run pods is

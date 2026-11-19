@@ -10,8 +10,8 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use adam_core::{
-    ClaimScope, ConversationScope, DynStore, NewRun, RunId, RunQuery, RunRecord, RunStatus,
-    RunUpdate, StoreError,
+    ClaimScope, ConversationScope, DynStore, NewRun, RunHeader, RunId, RunQuery, RunRecord,
+    RunStatus, RunUpdate, StoreError,
 };
 use adam_error::{BoxError, Classify, ErrorClass};
 
@@ -230,11 +230,31 @@ impl RunView {
     }
 }
 
+/// A run's view, built from a record the caller already holds: the same value
+/// [`Runtime::view`] returns, without a second read of the run.
+///
+/// `claimed` is the lease, which a record does not carry: a caller that lists records reads it
+/// beside the one record it needs it for (`adam-a2a-runtime` reads it only for a runnable run at
+/// version 1, the only record whose task state can still flip from `submitted` to `working`) and
+/// compares it against [`Runtime::now`], so the result agrees with [`Runtime::view`]. An
+/// unreadable state is [`RuntimeError::Corrupt`].
+///
+/// # Errors
+///
+/// [`RuntimeError::Corrupt`] when `rec.state` is not a valid envelope.
+pub fn view_from_record(rec: RunRecord, claimed: bool) -> Result<RunView, RuntimeError> {
+    let env = Envelope::decode(rec.id, &rec.state)?;
+    Ok(RunView::new(rec, env, claimed))
+}
+
 pub(crate) struct Config {
     pub worker_id: String,
     pub claim_scope: ClaimScope,
     pub lease_ttl: Duration,
+    /// How often an idle worker polls the store for due runs.
     pub poll_interval: Duration,
+    /// How often a step's cancel watch re-reads the run it steps.
+    pub cancel_poll_interval: Duration,
     pub retry: RetryPolicy,
     pub concurrency: usize,
     pub lease_renewal: bool,
@@ -366,9 +386,11 @@ impl Inner {
                     self.run_cancel_hook(run, &rec.agent, env.agent);
                     self.fire_cancel(run);
                     self.announce_finished(run).await;
-                    self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
+                    self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error.clone()))
                         .await;
-                    self.notify_parent(&committed).await;
+                    // A failed run reports its error; its output is not part of the notice.
+                    self.notify_parent(&committed, &Value::Null, Some(&error))
+                        .await;
                     return Ok(());
                 }
                 Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
@@ -436,11 +458,16 @@ impl Inner {
     /// ([`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND), or
     /// [`CHILD_REPORTED_KIND`](crate::CHILD_REPORTED_KIND) when the child has a conversation).
     ///
+    /// `output` and `error` are the values the caller just committed. The store returns the record
+    /// without its state ([`Store::commit_run`](adam_core::Store::commit_run)), so the caller
+    /// passes what it wrote instead of decoding what it sent; `child` supplies the ids, the status
+    /// and the parent.
+    ///
     /// Best effort by design, and never an error for the child: this runs after the child's own
     /// commit, so a crash or a store error here loses the message and nothing else. The parent
     /// keeps a timer and reads the child when it fires (`Ctx::child_status`), which is what makes
     /// the whole exchange at-least-once. A parent that is finished or gone has nobody to tell.
-    pub async fn notify_parent(&self, child: &RunRecord) {
+    pub async fn notify_parent(&self, child: &RunRecord, output: &Value, error: Option<&str>) {
         let Some(parent) = child.parent_id else {
             return;
         };
@@ -453,7 +480,7 @@ impl Inner {
         } else {
             RUN_FINISHED_KIND
         };
-        let notice = ChildStatus::from_record(child).notice(child.id, kind);
+        let notice = ChildStatus::from_parts(child.status, output, error).notice(child.id, kind);
         match self.deliver(parent, notice).await {
             Ok(()) => {}
             Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {
@@ -588,8 +615,29 @@ impl RuntimeBuilder {
     /// `deliver`/`start` on the same `Runtime` wake local workers at once, and
     /// with a [`notifier`](Self::notifier) so do those of other processes.
     /// Timers and retry backoffs are found by polling only.
+    ///
+    /// This is the worker's idle poll, **not** how fast a step learns of a cancel: that is
+    /// [`cancel_poll_interval`](Self::cancel_poll_interval).
     pub fn poll_interval(mut self, every: Duration) -> Self {
         self.cfg.poll_interval = every;
+        self
+    }
+
+    /// How often a step's cancel watch re-reads the run it is stepping. Default 1 s.
+    ///
+    /// The watch is how a step learns that its run turned terminal in another process (a cancel, a
+    /// time limit, a parent that ended) when no [`notifier`](Self::notifier) told it, and it is the
+    /// fallback for the signal: a `Signal::Finished` fires the step's token at once. It reads the
+    /// run's **header** ([`Store::run_header`](adam_core::Store::run_header)): an adapter that
+    /// overrides that method projects it and never reads the state; the trait's default (what
+    /// `MemoryStore` uses) reads the lease and then the record. The bound it implies: a state
+    /// change that no event announced reaches a step's cancel watch within this interval.
+    ///
+    /// Slower than [`poll_interval`](Self::poll_interval) on purpose: the worker's idle poll finds
+    /// work that appeared, which a person waits for, while the cancel watch waits on something a
+    /// person asked for and a signal normally delivers.
+    pub fn cancel_poll_interval(mut self, every: Duration) -> Self {
+        self.cfg.cancel_poll_interval = every;
         self
     }
 
@@ -674,6 +722,7 @@ impl Runtime {
                 claim_scope: ClaimScope::Any,
                 lease_ttl: Duration::from_secs(30),
                 poll_interval: Duration::from_millis(250),
+                cancel_poll_interval: Duration::from_secs(1),
                 retry: RetryPolicy::default(),
                 concurrency: 4,
                 lease_renewal: true,
@@ -685,6 +734,14 @@ impl Runtime {
     /// The store this runtime commits to.
     pub fn store(&self) -> &DynStore {
         &self.inner.store
+    }
+
+    /// The runtime's current time, from its clock ([`RuntimeBuilder::clock`]).
+    ///
+    /// A caller that builds a view from a record it holds ([`view_from_record`]) reads the run's
+    /// lease against this, so the `claimed` it computes agrees with [`view`](Self::view)'s.
+    pub fn now(&self) -> DateTime<Utc> {
+        self.inner.clock.now()
     }
 
     /// This runtime's lease identity.
@@ -930,9 +987,9 @@ impl Runtime {
     /// [`start_child`](Self::start_child) with a time limit: the child must finish within `within`
     /// of now, by the runtime's own clock (`None`: no limit, which is `start_child`). The deadline is
     /// stored with the run. Past it the worker fails the child with `cancelled: time limit: the run
-    /// did not finish within N min`, before a step and, for a step in flight, within one poll
-    /// (the step's token fires), and a child that is parked is woken at it. The parent gets the
-    /// failure as it gets any: the child's error.
+    /// did not finish within N min`, before a step and, for a step in flight, within one
+    /// cancel poll interval (the step's token fires), and a child that is parked is woken at it.
+    /// The parent gets the failure as it gets any: the child's error.
     #[tracing::instrument(skip(self, input))]
     pub async fn start_child_within(
         &self,
@@ -1119,6 +1176,13 @@ impl Runtime {
     /// whose id is the session id, exists with a parent: a root conversation that merely looks like
     /// a session's is not listed, and a session whose round 1 was purged is not either. Only the
     /// sessions of the parent itself are listed, not those of its sessions.
+    ///
+    /// A session's header, outcome and report live in its latest round's **state** (the envelope's
+    /// `agent` member), so the scan reads whole records: a projection that dropped `state` could
+    /// not say what a session is, whether it is closed or how its round ended. The count before the
+    /// scan is the guard for that bound, not a consistency check: it refuses a parent with more than
+    /// [`MAX_SESSION_ROUNDS_SCANNED`](crate::MAX_SESSION_ROUNDS_SCANNED) rounds without reading one
+    /// of them (the count after the scan, below, is the consistency check).
     ///
     /// The scan pages `list_runs`, which orders by `updated_at`, so a round that commits between
     /// two page reads can move past the cursor and be missed. The listing counts again after the
@@ -1361,7 +1425,7 @@ impl Runtime {
     /// [`CancelToken`] ([`Ctx::cancelled`](crate::Ctx::cancelled)): at once if
     /// this runtime holds the run, and if another process does, at once too
     /// when both runtimes share a [`Notifier`] (a
-    /// [`Signal::Finished`]), otherwise within one poll interval. The step is
+    /// [`Signal::Finished`]), otherwise within one cancel poll interval. The step is
     /// not aborted by the runtime: a step that listens to the token stops
     /// early (`LlmAgent` drops its model request, the coder kills its
     /// commands), one that does not runs to its end (its result is dropped
@@ -1402,9 +1466,21 @@ impl Runtime {
             return Ok(None);
         };
         let env = Envelope::decode(run, &rec.state)?;
-        let claimed = rec.status == RunStatus::Runnable
-            && until.is_some_and(|until| until > self.inner.clock.now());
+        let claimed = adam_core::claimed(rec.status, until, self.inner.clock.now());
         Ok(Some(RunView::new(rec, env, claimed)))
+    }
+
+    /// The header of a run from its durable record (`None` if it does not exist): its status, its
+    /// version and whether a worker holds it, without the state.
+    ///
+    /// One store call ([`Store::run_header`](adam_core::Store::run_header)): an adapter that
+    /// overrides it projects the header and the lease; the trait's default (what `MemoryStore`
+    /// uses) reads the lease and then the record. Use it for a reader that only needs the run's own
+    /// bookkeeping — a step's cancel watch, a parent check. An A2A task's state also needs
+    /// `waiting`, which is in the state, so a status poll reads [`view`](Self::view).
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn header(&self, run: RunId) -> Result<Option<RunHeader>, RuntimeError> {
+        Ok(self.inner.store.run_header(run).await?)
     }
 }
 
@@ -1503,5 +1579,29 @@ mod error_tests {
             "{e:?}"
         );
         assert!(std::error::Error::source(&e).is_some_and(|s| s.is::<serde_json::Error>()));
+    }
+}
+
+#[cfg(test)]
+mod defaults {
+    use std::sync::Arc;
+
+    use adam_core::MemoryStore;
+
+    use super::*;
+
+    /// The two polls are separate, with the fallbacks the docs promise: an idle worker every
+    /// 250 ms (a person waits for work to start), a step's cancel watch every second (a signal
+    /// normally tells it, and its read is one header).
+    #[test]
+    fn the_worker_and_the_cancel_watch_poll_at_their_own_intervals() {
+        let builder = Runtime::builder(Arc::new(MemoryStore::new()));
+        assert_eq!(builder.cfg.poll_interval, Duration::from_millis(250));
+        assert_eq!(builder.cfg.cancel_poll_interval, Duration::from_secs(1));
+        let builder = builder
+            .poll_interval(Duration::from_millis(5))
+            .cancel_poll_interval(Duration::from_millis(7));
+        assert_eq!(builder.cfg.poll_interval, Duration::from_millis(5));
+        assert_eq!(builder.cfg.cancel_poll_interval, Duration::from_millis(7));
     }
 }

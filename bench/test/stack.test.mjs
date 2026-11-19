@@ -201,6 +201,22 @@ test('the database of a slot is reset by postgres; the work directory is emptied
   void calls;
 });
 
+test('resetWork keeps the names it is told to (a task base), and refuses a name that is not plain', async (t) => {
+  const outputs = [];
+  const { stack } = makeStack(t, {
+    exec: async (file, args) => {
+      outputs.push(args);
+      return { exitCode: 0, stdout: '', stderr: '' };
+    },
+  });
+  fs.mkdirSync(path.join(stack.workRoot(1), 'bench-base'), { recursive: true });
+  await stack.resetWork(1, { keep: ['bench-base'] });
+  const script = outputs.find((a) => a[0] === 'run').at(-1);
+  assert.match(script, /find \/work -mindepth 1 -maxdepth 1 ! -name \.gitbox ! -name bench-base -exec rm -rf \{\} \+/);
+  assert.ok(fs.existsSync(path.join(stack.workRoot(1), 'bench-base')), 'the kept base is still there');
+  await assert.rejects(stack.resetWork(1, { keep: ['../etc'] }), /not plain/);
+});
+
 test('a directory of the work directory is made on the host, removed by a helper as uid 10001 and checked', async (t) => {
   const seen = [];
   const { stack } = makeStack(t, { exec: async (file, args) => (seen.push(args), { exitCode: 0, stdout: '', stderr: '' }) });

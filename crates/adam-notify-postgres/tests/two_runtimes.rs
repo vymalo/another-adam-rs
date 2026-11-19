@@ -170,11 +170,18 @@ async fn node(env: &Env, role: Role<'_>) -> Node {
     let local = BroadcastSink::default();
     let notify = PgNotify::new(notify_pool, local.clone())
         .with_channel_prefix(&env.channels)
-        .expect("channel prefix");
+        .expect("channel prefix")
+        // An ambient NOTIFY_LOCAL_ONLY must not silence the events this test
+        // expects to cross.
+        .local_only(false);
     let builder = Runtime::builder(store)
         .event_sink(notify.event_sink())
         .notifier(notify.notifier())
-        .poll_interval(Duration::from_secs(30));
+        .poll_interval(Duration::from_secs(30))
+        // The cancel watch must not be the thing that carries the cancel: with the default 1 s
+        // interval it would satisfy the 2 s assertion alone, and this test would stop proving the
+        // notifier works across processes.
+        .cancel_poll_interval(Duration::from_secs(30));
     let (rt, is_worker) = match role {
         Role::Front(name) => (builder.starter(JsonStarter(name.to_owned())).build(), false),
         Role::Worker(agent) => (builder.agent(agent.clone()).build(), true),

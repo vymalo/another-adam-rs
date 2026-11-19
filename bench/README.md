@@ -166,7 +166,7 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/stack.mjs`, `bench/compose.yaml`, `bench/lib/relay.mjs` | the stack, the host containers the harness starts (the coder, the arms, the grading), the relays |
 | `bench/lib/tarstream.mjs` | what a container wrote, as a tar stream parsed with limits |
 | `bench/lib/classify.mjs` | infrastructure told apart from the agent, from the meter's record |
-| `bench/lib/base.mjs` | the base of a task: its repository with the dependency links, made in the slot's volume, and the host's own copy of it |
+| `bench/lib/base.mjs` | the base of a task: its repository with the dependency links, made in the slot's volume, and the host's own copy of it; both once per (task, image, workdir) for the harness's life; the host copy's tree must equal the container's, which assumes the image's git normalises like the host's (`core.autocrlf=false`, `attributesFile=/dev/null`, `fsmonitor=false`) |
 | `bench/lib/agents/adam.mjs`, `opencode.mjs`, `common.mjs` | the two drivers (prepare, run, collect, cleanup) and what they share |
 | `bench/lib/runner.mjs` | one run through its states, resume of the ledger, and a plan one run at a time |
 | `bench/lib/plan.mjs`, `bench/lib/schedule.mjs`, `bench/lib/budget.mjs`, `bench/lib/run-cli.mjs` | task blocks in a seeded balanced order; the slots and the wait for budget; the pilot's budget and its confirmation; `bench pilot`, `confirm`, `run`, `regrade` |
@@ -371,7 +371,7 @@ environment. So one principle holds everywhere:
 | OpenCode's stream, stderr and export | `Stack.readFiles`: the three names only, a size cap, and a link, FIFO or device in their place is refused, logged and kept out |
 | the exit status of OpenCode | the container runtime's (`docker run`'s status and its time-out), never a file the agent could write |
 | the reward of a grading | read without following a link or blocking (`O_NOFOLLOW`, `O_NONBLOCK`), only if it is a regular file of at most 16 bytes |
-| the base of a task | made in the slot's work directory by the task image; the host builds its own repository from a tar of the tree; adam's copy is pushed to the git server by a one-shot container with no secret |
+| the base of a task | made in the slot's work directory by the task image once per (task, image, workdir), kept by `Stack.resetWork` and validated by a marker recording the bare repository's HEAD and the tree's digest (a changed ref or a host tree that does not match is remade from the image); the host builds its own repository from a tar of the tree once and reuses it (under `$BENCH_HOME`); adam's copy is pushed to the git server by a one-shot container with no secret |
 | the pushed branches | `git ls-remote` of an `http://` address on the loopback, run in a new empty directory that is not a repository, with discovery stopped and only plain http allowed |
 | the environment of a host git | an allow-list (`PATH`, locale, temp directory); the model's key, a proxy and any credential are not in it. The clone and the fetch of the upstream tasks run in it too (`lib/upstream.mjs`), so an upstream cannot see the key |
 | a token | never on a command line: the coder's settings are in a 0600 file removed once the coder exists, OpenCode's configuration goes in on stdin |
