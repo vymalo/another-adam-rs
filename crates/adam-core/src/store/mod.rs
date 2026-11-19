@@ -88,6 +88,72 @@ impl From<Uuid> for RunId {
     }
 }
 
+/// The content address of a file artifact's bytes: a SHA-256 as 64 lower-case hexadecimal digits.
+///
+/// Opaque, and deliberately computed outside this crate: `adam-core` has no hash dependency, so
+/// the digest is made where the bytes are (`adam_runtime::blob_id`) and a store trusts the id it
+/// is given. A store keeps the bytes under the id ([`Store::put_blob`]) and answers them back
+/// ([`Store::get_blob`]); a commit names the ids its state adds ([`RunUpdate::blobs`]) so the bytes
+/// survive the later commits of that run, and are collected once no run references them
+/// ([`Store::purge_blobs`]).
+///
+/// Serialized as its text. Deserialization validates it with [`from_hex`](Self::from_hex), so a
+/// `BlobId` from JSON or BSON is always 64 lower-case hex.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct BlobId(String);
+
+impl BlobId {
+    /// `hex` as an id if it is exactly 64 lower-case hexadecimal digits; `None` otherwise.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        (hex.len() == 64 && hex.bytes().all(is_lower_hex)).then(|| Self(hex.to_owned()))
+    }
+
+    /// The id of `digest`, the 32 bytes of a SHA-256, as 64 lower-case hex.
+    ///
+    /// For a process that just computed a digest and would only re-validate text it produced;
+    /// [`from_hex`](Self::from_hex) is the checked constructor for an id from anywhere else.
+    pub fn from_sha256(digest: &[u8; 32]) -> Self {
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            // Writing to a `String` cannot fail.
+            let _ = write!(hex, "{byte:02x}");
+        }
+        Self(hex)
+    }
+
+    /// The id as its 64 lower-case hexadecimal digits.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for BlobId {
+    type Error = String;
+
+    /// The checked constructor serde uses: `Ok` only for 64 lower-case hexadecimal digits.
+    fn try_from(hex: String) -> Result<Self, Self::Error> {
+        Self::from_hex(&hex).ok_or_else(|| format!("{hex:?} is not 64 lower-case hex digits"))
+    }
+}
+
+impl From<BlobId> for String {
+    fn from(id: BlobId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for BlobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
 /// Lifecycle status of a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,10 +256,20 @@ impl NewRun {
 ///
 /// The returned record does not echo `state` ([`Store::commit_run`]): the caller wrote it, and a
 /// commit that transferred the whole state back would pay for the largest member twice.
+/// `blobs` names the file bytes this commit **adds**, which the store records beside the run (see
+/// [`Store::put_blob`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunUpdate {
     pub status: RunStatus,
     pub state: Value,
+    /// The content addresses of the file bytes this commit **adds** (see [`BlobId`]).
+    ///
+    /// A delta, not the run's whole set: the store unions it with the ids already recorded, so a
+    /// commit that names none keeps the earlier ones. The set only grows — a file artifact is never
+    /// replaced (ADR 0012) — and the bytes survive the later commits of that run, to be collected
+    /// once no run references them ([`Store::purge_blobs`]). Empty by default, so a caller that
+    /// stores no blobs behaves exactly as before.
+    pub blobs: Vec<BlobId>,
     pub wake_at: Option<DateTime<Utc>>,
 }
 
@@ -202,8 +278,16 @@ impl RunUpdate {
         Self {
             status,
             state,
+            blobs: Vec::new(),
             wake_at: None,
         }
+    }
+
+    /// Name `blobs` as the digests this commit adds (a delta the store unions).
+    #[must_use]
+    pub fn blobs(mut self, blobs: Vec<BlobId>) -> Self {
+        self.blobs = blobs;
+        self
     }
 
     pub fn wake_at(mut self, at: DateTime<Utc>) -> Self {
@@ -530,6 +614,10 @@ pub trait Store: Send + Sync + 'static {
     /// supplied `update.state`, and a read returns the stored one. Every other field is the stored
     /// one, so a caller that reports the commit (the version, the status, the parent notice) reads
     /// it here and does not decode the state it already has.
+    ///
+    /// `update.blobs` is recorded with the CAS: a store that keeps blobs unions the commit's delta
+    /// ([`RunUpdate::blobs`]) with the references already recorded, in the same step as the version
+    /// check, and a commit that loses the check records nothing.
     async fn commit_run(
         &self,
         id: RunId,
@@ -673,11 +761,61 @@ pub trait Store: Send + Sync + 'static {
     /// Delete finished (done or failed) runs of `agent` last updated before
     /// `before`, with their journals and push configurations. Returns the number of runs deleted.
     ///
+    /// A run's blob references ([`RunUpdate::blobs`]) go with it; after the run deletions, in the
+    /// same call, the blobs no surviving run references and that are older than `before` are
+    /// deleted too. A digest shared with a run that survives is kept. The run count may be short
+    /// when several sweepers run at once (each takes the rows it could lock, and the next call
+    /// takes the rest).
+    ///
+    /// The sweep and a commit's reference insert are **not one transaction**: a reference another
+    /// commit is writing at that moment is invisible to the sweep, which can therefore collect a
+    /// blob that commit is about to name. S2a closes it (PostgreSQL: one data-modifying CTE;
+    /// MongoDB: insert the references, check their completeness, then CAS — ADR 0055, decision 3);
+    /// until then the window is a blob whose bytes a run's state still carries in the expand
+    /// release.
+    ///
     /// **Retention must be longer than a minute.** A child run looks at its parent at least once a
     /// minute (`adam-runtime`), and fails when the parent is `Failed`; a parent that is missing is
     /// treated as unknown and cancels nothing, so a failed parent purged before its children saw it
     /// leaves them running to their own limits.
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64>;
+
+    /// Whether this store keeps a run's file bytes out of its state
+    /// ([`put_blob`](Self::put_blob), [`get_blob`](Self::get_blob)). `false` (the default) means a
+    /// file artifact's bytes live in the run's state, which is how every store worked before blobs.
+    fn keeps_blobs(&self) -> bool {
+        false
+    }
+
+    /// Store `bytes` under `id`, their content address ([`BlobId`]).
+    ///
+    /// Idempotent: a second put of an id writes nothing, and the bytes behind an id never change,
+    /// so a commit that is retried costs one no-op statement. A store that keeps no blobs
+    /// ([`keeps_blobs`](Self::keeps_blobs)) answers [`StoreError::InvalidInput`].
+    async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
+        let _ = (id, bytes);
+        Err(StoreError::InvalidInput("this store keeps no blobs".into()))
+    }
+
+    /// The bytes stored under `id`, or `None` when there are none: never written, or collected once
+    /// no run referenced them any more (see [`purge_blobs`](Self::purge_blobs)). A store that keeps
+    /// no blobs ([`keeps_blobs`](Self::keeps_blobs)) answers [`StoreError::InvalidInput`], as
+    /// [`put_blob`](Self::put_blob) does.
+    async fn get_blob(&self, id: &BlobId) -> StoreResult<Option<Vec<u8>>> {
+        let _ = id;
+        Err(StoreError::InvalidInput("this store keeps no blobs".into()))
+    }
+
+    /// Delete the blobs written before `before` that no run references, and return how many were
+    /// deleted. A blob a surviving run references is kept, however old it is: a digest shared by
+    /// several runs is deleted only with the last one.
+    ///
+    /// The explicit knob for a host that reclaims bytes without purging runs;
+    /// [`purge_finished`](Self::purge_finished) sweeps the same set with its own cutoff.
+    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        let _ = before;
+        Ok(0)
+    }
 }
 
 /// Shared, type-erased store handle used by the runtime.
@@ -861,6 +999,25 @@ mod tests {
             StoreError::internal(Driver),
             StoreError::corrupt_source(Driver),
         ]
+    }
+
+    #[test]
+    fn a_blob_id_is_64_lower_case_hex_or_nothing() {
+        let id = BlobId::from_sha256(&[0xab; 32]);
+        assert_eq!(id.as_str(), "ab".repeat(32));
+        assert_eq!(BlobId::from_hex(id.as_str()), Some(id.clone()));
+        assert_eq!(BlobId::from_hex(&"A".repeat(64)), None, "upper case");
+        assert_eq!(BlobId::from_hex(&"g".repeat(64)), None, "not hex");
+        assert_eq!(BlobId::from_hex(&"0".repeat(63)), None, "too short");
+        assert_eq!(BlobId::from_hex(&"0".repeat(65)), None, "too long");
+        // Its text in JSON, both ways, and deserialization validates like `from_hex` does.
+        assert_eq!(serde_json::to_string(&id).unwrap(), format!("\"{id}\""));
+        assert_eq!(
+            serde_json::from_str::<BlobId>(&format!("\"{id}\"")).unwrap(),
+            id
+        );
+        assert!(serde_json::from_str::<BlobId>(&format!("\"{}\"", "A".repeat(64))).is_err());
+        assert!(serde_json::from_str::<BlobId>(&format!("\"{}\"", "0".repeat(63))).is_err());
     }
 
     #[test]
