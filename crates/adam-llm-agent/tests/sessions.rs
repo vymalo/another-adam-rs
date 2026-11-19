@@ -24,7 +24,7 @@ use adam_model::{
 };
 use adam_runtime::{
     CHILD_REPORTED_KIND, CollectingSink, Inbound, ManualClock, RetryPolicy, RunView, Runtime,
-    RuntimeBuilder, RuntimeError, SessionHeader, SessionState, child_run_id,
+    RuntimeBuilder, RuntimeError, SessionHeader, SessionLimits, SessionState, child_run_id,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -251,6 +251,10 @@ struct Rig {
     hold_parent_on: Option<(usize, Arc<Gate>)>,
     /// Build the parent as a build before session reports was: it never lists sessions to report.
     reports_off: bool,
+    /// The limits the session tools hold (`None`: the defaults).
+    limits: Option<SessionLimits>,
+    /// How long a kept-open session may sit idle (`None`: the runtime's default).
+    idle_ttl: Option<Duration>,
     sink: CollectingSink,
     clock: ManualClock,
 }
@@ -271,6 +275,8 @@ impl Rig {
             hold: None,
             hold_parent_on: None,
             reports_off: false,
+            limits: None,
+            idle_ttl: None,
             sink: CollectingSink::new(),
             clock: ManualClock::new(),
         }
@@ -301,7 +307,7 @@ impl Rig {
     }
 
     fn roster(&self) -> SessionTools {
-        SessionTools::new([
+        let tools = SessionTools::new([
             SessionAgent {
                 name: "helper".into(),
                 agent: self.child_name.clone(),
@@ -316,7 +322,11 @@ impl Rig {
                 within: None,
                 remote: true,
             },
-        ])
+        ]);
+        match self.limits {
+            Some(limits) => tools.with_limits(limits),
+            None => tools,
+        }
     }
 
     fn parent_with(&self, wrap: impl Fn(DynTool) -> DynTool) -> LlmAgent {
@@ -374,7 +384,12 @@ impl Rig {
     }
 
     fn builder(&self, store: &DynStore, worker: &str) -> RuntimeBuilder {
-        Runtime::builder(store.clone())
+        let builder = Runtime::builder(store.clone());
+        let builder = match self.idle_ttl {
+            Some(ttl) => builder.session_idle_ttl(ttl),
+            None => builder,
+        };
+        builder
             .worker_id(format!("{worker}-{}", RunId::new()))
             .event_sink(self.sink.clone())
             .clock(self.clock.clone())
@@ -2966,6 +2981,319 @@ mod cases {
     }
 
     // -----------------------------------------------------------------------
+    // Limits, idle sessions and cancel (ADR 0045, slice 4)
+    // -----------------------------------------------------------------------
+
+    /// Each limit refuses in words: `max_working` on a start and on a send that would start a
+    /// round (and never on a steer into a working round), `max_open` on a start, `max_rounds` on a
+    /// send and not on a close.
+    pub async fn each_limit_refuses_in_words(store: DynStore) {
+        let mut rig = Rig::new().holding(1);
+        rig.limits = Some(SessionLimits::new(2, 1, 2).unwrap());
+        for text in ["a0", "a1", "a1 again", "a2", "a2 again"] {
+            rig.child_mock.push_text(text);
+        }
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let parent = rig.start(&rt, &conv_id()).await;
+        let (s0, s1) = (child_run_id(parent, "c0"), child_run_id(parent, "c1"));
+        for calls in [
+            vec![start_call("c0", true)],
+            vec![read_call("r0", s0, true)],
+            vec![start_call("c1", true)],
+            vec![send_call("m0", s0, "more")],
+            vec![send_call("st", s1, "steer")],
+            vec![start_call("c2", true)],
+            vec![read_call("r1", s1, true)],
+            vec![start_call("c3", true)],
+            vec![close_call("x0", s0, false)],
+            vec![send_call("n2", s1, "round two")],
+            vec![read_call("r2", s1, true)],
+            vec![send_call("n3", s1, "round three")],
+            vec![close_call("x1", s1, false)],
+        ] {
+            rig.parent_mock.push_tool_calls(calls);
+        }
+        rig.parent_mock.push_text("done").push_text("done again");
+        let worker = spawn_worker(&rt);
+        // The second round is held in its model call, so it works while the parent refuses; the
+        // parent parks at `r1`, after every refusal.
+        reached(&rig.child_gate.reached, "the second round's model call").await;
+        wait_waiting_on_a_session(&rt, parent).await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let results = tool_results(&state_of(&rt, parent).await);
+        let text = |id: &str| result_of(&results, id).clone();
+        for id in ["m0", "c2"] {
+            let (_, words, is_error) = text(id);
+            assert!(
+                is_error && words.contains("1 subagent rounds are already working"),
+                "{id}: {words}"
+            );
+        }
+        let (_, steered, is_error) = text("st");
+        assert!(
+            !is_error,
+            "a steer into a working round starts none: {steered}"
+        );
+        let (_, words, is_error) = text("c3");
+        assert!(is_error && words.contains("2 open sessions"), "{words}");
+        assert_eq!(as_json(&text("x0").1)["state"], "closed");
+        assert!(!text("n2").2, "{:?}", text("n2"));
+        let (_, words, is_error) = text("n3");
+        assert!(is_error && words.contains("2 rounds"), "{words}");
+        assert_eq!(
+            as_json(&text("x1").1)["state"],
+            "closed",
+            "a close is never refused"
+        );
+    }
+
+    /// A round that only closes a session works for no one: it calls no model and ends by itself, so
+    /// it does not count against `max_working`. The child's worker is stopped after round 1, so the
+    /// closing round stays open and the test does not race its claim.
+    async fn a_closing_round_is_not_counted_as_working(store: DynStore, then_start: bool) {
+        let (mut rig, gate) = Rig::new().holding_parent(4);
+        rig.limits = Some(SessionLimits::new(4, 1, 20).unwrap());
+        rig.child_mock.push_text("a0").push_text("a1");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let (front, back) = (
+            rig.front(&store, &parent_agent),
+            rig.back(&store, &child_agent),
+        );
+        let parent = rig.start(&front, &conv_id()).await;
+        let (s0, s1) = (child_run_id(parent, "c0"), child_run_id(parent, "c1"));
+        for calls in [
+            vec![start_call("c0", true)],
+            vec![read_call("r0", s0, true)],
+            vec![start_call("c1", true)],
+            vec![read_call("r1", s1, true)],
+            vec![close_call("x0", s0, false)],
+            vec![if then_start {
+                start_call("next", true)
+            } else {
+                send_call("next", s1, "more")
+            }],
+        ] {
+            rig.parent_mock.push_tool_calls(calls);
+        }
+        rig.parent_mock.push_text("done").push_text("done again");
+        let (front_worker, back_worker) = (spawn_worker(&front), spawn_worker(&back));
+        reached(&gate.reached, "the parent's call before the close").await;
+        back_worker.stop().await;
+        gate.release.notify_one();
+        wait_waiting_on_a_session(&front, parent).await;
+        let results = tool_results(&state_of(&front, parent).await);
+        let (_, text, is_error) = result_of(&results, "x0");
+        assert!(!*is_error, "{text}");
+        let (_, text, is_error) = result_of(&results, "next");
+        assert!(
+            !*is_error,
+            "the closing round of the session just closed is no working round: {text}"
+        );
+        front_worker.stop().await;
+    }
+
+    pub async fn a_close_then_a_start_is_not_refused_by_the_closing_round(store: DynStore) {
+        a_closing_round_is_not_counted_as_working(store, true).await;
+    }
+
+    pub async fn a_close_then_a_send_is_not_refused_by_the_closing_round(store: DynStore) {
+        a_closing_round_is_not_counted_as_working(store, false).await;
+    }
+
+    /// A kept-open session nobody has written to for the idle TTL reads closed: a send is refused
+    /// as to a closed session and says why, and the session no longer counts toward `max_open`.
+    pub async fn an_idle_expired_session_refuses_a_send_as_closed(store: DynStore) {
+        let mut rig = Rig::new();
+        rig.limits = Some(SessionLimits::new(1, 1, 20).unwrap());
+        rig.idle_ttl = Some(Duration::from_secs(3600));
+        rig.child_mock.push_text("a0").push_text("a1");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let first = rig.start(&rt, &conv).await;
+        let session = child_run_id(first, "c0");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c0", true)])
+            .push_tool_calls(vec![read_call("r0", session, true)])
+            .push_text("one");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, first).await;
+        let listed = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(listed.sessions[0].state, SessionState::Idle);
+
+        rig.clock.advance(Duration::from_secs(2 * 3600));
+        rig.parent_mock
+            .push_tool_calls(vec![call("l0", "subagent_list", json!({}))])
+            .push_tool_calls(vec![send_call("d0", session, "back")])
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_text("two")
+            .push_text("two, and it reported");
+        let second = rt
+            .start_continuing(&rig.parent_name, user_message("again"), Some(&conv), first)
+            .await
+            .unwrap();
+        wait_done(&rt, second).await;
+        worker.stop().await;
+
+        let results = tool_results(&state_of(&rt, second).await);
+        assert!(
+            result_of(&results, "l0").1.contains("closed"),
+            "{results:?}"
+        );
+        let (_, words, is_error) = result_of(&results, "d0");
+        assert!(
+            *is_error && words.contains("is closed") && words.contains("idle"),
+            "{words}"
+        );
+        assert!(
+            !result_of(&results, "c1").2,
+            "an expired session frees its place under max_open"
+        );
+    }
+
+    /// The report of a round nobody has been told of stays due when its session has since
+    /// expired: it is told once, by the next task's first model call, and not again.
+    pub async fn an_expired_sessions_report_is_still_told_once(store: DynStore) {
+        let mut rig = Rig::new();
+        rig.idle_ttl = Some(Duration::from_secs(3600));
+        rig.child_mock.push_text("the person's round says 9");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        rig.parent_mock.push_text("first task");
+        let first = rig.start(&rt, &conv).await;
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, first).await;
+        let theirs = start_persons_round(&rt, &rig, &conv, "asked by a person").await;
+        wait_done(&rt, theirs).await;
+        rig.clock.advance(Duration::from_secs(2 * 3600));
+        let listed = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert!(listed.sessions[0].idle_expired);
+        assert_eq!(listed.sessions[0].state, SessionState::Closed);
+
+        let next = |prior: RunId, text: &'static str| {
+            let rt = rt.clone();
+            let (name, conv) = (rig.parent_name.clone(), conv.clone());
+            async move {
+                rt.start_continuing(&name, user_message(text), Some(&conv), prior)
+                    .await
+                    .unwrap()
+            }
+        };
+        rig.parent_mock.push_text("second task");
+        let second = next(first, "second").await;
+        wait_done(&rt, second).await;
+        rig.parent_mock.push_text("third task");
+        let third = next(second, "third").await;
+        wait_done(&rt, third).await;
+        worker.stop().await;
+
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 3);
+        let told = report_calls(&requests[1].messages);
+        assert_eq!(told.len(), 1, "{:?}", requests[1].messages);
+        assert_eq!(told[0].id, report_id(theirs));
+        assert!(matches!(
+            requests[1].messages.last(),
+            Some(Message::Tool { content, .. }) if content.contains("round says 9")
+        ));
+        assert_eq!(
+            report_calls(&requests[2].messages).len(),
+            1,
+            "not told again"
+        );
+        assert_eq!(state_of(&rt, third).await.reported_rounds, vec![theirs]);
+    }
+
+    /// A parent whose model fails for good stops the rounds it started.
+    pub async fn a_parent_that_fails_stops_its_rounds(store: DynStore) {
+        let rig = Rig::new().holding(0);
+        rig.child_mock.push_text("never said");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_error(ModelError::Auth("bad key".into()));
+        let worker = spawn_worker(&rt);
+        wait_for(&rt, parent, "the parent to fail", |v| {
+            v.status == RunStatus::Failed
+        })
+        .await;
+        let round = wait_for(&rt, session, "the round to be cancelled", |v| {
+            v.status == RunStatus::Failed
+        })
+        .await;
+        assert_eq!(
+            round.error.as_deref(),
+            Some("cancelled: the parent run ended")
+        );
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(list.sessions[0].state, SessionState::Idle, "kept open");
+        rig.child_gate.release.notify_one();
+        worker.stop().await;
+    }
+
+    /// A cancelled parent frees the working slots: the next task starts a round under
+    /// `max_working` 1.
+    pub async fn a_cancel_frees_the_working_slots_for_the_next_task(store: DynStore) {
+        let mut rig = Rig::new().holding(0);
+        rig.limits = Some(SessionLimits::new(2, 1, 20).unwrap());
+        rig.child_mock
+            .push_text("never said")
+            .push_text("c2 says 5");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let first = rig.start(&rt, &conv).await;
+        let session = child_run_id(first, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_text("started");
+        let worker = spawn_worker(&rt);
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        wait_waiting_on_a_session(&rt, first).await;
+        rt.cancel(first, "the person stopped it").await.unwrap();
+        wait_for(&rt, session, "the round to be cancelled", |v| {
+            v.status == RunStatus::Failed
+        })
+        .await;
+
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c2", true)])
+            .push_text("started the second")
+            .push_text("the second said 5");
+        let second = rt
+            .start_continuing(&rig.parent_name, user_message("again"), Some(&conv), first)
+            .await
+            .unwrap();
+        wait_done(&rt, second).await;
+        let results = tool_results(&state_of(&rt, second).await);
+        let (_, started, is_error) = result_of(&results, "c2");
+        assert!(
+            !*is_error,
+            "no slot is held by the cancelled round: {started}"
+        );
+        rig.child_gate.release.notify_one();
+        worker.stop().await;
+    }
+
+    // -----------------------------------------------------------------------
     // Reports during a turn (ADR 0045, slice 3)
     // -----------------------------------------------------------------------
 
@@ -3499,7 +3827,15 @@ mod cases {
         wait_done(&rt, first).await;
         let old = start_persons_round(&rt, &rig, &conv, "an old one").await;
         wait_done(&rt, old).await;
-        // The second task begins after the old round ended (the runtime's clock is the wall clock).
+        // The second task must begin strictly after the old round ended: a round that ends in the
+        // same instant as the chain starts is told (the rule is `ended >= chain_started`), and on
+        // the memory store both can fall in one clock tick. Wait for the runtime's clock to pass
+        // the round's last update; no fixed sleep, and no clock advance (the new round's end must
+        // stay after the chain's start).
+        let ended = store.load_run(old).await.unwrap().unwrap().updated_at;
+        while adam_runtime::Clock::now(&rig.clock) <= ended {
+            tokio::task::yield_now().await;
+        }
 
         rig.parent_mock
             .push_tool_calls(vec![start_call("c1", false)])
@@ -3994,6 +4330,28 @@ mod cases {
     }
 }
 
+#[test]
+fn limits_do_not_change_the_specs() {
+    let agents = || {
+        [SessionAgent {
+            name: "helper".into(),
+            agent: "helper".into(),
+            description: "Does a piece of work.".into(),
+            within: None,
+            remote: false,
+        }]
+    };
+    let specs = |tools: SessionTools| {
+        serde_json::to_string(&tools.tools().iter().map(|t| t.spec()).collect::<Vec<_>>()).unwrap()
+    };
+    let default = specs(SessionTools::new(agents()));
+    let limited = SessionLimits::new(3, 2, 5).unwrap();
+    assert_eq!(
+        default,
+        specs(SessionTools::new(agents()).with_limits(limited))
+    );
+}
+
 /// The five specs, as the model sees them, pinned: a spec is the model's contract, so a change is
 /// deliberate. Regenerate with `ADAM_UPDATE_SNAPSHOTS=1 cargo test -p adam-llm-agent --test sessions`.
 #[test]
@@ -4105,6 +4463,13 @@ macro_rules! session_suite {
                 a_stale_answer_leaves_its_reports_and_its_listing_for_the_next_call,
                 a_send_turns_the_listing_on,
                 a_closing_round_does_not_hide_the_newest_round_that_worked,
+                each_limit_refuses_in_words,
+                a_close_then_a_start_is_not_refused_by_the_closing_round,
+                a_close_then_a_send_is_not_refused_by_the_closing_round,
+                an_idle_expired_session_refuses_a_send_as_closed,
+                an_expired_sessions_report_is_still_told_once,
+                a_parent_that_fails_stops_its_rounds,
+                a_cancel_frees_the_working_slots_for_the_next_task,
             );
         }
     };

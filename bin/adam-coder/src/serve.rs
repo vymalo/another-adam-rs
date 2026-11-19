@@ -55,6 +55,7 @@ async fn build_agent(
     max_access_tier: AccessTier,
     redactor: Redactor,
     files: &AgentFiles,
+    sessions: adam_service::SessionSettings,
 ) -> anyhow::Result<(CoderAgent, Janitor, CommandsSweep)> {
     let model: DynModel = worker.model.client().context("building the model client")?;
     if worker.commands_can_read_the_app_key() {
@@ -201,7 +202,9 @@ async fn build_agent(
     // agent is bound: a server that is down, a local process the policy does not allow, a
     // `${VAR}` that is unset are startup errors with their own exit code (69 or 78), never
     // something found in the middle of a run. Without an `mcp.json` this connects to nothing.
+    // The deployment's session limits (SESSION_*); the root's file may only lower them.
     let def = def
+        .session_limits(sessions.limits)
         .connect_mcp(&policy)
         .await
         .context(
@@ -413,6 +416,7 @@ pub async fn serve(
                 config.max_access_tier,
                 Redactor::from_config(&config),
                 &files,
+                config.service.sessions,
             )
             .await?;
             // The prompts of the MCP servers the deployment adds (`ADAM_EXTRA_MCP_FILE`) are

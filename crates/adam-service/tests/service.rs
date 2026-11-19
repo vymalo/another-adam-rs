@@ -74,6 +74,28 @@ fn options() -> RuntimeOptions {
     }
 }
 
+#[tokio::test]
+async fn the_idle_limit_of_the_options_reaches_the_runtime() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let default = Service::new(Runtime::builder(store.clone()), "idle", &options());
+    assert_eq!(
+        default.runtime.session_idle_ttl(),
+        adam_runtime::DEFAULT_SESSION_IDLE_TTL
+    );
+    let set = Service::new(
+        Runtime::builder(store),
+        "idle",
+        &RuntimeOptions {
+            session_idle_ttl: Duration::from_secs(3 * 24 * 3600),
+            ..options()
+        },
+    );
+    assert_eq!(
+        set.runtime.session_idle_ttl(),
+        Duration::from_secs(3 * 24 * 3600)
+    );
+}
+
 fn card(name: &str) -> AgentCardConfig {
     AgentCardConfig::new(
         name,

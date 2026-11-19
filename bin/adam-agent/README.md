@@ -374,3 +374,5 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   smoke test and the compose scenarios (`dev/agent-e2e.sh`, and `dev/agent-cards-e2e.sh`, which serves the researcher
   folder on `mock-researcher` and checks the cards and the graph, and the words alone on a screen without them) run
   in `coder.yml` (see above).
+
+Session limits ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) slice 4): `SESSION_MAX_OPEN`, `SESSION_MAX_WORKING`, `SESSION_MAX_ROUNDS` and `SESSION_IDLE_DAYS` are read by every role (exit 78 when bad); the folder's root `limits.max_open_sessions`, `max_working_sessions` and `max_session_rounds` may lower them. A folder with subagents logs the effective values once (`session limits`). Tests: `session_settings_reach_the_agent_the_process_serves`, `a_bad_session_setting_exits_78_for_every_role`.

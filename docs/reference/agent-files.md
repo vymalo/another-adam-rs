@@ -88,6 +88,9 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
   max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
+  max_open_sessions: 8         # root only: most sessions open at once, 1 to 100; lowers SESSION_MAX_OPEN, never raises it (a larger value is lowered with a warning)
+  max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
+  max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 references:                    # root only: repositories the coder reads and never writes (below)
   - { name: design-system, url: "https://github.com/acme/design-system", description: Tokens and components the UI follows. }
@@ -638,7 +641,7 @@ sees the parent's history. The sequence and the states of the wait are in
 
 A root with a subagent, local or remote, also gets five tools that run a subagent **in the background** as a session
 (`subagent_start`, `subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`; [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md),
-[child runs](child-runs.md#sessions-adr-0045-slices-1-to-3)). No file declares them: they follow the folder's subagents,
+[child runs](child-runs.md#sessions-adr-0045-slices-1-to-4)). No file declares them: they follow the folder's subagents,
 whose names are the enum of `agent`, and they are not given to a subagent. A subagent file needs nothing for them, and a remote
 (`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the five is refused at
 bind. A root whose subagents are all remote gets the five tools as well.

@@ -7,7 +7,8 @@ use crate::diagnostic::Sink;
 use crate::frontmatter::{Split, clean_body, key_line};
 use crate::manifest::RemoteAuth;
 use crate::schema::{
-    AgentFrontmatter, MAX_MINUTES_LIMIT, MAX_PARALLEL_LIMIT, ModelRef, ToolList, check_references,
+    AgentFrontmatter, MAX_MINUTES_LIMIT, MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT,
+    MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT, ModelRef, ToolList, check_references,
     is_agent_name, is_env_name, is_tool_name,
 };
 
@@ -94,7 +95,7 @@ pub(crate) fn parse_agent_file(
     }
     let name = resolve_name(sink, &split, &fm, kind, path_name)?;
     check_keys(sink, &split, &fm);
-    check_values(sink, &split, &fm);
+    check_values(sink, &split, &fm, kind);
 
     if kind != FileKind::Sub
         && fm
@@ -106,6 +107,27 @@ pub(crate) fn parse_agent_file(
             key_line(&split, "limits"),
             "`limits.max_minutes` is for a subagent run (the parent stops it); it is ignored on this agent",
         );
+    }
+    if kind == FileKind::Sub
+        && let Some(limits) = fm.limits.as_ref()
+    {
+        let keys: Vec<&str> = [
+            ("`limits.max_open_sessions`", limits.max_open_sessions),
+            ("`limits.max_working_sessions`", limits.max_working_sessions),
+            ("`limits.max_session_rounds`", limits.max_session_rounds),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|_| key))
+        .collect();
+        if !keys.is_empty() {
+            sink.warn(
+                key_line(&split, "limits"),
+                format!(
+                    "the session limits ({}) are the root agent's: ignored on a subagent",
+                    keys.join(", ")
+                ),
+            );
+        }
     }
     if kind != FileKind::Sub {
         if fm.a2a.is_some() || fm.auth.is_some() {
@@ -341,7 +363,7 @@ fn check_keys(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
     }
 }
 
-fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
+fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter, kind: FileKind) {
     if let Some(ModelRef::Alias(alias)) = &fm.model
         && alias.contains("://")
     {
@@ -391,6 +413,46 @@ fn check_values(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
                 "`limits.max_parallel` is from 1 to {MAX_PARALLEL_LIMIT} (the tool calls of a turn that run at once); it is {n}"
             ),
         );
+    }
+    // The session limits are the root's: a subagent's are ignored (with a warning), so they are
+    // not range-checked there.
+    if let Some(limits) = fm.limits.as_ref().filter(|_| kind != FileKind::Sub) {
+        let (low, high) = MAX_SESSION_ROUNDS_LIMIT;
+        let ranges = [
+            (
+                "max_open_sessions",
+                limits.max_open_sessions,
+                1,
+                MAX_OPEN_SESSIONS_LIMIT,
+            ),
+            (
+                "max_working_sessions",
+                limits.max_working_sessions,
+                1,
+                MAX_WORKING_SESSIONS_LIMIT,
+            ),
+            ("max_session_rounds", limits.max_session_rounds, low, high),
+        ];
+        for (key, value, low, high) in ranges {
+            if let Some(n) = value
+                && !(low..=high).contains(&n)
+            {
+                sink.error(
+                    key_line(split, "limits"),
+                    format!("`limits.{key}` is from {low} to {high}; it is {n}"),
+                );
+            }
+        }
+        if let (Some(open), Some(working)) = (limits.max_open_sessions, limits.max_working_sessions)
+            && working > open
+        {
+            sink.error(
+                key_line(split, "limits"),
+                format!(
+                    "`limits.max_working_sessions` is {working}, more than `limits.max_open_sessions` ({open})"
+                ),
+            );
+        }
     }
     if let Err(why) = check_references(&fm.references) {
         sink.error(

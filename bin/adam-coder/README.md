@@ -1897,7 +1897,7 @@ middle of a run) for a `{{placeholder}}` the frontmatter does not declare, a var
 uses, or a `tools:` name the coder does not register. Then update `tests/fixtures/agent/prompt.txt` (the
 **instruction snapshot**: the body of `instructions.md`, placeholders as written) and `card.json` in the same commit:
 a change of what the model is told is a reviewed diff of those files, a change of behaviour to decide on and not
-a refactor (see [Tests](#tests)). The rendered body is under the loader's 30,000 characters by about 250 (the count
+a refactor (see [Tests](#tests)). The rendered body is under the loader's 30,000 characters by about 80 (the count
 varies a few characters with the check limits): a sentence added needs an equal length cut, and
 `the_prompt_names_no_opencode_and_stays_under_30000_chars` says when it does not. The limit in the prompt follows
 `MAX_CHECK_CYCLES` and `SCRATCH_CHECK_CYCLES`: the process passes `CoderSettings::max_check_cycles` and
@@ -3121,3 +3121,5 @@ remote and one pull request on the mock GitHub, and `dev/coder-e2e.sh` (run by
 Record the pull request URL and the log excerpts in the pull request that lands
 this change. (Not run by the author of this crate: no gateway or GitHub access
 in the environment it was written in.)
+
+Session limits ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) slice 4): `SESSION_MAX_OPEN`, `SESSION_MAX_WORKING`, `SESSION_MAX_ROUNDS` and `SESSION_IDLE_DAYS` (see `docs/reference/environment.md`) reach the coder's background helpers: `src/serve.rs` gives them to the definition before the agent is built, and the root's file may only lower them. Nothing under `src/tools` changed. There is no test that the coder's limits reach its agent: `build_agent` needs a model, GitHub and workspace configuration, so the wiring (one `session_limits` call) is covered by the assembly and `adam-agent` tests of the same call.

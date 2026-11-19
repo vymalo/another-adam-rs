@@ -10,7 +10,7 @@ use adam_llm_agent::{
     MAX_PARALLEL_LIMIT, SESSION_TOOLS, StepIo, ToolSource,
 };
 use adam_model::DynModel;
-use adam_runtime::RuntimeBuilder;
+use adam_runtime::{RuntimeBuilder, SessionLimits};
 
 use crate::def::{Node, Remote};
 use crate::error::{AliasProblem, Error, Origin};
@@ -36,6 +36,7 @@ pub struct BoundDef {
     aliases: Option<Vec<String>>,
     wait_poll: Option<Duration>,
     max_parallel: Option<usize>,
+    session_limits: SessionLimits,
     step_io: Option<StepIo>,
     scrub: Option<Scrub>,
     scrub_longest: Option<crate::scrub::Longest>,
@@ -62,7 +63,12 @@ impl std::fmt::Debug for BoundDef {
 }
 
 impl BoundDef {
-    pub(crate) fn new(manifest: AgentManifest, nodes: Vec<Node>, remotes: Vec<Remote>) -> Self {
+    pub(crate) fn new(
+        manifest: AgentManifest,
+        nodes: Vec<Node>,
+        remotes: Vec<Remote>,
+        session_limits: SessionLimits,
+    ) -> Self {
         Self {
             manifest,
             nodes,
@@ -72,6 +78,7 @@ impl BoundDef {
             aliases: None,
             wait_poll: None,
             max_parallel: None,
+            session_limits,
             step_io: None,
             scrub: None,
             scrub_longest: None,
@@ -267,6 +274,7 @@ impl BoundDef {
             rounds,
             info,
             remotes,
+            session_limits: self.session_limits,
             #[cfg(feature = "mcp")]
             prompt_commands: self.prompt_commands,
         })
@@ -412,11 +420,18 @@ pub struct Assembly {
     rounds: Vec<RemoteRoundAgent>,
     info: Vec<AgentInfo>,
     remotes: Vec<RemoteInfo>,
+    session_limits: SessionLimits,
     #[cfg(feature = "mcp")]
     prompt_commands: Vec<adam_mcp::PromptCommand>,
 }
 
 impl Assembly {
+    /// The limits the root's sessions run under: the deployment's
+    /// ([`AgentDef::session_limits`](crate::AgentDef::session_limits)) lowered by the root's file.
+    pub fn session_limits(&self) -> SessionLimits {
+        self.session_limits
+    }
+
     /// Every agent, the root first and then each subagent (depth first, in name order). What
     /// `Runtime::builder(..).agent(a)` takes, one by one; [`register`](Self::register) does the
     /// loop.

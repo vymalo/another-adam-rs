@@ -16,7 +16,8 @@ pub use adam_model_openai::{OpenAiConfigError, endpoint_for_logs};
 pub use config::McpSettings;
 pub use config::{
     A2aSettings, CardSigning, ConfigError, MAX_CONTEXT_WINDOW, ModelConfig, PromptCacheKey,
-    PushSettings, ServiceConfig, WorkerSettings, is_worker_id, parse_file, parse_flag, parse_or,
+    PushSettings, ServiceConfig, SessionSettings, WorkerSettings, is_worker_id, parse_file,
+    parse_flag, parse_or,
 };
 pub use exit::{
     EX_CONFIG, EX_GENERAL, EX_OSERR, EX_SOFTWARE, EX_UNAVAILABLE, exit_code, exit_code_with,

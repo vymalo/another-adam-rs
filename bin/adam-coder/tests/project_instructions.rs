@@ -36,6 +36,7 @@ fn options() -> RuntimeOptions {
         concurrency: 2,
         lease_ttl: Duration::from_secs(30),
         poll_interval: Duration::from_millis(20),
+        session_idle_ttl: adam_runtime::DEFAULT_SESSION_IDLE_TTL,
     }
 }
 
