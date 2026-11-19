@@ -20,6 +20,8 @@ adam-workspace = { path = "../adam-workspace", version = "0.1.0", default-featur
 aho-corasick.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+globset.workspace = true
+regex.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
