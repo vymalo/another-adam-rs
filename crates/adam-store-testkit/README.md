@@ -1,7 +1,8 @@
 # adam-store-testkit
 
 The conformance suite every `adam_core::Store` implementation must pass, plus
-a fault-injecting `Store` wrapper for testing callers.
+two `Store` wrappers for tests: one injects faults, the other counts calls and
+the state bytes that cross it.
 
 ## Where it sits
 
@@ -13,14 +14,20 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (48
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (49
   cases: create/load, `run_header` against `load_run` + `lease_until`, state round trip, CAS
   conflicts, concurrent commits, journal ordering and first-writer-wins, claim rules and
   exclusivity, busy runs that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
-  run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
+  run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run. The last case measures rather than asserts a rule: `the_state_write_is_quadratic_in_the_transcript` commits a 10 KB message 50 times through `counting::CountingStore` and pins today's quadratic write and the read that grows with the transcript, so the P2 slices can invert the bound.
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
+* `counting::CountingStore`: wraps a `DynStore` and counts calls per `fault::Method` and the
+  `state` bytes that cross it — every record read (`load_run`, `list_runs`, `claim_due`,
+  `open_run_for_conversation`) and every successful `commit_run` write — through `calls(method)`,
+  `state_bytes_read()`, `state_bytes_written()`, `max_commit_bytes()` and `reset()`. A commit that
+  failed wrote nothing and is not counted; `migrate` is not counted, and neither is a record
+  returned without its state (a `create_run` or `commit_run` echo, a header).
 * `fault::FaultyStore`: wraps a `DynStore` and fails scripted calls
   (`fail`, `fail_always`, `fail_after_apply`, `heal`, `calls`, `injected`, and `claimed(run)`, how many times
   `claim_due` handed a run to its caller; and `fail_run` /
@@ -60,6 +67,9 @@ failure (see `adam_core::testing`).
   each gets back exactly its own.
 * The `push_*` cases: a put creates then replaces (version, state and cursor reset, `created_at` kept), needs its run, lists per run in id order, round-trips configs with unusual keys, deletes idempotently; a claim takes only active, due configs of the asked agents, honours the limit and the lease, and 8 workers racing on 40 configs split them exactly once; a commit advances the version, drops the lease and fails with `Conflict` on a stale or replaced version and `NotFound` once deleted; configs go with their purged run.
 * `src/fault.rs`: unit tests and a doctest of `FaultyStore`.
+* `src/counting.rs`: unit tests of the counters (calls per method, reads through `load_run`,
+  `list_runs` and `claim_due`, the write total and its high-water mark, a failed commit that
+  counts nothing, a header that crosses without a state) and a doctest of `CountingStore`.
 
 The Postgres and MongoDB adapters run the suite from their own
 `tests/conformance.rs`.

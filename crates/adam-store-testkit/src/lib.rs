@@ -20,6 +20,7 @@
 // A conformance suite is test code: a failed unwrap is a failed assertion.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod counting;
 pub mod fault;
 
 pub use adam_core::testing::skipped;
@@ -73,6 +74,7 @@ macro_rules! store_conformance {
             list_runs_scopes_match_exactly, count_runs_ignores_the_page,
             list_runs_prefixes_with_slashes_match_literally,
             two_creates_with_different_ids_in_one_conversation_leave_one_open_run,
+            the_state_write_is_quadratic_in_the_transcript,
         );
     };
     (@cases $make:path; $($case:ident),* $(,)?) => {
@@ -143,6 +145,112 @@ pub mod cases {
             },
             "every other field of the returned record is the stored one"
         );
+    }
+
+    /// The write cost of a transcript-shaped run in today's shape: every commit carries the whole
+    /// state, so the bytes written grow with the square of the transcript.
+    ///
+    /// One run, 50 commits, each appending a 10 KB message: 10 KB × 50 × 51 / 2 = 12.75 MB, and
+    /// the last commit alone is ~500 KB. These are the **baseline** the P2 slices are measured
+    /// against, deliberately loose (2× the linear total): a head larger than expected must not fail
+    /// a case that is about the quadratic term. S3 inverts the bound (`< 50 × 20 KB`), which is why
+    /// the name says the shape it asserts rather than "a commit is small".
+    ///
+    /// The read side has the same shape: one `load_run` of the finished run transfers the whole
+    /// transcript, an order of magnitude more than the read after the first commit.
+    ///
+    /// It prints one `p2-measure:` line with the measured numbers, which `dev/p2-measure.sh`
+    /// parses and quotes.
+    pub async fn the_state_write_is_quadratic_in_the_transcript(store: DynStore) {
+        use std::sync::Arc;
+
+        use adam_core::Store;
+
+        use crate::counting::CountingStore;
+        use crate::fault::Method;
+
+        /// Commits, and the bytes of the message each one appends.
+        const COMMITS: usize = 50;
+        const MESSAGE_BYTES: usize = 10 * 1024;
+        /// The bound S3 asserts: twice the linear total (50 × 10 KB).
+        const LINEAR_BOUND: u64 = 50 * 20 * 1024;
+
+        let store = Arc::new(CountingStore::new(store));
+        let run = store
+            .create_run(NewRun::new(agent(), json!({"messages": []})))
+            .await
+            .unwrap();
+
+        let mut messages = Vec::with_capacity(COMMITS);
+        let mut version = run.version;
+        let mut first_read = 0;
+        for turn in 0..COMMITS {
+            messages.push(json!({
+                "role": "assistant",
+                "text": message_text(MESSAGE_BYTES, turn as u64),
+            }));
+            let update = RunUpdate::new(RunStatus::Runnable, json!({"messages": messages}));
+            version = store
+                .commit_run(run.id, version, update)
+                .await
+                .unwrap()
+                .version;
+            if turn == 0 {
+                store.load_run(run.id).await.unwrap().expect("the run");
+                first_read = store.state_bytes_read();
+            }
+        }
+        let finished = store.load_run(run.id).await.unwrap().expect("the run");
+        let final_read = store.state_bytes_read() - first_read;
+        let total = store.state_bytes_written();
+        let max = store.max_commit_bytes();
+
+        eprintln!(
+            "p2-measure: commits={COMMITS} total_written={total} max_commit={max} \
+             first_read={first_read} final_read={final_read}"
+        );
+        assert_eq!(store.calls(Method::CommitRun), COMMITS as u64);
+        assert_eq!(
+            finished.state["messages"].as_array().unwrap().len(),
+            COMMITS,
+            "the transcript holds every message"
+        );
+        assert_eq!(finished.version, version);
+        assert!(
+            total > LINEAR_BOUND,
+            "every commit rewrites the whole state: {total} bytes written, expected more than \
+             {LINEAR_BOUND} (the quadratic baseline)"
+        );
+        assert!(
+            max > 20 * 1024,
+            "the last commit carries the whole transcript: {max} bytes, expected more than 20480"
+        );
+        assert!(
+            first_read > MESSAGE_BYTES as u64,
+            "a read after the first commit transfers its message: {first_read} bytes"
+        );
+        assert!(
+            final_read > 10 * first_read,
+            "a read of the finished run transfers the whole transcript: {final_read} bytes \
+             against {first_read} after one commit"
+        );
+    }
+
+    /// `len` bytes of text that does not compress away: a real transcript is tokens, not one
+    /// repeated byte, and a store that compresses a large state (PostgreSQL TOASTs a big JSONB
+    /// value) must be measured on content it cannot shrink to nothing.
+    fn message_text(len: usize, seed: u64) -> String {
+        const ALPHABET: &[u8] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,\n";
+        let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ALPHABET[(state >> 33) as usize % ALPHABET.len()] as char
+            })
+            .collect()
     }
 
     /// `create_run` and `commit_run` return the record without its state: the caller wrote it, and

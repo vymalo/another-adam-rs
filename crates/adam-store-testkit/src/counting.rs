@@ -1,0 +1,466 @@
+//! [`CountingStore`]: a [`Store`] wrapper that counts calls and the bytes of the states that cross
+//! it, so a test can assert what a read or a commit costs.
+//!
+//! [`FaultyStore`](crate::fault::FaultyStore) proves callers stay correct while the store fails;
+//! this measures what they ask it to do while it works. The question it answers is the one a
+//! transcript asks: how much does one more commit write, and how much does one read transfer? It
+//! counts calls per [`Method`] and sums the `serde_json` bytes of the `state` of every
+//! [`RunRecord`] the store returns, and of every [`RunUpdate::state`] a successful commit writes. A
+//! record returned without its state (`create_run` and `commit_run` echo none) counts zero, and so
+//! does a state that is `null`. A store's own encoding (JSONB, BSON) may differ by a few bytes; a
+//! bound is about the ratio, not the encoding.
+//!
+//! ```
+//! # tokio_test_block(async {
+//! use std::sync::Arc;
+//! use adam_core::{MemoryStore, NewRun, RunStatus, RunUpdate, Store};
+//! use adam_store_testkit::counting::CountingStore;
+//! use adam_store_testkit::fault::Method;
+//! use serde_json::json;
+//!
+//! let store = CountingStore::new(Arc::new(MemoryStore::new()));
+//! let run = store.create_run(NewRun::new("a", json!({}))).await.unwrap();
+//! store.reset();
+//! store
+//!     .commit_run(run.id, 1, RunUpdate::new(RunStatus::Done, json!({"n": 1})))
+//!     .await
+//!     .unwrap();
+//! store.load_run(run.id).await.unwrap();
+//! assert_eq!(store.calls(Method::CommitRun), 1);
+//! assert_eq!(store.calls(Method::LoadRun), 1);
+//! assert!(store.state_bytes_written() > 0);
+//! assert!(store.state_bytes_read() > 0);
+//! # });
+//! # fn tokio_test_block(f: impl std::future::Future<Output = ()>) {
+//! #     tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+//! # }
+//! ```
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use adam_core::{
+    ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
+    RunHeader, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreResult,
+};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+
+use crate::fault::Method;
+
+#[derive(Default)]
+struct Counts {
+    calls: HashMap<Method, u64>,
+    state_bytes_read: u64,
+    state_bytes_written: u64,
+    max_commit_bytes: u64,
+}
+
+/// Wraps a store and counts calls and state bytes; every call passes through untouched.
+///
+/// Cloning is not offered: share it as `Arc<CountingStore>` (which also coerces to a [`DynStore`])
+/// so the test keeps a handle to read the counters while the code under test holds the same store.
+pub struct CountingStore {
+    inner: DynStore,
+    counts: Mutex<Counts>,
+}
+
+impl CountingStore {
+    /// Wrap `inner`; the counters start at zero.
+    pub fn new(inner: DynStore) -> Self {
+        Self {
+            inner,
+            counts: Mutex::default(),
+        }
+    }
+
+    fn counts(&self) -> MutexGuard<'_, Counts> {
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many calls of `method` the wrapped store has seen since the last
+    /// [`reset`](Self::reset). `migrate` is not counted: a store that cannot migrate never gets as
+    /// far as running anything, the same rule as [`FaultyStore`](crate::fault::FaultyStore).
+    pub fn calls(&self, method: Method) -> u64 {
+        self.counts().calls.get(&method).copied().unwrap_or(0)
+    }
+
+    /// The bytes of the `state` of every [`RunRecord`] returned since the last reset: what a
+    /// reader transferred, not what it kept. A record a store returns without its state (a
+    /// `create_run` or `commit_run` echo) adds nothing, and so does a `null` state.
+    pub fn state_bytes_read(&self) -> u64 {
+        self.counts().state_bytes_read
+    }
+
+    /// The bytes of [`RunUpdate::state`] written by the commits that **succeeded** since the last
+    /// reset. A commit that failed (a stale version, a lost connection) wrote no state and is not
+    /// counted.
+    pub fn state_bytes_written(&self) -> u64 {
+        self.counts().state_bytes_written
+    }
+
+    /// The largest state one commit wrote since the last reset: the last state of a transcript,
+    /// when every commit carries the whole thing.
+    pub fn max_commit_bytes(&self) -> u64 {
+        self.counts().max_commit_bytes
+    }
+
+    /// Zero every counter, keeping the wrapped store.
+    pub fn reset(&self) {
+        *self.counts() = Counts::default();
+    }
+
+    fn call(&self, method: Method) {
+        *self.counts().calls.entry(method).or_default() += 1;
+    }
+
+    fn read(&self, record: &RunRecord) {
+        self.counts().state_bytes_read += state_bytes(&record.state);
+    }
+
+    fn reads<'a>(&self, records: impl IntoIterator<Item = &'a RunRecord>) {
+        let bytes: u64 = records
+            .into_iter()
+            .map(|record| state_bytes(&record.state))
+            .sum();
+        self.counts().state_bytes_read += bytes;
+    }
+
+    fn wrote(&self, bytes: u64) {
+        let mut counts = self.counts();
+        counts.state_bytes_written += bytes;
+        counts.max_commit_bytes = counts.max_commit_bytes.max(bytes);
+    }
+}
+
+fn state_bytes(state: &Value) -> u64 {
+    // A record a store returns without its state carries `null` (the create and commit echo):
+    // that is no state transferred, not the four bytes of the word.
+    if state.is_null() {
+        return 0;
+    }
+    serde_json::to_vec(state)
+        .expect("a serde_json::Value always serializes")
+        .len() as u64
+}
+
+impl fmt::Debug for CountingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountingStore").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Store for CountingStore {
+    async fn migrate(&self) -> StoreResult<()> {
+        self.inner.migrate().await
+    }
+
+    async fn create_run(&self, run: NewRun) -> StoreResult<RunRecord> {
+        self.call(Method::CreateRun);
+        let record = self.inner.create_run(run).await?;
+        self.read(&record);
+        Ok(record)
+    }
+
+    async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        self.call(Method::LoadRun);
+        let record = self.inner.load_run(id).await?;
+        if let Some(record) = &record {
+            self.read(record);
+        }
+        Ok(record)
+    }
+
+    async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
+        self.call(Method::RunHeader);
+        self.inner.run_header(id).await
+    }
+
+    async fn commit_run(
+        &self,
+        id: RunId,
+        expected_version: u64,
+        update: RunUpdate,
+    ) -> StoreResult<RunRecord> {
+        self.call(Method::CommitRun);
+        let written = state_bytes(&update.state);
+        let record = self.inner.commit_run(id, expected_version, update).await?;
+        self.wrote(written);
+        self.read(&record);
+        Ok(record)
+    }
+
+    async fn open_run_for_conversation(
+        &self,
+        agent: &str,
+        conversation_id: &str,
+    ) -> StoreResult<Option<RunRecord>> {
+        self.call(Method::OpenRunForConversation);
+        let record = self
+            .inner
+            .open_run_for_conversation(agent, conversation_id)
+            .await?;
+        if let Some(record) = &record {
+            self.read(record);
+        }
+        Ok(record)
+    }
+
+    async fn journal_get(&self, run: RunId, seq: u64) -> StoreResult<Option<JournalEntry>> {
+        self.call(Method::JournalGet);
+        self.inner.journal_get(run, seq).await
+    }
+
+    async fn journal_put(&self, run: RunId, entry: JournalEntry) -> StoreResult<JournalEntry> {
+        self.call(Method::JournalPut);
+        self.inner.journal_put(run, entry).await
+    }
+
+    async fn journal_list(&self, run: RunId) -> StoreResult<Vec<JournalEntry>> {
+        self.call(Method::JournalList);
+        self.inner.journal_list(run).await
+    }
+
+    async fn claim_due(
+        &self,
+        agents: &[String],
+        worker: &str,
+        scope: ClaimScope,
+        busy: &[RunId],
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> StoreResult<Vec<Lease>> {
+        self.call(Method::ClaimDue);
+        let leases = self
+            .inner
+            .claim_due(agents, worker, scope, busy, now, ttl, limit)
+            .await?;
+        self.reads(leases.iter().map(|lease| &lease.run));
+        Ok(leases)
+    }
+
+    async fn renew_lease(
+        &self,
+        id: RunId,
+        worker: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+    ) -> StoreResult<bool> {
+        self.call(Method::RenewLease);
+        self.inner.renew_lease(id, worker, now, ttl).await
+    }
+
+    async fn release_lease(&self, id: RunId, worker: &str) -> StoreResult<()> {
+        self.call(Method::ReleaseLease);
+        self.inner.release_lease(id, worker).await
+    }
+
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+        self.call(Method::LeaseUntil);
+        self.inner.lease_until(id).await
+    }
+
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+        self.call(Method::ListRuns);
+        let runs = self.inner.list_runs(query).await?;
+        self.reads(&runs);
+        Ok(runs)
+    }
+
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
+        self.call(Method::CountRuns);
+        self.inner.count_runs(query).await
+    }
+
+    async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
+        self.call(Method::PushPut);
+        self.inner.push_put(new).await
+    }
+
+    async fn push_list(&self, run: RunId) -> StoreResult<Vec<PushRecord>> {
+        self.call(Method::PushList);
+        self.inner.push_list(run).await
+    }
+
+    async fn push_delete(&self, run: RunId, id: &str) -> StoreResult<bool> {
+        self.call(Method::PushDelete);
+        self.inner.push_delete(run, id).await
+    }
+
+    async fn push_claim_due(
+        &self,
+        agents: &[String],
+        worker: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> StoreResult<Vec<PushRecord>> {
+        self.call(Method::PushClaimDue);
+        self.inner
+            .push_claim_due(agents, worker, now, ttl, limit)
+            .await
+    }
+
+    async fn push_commit(
+        &self,
+        run: RunId,
+        id: &str,
+        expected_version: u64,
+        progress: PushProgress,
+    ) -> StoreResult<PushRecord> {
+        self.call(Method::PushCommit);
+        self.inner
+            .push_commit(run, id, expected_version, progress)
+            .await
+    }
+
+    async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
+        self.call(Method::PurgeFinished);
+        self.inner.purge_finished(agent, before).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use adam_core::{ConversationScope, MemoryStore, RunStatus};
+    use serde_json::json;
+
+    use super::*;
+
+    const AGENT: &str = "counting-test";
+
+    fn counting() -> Arc<CountingStore> {
+        Arc::new(CountingStore::new(Arc::new(MemoryStore::new())))
+    }
+
+    async fn create(store: &CountingStore) -> RunRecord {
+        store
+            .create_run(NewRun::new(AGENT, json!({"messages": []})).conversation("counting:1"))
+            .await
+            .expect("create")
+    }
+
+    #[tokio::test]
+    async fn counts_calls_per_method_until_reset() {
+        let store = counting();
+        let run = create(&store).await;
+        store.load_run(run.id).await.expect("load");
+        store.load_run(run.id).await.expect("load");
+        assert_eq!(store.calls(Method::CreateRun), 1);
+        assert_eq!(store.calls(Method::LoadRun), 2);
+        assert_eq!(store.calls(Method::CommitRun), 0);
+        store.reset();
+        assert_eq!(store.calls(Method::CreateRun), 0);
+        assert_eq!(store.calls(Method::LoadRun), 0);
+        assert_eq!(store.state_bytes_read(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_read_counts_the_state_of_every_record_returned() {
+        let store = counting();
+        let run = store
+            .create_run(
+                NewRun::new(AGENT, json!({"text": "x".repeat(1000)})).conversation("counting:1"),
+            )
+            .await
+            .expect("create");
+        // A create echoes no state: there is nothing to read back.
+        assert_eq!(store.state_bytes_read(), 0);
+
+        store.reset();
+        let loaded = store.load_run(run.id).await.expect("load").expect("run");
+        let state = state_bytes(&loaded.state);
+        assert!(state > 1000);
+        assert_eq!(store.state_bytes_read(), state);
+
+        // A listing returns the states of the page, and each one counts.
+        store.reset();
+        let listed = store
+            .list_runs(&RunQuery::new(
+                AGENT,
+                ConversationScope::Exact("counting:1".into()),
+                10,
+            ))
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(store.state_bytes_read(), state);
+
+        // So does a claim, which returns the run it leased.
+        store.reset();
+        let claimed = store
+            .claim_due(
+                &[AGENT.to_owned()],
+                "w",
+                ClaimScope::Any,
+                &[],
+                adam_core::store::now(),
+                Duration::from_secs(30),
+                1,
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(store.state_bytes_read(), state);
+    }
+
+    #[tokio::test]
+    async fn a_commit_counts_the_state_it_writes_and_the_largest_one() {
+        let store = counting();
+        let run = create(&store).await;
+        store.reset();
+        let small = json!({"n": 1});
+        let small_bytes = state_bytes(&small);
+        store
+            .commit_run(run.id, 1, RunUpdate::new(RunStatus::Runnable, small))
+            .await
+            .expect("commit");
+        assert_eq!(store.state_bytes_written(), small_bytes);
+        assert_eq!(store.max_commit_bytes(), small_bytes);
+
+        let large = json!({"n": 2, "text": "x".repeat(10_000)});
+        let large_bytes = state_bytes(&large);
+        store
+            .commit_run(run.id, 2, RunUpdate::new(RunStatus::Runnable, large))
+            .await
+            .expect("commit");
+        assert_eq!(store.state_bytes_written(), small_bytes + large_bytes);
+        assert_eq!(store.max_commit_bytes(), large_bytes);
+
+        // A commit that loses the CAS wrote nothing: neither counter moves.
+        let before = store.state_bytes_written();
+        assert!(
+            store
+                .commit_run(run.id, 1, RunUpdate::new(RunStatus::Done, json!({"n": 3})),)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.state_bytes_written(), before);
+        assert_eq!(store.max_commit_bytes(), large_bytes);
+        assert_eq!(store.calls(Method::CommitRun), 3);
+    }
+
+    #[tokio::test]
+    async fn a_header_crosses_the_wrapper_without_a_state() {
+        let store = counting();
+        let run = create(&store).await;
+        store.reset();
+        let header = store
+            .run_header(run.id)
+            .await
+            .expect("header")
+            .expect("run");
+        assert_eq!(header.id, run.id);
+        assert_eq!(store.calls(Method::RunHeader), 1);
+        // The header is delegated whole: an adapter that overrides it reads no state, and the
+        // wrapper sees one call and no state bytes.
+        assert_eq!(store.state_bytes_read(), 0);
+    }
+}
