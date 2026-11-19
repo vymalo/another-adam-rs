@@ -219,7 +219,7 @@ told otherwise.
   however lively the stream). Beside them the configuration's first-byte and idle timeouts. A call over a response
   limit or a time limit is cut, the upstream request is destroyed and the call is charged its worst case.
 * **A client that closes at `[DONE]`** (adam does, right after the last chunk and before the upstream has ended) is charged the usage the meter had already read from the stream, not the worst case; only a client that closes before any usage was seen is charged the worst case.
-* **A proxy:** the meter uses `https.request`, which takes `HTTPS_PROXY` from the environment only when `NODE_USE_ENV_PROXY=1` is set **and** the Node release has it: *verified 2026-11-17* in Node's changelogs (`doc/changelogs/CHANGELOG_V24.md` and `CHANGELOG_V22.md`, "http,https: add built-in proxy support in http/https.request and Agent", nodejs/node#58980): first in 24.5.0 (2025-07-31) and 22.21.0 (2025-10-20); `fetch()` has had it since 24.0.0, which is not what the meter uses. `bench doctor` warns when a proxy is set without the variable, or with a Node older than those, and says what to do. Everything else in the harness needs only Node 22.
+* **A proxy:** the meter uses `https.request`, which takes `HTTPS_PROXY` from the environment only when `NODE_USE_ENV_PROXY=1` is set **and** the Node release has it: *verified 2026-11-17* in Node's changelogs (`doc/changelogs/CHANGELOG_V24.md` and `CHANGELOG_V22.md`, "http,https: add built-in proxy support in http/https.request and Agent", nodejs/node#58980): first in 24.5.0 (2025-07-31) and 22.21.0 (2025-10-20); `fetch()` has had it since 24.0.0, which is not what the meter uses. Each call opens its own connection (an endpoint or proxy that closes an idle socket must not fail the next call), and with a proxy the default agent is kept — Node applies the env proxy to it only — with `connection: close` on every request, so the proxy is never bypassed (`upstreamAgent`, `bench/test/meter.test.mjs`). `bench doctor` warns when a proxy is set without the variable, or with a Node older than those, and says what to do. Everything else in the harness needs only Node 22.
 * **Backpressure:** an SSE stream is relayed chunk by chunk and the upstream is paused while the client does not read.
 
 **The report** shows pass rates with Wilson intervals, paired differences (exact McNemar, seeded bootstrap), splits
@@ -335,8 +335,9 @@ patch that touches the grading's own machinery as **suspect**, for a person to r
   directories; the logs directory is a new one for each attempt, and the reward is opened without following a link
   and without blocking. A pass needs **all** of: exit status 0, a reward of exactly `1` written
   during the attempt, and no error. A reward of `1` with another exit status is a fail and **suspect**. A patch whose added
-  lines mention `reward.txt`, `/logs/verifier`, `/tests/` or `test.sh` is graded as it is and **suspect** too. The agent
-  phase has no network; the grading container has the verifier's network.
+  lines mention `reward.txt`, `/logs/verifier`, `/tests/` or `test.sh` is graded as it is and **suspect** too. The agent's
+  container is on the slot's network (the meter, the git server, postgres and the mock), which is internal; the grading
+  container has the verifier's network.
 * **The verifier's network is an allow-list:** `none`, `default` (the internal `verifier` network, shared by the
   gradings), `public` (the `egress` network, alone in its window), or a name in `tasks.verifierNetworks` of the
   local configuration. `host` and anything else is refused, when the task is read and again when the container starts.
@@ -403,7 +404,7 @@ coder's A2A port on the loopback.
 |---|---|
 | `slot-N` | `git-server`, `meter-N`, `mock-github`, `postgres`, `pub-coder-N`; the coder of the slot joins it at run time (`adam-bench_slot-N`) |
 | `gitpub-net` | `git-server`, `pub-git`, `pusher-1`, `pusher-2` |
-| `verifier` | no service: the network a grading's host container joins (`adam-bench_verifier`), so gradings share one internal network and have no route out. The harness makes it, because Compose makes no network that has no service |
+| `verifier` | no service: the network a grading's host container joins (`adam-bench_verifier`), so gradings share one internal network and have no route out. The harness makes it, because Compose makes no network that has no service, and refuses one that exists without the internal flag |
 | `egress` | the five relays and nothing else |
 
 So no coder, sandbox, git server or database has a route to the internet, and slot 1 and slot 2 share no network (the
@@ -803,9 +804,13 @@ deletes the file first, so an old yes never covers a new pilot.
 plugin, whether the daemon is rootless, free disk (a failure under 20 GB, a warning under 100 GB, in `$BENCH_HOME` and in
 Docker's root) and the coder image by digest. **For each selected task image** it runs the coder's binary with no
 configuration as uid 10001 in that image: exit 78 means the coder starts (it refuses an empty configuration), a loader
-error or another architecture means the image cannot run it. The coder's binaries are static (musl, ADR 0053 decision 11),
-so the image's C library is not the question: a Debian bookworm task image starts the coder as well as a trixie one, and an
-image that cannot run the binary at all is **refused for both arms**. The output names the distribution and the error. With
+error or another architecture means the image cannot run it. **The probe runs the binaries of the pinned coder image**, and
+`bench/pins.json` still names the build before ADR 0053 decision 11's static one: in a Debian bookworm task image those
+fail on glibc (`GLIBC_2.38` and `GLIBC_2.39` not found) and the image is **refused for both arms**, until slice 6b moves
+the pin. The static build (musl) starts in bookworm (probed by hand: exit 78), so once the pin moves the image's C library
+stops being the question; an image that cannot run the binary at all is refused for both arms. The probe is the coder's
+alone: the OpenCode binary is linked to glibc, so an image that starts a static coder but cannot run OpenCode (Alpine) is
+not refused by it. The output names the distribution and the error. With
 `--start` it brings the stack up and runs a container of the coder image on the host, for each slot and for the grading,
 and asks the runtime whether it takes the arms' limits (a refusal is a warning: both arms still get the same setting).
 Compose 2.24 or newer and an x64 machine are required. The exit is 1 when a check fails, which includes a task image the
@@ -815,7 +820,10 @@ coder cannot start in.
 
 `sh bench/dry-run.sh` (Docker-gated: `BENCH_TEST_DOCKER=1`; a failure under `BENCH_TEST_REQUIRE_DOCKER=1`) runs both agents
 through three tasks of `bench/tasks/self/` on the stack, with a scripted model (`lib/agent-script.mjs`, served by
-`lib/scripted-model.mjs`) that tells the callers apart by the tools they are offered and the task by a `[mock:<name>]` marker:
+`lib/scripted-model.mjs`) that tells the callers apart by the tools they are offered and the task by a `[mock:<name>]` marker.
+The harness runs in a session of its own and the script's cleanup stops that whole process group, so a stopped dry run
+leaves no `resume-child` behind: a child that outlived it rebuilt the self images under the next run, which then failed
+with `No such image` (the test is `bench/test/dryrun-sh.test.mjs`).
 
 | Task | Statement | The scripted model writes | Grade |
 |---|---|---|---|
@@ -844,7 +852,7 @@ A2A server), the stack (on a fake `docker`) and the self-test tasks (their gold 
 ## Tests
 
 ```sh
-node --test "bench/test/*.test.mjs"     # about 520 tests, seconds, nothing beyond 127.0.0.1 (fixture git repositories are made in a temp directory)
+node --test "bench/test/*.test.mjs"     # about 650 tests, seconds, nothing beyond 127.0.0.1 (fixture git repositories are made in a temp directory)
 ```
 
 A test of the real OpenCode needs the pinned binary: `BENCH_TEST_OPENCODE_BIN=/path/to/opencode node --test bench/test/opencode.test.mjs`
@@ -858,8 +866,9 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
 
 * **What the dry run did not cover:** a model key and a real endpoint (the scripted model is the only server the tests
   have seen), a bookworm task image in a run (the probe's rule is tested on fakes and the static coder was probed in
-  Debian 12 bookworm by hand — exit 78; the dry run's images are built from the
-  workspace base), two slots at once with real task
+  Debian 12 bookworm by hand — exit 78; the pinned, pre-static coder was probed there too and fails on
+  `GLIBC_2.38`/`GLIBC_2.39` not found, which is what `bench doctor` reports until the pin moves; the dry run's images are
+  built from the workspace base), two slots at once with real task
   images, and `bench doctor --start` (the probe and the stack's `up` ran, not that command). The probe, the stack, the
   coder in the trixie self image, both arms with the pinned OpenCode binary, the grading, the budget and the kill/resume
   did run.
@@ -889,7 +898,8 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
   makes model calls the script does not know (a title, say: the scripted model then answers in words); the gated test
   with a local OpenCode binary (`BENCH_TEST_OPENCODE_BIN`); ownership of files the containers write into the shared
   directories; the workflow.
-* `shellcheck` was not available where the slice was written: `dry-run.sh` was read for its findings and checked with `sh -n`.
+* `shellcheck -s sh` is clean on `dry-run.sh` (*verified 2026-11-19*, `koalaman/shellcheck:stable`); it was not available
+  where the slice was written, and the script had been read and checked with `sh -n` only.
 * **Finding by finding of the review of slice 3, what the dry run did not prove:** that a tar made by `tar --format=posix`
   inside the coder image is what the parser reads; that the sandbox's socket under `/work/.gitbox` is made by
   `adam-git-sandbox` with a directory the harness makes (`mkdir -p` in its entrypoint); that a pusher with the work

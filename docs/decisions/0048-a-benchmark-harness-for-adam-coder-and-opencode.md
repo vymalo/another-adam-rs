@@ -414,3 +414,19 @@ and what it could not cover are in `bench/README.md`, "Unverified". The static b
 `GLIBC_2.38` and `GLIBC_2.39` not found, which the probe reports until the pin moves. *Unverified*: a real model endpoint
 and key (the scripted model only), a real OpenCode binary (`BENCH_TEST_OPENCODE_BIN`), and two slots at once with real
 task images.
+
+**The sabotage review of the merge (2026-11-19).** Two sessions had worked the branch, so the whole change was reviewed as
+one. Four defects were found and fixed, each with a test that failed first, and the proof was run again on the result:
+a stopped `bench/dry-run.sh` did not stop the harness's children — a `resume-child` outlived it and rebuilt the self
+images under the next run (`No such image`); the harness now runs in a session of its own and the cleanup stops the whole
+process group. An image pull was keyed by the slot that asked, so two slots preparing one task could pull it twice; the
+promise is keyed by the image (the host's store is one store). `up` used an existing `adam-bench_verifier` without reading
+its internal flag; a network that is not internal is refused now. The meter's per-call connection first passed
+`agent: false`, which bypassed Node's env proxy (measured: the proxy saw no `CONNECT`); with a proxy the default agent is
+kept and every request says `connection: close`, so a call still gets its own connection without going round the proxy.
+The README's doctor paragraph said a bookworm image starts the pinned coder; the pin is still the pre-static build and it
+fails there on `GLIBC_2.38`/`GLIBC_2.39` (probed live), so the paragraph says what the probe reports until the pin moves,
+and the Grading section no longer claims the agent phase has no network. The grader's `RWLock` tests, which the merge had
+dropped, are back. Proof on the final head: `node --test "bench/test/*.test.mjs"` 649 tests, 646 pass, 3 gated skips;
+`node tools/docs-check/check-docs.mjs`; `shellcheck -s sh bench/dry-run.sh`; `BENCH_TEST_DOCKER=1 sh bench/dry-run.sh`
+with the same phases and 27 model requests = 27 ledger calls; 18 deliberate mutations, each killed by the suite.
