@@ -669,7 +669,8 @@ What it renders, and why each is there:
 | `Deployment`, `Service`, `ServiceAccount`, `ConfigMap`, `PodDisruptionBudget`, `NetworkPolicy` `<release>-coder-egress` | **the egress proxy**, the one way out of a run pod: [below](#the-egress-proxy) |
 
 The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_POD_NAMESPACE` (its own, by the downward API), `RUN_POD_INSTANCE` (the release),
-`RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.92 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (600), a
+`RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.92 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (1020: it
+outlasts the idle life, the 60 s sweep and the 2 s delete grace — 900 + 60 + 2 — so a run never gives up while a slot is about to free), a
 `WORKER_ID` from the pod name (a worker sweeps only its own idle pods), the ServiceAccount, `GIT_SANDBOX_SOCKET` (the socket of [the git sandbox](#the-git-sandbox)), and **`runPods.coderResources`
 (a 1Gi memory limit) instead of `resources`** (6Gi), which is untouched while run pods are off. Set `runPods.coderResources: null` to keep `resources`. The git that
 used to run in the coder's memory runs in the sandbox now, which has a memory limit of its own (`runPods.gitSandbox.resources`, 1Gi).

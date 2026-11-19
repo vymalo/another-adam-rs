@@ -783,7 +783,7 @@ spec:
             - name: RUN_POD_IDLE_SECS
               value: "900"
             - name: RUN_POD_WAIT_SECS
-              value: "600"
+              value: "1020"
             - name: GIT_SANDBOX_SOCKET
               value: "/run/git-sandbox/git.sock"
             - name: DATABASE_URL
