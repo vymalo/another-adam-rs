@@ -26,7 +26,7 @@ the test command). The hidden tests are **not** here: `bench tasks build` reads 
 
    `clone` is a name in `tasks.clones` of your configuration. `toolchain` is optional: `env` becomes `ENV` lines and
    `run` becomes `RUN` lines (as root, with the network, at build time) in the generated Dockerfile, after the
-   repository is copied to `/app`. Put there what the tests need that the workspace image lacks, for example the
+   repository is copied to `/app` and before git is configured, so a workspace image without git can install it there. Put there what the tests need that the workspace image lacks, for example the
    toolchain version the repository pins, and the dependencies fetched (`cargo fetch`, `npm ci`): the agent has no network.
 4. Write `instruction.md` **from the intent of the pull request, never from its body or its diff**. The body often
    describes the solution. Say what is wrong or missing, as an issue would, and what behaviour is expected.

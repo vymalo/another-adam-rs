@@ -1,0 +1,16 @@
+{
+  "id": "durations-3",
+  "repo": "durations",
+  "clone": "durations",
+  "commit": "ce7afdccbcf4f5277cc50c5903f1c468125026a8",
+  "base": "91d81353e09d3132a6beb31bcaf19a1fe8ebdc17",
+  "language": "javascript",
+  "testCommand": "node --test",
+  "toolchain": {
+    "run": [
+      "command -v git >/dev/null || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*)",
+      "id -u 10001 >/dev/null 2>&1 || useradd -u 10001 -U -m -s /bin/bash agent",
+      "install -d -o 10001 -g 10001 /work /work/workspaces"
+    ]
+  }
+}

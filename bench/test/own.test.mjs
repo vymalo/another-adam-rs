@@ -55,6 +55,15 @@ test('the Dockerfile: the workspace image by digest, the repository at /app, the
   assert.equal(ownDockerfile({ workspaceImage: WS }), ownDockerfile({ workspaceImage: WS, toolchain: { env: {}, run: [] } }));
 });
 
+test('the Dockerfile configures git after the toolchain lines, so a workspace image without git can install it there', () => {
+  const d = ownDockerfile({ workspaceImage: WS, toolchain: { run: ['command -v git >/dev/null || apt-get install -y git'] } }).split('\n');
+  const install = d.indexOf('RUN command -v git >/dev/null || apt-get install -y git');
+  const config = d.indexOf("RUN git config --system --add safe.directory '*'");
+  assert.ok(install > d.indexOf('RUN chown -R 10001:10001 /app') && config > install, d.join('\n'));
+  assert.equal(d.filter((l) => l.includes('git config')).length, 1);
+  assert.deepEqual(d.slice(-4), ["RUN git config --system --add safe.directory '*'", 'WORKDIR /app', 'USER 10001', '']);
+});
+
 test('the test script resets the hidden test files, applies the patch from /tests and writes the reward', (t) => {
   const s = ownTestScript({ testFiles: ['src/a.test.ts', 'tests/it.rs'], testCommand: 'cargo test --locked' });
   assert.match(s, /\/logs\/verifier\/reward\.txt/);
