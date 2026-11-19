@@ -771,3 +771,19 @@ test('defect 1: a client that aborts after the usage chunk but before [DONE] is 
   assert.equal(settled.usageMissing, true);
   assert.equal(settled.costMicro, callRecords(s.ledger, 'pending')[0].worstMicro);
 });
+
+test('the meter opens a connection for each call: a peer that closes an idle socket cannot fail the next call', async (t) => {
+  // A real endpoint or proxy closes an idle connection (Node's own server default is 5 s). The dry run hit exactly this:
+  // two adam calls failed after the coder took about 5.8 s between them, and each was charged its worst case. A fresh
+  // connection for every call removes the class, at the cost of one handshake per model call.
+  const s = await setup(t);
+  let connections = 0;
+  s.model.server.on('connection', () => {
+    connections += 1;
+  });
+  const { baseUrl } = s.open();
+  assert.equal((await chat(baseUrl, { model: 'whatever', messages: [{ role: 'user', content: 'one' }] })).status, 200);
+  assert.equal((await chat(baseUrl, { model: 'whatever', messages: [{ role: 'user', content: 'two' }] })).status, 200);
+  assert.equal(connections, 2, 'no keep-alive socket is reused');
+  assert.deepEqual(callRecords(s.ledger, 'settled').map((r) => r.usageMissing), [false, false]);
+});

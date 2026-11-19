@@ -400,6 +400,9 @@ export function createMeter({ config, ledger, book, env = process.env, log = () 
           port: upstream.port || undefined,
           path: upstreamPath,
           method: 'POST',
+          // One connection for each call: an endpoint or a proxy that closes an idle socket (Node's own default is 5 s)
+          // must not turn the next call into a failed one charged its worst case. The handshake costs a few ms.
+          agent: false,
           headers: {
             authorization: `Bearer ${key}`,
             'content-type': 'application/json',
