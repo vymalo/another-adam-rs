@@ -541,8 +541,10 @@ impl RunWorkspace {
     /// `None` when a listing must be made: a slot's directory was moved away or replaced, or a
     /// worktree's git directory was never told or no longer names it. A listing made now resolves
     /// the git directory through the mirror (`admin_by_backpointer`), which knows the names from
-    /// before they carried the run, and records it; stripping it from the cached slot would leave
-    /// a legacy worktree without git for the life of the process.
+    /// before they carried the run; a legacy name is found there but **not recorded** (only a
+    /// `<run>+` name is), so a run whose worktree has one lists again on every call. Stripping the
+    /// git directory from the cached slot instead would leave it without git for the life of the
+    /// process.
     async fn rechecked(&self, slots: &[Slot]) -> Option<Vec<Slot>> {
         let inner = self.inner();
         let mut checked = Vec::with_capacity(slots.len());

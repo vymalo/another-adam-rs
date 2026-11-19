@@ -1154,8 +1154,9 @@ async fn ten_commands_ask_the_service_once_that_the_container_is_there() {
 #[tokio::test]
 async fn a_container_that_dies_is_noticed_when_the_verdict_expires() {
     // The liveness cache is the setting, so the test waits for its own short one, not the
-    // default's three seconds.
-    let (rig, ws, _) = devbox_with(|s| s.alive_ttl = std::time::Duration::from_secs(1)).await;
+    // default's three seconds. The window is longer than the work the third `ensure` does, so a
+    // stalled runner cannot make it expire before that call reads it.
+    let (rig, ws, _) = devbox_with(|s| s.alive_ttl = std::time::Duration::from_secs(2)).await;
     rig.env.ensure(&ws, &Steps::default()).await.unwrap();
     // The answer is cached by this call.
     rig.env.ensure(&ws, &Steps::default()).await.unwrap();
@@ -1167,7 +1168,7 @@ async fn a_container_that_dies_is_noticed_when_the_verdict_expires() {
         "within the cache the container is not asked about again"
     );
     // After it, the container is gone and the environment is made again.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
     let steps = Steps::default();
     rig.env.ensure(&ws, &steps).await.unwrap();
     assert_eq!(

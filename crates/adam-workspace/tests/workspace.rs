@@ -4364,10 +4364,10 @@ async fn a_git_directory_from_before_names_carried_the_run_is_found_on_every_lis
         .join(format!("{}.json", slot.dir()));
     std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
 
-    // The first listing finds the name through the mirror; the second is served from the list the
-    // first made and must give the same answer: a legacy name is not "gone" because it carries no
+    // The first listing finds the name through the mirror; the second lists again, because a legacy
+    // name is never recorded, and must give the same answer: it is not "gone" because it carries no
     // prefix.
-    for listing in ["first", "cached"] {
+    for listing in ["first", "again"] {
         let slots = run.slots().await.unwrap();
         let wt = slots[0].worktree().unwrap();
         assert_eq!(wt.git_dir(), Some(legacy.as_path()), "{listing}");
