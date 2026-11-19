@@ -342,7 +342,9 @@ impl BoundDef {
     /// bind, not here, so that a name clash is found before a model is needed, and so that
     /// [`AgentInfo::tools`] and the agent cannot disagree. This function only hands them over.
     /// The remote subagents (slice S9b) join the same list in `bind`, where their names meet the
-    /// local ones, and so do the MCP tools of `mcp.json` (slice S11), which `tools:` selects.
+    /// local ones, and so do the MCP tools of `mcp.json` (slice S11), which `tools:` selects. A
+    /// server whose `when` loads it only when a run's task matches gets a source of its own here,
+    /// so its tools are withheld from a run that does not load it.
     fn build(
         &self,
         node: &Node,
@@ -368,6 +370,11 @@ impl BoundDef {
         }
         for apply in &self.state {
             builder = apply(builder);
+        }
+        // The agent's own sources first (the `mcp.json` servers a run loads only when its task
+        // matches), then the deployment's, in the order it added them.
+        for source in &node.sources {
+            builder = builder.dyn_tool_source(Arc::clone(source));
         }
         for source in &self.sources {
             builder = builder.dyn_tool_source(Arc::clone(source));
@@ -395,11 +402,14 @@ pub struct AgentInfo {
     /// The gateway alias its model calls use.
     pub model_alias: String,
     /// The system prompt the model sees: the instructions with the vars substituted, then the
-    /// skills catalog and the preloaded skills.
+    /// skills catalog, the preloaded skills and the instructions of its **eager** MCP servers. A
+    /// server with a `when` adds its section to a run, when the run loads it.
     pub prompt: String,
     /// The names of its tools, in the order the model is shown them: its own, then `load_skill`
     /// and `read_skill_file` when it has skills to load and files to read, then one per local
-    /// subagent (the subagent's name: the entries of `info()` whose `parent` is this agent).
+    /// subagent (the subagent's name: the entries of `info()` whose `parent` is this agent). An
+    /// MCP server with a `when` contributes its tools here too: a run that does not load it is not
+    /// shown them.
     pub tools: Vec<String>,
     /// The skills it may use, in the order of its `skills:` (by name for `all`).
     pub skills: Vec<String>,

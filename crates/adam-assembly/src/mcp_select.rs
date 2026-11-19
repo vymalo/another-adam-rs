@@ -1,0 +1,282 @@
+//! Which MCP servers of an agent are loaded for a run: the `when` of its `mcp.json`.
+//!
+//! A server with no `when` is **eager**: its tools are in the agent's own tool list and its
+//! instructions are in the agent's prompt, as before the key existed. A server with a `when` is
+//! **triggered**: its tools are in the same list but withheld on every turn of a run whose task
+//! does not mention one of its keywords, and its instructions are added to the prompt by this
+//! source only when it is loaded.
+//!
+//! The decision is made from the task alone ([`SourceCtx::task`]), which is the same text at every
+//! turn and at every call of a run, so the tools array is the same bytes from the run's first
+//! request to its last (ADR 0044, decision 1). It is **recomputed** rather than stored: the run's
+//! state already holds the task, and a stored field would be a second place where the same decision
+//! lives (a resumed or continued run reads the same first message, so it decides identically).
+
+use adam_llm_agent::{SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource, Withheld};
+use adam_model::ToolSpec;
+use async_trait::async_trait;
+
+/// The most the instructions of the loaded servers may add to a prompt, all together: the bound
+/// `adam-mcp` applies to the whole set when it is appended at bind
+/// (`adam_mcp::MAX_INSTRUCTIONS_BYTES`, 8 KiB). A `when` splits that set in two, so the eager
+/// servers and the loaded triggered ones are each bounded by it. A test with the feature `mcp`
+/// holds the two values equal.
+const MAX_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+
+/// One server of an agent's `mcp.json` that declares `when`.
+pub(crate) struct Triggered {
+    /// The server's name, as its tools and the prompt's headings name it.
+    pub(crate) server: String,
+    /// The words as the file wrote them, for the refusal's message.
+    pub(crate) keywords: Vec<String>,
+    /// The words folded for matching, in the same order.
+    folded: Vec<String>,
+    /// The tools the binding gave this server: the one table `bind` built, never a name parsed
+    /// again here.
+    pub(crate) tools: Vec<String>,
+    /// What the server said about itself when it initialized, heading included; `None` when it
+    /// said nothing or the file turned it off.
+    pub(crate) instructions: Option<String>,
+}
+
+impl Triggered {
+    pub(crate) fn new(
+        server: String,
+        keywords: Vec<String>,
+        tools: Vec<String>,
+        instructions: Option<String>,
+    ) -> Self {
+        let folded = keywords.iter().map(|word| word.to_lowercase()).collect();
+        Self {
+            server,
+            keywords,
+            folded,
+            tools,
+            instructions,
+        }
+    }
+}
+
+/// The triggered servers of one agent, and what a run's task loads of them.
+pub(crate) struct McpSelect {
+    servers: Vec<Triggered>,
+}
+
+impl McpSelect {
+    pub(crate) fn new(servers: Vec<Triggered>) -> Self {
+        Self { servers }
+    }
+
+    /// Whether each server is loaded for a run whose task is `task`: any keyword is held by the
+    /// task, ignoring case. No task (a message with no words) loads none of them.
+    fn loaded(&self, task: Option<&str>) -> Vec<bool> {
+        let task = task.map(str::to_lowercase);
+        self.servers
+            .iter()
+            .map(|server| match &task {
+                Some(task) => server
+                    .folded
+                    .iter()
+                    .any(|word| !word.is_empty() && task.contains(word.as_str())),
+                None => false,
+            })
+            .collect()
+    }
+}
+
+/// What the model is told when it calls a tool of a server that was not loaded.
+fn reason(server: &Triggered, tool: &str) -> String {
+    let words: Vec<&str> = server.keywords.iter().take(8).map(String::as_str).collect();
+    let more = server.keywords.len().saturating_sub(words.len());
+    let list = match more {
+        0 => words.join(", "),
+        n => format!("{} and {n} more", words.join(", ")),
+    };
+    format!(
+        "`{tool}` is not loaded for this run: the MCP server `{}` loads only when the task mentions \
+         one of its keywords ({list})",
+        server.server
+    )
+}
+
+/// `sections` (a server's name and the section `adam_mcp::McpServers::instructions_by_server` gives
+/// it) as one text: blank-line separated, in order, cut at [`MAX_INSTRUCTIONS_BYTES`] together (the
+/// server that would pass it and the ones after are left out, with a warning).
+pub(crate) fn join_sections(sections: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (server, section) in sections {
+        let separator = if out.is_empty() { "" } else { "\n\n" };
+        if out.len() + separator.len() + section.len() > MAX_INSTRUCTIONS_BYTES {
+            tracing::warn!(
+                server = %server,
+                "the MCP servers' instructions are over {MAX_INSTRUCTIONS_BYTES} bytes together: \
+                 this server's and the next ones' are left out"
+            );
+            break;
+        }
+        out.push_str(separator);
+        out.push_str(section);
+    }
+    out
+}
+
+#[async_trait]
+impl ToolSource for McpSelect {
+    async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+        // The tools are the agent's own (`bind` put them there); this source only decides which of
+        // them a run may see.
+        Vec::new()
+    }
+
+    async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        let loaded = self.loaded(ctx.task());
+        let sections: Vec<(String, String)> = self
+            .servers
+            .iter()
+            .zip(loaded)
+            .filter(|(_, loaded)| *loaded)
+            .filter_map(|(server, _)| {
+                server
+                    .instructions
+                    .as_ref()
+                    .map(|text| (server.server.clone(), text.clone()))
+            })
+            .collect();
+        let text = join_sections(&sections);
+        (!text.is_empty()).then_some(text)
+    }
+
+    async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
+        let loaded = self.loaded(ctx.task());
+        let mut held = Vec::new();
+        for (server, loaded) in self.servers.iter().zip(loaded) {
+            if loaded {
+                continue;
+            }
+            for tool in &server.tools {
+                if tools.contains(&tool.as_str()) {
+                    held.push(Withheld::new(tool.clone(), reason(server, tool)));
+                }
+            }
+        }
+        held
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: serde_json::Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        // Every tool is an own tool of the agent: the agent calls it, not this source.
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Map, Value};
+
+    use super::*;
+
+    fn triggered(
+        server: &str,
+        keywords: &[&str],
+        tools: &[&str],
+        instructions: Option<&str>,
+    ) -> Triggered {
+        Triggered::new(
+            server.to_owned(),
+            keywords.iter().map(|word| (*word).to_owned()).collect(),
+            tools.iter().map(|tool| (*tool).to_owned()).collect(),
+            instructions.map(str::to_owned),
+        )
+    }
+
+    fn source() -> McpSelect {
+        McpSelect::new(vec![
+            triggered(
+                "linear",
+                &["linear", "ticket"],
+                &["linear__list_issues"],
+                Some("## Linear\n\n> linear words"),
+            ),
+            triggered(
+                "docs",
+                &["docs"],
+                &["docs__search", "docs__read"],
+                Some("## Docs\n\n> docs words"),
+            ),
+        ])
+    }
+
+    fn ctx(task: Option<&str>) -> SourceCtx {
+        SourceCtx::detached(Map::<String, Value>::new()).with_task(task)
+    }
+
+    #[tokio::test]
+    async fn a_keyword_loads_the_server_and_the_others_are_withheld() {
+        let source = source();
+        let held = source
+            .withhold(
+                &ctx(Some("fix the linear ticket")),
+                &["linear__list_issues", "docs__search"],
+            )
+            .await;
+        assert_eq!(
+            held.iter().map(|h| h.tool.as_str()).collect::<Vec<_>>(),
+            ["docs__search"],
+            "only the server whose keyword did not match is held back"
+        );
+        assert!(held[0].reason.contains("not loaded for this run"));
+        assert!(held[0].reason.contains("docs"));
+    }
+
+    #[tokio::test]
+    async fn the_match_ignores_case_and_an_empty_task_loads_nothing() {
+        let source = source();
+        let held = source
+            .withhold(&ctx(Some("LINEAR")), &["linear__list_issues"])
+            .await;
+        assert!(held.is_empty(), "the keyword matches whatever its case");
+        let held = source
+            .withhold(&ctx(Some("")), &["linear__list_issues"])
+            .await;
+        assert_eq!(held.len(), 1, "an empty task loads no triggered server");
+        let held = source.withhold(&ctx(None), &["linear__list_issues"]).await;
+        assert_eq!(held.len(), 1, "a message with no words loads none either");
+    }
+
+    #[tokio::test]
+    async fn the_instructions_of_a_loaded_server_only() {
+        let source = source();
+        let text = source
+            .instructions(&ctx(Some("read the docs")))
+            .await
+            .expect("the loaded server said something");
+        assert!(text.contains("docs words"), "{text}");
+        assert!(!text.contains("linear words"), "{text}");
+        assert!(
+            source.instructions(&ctx(Some("a typo"))).await.is_none(),
+            "nothing loaded, nothing added"
+        );
+    }
+
+    #[test]
+    fn a_reason_names_the_tool_the_server_and_its_keywords() {
+        let server = triggered("linear", &["linear", "ticket"], &["linear__x"], None);
+        let text = reason(&server, "linear__x");
+        assert!(
+            text.starts_with("`linear__x` is not loaded for this run"),
+            "{text}"
+        );
+        assert!(text.contains("`linear`"), "{text}");
+        assert!(text.contains("linear, ticket"), "{text}");
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn the_instruction_bound_is_the_one_adam_mcp_uses() {
+        assert_eq!(MAX_INSTRUCTIONS_BYTES, adam_mcp::MAX_INSTRUCTIONS_BYTES);
+    }
+}
