@@ -13,7 +13,7 @@
 // graded again.
 import fs from 'node:fs';
 import path from 'node:path';
-import { BaseCache, BASE_NAME, baseKey } from './base.mjs';
+import { BaseCache, baseKey } from './base.mjs';
 import { CapBook } from './cap.mjs';
 import { callStats, classifyRun } from './classify.mjs';
 import { gradePatch, hostGradeIO } from './grade.mjs';
@@ -135,7 +135,9 @@ export async function executeRun({ deps, spec, attempt }) {
     // A coder from a killed harness would still write the work directory the base is made in.
     if (stack.stopCoder) await stack.stopCoder(spec.slot).catch(() => {});
     await deps.pullImage?.(spec.slot, task);
-    await stack.resetWork(spec.slot, { keep: [BASE_NAME] });
+    // The slot's /work/bench-base is shared by every task: a base kept from another task is the wrong repository.
+    // The host's copy is still cached per (task, image, workdir).
+    await stack.resetWork(spec.slot);
     const base = await (deps.prepareBase ?? ((o) => bases.prepare(o)))({
       containers,
       stack,
