@@ -18,9 +18,9 @@
 //! * `adam_run_blob` (schema version 5, part 1): the append-only set of digests one run
 //!   references, `_id` = `"<run>:<digest>"`, deleted with its run by the purge.
 //! * `adam_body` (schema version 5, part 2): one document per transcript row, `_id` =
-//!   `"<run>:<commit>:<idx>"`, `message` the row as BSON, `written_at` when the set was written.
-//!   A commit names its set by the `commit` its head carries; a set no head names is ignored and
-//!   collected an hour after it was superseded. Deleted with its run by the purge.
+//!   `"<run>:<generation>:<idx>"`, `message` the row as BSON, `written_at` when the row was
+//!   written. A commit names its generation in the head it writes; rows no head names are ignored
+//!   and collected an hour after the generation was superseded. Deleted with its run by the purge.
 //!
 //! A run document written before schema version 5, part 2 has neither a `head` nor a
 //! `head_version` field. `{head_version: null}` matches a missing field, as `owner` did for
@@ -34,10 +34,12 @@
 //!
 //! * Commits: `findOneAndUpdate({_id, version: expected}, {$inc: {version: 1}, ..})`, after a
 //!   read projected to the metadata (no `state`) for `agent`/`conversation_id` and the record.
-//!   A commit's blob references and transcript rows are inserted **before** the CAS: rows a lost
-//!   CAS leaves behind are ignored (nothing names them) and go with the run's purge, or with the
-//!   superseded-set GC an hour later. The body insert is checked for completeness first — a row
-//!   that did not land aborts the commit before the CAS, so a head never names a partial set.
+//!   A commit's blob references and transcript rows are inserted **before** the CAS; a commit that
+//!   loses deletes the rows its `writer` added (never one the winner's head names). The body insert
+//!   is checked for completeness first — a row that did not land aborts the commit before the CAS,
+//!   so a head never names a partial set. A duplicate slot is resolved by content and age: an
+//!   identical foreign row is adopted, a differing one older than the orphan grace is collected and
+//!   the insert retried once, and a live attempt's differing row is a `Conflict`.
 //! * Journal: `insertOne` with a deterministic `_id = "<run>:<seq>"`; a duplicate key means an
 //!   earlier writer won, and their entry is read back and returned. After an insert, one check
 //!   that the run still exists (a purge that removed it must not leave an orphan), so a journaled
@@ -145,6 +147,10 @@ pub struct MongoStore {
     /// A test-only hook, shared by clones, run after the rows/refs and before the CAS.
     #[cfg(test)]
     before_cas: std::sync::Arc<std::sync::Mutex<Option<BeforeCas>>>,
+    /// A test-only hook, shared by clones, run after the commit context is read and before the
+    /// body rows are inserted: a test can let a winner commit in that gap.
+    #[cfg(test)]
+    before_body_insert: std::sync::Arc<std::sync::Mutex<Option<BeforeCas>>>,
 }
 
 impl MongoStore {
@@ -202,6 +208,8 @@ impl MongoStore {
             body,
             #[cfg(test)]
             before_cas: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            before_body_insert: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -210,6 +218,16 @@ impl MongoStore {
     fn set_before_cas(&self, hook: BeforeCas) {
         *self
             .before_cas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Install the test-only hook that runs after the commit context is read and before the body
+    /// rows are inserted.
+    #[cfg(test)]
+    fn set_before_body_insert(&self, hook: BeforeCas) {
+        *self
+            .before_body_insert
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
@@ -344,6 +362,14 @@ fn body_id(run: RunId, generation: Uuid, idx: u32) -> String {
 /// it.
 const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
 
+/// How old a foreign attempt's body row must be before a commit may collect it.
+///
+/// A row is written just before its attempt's CAS, so a **live** attempt's row is seconds old, and
+/// the runtime's lease (30 s by default) has expired long before this grace. A row older than it
+/// belongs to an attempt that died between its insert and its CAS; nothing else will collect it,
+/// because the head it never wrote does not name it and the run may not be terminal.
+const BODY_ORPHAN_GRACE: chrono::Duration = chrono::Duration::minutes(5);
+
 /// One row as the document `adam_body` holds.
 fn body_doc(
     run: RunId,
@@ -393,6 +419,35 @@ fn body_insert_counts(err: &mongodb::error::Error, expected: usize) -> Option<(u
         .count();
     Some((expected.saturating_sub(errors.len()), duplicates))
 }
+/// The transcript rows one commit writes, resolved before the CAS: the generation, where the
+/// append starts, this attempt's writer, the full transcript and the write time.
+struct BodyPlan {
+    generation: Uuid,
+    start: usize,
+    writer: Uuid,
+    rows: Vec<BodyRow>,
+    written_at: DateTime<Utc>,
+}
+
+/// Whether a stored foreign row is the row this attempt would write at the same index: the
+/// message after the same [`storable`] normalization [`body_doc`] applied, never the raw bytes.
+fn foreign_row_matches(stored: &Document, rows: &[BodyRow]) -> bool {
+    let Ok(idx) = get_u64(stored, "idx") else {
+        return false;
+    };
+    let Ok(idx) = usize::try_from(idx) else {
+        return false;
+    };
+    let Some(expected) = rows.get(idx) else {
+        return false;
+    };
+    let expected = storable(&expected.message);
+    stored
+        .get("message")
+        .and_then(|message| bson_to_json(message).ok())
+        .is_some_and(|message| message == *expected)
+}
+
 /// The digests a v5 head's file artifacts name: what a losing commit must not collect.
 fn head_digests(head: &Value) -> HashSet<BlobId> {
     head.get("artifacts")
@@ -955,7 +1010,7 @@ impl Store for MongoStore {
         } else {
             None
         };
-        let mut body_plan = None;
+        let mut body_plan: Option<BodyPlan> = None;
         let mut head = head;
         if let Some(body) = body {
             let BodyWrite {
@@ -997,66 +1052,46 @@ impl Store for MongoStore {
             if let Some(head) = &mut head {
                 set_head_body(head, target, len)?;
             }
-            body_plan = Some((target, start, writer, rows, t));
+            body_plan = Some(BodyPlan {
+                generation: target,
+                start,
+                writer,
+                rows,
+                written_at: t,
+            });
+        }
+        #[cfg(test)]
+        if body_plan.is_some() {
+            let hook = self
+                .before_body_insert
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(BeforeCas(hook)) = hook {
+                hook().await;
+            }
         }
         // The rows go first, as the head that names them would: there is no multi-document
         // transaction, so a commit that loses the CAS deletes the rows its `writer` inserted. The
         // completeness check is what keeps a head from naming a generation missing a row.
-        if let Some((generation, start, writer, rows, written_at)) = &body_plan {
-            let docs = rows
-                .iter()
-                .skip(*start)
-                .map(|row| body_doc(id, *generation, *writer, row, *written_at))
-                .collect::<StoreResult<Vec<_>>>()?;
-            if !docs.is_empty() {
-                let count = docs.len();
-                match self.body.insert_many(&docs).ordered(false).await {
-                    Ok(result) => {
-                        if !body_insert_is_complete(result.inserted_ids.len(), 0, count) {
-                            return Err(StoreError::Corrupt(format!(
-                                "body generation {generation} of run {id}: only {} of {count} rows landed",
-                                result.inserted_ids.len()
-                            )));
-                        }
-                    }
-                    Err(err) => match body_insert_counts(&err, count) {
-                        // Every failure is a row that is already there. It is this attempt's retry
-                        // only if this attempt wrote it: another attempt at the same expected
-                        // version may have inserted different messages at the same slots, and it
-                        // must not win the CAS naming them.
-                        Some((inserted, duplicates))
-                            if body_insert_is_complete(inserted, duplicates, count) =>
-                        {
-                            let from = i64::try_from(*start).map_err(|_| {
-                                StoreError::InvalidInput("body start exceeds i64".into())
-                            })?;
-                            let to = i64::try_from(rows.len()).map_err(|_| {
-                                StoreError::InvalidInput("a transcript is longer than i64".into())
-                            })?;
-                            let foreign = self
-                                .body
-                                .count_documents(doc! {
-                                    "run_id": uuid(id),
-                                    "generation": generation_uuid(*generation),
-                                    "idx": { "$gte": from, "$lt": to },
-                                    "writer": { "$ne": generation_uuid(*writer) },
-                                })
-                                .await
-                                .map_err(classify)?;
-                            if foreign > 0 {
-                                self.delete_loser(id, Some((*generation, *writer)), &[])
-                                    .await?;
-                                return Err(StoreError::Conflict {
-                                    run: id,
-                                    expected,
-                                    actual: expected,
-                                });
-                            }
-                        }
-                        _ => return Err(classify(err)),
-                    },
-                }
-            }
+        if let Some(plan) = &body_plan
+            && !self.write_body_rows(id, expected, plan).await?
+        {
+            // A live attempt at the same expected version owns a slot with a different message:
+            // this attempt's rows (if any landed) are not named by anything and go with the
+            // conflict, the foreign attempt's stay. The version is read on the error path, so the
+            // conflict reports where the run is now rather than echoing `expected`.
+            let actual = self.live_version(id).await?;
+            self.delete_loser(id, Some((plan.generation, plan.writer)), &[])
+                .await?;
+            return match actual {
+                Some(actual) => Err(StoreError::Conflict {
+                    run: id,
+                    expected,
+                    actual,
+                }),
+                None => Err(StoreError::NotFound(id)),
+            };
         }
         // The refs go first, as the head that names them would: there is no multi-document
         // transaction, so a commit that loses the CAS deletes them. They are ignored by every
@@ -1111,9 +1146,9 @@ impl Store for MongoStore {
             Ok(Some(_)) => {
                 // The superseded generations are collected only after the CAS: a commit that lost
                 // names nothing, so it has nothing to supersede.
-                if let Some((generation, _, _, _, written_at)) = body_plan {
+                if let Some(plan) = body_plan {
                     let _ = self
-                        .gc_body(id, generation, written_at - BODY_GC_GRACE)
+                        .gc_body(id, plan.generation, plan.written_at - BODY_GC_GRACE)
                         .await;
                 }
                 Ok(RunRecord {
@@ -1148,8 +1183,8 @@ impl Store for MongoStore {
                     // The loser removes its own rows and refs, but never a row or a digest the
                     // winner's head names. A commit with refs but no body (a v4 commit) cleans
                     // its refs too.
-                    if let Some((generation, _, writer, _, _)) = &body_plan {
-                        self.delete_loser(id, Some((*generation, *writer)), &blobs)
+                    if let Some(plan) = &body_plan {
+                        self.delete_loser(id, Some((plan.generation, plan.writer)), &blobs)
                             .await?;
                     } else if !blobs.is_empty() {
                         self.delete_loser(id, None, &blobs).await?;
@@ -1811,6 +1846,132 @@ impl MongoStore {
                 .map_err(classify)?;
         }
         Ok(())
+    }
+
+    /// Write the transcript rows of one commit before its CAS.
+    ///
+    /// Returns `Ok(true)` when every row of the attempted range is in place — inserted by this
+    /// attempt, or an identical row another attempt wrote (adopted) — and `Ok(false)` when a
+    /// **live** attempt at the same version owns a slot with a different message: the caller
+    /// answers `Conflict` and deletes this attempt's rows.
+    ///
+    /// A duplicate key is not always a live race. The rows are keyed `(run, generation, idx)`, and
+    /// an attempt that died between its insert and its CAS leaves its rows behind with the head
+    /// unchanged; two attempts at the same version then collide on the same `_id`s for ever.
+    /// Content decides: an identical row is adopted (a deterministic re-run of the same transcript
+    /// makes progress), and a differing row older than [`BODY_ORPHAN_GRACE`] belongs to an attempt
+    /// whose lease has long expired, so it is deleted and the insert is retried once. A differing
+    /// row younger than the grace belongs to a live attempt and stays a `Conflict`.
+    async fn write_body_rows(
+        &self,
+        id: RunId,
+        expected: u64,
+        plan: &BodyPlan,
+    ) -> StoreResult<bool> {
+        let BodyPlan {
+            generation,
+            start,
+            writer,
+            rows,
+            written_at,
+        } = plan;
+        let (generation, start, writer, written_at) = (*generation, *start, *writer, *written_at);
+        let docs = rows
+            .iter()
+            .skip(start)
+            .map(|row| body_doc(id, generation, writer, row, written_at))
+            .collect::<StoreResult<Vec<_>>>()?;
+        if docs.is_empty() {
+            return Ok(true);
+        }
+        let count = docs.len();
+        let from = i64::try_from(start)
+            .map_err(|_| StoreError::InvalidInput("body start exceeds i64".into()))?;
+        let to = i64::try_from(rows.len())
+            .map_err(|_| StoreError::InvalidInput("a transcript is longer than i64".into()))?;
+        // One retry: the first pass may collect an orphaned attempt's rows and insert again. A
+        // second duplicate is a live attempt (or an insert that cannot be completed), never a
+        // third pass.
+        for pass in 0..2 {
+            match self.body.insert_many(&docs).ordered(false).await {
+                Ok(result) => {
+                    if !body_insert_is_complete(result.inserted_ids.len(), 0, count) {
+                        return Err(StoreError::Corrupt(format!(
+                            "body generation {generation} of run {id}: only {} of {count} rows landed",
+                            result.inserted_ids.len()
+                        )));
+                    }
+                    return Ok(true);
+                }
+                Err(err) => {
+                    let Some((inserted, duplicates)) = body_insert_counts(&err, count) else {
+                        return Err(classify(err));
+                    };
+                    if !body_insert_is_complete(inserted, duplicates, count) {
+                        return Err(classify(err));
+                    }
+                    // Every failure is a row that is already there. Whose, and is it the same
+                    // message this attempt would write?
+                    let foreign: Vec<Document> = self
+                        .body
+                        .find(doc! {
+                            "run_id": uuid(id),
+                            "generation": generation_uuid(generation),
+                            "idx": { "$gte": from, "$lt": to },
+                            "writer": { "$ne": generation_uuid(writer) },
+                        })
+                        .projection(doc! { "idx": 1, "message": 1, "written_at": 1 })
+                        .await
+                        .map_err(classify)?
+                        .try_collect()
+                        .await
+                        .map_err(classify)?;
+                    if foreign.is_empty() {
+                        // Every duplicate is this attempt's own row: a retry after a transient
+                        // error, before the CAS.
+                        return Ok(true);
+                    }
+                    if foreign.iter().all(|row| foreign_row_matches(row, rows)) {
+                        // Another attempt wrote the same messages at these slots: adopting them
+                        // is indistinguishable from our own rows, and the CAS decides whose head
+                        // names them.
+                        return Ok(true);
+                    }
+                    let cutoff = written_at - BODY_ORPHAN_GRACE;
+                    let mut orphaned = true;
+                    for row in &foreign {
+                        let at = get_date(row, "written_at")?.ok_or_else(|| bad("written_at"))?;
+                        if at >= cutoff {
+                            orphaned = false;
+                            break;
+                        }
+                    }
+                    // A live attempt wrote a different message at a slot this commit needs. After
+                    // one collection, a second collision is a live attempt too: stop.
+                    if pass > 0 || !orphaned {
+                        return Ok(false);
+                    }
+                    // The run may have advanced while this attempt was inserting: a winner's head
+                    // can name rows at these slots, and a row the head names is never collected.
+                    // A winner that commits after this read writes fresh rows, so the delete below
+                    // cannot take them.
+                    if self.live_version(id).await? != Some(expected) {
+                        return Ok(false);
+                    }
+                    self.body
+                        .delete_many(doc! {
+                            "run_id": uuid(id),
+                            "generation": generation_uuid(generation),
+                            "idx": { "$gte": from, "$lt": to },
+                            "writer": { "$ne": generation_uuid(writer) },
+                            "written_at": { "$lt": date(cutoff) },
+                        })
+                        .await
+                        .map_err(classify)?;
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Delete the body generations of `run` other than `keep_generation` that were written before
@@ -2558,10 +2719,10 @@ mod body_loser_tests {
         clean(&store, &prefix).await;
     }
 
-    /// A duplicate slot written by **another** attempt is not this attempt's retry: the commit is
-    /// a conflict, so it cannot win the CAS naming the other attempt's messages.
+    /// A duplicate slot written by **another**, live attempt is not this attempt's retry: the
+    /// commit is a conflict, so it cannot win the CAS naming the other attempt's messages.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_foreign_writer_at_a_duplicate_slot_is_a_conflict() {
+    async fn a_live_foreign_writer_at_a_duplicate_slot_is_a_conflict() {
         let Some((store, prefix)) = store().await else {
             return;
         };
@@ -2647,6 +2808,282 @@ mod body_loser_tests {
             .expect("find")
             .expect("the run");
         assert!(doc.get("head").is_none(), "no head names the foreign rows");
+        clean(&store, &prefix).await;
+    }
+
+    /// A foreign attempt that wrote the same messages at the attempted slots is adopted: the
+    /// commit proceeds to the CAS, the rows keep their first writer, and the head names them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_identical_foreign_row_is_adopted() {
+        let Some((store, prefix)) = store().await else {
+            return;
+        };
+        let agent = format!("adopt-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .expect("create");
+        let generation = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+        let rows = [0_u32, 1]
+            .into_iter()
+            .map(|idx| {
+                body_doc(
+                    run.id,
+                    generation,
+                    foreign,
+                    &BodyRow {
+                        idx,
+                        message: json!(format!("message {idx}")),
+                    },
+                    now(),
+                )
+                .expect("a row")
+            })
+            .collect::<Vec<_>>();
+        store
+            .body
+            .insert_many(&rows)
+            .await
+            .expect("the foreign rows");
+        let committed = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head(
+                        generation,
+                        2,
+                        &BlobId::from_hex(&"a".repeat(64)).expect("a digest"),
+                    ))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: vec![
+                            BodyRow {
+                                idx: 0,
+                                message: json!("message 0"),
+                            },
+                            BodyRow {
+                                idx: 1,
+                                message: json!("message 1"),
+                            },
+                        ],
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await
+            .expect("the identical rows are adopted");
+        assert_eq!(committed.version, 2, "the CAS ran");
+        assert_eq!(
+            store
+                .body_list(run.id, generation)
+                .await
+                .expect("rows")
+                .len(),
+            2,
+            "the adopted rows are the generation"
+        );
+        let stored = store
+            .body
+            .find_one(doc! { "_id": body_id(run.id, generation, 0) })
+            .await
+            .expect("find")
+            .expect("the row");
+        assert_eq!(
+            stored.get("writer"),
+            Some(&generation_uuid(foreign)),
+            "an adopted row is not rewritten with this attempt's writer"
+        );
+        let served = store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run");
+        assert_eq!(served.state["body"]["len"], 2);
+        clean(&store, &prefix).await;
+    }
+
+    /// A differing foreign row older than the orphan grace is collected and the commit proceeds;
+    /// the next commit at the new version succeeds too, so the run is not wedged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_orphaned_foreign_row_is_collected_and_the_run_moves_on() {
+        let Some((store, prefix)) = store().await else {
+            return;
+        };
+        let agent = format!("orphan-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .expect("create");
+        let generation = Uuid::new_v4();
+        let old = now() - BODY_ORPHAN_GRACE - chrono::Duration::minutes(1);
+        let rows = [0_u32, 1]
+            .into_iter()
+            .map(|idx| {
+                body_doc(
+                    run.id,
+                    generation,
+                    Uuid::new_v4(),
+                    &BodyRow {
+                        idx,
+                        message: json!(format!("dead {idx}")),
+                    },
+                    old,
+                )
+                .expect("a row")
+            })
+            .collect::<Vec<_>>();
+        store
+            .body
+            .insert_many(&rows)
+            .await
+            .expect("the dead attempt's rows");
+        let committed = store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head(
+                        generation,
+                        2,
+                        &BlobId::from_hex(&"a".repeat(64)).expect("a digest"),
+                    ))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: vec![
+                            BodyRow {
+                                idx: 0,
+                                message: json!("ours 0"),
+                            },
+                            BodyRow {
+                                idx: 1,
+                                message: json!("ours 1"),
+                            },
+                        ],
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await
+            .expect("the orphan is collected");
+        assert_eq!(committed.version, 2, "the CAS ran after the collection");
+        let stored = store.body_list(run.id, generation).await.expect("rows");
+        assert_eq!(
+            stored.iter().map(|row| &row.message).collect::<Vec<_>>(),
+            vec![&json!("ours 0"), &json!("ours 1")],
+            "the dead attempt's rows went and this attempt's are there"
+        );
+        let next = store
+            .commit_run(
+                run.id,
+                committed.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 2})),
+            )
+            .await
+            .expect("a second commit at the new version");
+        assert_eq!(next.version, 3, "the run is not wedged");
+        clean(&store, &prefix).await;
+    }
+
+    /// A live foreign conflict reports the version the run reached, not the one this attempt
+    /// expected: a winner commits between this attempt's context read and its body insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_foreign_conflict_reports_the_version_the_run_reached() {
+        use std::sync::Arc;
+
+        use tokio::sync::Notify;
+
+        let Some((store, prefix)) = store().await else {
+            return;
+        };
+        let agent = format!("actual-{}", Uuid::new_v4().simple());
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .expect("create");
+        let generation = Uuid::new_v4();
+        let digest = BlobId::from_hex(&"a".repeat(64)).expect("a digest");
+        let started = Arc::new(Notify::new());
+        let done = Arc::new(Notify::new());
+        store.set_before_body_insert(BeforeCas(Arc::new({
+            let started = started.clone();
+            let done = done.clone();
+            move || {
+                let started = started.clone();
+                let done = done.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    done.notified().await;
+                })
+            }
+        })));
+        let winner_digest = digest.clone();
+        let winner_task = tokio::spawn({
+            let store = store.clone();
+            let started = started.clone();
+            let done = done.clone();
+            async move {
+                started.notified().await;
+                let result = store
+                    .commit_run(
+                        run.id,
+                        1,
+                        RunUpdate::new(RunStatus::Runnable, json!({"turn": 1, "winner": true}))
+                            .head(head(generation, 1, &winner_digest))
+                            .body(BodyWrite {
+                                generation: Some(generation),
+                                rows: vec![BodyRow {
+                                    idx: 0,
+                                    message: json!("winner"),
+                                }],
+                                writer: Uuid::new_v4(),
+                            }),
+                    )
+                    .await;
+                done.notify_one();
+                result
+            }
+        });
+        let loser = store
+            .commit_run(
+                run.id,
+                1,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1, "loser": true}))
+                    .head(head(generation, 1, &digest))
+                    .body(BodyWrite {
+                        generation: Some(generation),
+                        rows: vec![BodyRow {
+                            idx: 0,
+                            message: json!("loser"),
+                        }],
+                        writer: Uuid::new_v4(),
+                    }),
+            )
+            .await;
+        let winner = winner_task.await.expect("the winner task");
+        assert!(winner.is_ok(), "the winner committed: {winner:?}");
+        match loser {
+            Err(StoreError::Conflict {
+                run: id,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(id, run.id);
+                assert_eq!(expected, 1);
+                assert_eq!(
+                    actual, 2,
+                    "the conflict reports the version the run reached"
+                );
+            }
+            other => panic!("the loser is a conflict: {other:?}"),
+        }
+        assert_eq!(
+            store.body_list(run.id, generation).await.expect("rows"),
+            vec![BodyRow {
+                idx: 0,
+                message: json!("winner"),
+            }],
+            "the winner's row is the one the generation holds"
+        );
         clean(&store, &prefix).await;
     }
 
