@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 
 use adam_core::{RunId, RunStatus};
@@ -203,13 +203,9 @@ impl Artifact {
     /// screen keeps the file under, and what a form's picture of it (`ask_user`'s `image.sha256`)
     /// refers to. `None` for a JSON artifact.
     pub fn file_sha256(&self) -> Option<String> {
-        use sha2::Digest as _;
-        self.file.as_ref().map(|f| {
-            sha2::Sha256::digest(&f.bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
-        })
+        self.file
+            .as_ref()
+            .map(|f| crate::file::sha256_hex(&f.bytes))
     }
 }
 
@@ -449,10 +445,19 @@ pub const REPLAY_EVENTS_PER_RUN: usize = 64;
 /// it); an event older than this is not replayed, and the durable record says what happened since.
 pub const REPLAY_MAX_AGE: Duration = Duration::from_secs(30);
 
-/// The most runs [`BroadcastSink`] keeps events for: 64. A step's end can carry about 12 KiB of
-/// input and output, so the worst case stays near 50 MiB. Past it the run whose newest event is the
-/// oldest is forgotten.
+/// The most runs [`BroadcastSink`] keeps events for: 64. Past it the run whose newest event is the
+/// oldest is forgotten. This only decides which runs are kept; [`REPLAY_MAX_BYTES`] bounds what they
+/// hold, since a step's end can carry about 12 KiB of input and output and a tool result can be
+/// megabytes.
 pub const REPLAY_MAX_RUNS: usize = 64;
+
+/// The most bytes the replay of a [`BroadcastSink`] keeps for every run together: 16 MiB, a per
+/// process cap, as an estimate of the heap the events hold (`event_bytes`). The count bounds
+/// alone leave the worst case near 50 MiB (64 runs of 64 events, each a step end with its input
+/// and output); one run's tool results of megabytes would pin it. Past the bound the globally
+/// oldest events go first, so every retained run keeps its newest events, and an event larger than
+/// the whole bound is not kept at all.
+pub const REPLAY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// The bounds of the replay of a [`BroadcastSink`].
 #[derive(Clone, Copy, Debug)]
@@ -460,6 +465,7 @@ struct ReplayBounds {
     per_run: usize,
     max_age: Duration,
     max_runs: usize,
+    max_bytes: usize,
 }
 
 impl ReplayBounds {
@@ -467,6 +473,7 @@ impl ReplayBounds {
         per_run: REPLAY_EVENTS_PER_RUN,
         max_age: REPLAY_MAX_AGE,
         max_runs: REPLAY_MAX_RUNS,
+        max_bytes: REPLAY_MAX_BYTES,
     };
 }
 
@@ -477,6 +484,8 @@ impl ReplayBounds {
 struct Replay {
     bounds: ReplayBounds,
     runs: HashMap<RunId, VecDeque<(Instant, SinkEvent)>>,
+    /// The estimate of the heap every kept event holds, as [`event_bytes`] counts it.
+    bytes: usize,
 }
 
 impl Replay {
@@ -484,6 +493,7 @@ impl Replay {
         Self {
             bounds,
             runs: HashMap::new(),
+            bytes: 0,
         }
     }
 
@@ -496,7 +506,7 @@ impl Replay {
     fn record(&mut self, now: Instant, event: &SinkEvent) {
         match &event.event {
             RunEvent::Status { .. } => {
-                self.runs.remove(&event.run);
+                self.forget(event.run);
                 return;
             }
             RunEvent::Artifact { .. } => return,
@@ -511,21 +521,38 @@ impl Replay {
                     .min_by_key(|(_, events)| events.back().map(|(at, _)| *at))
                     .map(|(run, _)| *run);
                 if let Some(run) = oldest {
-                    self.runs.remove(&run);
+                    self.forget(run);
                 }
             }
         }
+        let size = event_bytes(event);
         let events = self.runs.entry(event.run).or_default();
         events.push_back((now, event.clone()));
+        self.bytes += size;
         while events.len() > self.bounds.per_run {
-            events.pop_front();
+            if let Some((_, dropped)) = events.pop_front() {
+                self.bytes -= event_bytes(&dropped);
+            }
         }
         // The stamps only grow, so the old events are at the front.
         while events
             .front()
             .is_some_and(|(at, _)| now.saturating_duration_since(*at) > self.bounds.max_age)
         {
-            events.pop_front();
+            if let Some((_, dropped)) = events.pop_front() {
+                self.bytes -= event_bytes(&dropped);
+            }
+        }
+        // The byte bound: the globally oldest event goes first, so a run keeps its newest events
+        // even when its older ones are large. An event over the whole bound is dropped at once.
+        while self.bytes > self.bounds.max_bytes {
+            let oldest = self
+                .runs
+                .iter()
+                .filter_map(|(run, events)| events.front().map(|(at, _)| (*at, *run)))
+                .min();
+            let Some((_, run)) = oldest else { break };
+            self.pop_front(run);
         }
     }
 
@@ -539,7 +566,9 @@ impl Replay {
             .front()
             .is_some_and(|(at, _)| now.saturating_duration_since(*at) > max_age)
         {
-            events.pop_front();
+            if let Some((_, dropped)) = events.pop_front() {
+                self.bytes -= event_bytes(&dropped);
+            }
         }
         if events.is_empty() {
             self.runs.remove(&run);
@@ -551,11 +580,106 @@ impl Replay {
     /// Forget every run whose newest event is too old.
     fn prune(&mut self, now: Instant) {
         let max_age = self.bounds.max_age;
+        let mut freed = 0;
         self.runs.retain(|_, events| {
-            events
+            let keep = events
                 .back()
-                .is_some_and(|(at, _)| now.saturating_duration_since(*at) <= max_age)
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) <= max_age);
+            if !keep {
+                freed += events.iter().map(|(_, e)| event_bytes(e)).sum::<usize>();
+            }
+            keep
         });
+        self.bytes -= freed;
+    }
+
+    /// Forget everything kept for `run`.
+    fn forget(&mut self, run: RunId) {
+        if let Some(events) = self.runs.remove(&run) {
+            self.bytes -= events.iter().map(|(_, e)| event_bytes(e)).sum::<usize>();
+        }
+    }
+
+    /// Drop the oldest event of `run`, and the run with its last one.
+    fn pop_front(&mut self, run: RunId) {
+        let Some(events) = self.runs.get_mut(&run) else {
+            return;
+        };
+        if let Some((_, dropped)) = events.pop_front() {
+            self.bytes -= event_bytes(&dropped);
+        }
+        if events.is_empty() {
+            self.runs.remove(&run);
+        }
+    }
+}
+
+/// An estimate of the heap a [`SinkEvent`] keeps alive: the event's own storage, its strings, its
+/// maps and its JSON payloads, by their lengths (not the allocator's capacities). It is what
+/// [`REPLAY_MAX_BYTES`] bounds, so the same event always counts the same.
+fn event_bytes(event: &SinkEvent) -> usize {
+    std::mem::size_of::<SinkEvent>() + event.agent.len() + run_event_bytes(&event.event)
+}
+
+fn run_event_bytes(event: &RunEvent) -> usize {
+    match event {
+        RunEvent::Status { detail, .. } => opt_str_bytes(detail),
+        RunEvent::Progress { message } => message.len(),
+        RunEvent::Step(step) => {
+            step.id.len()
+                + opt_str_bytes(&step.parent)
+                + step.label.len()
+                + opt_str_bytes(&step.detail)
+                + step.input.as_ref().map_or(0, map_bytes)
+                + step.output.as_ref().map_or(0, |output| output.text.len())
+        }
+        RunEvent::TextDelta { stream, text, .. }
+        | RunEvent::ReasoningDelta { stream, text, .. } => stream.len() + text.len(),
+        RunEvent::Usage(usage) => {
+            usage.call.len()
+                + opt_str_bytes(&usage.step)
+                + opt_str_bytes(&usage.provider)
+                + usage.model.len()
+        }
+        RunEvent::Custom { kind, payload } => kind.len() + value_bytes(payload),
+        RunEvent::Artifact {
+            id,
+            name,
+            mime_type,
+            data,
+            file,
+        } => {
+            opt_str_bytes(id)
+                + name.len()
+                + opt_str_bytes(mime_type)
+                + value_bytes(data)
+                + file
+                    .as_ref()
+                    .map_or(0, |file| file.filename.len() + file.bytes.len())
+        }
+    }
+}
+
+fn opt_str_bytes(text: &Option<String>) -> usize {
+    text.as_ref().map_or(0, String::len)
+}
+
+fn map_bytes(map: &Map<String, Value>) -> usize {
+    map.iter()
+        .map(|(key, value)| key.len() + value_bytes(value))
+        .sum::<usize>()
+        + map.len() * std::mem::size_of::<Value>()
+}
+
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        Value::String(text) => text.len(),
+        Value::Array(items) => {
+            items.iter().map(value_bytes).sum::<usize>()
+                + items.len() * std::mem::size_of::<Value>()
+        }
+        Value::Object(map) => map_bytes(map),
     }
 }
 
@@ -568,9 +692,9 @@ impl Replay {
 /// a run is submitted and then subscribed to, and a worker may take the run, and emit its first
 /// steps, in between. The replay is a latency and fidelity aid, never the truth: it holds at most
 /// [`REPLAY_EVENTS_PER_RUN`] events per run, none older than [`REPLAY_MAX_AGE`], for at most
-/// [`REPLAY_MAX_RUNS`] runs; it holds no `Status` (read the durable record) and no `Artifact`
-/// (durable too); and a run's events are dropped whenever its status changes (it holds what
-/// happened since the run last changed state).
+/// [`REPLAY_MAX_RUNS`] runs, and no more than [`REPLAY_MAX_BYTES`] in all; it holds no `Status` (read
+/// the durable record) and no `Artifact` (durable too); and a run's events are dropped whenever its
+/// status changes (it holds what happened since the run last changed state).
 #[derive(Clone, Debug)]
 pub struct BroadcastSink {
     tx: broadcast::Sender<SinkEvent>,
@@ -1037,6 +1161,47 @@ mod tests {
         assert_eq!(got.len(), REPLAY_EVENTS_PER_RUN);
         assert_eq!(got.first(), Some(&progress(total - REPLAY_EVENTS_PER_RUN)));
         assert_eq!(got.last(), Some(&progress(total - 1)));
+    }
+
+    /// A run whose tool results are large must not pin the replay: the byte bound decides, and
+    /// every run it keeps still has its newest event.
+    #[tokio::test]
+    async fn the_replay_is_bounded_by_bytes_and_keeps_each_runs_newest_event() {
+        let sink = BroadcastSink::default();
+        let runs: Vec<RunId> = (0..8).map(|_| RunId::new()).collect();
+        let padding = "x".repeat(64 * 1024);
+        let piece = |n: usize| RunEvent::Progress {
+            message: format!("{n}:{padding}"),
+        };
+        for n in 0..REPLAY_EVENTS_PER_RUN {
+            for run in &runs {
+                sink.emit(*run, "x", piece(n)).await;
+            }
+        }
+
+        let replay = sink.replay.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(replay.bytes > 0);
+        assert!(
+            replay.bytes <= REPLAY_MAX_BYTES,
+            "{} bytes kept, over the {REPLAY_MAX_BYTES} bound",
+            replay.bytes
+        );
+        for run in &runs {
+            let events = replay
+                .runs
+                .get(run)
+                .unwrap_or_else(|| panic!("the replay dropped run {run}"));
+            // The byte bound decided, not the count bound: a run's 64 events do not fit.
+            assert!(
+                events.len() < REPLAY_EVENTS_PER_RUN,
+                "{} events kept, so the count bound was the one that applied",
+                events.len()
+            );
+            assert_eq!(
+                events.back().map(|(_, event)| &event.event),
+                Some(&piece(REPLAY_EVENTS_PER_RUN - 1))
+            );
+        }
     }
 
     #[tokio::test]

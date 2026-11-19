@@ -1115,10 +1115,13 @@ async fn files_changed_beside_the_write_tools_reach_the_server_as_watched_files(
         lsp.logged("workspace/didChangeWatchedFiles").is_empty(),
         "the first call is the baseline"
     );
-    // What `run`, a build or the shell does: no write tool is told.
+    // What `run`, a build or the shell does: no write tool is told. The walk of the root is made at
+    // most once per `WATCHED_TTL`, so the change is reported by the call after the interval.
     lsp.put("src/new.rs", "pub fn new() {}\n");
     std::fs::remove_file(lsp.worktree().join("src/gone.rs")).unwrap();
     lsp.put("src/kept.rs", "pub fn kept() { /* a longer body */ }\n");
+    tokio::time::sleep(adam_coder::tools::lsp::server::WATCHED_TTL + Duration::from_millis(200))
+        .await;
     lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
     // The notification is written before the call answers; the script logs it when it reads it.
     until("the server to read the notification", || {
@@ -1138,6 +1141,78 @@ async fn files_changed_beside_the_write_tools_reach_the_server_as_watched_files(
     assert_eq!(kind("src/kept.rs"), Some(2));
     assert_eq!(kind("src/gone.rs"), Some(3));
     assert_eq!(changes.len(), 3, "{changes:?}");
+}
+
+#[tokio::test]
+async fn the_root_is_walked_once_per_interval_and_a_change_is_reported_on_the_next_walk() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    // The first call walks the root: it is the baseline the later ones are compared with.
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert!(
+        lsp.logged("workspace/didChangeWatchedFiles").is_empty(),
+        "the first call is the baseline"
+    );
+    lsp.put("src/later.rs", "pub fn later() {}\n");
+    for _ in 0..4 {
+        lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    }
+    assert!(
+        lsp.logged("workspace/didChangeWatchedFiles").is_empty(),
+        "four calls inside the interval reuse the walk"
+    );
+    // Past the interval the next call walks: the file that appeared meanwhile is reported once.
+    tokio::time::sleep(adam_coder::tools::lsp::server::WATCHED_TTL + Duration::from_millis(200))
+        .await;
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    until("the walk to report the file", || {
+        !lsp.logged("workspace/didChangeWatchedFiles").is_empty()
+    })
+    .await;
+    let watched = lsp.logged("workspace/didChangeWatchedFiles");
+    assert_eq!(watched.len(), 1);
+    let changes = watched[0]["params"]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0]["type"], 1, "created");
+    assert!(
+        changes[0]["uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("src/later.rs")
+    );
+}
+
+#[tokio::test]
+async fn a_write_of_a_file_tool_is_walked_at_the_next_call_inside_the_interval() {
+    let lsp = Lsp::new(json!({})).await;
+    rust_project(&lsp);
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    assert!(lsp.logged("workspace/didChangeWatchedFiles").is_empty());
+    // The coder's own tool wrote a file the server does not hold open: the next call must walk,
+    // not wait for the interval.
+    let written = lsp
+        .call(
+            "write_file",
+            json!({"path": "src/other.rs", "content": "pub fn other() {}\n"}),
+        )
+        .await;
+    assert!(!written.is_error, "{}", written.content);
+    lsp.diagnostics(json!({"path": "src/lib.rs"})).await;
+    until("the write to be reported", || {
+        !lsp.logged("workspace/didChangeWatchedFiles").is_empty()
+    })
+    .await;
+    let watched = lsp.logged("workspace/didChangeWatchedFiles");
+    assert_eq!(watched.len(), 1);
+    let changes = watched[0]["params"]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0]["type"], 1);
+    assert!(
+        changes[0]["uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("src/other.rs")
+    );
 }
 
 // ------------------------------------------------------------------------------- never writes

@@ -401,7 +401,7 @@ fn spawn_cancel_watch(
 }
 
 /// One claimed run: step it, commit, release.
-#[tracing::instrument(skip_all, fields(run = %lease.run.id, agent = %lease.run.agent))]
+#[tracing::instrument(level = "debug", skip_all, fields(run = %lease.run.id, agent = %lease.run.agent))]
 async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
     let run = lease.run.id;
     // The first claim of a run is news to whoever watches it: the lease now says a worker is on
@@ -425,21 +425,22 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
         .then(|| spawn_renewer(inner.clone(), run));
     let cancel = CancelToken::new();
     let tracked = inner.track(run, cancel.clone());
-    let envelope = Envelope::decode(run, &lease.run.state).ok();
+    // Decoded once, here, and handed to `transition`: it is the same record.
+    let envelope = Envelope::decode(run, &lease.run.state);
     // A run that waited for a person and is stepped again has the rest of its time from now.
     let restored = (lease.run.status == RunStatus::Runnable)
-        .then(|| envelope.as_ref().and_then(|e| e.remaining_secs))
+        .then(|| envelope.as_ref().ok().and_then(|e| e.remaining_secs))
         .flatten()
         .map(|secs| {
             inner.clock.now() + chrono::Duration::seconds(secs.try_into().unwrap_or(i64::MAX))
         });
     let watched = Watched {
         parent: lease.run.parent_id,
-        deadline: envelope.as_ref().and_then(|e| e.deadline).or(restored),
-        limit_secs: envelope.as_ref().and_then(|e| e.limit_secs),
+        deadline: envelope.as_ref().ok().and_then(|e| e.deadline).or(restored),
+        limit_secs: envelope.as_ref().ok().and_then(|e| e.limit_secs),
     };
     let watch = spawn_cancel_watch(inner.clone(), run, watched, cancel.clone());
-    let release = transition(&inner, lease.run, cancel).await;
+    let release = transition(&inner, lease.run, envelope, cancel).await;
     drop(watch);
     drop(tracked);
     drop(renewer);
@@ -486,7 +487,15 @@ enum Plan {
 }
 
 /// Returns whether the lease should be released.
-async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> bool {
+///
+/// `decoded` is [`RunRecord::state`] of `rec`, decoded by [`advance`]: a transition reads the state
+/// once, and the failure it carries (an unreadable envelope) is committed here.
+async fn transition(
+    inner: &Arc<Inner>,
+    rec: RunRecord,
+    decoded: Result<Envelope, RuntimeError>,
+    cancel: CancelToken,
+) -> bool {
     let run = rec.id;
     // A claim may hand back a snapshot read after the lease was taken (the MongoDB store sets the
     // lease, then reads the run), and a cancel does not touch the lease: the run can be terminal
@@ -504,11 +513,12 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
         cancel_for_parent(inner, run).await;
         return true;
     }
-    let env = match Envelope::decode(run, &rec.state) {
+    let mut env = match decoded {
         Ok(env) => env,
         Err(e) => {
-            tracing::error!(error = %e, "failing run with unreadable state");
-            let update = RunUpdate::new(RunStatus::Failed, rec.state.clone());
+            tracing::error!(run = %run, error = %e, "failing run with unreadable state");
+            // The state is unreadable, so it is stored as it is: the record's own value is moved.
+            let update = RunUpdate::new(RunStatus::Failed, rec.state);
             if let Ok(committed) = inner.store.commit_run(run, rec.version, update).await {
                 inner
                     .emit_status(run, &rec.agent, RunStatus::Failed, Some(e.to_string()))
@@ -534,7 +544,8 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
         && env.inbox.is_empty()
         && !env.agent_wake.is_some_and(|wake| wake <= now)
     {
-        park_again(inner, &rec, &env, now).await;
+        // `rec` is not read again on this path.
+        park_again(inner, rec, &env, now).await;
         return true;
     }
     // A run that waited for a person gets the rest of its time again from now.
@@ -550,7 +561,7 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
         .get(&rec.agent)
         .and_then(|r| r.agent().cloned())
     else {
-        tracing::error!(agent = %rec.agent, "claimed a run of an unregistered agent");
+        tracing::error!(run = %run, agent = %rec.agent, "claimed a run of an unregistered agent");
         return true;
     };
 
@@ -569,7 +580,7 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
             inner: Arc::clone(inner),
         },
     });
-    let stepped = AssertUnwindSafe(agent.step(&mut ctx, env.agent.clone()))
+    let stepped = AssertUnwindSafe(agent.step(&mut ctx, std::mem::take(&mut env.agent)))
         .catch_unwind()
         .await;
     let result = stepped.unwrap_or_else(|panic| {
@@ -580,7 +591,10 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
     });
     let outcome = ctx.into_outcome();
 
-    let plan = plan(inner, &env, outcome, result);
+    // The step consumed the agent state. A failure commits the state the run already had, which is
+    // the record's own `agent` member: read, and copied, only then. `agent` is required by
+    // `Envelope` (it has no serde default), so a record that lacks it never decodes to here.
+    let plan = plan(inner, run, &env, rec.state.get("agent"), outcome, result);
     let Plan::Commit(mut next) = plan else {
         return false;
     };
@@ -603,12 +617,13 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
         }
         Ok(None) => {
             tracing::info!(
+                run = %run,
                 "commit rejected (run advanced or cancelled elsewhere); dropping result"
             );
             true
         }
         Err(e) => {
-            tracing::error!(error = %report(&e), "commit failed; the run will be retried when its lease expires");
+            tracing::error!(run = %run, error = %report(&e), "commit failed; the run will be retried when its lease expires");
             false
         }
     }
@@ -635,9 +650,14 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// Decide what the transition's result means for the run.
+///
+/// `base_agent` is the agent state the run had before the step: the step took `base.agent` by
+/// move, so the paths that commit the state untouched read it from the record instead.
 fn plan(
     inner: &Inner,
+    run: RunId,
     base: &Envelope,
+    base_agent: Option<&Value>,
     out: CtxOutcome,
     result: Result<Transition<Value>, AgentError>,
 ) -> Plan {
@@ -669,7 +689,7 @@ fn plan(
     let failed = |error: String| Next {
         status: RunStatus::Failed,
         wake_at: None,
-        agent: base.agent.clone(),
+        agent: base_agent.cloned().unwrap_or(Value::Null),
         output: Value::Null,
         error: Some(error),
         attempt: base.attempt,
@@ -708,7 +728,7 @@ fn plan(
             Next {
                 status: RunStatus::Runnable,
                 wake_at: Some(wake_at),
-                agent: base.agent.clone(),
+                agent: base_agent.cloned().unwrap_or(Value::Null),
                 output: Value::Null,
                 error: None,
                 attempt: failures,
@@ -761,6 +781,7 @@ fn plan(
             // would loop for ever, so the run ends.
             ErrorClass::Corrupt | ErrorClass::Invalid => {
                 tracing::error!(
+                    run = %run,
                     error = %report(&e),
                     "the store cannot read or accept this run's data; failing the run"
                 );
@@ -769,6 +790,7 @@ fn plan(
             // Anything else (an unreachable store, a bug): leave the run to its lease.
             class => {
                 tracing::error!(
+                    run = %run,
                     error = %report(&e),
                     class = ?class,
                     alert = class.should_alert(),
@@ -789,7 +811,9 @@ fn chrono_of(d: Duration) -> chrono::Duration {
 /// state is stored as it is; only the wake moves, to the earliest of the agent's own wake, the
 /// deadline (plus a second when this wake came early) and the next look at the parent. A message that
 /// lands meanwhile moves the version and this commit is dropped: the run is runnable and is claimed.
-async fn park_again(inner: &Inner, rec: &RunRecord, env: &Envelope, now: DateTime<Utc>) {
+///
+/// Takes the record by value: its state is moved into the update, not copied.
+async fn park_again(inner: &Inner, rec: RunRecord, env: &Envelope, now: DateTime<Utc>) {
     let mut wake = now + chrono_of(CHILD_WAIT_POLL);
     if let Some(agent) = env.agent_wake {
         wake = wake.min(agent);
@@ -797,7 +821,7 @@ async fn park_again(inner: &Inner, rec: &RunRecord, env: &Envelope, now: DateTim
     if let Some(deadline) = env.deadline {
         wake = wake.min(deadline + chrono_of(DEADLINE_SKEW));
     }
-    let mut update = RunUpdate::new(RunStatus::Parked, rec.state.clone());
+    let mut update = RunUpdate::new(RunStatus::Parked, rec.state);
     update.wake_at = Some(wake);
     match inner.store.commit_run(rec.id, rec.version, update).await {
         Ok(_) | Err(StoreError::Conflict { .. } | StoreError::NotFound(_)) => {}
@@ -808,6 +832,9 @@ async fn park_again(inner: &Inner, rec: &RunRecord, env: &Envelope, now: DateTim
 }
 
 /// The record to write, built on the freshest envelope.
+///
+/// `cur` is the claim's envelope on the first attempt, or a freshly decoded retry. A stepped
+/// envelope is drained (`cur.agent` is `Null`), so nothing here may read that member.
 fn build_update(
     next: &Next,
     cur: &Envelope,
@@ -850,6 +877,9 @@ fn build_update(
     for artifact in &next.artifacts {
         add_artifact(&mut artifacts, artifact);
     }
+    // `next` and `cur` are borrowed for the whole retry loop, which builds this update again from
+    // them after a lost CAS race, so the envelope owns copies of what it keeps. Moving them would
+    // leave a retry with `null`.
     let env = Envelope {
         v: cur.v,
         agent: next.agent.clone(),
@@ -917,8 +947,9 @@ async fn commit(
     parent: bool,
 ) -> StoreResult<Option<RunRecord>> {
     let run = claimed.id;
-    let mut cur_rec = claimed.clone();
-    let mut cur_env = base.clone();
+    // On the first attempt the update is built from the borrowed record and envelope: nothing is
+    // copied. A retry owns the record it just loaded, and builds from that.
+    let mut retried: Option<(RunRecord, Envelope)> = None;
     for attempt in 0..MAX_COMMIT_RETRIES {
         if attempt > 0 {
             let Some(rec) = inner.store.load_run(run).await? else {
@@ -936,12 +967,15 @@ async fn commit(
             {
                 return Ok(None);
             }
-            cur_rec = rec;
-            cur_env = env;
+            retried = Some((rec, env));
         }
+        let (cur_rec, cur_env) = match &retried {
+            Some((rec, env)) => (rec, env),
+            None => (claimed, base),
+        };
         let update = build_update(
             next,
-            &cur_env,
+            cur_env,
             base.inbox.len(),
             base.rev,
             parent,
@@ -949,7 +983,7 @@ async fn commit(
         )?;
         match inner.store.commit_run(run, cur_rec.version, update).await {
             Ok(rec) => {
-                if reopens(next, &cur_env, base.inbox.len()) {
+                if reopens(next, cur_env, base.inbox.len()) {
                     tracing::info!(%run, "a message arrived while the run finished: the run goes on instead");
                 }
                 return Ok(Some(rec));
@@ -1115,7 +1149,8 @@ mod claim_tests {
         let cancelled = store.load_run(run).await.expect("load").expect("run");
         assert_eq!(cancelled.status, RunStatus::Failed);
 
-        assert!(transition(&rt.inner, cancelled.clone(), CancelToken::new()).await);
+        let decoded = Envelope::decode(cancelled.id, &cancelled.state);
+        assert!(transition(&rt.inner, cancelled.clone(), decoded, CancelToken::new()).await);
 
         assert_eq!(steps.load(SeqCst), 0, "the agent was not stepped");
         let after = store.load_run(run).await.expect("load").expect("run");

@@ -36,6 +36,12 @@ Start with the [root README](../README.md), then the guide for what you are doin
 | [Roadmap](roadmap.md) | what is built and what is not |
 | [The chart](../deploy/coder/README.md) | every value of the coder's Helm chart |
 
+## Reviews
+
+| Review | What it found |
+|---|---|
+| [Optimisation review, 2026-11-18](reviews/2026-11-18-optimisation.md) | where the framework's RAM, CPU and I/O go, and the ranked fixes |
+
 ## Decisions
 
 ADRs are history: a change to a past decision is a dated *Amended* note, never a silent edit.

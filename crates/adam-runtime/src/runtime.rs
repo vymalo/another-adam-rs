@@ -1386,7 +1386,9 @@ impl Runtime {
     }
 
     /// Snapshot of a run from its durable record (`None` if it does not exist).
-    #[tracing::instrument(skip(self))]
+    ///
+    /// Polled: the span is `debug` so a control plane at `info` pays nothing per poll.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn view(&self, run: RunId) -> Result<Option<RunView>, RuntimeError> {
         // The lease is read **before** the record. The two reads are not one snapshot, and this
         // order makes every interleaving harmless: a claim that lands between them reads as not

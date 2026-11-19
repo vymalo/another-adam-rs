@@ -126,6 +126,7 @@ dependencies = [
  "chrono",
  "futures",
  "jsonschema",
+ "memchr",
  "reqwest",
  "rustls-pki-types",
  "ryu-js",
@@ -312,6 +313,7 @@ dependencies = [
  "adam-store-postgres",
  "adam-ui",
  "adam-workspace",
+ "aho-corasick",
  "anyhow",
  "async-trait",
  "axum",
@@ -405,6 +407,7 @@ dependencies = [
  "tokio",
  "tower-test",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -546,6 +549,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "httpdate",
+ "memchr",
  "proptest",
  "reqwest",
  "secrecy",

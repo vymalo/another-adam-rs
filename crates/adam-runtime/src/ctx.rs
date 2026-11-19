@@ -271,7 +271,9 @@ impl Ctx {
     /// transient retry re-runs the steps of the failed try. Make side effects
     /// idempotent (idempotency keys, "create if absent", upserts) when running
     /// them twice would be harmful.
-    #[tracing::instrument(skip(self, f), fields(run = %self.run, seq = self.seq))]
+    /// A step is one journaled side effect, and there are several per transition: the span is
+    /// `debug`, so a worker at `info` pays nothing for it.
+    #[tracing::instrument(level = "debug", skip(self, f), fields(run = %self.run, seq = self.seq))]
     pub async fn step<T, E, F, Fut>(&mut self, name: &str, f: F) -> Result<Result<T, E>, AgentError>
     where
         T: Serialize + DeserializeOwned,
@@ -595,7 +597,7 @@ where
             store.journal_put(run, entry).await.map_err(store_error)?
         }
     };
-    decode::<T, E>(&entry).map_err(|e| {
+    decode::<T, E>(entry).map_err(|e| {
         AgentError::non_determinism(format!(
             "run {run} step {seq} ({name:?}): recorded result does not decode"
         ))
@@ -678,12 +680,13 @@ fn store_error(e: StoreError) -> AgentError {
 }
 
 fn decode<T: DeserializeOwned, E: DeserializeOwned>(
-    entry: &JournalEntry,
+    entry: JournalEntry,
 ) -> Result<Result<T, E>, serde_json::Error> {
+    // The entry is the runtime's own: its payload moves into the value, not a copy of it.
     if entry.ok {
-        serde_json::from_value(entry.payload.clone()).map(Ok)
+        serde_json::from_value(entry.payload).map(Ok)
     } else {
-        serde_json::from_value(entry.payload.clone()).map(Err)
+        serde_json::from_value(entry.payload).map(Err)
     }
 }
 
@@ -1015,6 +1018,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, "s0"), (1, "s1"), (2, "s2")]
         );
+    }
+
+    /// A 1 MiB step payload survives a fresh step and a replay of it.
+    #[tokio::test]
+    async fn a_megabyte_step_payload_decodes_on_the_run_and_on_the_replay() {
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        let big = "x".repeat(1024 * 1024);
+        let first: Result<Result<String, String>, AgentError> =
+            ctx.step("big", || async { Ok(big.clone()) }).await;
+        assert_eq!(first.expect("step").expect("ok"), big);
+        let recorded = ctx
+            .store
+            .journal_get(ctx.run_id(), 0)
+            .await
+            .expect("get")
+            .expect("recorded");
+        assert_eq!(recorded.payload.as_str().map(str::len), Some(1024 * 1024));
+
+        // The replay reads the recorded 1 MiB back: the closure does not run.
+        let (store, run) = (ctx.store.clone(), ctx.run_id());
+        let mut replay = ctx_on(&store, run, 0);
+        let again: Result<Result<String, String>, AgentError> =
+            replay.step("big", || async { Ok(String::new()) }).await;
+        assert_eq!(again.expect("replay").expect("ok"), big);
     }
 
     #[tokio::test]

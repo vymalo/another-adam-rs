@@ -37,11 +37,11 @@ use crate::conversation::{
     PendingSession, PendingWait, Repeats, asks_to_close, parse_context, parse_root_run,
     parse_root_step, parse_session, parse_user_text,
 };
-use crate::history::record_shortenings;
+use crate::history::{RunChars, record_shortenings};
 use crate::images::{
-    ImageGate, ImageStore, InboundImage, Item, KeptImage, MAX_RUN_JOURNALED_IMAGE_BYTES,
-    admit_inbound, answer_with, described, for_sending, image_data, image_scope, image_step,
-    parse_inbound_images, parts_of, state_bytes,
+    ImageCache, ImageGate, ImageStore, InboundImage, Item, KeptImage,
+    MAX_RUN_JOURNALED_IMAGE_BYTES, admit_inbound, answer_with, described, for_sending, image_data,
+    image_scope, image_step, parse_inbound_images, parts_of, state_bytes,
 };
 use crate::kept::{KeptOutput, MAX_RUN_KEPT_BYTES};
 use crate::order;
@@ -290,7 +290,8 @@ struct CallFacts {
 /// from the state and the `Ctx` before [`Ctx::step`], which is where they start.
 struct EarlyFacts {
     ctx: CtxFacts,
-    context: Map<String, Value>,
+    /// The step's one shared copy of the run's context: every call of the turn reads the same map.
+    context: Option<Arc<Map<String, Value>>>,
     root: (Option<RunId>, Option<String>, Option<Plan>),
     kept: Arc<BTreeMap<String, String>>,
     kept_left: usize,
@@ -446,7 +447,7 @@ impl<'a> Early<'a> {
         };
         let mut prepared = self.agent.prepare(
             &self.facts.ctx,
-            &self.facts.context,
+            self.facts.context.as_ref(),
             self.root(),
             &self.notes,
             &call,
@@ -1205,25 +1206,34 @@ impl LlmAgentBuilder {
                 }
             }
         }
+        // Above a limit of one the model is told what `after_previous` means.
+        let instructions = if self.max_parallel > 1 {
+            Some(match self.instructions {
+                Some(own) if !own.trim().is_empty() => {
+                    format!("{own}\n\n{}", order::INSTRUCTION)
+                }
+                _ => order::INSTRUCTION.to_owned(),
+            })
+        } else {
+            self.instructions
+        };
+        // The toolset never changes after the build, so what a request holds besides the history
+        // (the instructions and the specs as the request shows them) is counted once, here, and
+        // never cloned or serialised again to answer `fixed_chars`.
+        let mut shown = specs.clone();
+        order::prepare(&mut shown, self.max_parallel > 1);
+        let fixed_chars = instructions.as_deref().map_or(0, |s| s.chars().count())
+            + serde_json::to_string(&shown).map_or(0, |s| s.chars().count());
         LlmAgent {
             name: self.name,
             model: self.model,
             model_alias: self.model_alias,
-            // Above a limit of one the model is told what `after_previous` means.
-            instructions: if self.max_parallel > 1 {
-                Some(match self.instructions {
-                    Some(own) if !own.trim().is_empty() => {
-                        format!("{own}\n\n{}", order::INSTRUCTION)
-                    }
-                    _ => order::INSTRUCTION.to_owned(),
-                })
-            } else {
-                self.instructions
-            },
+            instructions,
             tools,
             sources: self.sources,
             index,
             specs,
+            fixed_chars,
             limits: self.limits,
             extensions: Arc::new(self.extensions),
             wait_poll: self.wait_poll,
@@ -1232,6 +1242,8 @@ impl LlmAgentBuilder {
             session_agents: self.session_agents.into(),
             session_reports: self.session_reports,
             max_parallel: self.max_parallel,
+            images_cache: Arc::new(Mutex::new(ImageCache::new())),
+            run_chars: Arc::new(Mutex::new(RunChars::default())),
         }
     }
 }
@@ -1386,6 +1398,9 @@ pub struct LlmAgent {
     sources: Vec<DynToolSource>,
     index: HashMap<String, usize>,
     specs: Vec<ToolSpec>,
+    /// The characters of the instructions and the specs as a request shows them: what a request
+    /// holds besides the history. Counted once at build; the toolset never changes after it.
+    fixed_chars: usize,
     limits: Limits,
     extensions: Arc<Extensions>,
     wait_poll: Duration,
@@ -1397,6 +1412,12 @@ pub struct LlmAgent {
     session_reports: bool,
     /// The most tool calls of a turn that run at the same time.
     max_parallel: usize,
+    /// The bytes of the images already read and checked, by SHA-256, shared by every run of this
+    /// agent: a turn reads an image file once, not once per model call.
+    images_cache: Arc<Mutex<ImageCache>>,
+    /// The characters of each run's history as this worker last counted it: a turn counts only the
+    /// messages appended since, not the whole transcript again.
+    run_chars: Arc<Mutex<RunChars>>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -1677,6 +1698,9 @@ impl LlmAgent {
                     |p| !matches!(p, adam_model::ContentPart::Text { text } if text.is_empty()),
                 );
                 content.extend(parts_of("", &items));
+                // The message the run started with changed in place: the count of the history this
+                // worker keeps no longer describes it, so the next turn counts in full.
+                self.forget_chars(ctx.run_id());
             }
         }
         for inbound in inbox {
@@ -1831,6 +1855,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         state: &mut Conversation,
+        context: Option<&Arc<Map<String, Value>>>,
     ) -> Result<(Flow, Option<Early<'_>>), AgentError> {
         if ctx.is_cancelled() {
             return Ok((Flow::Fail(CANCELLED.into()), None));
@@ -1881,7 +1906,7 @@ impl LlmAgent {
                 ctx.run_id(),
                 state.root_run.unwrap_or_else(|| ctx.run_id()),
                 ctx.conversation_id().map(str::to_owned),
-                Arc::new(state.context.clone()),
+                context.cloned().unwrap_or_default(),
             )
         });
         let turn = state.turns;
@@ -1908,20 +1933,26 @@ impl LlmAgent {
             &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
         );
         let images_state = Arc::clone(&state.images);
+        let images_cache = Arc::clone(&self.images_cache);
         // A report is told to the model before its first call of a run, and before every call
         // while a session of the conversation may still end.
         if turn == 0 && state.chain_started.is_none() {
             state.chain_started = Some(ctx.now());
         }
+        // What a call of this turn is made from, taken once: the report's tool context and the calls
+        // that may start while the model writes read the same snapshot.
+        let ctx_facts = CtxFacts::of(ctx);
         let report_plan = (self.session_reports && !closing && (turn == 0 || state.sessions_open))
-            .then(|| self.report_plan(ctx, state))
+            .then(|| self.report_plan(&ctx_facts, state, context))
             .flatten();
         // The calls of this turn may start while the model is still writing (ADR 0049, amended):
         // what they need is taken from the state and the `Ctx` now, because neither is at hand
         // inside `Ctx::step`. The batch is handed back through the slot however the step ends.
         let early_facts = EarlyFacts {
-            ctx: CtxFacts::of(ctx),
-            context: state.context.clone(),
+            ctx: ctx_facts,
+            // The step's one shared copy, not a clone of the map: a started call reads the same
+            // context as the calls that run at the turn.
+            context: context.cloned(),
             root: (state.root_run, state.root_step.clone(), state.plan.clone()),
             kept: Arc::clone(&state.kept_outputs),
             kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
@@ -1948,6 +1979,7 @@ impl LlmAgent {
                         images_store.as_ref(),
                         &images_scope,
                         &images_state,
+                        &images_cache,
                     )
                     .await;
                 }
@@ -2093,10 +2125,12 @@ impl LlmAgent {
             // The provider refused the request itself: if images no earlier request carried are in
             // it, they may be why.
             Err(f) if f.refused => {
-                return Ok((
-                    Self::refused_with_images(state, &carried, &f.message),
-                    early,
-                ));
+                let flow = Self::refused_with_images(state, &carried, &f.message);
+                if matches!(flow, Flow::Next) {
+                    // Images left the history in place: count it afresh next turn.
+                    self.forget_chars(run);
+                }
+                return Ok((flow, early));
             }
             Err(f) => {
                 return Ok((
@@ -2280,17 +2314,15 @@ impl LlmAgent {
 
     /// Characters a request holds besides the history: the instructions and the tools.
     fn fixed_chars(&self) -> usize {
-        self.instructions
-            .as_deref()
-            .map_or(0, |s| s.chars().count())
-            + serde_json::to_string(&self.shown_specs()).map_or(0, |s| s.chars().count())
+        self.fixed_chars
     }
 
-    /// The agent's own specs as a request shows them: with `after_previous` above a limit of one.
-    fn shown_specs(&self) -> Vec<ToolSpec> {
-        let mut specs = self.specs.clone();
-        order::prepare(&mut specs, self.max_parallel > 1);
-        specs
+    /// Forget the character count of a run that ends: nothing of its history is counted again.
+    fn forget_chars(&self, run: RunId) {
+        self.run_chars
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .forget(run);
     }
 
     /// The estimate of the next request, in tokens.
@@ -2462,6 +2494,7 @@ impl LlmAgent {
             &state.root_run.unwrap_or_else(|| ctx.run_id()).to_string(),
         );
         let images_state = Arc::clone(&state.images);
+        let images_cache = Arc::clone(&self.images_cache);
         let recorded: Result<Summarised, ModelFailure> = ctx
             .step(&id, move || async move {
                 if !named.is_empty() {
@@ -2470,6 +2503,7 @@ impl LlmAgent {
                         images_store.as_ref(),
                         &images_scope,
                         &images_state,
+                        &images_cache,
                     )
                     .await;
                 }
@@ -2625,14 +2659,19 @@ impl LlmAgent {
 
     /// What the model call needs to be told the reports of ended rounds, if this agent has session
     /// tools to read them with.
-    fn report_plan(&self, ctx: &Ctx, state: &Conversation) -> Option<ReportPlan> {
+    fn report_plan(
+        &self,
+        ctx: &CtxFacts,
+        state: &Conversation,
+        context: Option<&Arc<Map<String, Value>>>,
+    ) -> Option<ReportPlan> {
         if self.session_agents.is_empty() {
             return None;
         }
         let tool = self.tool(SUBAGENT_READ)?.clone();
         let tool_ctx = self.tool_ctx(
-            &CtxFacts::of(ctx),
-            &state.context,
+            ctx,
+            context,
             (
                 state.root_run,
                 state.root_step.as_deref(),
@@ -2653,8 +2692,8 @@ impl LlmAgent {
             paged: tool.paged(),
             tool,
             tool_ctx,
-            starter: ctx.child_starter(),
-            me: ctx.run_id(),
+            starter: ctx.child_starter.clone(),
+            me: ctx.run,
             agents: Arc::clone(&self.session_agents),
             reported: state.reported_rounds.clone(),
             in_history,
@@ -2919,6 +2958,7 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         notices: &[(RunId, ChildStatus)],
+        context: Option<&Arc<Map<String, Value>>>,
         early: &mut Option<Early<'_>>,
     ) -> Result<Flow, AgentError> {
         while let Some(call) = state.pending_calls.first().cloned() {
@@ -2929,7 +2969,10 @@ impl LlmAgent {
             // The calls that run beside this one: none unless the schedule puts several together.
             let together = self.together(state);
             if together >= 2 {
-                match self.run_segment(ctx, state, together, early).await? {
+                match self
+                    .run_segment(ctx, state, together, context, early)
+                    .await?
+                {
                     Some(flow) => return Ok(flow),
                     None => continue,
                 }
@@ -3005,7 +3048,7 @@ impl LlmAgent {
             let (result, reported) = self
                 .run_tool(
                     ctx,
-                    &state.context,
+                    context,
                     (
                         state.root_run,
                         state.root_step.as_deref(),
@@ -3242,6 +3285,7 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         n: usize,
+        context: Option<&Arc<Map<String, Value>>>,
         early: &mut Option<Early<'_>>,
     ) -> Result<Option<Flow>, AgentError> {
         let calls: Vec<ToolCall> = state.pending_calls[..n].to_vec();
@@ -3310,7 +3354,7 @@ impl LlmAgent {
                 kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                 images: self.image_gate(state),
             };
-            let mut one = self.prepare(&facts_of_ctx, &state.context, root, &notes, call, facts);
+            let mut one = self.prepare(&facts_of_ctx, context, root, &notes, call, facts);
             match &first {
                 Some(head) => one.tool_ctx = one.tool_ctx.sharing_budgets_of(head),
                 None => first = Some(one.tool_ctx.clone()),
@@ -3755,7 +3799,7 @@ impl LlmAgent {
     fn prepare(
         &self,
         ctx: &CtxFacts,
-        context: &Map<String, Value>,
+        context: Option<&Arc<Map<String, Value>>>,
         root: (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call: &ToolCall,
@@ -3789,7 +3833,7 @@ impl LlmAgent {
                     ctx.run,
                     root.0.unwrap_or(ctx.run),
                     ctx.conversation_id.clone(),
-                    Arc::new(context.clone()),
+                    context.cloned().unwrap_or_default(),
                 ),
             )
         });
@@ -3869,7 +3913,7 @@ impl LlmAgent {
     async fn run_tool(
         &self,
         ctx: &mut Ctx,
-        context: &Map<String, Value>,
+        context: Option<&Arc<Map<String, Value>>>,
         root: (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call: &ToolCall,
@@ -4098,7 +4142,7 @@ impl LlmAgent {
     fn tool_ctx(
         &self,
         ctx: &CtxFacts,
-        context: &Map<String, Value>,
+        context: Option<&Arc<Map<String, Value>>>,
         (root_run, root_step, plan): (Option<RunId>, Option<&str>, Option<&Plan>),
         notes: &[ToolNote],
         call_id: &str,
@@ -4113,7 +4157,7 @@ impl LlmAgent {
             ctx.cancel.clone(),
             Arc::clone(&self.extensions),
             Some(ctx.child_starter.clone()),
-            Arc::new(context.clone()),
+            context.cloned().unwrap_or_default(),
             root_run,
             root_step.map(str::to_owned),
             self.style_of(tool, notes)
@@ -4233,6 +4277,7 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         wait: &PendingRemote,
+        context: Option<&Arc<Map<String, Value>>>,
     ) -> Result<Option<StepState>, AgentError> {
         let owed = |state: &mut Conversation, message: Message| {
             state.messages.push(message);
@@ -4271,7 +4316,7 @@ impl LlmAgent {
         let tool_ctx = self
             .tool_ctx(
                 &CtxFacts::of(ctx),
-                &state.context,
+                context,
                 (
                     state.root_run,
                     state.root_step.as_deref(),
@@ -5045,6 +5090,7 @@ impl Agent for LlmAgent {
                 .map(Message::text)
                 .unwrap_or_default();
             let output = json!({ "text": text, "artifacts": [], "closed": true });
+            self.forget_chars(ctx.run_id());
             return Ok(Transition::Done { state, output });
         }
         // The history is shortened here, in the state, from the state as it was committed: before
@@ -5069,15 +5115,40 @@ impl Agent for LlmAgent {
         if self.compact_if_due(ctx, &mut state, &output_id_of).await? {
             return Ok(Transition::Continue(state));
         }
+        let mut counted = {
+            let mut totals = self
+                .run_chars
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            totals.begin(
+                run,
+                state.turns,
+                state.shortenings.len(),
+                state.compactions.len(),
+            )
+        };
         if record_shortenings(
             &mut state.messages,
             self.limits.max_history_tokens,
             &output_id_of,
+            &mut counted,
         ) {
             state.shortenings.push(state.turns);
             state.last_prompt = None;
             // The images of a result that was shortened left the history with it.
             state.drop_unnamed_images();
+        }
+        {
+            let mut totals = self
+                .run_chars
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            totals.end(
+                run,
+                counted,
+                state.shortenings.len(),
+                state.compactions.len(),
+            );
         }
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx
             .take_inbox()
@@ -5148,6 +5219,13 @@ impl Agent for LlmAgent {
         if expired > 0 {
             tracing::debug!(expired, "expired entries left the run's context");
         }
+        // One shared copy of the run's context for this step: when there is a context, every tool
+        // call and every source sees the same map, and no call clones it. Built after this step's messages merged their
+        // context and the expired entries left, so it is the map the tools of this step read, and
+        // only when there is something in it: a step with no context (a wake that only looks at a
+        // wait) does not copy one.
+        let context: Option<Arc<Map<String, Value>>> =
+            (!state.context.is_empty()).then(|| Arc::new(state.context.clone()));
 
         // A wait on a child ends with the child's message or, when woken without one (the timer,
         // or a user message), with what the store says. A message that matches no wait (a
@@ -5172,7 +5250,10 @@ impl Agent for LlmAgent {
         // (or by a user message, which queues behind the result), the run looks once and either
         // answers the call or parks again.
         if let Some(PendingWait::Remote(wait)) = state.pending_wait.clone() {
-            match self.poll_remote(ctx, &mut state, &wait).await? {
+            match self
+                .poll_remote(ctx, &mut state, &wait, context.as_ref())
+                .await?
+            {
                 Some(outcome) => {
                     ctx.emit(self.step_end_with_result(&state, &wait.tool, &wait.call_id, outcome))
                         .await;
@@ -5194,7 +5275,10 @@ impl Agent for LlmAgent {
                 task: wait.session.to_string(),
                 deadline: None,
             };
-            match self.poll_remote(ctx, &mut state, &looking).await? {
+            match self
+                .poll_remote(ctx, &mut state, &looking, context.as_ref())
+                .await?
+            {
                 Some(outcome) => {
                     ctx.emit(self.step_end_with_result(
                         &state,
@@ -5217,7 +5301,7 @@ impl Agent for LlmAgent {
         let mut early: Option<Early<'_>> = None;
         if state.pending_calls.is_empty() {
             state.messages.append(&mut state.deferred);
-            let (next, batch) = self.model_turn(ctx, &mut state).await?;
+            let (next, batch) = self.model_turn(ctx, &mut state, context.as_ref()).await?;
             flow = next;
             early = batch;
             // A call that starts, sends to or closes a session has an effect no failed try can undo:
@@ -5234,7 +5318,7 @@ impl Agent for LlmAgent {
         }
         if matches!(flow, Flow::Next) {
             flow = self
-                .run_pending(ctx, &mut state, &notices, &mut early)
+                .run_pending(ctx, &mut state, &notices, context.as_ref(), &mut early)
                 .await?;
         }
         // Whatever the turn did not use (a limit answered its calls, a barrier came first, a stream
@@ -5261,6 +5345,7 @@ impl Agent for LlmAgent {
                     {
                         let mut output = json!({ "text": text, "artifacts": state.artifacts });
                         self.end_sessions(ctx, &mut state, &mut output).await?;
+                        self.forget_chars(ctx.run_id());
                         return Ok(Transition::Done { state, output });
                     }
                     state.announced_final = false;
@@ -5278,9 +5363,13 @@ impl Agent for LlmAgent {
             },
             Flow::Done(mut output) => {
                 self.end_sessions(ctx, &mut state, &mut output).await?;
+                self.forget_chars(ctx.run_id());
                 Transition::Done { state, output }
             }
-            Flow::Fail(error) => Transition::Fail { state, error },
+            Flow::Fail(error) => {
+                self.forget_chars(ctx.run_id());
+                Transition::Fail { state, error }
+            }
         })
     }
 }
@@ -5605,23 +5694,25 @@ mod compaction_gate_tests {
             .build()
     }
 
+    /// An agent with one tool and a sentence of instructions, at a limit of `limit` calls.
+    fn built(limit: usize) -> LlmAgent {
+        let model: DynModel = Arc::new(MockModel::new());
+        LlmAgent::builder("t", model, "m")
+            .instructions("be brief")
+            .max_parallel(limit)
+            .tool(crate::FnTool::raw(
+                "a",
+                "a",
+                json!({"type": "object", "properties": {}}),
+                |_ctx, _args| async { Ok::<_, crate::ToolError>(crate::ToolOutput::text("a")) },
+            ))
+            .build()
+    }
+
     /// The budget of a request counts what the loop adds above a limit of one: the property in each
     /// schema and the sentence of the instructions.
     #[test]
     fn the_fixed_part_of_a_request_counts_the_injected_order() {
-        let built = |limit: usize| {
-            let model: DynModel = Arc::new(MockModel::new());
-            LlmAgent::builder("t", model, "m")
-                .instructions("be brief")
-                .max_parallel(limit)
-                .tool(crate::FnTool::raw(
-                    "a",
-                    "a",
-                    json!({"type": "object", "properties": {}}),
-                    |_ctx, _args| async { Ok::<_, crate::ToolError>(crate::ToolOutput::text("a")) },
-                ))
-                .build()
-        };
         let one = built(1).fixed_chars();
         let ten = built(10).fixed_chars();
         let mut specs = built(10).specs.clone();

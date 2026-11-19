@@ -214,6 +214,11 @@ commands do not change environment half way. An `ensure` is single-flight per ru
 `<run dir>/lock`), and the caller may drop it: a half-made environment is `Building` in `state.json` and is made again, with
 its partial container removed by label.
 
+*Amended 2026-11-19:* the check is cached for 3 seconds (`Settings::alive_ttl`): only a positive verdict is
+remembered, keyed by the run and the container id, and `build`, `rebuild` and `release` forget it. A command in a
+container that dies inside the window fails rather than running elsewhere; the first `ensure` after the window sees
+it gone and makes the environment again (`Again::Lost`).
+
 ## Defaults the owner may revisit
 
 | Id | Topic | Default | Alternative |

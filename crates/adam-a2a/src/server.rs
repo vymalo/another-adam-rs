@@ -18,6 +18,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::StreamExt;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 
 use crate::activation::{self, HEADER};
 use crate::auth::{self, AuthConfig, Authenticator, JWKS_PATH};
@@ -325,23 +327,127 @@ async fn echo_extensions(State(echo): State<Echo>, request: Request, next: Next)
 /// other body (a method that carries no message, or something that is not a JSON-RPC request).
 fn message_extensions(body: &[u8]) -> Vec<String> {
     use a2a::jsonrpc::methods::{SEND_MESSAGE, SEND_STREAMING_MESSAGE};
-    let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Ok(request) = serde_json::from_slice::<SendEnvelope>(body) else {
         return Vec::new();
     };
     if !matches!(
-        request["method"].as_str(),
-        Some(SEND_MESSAGE | SEND_STREAMING_MESSAGE)
+        request.method.as_str(),
+        SEND_MESSAGE | SEND_STREAMING_MESSAGE
     ) {
         return Vec::new();
     }
-    request["params"]["message"]["extensions"]
-        .as_array()
-        .map(|uris| {
-            uris.iter()
-                .filter_map(|u| u.as_str().map(str::to_owned))
-                .collect()
-        })
+    request
+        .params
+        .and_then(|params| params.message)
+        .map(|message| message.extensions)
         .unwrap_or_default()
+}
+
+/// A JSON-RPC request read for the extensions its message names, and nothing else: a body is up to
+/// 10 MiB of base64 file parts, which a full `serde_json::Value` would copy and this does not.
+#[derive(Deserialize)]
+struct SendEnvelope {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    params: Option<SendParams>,
+}
+
+#[derive(Deserialize)]
+struct SendParams {
+    #[serde(default)]
+    message: Option<SendMessage>,
+}
+
+/// A message read for its `extensions` only. Every other member is skipped: `parts` is named so
+/// that it is skipped with [`IgnoredAny`] (which scans a string without allocating it) rather than
+/// by relying on the derive's unknown-field path.
+#[derive(Deserialize)]
+pub(crate) struct SendMessage {
+    #[serde(rename = "parts", default)]
+    _parts: Option<IgnoredAny>,
+    #[serde(default, deserialize_with = "extensions")]
+    pub(crate) extensions: Vec<String>,
+}
+
+/// The extension URIs of a message, read leniently: an element that is not a string is skipped, as
+/// indexing the array of a `serde_json::Value` did, and so is a member that is not an array.
+fn extensions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    /// One element of the array: its text, or nothing for anything else.
+    #[derive(Default)]
+    struct Extension(Option<String>);
+
+    impl<'de> serde::Deserialize<'de> for Extension {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Element;
+            impl<'de> serde::de::Visitor<'de> for Element {
+                type Value = Extension;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a message extension URI")
+                }
+
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Extension, E> {
+                    Ok(Extension(Some(v.to_owned())))
+                }
+
+                fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Extension, E> {
+                    Ok(Extension(Some(v)))
+                }
+
+                fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Extension, E> {
+                    Ok(Extension(None))
+                }
+
+                fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Extension, E> {
+                    Ok(Extension(None))
+                }
+
+                fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Extension, E> {
+                    Ok(Extension(None))
+                }
+
+                fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Extension, E> {
+                    Ok(Extension(None))
+                }
+
+                fn visit_unit<E: serde::de::Error>(self) -> Result<Extension, E> {
+                    Ok(Extension(None))
+                }
+
+                fn visit_none<E: serde::de::Error>(self) -> Result<Extension, E> {
+                    Ok(Extension(None))
+                }
+
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> Result<Extension, A::Error> {
+                    while seq.next_element::<IgnoredAny>()?.is_some() {}
+                    Ok(Extension(None))
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Extension, A::Error> {
+                    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                    Ok(Extension(None))
+                }
+            }
+
+            let extension = deserializer.deserialize_any(Element)?;
+            Ok(Extension(extension.0))
+        }
+    }
+
+    Ok(Vec::<Extension>::deserialize(deserializer)?
+        .into_iter()
+        .filter_map(|extension| extension.0)
+        .collect())
 }
 
 /// Turn the SDK extractor's plain-text rejections into JSON-RPC error objects.
@@ -409,12 +515,13 @@ async fn json_rpc_rejections(request: Request, next: Next) -> Response {
 /// the 1.0 way (`taskPushNotificationConfig`).
 fn legacy_push_config(body: &[u8]) -> Option<a2a::JsonRpcId> {
     use a2a::jsonrpc::methods::{SEND_MESSAGE, SEND_STREAMING_MESSAGE};
-    // Cheap first: almost every request does not contain the word.
+    // Cheap first: almost every request does not contain the word, and the scan allocates nothing.
     const LEGACY: &[u8] = b"\"pushNotificationConfig\"";
-    if !body.windows(LEGACY.len()).any(|w| w == LEGACY) {
-        return None;
-    }
-    let request: serde_json::Value = serde_json::from_slice(body).ok()?;
+    memchr::memmem::find(body, LEGACY)?;
+    // A body that names the member is still read whole, into a `Value` of up to the SDK's 10 MiB:
+    // the check needs the configuration's shape, and the needle is rare (a normal request never
+    // contains it, and the SDK reads the whole body anyway).
+    let request = full_body(body)?;
     if !matches!(
         request["method"].as_str(),
         Some(SEND_MESSAGE | SEND_STREAMING_MESSAGE)
@@ -428,6 +535,36 @@ fn legacy_push_config(body: &[u8]) -> Option<a2a::JsonRpcId> {
         return None;
     }
     Some(serde_json::from_value(request["id"].clone()).unwrap_or(a2a::JsonRpcId::Null))
+}
+
+/// A request body as a whole `serde_json::Value`. The only caller is [`legacy_push_config`], which
+/// runs only for a body that names a member of an earlier draft; a test counts these, and proves a
+/// send body is read without one.
+pub(crate) fn full_body(body: &[u8]) -> Option<serde_json::Value> {
+    #[cfg(test)]
+    work::full_parses();
+    serde_json::from_slice(body).ok()
+}
+
+/// What reading a body costs, for the test that proves a send body is not built into a
+/// `serde_json::Value` to read its extensions. Thread-local: the tests run in parallel, each on its
+/// own thread.
+#[cfg(test)]
+pub(crate) mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FULL_PARSES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn full_parses() {
+        FULL_PARSES.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Bodies built into a `serde_json::Value` on this thread so far.
+    pub(crate) fn parsed_fully() -> u64 {
+        FULL_PARSES.with(Cell::get)
+    }
 }
 
 const NOT_JSON: &str = "parse error: the body is not valid JSON";
@@ -463,4 +600,149 @@ async fn keepalive(State(interval): State<Duration>, request: Request, next: Nex
         }
     });
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the echo read before the typed parse: `params.message.extensions` of the body indexed
+    /// as a `serde_json::Value`. The typed read must say the same for every shape.
+    fn as_value(body: &[u8]) -> Vec<String> {
+        use a2a::jsonrpc::methods::{SEND_MESSAGE, SEND_STREAMING_MESSAGE};
+        let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Vec::new();
+        };
+        if !matches!(
+            request["method"].as_str(),
+            Some(SEND_MESSAGE | SEND_STREAMING_MESSAGE)
+        ) {
+            return Vec::new();
+        }
+        request["params"]["message"]["extensions"]
+            .as_array()
+            .map(|uris| {
+                uris.iter()
+                    .filter_map(|u| u.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A `SendMessage` body whose message names `extensions`.
+    fn send(extensions: serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": {"message": {
+                "messageId": "m",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hi"}],
+                "extensions": extensions,
+            }},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn the_extensions_read_are_the_ones_a_value_read_gave() {
+        for body in [
+            send(serde_json::json!(["urn:a", "urn:b"])),
+            send(serde_json::json!([])),
+            // An element that is not a string is skipped, as indexing the array did.
+            send(serde_json::json!(["urn:a", 7, null, {"x": 1}, ["y"]])),
+            send(serde_json::json!("urn:a")),
+            send(serde_json::Value::Null),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "GetTask",
+                "params": {"message": {"extensions": ["urn:a"]}},
+            })
+            .to_string(),
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": 7, "params": {}}).to_string(),
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": []})
+                .to_string(),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {"message": 5},
+            })
+            .to_string(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        ] {
+            assert_eq!(
+                message_extensions(body.as_bytes()),
+                as_value(body.as_bytes()),
+                "{body}"
+            );
+        }
+        // The twelfth shape, which the `Value` oracle cannot judge: duplicate members. The typed
+        // read refuses the body, where indexing a `Value` takes the last member. The SDK reads a
+        // request with a derived `Deserialize` into `JsonRpcRequest`, which refuses a duplicate
+        // field too, so such a request is answered with an error either way and the echo is empty.
+        for duplicate in [
+            // duplicate `method`
+            r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","method":"GetTask","params":{"message":{"extensions":["urn:a"]}}}"#,
+            // duplicate `params`
+            r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"extensions":["urn:a"]}},"params":{}}"#,
+            // duplicate `extensions`
+            r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"extensions":["urn:a"],"extensions":["urn:b"]}}}"#,
+        ] {
+            assert!(
+                message_extensions(duplicate.as_bytes()).is_empty(),
+                "{duplicate}"
+            );
+        }
+    }
+
+    /// A send body is up to the SDK's 10 MiB of base64 file parts: reading the extensions must not
+    /// build a `serde_json::Value` of them. The counter is the one full parse left
+    /// ([`legacy_push_config`]), and its second half proves the counter can move.
+    #[test]
+    fn a_large_send_body_is_read_without_building_a_value() {
+        // 4 MiB of base64, under the SDK's limit and well over what a test should copy twice.
+        let raw = "QUJD".repeat(1024 * 1024);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "SendMessage",
+            "params": {"message": {
+                "messageId": "m",
+                "role": "ROLE_USER",
+                "parts": [{"raw": raw}],
+                "extensions": ["urn:a", "urn:b"],
+            }},
+        })
+        .to_string();
+        assert!(body.len() > 4 * 1024 * 1024, "{}", body.len());
+        let before = work::parsed_fully();
+        assert_eq!(message_extensions(body.as_bytes()), ["urn:a", "urn:b"]);
+        assert_eq!(
+            work::parsed_fully(),
+            before,
+            "the send body was not built into a Value"
+        );
+
+        let legacy = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "m",
+                    "role": "ROLE_USER",
+                    "parts": [{"raw": raw}],
+                },
+                "configuration": {"pushNotificationConfig": {"url": "https://hooks.example.com/x"}},
+            },
+        })
+        .to_string();
+        assert_eq!(
+            legacy_push_config(legacy.as_bytes()),
+            Some(a2a::JsonRpcId::Number(9))
+        );
+        assert!(
+            work::parsed_fully() > before,
+            "the full parse of the legacy check is counted"
+        );
+    }
 }

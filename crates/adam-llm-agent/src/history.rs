@@ -1,5 +1,8 @@
 //! Fitting the history into the model's context budget.
 
+use std::collections::{HashMap, VecDeque};
+
+use adam_core::RunId;
 use adam_model::{ContentPart, Message};
 
 /// Prefix of the marker appended to a truncated tool output. Public through
@@ -152,6 +155,31 @@ fn part_chars(p: &ContentPart) -> usize {
     }
 }
 
+/// Characters a tool call's arguments take when they are written: the serialisation the model is
+/// sent, counted without keeping it.
+fn arguments_chars(arguments: &serde_json::Value) -> usize {
+    #[cfg(test)]
+    SERIALISATIONS.with(|n| n.set(n.get() + 1));
+    arguments.to_string().chars().count()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many tool call arguments were serialised on this thread: the test's proof that a warm
+    /// count does not walk the history again.
+    static SERIALISATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn serialisations() -> usize {
+    SERIALISATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_serialisations() {
+    SERIALISATIONS.with(|n| n.set(0));
+}
+
 /// Characters a message contributes to the estimate.
 pub(crate) fn message_chars(m: &Message) -> usize {
     match m {
@@ -166,12 +194,103 @@ pub(crate) fn message_chars(m: &Message) -> usize {
                 + content.iter().map(part_chars).sum::<usize>()
                 + tool_calls
                     .iter()
-                    .map(|c| c.name.chars().count() + c.arguments.to_string().chars().count())
+                    .map(|c| c.name.chars().count() + arguments_chars(&c.arguments))
                     .sum::<usize>()
         }
         Message::Tool {
             content, images, ..
         } => content.chars().count() + images.len() * IMAGE_CHARS,
+    }
+}
+
+/// The characters of a history as it grows: a count from the messages appended since the last one,
+/// never from the whole transcript again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Chars {
+    len: usize,
+    chars: usize,
+}
+
+impl Chars {
+    /// The total characters of `messages`. A history of one run only ever grows between two counts,
+    /// so only the messages past the last count are walked; a shorter history (a compaction) is
+    /// counted in full. A rewrite that changes a message in place without changing the count -
+    /// `record_shortenings` itself, the start message's images in `LlmAgent::admit_images`, and the
+    /// images of a refused request in `Conversation::replace_unsent_images` - leaves this count
+    /// stale: `record_shortenings` updates it, and the other two call `LlmAgent::forget_chars`.
+    pub(crate) fn total(&mut self, messages: &[Message]) -> usize {
+        if self.len <= messages.len() {
+            self.chars += messages[self.len..]
+                .iter()
+                .map(message_chars)
+                .sum::<usize>();
+        } else {
+            self.chars = messages.iter().map(message_chars).sum();
+        }
+        self.len = messages.len();
+        self.chars
+    }
+}
+
+/// The character count of each run's history as this worker last made it, so a turn counts only
+/// what it appended since. The guard covers the two changes that rewrite the history and record
+/// it: `shortenings` and `compactions` must be the same. A message rewritten in place without
+/// either counter moving - the start message's images, a refused request's images - is not seen by
+/// the guard; those rewrites call `LlmAgent::forget_chars` in the process that makes them. A run's
+/// first turn is always counted in full, so a run id the store reuses after a purge never reads
+/// another run's total.
+#[derive(Debug, Default)]
+pub(crate) struct RunChars {
+    entries: HashMap<RunId, (Chars, usize, usize)>,
+    order: VecDeque<RunId>,
+}
+
+/// The most runs whose totals are remembered; past it the oldest entry goes, and a run that comes
+/// back counts in full once.
+const RUN_CHARS_MAX: usize = 1024;
+
+impl RunChars {
+    /// The count to start `run`'s turn from: its last one when the history is still the one it
+    /// counted (nothing shortened or compacted it, and this is not the run's first turn), else an
+    /// empty one, which counts every message.
+    pub(crate) fn begin(
+        &mut self,
+        run: RunId,
+        turns: u32,
+        shortenings: usize,
+        compactions: usize,
+    ) -> Chars {
+        if turns == 0 {
+            return Chars::default();
+        }
+        match self.entries.get(&run) {
+            Some((chars, shortened, compacted))
+                if *shortened == shortenings && *compacted == compactions =>
+            {
+                *chars
+            }
+            _ => Chars::default(),
+        }
+    }
+
+    /// Remember what the turn's count says the history holds, for the next turn of `run`.
+    pub(crate) fn end(&mut self, run: RunId, chars: Chars, shortenings: usize, compactions: usize) {
+        if !self.entries.contains_key(&run) {
+            self.order.push_back(run);
+            while self.order.len() > RUN_CHARS_MAX {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+        self.entries.insert(run, (chars, shortenings, compactions));
+    }
+
+    /// Forget `run`: it ended, so nothing of its history will be counted again.
+    pub(crate) fn forget(&mut self, run: RunId) {
+        if self.entries.remove(&run).is_some() {
+            self.order.retain(|r| *r != run);
+        }
     }
 }
 
@@ -204,11 +323,14 @@ fn estimate_tokens(messages: &[Message]) -> usize {
 ///   may reject, failing the run with a clear error) than silently losing conversation.
 ///
 /// A pure function of `messages` and `max_tokens`, so a replay of a turn from the committed state
-/// shortens the same way.
+/// shortens the same way. `counted` is only how the count is made cheaper ([`Chars`]): it carries
+/// the characters of the messages already counted, so only those appended since are walked, and it
+/// is left exact for the next turn.
 pub(crate) fn record_shortenings(
     messages: &mut [Message],
     max_tokens: u32,
     output_id_of: &dyn Fn(&str) -> Option<String>,
+    counted: &mut Chars,
 ) -> bool {
     if max_tokens == 0 {
         return false;
@@ -216,7 +338,7 @@ pub(crate) fn record_shortenings(
     let budget = usize::try_from(max_tokens)
         .unwrap_or(usize::MAX)
         .saturating_mul(4);
-    let mut total: usize = messages.iter().map(message_chars).sum();
+    let mut total = counted.total(messages);
     if total <= budget {
         return false;
     }
@@ -265,6 +387,8 @@ pub(crate) fn record_shortenings(
             shortened_any = true;
         }
     }
+    counted.chars = total;
+    counted.len = messages.len();
     shortened_any
 }
 
@@ -277,7 +401,7 @@ mod tests {
     /// `messages` after [`record_shortenings`], as a copy.
     fn fit_history(messages: &[Message], max_tokens: u32) -> Vec<Message> {
         let mut out = messages.to_vec();
-        record_shortenings(&mut out, max_tokens, &no_ids);
+        record_shortenings(&mut out, max_tokens, &no_ids, &mut Chars::default());
         out
     }
 
@@ -371,18 +495,118 @@ mod tests {
     #[test]
     fn it_says_whether_it_shortened_and_does_not_shorten_twice() {
         let mut m = convo();
-        assert!(!record_shortenings(&mut m.clone(), 0, &no_ids));
-        assert!(!record_shortenings(&mut m.clone(), 10_000, &no_ids));
-        assert!(record_shortenings(&mut m, 2750, &no_ids));
+        assert!(!record_shortenings(
+            &mut m.clone(),
+            0,
+            &no_ids,
+            &mut Chars::default()
+        ));
+        assert!(!record_shortenings(
+            &mut m.clone(),
+            10_000,
+            &no_ids,
+            &mut Chars::default()
+        ));
+        assert!(record_shortenings(
+            &mut m,
+            2750,
+            &no_ids,
+            &mut Chars::default()
+        ));
         let once = m.clone();
         // Under three quarters of the budget now: the next call has nothing to do, and the
         // history is what it was (the requests after a shortening extend it unchanged).
-        assert!(!record_shortenings(&mut m, 2750, &no_ids));
+        assert!(!record_shortenings(
+            &mut m,
+            2750,
+            &no_ids,
+            &mut Chars::default()
+        ));
         assert_eq!(m, once);
         // Over budget with nothing left to shorten is not a shortening either.
         let mut floor = convo();
-        assert!(record_shortenings(&mut floor, 10, &no_ids));
-        assert!(!record_shortenings(&mut floor, 10, &no_ids));
+        assert!(record_shortenings(
+            &mut floor,
+            10,
+            &no_ids,
+            &mut Chars::default()
+        ));
+        assert!(!record_shortenings(
+            &mut floor,
+            10,
+            &no_ids,
+            &mut Chars::default()
+        ));
+    }
+
+    /// An assistant message whose call carries 50 KB of arguments: the serialisation a whole-history
+    /// count pays for once per historical call.
+    fn big_call(n: usize) -> Message {
+        Message::Assistant {
+            content: vec![],
+            tool_calls: vec![ToolCall {
+                id: format!("c{n}"),
+                name: "t".into(),
+                arguments: json!({"blob": "x".repeat(50_000)}),
+                ..Default::default()
+            }],
+            reasoning: None,
+        }
+    }
+
+    /// A turn counts only what the history gained since the last count: the 40 calls already
+    /// counted are not serialised again, and the total is the one a full count gives.
+    #[test]
+    fn a_warm_count_walks_only_the_messages_appended_since() {
+        let mut messages: Vec<Message> = (0..40).map(big_call).collect();
+        let mut counted = Chars::default();
+        reset_serialisations();
+        let first = counted.total(&messages);
+        assert_eq!(serialisations(), 40);
+        assert_eq!(first, messages.iter().map(message_chars).sum::<usize>());
+        // The turn appends its answer; the next count serialises that one call only.
+        messages.push(big_call(40));
+        reset_serialisations();
+        let second = counted.total(&messages);
+        assert_eq!(serialisations(), 1);
+        assert_eq!(second, messages.iter().map(message_chars).sum::<usize>());
+    }
+
+    /// The shortening decision and the history it leaves are the same whether the count was made
+    /// fresh or carried from the turn before.
+    #[test]
+    fn a_warm_count_shortens_exactly_as_a_cold_one() {
+        let history = convo();
+        let mut cold = history.clone();
+        let mut warm = history.clone();
+        let mut counted = Chars::default();
+        counted.total(&warm);
+        let cold_cut = record_shortenings(&mut cold, 1000, &no_ids, &mut Chars::default());
+        let warm_cut = record_shortenings(&mut warm, 1000, &no_ids, &mut counted);
+        assert!(cold_cut, "the history is over the budget");
+        assert_eq!(cold_cut, warm_cut);
+        assert_eq!(cold, warm);
+        // The count a shortened history leaves is exact for the next turn.
+        assert_eq!(counted.chars, warm.iter().map(message_chars).sum::<usize>());
+    }
+
+    /// A run's total is used only for the history it counted: its first turn, and every turn after
+    /// one that neither shortened nor compacted it.
+    #[test]
+    fn a_run_reuses_its_total_only_for_the_history_it_counted() {
+        let run = RunId::new();
+        let mut totals = RunChars::default();
+        assert_eq!(totals.begin(run, 0, 0, 0), Chars::default());
+        let mut counted = Chars::default();
+        counted.total(&convo());
+        totals.end(run, counted, 0, 0);
+        assert_eq!(totals.begin(run, 1, 0, 0), counted);
+        // Another worker shortened or compacted the history: this total is not its.
+        assert_eq!(totals.begin(run, 1, 1, 0), Chars::default());
+        assert_eq!(totals.begin(run, 1, 0, 1), Chars::default());
+        // A run that ends is forgotten, so an id the store reuses starts afresh.
+        totals.forget(run);
+        assert_eq!(totals.begin(run, 1, 0, 0), Chars::default());
     }
 
     #[test]
@@ -478,7 +702,12 @@ mod tests {
             call("c3"),
             big("c3", 10, 'y'),
         ];
-        assert!(record_shortenings(&mut m, 100, &no_ids));
+        assert!(record_shortenings(
+            &mut m,
+            100,
+            &no_ids,
+            &mut Chars::default()
+        ));
         assert_eq!(m[2].text(), small);
     }
 
@@ -603,7 +832,12 @@ mod tests {
         for turn in 0..5 {
             m.push(call(&format!("c{turn}")));
             m.push(big(&format!("c{turn}"), 5_000, 'x'));
-            cuts.push(record_shortenings(&mut m, 100, &no_ids));
+            cuts.push(record_shortenings(
+                &mut m,
+                100,
+                &no_ids,
+                &mut Chars::default(),
+            ));
         }
         assert_eq!(cuts, [false, true, true, true, true]);
     }
@@ -686,7 +920,7 @@ mod tests {
 
                 // A second pass has nothing to do: the next request extends this history as it is.
                 let mut again = fitted.clone();
-                prop_assert!(!record_shortenings(&mut again, max_tokens, &no_ids));
+                prop_assert!(!record_shortenings(&mut again, max_tokens, &no_ids, &mut Chars::default()));
                 prop_assert_eq!(&again, &fitted);
 
                 if max_tokens == 0 {
@@ -747,10 +981,10 @@ mod tests {
                     originals.push((messages.len(), text.clone()));
                     messages.push(Message::tool_result(format!("c{n}"), text.clone()));
                     // A pass after each growth, with the budget of that pass.
-                    record_shortenings(&mut messages, budgets[n % budgets.len()], &one_id);
+                    record_shortenings(&mut messages, budgets[n % budgets.len()], &one_id, &mut Chars::default());
                     messages.push(call("last"));
                     messages.push(Message::tool_result("last", "tail"));
-                    record_shortenings(&mut messages, budgets[n % budgets.len()], &one_id);
+                    record_shortenings(&mut messages, budgets[n % budgets.len()], &one_id, &mut Chars::default());
                     messages.truncate(messages.len() - 2);
                 }
                 for (at, original) in &originals {

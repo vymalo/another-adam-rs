@@ -72,6 +72,10 @@ pub const PUBLISH_SETTLE: Duration = Duration::from_millis(300);
 pub const MAX_OPEN_FILES: usize = 200;
 /// The most files looked at for changes under a project root.
 pub const MAX_WATCHED_FILES: usize = 20_000;
+/// How often the root is walked for `didChangeWatchedFiles`: a call inside the interval reuses the
+/// last walk unless the coder wrote since, so a turn of tool calls does not walk the project once
+/// per call, and a change the coder made is still reported at its next call.
+pub const WATCHED_TTL: Duration = Duration::from_secs(1);
 /// The largest file sent to a server.
 pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the process to be gone.
@@ -483,8 +487,22 @@ struct Work {
     order: Vec<PathBuf>,
     /// The files under the root, as the server was last told: size and modification time.
     watched: Option<HashMap<PathBuf, (u64, u128)>>,
+    /// When `watched` was taken: the walk is repeated at most once per [`WATCHED_TTL`].
+    walked_at: Option<Instant>,
     /// A reference's state when the server started: what it must leave as it found it.
     reference: Option<Snapshot>,
+}
+
+impl Work {
+    /// Whether this call walks the root again: the first call, a write the coder made since the
+    /// last walk, or a set older than [`WATCHED_TTL`]. A call inside the interval reuses the set.
+    fn should_walk(&self, now: Instant, written: bool) -> bool {
+        self.watched.is_none()
+            || written
+            || self
+                .walked_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= WATCHED_TTL)
+    }
 }
 
 /// One server.
@@ -500,6 +518,9 @@ pub struct Server {
     stderr: Arc<Mutex<Tail>>,
     work: tokio::sync::Mutex<Work>,
     busy: AtomicUsize,
+    /// A tool of the coder wrote to the worktree since the last walk of the root: the next call
+    /// walks it, whatever [`WATCHED_TTL`] says.
+    written: AtomicBool,
     /// The directory the server was told to build in (a safe rust-analyzer's), removed when it ends.
     scratch: Option<String>,
     last_used: Mutex<Instant>,
@@ -533,6 +554,12 @@ impl Server {
     /// Safe or full.
     pub fn mode(&self) -> Mode {
         self.key.mode
+    }
+
+    /// Note that the run wrote to its worktree: the next call walks the root, so a file the server
+    /// does not hold open is reported without waiting for [`WATCHED_TTL`].
+    fn wrote(&self) {
+        self.written.store(true, Ordering::Release);
     }
 
     /// The process id, while it is known.
@@ -946,27 +973,34 @@ impl Gate<'_> {
                 }
             }
         }
-        // The files the server did not open: created, changed or deleted.
-        let (key_root, extensions) = (server.key.root.clone(), server.extensions);
-        let now = tokio::task::spawn_blocking(move || walk(&key_root, extensions))
-            .await
-            .unwrap_or_default();
-        if let Some(before) = &self.work.watched {
-            let changes = watched_changes(before, &now, MAX_WATCHED_FILES, |path| {
-                self.work.opened.contains_key(path)
-            });
-            if !changes.is_empty() {
-                server
-                    .client
-                    .notify(
-                        "workspace/didChangeWatchedFiles",
-                        json!({ "changes": changes }),
-                    )
-                    .await?;
-                synced.anything = true;
+        // The files the server did not open: created, changed or deleted. The walk is the expensive
+        // part (up to MAX_WATCHED_FILES of the project) and a turn asks the same question call after
+        // call, so it is made at most once per WATCHED_TTL, or at once when the coder wrote since:
+        // a server that caches file contents still learns of every change.
+        let written = server.written.swap(false, Ordering::AcqRel);
+        if self.work.should_walk(Instant::now(), written) {
+            let (key_root, extensions) = (server.key.root.clone(), server.extensions);
+            let walked = tokio::task::spawn_blocking(move || walk(&key_root, extensions))
+                .await
+                .unwrap_or_default();
+            if let Some(before) = &self.work.watched {
+                let changes = watched_changes(before, &walked, MAX_WATCHED_FILES, |path| {
+                    self.work.opened.contains_key(path)
+                });
+                if !changes.is_empty() {
+                    server
+                        .client
+                        .notify(
+                            "workspace/didChangeWatchedFiles",
+                            json!({ "changes": changes }),
+                        )
+                        .await?;
+                    synced.anything = true;
+                }
             }
+            self.work.watched = Some(walked);
+            self.work.walked_at = Some(Instant::now());
         }
-        self.work.watched = Some(now);
         Ok(synced)
     }
 
@@ -1309,6 +1343,14 @@ impl Servers {
             (run.to_owned(), slot.to_owned(), language),
             (described.to_owned(), probe),
         );
+    }
+
+    /// Note that `run` wrote to its worktree (a tool of the coder, not a server): the next call of
+    /// each of its servers walks the root, whatever the walk interval says.
+    pub fn wrote(&self, run: &str) {
+        for server in self.list().iter().filter(|s| s.key.run == run) {
+            server.wrote();
+        }
     }
 
     /// Stop every server of `run`, saying why, and forget what was probed for it. Waits until the
@@ -1711,6 +1753,7 @@ async fn start(want: &Want<'_>) -> Result<Arc<Server>, StartError> {
         stderr,
         work: tokio::sync::Mutex::new(Work::default()),
         busy: AtomicUsize::new(0),
+        written: AtomicBool::new(false),
         scratch,
         last_used: Mutex::new(Instant::now()),
         started: Instant::now(),
@@ -2082,6 +2125,28 @@ mod tests {
                 .iter()
                 .any(|c| c["type"] == 3 && c["uri"].as_str().unwrap().ends_with("/b.rs")),
             "{changes:?}"
+        );
+    }
+
+    /// A turn of tool calls asks the same question call after call: the root is walked once, and
+    /// again after the interval or after a write of the coder.
+    #[test]
+    fn the_root_is_walked_once_per_interval_and_after_a_write_of_the_coder() {
+        let mut work = Work::default();
+        let t0 = Instant::now();
+        assert!(work.should_walk(t0, false), "the first call has no set");
+        work.watched = Some(HashMap::new());
+        work.walked_at = Some(t0);
+        for ms in [0, 100, 500, 999] {
+            assert!(
+                !work.should_walk(t0 + Duration::from_millis(ms), false),
+                "{ms} ms is inside the interval"
+            );
+        }
+        assert!(work.should_walk(t0 + WATCHED_TTL, false), "the set is old");
+        assert!(
+            work.should_walk(t0 + Duration::from_millis(1), true),
+            "the coder wrote"
         );
     }
 }

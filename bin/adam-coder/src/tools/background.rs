@@ -1342,7 +1342,7 @@ async fn supervise(
     lock(&command.sink).finish();
     command.kept.end_live(&command.run, &command.id);
     if let Some(watch) = &command.git
-        && let Some(after) = Snapshot::of_slot(&watch.slot).await
+        && let Ok(after) = Snapshot::of_slot(&watch.slot).await
     {
         let mut notes: Vec<&str> = Vec::new();
         if !watch.before.same_configuration_as(&after) {
@@ -1625,10 +1625,14 @@ pub async fn start_command(
         kill_recorded(record, env.commands.host(), Some(&*environment), kill_wait).await;
     }
 
-    let Some(before) = Snapshot::of_slot(&slot).await else {
-        return Ok(ToolOutput::error(
-            "Cannot read the state of the worktree, so nothing was started. Try again; if it persists, tell the person.",
-        ));
+    let before = match Snapshot::of_slot(&slot).await {
+        Ok(before) => before,
+        Err(e) => {
+            return Ok(ToolOutput::error(super::inspect::cannot_snapshot(
+                e,
+                "Nothing was started.",
+            )));
+        }
     };
     if let Some(refusal) = before.refusal() {
         return Ok(ToolOutput::error(refusal));

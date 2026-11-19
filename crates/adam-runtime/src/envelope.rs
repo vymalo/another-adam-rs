@@ -19,6 +19,10 @@ pub(crate) struct Envelope {
     /// Layout version.
     pub v: u32,
     /// The agent's own state.
+    ///
+    /// `transition` takes this by move before stepping, leaving `Null` in the envelope it still
+    /// holds. That envelope is never encoded (a commit builds a fresh one from `Next`), and a
+    /// reader of a stepped envelope must not treat `Null` as the agent's state.
     pub agent: Value,
     /// Delivered, not yet consumed messages, oldest first.
     #[serde(default)]
@@ -110,16 +114,47 @@ impl Envelope {
             Some(v) => return Err(corrupt(format!("unsupported envelope version {v}"))),
             None => return Err(corrupt("missing envelope version".into())),
         }
-        serde_json::from_value(state.clone()).map_err(|e| RuntimeError::Corrupt {
+        // `&Value` is a deserialiser: no copy of the state is made before it is read.
+        let decoded = Self::deserialize(state).map_err(|e| RuntimeError::Corrupt {
             run,
             reason: "the envelope does not decode".into(),
             source: Some(Box::new(e)),
-        })
+        });
+        #[cfg(test)]
+        if decoded.is_ok() {
+            decodes::bump();
+        }
+        decoded
     }
 
     pub fn encode(&self) -> Result<Value, StoreError> {
         serde_json::to_value(self)
             .map_err(|e| StoreError::InvalidInput(format!("the envelope does not serialize: {e}")))
+    }
+}
+
+/// How many envelopes a thread decoded, in tests: what a test asserts a listing does not do.
+#[cfg(test)]
+pub(crate) mod decodes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Note one decode.
+    pub(crate) fn bump() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    /// How many decodes this thread took, resetting the count.
+    pub(crate) fn take() -> usize {
+        COUNT.with(|count| count.replace(0))
+    }
+
+    /// How many decodes this thread took, leaving the count.
+    pub(crate) fn count() -> usize {
+        COUNT.with(Cell::get)
     }
 }
 
@@ -148,5 +183,77 @@ mod tests {
         let back = Envelope::decode(RunId::new(), &env.encode().unwrap()).unwrap();
         assert_eq!(back.deadline, Some(now + chrono::Duration::seconds(1800)));
         assert_eq!(back.limit_secs, Some(1800));
+    }
+
+    /// The state is decoded from a borrow and re-encoded as it was: every member, in the order the
+    /// encoder writes them, with no key added or dropped.
+    #[test]
+    fn decode_then_encode_gives_the_same_bytes_back() {
+        let now = Utc::now();
+        let mut env = Envelope::new(serde_json::json!({
+            "messages": [
+                {"role": "user", "text": "hi"},
+                {"role": "assistant", "text": "hello"},
+            ],
+            "artifacts": [],
+        }))
+        .with_limit(now, std::time::Duration::from_secs(90));
+        env.inbox.push(
+            crate::agent::Inbound::new("message", serde_json::json!({"text": "late"}))
+                .with_id("m-1"),
+        );
+        env.seq = 7;
+        env.attempt = 2;
+        env.rev = 3;
+        env.output = serde_json::json!({"answer": 42});
+        env.error = Some("not yet".into());
+        env.artifacts.push(Artifact::new(
+            "plan",
+            None,
+            serde_json::json!({"steps": [1, 2]}),
+        ));
+        env.remaining_secs = Some(60);
+        env.agent_wake = Some(now);
+        env.hb = true;
+        let state = env.encode().expect("encodes");
+        let bytes = serde_json::to_string(&state).expect("serialises");
+
+        let decoded = Envelope::decode(RunId::new(), &state).expect("decodes");
+        let again = decoded.encode().expect("encodes again");
+        assert_eq!(
+            serde_json::to_string(&again).expect("serialises"),
+            bytes,
+            "decode then encode is the identity on the bytes"
+        );
+        // And the content survived, member by member.
+        assert_eq!(decoded.agent, env.agent);
+        assert_eq!(decoded.inbox, env.inbox);
+        assert_eq!(decoded.artifacts, env.artifacts);
+        assert_eq!(decoded.output, env.output);
+        assert_eq!(decoded.error, env.error);
+        assert_eq!(
+            (decoded.deadline, decoded.limit_secs),
+            (env.deadline, env.limit_secs)
+        );
+        assert_eq!(
+            (decoded.remaining_secs, decoded.agent_wake, decoded.hb),
+            (env.remaining_secs, env.agent_wake, env.hb)
+        );
+    }
+
+    /// A state written before the optional members existed keeps decoding and re-encodes to the same
+    /// bytes: the version check accepts it and the defaults are left out again.
+    #[test]
+    fn an_old_state_re_encodes_to_itself() {
+        let old = serde_json::json!({
+            "v": 1, "agent": {"x": 1}, "inbox": [], "seq": 3, "attempt": 0, "rev": 2,
+            "output": null, "error": null, "artifacts": []
+        });
+        let bytes = serde_json::to_string(&old).expect("serialises");
+        let env = Envelope::decode(RunId::new(), &old).expect("decodes");
+        assert_eq!(
+            serde_json::to_string(&env.encode().expect("encodes")).expect("serialises"),
+            bytes
+        );
     }
 }
