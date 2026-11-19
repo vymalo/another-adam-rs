@@ -27,14 +27,16 @@ env:
   COVERAGE_IGNORE: '(adam-acp-fake-agent|adam-mcp-testkit|/tests/)'
 
 jobs:
+  # Formatting, and the README rule that does not need a compiler. The five compiles this job used to run
+  # one after another are their own jobs below, so a pull request waits for the slowest, not their sum.
   lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt
       # Every crate documents itself: update its README in the same change as
       # any change to its public API, environment variables or tests.
       - name: Every crate has a README
@@ -48,16 +50,58 @@ jobs:
             fi
           done
           exit "$missing"
-      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # Optional features are linted and doc-tested too, or their code never runs in CI.
-      - run: cargo clippy --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp -- -D warnings
-      # nextest does not run doctests; the database suites are not needed here.
-      - run: cargo test --workspace --doc --locked
-      - run: cargo test --workspace --doc --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
-      # Broken or redundant intra-doc links, with every feature on (the documented build; some
-      # docs link to items that exist only behind a feature).
+
+  # The two clippy arms, each in its own job: the default features, and the optional features (or their code
+  # never runs in CI). Same commands and same `-D warnings` as when they shared a job.
+  clippy:
+    name: clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: ""
+          - name: optional features
+            args: "--features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked ${{ matrix.args }} -- -D warnings
+
+  # nextest does not run doctests; the database suites are not needed here. Two jobs, like clippy.
+  doctest:
+    name: doctest (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: ""
+          - name: optional features
+            args: "--features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --doc --locked ${{ matrix.args }}
+
+  # Broken or redundant intra-doc links, with every feature on (the documented build; some
+  # docs link to items that exist only behind a feature).
+  rustdoc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
