@@ -62,13 +62,16 @@ trait at your rev: its doc comments are the contract.
 
    `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
    calls `migrate` first. `blob_conformance!` adds the nine blob cases (put/get, a 4 MiB round trip,
-   an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive, a shared
-   digest surviving until the last run is purged, the cutoff, and `purge_finished`'s sweep); every
+   an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive (including
+   after a commit that names a different one), a shared digest surviving until the last run is
+   purged, the cutoff, and `purge_finished`'s sweep); every
    case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `None` skips the
    suites. Cases isolate themselves with a unique agent name, so they run in parallel on one shared
    database — **except the blob cases and the cases that purge**, which sweep every unreferenced
    blob and therefore must not overlap: keep them in one nextest test group (`.config/nextest.toml`,
-   `[test-groups.store-global-sweeps]`) and take the suite's `BLOB_SUITE` lock under libtest.
+   `[test-groups.store-global-sweeps]`) and take the suite's `BLOB_SUITE` lock under libtest. A test
+   that calls `purge_finished` or `purge_blobs` must carry `purge` in its name so the group's filter
+   catches it.
    `counting::measure_transcript_write` is a measurement helper, not a conformance case: it runs one
    50-commit transcript and prints the bytes, and it asserts nothing.
 5. **In CI set `ADAM_TEST_REQUIRE_DB=1`**: a suite whose database variable is unset then fails

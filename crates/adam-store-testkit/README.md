@@ -22,7 +22,8 @@ dependency.
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `blob_conformance!(make)` generates one `#[tokio::test]` per blob case (9 cases: put/get round
   trip, a 4 MiB round trip (a file artifact's cap), an idempotent put whose first bytes win, an
-  unknown id answers `None`, empty bytes are a blob, a run's reference keeps a blob alive, a shared
+  unknown id answers `None`, empty bytes are a blob, a run's reference keeps a blob alive (including
+after a commit that names a different one), a shared
   digest survives until the last referencing run is purged, `purge_blobs` respects its cutoff, and
   `purge_finished` removes the run's references and the unreferenced blob). Every case asserts `keeps_blobs()`: a store that keeps none is not
   given this suite. Blobs are global, so the cases take turns inside one test binary (the

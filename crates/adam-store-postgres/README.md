@@ -124,10 +124,11 @@ step itself only runs from version 4.
 references cascaded away), and `purge_blobs(before)` is the explicit knob for a host that reclaims
 bytes without purging runs. A blob a surviving run references is kept, however old it is.
 
-`RunUpdate` gained the public field `blobs` (the digests a commit's state references), so **a
-hand-built `RunUpdate { .. }` literal stops compiling**: add `blobs: Vec::new()` or use
-`RunUpdate::new(..)`/`.blobs(..)`. The four blob methods are **defaulted** on `Store`, so a store of
-your own that keeps no blobs still compiles and behaves as before.
+`RunUpdate` gained the public field `blobs` — a delta the store unions; a commit that names none
+keeps the earlier ones — so **a hand-built `RunUpdate { .. }` literal stops compiling**: add
+`blobs: Vec::new()` or use `RunUpdate::new(..)`/`.blobs(..)`. The four blob methods are
+**defaulted** on `Store`, so a store of your own that keeps no blobs still compiles and behaves as
+before.
 
 ## Schema version and the owner column
 

@@ -293,15 +293,39 @@ pub mod cases {
             "a referenced blob is never collected, however old"
         );
 
-        // Clean up: a finished run that is purged takes its reference, and then the bytes. Before
-        // that, the second commit named no digest at all — a store unions each commit's delta with
-        // the references it already has, so the sweep must still keep the bytes. A store that
-        // replaced the set on an empty delta fails here.
+        // A second commit names a **different** digest and not the first: a store unions each
+        // commit's delta with the references it already has, so both must survive the sweep. A
+        // store that replaced the set with the delta fails here.
+        let other_bytes = b"a second file the same run names".to_vec();
+        let other = blob_digest(&other_bytes);
+        store.put_blob(&other, &other_bytes).await.unwrap();
         store
             .commit_run(
                 run.id,
                 run.version + 1,
-                RunUpdate::new(RunStatus::Done, json!({"turn": 2})),
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 2})).blobs(vec![other.clone()]),
+            )
+            .await
+            .unwrap();
+        store.purge_blobs(cutoff).await.unwrap();
+        assert_eq!(
+            store.get_blob(&id).await.unwrap(),
+            Some(bytes.clone()),
+            "an earlier reference survives a commit that names a different digest"
+        );
+        assert_eq!(
+            store.get_blob(&other).await.unwrap(),
+            Some(other_bytes.clone()),
+            "the new digest is recorded"
+        );
+
+        // Clean up: a finished run that is purged takes its references, and then the bytes. The
+        // last commit names no digest at all — the union keeps both.
+        store
+            .commit_run(
+                run.id,
+                run.version + 2,
+                RunUpdate::new(RunStatus::Done, json!({"turn": 3})),
             )
             .await
             .unwrap();
@@ -311,8 +335,14 @@ pub mod cases {
             Some(bytes.clone()),
             "a commit that names no blob keeps the earlier references"
         );
+        assert_eq!(
+            store.get_blob(&other).await.unwrap(),
+            Some(other_bytes.clone()),
+            "and the one the previous commit added"
+        );
         assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 1);
         assert_eq!(store.get_blob(&id).await.unwrap(), None);
+        assert_eq!(store.get_blob(&other).await.unwrap(), None);
     }
 
     pub async fn blob_a_shared_digest_survives_until_the_last_run_is_purged(store: DynStore) {

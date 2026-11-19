@@ -769,8 +769,10 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// The sweep and a commit's reference insert are **not one transaction**: a reference another
     /// commit is writing at that moment is invisible to the sweep, which can therefore collect a
-    /// blob that commit is about to name. S2a's single CTE closes it; until then the window is a
-    /// blob whose bytes a run's state still carries in the expand release.
+    /// blob that commit is about to name. S2a closes it (PostgreSQL: one data-modifying CTE;
+    /// MongoDB: insert the references, check their completeness, then CAS — ADR 0055, decision 3);
+    /// until then the window is a blob whose bytes a run's state still carries in the expand
+    /// release.
     ///
     /// **Retention must be longer than a minute.** A child run looks at its parent at least once a
     /// minute (`adam-runtime`), and fails when the parent is `Failed`; a parent that is missing is
