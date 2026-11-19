@@ -119,9 +119,10 @@ racing), one open run per conversation including a 16-way race, listing and coun
 pages, filters), push configurations, and purging.
 
 The write cost of a transcript-shaped run is measured, not asserted: `counting::measure_transcript_write`
-commits a 10 KB message 50 times through `CountingStore` and prints the bytes, `measure_the_transcript_write`
-in each adapter's test file prints the line, and `dev/p2-measure.sh` quotes the disk side. The baseline is in
-[ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md); S3 adds the bound.
+commits a 10 KB message 50 times through `CountingStore` and prints the bytes; `transcript_measurement!`
+emits the `measure_the_transcript_write` test in each adapter's test file, and `dev/p2-measure.sh` quotes the
+disk side. The baseline is in [ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md);
+S3 rewrites the workload to commit a head and a body, then asserts the bound.
 
 ## Adding a backend
 

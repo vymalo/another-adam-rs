@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use adam_core::{
     ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
-    RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreResult,
+    RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreResult,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -92,11 +92,11 @@ impl CountingStore {
     /// reader transferred, not what it kept. A record a store returns without its state (a
     /// `create_run` or `commit_run` echo) adds nothing, and so does a `null` state.
     ///
-    /// A header is the exception: [`Store::run_header`] is not overridden here, so the trait
-    /// default answers on the wrapper (one `lease_until`, one `load_run`, the record's state) —
-    /// what `MemoryStore` costs too. An adapter that overrides it answers in one small read with no
-    /// state, and this wrapper cannot see that read. Measure reads with `load_run`/`load_head`,
-    /// never `run_header`.
+    /// A header is the blind spot: [`Store::run_header`] is forwarded, and an adapter that
+    /// overrides it answers in one small read with no state. One whose `run_header` is the trait
+    /// default reads the record *inside* the adapter, which this wrapper cannot see, so it counts
+    /// neither that `load_run` nor its state. Measure reads with `load_run`/`load_head`, never
+    /// `run_header`.
     pub fn state_bytes_read(&self) -> u64 {
         self.counts().state_bytes_read
     }
@@ -172,6 +172,10 @@ pub struct Measurement {
 }
 
 impl Measurement {
+    /// How many commits [`measure_transcript_write`] makes: the workload's one place for the
+    /// number, so a test's `commits` assertion cannot drift from it.
+    pub const COMMITS: usize = 50;
+
     /// The one line `dev/p2-measure.sh` parses and a test prints:
     /// `p2-measure: commits=50 total_written=13290322 max_commit=521202 first_read=10434 final_read=521202`.
     pub fn report(&self) -> String {
@@ -188,19 +192,19 @@ impl fmt::Display for Measurement {
     }
 }
 
-/// Commits [`measure_transcript_write`] makes, and the bytes of the message each one appends.
-const COMMITS: usize = 50;
+/// The bytes of each message [`measure_transcript_write`] appends.
 const MESSAGE_BYTES: usize = 10 * 1024;
 
-/// Measure what a transcript-shaped run costs today: one run, 50 commits, each appending a 10 KB
-/// message, the last one leaving the run [`RunStatus::Done`] so it is purgeable.
+/// Measure what a transcript-shaped run costs today: one run, [`Measurement::COMMITS`] commits,
+/// each appending a 10 KB message, the last one leaving the run [`RunStatus::Done`], and the run
+/// purged afterwards so repeated measurements do not accumulate.
 ///
 /// **This is a measurement, not a conformance case.** The bytes it sums are the caller's
 /// [`RunUpdate::state`], which a wrapper sees before the store does: on its own the number says
-/// what the runtime handed over, not what an adapter wrote. It asserts nothing; each adapter's
-/// `measure_the_transcript_write` test prints [`Measurement::report`] and asserts only that the
-/// workload ran. S3 adds the `< 50 × 20 KB` and `max < 20 KB` assertions to those tests, when the
-/// contract release makes them true.
+/// what the runtime handed over, not what an adapter wrote. It asserts nothing; the
+/// `transcript_measurement!` test prints [`Measurement::report`] and asserts only that the workload
+/// ran. S3 rewrites this workload to commit a head and a body, then adds the `< 50 × 20 KB` and
+/// `max < 20 KB` assertions to that test.
 ///
 /// The measured baseline, on Memory, PostgreSQL and MongoDB (identical state JSON):
 /// `p2-measure: commits=50 total_written=13290322 max_commit=521202 first_read=10434
@@ -212,21 +216,22 @@ const MESSAGE_BYTES: usize = 10 * 1024;
 /// When the store errors: a measurement that cannot run is a broken test, not a number.
 pub async fn measure_transcript_write(store: DynStore) -> Measurement {
     let store = CountingStore::new(store);
+    let agent = crate::agent();
     let run = store
-        .create_run(NewRun::new(crate::agent(), json!({"messages": []})))
+        .create_run(NewRun::new(&agent, json!({"messages": []})))
         .await
         .expect("create the measured run");
 
-    let mut messages = Vec::with_capacity(COMMITS);
+    let mut messages = Vec::with_capacity(Measurement::COMMITS);
     let mut version = run.version;
     let mut commits = 0;
     let mut first_read = 0;
-    for turn in 0..COMMITS {
+    for turn in 0..Measurement::COMMITS {
         messages.push(json!({
             "role": "assistant",
             "text": message_text(MESSAGE_BYTES, turn as u64),
         }));
-        let status = if turn + 1 == COMMITS {
+        let status = if turn + 1 == Measurement::COMMITS {
             RunStatus::Done
         } else {
             RunStatus::Runnable
@@ -243,14 +248,25 @@ pub async fn measure_transcript_write(store: DynStore) -> Measurement {
         }
     }
     let final_read = read_state_bytes(&store, run.id).await;
-
-    Measurement {
+    let measured = Measurement {
         commits,
         total_written: store.state_bytes_written(),
         max_commit: store.max_commit_bytes(),
         first_read,
         final_read,
-    }
+    };
+
+    // The last commit left the run `Done`: purge it now that the numbers are taken, so a suite that
+    // runs the measurement repeatedly does not accumulate a 500 KB run per adapter per measurement.
+    store
+        .purge_finished(
+            &agent,
+            adam_core::store::now() + chrono::Duration::minutes(1),
+        )
+        .await
+        .expect("purge the measured run");
+
+    measured
 }
 
 /// One `load_run`, and the state bytes it transferred (a delta, not the cumulative counter).
@@ -286,11 +302,12 @@ impl fmt::Debug for CountingStore {
     }
 }
 
-// Every `Store` method is implemented here except `run_header`, whose default deliberately answers
-// on the wrapper (see `state_bytes_read`). When the contract grows a **defaulted** method — S1/S2
-// add `keeps_bodies`, `keeps_blobs`, `body_list`, `put_blob`, `get_blob` and `purge_blobs` — forward
-// it explicitly too: a default left to the wrapper answers for the wrapper, not for the store it
-// wraps (`keeps_bodies` would say `false` for a store that keeps bodies).
+// Every `Store` method is implemented here, `run_header` included: forwarding it keeps the measured
+// store's own query (`PgStore` and `MongoStore` project the header; `MemoryStore` answers with the
+// trait default). When the contract grows a **defaulted** method — S1/S2 add `keeps_bodies`,
+// `keeps_blobs`, `body_list`, `put_blob`, `get_blob` and `purge_blobs` — forward it explicitly too:
+// a default left to the wrapper answers for the wrapper, not for the store it wraps
+// (`keeps_bodies` would say `false` for a store that keeps bodies).
 #[async_trait]
 impl Store for CountingStore {
     async fn migrate(&self) -> StoreResult<()> {
@@ -311,6 +328,11 @@ impl Store for CountingStore {
             self.read(record);
         }
         Ok(record)
+    }
+
+    async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
+        self.call(Method::RunHeader);
+        self.inner.run_header(id).await
     }
 
     async fn commit_run(
@@ -581,10 +603,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_header_reads_the_record_through_the_trait_default() {
+    async fn a_forwarded_header_hides_the_default_read_from_the_wrapper() {
         let store = counting();
         let run = create(&store).await;
-        let state = state_bytes(&store.load_run(run.id).await.unwrap().unwrap().state);
         store.reset();
         let header = store
             .run_header(run.id)
@@ -592,11 +613,11 @@ mod tests {
             .expect("header")
             .expect("run");
         assert_eq!(header.id, run.id);
-        // The wrapper does not override `run_header`: the trait default reads the lease and then
-        // the record, so a header costs what `MemoryStore` costs.
-        assert_eq!(store.calls(Method::RunHeader), 0);
-        assert_eq!(store.calls(Method::LeaseUntil), 1);
-        assert_eq!(store.calls(Method::LoadRun), 1);
-        assert_eq!(store.state_bytes_read(), state);
+        // `run_header` is forwarded: the wrapper counts the call. `MemoryStore` answers it with the
+        // trait default, which reads the record *inside* the adapter — a `load_run` and its state
+        // the wrapper cannot see, so it counts neither.
+        assert_eq!(store.calls(Method::RunHeader), 1);
+        assert_eq!(store.calls(Method::LoadRun), 0);
+        assert_eq!(store.state_bytes_read(), 0);
     }
 }

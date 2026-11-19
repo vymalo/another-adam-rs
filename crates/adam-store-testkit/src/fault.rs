@@ -37,8 +37,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 /// A [`Store`] method a wrapper can target: [`FaultyStore`] injects a fault on it and
-/// [`CountingStore`](crate::counting::CountingStore) counts its calls. `migrate` is not
-/// injectable: a store that cannot migrate never gets as far as running anything.
+/// [`CountingStore`](crate::counting::CountingStore) counts its calls. `CountingStore` counts
+/// every method it forwards, but a `RunHeader` it forwards to an adapter whose `run_header` is the
+/// trait default reads the record inside the adapter, which the wrapper cannot see. `migrate` is
+/// not injectable: a store that cannot migrate never gets as far as running anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Method {
     /// [`Store::create_run`].
