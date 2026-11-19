@@ -1,34 +1,34 @@
 # The benchmark stack (bench/README.md, "The stack"): the pieces of the dev stack that a headless adam-coder
-# needs, one Podman service, one coder and one git sandbox for each slot, and a separate Podman service that grades.
-# `bench` brings it up, writes the per-run settings of a coder to `$BENCH_STACK_DIR/slot-N.env` (mode 0600, removed once
-# the coder is created) and recreates the coder for each run. Every credential in this file is a dummy; the model's key
-# is never here: it lives in the harness's meter, which the stack reaches only through the `meter-N` relays.
+# needs, one git sandbox and one meter relay for each slot, and the relays the host reaches. The arms and the
+# grading are host containers of the task image, started by the harness on the host's Docker (lib/containers.mjs,
+# lib/stack.mjs): they are not services of this file. Each image is in the host's store once.
+#
+# `bench` brings it up, writes the per-run settings of a coder to `$BENCH_STACK_DIR/slot-N.env` (mode 0600, removed
+# once the coder is created) and starts the coder for each run. Every credential in this file is a dummy; the
+# model's key is never here: it lives in the harness's meter, which the stack reaches only through the `meter-N`
+# relays.
 #
 # Every container here runs the one coder image of bench/pins.json (the relays, the git sandbox, the pusher) or a
 # service of the dev stack; no other image is added.
 #
-# Variables the harness sets (a person never needs to): BENCH_STACK_DIR,
-# BENCH_AGENT_DIR, BENCH_SLOT_1_DIR and BENCH_SLOT_2_DIR (what the harness hands a slot's agent service: a statement,
-# the OpenCode binary), BENCH_METER_PORT, PODMAN_SECCOMP, and the optional BENCH_GIT_PORT, BENCH_CODER_1_PORT,
-# BENCH_CODER_2_PORT.
+# Variables the harness sets (a person never needs to): BENCH_WORK_1_DIR and BENCH_WORK_2_DIR (the slot's work
+# directory on the host), BENCH_METER_PORT, and the optional BENCH_GIT_PORT.
 #
 # Networks (all `internal` but egress; a test over the rendered file holds each member list):
-#   agentnet-N   podman-N and meter-N. A container the Podman service runs shares the service's network namespace
-#                (dev/podman/README.md), so what an agent's commands reach is exactly this: the meter relay.
-#   slot-N       coder-N, meter-N, pub-coder-N, git-server, postgres, mock-github. The coders never share a network
-#                with a Podman service, and slot 1 never shares one with slot 2 (git-server, postgres and mock-github
-#                are on both: they answer, they do not connect the slots).
+#   slot-N       git-server, meter-N, mock-github, postgres. The coder of the slot joins it at run time (its host
+#                container is started with `--network adam-bench_slot-N`); slot 1 never shares a network with slot
+#                2 (git-server, postgres and mock-github are on both: they answer, they do not connect the slots).
 #   gitpub-net   git-server, pub-git and the pushers.
-#   grader-net   grader, alone.
-#   egress       a plain bridge, only for the relays, each of which forwards to one fixed target: meter-N (the harness's
-#                meter on the host), pub-coder-N (the coder's A2A port, published on the loopback) and pub-git (the git
-#                server, published on the loopback). Nothing else is on it, so no coder, sandbox, git server or
-#                Podman service has a route to the internet. A Podman service joins it only while the harness pulls
-#                an image (`docker network connect`), and the grader only while a verifier needs the network.
+#   verifier     no service: the network a grading's host container joins (`adam-bench_verifier`), so gradings
+#                share one internal network and have no route out. The harness creates it (`stack.up`), because
+#                Compose does not make a network that has no service.
+#   egress       a plain bridge, only for the relays, each of which forwards to one fixed target: meter-N (the
+#                harness's meter on the host) and pub-git (the git server, published on the loopback). Nothing
+#                else is on it. A grading whose verifier asks for the internet is started with
+#                `--network adam-bench_egress` by the harness, alone, in its window.
 #
-# Two slots: one 4 CPU, 12 GB Podman service for each is what one desktop can run at once. A third needs services
-# `podman-3`, `coder-3`, `gitbox-3`, `meter-3`, `pub-coder-3`, `pusher-3`, a database in postgres-init.sql, two networks
-# and three volumes.
+# Two slots: one git sandbox and one meter relay for each is what one desktop can run at once. A third needs
+# `gitbox-3`, `meter-3`, `pusher-3`, a database in postgres-init.sql, two networks and a work directory.
 
 name: adam-bench
 
@@ -42,64 +42,7 @@ x-wiremock: &wiremock
     retries: 30
     start_period: 5s
 
-x-image: &image ghcr.io/vymalo/another-adam-rs/coder:sha-3f668c3@sha256:dad89fc8f89f176cd4884d2370bc7de73bb8a884c067867ec1d2344586d8c72b
-
-x-podman: &podman
-  build:
-    context: ../dev/podman
-    dockerfile: Containerfile
-  image: adam-rs/podman:dev
-  restart: "no"
-  user: "10001:10001"
-  command: ["podman", "system", "service", "--time=0", "unix:///run/podman/podman.sock"]
-  environment:
-    PODMAN_IGNORE_CGROUPSV1_WARNING: "1"
-  security_opt:
-    # The three options of dev/compose.devcontainer.yaml, for the reasons in dev/podman/README.md. An absolute path,
-    # set by the harness: whether Compose resolves a relative one against the project directory is unverified.
-    - seccomp=${PODMAN_SECCOMP:?the harness sets PODMAN_SECCOMP to the absolute path of dev/podman/seccomp.json}
-    - systempaths=unconfined
-    - apparmor=unconfined
-  # No privileged, no cap_add, no devices. The service bounds every container it runs together: their own cgroups are
-  # off, so one run at a time for each service.
-  cpus: 4
-  mem_limit: 12g
-  pids_limit: 4096
-  healthcheck:
-    test: ["CMD", "podman", "--remote", "--url", "unix:///run/podman/podman.sock", "info"]
-    interval: 5s
-    timeout: 10s
-    retries: 24
-    start_period: 5s
-
-x-coder: &coder
-  image: *image
-  restart: "no"
-  environment: &coder-env
-    MODEL_API_KEY: bench-dummy-key # the meter holds the real key
-    MODEL: bench-model
-    WORKSPACE_ROOT: /work
-    WORKSPACE_SWEEP_SECS: "0" # the worktree stays until the harness has copied it
-    # The bench serves plain http from its own git server. ALLOWED_REPO_HOSTS is that server only; a local path or a
-    # file:// URL is still accepted by ALLOW_LOCAL_REPOS (crates/adam-workspace, Policy::check), and is harmless
-    # here: the coder's container holds nothing but the work volume.
-    ALLOWED_REPO_HOSTS: git-server
-    ALLOW_LOCAL_REPOS: "true"
-    GITHUB_API_URL: http://mock-github:8080 # open_pull_request succeeds, so a run completes instead of parking
-    GITHUB_TOKEN: bench-dummy-token
-    ADAM_AGENT_DIR: /etc/adam/agent
-    DEVCONTAINER_RUNTIME: podman
-    CONTAINER_HOST: unix:///run/podman/podman.sock
-    DEVCONTAINER_PREPULL: "false"
-    DEVCONTAINER_NETWORK: inherit
-    # The coder's git runs in the sandbox, where no secret is readable (docs/reference/environment.md, GIT_SANDBOX_SOCKET).
-    GIT_SANDBOX_SOCKET: /work/.gitbox/git.sock
-  healthcheck:
-    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
-    interval: 3s
-    timeout: 3s
-    retries: 40
-    start_period: 10s
+x-image: &image ghcr.io/vymalo/another-adam-rs/coder:sha-e46c8f4@sha256:60b211ab2709913d0e175d07cc00af9e431a94dc55f0bdcb26cbd33e4f305744
 
 x-relay: &relay
   image: *image
@@ -173,18 +116,18 @@ services:
     <<: *relay
     environment:
       RELAY_PORT: "8090"
-      RELAY_TARGET: host.docker.internal:${BENCH_METER_PORT:?the harness sets BENCH_METER_PORT}
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    networks: [agentnet-1, slot-1, egress]
+      RELAY_TARGET: ${BENCH_METER_HOST:?the harness sets BENCH_METER_HOST}:${BENCH_METER_PORT:?the harness sets BENCH_METER_PORT}
+    networks: [slot-1, egress]
 
   meter-2:
     <<: *relay
     environment:
       RELAY_PORT: "8090"
-      RELAY_TARGET: host.docker.internal:${BENCH_METER_PORT}
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    networks: [agentnet-2, slot-2, egress]
+      RELAY_TARGET: ${BENCH_METER_HOST}:${BENCH_METER_PORT}
+    networks: [slot-2, egress]
 
+  # The coder is a host container on the slot's internal network; a relay on a network with a route out publishes its A2A
+  # port on the loopback. The relay resolves the coder's name on the slot's network when a connection comes in.
   pub-coder-1:
     <<: *relay
     environment:
@@ -209,130 +152,37 @@ services:
     ports: ["127.0.0.1:${BENCH_GIT_PORT:-18083}:8080"]
     networks: [gitpub-net, egress]
 
-  # What an agent's commands run on: one Podman service for each slot. It mounts the slot's work volume and one
-  # directory the harness writes (a statement, the OpenCode binary), read-only: never $BENCH_HOME, so no hidden test,
-  # gold patch, ledger or other run is visible to it.
-  podman-1:
-    <<: *podman
-    volumes:
-      - podman-socket-1:/run/podman
-      - podman-storage-1:/home/agent/.local/share/containers
-      # The coder's work volume at the same path as in the coder: a bind source is resolved by the service.
-      - work-1:/work
-      - ${BENCH_SLOT_1_DIR:?the harness sets BENCH_SLOT_1_DIR}:${BENCH_SLOT_1_DIR}:ro
-    networks: [agentnet-1]
-
-  podman-2:
-    <<: *podman
-    volumes:
-      - podman-socket-2:/run/podman
-      - podman-storage-2:/home/agent/.local/share/containers
-      - work-2:/work
-      - ${BENCH_SLOT_2_DIR}:${BENCH_SLOT_2_DIR}:ro
-    networks: [agentnet-2]
-
-  # What grades: a grading's tests and patch are staged in a volume of its own and mounted read-only into the grading
-  # container only. No agent can reach this service: it is on a network of its own with nothing else on it, and it
-  # mounts no directory of the host.
-  grader:
-    <<: *podman
-    volumes:
-      - grader-socket:/run/podman
-      - grader-storage:/home/agent/.local/share/containers
-      # Nothing of the host's: the harness copies a grading's tests and patch in, as tar streams, into /grade/<id>, and reads the
-      # reward out the same way (lib/stack.mjs, graderIO).
-    # A volume of memory, writable by the service's user and gone with the service:
-    tmpfs: ["/grade:mode=1777,size=1g"]
-    networks: [grader-net]
-
+  # The git sandbox of a slot: the coder's git runs there (GIT_SANDBOX_SOCKET), in a container with no secret and
+  # no network. It mounts the slot's work directory, which is the host's: the coder is a host container too.
   gitbox-1:
     <<: *gitbox
-    volumes: ["work-1:/work"]
+    volumes: ["${BENCH_WORK_1_DIR:?the harness sets BENCH_WORK_1_DIR}:/work"]
 
   gitbox-2:
     <<: *gitbox
-    volumes: ["work-2:/work"]
-
-  coder-1:
-    <<: *coder
-    depends_on:
-      podman-1: { condition: service_healthy }
-      gitbox-1: { condition: service_started }
-      postgres: { condition: service_healthy }
-      git-server: { condition: service_started }
-      mock-github: { condition: service_healthy }
-      meter-1: { condition: service_started }
-    environment:
-      <<: *coder-env
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/adam_bench_1
-      PUBLIC_URL: http://127.0.0.1:${BENCH_CODER_1_PORT:-18081}/
-      DEVCONTAINER_DEPLOYMENT_ID: bench-slot-1
-    # The run's own settings: the model address (with the run's meter token), the A2A bearer, the task image.
-    env_file:
-      - path: ${BENCH_STACK_DIR:?the harness sets BENCH_STACK_DIR}/slot-1.env
-        required: false
-    volumes:
-      - work-1:/work
-      - podman-socket-1:/run/podman
-      - ${BENCH_AGENT_DIR:?the harness sets BENCH_AGENT_DIR}:/etc/adam/agent:ro
-    networks: [slot-1]
-
-  coder-2:
-    <<: *coder
-    depends_on:
-      podman-2: { condition: service_healthy }
-      gitbox-2: { condition: service_started }
-      postgres: { condition: service_healthy }
-      git-server: { condition: service_started }
-      mock-github: { condition: service_healthy }
-      meter-2: { condition: service_started }
-    environment:
-      <<: *coder-env
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/adam_bench_2
-      PUBLIC_URL: http://127.0.0.1:${BENCH_CODER_2_PORT:-18082}/
-      DEVCONTAINER_DEPLOYMENT_ID: bench-slot-2
-    env_file:
-      - path: ${BENCH_STACK_DIR}/slot-2.env
-        required: false
-    volumes:
-      - work-2:/work
-      - podman-socket-2:/run/podman
-      - ${BENCH_AGENT_DIR}:/etc/adam/agent:ro
-    networks: [slot-2]
+    volumes: ["${BENCH_WORK_2_DIR:?the harness sets BENCH_WORK_2_DIR}:/work"]
 
   # One-shot: puts a run's base on the git server from a container (the host runs no git in a repository a container
-  # wrote). `docker compose run --rm pusher-N '<script>'`; the base is read from the slot's work volume.
+  # wrote). `docker compose run --rm pusher-N '<script>'`; the base is read from the slot's work directory.
   pusher-1:
     <<: *pusher
-    volumes: ["work-1:/work:ro"]
+    volumes: ["${BENCH_WORK_1_DIR:?the harness sets BENCH_WORK_1_DIR}:/work:ro"]
 
   pusher-2:
     <<: *pusher
-    volumes: ["work-2:/work:ro"]
+    volumes: ["${BENCH_WORK_2_DIR:?the harness sets BENCH_WORK_2_DIR}:/work:ro"]
 
 networks:
-  agentnet-1:
-    internal: true
-  agentnet-2:
-    internal: true
   slot-1:
     internal: true
   slot-2:
     internal: true
   gitpub-net:
     internal: true
-  grader-net:
+  verifier:
     internal: true
   egress: {}
 
 volumes:
   postgres-data:
   git-data:
-  podman-socket-1:
-  podman-socket-2:
-  podman-storage-1:
-  podman-storage-2:
-  grader-socket:
-  grader-storage:
-  work-1:
-  work-2:

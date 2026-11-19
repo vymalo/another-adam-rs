@@ -22,23 +22,21 @@ const METER = `http://meter-1:8090/r/${TOKEN}/v1`;
 const SLUG = 'demo-1-aaaaaa';
 const LIMITS = { limitMs: 50 * 60 * 1000, steps: 150, cancelGraceMs: 30_000 };
 
-test('the settings: the meter\'s address, the bearer, the task image by digest only, the window, which is required', () => {
-  const ref = `${IMAGE}@${DIGEST}`;
-  assert.deepEqual(adamSettings({ meterBaseUrl: METER, bearer: BEARER, taskImage: ref, contextWindow: 65536 }), { MODEL_BASE_URL: METER, A2A_BEARER_TOKENS: BEARER, DEVCONTAINER_DEFAULT_IMAGE: ref, MODEL_CONTEXT_WINDOW: '65536' });
-  assert.throws(() => adamSettings({ meterBaseUrl: METER, bearer: BEARER, taskImage: `${IMAGE}:tag@${DIGEST}`, contextWindow: 1024 }), /digest only/);
-  assert.throws(() => adamSettings({ meterBaseUrl: METER, bearer: BEARER, taskImage: ref }), /context window is required/);
-  assert.throws(() => adamSettings({ meterBaseUrl: METER, bearer: BEARER, taskImage: ref, contextWindow: null }), /context window is required/);
+test('the settings: the meter\'s address, the bearer, the window, which is required', () => {
+  assert.deepEqual(adamSettings({ meterBaseUrl: METER, bearer: BEARER, contextWindow: 65536 }), { MODEL_BASE_URL: METER, A2A_BEARER_TOKENS: BEARER, MODEL_CONTEXT_WINDOW: '65536' });
+  assert.throws(() => adamSettings({ meterBaseUrl: METER, bearer: BEARER }), /context window is required/);
+  assert.throws(() => adamSettings({ meterBaseUrl: METER, bearer: BEARER, contextWindow: null }), /context window is required/);
 });
 
 test('the message is the one line adam needs, then the statement as it is', () => {
   assert.equal(adamMessage({ repoUrl: 'http://git-server:8080/bench/x-1.git', statement: 'Fix the bug.\n' }), 'In http://git-server:8080/bench/x-1.git (base branch main), do this task:\n\nFix the bug.\n');
 });
 
-test('a container of the task image ran: by the digest in its image, or by its id', () => {
-  const task = { image: { digest: DIGEST } };
-  assert.equal(ranTaskImage([{ image: `registry.example.test/x@${DIGEST}`, imageId: 'f'.repeat(64) }], task), true);
-  assert.equal(ranTaskImage([{ image: 'x', imageId: DIGEST.slice(7) }], task), true);
-  assert.equal(ranTaskImage([{ image: 'docker.io/library/debian:12', imageId: 'e'.repeat(64) }], task), false);
+test('the coder ran the task image: by the digest in the reference it was started from', () => {
+  const task = { image: { digest: DIGEST, ref: `registry.example.test/x@${DIGEST}` } };
+  assert.equal(ranTaskImage([{ image: `registry.example.test/x@${DIGEST}` }], task), true);
+  assert.equal(ranTaskImage([{ image: task.image.ref }], task), true);
+  assert.equal(ranTaskImage([{ image: 'docker.io/library/debian:12' }], task), false);
   assert.equal(ranTaskImage([], task), false);
 });
 
@@ -48,7 +46,7 @@ async function setup(t, { script = [{ state: 'working' }, { state: 'completed' }
   const calls = [];
   const containers = new FakeContainers();
   containers.listing = [{ image: `${IMAGE}@${DIGEST}`, imageId: 'f'.repeat(64), labels: {}, names: ['devc'] }];
-  const state = { runs: ['0191a2b3-7c4d'], slots: { '0191a2b3-7c4d': [SLUG] } };
+  const state = { runs: ['0191a2b3-7c4d'], slots: { '0191a2b3-7c4d': [SLUG] }, coderListing: [{ image: task.image.ref, imageId: 'f'.repeat(64), labels: {}, names: ['coder-1'] }] };
   const server = await fakeCoder({ script, holdStream, bearer: BEARER });
   t.after(() => server.close());
   const stack = {
@@ -56,8 +54,9 @@ async function setup(t, { script = [{ state: 'working' }, { state: 'completed' }
     ports: { git: 18083 },
     resetDatabase: async (slot) => calls.push(['resetDatabase', slot]),
     pushBase: async (slot, script) => calls.push(['pushBase', slot, script]),
-    startCoder: async (slot, env) => calls.push(['startCoder', slot, env]),
+    startCoder: async (slot, env, o) => calls.push(['startCoder', slot, env, o]),
     stopCoder: async (slot) => calls.push(['stopCoder', slot]),
+    coderContainers: () => ({ listContainers: async () => state.coderListing }),
     deleteRepo: async (name) => calls.push(['deleteRepo', name]),
     coderUrl: () => server.url,
     listDir: async (slot, dir) => (dir === '/work/workspaces' ? state.runs : state.slots[dir.split('/').at(-1)] ?? []),
@@ -115,7 +114,8 @@ test('prepare: the folder with the configured turn limit, a clean database, the 
   const repo = runRepoName(SLUG, 'r1', 1);
   assert.match(calls[1][2], new RegExp(`push -q --force http://git-server:8080/bench/${repo}\\.git FETCH_HEAD:refs/heads/main`));
   assert.match(calls[1][2], /fetch -q \/work\/bench-base\/base\.git refs\/heads\/main/);
-  assert.deepEqual(calls[2][2], { MODEL_BASE_URL: METER, A2A_BEARER_TOKENS: BEARER, DEVCONTAINER_DEFAULT_IMAGE: task.image.ref, MODEL_CONTEXT_WINDOW: '131072' });
+  assert.deepEqual(calls[2][2], { MODEL_BASE_URL: METER, A2A_BEARER_TOKENS: BEARER, MODEL_CONTEXT_WINDOW: '131072' });
+  assert.deepEqual(calls[2][3], { image: task.image.ref });
   assert.match(ctx.stack.agentDir, new RegExp(`agent-folder/${PINS.coder.revision.slice(0, 12)}-t150$`));
 });
 
@@ -201,12 +201,12 @@ test('run: a task that parks twice is nudged once and cancelled; a refusal of th
   assert.equal((await hit.agent.run(hit.ctx)).exit, 'budget_hit');
 });
 
-test('finding 8: a run in which no container of the task image ran is infrastructure, with the reason', async (t) => {
-  const { agent, ctx, containers } = await setup(t);
+test('finding 8: a run in which the coder did not run the task image is infrastructure, with the reason', async (t) => {
+  const { agent, ctx, state } = await setup(t);
   await agent.prepare(ctx);
-  containers.listing = [{ image: 'docker.io/library/debian:12', imageId: 'e'.repeat(64), labels: {}, names: [] }];
+  state.coderListing = [{ image: 'docker.io/library/debian:12', imageId: 'e'.repeat(64), labels: {}, names: ['coder-1'] }];
   await assert.rejects(agent.run(ctx), (e) => e instanceof InfraError && e.reason === 'no-task-container');
-  containers.listing = [];
+  state.coderListing = [];
   await assert.rejects(agent.run(ctx), (e) => e.reason === 'no-task-container');
 });
 
@@ -241,7 +241,7 @@ test('collect: the worktree comes out as a tar stream into a directory the harne
   assert.equal(fs.existsSync(path.join(ctx.paths.scratch, 'tree')), false, 'the tree is removed once the patch is made');
 });
 
-test('collect: a run that made no workspace has an empty patch, and the notes say why; two runs on the volume is an error', async (t) => {
+test('collect: a run that made no workspace has an empty patch, and the notes say why; two runs in the work directory is an error', async (t) => {
   const none = await setup(t);
   none.state.runs.length = 0;
   await none.agent.prepare(none.ctx);
@@ -264,7 +264,7 @@ test('collect: a branch list that fails does not fail the collection', async (t)
   assert.deepEqual((await agent.collect(ctx)).notes.branch, { error: 'the branches could not be listed' });
 });
 
-test('finding 4 and 9: cleanup deletes the run\'s repository, stops the coder, reaps the service and removes the scratch, even after a failure', async (t) => {
+test('finding 4 and 9: cleanup deletes the run\'s repository, stops the coder, reaps the containers and removes the scratch, even after a failure', async (t) => {
   const { agent, ctx, calls, containers } = await setup(t);
   await agent.prepare(ctx);
   fs.writeFileSync(path.join(ctx.paths.scratch, 'x'), 'x');

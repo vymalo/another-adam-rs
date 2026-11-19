@@ -70,11 +70,36 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", RunId::new().0.simple())
 }
 
-/// A port nobody listens on right now. (Another process may take it before it is used: the cases
-/// that use it retry nothing and fail loudly if it happens.)
-async fn free_port() -> u16 {
+/// A listener on a port the system picked, and that port, for the configuration and the card.
+/// `serve_on` takes the listener itself, so no other process can take the port in between.
+async fn listen() -> (TcpListener, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
+}
+
+/// The helpers are checked before the database is: a misconfiguration is exit 78 even when no
+/// database answers, not the 69 of a store that cannot be reached.
+#[tokio::test]
+async fn an_unregistered_helper_is_78_before_the_database_is_asked() {
+    let name = unique("serve-sessions-early");
+    // Port 1 is privileged and nothing in a test listens there: the connection is refused.
+    let cfg = config("postgres://nobody:nothing@127.0.0.1:1/none", "all", 0);
+    let helper = format!("{name}/helper");
+    let agents = agents(&name, &cfg).child_sessions(sessions_for(&helper));
+    // A `serve` that did not stop would never return: the bound fails the test instead of hanging it.
+    let error = tokio::time::timeout(
+        Duration::from_secs(20),
+        adam_service::serve(&cfg, agents, std::future::pending()),
+    )
+    .await
+    .expect("serve stops at once for a helper nobody registered")
+    .unwrap_err();
+    assert!(
+        matches!(&error, ServeError::ChildSessions { agent } if *agent == helper),
+        "{error}"
+    );
+    assert_eq!(exit_code(&error), 78);
 }
 
 fn config(database: &str, role: &str, port: u16) -> ServiceConfig {
@@ -171,11 +196,11 @@ struct Running {
 }
 
 impl Running {
-    /// Serve until `finish`.
-    fn start(config: ServiceConfig, agents: Agents) -> Self {
+    /// Serve on `listener` until `finish`.
+    fn start(listener: TcpListener, config: ServiceConfig, agents: Agents) -> Self {
         let (stop, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            adam_service::serve(&config, agents, async {
+            adam_service::serve_on(&config, agents, listener, async {
                 let _ = rx.await;
             })
             .await
@@ -240,9 +265,10 @@ async fn a_database_that_is_down_is_a_connect_error_and_exit_69() {
 async fn serve_runs_the_whole_agent_and_stops_on_shutdown() {
     let Some(url) = database() else { return };
     let name = unique("serve-all");
-    let port = free_port().await;
+    let (listener, port) = listen().await;
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let running = Running::start(
+        listener,
         config(&url, "all", port),
         agents(&name, &config(&url, "all", port)),
     );
@@ -296,10 +322,10 @@ async fn a_worker_serves_only_health_and_a_control_plane_serves_a2a() {
     let Some(url) = database() else { return };
 
     let name = unique("serve-worker");
-    let port = free_port().await;
+    let (listener, port) = listen().await;
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let cfg = config(&url, "worker", port);
-    let running = Running::start(config(&url, "worker", port), agents(&name, &cfg));
+    let running = Running::start(listener, config(&url, "worker", port), agents(&name, &cfg));
     until_ok(addr, "/healthz", &running.handle).await;
     assert_eq!(
         status_of(addr, "/.well-known/agent-card.json").await,
@@ -308,10 +334,14 @@ async fn a_worker_serves_only_health_and_a_control_plane_serves_a2a() {
     running.finish().await;
 
     let name = unique("serve-front");
-    let port = free_port().await;
+    let (listener, port) = listen().await;
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let cfg = config(&url, "control-plane", port);
-    let running = Running::start(config(&url, "control-plane", port), agents(&name, &cfg));
+    let running = Running::start(
+        listener,
+        config(&url, "control-plane", port),
+        agents(&name, &cfg),
+    );
     until_ok(addr, "/healthz", &running.handle).await;
     assert_eq!(
         status_of(addr, "/.well-known/agent-card.json").await,
@@ -333,7 +363,7 @@ async fn a_component_of_the_binary_runs_with_the_workers_and_stops_with_them() {
         let (started, stopped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let (on_start, on_stop) = (started.clone(), stopped.clone());
         let name = unique("serve-component");
-        let port = free_port().await;
+        let (listener, port) = listen().await;
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let cfg = config(&url, role, port);
         let agents = agents(&name, &cfg).worker_component("probe", move |store, stop| async move {
@@ -344,7 +374,7 @@ async fn a_component_of_the_binary_runs_with_the_workers_and_stops_with_them() {
             on_stop.fetch_add(1, SeqCst);
             Ok(())
         });
-        let running = Running::start(config(&url, role, port), agents);
+        let running = Running::start(listener, config(&url, role, port), agents);
         until_ok(addr, "/healthz", &running.handle).await;
         for _ in 0..100 {
             if started.load(SeqCst) > 0 {
@@ -380,6 +410,21 @@ async fn an_address_that_is_taken_is_a_bind_error_and_exit_71() {
     assert!(matches!(error, ServeError::Bind { .. }), "{error:?}");
     assert_eq!(error.to_string(), format!("binding 127.0.0.1:{port}"));
     assert_eq!(exit_code(&error), 71);
+}
+
+/// `serve_on` serves on the listener it is given and never binds `LISTEN_ADDR`: here that address
+/// is taken, which would be `ServeError::Bind` if it were read.
+#[tokio::test]
+async fn serve_on_serves_the_listener_it_is_given_and_never_binds_listen_addr() {
+    let Some(url) = database() else { return };
+    let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cfg = config(&url, "worker", taken.local_addr().unwrap().port());
+    let (listener, port) = listen().await;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let running = Running::start(listener, cfg.clone(), agents(&unique("serve-on"), &cfg));
+    until_ok(addr, "/healthz", &running.handle).await;
+    running.finish().await;
+    drop(taken);
 }
 
 /// What a deployment turns on is on, end to end over Postgres: the card says push notifications and
@@ -438,7 +483,7 @@ async fn push_notifications_the_extended_card_and_the_signature_work_through_ser
     std::fs::write(&key_file, adam_a2a::generate_signing_key_pem(false)).unwrap();
 
     let name = unique("serve-features");
-    let port = free_port().await;
+    let (listener, port) = listen().await;
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let cfg = config_with(
         &url,
@@ -476,7 +521,7 @@ async fn push_notifications_the_extended_card_and_the_signature_work_through_ser
             poll_interval: Duration::from_millis(20),
             ..RuntimeOptions::default()
         });
-    let running = Running::start(cfg, agents);
+    let running = Running::start(listener, cfg, agents);
     until_ok(addr, "/healthz", &running.handle).await;
 
     let base = format!("http://{addr}");
@@ -583,10 +628,14 @@ async fn nothing_optional_is_on_unless_the_environment_says_so() {
     use a2a_client::agent_card::AgentCardResolver;
     let Some(url) = database() else { return };
     let name = unique("serve-plain");
-    let port = free_port().await;
+    let (listener, port) = listen().await;
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let cfg = config(&url, "control-plane", port);
-    let running = Running::start(config(&url, "control-plane", port), agents(&name, &cfg));
+    let running = Running::start(
+        listener,
+        config(&url, "control-plane", port),
+        agents(&name, &cfg),
+    );
     until_ok(addr, "/healthz", &running.handle).await;
     let card = AgentCardResolver::new(None)
         .resolve(&format!("http://{addr}"))
@@ -607,11 +656,12 @@ async fn nothing_optional_is_on_unless_the_environment_says_so() {
 async fn a2a_docs_false_turns_the_docs_off() {
     let Some(url) = database() else { return };
     let name = unique("serve-nodocs");
-    let port = free_port().await;
+    let (listener, port) = listen().await;
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let more = [("A2A_DOCS", "false".to_owned())];
     let cfg = config_with(&url, "control-plane", port, &more);
     let running = Running::start(
+        listener,
         config_with(&url, "control-plane", port, &more),
         agents(&name, &cfg),
     );
@@ -639,7 +689,7 @@ async fn serve_expands_the_commands_it_is_given_and_the_card_lists_them() {
 
     for served in [true, false] {
         let name = unique("serve-commands");
-        let port = free_port().await;
+        let (listener, port) = listen().await;
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let cfg = config(&url, "all", port);
         let mut card = AgentCardConfig::new(
@@ -658,7 +708,7 @@ async fn serve_expands_the_commands_it_is_given_and_the_card_lists_them() {
             card = card.with_extension(ExtensionConfig::commands(&[info]).unwrap());
             agents = agents.commands(Commands::new([("echo", "[$ARGUMENTS]")]));
         }
-        let running = Running::start(cfg, agents.card(card));
+        let running = Running::start(listener, cfg, agents.card(card));
         until_ok(addr, "/healthz", &running.handle).await;
 
         let public = AgentCardResolver::new(None)
@@ -722,4 +772,125 @@ async fn serve_expands_the_commands_it_is_given_and_the_card_lists_them() {
         assert_eq!(answer.as_deref(), Some(wanted.as_str()), "served: {served}");
         running.finish().await;
     }
+}
+
+/// A runtime on the memory store with the agent `name` and the helpers registered as starters.
+fn service_with(name: &str, helpers: &[&str]) -> Service {
+    let mut builder = Runtime::builder(std::sync::Arc::new(adam_core::MemoryStore::new()))
+        .starter(EchoStarter(name.to_owned()));
+    for helper in helpers {
+        builder = builder.starter(EchoStarter((*helper).to_owned()));
+    }
+    Service::new(builder, name, &RuntimeOptions::default())
+}
+
+fn sessions_for(registered: &str) -> adam_a2a_runtime::ChildSessions {
+    use adam_a2a_runtime::{ChildSessionAgent, ChildSessions};
+    ChildSessions::new([ChildSessionAgent::new("helper", registered, "Helps.")], 8).unwrap()
+}
+
+/// `Service::with_child_sessions` hands the sessions to the backend only when every helper is
+/// registered on the runtime; `None` changes nothing.
+#[tokio::test]
+async fn a_service_serves_child_sessions_only_when_every_helper_is_registered() {
+    let name = unique("svc-sessions");
+    let helper = format!("{name}/helper");
+
+    let none = service_with(&name, &[&helper]).with_child_sessions(None);
+    assert!(none.child_sessions().is_none());
+
+    let served = service_with(&name, &[&helper]).with_child_sessions(Some(sessions_for(&helper)));
+    assert_eq!(served.child_sessions(), Some(&sessions_for(&helper)));
+
+    let missing = service_with(&name, &[]).with_child_sessions(Some(sessions_for(&helper)));
+    assert!(
+        missing.child_sessions().is_none(),
+        "a helper nobody registered"
+    );
+}
+
+/// The card lists `child-sessions/v1` exactly when `Agents::child_sessions` is given and served,
+/// with the limits' `maxOpen`; `serve` adds it, not the binary's card.
+#[tokio::test]
+async fn serve_lists_child_sessions_on_the_card_exactly_when_it_serves_them() {
+    use a2a_client::agent_card::AgentCardResolver;
+    use adam_a2a::CHILD_SESSIONS_EXTENSION;
+
+    let Some(url) = database() else { return };
+
+    for role in ["all", "control-plane"] {
+        for served in [true, false] {
+            let name = unique("serve-sessions");
+            let helper = format!("{name}/helper");
+            let (listener, port) = listen().await;
+            let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+            let cfg = config(&url, role, port);
+            let (n, h) = (name.clone(), helper.clone());
+            let register = cfg.role.runs_workers();
+            let mut agents = Agents::new(name.as_str(), move |b| {
+                if register {
+                    b.agent(Echo(n)).agent(Echo(h))
+                } else {
+                    b.starter(EchoStarter(n)).starter(EchoStarter(h))
+                }
+            })
+            .card(AgentCardConfig::new(
+                &name,
+                "A test agent.",
+                format!("http://{addr}/").parse().unwrap(),
+                "0.0.1",
+            ))
+            .options(RuntimeOptions {
+                poll_interval: Duration::from_millis(20),
+                ..RuntimeOptions::default()
+            });
+            if served {
+                agents = agents.child_sessions(sessions_for(&helper));
+            }
+            let running = Running::start(listener, cfg, agents);
+            until_ok(addr, "/healthz", &running.handle).await;
+
+            let public = AgentCardResolver::new(None)
+                .resolve(&format!("http://{addr}"))
+                .await
+                .unwrap();
+            let entry = public
+                .capabilities
+                .extensions
+                .iter()
+                .flatten()
+                .find(|e| e.uri == CHILD_SESSIONS_EXTENSION);
+            assert_eq!(entry.is_some(), served, "{role}, served {served}");
+            if let Some(entry) = entry {
+                let params = entry.params.as_ref().unwrap();
+                assert_eq!(params["maxOpen"], 8, "{role}");
+                assert_eq!(
+                    params["agents"],
+                    json!([{"name": "helper", "description": "Helps."}]),
+                    "{role}"
+                );
+            }
+            running.finish().await;
+        }
+    }
+}
+
+/// A helper the process did not register is a fault of the binary, found at start: exit 78 and
+/// nothing served.
+#[tokio::test]
+async fn a_helper_that_is_not_registered_stops_serve_with_78() {
+    let Some(url) = database() else { return };
+    let name = unique("serve-sessions-missing");
+    let cfg = config(&url, "all", 0);
+    let helper = format!("{name}/helper");
+    let agents = agents(&name, &cfg).child_sessions(sessions_for(&helper));
+    let error = adam_service::serve(&cfg, agents, std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, ServeError::ChildSessions { agent } if *agent == helper),
+        "{error}"
+    );
+    assert_eq!(exit_code(&error), 78);
+    assert!(!error.to_string().contains("postgres://"));
 }

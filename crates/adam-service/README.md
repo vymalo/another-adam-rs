@@ -41,9 +41,10 @@ an agent does.
 | `ConfigError { problems }` | what a non-empty list becomes (`ConfigError::check(problems)`); `Classify` gives `Invalid` |
 | `RuntimeOptions`, `LiveSignals` | how the runtime is set up (worker id, claim scope, concurrency, lease, and the three intervals: `poll_interval` 250 ms for the worker's idle poll, `cancel_poll_interval` 1 s for a step's cancel watch, `view_poll_interval` 2 s for a subscription's fallback), and how a process learns of other processes (`LiveSignals::local()` or the Postgres `NOTIFY` ones `serve` builds). **`cancel_poll_interval` and `view_poll_interval` are new public fields: a `RuntimeOptions` built with a struct literal needs them** |
 | `Service { runtime, backend }` | `Service::new(builder, name, options)`, `new_with(.., live)`, `with_inbound(Option<InboundFn>)` (how an A2A message becomes the agent's input), `router(card, auth)`, `router_with_options(card, auth, ServerOptions)` (push notifications, the card's signature), `run_worker(shutdown)`; `router(&backend, card, auth)` and `router_with_options(&backend, ..)` for a composition that holds the parts itself |
-| `Agents::new(name, register)` | the agent a process serves: its name, `.card(card)`, `.options(options)`, `.inbound(f)` (read A2A messages with `f`, e.g. `adam_a2a_runtime::vymalo_inbound` for an agent behind a screen; the default is `default_inbound`), `.access_tiers(tiers)` (the agent's card lists `access-tier/v1` with these tiers: the backend then reads, validates and says them, see `adam-a2a-runtime`; `Service::with_access_tiers(Option<AccessTiers>)` is the same for a composition that holds the service itself), `.commands(commands)` (`adam_a2a_runtime::Commands`: the agent's card lists `commands/v1`, and the backend expands a message that names one; `Service::with_commands(Option<Commands>)` is the same; the card still comes from the caller, so build both from one manifest (`Commands::from_manifest` and `card_of`), and `tests/serve.rs` proves `serve` passes the commands to the backend; **`Agents` gained the public field `commands`**, it is `#[non_exhaustive]` so only a destructuring without `..` breaks), and `register`, a closure that puts it on the runtime builder (`Assembly::register`, or the starter only for a control plane); `.worker_component(name, f)` adds a component of the binary to the worker tier (below) |
+| `Agents::new(name, register)` | the agent a process serves: its name, `.card(card)`, `.options(options)`, `.inbound(f)` (read A2A messages with `f`, e.g. `adam_a2a_runtime::vymalo_inbound` for an agent behind a screen; the default is `default_inbound`), `.access_tiers(tiers)` (the agent's card lists `access-tier/v1` with these tiers: the backend then reads, validates and says them, see `adam-a2a-runtime`; `Service::with_access_tiers(Option<AccessTiers>)` is the same for a composition that holds the service itself), `.commands(commands)` (`adam_a2a_runtime::Commands`: the agent's card lists `commands/v1`, and the backend expands a message that names one; `Service::with_commands(Option<Commands>)` is the same; the card still comes from the caller, so build both from one manifest (`Commands::from_manifest` and `card_of`), and `tests/serve.rs` proves `serve` passes the commands to the backend; **`Agents` gained the public field `commands`**, it is `#[non_exhaustive]` so only a destructuring without `..` breaks), and `register`, a closure that puts it on the runtime builder (`Assembly::register`, or the starter only for a control plane); `.child_sessions(sessions)` (`adam_a2a_runtime::ChildSessions`, from `AgentDef::child_sessions`: the backend serves `child-sessions/v1` for these helpers and **`serve` adds the extension to the card itself, only when the backend accepted them**, so the binary's card never lists what the process does not serve; every helper must be registered on the runtime (the full agent, or its starter on a control plane), or `serve` returns `ServeError::ChildSessions` before it serves anything; `Service::with_child_sessions(Option<ChildSessions>)` and `Service::child_sessions()` are the same for a composition that holds the service itself; **`Agents` gained the public field `child_sessions`**, as before only a destructuring without `..` breaks), `.worker_component(name, f)` adds a component of the binary to the worker tier (below) |
 | `serve(&config, agents, shutdown)` | the whole process, until `shutdown` resolves; `ServeError` on failure |
-| `ServeError` | `Connect`, `Migrate`, `NoCard`, `Bind`, `LocalAddr`, `Host`, `Push` (push notifications are on and cannot be set up: exit 78). The message names the step; the cause is the `source`, so a chain printed whole says it once |
+| `serve_on(&config, agents, listener, shutdown)` | the same on a `tokio::net::TcpListener` the caller bound (`LISTEN_ADDR` is not read, so never `Bind`): a host that must know its port first binds it and hands it over, with no moment in which another process can take it; the checks run in the same order |
+| `ServeError` | `Connect`, `Migrate`, `NoCard`, `ChildSessions` (a helper of `child-sessions/v1` is not registered on the runtime: exit 78), `Bind`, `LocalAddr`, `Host`, `Push` (push notifications are on and cannot be set up: exit 78). The message names the step; the cause is the `source`, so a chain printed whole says it once |
 | `claim_scope_for(placement)` | `Pinned` for a placement that pins runs, `Any` otherwise |
 | `exit_code(&err)`, `exit_code_with(&err, classify)`, `EX_*` | the exit code of an error chain (below); `classify` is how a binary adds its own error types |
 
@@ -91,10 +92,12 @@ sequenceDiagram
   participant P as Postgres
   participant H as Host (adam-host)
   B->>B: parse the configuration, read the agent's files, assemble the agent
-  B->>S: serve(config, Agents { name, card, register, options, inbound }, shutdown)
-  S->>P: connect, migrate
+  B->>S: serve(config, Agents { name, card, register, options, inbound, child_sessions }, shutdown)
+  S->>S: open the pool without connecting (PgStore::connect_lazy)
   S->>S: PgNotify (LISTEN/NOTIFY) as LiveSignals
   S->>S: Service::new_with(register(Runtime::builder(store)), name, options, live)
+  S->>S: every helper of child_sessions is registered, else ServeError::ChildSessions (78), and the card lists the extension
+  S->>P: connect, migrate
   S->>S: bind LISTEN_ADDR, log `listening` (addr, role, workers, worker_id)
   S->>H: the components of the role
   H-->>S: shutdown: drain the server, let the steps finish, flush notify
@@ -105,7 +108,7 @@ sequenceDiagram
 stateDiagram-v2
   [*] --> Connecting
   Connecting --> Listening: migrated, bound
-  Connecting --> Failed: Postgres down or schema refused, address taken, no card
+  Connecting --> Failed: no card, a helper of child-sessions/v1 not registered (78), Postgres down or schema refused, address taken
   Listening --> Draining: the shutdown future resolves
   Listening --> Failed: a component stops on its own
   Draining --> [*]: components stopped, notify flushed
@@ -115,7 +118,7 @@ stateDiagram-v2
 | Role | Components | Also |
 |---|---|---|
 | `all` (default) | `a2a-server`, `worker`, `notify` | |
-| `control-plane` | `a2a-server`, `notify` | the runtime knows the agent as a starter only: no model, no tools |
+| `control-plane` | `a2a-server`, `notify` | the runtime knows the agent, and the helpers of `child-sessions/v1`, as starters only: no model, no tools |
 | `worker` | `worker`, `health`, `notify` | `/healthz` on `LISTEN_ADDR`, no A2A |
 
 A binary adds components of its own with `Agents::worker_component(name, |store, stop| async { .. })`: they
@@ -145,7 +148,7 @@ repository's sources).
 | Code | Name | Root cause |
 |---|---|---|
 | 0 | | clean shutdown after a signal |
-| 78 | `EX_CONFIG` | `ConfigError`, `OpenAiConfigError`, `ServeError::NoCard`, or any error whose class is `Invalid` (including what a binary classifies with `exit_code_with`: a mistake in the agent's files) |
+| 78 | `EX_CONFIG` | `ConfigError`, `OpenAiConfigError`, `ServeError::NoCard`, `ServeError::ChildSessions`, or any error whose class is `Invalid` (including what a binary classifies with `exit_code_with`: a mistake in the agent's files) |
 | 69 | `EX_UNAVAILABLE` | a `Transient`, `RateLimited` or `Conflict` error: Postgres, an MCP server |
 | 71 | `EX_OSERR` | an `io::Error`, `ServeError::Bind`: a port that cannot be bound |
 | 70 | `EX_SOFTWARE` | `HostError` (a component stopped, panicked or ended while still needed), a panicked task, a `Corrupt` or `Internal` error |
@@ -172,7 +175,8 @@ from a worker not a 69.
   answers, a bearer token is required, a task completes, a control plane and a worker over one store meet in it,
   and two services of different names share a store without stealing each other's runs.
 * `tests/serve.rs` (needs `ADAM_TEST_POSTGRES_URL`, skipped without it; `ADAM_TEST_REQUIRE_DB=1` makes a
-  missing URL a failure): `serve` end to end on Postgres, for each role, and a binary's own component
+  missing URL a failure): `serve` end to end on Postgres, for each role (through `serve_on`, on a listener the test
+  bound, so no other test takes its port; `serve` itself for the bind error), and a binary's own component
   (`worker_component`) that runs with the workers and stops with them; nothing optional is on by default but the docs
   (`/openapi.json` 200 and `/docs` 303 without a token), and `A2A_DOCS=false` closes them (`a2a_docs_false_turns_the_docs_off`).
 

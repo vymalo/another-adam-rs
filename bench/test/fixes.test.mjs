@@ -296,10 +296,10 @@ test('row 10: rm -f has a -- before the path', () => {
 // ---- row 11: URLs ----
 
 test('row 11: a URL that begins with - or has the wrong scheme is refused', (t) => {
-  for (const tasks of [{ upstreamUrl: '--upload-pack=touch' }, { upstreamUrl: 'ftp://x/y' }, { podman: { url: '--x' } }, { podman: { url: 'http://x' } }, { podman: { connection: '-x' } }]) {
+  for (const tasks of [{ upstreamUrl: '--upload-pack=touch' }, { upstreamUrl: 'ftp://x/y' }, { verifierNetworks: ['host'] }, { upstreamDir: '/absolute' }, { workspaceImage: 'x:1' }]) {
     assert.throws(() => normalizeConfig(rawConfig({ tasks })), ConfigError, JSON.stringify(tasks));
   }
-  for (const tasks of [{ upstreamUrl: 'https://example.test/x.git' }, { upstreamUrl: '/srv/up.git' }, { podman: { url: 'unix:///run/podman.sock' } }, { podman: { url: 'ssh://u@h/run/p.sock' } }]) normalizeConfig(rawConfig({ tasks }));
+  for (const tasks of [{ upstreamUrl: 'https://example.test/x.git' }, { upstreamUrl: '/srv/up.git' }, { verifierNetworks: ['bench-verifier'] }, { upstreamDir: 'v2' }]) normalizeConfig(rawConfig({ tasks }));
   assert.throws(() => fetchUpstream({ url: '--upload-pack=touch', commit: 'a'.repeat(40), dir: path.join(tmp(t), 'x') }), UpstreamError);
 });
 

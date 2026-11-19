@@ -79,6 +79,7 @@ flowchart TB
         openai["adam-model-openai"]
         oauth["adam-model-oauth"]
         ws["adam-workspace"]
+        codetools["adam-code-tools"]
         gitsb["adam-git-sandbox"]
         devc["adam-devcontainer"]
         kube["adam-env-kubernetes"]
@@ -89,6 +90,8 @@ flowchart TB
     coder --> ui
     coder --> facade
     coder --> ws
+    coder --> codetools
+    codetools --> ws
     coder --> devc
     coder --> kube
     coder --> acp
@@ -134,7 +137,7 @@ flowchart TB
 | Layer | Crates | Job |
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
-| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
+| Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-devcontainer`](../crates/adam-devcontainer/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
 | Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Binaries | [`adam-coder`](../bin/adam-coder/README.md), [`adam-agent`](../bin/adam-agent/README.md), [`adam-egress`](../bin/adam-egress/README.md) | The two agents you can run, library and binary each, over `adam-service`; and the HTTPS-only egress proxy for run pods, which uses only `adam-error` and is in the same image; the chart deploys it with the run pods, whose network policy allows nothing else out ([ADR 0042](decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)). |
@@ -246,13 +249,13 @@ flowchart LR
             mcp["AgentDef::connect_mcp<br/>the folder's mcp.json, McpSettings policy"]
             agent["CoderAgent::try_from_def<br/>model + ToolEnv + MCP tools"]
         end
-        starter["CoderStarter<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
-        agents["Agents { name, card, register, options }"]
+        starter["CoderStarter + the helpers' starters (AgentDef::session_starters)<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
+        agents["Agents { name, card, register, options, child_sessions }"]
     end
 
     subgraph svc["adam-service: serve(ServiceConfig, Agents, shutdown)"]
         direction LR
-        pg["PgStore::connect + migrate()<br/>as DynStore"]
+        pg["PgStore::connect_lazy, then ping + migrate()<br/>as DynStore"]
         pgn["PgNotify::new(store pool, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
         service["Service::new_with(register(Runtime::builder(store)), name, options, live)"]
         rtm["Runtime<br/>PgEventSink as EventSink, PgNotifier as Notifier"]
@@ -294,7 +297,7 @@ flowchart LR
 | `ROLE` | Components | Needs |
 |---|---|---|
 | `all` (default) | `a2a-server`, `worker`, `notify` in one process | every variable |
-| `control-plane` | `a2a-server`, `notify`, over a runtime that has only the agent's starter (starts, delivers, cancels and views runs; never steps) | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variable |
+| `control-plane` | `a2a-server`, `notify`, over a runtime that has only the agent's starter and its helpers' starters (`AgentDef::session_starters`; starts, delivers, cancels and views runs; never steps) | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variable |
 | `worker` | `worker`, `notify`, `health` (`GET /healthz` on `LISTEN_ADDR`, no A2A) | everything except `A2A_BEARER_TOKENS` and `PUBLIC_URL` |
 
 * The roles meet in the store (the record and its CAS, the leases) and in `NOTIFY` ([below](#across-processes-signals-and-events)).

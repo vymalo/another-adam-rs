@@ -1,7 +1,7 @@
 //! The servers of an `mcp.json`, as tools an [`LlmAgent`](adam_llm_agent::LlmAgent) can call.
 //!
 //! [`McpServers::connect`] takes the [`McpConfig`](adam_agent_fs::McpConfig) that `adam-agent-fs`
-//! parsed, an [`Env`] (values for `${VAR}`, before the process environment) and an [`McpPolicy`] (what
+//! parsed, an [`Env`] (values for `${VAR}`, before its source, the process environment by default) and an [`McpPolicy`] (what
 //! the deployment allows), connects to every server over streamable HTTP or, when the policy allows a
 //! local process, stdio, lists their tools, and [`McpServers::tools`] gives them back as tools named
 //! `<server>__<tool>`. Everything that can be wrong is an [`Error`] at startup, naming the server and

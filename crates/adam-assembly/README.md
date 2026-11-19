@@ -16,13 +16,13 @@ and the "files" track (`adam-agent-fs`).
 adam-agent-fs  (files -> manifest) ─┐
 adam-llm-agent (ToolSet, LlmAgent) ─┼─> adam-assembly ─> adam (facade)
 adam-model, adam-runtime ───────────┘        ▲
-adam-a2a  (feature a2a) ─────────────────────┤
+adam-a2a, adam-a2a-runtime (feature a2a) ───┤
 adam-mcp  (feature mcp) ─────────────────────┘
 ```
 
 It depends on `adam-agent-fs`, `adam-llm-agent`, `adam-model`, `adam-runtime`, `adam-error`,
 `adam-core`, `async-trait`, `chrono`, `serde`, `serde_json`, `thiserror` and `url`, on the A2A client for remote subagents (`a2a-client-lf`,
-`a2a-lf`, `reqwest`, `tokio` for a lock and a timeout, `secrecy` for the token, `tracing`), and on `adam-a2a` behind the
+`a2a-lf`, `reqwest`, `tokio` for a lock and a timeout, `secrecy` for the token, `tracing`), and on `adam-a2a` and `adam-a2a-runtime` (its `ChildSessions` type) behind the
 feature `a2a`, on [`adam-mcp`](../adam-mcp/README.md) behind the feature `mcp` (the MCP client; see
 [MCP tools](#mcp-tools-feature-mcp)), and, behind the feature `dev` only, on [`notify`](https://crates.io/crates/notify) (see
 [Dev reload](#dev-reload-feature-dev)). It has no `unsafe`. Its I/O is the skill tools (the bytes are read once at startup, or come
@@ -54,7 +54,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 
 | Item | What |
 |---|---|
-| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `run_skills(Arc<dyn RunSkills>)` (the root finds skills during its run: [Skills a run finds](#skills-a-run-finds-runskills)), `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`; what each agent's servers said about themselves is appended to **that agent's** instructions at `bind`, once, after the instructions and before the skills: [adam-mcp](../adam-mcp/README.md#server-instructions)), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `name()`, `manifest()`, `bind(ToolSet)` |
+| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `run_skills(Arc<dyn RunSkills>)` (the root finds skills during its run: [Skills a run finds](#skills-a-run-finds-runskills)), `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `secrets(DynSecretSource)` (where a variable that `env` does not give is asked, for remote subagents and MCP servers alike: `adam_core::ProcessEnv` by default, `adam_core::NoSecrets` in an embedded engine, ADR 0047), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`; what each agent's servers said about themselves is appended to **that agent's** instructions at `bind`, once, after the instructions and before the skills: [adam-mcp](../adam-mcp/README.md#server-instructions)), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `name()`, `manifest()`, `bind(ToolSet)`, `child_sessions()` (feature `a2a`: the helpers and limits the root's A2A front serves `child-sessions/v1` for, from the same roster as the session tools, `None` without a subagent; pure, no binding), `session_starters(RuntimeBuilder)` (the start-only agents of the root's helpers, local and remote, for a process that serves the front and does not step: [Child sessions on the A2A front](#child-sessions-on-the-a2a-front)) |
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
@@ -63,8 +63,9 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `BoundDef` | `state(Arc<T>)`, `tool_source(source)` (a `ToolSource` of `adam-llm-agent` for every agent: tools it learns about while it runs, offered at every model turn after the agent's own; `tools:` does not narrow it), `model_aliases(..)`, `wait_poll(Duration)` (how often a waiting agent looks: a remote subagent's task is polled at this interval), `max_parallel(n)` (the most tool calls of one model turn that run at once, for every agent: the deployment's `MAX_PARALLEL_TOOL_CALLS`, 10 when not given; an agent's `limits.max_parallel` lowers it for that agent, and a larger one is the deployment's with a warning),  `scrub(f)` (a function that scrubs secrets out of what the five session tools give the model, which `bind` makes itself and a deployment's own tool wrapper never sees: the coder gives its redactor; the wrapper it makes, `Scrubbed`, also forwards `Tool::read_answer` and scrubs the words and interface of a refusal or an ending, as it scrubs a question), `scrub_longest(f)` (the length of the longest value it replaces, for `ToolCtx::scrub_margin`, as the coder's own wrapper passes it; a report is a child's text scrubbed whole, never a cut one, so no open edge applies), `step_io(StepIo)` (how every agent's tool-call steps report their input and output, and what is scrubbed from them first: `LlmAgentBuilder::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)), `model(DynModel, alias)` |
 | `adam_llm_agent::ReadOutput` | **added by `bind` to every agent whose tools include an MCP tool** (unless its tool list already holds `read_output`, as the coder's does), after the tools it selected: a long MCP result is kept and the model reads the rest with `read_output { id, offset?, limit? }` (an agent that is only a folder keeps it in the run's state, 4 MiB; see [`adam-mcp`](../adam-mcp/README.md)). An agent with no MCP tool among its tools does not get it |
 | `SubagentTool` | the tool that runs a subagent as a child run: `new(tool_name, agent, description)`, `agent()`. `bind` adds one per local subagent, so a user never builds one. Its call is a `subagent` step drawn as an agent (`Tool::step_style`), as is a remote subagent's, **labelled with the tool's name as a person reads it** (`explorer` is "Explorer", `code_reviewer` is "Code reviewer"). `load_skill` and `read_skill_file` are "Load a skill" and "Read a skill file" |
-| `Assembly` | `agents()`, `root()`, `register(RuntimeBuilder)` (the agents and the round agents of the remote sessions), `remote_round_agents()`, `info()`, `remotes()`, `manifest()`, `card(url, version)` (feature `a2a`) |
+| `Assembly` | `agents()`, `root()`, `register(RuntimeBuilder)` (the agents and the round agents of the remote sessions), `remote_round_agents()`, `info()`, `remotes()`, `manifest()`, `card(url, version)` (feature `a2a`), `child_sessions()` (feature `a2a`: what the definition computed at `bind`) |
 | `RemoteRoundAgent` | the `Agent` (and `AgentStarter`) that works the rounds of a session on a remote subagent of the root, registered as `<root>/<subagent>`; `with_wait_poll(Duration)` (`BoundDef::wait_poll` sets it). See [Remote sessions](#remote-sessions) |
+| `RemoteRoundStarter` | its start-only twin, `new(name)`: makes the same round state (`init`, `init_continuing`) with no endpoint and no credential; `AgentDef::session_starters` registers it |
 | `Assembly::prompt_commands()` (feature `mcp`) | the prompts of the **root's** MCP servers as commands (`adam_mcp::PromptCommand`), read once when the servers were connected; a subagent's give none. `adam-service` adds them to the backend and the card ([adam-mcp](../adam-mcp/README.md#prompts-as-commands)) |
 | `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog and the instructions of its MCP servers), `tools` (own, skill tools, then one per subagent, local or remote, then the five session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `limits`: what an `LlmAgent` was made from, comparable |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
@@ -586,6 +587,18 @@ auth: bearer:BILLING_AGENT_TOKEN
 | an `a2a:` URL that is plain http to another machine (without the development switch) or has a user name or password | `RemoteUrl { origin, url, problem }` |
 | a remote named like a tool of the parent, like `load_skill`/`read_skill_file`, or like another subagent | `SubagentToolClash` |
 
+### Child sessions on the A2A front
+
+With feature `a2a`, `AgentDef::child_sessions()` gives `adam-a2a-runtime` the helpers a person may start a session with
+(`ChildSessions`): the root's subagents in the order of the manifest, each registered as `<root>/<name>`, with the
+time limit of its rounds (a local one's `limits.max_minutes`, a remote one's `remote_timeout`), and the **effective**
+limits (`effective_session_limits()`), never the deployment's raw `SessionSettings`. It is made from the same roster as
+the five session tools, so the card, the front and the tools cannot disagree. A control plane that never binds an agent
+passes it to the front and registers `session_starters` beside the root's starter; the worker registers the assembly.
+Register one or the other for a name on a process, not both: a second registration replaces the first. Tests:
+`tests/child_sessions.rs` (the list and its limits, a property test over random folders, the starters, and a session
+started on a control plane and worked by a worker on every store).
+
 ### Remote sessions
 
 A root's remote subagent can run as a session (`subagent_start` and the other four tools). Each round is a run of a
@@ -670,7 +683,9 @@ Tests: `tests/extra_mcp.rs`.
   a registered tool (`McpToolClash`); then `tools:` resolves against the catalog. A subagent named like an MCP
   tool its parent selects is a `SubagentToolClash` with `ToolClash::McpTool { server }`. Tools given for an agent
   the definition does not contain are `McpUnknownAgent`, with a suggestion, before anything else is checked.
-* **The environment.** `${VAR}` in the files reads `AgentDef::env` first and the process environment second, as
+* **The environment.** `${VAR}` in the files reads `AgentDef::env` first and the `AgentDef::secrets` source second (the
+  process environment unless the host gives another; a name it refuses is `RemoteAuthProblem::Refused` or
+  `VarProblem::Refused`, **new variants of closed enums**), as
   `auth: bearer:VAR` does, so one set of secrets serves remote subagents and MCP servers. Secrets stay
   `SecretString`s in `adam-mcp`; none appears in a journal, state, event, log, `Debug`, error or tool result (a
   test reads all of them). Put secrets in `headers`: a `${VAR}` in a `url` is refused unless the policy given to
@@ -779,6 +794,7 @@ place each:
   bound as its files say; the root and a subagent run to the end on a `MockModel` through a `Runtime` on
   the in-memory store. The fixture's remote subagent says `auth: bearer:BILLING_AGENT_TOKEN`, so these tests
   give it a value with `AgentDef::env` (an unset variable is a bind error).
+* `tests/child_sessions.rs` (feature `a2a`): see [Child sessions on the A2A front](#child-sessions-on-the-a2a-front).
 * `tests/remote_sessions.rs`: remote sessions against an in-process A2A server whose backend records what it was asked: the
   context carried across rounds, a steer and a queued message, a restart, a lost send response, a failed round, a question, a
   closing round, and the four cancel cases (`CancelTask` on close with cancel, on a cancelled parent, at the time limit, and

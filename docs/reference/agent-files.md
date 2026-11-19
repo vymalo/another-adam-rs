@@ -646,6 +646,8 @@ whose names are the enum of `agent`, and they are not given to a subagent. A sub
 (`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the five is refused at
 bind. A root whose subagents are all remote gets the five tools as well.
 
+**The same helpers are offered to a person.** `adam-agent` and `adam-coder` list `child-sessions/v1` on the card of a root with a subagent, so a client can open, talk to and close a session on any of them ([A2A server](a2a-server.md#child-sessions-child-sessionsv1)). The card's `maxOpen` is the effective `SESSION_MAX_OPEN`: `limits.max_open_sessions` of the root's file lowers it, never raises it. A root with no subagent lists nothing.
+
 ### The subagent tool
 
 * **Name and shape.** Named after the subagent. Input `{ "message": string }`, required. Description: the
@@ -816,7 +818,8 @@ stateDiagram-v2
   server again, but a transition that fails before it commits calls it again. MCP has no idempotency key, so
   **no failure of an MCP call is `ToolError::Transient`**: a timeout or lost connection is an error result saying
   the call may or may not have run.
-* **Secrets.** `${VAR}` reads `AgentDef::env` then the process environment. Expanded values are
+* **Secrets.** `${VAR}` reads `AgentDef::env` then the `AgentDef::secrets` source: the process environment in a server,
+  nothing in an embedded engine unless its host gives it (`NoSecrets`, ADR 0047). Expanded values are
   `SecretString`s and registered (with their encoded forms) with a redactor that every server message, tool
   result and child stderr line passes through. **Secrets go in `headers`, not in the URL** (the SDK logs the
   URL): `${VAR}` in a `url` is refused unless `McpPolicy::allow_url_secrets(true)`. A secret in stdio `args`

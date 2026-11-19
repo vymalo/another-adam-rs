@@ -31,6 +31,8 @@ database driver.
 | `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
 | `storable` | the one rule every adapter applies before it writes a JSON value: a NUL in a string or a key becomes U+FFFD, so a state or a journal payload is the same value in every backend ([ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)) |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
+| `SecretSource` (trait), `DynSecretSource`, `SecretError` | where a secret that agent files name comes from ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), decision 5): `secret(name)` gives a `SecretString` or `Missing`, `NotUnicode`, `Refused` (`#[non_exhaustive]`: a reader treats a reason it does not know as `Refused`); it is synchronous, so a source answers from memory (a host fetches a vault's secrets first); `kind()` names the source, and `Debug` of a `dyn SecretSource` shows only that, never a value, so a host's source needs no `Debug`; used by `adam-assembly`'s `AgentDef::secrets` and `adam-mcp`'s `Env::source` |
+| `ProcessEnv`, `NoSecrets` | the process environment (a server's default), and a source that refuses every name, set or not (an embedded engine's default) |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
 
 ```rust
@@ -232,8 +234,10 @@ live next to the code; those in `src/store/mod.rs` (`class_table`,
 `StoreError` variant with an exhaustive `match`. `the_defaults_keep_no_bodies_and_serve_the_whole_state`
 pins the three transcript defaults on a store that overrides none of them, and
 `a_head_round_trips_and_a_headless_commit_makes_it_stale` and
-`the_body_gc_keeps_the_current_set_and_collects_an_old_superseded_one` pin `MemoryStore`'s head and
-its GC with an explicit cutoff. Database gating is described in the
+`the_body_gc_keeps_the_current_generation_and_collects_an_old_one` pin `MemoryStore`'s head and its
+GC with an explicit cutoff. `src/secrets.rs` checks that `ProcessEnv` gives what the process has,
+that `NoSecrets` refuses a name the process has, that a held source's `Debug` shows its kind and not
+its values, and that no error says a value. Database gating is described in the
 [testing guide](../../docs/guides/testing.md).
 
 ## See also

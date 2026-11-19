@@ -52,7 +52,7 @@ agent/
 | `name` | the registered name and **the key of the stored runs**: renaming strands the old runs |
 | `description` or `card.description` | the A2A card needs one |
 | `card:` | the card: `name`, `skills` (`id`, `name`, `description`, `tags`, `examples`); the URL is `PUBLIC_URL` |
-| `limits:` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`, `max_parallel` (tool calls of one turn that run at once, 1 to 32; it lowers the deployment's `MAX_PARALLEL_TOOL_CALLS` for this agent), `max_open_sessions`, `max_working_sessions`, `max_session_rounds` (root only: lower the deployment's `SESSION_MAX_OPEN`, `SESSION_MAX_WORKING`, `SESSION_MAX_ROUNDS` for the sessions this agent starts, never raise them) |
+| `limits:` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`, `max_parallel` (tool calls of one turn that run at once, 1 to 32; it lowers the deployment's `MAX_PARALLEL_TOOL_CALLS` for this agent), `max_open_sessions`, `max_working_sessions`, `max_session_rounds` (root only: with a subagent, the agent also offers sessions to a person over A2A, and these lower the card's `maxOpen`; lower the deployment's `SESSION_MAX_OPEN`, `SESSION_MAX_WORKING`, `SESSION_MAX_ROUNDS` for the sessions this agent starts, never raise them) |
 | `model:` | a gateway alias, when it should not be `MODEL`; `inherit` takes the parent's |
 | `vars:` | defaults for `{{placeholders}}` in the body; an undeclared or unused one stops startup |
 | `tools:` | optional selection among the agent's tools; `linear__*` takes a server's tools; an unknown name is refused with a suggestion |

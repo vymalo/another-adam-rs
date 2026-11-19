@@ -139,7 +139,7 @@ test('only an http address of the bench repository on the loopback is listed', a
 test('the base is pushed by a container: the script fetches into a fresh repository and pushes from it, and takes only plain names', () => {
   const script = pushScript({ base: '/work/bench-base/base.git', url: 'http://git-server:8080/bench/x-1-r1.git' });
   assert.match(script, /git init -q "\$P"/);
-  assert.match(script, /git -C "\$P" fetch -q \/work\/bench-base\/base\.git refs\/heads\/main/);
+  assert.match(script, /git -c safe\.directory='\*' -C "\$P" fetch -q \/work\/bench-base\/base\.git refs\/heads\/main/);
   assert.match(script, /git -C "\$P" push -q --force http:\/\/git-server:8080\/bench\/x-1-r1\.git FETCH_HEAD:refs\/heads\/main/);
   assert.match(script, /GIT_CONFIG_GLOBAL=\/dev\/null/);
   for (const bad of [{ base: '/work/a b', url: 'http://git-server:8080/bench/x.git' }, { base: '/work/b.git', url: 'http://evil.example.test/bench/x.git' }, { base: '/work/b.git', url: 'http://git-server:8080/bench/x.git; rm' }]) assert.throws(() => pushScript(bad), /plain/);

@@ -12,7 +12,8 @@ rust-version.workspace = true
 default = ["macros"]
 # `#[tool]` (and the paths it generates code against, which are always there).
 macros = ["dep:adam-macros"]
-# `Assembly::card`: the root agent's `card:` as an `adam_a2a::AgentCardConfig`.
+# The root agent's A2A side (`adam-assembly/a2a`): `Assembly::card` and the `child-sessions/v1` helpers
+# (`AgentDef::child_sessions`, `session_starters`).
 a2a = ["adam-assembly/a2a"]
 # Dev reload (`adam::assembly::LiveAssembly`): read the agent directory at run time and swap the
 # agents when a file changes. Off by default: a release build cannot read prompts from disk.
