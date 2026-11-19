@@ -21,7 +21,7 @@ the provider asked to wait, and the runtime owns backoff.
 |---|---|
 | `ModelClient` (trait) | `complete(ModelRequest) -> ModelResponse` and `stream(ModelRequest) -> BoxStream<ModelDelta>`; two default methods, `provider() -> Option<&str>` (a label for reports, `openai` for the OpenAI-compatible client) and `context_window(alias) -> Option<u64>` (the window the deployment configured for that alias), both `None` unless the client says |
 | `DynModel` | `Arc<dyn ModelClient>` |
-| `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; **new public field, breaks `ModelRequest` struct literals**: use `ModelRequest::new`), response and streamed chunks |
+| `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; **new public field, breaks `ModelRequest` struct literals**: use `ModelRequest::new`), response and streamed chunks. `ModelDelta` is `#[non_exhaustive]` since `ToolCallComplete` (below): a `match` over it needs one more arm |
 | `Message`, `ContentPart`, `ToolCall`, `ToolSpec`, `Usage`, `FinishReason` | conversation and tool-calling types; all derive `Serialize`/`Deserialize` because a run persists its history. `ToolCall` has `new(id, name, arguments)`, `with_invalid_arguments(id, name, raw)` and `Default`; its `invalid_arguments: Option<String>` holds the raw argument text when it was not JSON (`arguments` is then `{}`). **Breaking:** a `ToolCall { id, name, arguments }` literal no longer compiles (use `ToolCall::new` or `..Default::default()`); the serialized form and the `ModelClient` trait are unchanged, and journals written before the field decode with `None` |
 | `ModelError` | `RateLimited { retry_after }`, `Transient`, `ContextLength`, `InvalidRequest`, `Auth`, `Protocol`; `#[non_exhaustive]`, see *Errors* |
 | `Classify`, `ErrorClass` | re-exported from `adam-error`: `class()`, `is_retryable()`, `retry_after()` |
@@ -38,6 +38,20 @@ req.messages.push(Message::user_text("hi"));
 let resp = model.complete(req).await.unwrap();
 assert_eq!(resp.message.text(), "hello");
 ```
+
+### A tool call whose arguments are complete
+
+`ModelDelta::ToolCallComplete(ToolCall)` says that the arguments of a call are whole: the text of them parses as a JSON
+**object**, and the call holds what `Finished` will hold for it (same id, same name, same arguments), so a consumer may
+start it before the turn ends ([ADR 0049](../../docs/decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md),
+amended). A client says it **once per call**: the first time the accumulated text parses as an object, and for every call
+it did not say it for, immediately before `Finished`. Empty text is not complete on its own (it parses as `{}`), so a
+provider that sends the id and the name first and the arguments after is not announced as `{}`; a call with no name yet
+waits for its name (it is not a call until it has one). A call whose text never
+parses as JSON is announced with `ToolCall::invalid_arguments` set (and does not run). A made-up id is fixed at the
+announcement, and the response keeps it. A model that does not stream says none of this.
+**Breaking:** `ModelDelta` is now `#[non_exhaustive]`, so a `match` outside this crate needs a wildcard arm, and every
+consumer of the stream may see the new variant.
 
 ### Reasoning
 
