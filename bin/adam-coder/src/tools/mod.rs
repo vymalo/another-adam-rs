@@ -1158,11 +1158,13 @@ const LIMIT_MARGIN: Duration = Duration::from_secs(30);
 
 /// The tools whose call can change a file of the worktree under a language server's root. The
 /// servers are told of the files they hold open; a file they do not is reported by the walk their
-/// next call makes, which one of these calls must bring forward ([`Servers::wrote`]).
+/// next call makes, which one of these calls must bring forward ([`Servers::wrote`]). An MCP tool
+/// that writes the worktree cannot be named here: its change is reported at the next walk, at most
+/// one interval later.
 fn writes_the_worktree(tool: &str) -> bool {
     matches!(
         tool,
-        "write_file" | "edit_file" | "apply_patch" | "run" | "run_checks"
+        "write_file" | "edit_file" | "apply_patch" | "run" | "run_checks" | "start_command"
     )
 }
 

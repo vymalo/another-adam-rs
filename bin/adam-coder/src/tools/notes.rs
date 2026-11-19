@@ -1065,8 +1065,9 @@ impl RunNotes {
 }
 
 /// What a cached parse was made from: the file's identity and the moment it was written. A write
-/// through [`NotesStore::save`] replaces the file (a rename), so the inode changes; a write another
-/// process makes in place is seen by the length or the time.
+/// that keeps the inode, the length and the time is **not** seen (a cache hit); every writer here
+/// replaces the file by a rename ([`NotesStore::save`]), which changes the inode, and a writer in
+/// place changes the length or the time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     len: u64,
@@ -1144,7 +1145,8 @@ impl NotesStore {
     /// The file is read through a descriptor whose metadata is the cache key: a write of another
     /// process (the workers of one run share the volume, ADR 0037) is seen by the next call, since
     /// [`save`](Self::save) replaces the file and the inode changes. A parse is kept until the file
-    /// it was made from is replaced, so a turn's calls do not each parse the same JSON.
+    /// it was made from is replaced, so a turn's calls do not each parse the same JSON. A write that
+    /// keeps the inode, the length and the time would not be seen; no writer here does that.
     async fn shared(&self, run: &str) -> io::Result<Option<Arc<RunNotes>>> {
         let path = self.path(run)?;
         let file = match tokio::fs::File::open(&path).await {
@@ -1284,8 +1286,9 @@ impl NotesStore {
         let bytes = serde_json::to_vec_pretty(notes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         tokio::fs::write(&tmp, bytes).await?;
-        // The stamp of the file the rename is about to make `path`: taken before it, so a write of
-        // another process that lands between the two is not cached as this value.
+        // The stamp of the inode this rename installs. A write of another process after the rename
+        // changes the inode, and the next read re-parses; one before it is replaced by this rename,
+        // and this value is the file.
         let meta = tokio::fs::metadata(&tmp).await?;
         tokio::fs::rename(&tmp, &path).await?;
         Ok(Stamp::of(&meta))

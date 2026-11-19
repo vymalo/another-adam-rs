@@ -25,7 +25,7 @@ use adam::prelude::*;
 
 use super::checks::missing_tool_answer;
 use super::gitcli::{
-    GitAt, RepoState, git_stdout, head_ref, head_sha, point_head, repo_state,
+    GitAt, RepoState, SnapshotError, git_stdout, head_ref, point_head, repo_state,
     restore_configuration_only, restore_repo_state, restore_worktree, status_text, working_tree_id,
 };
 use super::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
@@ -74,15 +74,20 @@ pub async fn run_command(
     let environment = env.session(ctx).await?;
 
     // What the worktree is before the command: nothing it does may change it.
-    let Some(before) = Snapshot::of_slot(&slot).await else {
-        return Ok(ToolOutput::error(super::background::noted(
-            &env,
-            ctx,
-            &slot,
-            "Cannot read the state of the worktree, so nothing was run (a command that might \
-             change it cannot be undone). Try again; if it persists, tell the person."
-                .to_owned(),
-        )));
+    let before = match Snapshot::of_slot(&slot).await {
+        Ok(before) => before,
+        Err(e) => {
+            return Ok(ToolOutput::error(super::background::noted(
+                &env,
+                ctx,
+                &slot,
+                cannot_snapshot(
+                    e,
+                    "Nothing was run, because a command that might change the worktree cannot be \
+                     undone.",
+                ),
+            )));
+        }
     };
     if let Some(refusal) = before.refusal() {
         return Ok(ToolOutput::error(super::background::noted(
@@ -107,7 +112,7 @@ pub async fn run_command(
     output::settle(&env, ctx, &mut outcome).await;
 
     // Did it change anything it should not have?
-    let after = Snapshot::of_slot(&slot).await;
+    let after = Snapshot::of_slot(&slot).await.ok();
     if after.as_ref() != Some(&before) {
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("undid a change made by: {shown}"))
@@ -176,7 +181,7 @@ pub(super) struct Snapshot {
 
 impl Snapshot {
     /// The state of `slot`'s worktree, with the run's own branch from the coder's metadata.
-    pub(super) async fn of_slot(slot: &adam_workspace::Slot) -> Option<Self> {
+    pub(super) async fn of_slot(slot: &adam_workspace::Slot) -> Result<Self, SnapshotError> {
         Self::take(
             &GitAt::slot(slot),
             slot.worktree().map(adam_workspace::Worktree::local_branch),
@@ -186,29 +191,28 @@ impl Snapshot {
 
     /// The state of the worktree `at`. `own` is the branch the run's metadata says the worktree is on
     /// (a repository's worktree; `None` for a scratch project).
-    pub(super) async fn take(at: &GitAt, own: Option<&str>) -> Option<Self> {
+    pub(super) async fn take(at: &GitAt, own: Option<&str>) -> Result<Self, SnapshotError> {
         // Every question is an independent read of the worktree, and each one is a `git` process:
         // asked at once they cost one round of starts rather than six, and a command has already
-        // ended by the time this is called. `status` is the fallback of the tree id, so it waits
+        // ended by the time this is called. The git directory and `HEAD` come from one `rev-parse`,
+        // which prints each on its own line. `status` is the fallback of the tree id, so it waits
         // for it.
-        let (git_dir, dot_git, branch, head, tree, repo) = tokio::join!(
-            git_stdout(at, &["rev-parse", "--absolute-git-dir"]),
+        let (git_and_head, dot_git, branch, tree, repo) = tokio::join!(
+            git_stdout(at, &["rev-parse", "--absolute-git-dir", "HEAD"]),
             at.dot_git(),
             head_ref(at),
-            head_sha(at),
             working_tree_id(at),
             repo_state(at),
         );
-        let git_dir = git_dir?;
-        let head = head?;
+        let (git_dir, head) = split_rev_parse(git_and_head).ok_or(SnapshotError::Unreadable)?;
         let repo = repo?;
         let head_is_foreign =
             own.is_some_and(|own| branch.as_deref() != Some(format!("refs/heads/{own}").as_str()));
         let status = match tree {
             Some(_) => None,
-            None => Some(status_text(at).await?),
+            None => Some(status_text(at).await.ok_or(SnapshotError::Unreadable)?),
         };
-        Some(Self {
+        Ok(Self {
             git_dir,
             dot_git,
             head,
@@ -349,8 +353,34 @@ impl Snapshot {
             return false;
         };
         repo && restore_worktree(&at, &self.head, branch, tree).await
-            && Self::take(&at, self.own_branch.as_deref()).await.as_ref() == Some(self)
+            && Self::take(&at, self.own_branch.as_deref())
+                .await
+                .ok()
+                .as_ref()
+                == Some(self)
     }
+}
+
+/// The git directory and `HEAD` from one `rev-parse --absolute-git-dir HEAD`: git prints each on
+/// its own line. Splitting from the end keeps a git directory whose name holds a newline whole.
+fn split_rev_parse(out: Option<String>) -> Option<(String, String)> {
+    let out = out?;
+    let (git_dir, head) = out.rsplit_once('\n')?;
+    (!git_dir.is_empty() && !head.is_empty()).then(|| (git_dir.to_owned(), head.to_owned()))
+}
+
+/// What a tool says when the worktree cannot be snapshotted: why, then `not_done`.
+pub(super) fn cannot_snapshot(error: SnapshotError, not_done: &str) -> String {
+    let why = match error {
+        SnapshotError::GitTooOld => {
+            "the git of this workspace is too old: the refs are scanned with `git for-each-ref \
+             --exclude`, which needs git 2.42 or later"
+        }
+        SnapshotError::Unreadable => "the state of the worktree cannot be read",
+    };
+    format!(
+        "Cannot look at the worktree: {why}. {not_done} Try again; if it persists, tell the person."
+    )
 }
 
 /// What the model is told when its command changed the worktree.
@@ -388,6 +418,62 @@ pub(super) fn render(command: &str, outcome: &ShellOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::gitcli::head_sha;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// The git directory and `HEAD` of one `rev-parse --absolute-git-dir HEAD` are the two values
+    /// the two commands gave, on a branch and detached; a HEAD that does not exist is still a
+    /// failure (a snapshot with no head has nothing to restore).
+    #[tokio::test]
+    async fn the_git_directory_and_head_of_one_rev_parse_are_the_two_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(dir.join("README.md"), "x\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "--quiet", "-m", "seed"]);
+        let at = GitAt::plain(dir);
+
+        let snap = Snapshot::take(&at, None).await.unwrap();
+        assert_eq!(
+            snap.git_dir,
+            git_stdout(&at, &["rev-parse", "--absolute-git-dir"])
+                .await
+                .unwrap()
+        );
+        assert_eq!(snap.head, head_sha(&at).await.unwrap());
+
+        git(dir, &["checkout", "--quiet", "--detach", "HEAD"]);
+        let snap = Snapshot::take(&at, None).await.unwrap();
+        assert_eq!(snap.head, head_sha(&at).await.unwrap());
+        assert_eq!(snap.branch, None);
+
+        // An unborn HEAD: `rev-parse HEAD` fails, and so does the snapshot.
+        git(dir, &["checkout", "--quiet", "--orphan", "empty"]);
+        assert_eq!(
+            Snapshot::take(&at, None).await,
+            Err(SnapshotError::Unreadable)
+        );
+    }
 
     fn outcome(code: Option<i32>, tail: &str, timed_out: bool, truncated: bool) -> ShellOutcome {
         ShellOutcome {
@@ -397,6 +483,16 @@ mod tests {
             truncated,
             ..ShellOutcome::default()
         }
+    }
+
+    #[test]
+    fn a_git_too_old_is_said_as_such_not_as_an_unreadable_worktree() {
+        let said = cannot_snapshot(SnapshotError::GitTooOld, "Nothing was run.");
+        assert!(said.contains("git 2.42"), "{said}");
+        assert!(!said.contains("cannot be read"), "{said}");
+        let plain = cannot_snapshot(SnapshotError::Unreadable, "Nothing was run.");
+        assert!(plain.contains("cannot be read"), "{plain}");
+        assert!(!plain.contains("2.42"), "{plain}");
     }
 
     #[test]

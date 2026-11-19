@@ -429,7 +429,9 @@ impl RepoState {
     }
 }
 
-/// Whether a run other than this one changes `refname` as a matter of course.
+/// Whether a run other than this one changes `refname` as a matter of course. This is the
+/// **authority** on what a snapshot compares: the scan's `--exclude` patterns below are only a
+/// pre-filter.
 fn moved_by_others(refname: &str) -> bool {
     refname.starts_with("refs/heads/agent/")
         || refname.starts_with("refs/remotes/")
@@ -437,14 +439,15 @@ fn moved_by_others(refname: &str) -> bool {
         || refname == "refs/stash"
 }
 
-/// [`moved_by_others`] as `for-each-ref --exclude` patterns (git 2.43), so that the scan does not
-/// produce a line per run's branch only to drop it: the two lists name the same namespaces.
-const MOVED_BY_OTHERS: [&str; 4] = [
-    "refs/heads/agent/*",
-    "refs/remotes/*",
-    "refs/tags/*",
-    "refs/stash",
-];
+/// [`moved_by_others`] as `for-each-ref --exclude` patterns (git 2.42): a **best-effort
+/// pre-filter**, so the scan does not produce a line per run's branch in the shared mirror only to
+/// drop it. `moved_by_others` stays the authority; the two lists must keep the same refs.
+///
+/// `**` matches a nested ref (`*` does not cross a `/`: `refs/tags/*` would leave
+/// `refs/tags/release/v1` in the scan). `refs/stash` is **not** excluded: the pattern rule would
+/// also hide `refs/stash/<name>`, which `moved_by_others` keeps, and a change a scan hides is a
+/// change no snapshot sees. One line per repository is cheaper than that hole.
+const MOVED_BY_OTHERS: [&str; 3] = ["refs/heads/agent/**", "refs/remotes/**", "refs/tags/**"];
 
 /// Whether `key` is one that `prepare` and `push` write for a run's own branch.
 fn written_per_run(key: &str) -> bool {
@@ -542,21 +545,62 @@ async fn put_exclude(at: &GitAt, path: &Path, content: Option<&str>) -> bool {
     }
 }
 
-/// [`RepoState`] now, `None` when it cannot be read.
-pub(crate) async fn repo_state(at: &GitAt) -> Option<RepoState> {
+/// Why the state of a worktree cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotError {
+    /// The host's `git` is older than 2.42: it has no `for-each-ref --exclude`, and the refs a
+    /// command could change cannot be scanned without it.
+    GitTooOld,
+    /// The repository, the slot or the index cannot be read.
+    Unreadable,
+}
+
+/// The arguments of the ref scan: `for-each-ref` with the pre-filter patterns of
+/// [`MOVED_BY_OTHERS`]. The test that pins the pre-filter to [`moved_by_others`] uses the same
+/// arguments.
+fn ref_scan_args() -> Vec<&'static str> {
     let mut args = vec!["for-each-ref", "--format=%(refname) %(objectname)"];
     for pattern in MOVED_BY_OTHERS {
         args.push("--exclude");
         args.push(pattern);
     }
-    let refs = git_stdout(at, &args).await?;
+    args
+}
+
+/// Why [`ref_scan_args`] failed: a `git` without `for-each-ref --exclude` is told apart from a
+/// repository that cannot be read at all, so a tool can say which.
+async fn ref_scan_error(at: &GitAt) -> SnapshotError {
+    if git_stdout(at, &["for-each-ref", "--count=1"])
+        .await
+        .is_none()
+    {
+        return SnapshotError::Unreadable;
+    }
+    if git_stdout(at, &["for-each-ref", "--count=1", "--exclude=refs/tags/**"])
+        .await
+        .is_none()
+    {
+        SnapshotError::GitTooOld
+    } else {
+        SnapshotError::Unreadable
+    }
+}
+
+/// [`RepoState`] now, or why it cannot be read.
+pub(crate) async fn repo_state(at: &GitAt) -> Result<RepoState, SnapshotError> {
+    let refs = match git_stdout(at, &ref_scan_args()).await {
+        Some(refs) => refs,
+        None => return Err(ref_scan_error(at).await),
+    };
     let refs = refs
         .lines()
         .filter_map(|l| l.split_once(' '))
         .filter(|(name, _)| !moved_by_others(name))
         .map(|(n, id)| (n.to_owned(), id.to_owned()))
         .collect();
-    let config = git_stdout(at, &["config", "--local", "--list", "-z"]).await?;
+    let config = git_stdout(at, &["config", "--local", "--list", "-z"])
+        .await
+        .ok_or(SnapshotError::Unreadable)?;
     let mut config: Vec<(String, String)> = config
         .split('\0')
         .filter(|e| !e.is_empty())
@@ -569,8 +613,11 @@ pub(crate) async fn repo_state(at: &GitAt) -> Option<RepoState> {
     // Where a key sits in the file does not matter (restoring it appends), what it says does; the
     // values of one key keep their order (the sort is stable).
     config.sort_by(|a, b| a.0.cmp(&b.0));
-    let exclude = read_exclude(at, &exclude_path(at).await?).await?;
-    Some(RepoState {
+    let path = exclude_path(at).await.ok_or(SnapshotError::Unreadable)?;
+    let exclude = read_exclude(at, &path)
+        .await
+        .ok_or(SnapshotError::Unreadable)?;
+    Ok(RepoState {
         refs,
         config,
         exclude,
@@ -581,7 +628,7 @@ pub(crate) async fn repo_state(at: &GitAt) -> Option<RepoState> {
 /// that moved may be the run's own commit. The caller holds the mirror lock. `true` when they are
 /// as they were.
 pub(crate) async fn restore_configuration_only(at: &GitAt, before: &RepoState) -> bool {
-    let Some(now) = repo_state(at).await else {
+    let Some(now) = repo_state(at).await.ok() else {
         return false;
     };
     let mut keep = before.clone();
@@ -593,7 +640,7 @@ pub(crate) async fn restore_configuration_only(at: &GitAt, before: &RepoState) -
 /// had them. `true` when every step succeeded. The caller holds the mirror lock
 /// (`Worktree::lock_mirror`): the configuration is written by one at a time.
 pub(crate) async fn restore_repo_state(at: &GitAt, before: &RepoState) -> bool {
-    let Some(now) = repo_state(at).await else {
+    let Some(now) = repo_state(at).await.ok() else {
         return false;
     };
     let mut ok = true;
@@ -653,7 +700,7 @@ pub(crate) async fn restore_repo_state(at: &GitAt, before: &RepoState) -> bool {
         };
         ok &= put_exclude(at, &path, before.exclude.as_deref()).await;
     }
-    ok && repo_state(at).await.as_ref() == Some(before)
+    ok && repo_state(at).await.ok().as_ref() == Some(before)
 }
 
 /// The tree id of `HEAD`: the code a pull request from this branch contains.
@@ -979,19 +1026,85 @@ mod tests {
     /// the comparison: a branch literally named `agent` is not a run's branch and is kept.
     #[test]
     fn the_scan_leaves_out_the_namespaces_the_comparison_leaves_out() {
-        assert_eq!(MOVED_BY_OTHERS.len(), 4);
+        assert_eq!(MOVED_BY_OTHERS.len(), 3);
         for name in [
             "refs/heads/agent/run-1",
             "refs/heads/agent/run-1/w1",
             "refs/remotes/origin/main",
             "refs/tags/v1",
+            "refs/tags/release/v1",
             "refs/stash",
         ] {
             assert!(moved_by_others(name), "{name}");
         }
-        for name in ["refs/heads/agent", "refs/heads/main", "refs/notes/commits"] {
+        for name in [
+            "refs/heads/agent",
+            "refs/heads/main",
+            "refs/notes/commits",
+            "refs/stash/x",
+        ] {
             assert!(!moved_by_others(name), "{name}");
         }
+    }
+
+    /// The scan's pre-filter and the comparison must name the same refs: a ref the filter keeps but
+    /// the scan hides would be a change no snapshot sees. Nested names need `**` (`*` does not cross
+    /// a `/`), and `refs/stash` is not excluded because the pattern rule would also hide
+    /// `refs/stash/<name>`, which the comparison keeps.
+    #[tokio::test]
+    async fn the_ref_scan_keeps_exactly_the_refs_the_comparison_compares() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, None, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(dir.join("README.md"), "x\n").unwrap();
+        git(dir, None, &["add", "-A"]);
+        git(dir, None, &["commit", "--quiet", "-m", "seed"]);
+        let sha = git(dir, None, &["rev-parse", "HEAD"]);
+        for name in [
+            "refs/remotes/origin/main",
+            "refs/tags/release/v1",
+            "refs/heads/agent/r/x",
+            "refs/notes/commits",
+            "refs/stash/x",
+        ] {
+            git(dir, None, &["update-ref", name, &sha]);
+        }
+        let at = GitAt::plain(dir);
+        let state = repo_state(&at).await.unwrap();
+        let names: Vec<&str> = state.refs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["refs/heads/main", "refs/notes/commits", "refs/stash/x"],
+            "the scan keeps what the comparison keeps"
+        );
+        // The pre-filter does the work: the nested namespaces are not even in what git printed.
+        let printed = git_stdout(&at, &ref_scan_args()).await.unwrap();
+        for hidden in ["refs/remotes/", "refs/tags/", "refs/heads/agent/"] {
+            assert!(
+                !printed.contains(hidden),
+                "{hidden} was not pre-filtered: {printed}"
+            );
+        }
+        assert!(printed.contains("refs/stash/x"), "{printed}");
+
+        // The single ref `refs/stash` is the one the comparison drops: the scan prints it (one
+        // line) and the comparison leaves it out.
+        git(dir, None, &["update-ref", "-d", "refs/stash/x"]);
+        git(dir, None, &["update-ref", "refs/stash", &sha]);
+        let state = repo_state(&at).await.unwrap();
+        assert!(
+            state.refs.iter().all(|(n, _)| n != "refs/stash"),
+            "{:?}",
+            state.refs
+        );
+    }
+
+    /// A scan that cannot run at all is not blamed on an old git: the plain question fails too.
+    #[tokio::test]
+    async fn a_ref_scan_that_cannot_run_is_unreadable_not_a_git_too_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = GitAt::refused(tmp.path());
+        assert_eq!(ref_scan_error(&at).await, SnapshotError::Unreadable);
     }
 }
 
@@ -1523,7 +1636,7 @@ mod exclude_tests {
         let info = slot.path().join(".git/info");
         let exclude = info.join("exclude");
         // `git init --template=` makes no `info`.
-        assert!(repo_state(&at).await.is_some());
+        assert!(repo_state(&at).await.is_ok());
         std::fs::create_dir_all(&info).unwrap();
 
         // The ordinary file is read; a missing one is none.
@@ -1538,7 +1651,7 @@ mod exclude_tests {
         // A link to a file the coder can read is not read through.
         let secret = victim(&f);
         std::os::unix::fs::symlink(&secret, &exclude).unwrap();
-        assert!(repo_state(&at).await.is_none(), "a link at info/exclude");
+        assert!(repo_state(&at).await.is_err(), "a link at info/exclude");
         std::fs::remove_file(&exclude).unwrap();
 
         // A pipe is not waited on.
@@ -1552,7 +1665,7 @@ mod exclude_tests {
         let asked = tokio::time::timeout(std::time::Duration::from_secs(10), repo_state(&at))
             .await
             .expect("the coder waited on a pipe");
-        assert!(asked.is_none());
+        assert!(asked.is_err());
         std::fs::remove_file(&exclude).unwrap();
 
         // `info` itself a link to a directory with an exclude file in it.
@@ -1561,7 +1674,7 @@ mod exclude_tests {
         std::fs::write(elsewhere.join("exclude"), "from elsewhere\n").unwrap();
         std::fs::remove_dir_all(&info).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &info).unwrap();
-        assert!(repo_state(&at).await.is_none(), "a link at info");
+        assert!(repo_state(&at).await.is_err(), "a link at info");
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), VICTIM);
     }
 
@@ -1837,7 +1950,7 @@ mod sandboxed_tests {
 
         assert!(head_sha(&at).await.is_some());
         assert_eq!(head_ref(&at).await.as_deref(), Some("refs/heads/main"));
-        assert!(repo_state(&at).await.is_some());
+        assert!(repo_state(&at).await.is_ok());
         assert_eq!(
             working_tree_id(&at).await.unwrap(),
             tree,
@@ -1908,7 +2021,7 @@ mod sandboxed_tests {
         assert_eq!(working_tree_id(&at).await, None);
         assert_eq!(status_text(&at).await, None);
         assert_eq!(head_sha(&at).await, None);
-        assert!(repo_state(&at).await.is_none());
+        assert!(repo_state(&at).await.is_err());
         assert!(
             !marker.exists(),
             "a filter ran in this container because the sandbox was down"

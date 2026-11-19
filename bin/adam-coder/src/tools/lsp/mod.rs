@@ -487,11 +487,14 @@ impl Call<'_> {
             Mode::Full
         };
         let before = if mode == Mode::Safe {
-            let Some(state) = Snapshot::of_slot(self.slot).await else {
-                return Ok(ToolOutput::error(
-                    "Cannot read the state of the workspace, so no language server was used. Try \
-                     again; if it persists, tell the person.",
-                ));
+            let state = match Snapshot::of_slot(self.slot).await {
+                Ok(state) => state,
+                Err(e) => {
+                    return Ok(ToolOutput::error(super::inspect::cannot_snapshot(
+                        e,
+                        "No language server was used.",
+                    )));
+                }
             };
             if let Some(refusal) = state.refusal() {
                 return Ok(ToolOutput::error(refusal));
@@ -584,7 +587,7 @@ impl Call<'_> {
             per_call.as_ref()
         };
         if let Some(was) = must_be
-            && let Some(now) = Snapshot::of_slot(self.slot).await
+            && let Ok(now) = Snapshot::of_slot(self.slot).await
             && *was != now
         {
             return Ok(self.wrote_to_slot(&server, was).await);

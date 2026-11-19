@@ -14,6 +14,9 @@ Given "in repo X, do Y" it
 4. commits, pushes and opens a pull request, and
 5. streams progress throughout and reports the check results, the branch and the pull request as artifacts.
 
+**Requirements.** `git` 2.42 or later in the workspace image: the snapshot a command takes scans the refs with
+`git for-each-ref --exclude` (2.42), and an older git makes those calls refuse with a message that names the version.
+
 It is durable (every model and tool step is journaled by `adam-runtime`, so a
 restarted worker replays instead of repeating a side effect) and addressable
 (an A2A 1.0 server from `adam-a2a`, backed by `adam-a2a-runtime`). By default one
