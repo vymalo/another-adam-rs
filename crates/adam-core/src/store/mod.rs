@@ -252,6 +252,33 @@ impl NewRun {
     }
 }
 
+/// One message of a run's transcript: the row at `idx` of the body set a head names.
+///
+/// A body set is `(run, commit, idx)`: `commit` is the UUID a commit picks for the transcript it
+/// writes ([`BodyWrite`]), so a commit that loses the version CAS leaves rows no head names rather
+/// than overwriting the winner's rows at the same index. See [`Store::body_list`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BodyRow {
+    /// Position in the transcript, oldest first.
+    pub idx: u32,
+    /// The message, as the agent's state holds it.
+    pub message: Value,
+}
+
+/// The transcript rows one commit writes, as one body set named by `commit`.
+///
+/// The rows are written once and never updated: a retry of the same attempt reuses `commit`, and a
+/// row that is already there is left as it is, so the set is idempotent. A later commit of the same
+/// run writes a new set with a new `commit`; the earlier one is superseded, stays readable for a
+/// grace period, and is collected afterwards ([`Store::body_list`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BodyWrite {
+    /// The set's identity; the head that names these rows carries the same value.
+    pub commit: Uuid,
+    /// The rows, oldest first. Their `idx` values must be unique.
+    pub rows: Vec<BodyRow>,
+}
+
 /// Input for [`Store::commit_run`]: the next state of the run.
 ///
 /// The returned record does not echo `state` ([`Store::commit_run`]): the caller wrote it, and a
@@ -262,6 +289,18 @@ impl NewRun {
 pub struct RunUpdate {
     pub status: RunStatus,
     pub state: Value,
+    /// The v5 head this commit writes, or `None` to leave the stored head (and its version) alone.
+    ///
+    /// A step that splits its agent state writes the head beside the full `state`; a delivery, a
+    /// cancel or a park re-encodes what it read and passes `None`, so it keeps the format it read
+    /// and a stale head is not made current by a commit that did not rebuild it.
+    pub head: Option<Value>,
+    /// The transcript set this commit writes, or `None` to write no rows.
+    ///
+    /// The rows go to the store **before** the version CAS: a commit that loses leaves rows no
+    /// head names, which readers ignore and the store collects later. The head this commit writes
+    /// names the same `commit` and carries the row count.
+    pub body: Option<BodyWrite>,
     /// The content addresses of the file bytes this commit **adds** (see [`BlobId`]).
     ///
     /// A delta, not the run's whole set: the store unions it with the ids already recorded, so a
@@ -278,9 +317,25 @@ impl RunUpdate {
         Self {
             status,
             state,
+            head: None,
+            body: None,
             blobs: Vec::new(),
             wake_at: None,
         }
+    }
+
+    /// Write `head` with this commit (see [`head`](Self::head)).
+    #[must_use]
+    pub fn head(mut self, head: Value) -> Self {
+        self.head = Some(head);
+        self
+    }
+
+    /// Write `body` with this commit (see [`body`](Self::body)).
+    #[must_use]
+    pub fn body(mut self, body: BodyWrite) -> Self {
+        self.body = Some(body);
+        self
     }
 
     /// Name `blobs` as the digests this commit adds (a delta the store unions).
@@ -572,6 +627,19 @@ pub trait Store: Send + Sync + 'static {
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>>;
 
+    /// The run as an **observer** reads it: its `state` is the v5 head when the store has a current
+    /// one (`head_version == version`), and the whole state otherwise.
+    ///
+    /// Defaults to [`load_run`](Self::load_run), so a store that keeps no head answers exactly as it
+    /// does today. A head that a later commit did not rebuild (a delivery, a cancel, a park) is
+    /// stale and is **not** served: the whole state is, and the next step re-splits and rewrites the
+    /// head. The expand release (S2a) writes and verifies the head but serves the full state: the
+    /// read path (`Runtime::view`) does not call this method yet, and neither does anything that
+    /// steps a run. Tests call it to prove the stored head round-trips.
+    async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        self.load_run(id).await
+    }
+
     /// The run's header — everything about it but its state — or `None` if it does not exist.
     ///
     /// **The default implementation reads twice**: [`lease_until`](Self::lease_until) and then
@@ -618,6 +686,14 @@ pub trait Store: Send + Sync + 'static {
     /// `update.blobs` is recorded with the CAS: a store that keeps blobs unions the commit's delta
     /// ([`RunUpdate::blobs`]) with the references already recorded, in the same step as the version
     /// check, and a commit that loses the check records nothing.
+    ///
+    /// `update.head` and `update.body` are the expand release's shadow (ADR 0055): a step that
+    /// splits its agent state writes the v5 head beside the full `state` and the rows the head
+    /// names. `head: None` leaves the stored head and its version alone, so a delivery, a cancel or
+    /// a park keeps the format it read. `body: None` writes no rows. A store that keeps bodies
+    /// ([`keeps_bodies`](Self::keeps_bodies)) writes the rows **before** the CAS and checks that all
+    /// of them landed: a commit that loses leaves rows no head names, and a head must never name a
+    /// set that is missing a row.
     async fn commit_run(
         &self,
         id: RunId,
@@ -759,7 +835,8 @@ pub trait Store: Send + Sync + 'static {
     ) -> StoreResult<PushRecord>;
 
     /// Delete finished (done or failed) runs of `agent` last updated before
-    /// `before`, with their journals and push configurations. Returns the number of runs deleted.
+    /// `before`, with their journals, body rows and push configurations. Returns the number of runs
+    /// deleted.
     ///
     /// A run's blob references ([`RunUpdate::blobs`]) go with it; after the run deletions, in the
     /// same call, the blobs no surviving run references and that are older than `before` are
@@ -779,6 +856,23 @@ pub trait Store: Send + Sync + 'static {
     /// treated as unknown and cancels nothing, so a failed parent purged before its children saw it
     /// leaves them running to their own limits.
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64>;
+
+    /// Whether this store keeps a run's transcript beside its head ([`body_list`](Self::body_list),
+    /// [`RunUpdate::body`]). `false` (the default) means `RunUpdate::state` is the whole run, as
+    /// before: a store that opts out keeps exactly today's behaviour.
+    fn keeps_bodies(&self) -> bool {
+        false
+    }
+
+    /// The rows of body set `commit` of `run`, ordered by [`idx`](BodyRow::idx); empty when the set
+    /// does not exist (never written, or collected after it was superseded).
+    ///
+    /// A store that keeps no bodies ([`keeps_bodies`](Self::keeps_bodies)) answers empty. The rows
+    /// of a set no head names are still readable: nothing hides them, and nothing serves them.
+    async fn body_list(&self, run: RunId, commit: Uuid) -> StoreResult<Vec<BodyRow>> {
+        let _ = (run, commit);
+        Ok(Vec::new())
+    }
 
     /// Whether this store keeps a run's file bytes out of its state
     /// ([`put_blob`](Self::put_blob), [`get_blob`](Self::get_blob)). `false` (the default) means a
@@ -950,7 +1044,191 @@ pub fn open_conversation_key(agent: &str, conversation_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use serde_json::json;
+
+    /// A store that overrides none of the new defaults: the reference for "today's behaviour".
+    struct Bare {
+        state: Value,
+    }
+
+    #[async_trait]
+    impl Store for Bare {
+        async fn migrate(&self) -> StoreResult<()> {
+            Ok(())
+        }
+
+        async fn create_run(&self, _run: NewRun) -> StoreResult<RunRecord> {
+            unimplemented!("the defaults under test never create a run")
+        }
+
+        async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+            let t = now();
+            Ok(Some(RunRecord {
+                id,
+                agent: "a".into(),
+                conversation_id: None,
+                parent_id: None,
+                status: RunStatus::Runnable,
+                state: self.state.clone(),
+                wake_at: None,
+                version: 1,
+                created_at: t,
+                updated_at: t,
+            }))
+        }
+
+        async fn commit_run(
+            &self,
+            _id: RunId,
+            _expected_version: u64,
+            _update: RunUpdate,
+        ) -> StoreResult<RunRecord> {
+            unimplemented!("the defaults under test never commit")
+        }
+
+        async fn open_run_for_conversation(
+            &self,
+            _agent: &str,
+            _conversation_id: &str,
+        ) -> StoreResult<Option<RunRecord>> {
+            unimplemented!("the defaults under test never open a conversation")
+        }
+
+        async fn journal_get(&self, _run: RunId, _seq: u64) -> StoreResult<Option<JournalEntry>> {
+            unimplemented!("the defaults under test never read the journal")
+        }
+
+        async fn journal_put(
+            &self,
+            _run: RunId,
+            _entry: JournalEntry,
+        ) -> StoreResult<JournalEntry> {
+            unimplemented!("the defaults under test never write the journal")
+        }
+
+        async fn journal_list(&self, _run: RunId) -> StoreResult<Vec<JournalEntry>> {
+            unimplemented!("the defaults under test never list the journal")
+        }
+
+        async fn claim_due(
+            &self,
+            _agents: &[String],
+            _worker: &str,
+            _scope: ClaimScope,
+            _busy: &[RunId],
+            _now: DateTime<Utc>,
+            _ttl: Duration,
+            _limit: usize,
+        ) -> StoreResult<Vec<Lease>> {
+            unimplemented!("the defaults under test never claim")
+        }
+
+        async fn renew_lease(
+            &self,
+            _id: RunId,
+            _worker: &str,
+            _now: DateTime<Utc>,
+            _ttl: Duration,
+        ) -> StoreResult<bool> {
+            unimplemented!("the defaults under test never renew a lease")
+        }
+
+        async fn release_lease(&self, _id: RunId, _worker: &str) -> StoreResult<()> {
+            unimplemented!("the defaults under test never release a lease")
+        }
+
+        async fn lease_until(&self, _id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+            unimplemented!("the defaults under test never read a lease")
+        }
+
+        async fn list_runs(&self, _query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+            unimplemented!("the defaults under test never list")
+        }
+
+        async fn count_runs(&self, _query: &RunQuery) -> StoreResult<u64> {
+            unimplemented!("the defaults under test never count")
+        }
+
+        async fn push_put(&self, _new: NewPushConfig) -> StoreResult<PushRecord> {
+            unimplemented!("the defaults under test never write a push config")
+        }
+
+        async fn push_list(&self, _run: RunId) -> StoreResult<Vec<PushRecord>> {
+            unimplemented!("the defaults under test never list push configs")
+        }
+
+        async fn push_delete(&self, _run: RunId, _id: &str) -> StoreResult<bool> {
+            unimplemented!("the defaults under test never delete a push config")
+        }
+
+        async fn push_claim_due(
+            &self,
+            _agents: &[String],
+            _worker: &str,
+            _now: DateTime<Utc>,
+            _ttl: Duration,
+            _limit: usize,
+        ) -> StoreResult<Vec<PushRecord>> {
+            unimplemented!("the defaults under test never claim a push config")
+        }
+
+        async fn push_commit(
+            &self,
+            _run: RunId,
+            _id: &str,
+            _expected_version: u64,
+            _progress: PushProgress,
+        ) -> StoreResult<PushRecord> {
+            unimplemented!("the defaults under test never commit a push config")
+        }
+
+        async fn purge_finished(&self, _agent: &str, _before: DateTime<Utc>) -> StoreResult<u64> {
+            unimplemented!("the defaults under test never purge")
+        }
+    }
+
+    #[test]
+    fn a_new_run_update_writes_no_head_and_no_body() {
+        let update = RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}));
+        assert_eq!(update.head, None);
+        assert_eq!(update.body, None);
+        assert!(update.blobs.is_empty());
+        assert_eq!(update.wake_at, None);
+    }
+
+    #[tokio::test]
+    async fn the_defaults_keep_no_bodies_and_serve_the_whole_state() {
+        let state = json!({"v": 1, "agent": {"turn": 1}});
+        let store = Bare {
+            state: state.clone(),
+        };
+        let id = RunId::new();
+        assert!(!store.keeps_bodies(), "a store opts in to bodies");
+        assert!(
+            store.body_list(id, Uuid::nil()).await.unwrap().is_empty(),
+            "a store that keeps no bodies answers empty"
+        );
+        // `load_head` is `load_run`: the same record, and the whole state.
+        let run = store.load_run(id).await.unwrap();
+        let head = store.load_head(id).await.unwrap();
+        assert_eq!(head, run);
+        assert_eq!(head.unwrap().state, state);
+    }
+
+    #[test]
+    fn a_body_row_is_its_index_and_its_message() {
+        let row = BodyRow {
+            idx: 7,
+            message: json!({"role": "user", "text": "hi"}),
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            json,
+            json!({"idx": 7, "message": {"role": "user", "text": "hi"}})
+        );
+        assert_eq!(serde_json::from_value::<BodyRow>(json).unwrap(), row);
+    }
 
     fn run() -> RunId {
         RunId(Uuid::nil())

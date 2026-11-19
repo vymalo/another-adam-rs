@@ -48,6 +48,7 @@ use adam_core::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::fault::Method;
 
@@ -333,6 +334,15 @@ impl Store for CountingStore {
         Ok(record)
     }
 
+    async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        self.call(Method::LoadHead);
+        let record = self.inner.load_head(id).await?;
+        if let Some(record) = &record {
+            self.read(record);
+        }
+        Ok(record)
+    }
+
     async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
         self.call(Method::RunHeader);
         self.inner.run_header(id).await
@@ -350,6 +360,15 @@ impl Store for CountingStore {
         self.wrote(written);
         self.read(&record);
         Ok(record)
+    }
+
+    fn keeps_bodies(&self) -> bool {
+        self.inner.keeps_bodies()
+    }
+
+    async fn body_list(&self, run: RunId, commit: Uuid) -> StoreResult<Vec<adam_core::BodyRow>> {
+        self.call(Method::BodyList);
+        self.inner.body_list(run, commit).await
     }
 
     async fn open_run_for_conversation(

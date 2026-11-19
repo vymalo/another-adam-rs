@@ -1033,6 +1033,8 @@ impl Store for PgStore {
         let RunUpdate {
             status,
             state,
+            head: _,
+            body: _,
             blobs,
             wake_at,
         } = update;

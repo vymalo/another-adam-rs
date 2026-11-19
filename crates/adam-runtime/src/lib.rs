@@ -90,6 +90,7 @@ mod envelope;
 mod erased;
 mod events;
 mod file;
+mod head;
 mod lines;
 mod notify;
 mod retry;

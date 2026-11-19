@@ -26,7 +26,10 @@ accept the poll latency.
 * `MongoStore::new(database)`: reuse your application's `Database` handle.
 * `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
-* `MongoStore::database()`, `SCHEMA_VERSION` (5).
+* `MongoStore::database()`, `SCHEMA_VERSION` (5, parts 1 and 2).
+* `MongoStore::gc_body(run, keep, before)`: delete the superseded body sets of `run` written before
+  `before` (the commit path calls it with a one-hour grace; a test or an operator can pass its own
+  cutoff).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and returning it would convert the document back on every transition. `load_run`, the claim
   and the listings return the stored state; `journal_put` returns the stored payload (the loop
@@ -123,6 +126,33 @@ keeps the earlier ones — so **a hand-built `RunUpdate { .. }` literal stops co
 **defaulted** on `Store`, so a store of your own that keeps no blobs still compiles and behaves as
 before.
 
+## Schema version 5, part 2: the head and the transcript
+
+A run document gains `head` (the v5 document the runtime writes beside `state`) and `head_version`
+(the version the head was written at). Nothing is rewritten by the migration: a version 4 document
+has neither field, and `{head_version: null}` matches a missing field, as `owner` did for version 2.
+A commit that writes a head sets both; a commit that does not (a delivery, a cancel, a park) leaves
+both alone, so the head becomes stale (`head_version < version`) and `load_head` serves the whole
+`state` instead.
+
+`<prefix>body` holds the transcript: `_id = "<run>:<commit>:<idx>"`, `run_id`, `commit_id` (both
+binary UUIDs), `idx` (int), `message` (BSON through the codec) and `written_at`. Indexes:
+`adam_body_run` (`run_id, commit_id, idx`) for reading a set in order, `adam_body_gc`
+(`written_at`) for the sweep.
+
+A commit with rows inserts them **before** the CAS, in one unordered `insertMany` (duplicates
+ignored), then **checks completeness**: `inserted + duplicate_keys == rows.len()`. A duplicate is a
+row that is already there (a retry of the same attempt reuses the commit id); any other write error
+means a row is missing, and the commit aborts before the CAS — a head never names a partial set. The
+refs go next, then the CAS, then the GC: the superseded sets of the run written more than an hour
+ago are deleted. A commit that loses the CAS leaves rows no head names; they are ignored and
+collected by the GC, or deleted with the run's purge. `load_head` reads the document once and serves
+the head only when `head_version == version`.
+
+`purge_finished` deletes the purged runs' body rows with their journal and references. The body
+methods are **defaulted** on `Store`; `RunUpdate` gained the public fields `head` and `body`, so a
+hand-built literal stops compiling (see [`adam-core`](../adam-core/README.md#transcripts-the-head-and-the-body)).
+
 ## Schema version and the owner field
 
 The owner field is schema version 2. Version 2 adds an `owner` field to run documents, set by the first pinned
@@ -166,11 +196,17 @@ None.
 
 ## Tests
 
-`tests/conformance.rs` runs the shared suite and the blob suite, and checks that a version 1
-document (no `owner` field) is claimable and then pinned; `src/codec.rs` has property
+`tests/conformance.rs` runs the shared suite, the blob suite and the body suite (six cases: round
+trip and order, an idempotent retry, a superseded set, a headless commit leaving the head stale, sets
+per run, and the purge), checks that a version 1 document (no `owner` field) is claimable and then
+pinned, and adds three adapter-local cases: a head stored with its `head_version` and a headless
+commit leaving both alone (including a version 4 document with neither field), a partial body insert
+aborting before the CAS (a `collMod` validator rejects one row of a set, so the other lands and the
+commit must refuse it), and the body GC with an explicit cutoff; `src/codec.rs` has property
 tests of the key escaping; `src/lib.rs` has unit tests of the error classes
 (`driver_errors_are_classified_by_what_they_mean`,
-`the_driver_error_is_kept_as_the_source`), of what a write returns
+`the_driver_error_is_kept_as_the_source`), of the body completeness check
+(`a_body_insert_is_complete_only_when_every_row_landed`), of what a write returns
 (`returned_value_tests`: the cleaned value it stored, without converting the stored document
 back to JSON) and of the round trips a journal entry costs (`round_trip_tests`, counting the
 driver's command events).

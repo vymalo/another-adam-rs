@@ -30,6 +30,14 @@ after a commit that names a different one), a shared
   `BLOB_SUITE` lock, which the cases that purge take too); under nextest, where each test is its own
   process, `.config/nextest.toml` puts the same cases in one single-thread group. Runs are still
   isolated by agent name. `make` is the same `async fn() -> Option<DynStore>` as above.
+* `body_conformance!(make)` generates one `#[tokio::test]` per body case (6 cases: a set written
+  and read back ordered by `idx` with the head that names it served, a retry of the same set that
+  adds no row and keeps the first bytes, a superseded set that stays readable while the head names
+  the new one, a commit that writes no head leaving the stored one stale (a delivery's shape), sets
+  per run even under the same commit id, and a purge that removes the rows). Every case asserts
+  `keeps_bodies()`: a store that keeps none is not given this suite. The purge case takes the
+  `BLOB_SUITE` lock because `purge_finished` sweeps blobs in the same call. `make` is the same
+  `async fn() -> Option<DynStore>` as above.
 * `transcript_measurement!(make)` generates the `measure_the_transcript_write` test: it runs
   `counting::measure_transcript_write` through `make`, prints its `p2-measure:` line and asserts
   only that the workload ran. `make` is the same `async fn() -> Option<DynStore>` as above; `None`
@@ -59,7 +67,7 @@ after a commit that names a different one), a shared
   `fault::Method` and `fault::Mode` selecting the method and whether the
   operation is applied before the error is returned. `fault::Method` is **not** `#[non_exhaustive]`:
   a new variant breaks an exhaustive `match` on it (schema version 5 part 1 added `PutBlob`,
-  `GetBlob` and `PurgeBlobs`). `fault::is_injected`
+  `GetBlob` and `PurgeBlobs`; part 2 added `LoadHead` and `BodyList`). `fault::is_injected`
   tells an injected error from a real one.
 * `skipped`: re-export of `adam_core::testing::skipped`.
 
@@ -81,7 +89,8 @@ failure (see `adam_core::testing`).
 
 ## Tests
 
-* `tests/memory.rs`: runs the store suite and the blob suite against `MemoryStore` (always on).
+* `tests/memory.rs`: runs the store suite, the blob suite and the body suite against `MemoryStore`
+  (always on).
 * `claim_skips_busy_runs` (both scopes): runs named as `busy` are not claimed, with a live lease or an expired one,
   take no slot of the limit, and are not leased by the call that skipped them.
 * `lease_until_reports_the_lease`: nothing before a claim or for an unknown run, the end of the claim, of a renewal, still the same after a commit and after a stranger's release, nothing after the holder's release, and an expired lease reported as it was.

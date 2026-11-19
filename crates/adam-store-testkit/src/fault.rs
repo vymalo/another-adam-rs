@@ -35,6 +35,7 @@ use adam_core::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 /// A [`Store`] method a wrapper can target: [`FaultyStore`] injects a fault on it and
 /// [`CountingStore`](crate::counting::CountingStore) counts its calls. `CountingStore` counts
@@ -47,10 +48,14 @@ pub enum Method {
     CreateRun,
     /// [`Store::load_run`].
     LoadRun,
+    /// [`Store::load_head`].
+    LoadHead,
     /// [`Store::run_header`].
     RunHeader,
     /// [`Store::commit_run`].
     CommitRun,
+    /// [`Store::body_list`].
+    BodyList,
     /// [`Store::open_run_for_conversation`].
     OpenRunForConversation,
     /// [`Store::journal_get`].
@@ -307,6 +312,11 @@ impl Store for FaultyStore {
             .await
     }
 
+    async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        self.run(Method::LoadHead, Some(id), self.inner.load_head(id))
+            .await
+    }
+
     async fn run_header(&self, id: RunId) -> StoreResult<Option<adam_core::RunHeader>> {
         self.run(Method::RunHeader, Some(id), self.inner.run_header(id))
             .await
@@ -322,6 +332,19 @@ impl Store for FaultyStore {
             Method::CommitRun,
             Some(id),
             self.inner.commit_run(id, expected_version, update),
+        )
+        .await
+    }
+
+    fn keeps_bodies(&self) -> bool {
+        self.inner.keeps_bodies()
+    }
+
+    async fn body_list(&self, run: RunId, commit: Uuid) -> StoreResult<Vec<adam_core::BodyRow>> {
+        self.run(
+            Method::BodyList,
+            Some(run),
+            self.inner.body_list(run, commit),
         )
         .await
     }

@@ -13,15 +13,20 @@ use futures::{FutureExt, StreamExt};
 use serde_json::Value;
 use tokio::task::{JoinHandle, JoinSet};
 
-use adam_core::{Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError, StoreResult};
+use adam_core::{
+    BodyRow, BodyWrite, Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError, StoreResult,
+};
 use adam_error::{Classify, ErrorClass, report};
+use uuid::Uuid;
 
 use crate::agent::{AgentError, Transition};
 use crate::cancel::CancelToken;
 use crate::child::news_since;
 use crate::ctx::{Ctx, CtxOutcome, CtxParts};
 use crate::envelope::Envelope;
+use crate::erased::Stepped;
 use crate::events::Artifact;
+use crate::head::{BodyRef, Head};
 use crate::notify::{Delivery, Signal};
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
 
@@ -473,6 +478,9 @@ struct Next {
     reopen: bool,
     /// The ids of the messages the agent says the run has read ([`Ctx::read_already`]).
     read: Vec<String>,
+    /// `(head, rows)` when the agent splits the state this transition commits; `None` writes the
+    /// whole state and no head.
+    split: Option<(Value, Vec<Value>)>,
     /// The deadline and what is left of the time limit to store (set once, when the run is made, or
     /// restored from what was left after a wait for a person: never recomputed from the commit).
     deadline: Option<DateTime<Utc>>,
@@ -603,6 +611,34 @@ async fn transition(
     let Plan::Commit(mut next) = plan else {
         return false;
     };
+    // The shadow's one check: a head must reconstruct the state it is written beside, or the run
+    // stays v4. A split that does not join is refused here, before anything is written: the state
+    // goes alone, the run keeps its format, and the log says why. The typed state is deserialized
+    // once more (the same `S`), never re-parsed from the head.
+    if let Some((head, rows)) = &next.split {
+        match agent.join(head.clone(), rows.clone()) {
+            Ok(joined) if joined == next.agent => {}
+            Ok(_) => {
+                tracing::error!(
+                    run = %run,
+                    "the split does not reconstruct the committed state; writing the state only \
+                     (the run stays v4)"
+                );
+                next.split = None;
+            }
+            Err(e) => {
+                tracing::error!(
+                    run = %run,
+                    error = %report(&e),
+                    "the split's head does not join; writing the state only (the run stays v4)"
+                );
+                next.split = None;
+            }
+        }
+    }
+    // One body set per step attempt: the commit's CAS retries reuse it, so a retry of the same
+    // attempt is idempotent and a lost CAS leaves rows no head names.
+    let body_commit = Uuid::new_v4();
     next.deadline = deadline;
     next.remaining_secs = remaining_secs;
     // Parked with no timer: the run waits for a person (or a message), whose time is not the run's.
@@ -613,7 +649,16 @@ async fn transition(
         let left = (deadline - inner.clock.now()).num_seconds().max(0);
         next.remaining_secs = Some(u64::try_from(left).unwrap_or(0));
     }
-    match commit(inner, &rec, &env, &next, rec.parent_id.is_some()).await {
+    match commit(
+        inner,
+        &rec,
+        &env,
+        &next,
+        rec.parent_id.is_some(),
+        body_commit,
+    )
+    .await
+    {
         Ok(Some(committed)) => {
             announce(inner, &committed, &next).await;
             // After the commit, never before: the parent's timer is the fallback for a crash here.
@@ -667,7 +712,7 @@ fn plan(
     base: &Envelope,
     base_agent: Option<&Value>,
     out: CtxOutcome,
-    result: Result<Transition<Value>, AgentError>,
+    result: Result<Stepped, AgentError>,
 ) -> Plan {
     let CtxOutcome {
         seq,
@@ -677,7 +722,7 @@ fn plan(
         artifacts,
     } = out;
     // Starting point for a transition that made progress.
-    let progressed = |status, wake_at, agent, output, error| Next {
+    let progressed = |status, wake_at, agent, output, error, split| Next {
         status,
         wake_at,
         agent,
@@ -690,6 +735,7 @@ fn plan(
         retry_detail: None,
         reopen,
         read: read.clone(),
+        split,
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
     };
@@ -707,6 +753,7 @@ fn plan(
         retry_detail: None,
         reopen: false,
         read: Vec::new(),
+        split: None,
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
     };
@@ -751,6 +798,7 @@ fn plan(
                 )),
                 reopen: false,
                 read: Vec::new(),
+                split: None,
                 deadline: base.deadline,
                 remaining_secs: base.remaining_secs,
             }
@@ -758,16 +806,29 @@ fn plan(
     };
 
     let next = match result {
-        Ok(Transition::Continue(s)) => progressed(RunStatus::Runnable, None, s, Value::Null, None),
-        Ok(Transition::Park { state, wake_at }) => {
-            progressed(RunStatus::Parked, wake_at, state, Value::Null, None)
-        }
-        Ok(Transition::Done { state, output }) => {
-            progressed(RunStatus::Done, None, state, output, None)
-        }
-        Ok(Transition::Fail { state, error }) => {
-            progressed(RunStatus::Failed, None, state, Value::Null, Some(error))
-        }
+        Ok(Stepped {
+            transition: Transition::Continue(s),
+            split,
+        }) => progressed(RunStatus::Runnable, None, s, Value::Null, None, split),
+        Ok(Stepped {
+            transition: Transition::Park { state, wake_at },
+            split,
+        }) => progressed(RunStatus::Parked, wake_at, state, Value::Null, None, split),
+        Ok(Stepped {
+            transition: Transition::Done { state, output },
+            split,
+        }) => progressed(RunStatus::Done, None, state, output, None, split),
+        Ok(Stepped {
+            transition: Transition::Fail { state, error },
+            split,
+        }) => progressed(
+            RunStatus::Failed,
+            None,
+            state,
+            Value::Null,
+            Some(error),
+            split,
+        ),
         // A retry hint from the peer only lengthens the policy's backoff.
         Err(AgentError::Transient {
             message,
@@ -850,6 +911,7 @@ fn build_update(
     base_rev: u64,
     parent: bool,
     now: DateTime<Utc>,
+    body_commit: Uuid,
 ) -> StoreResult<RunUpdate> {
     // Messages that arrived while stepping sit after the ones we started
     // with. A parked agent must not sleep through them.
@@ -910,6 +972,38 @@ fn build_update(
     };
     let mut update = RunUpdate::new(status, env.encode()?);
     update.wake_at = wake_at;
+    // The shadow: the head beside the full state, and the rows it names. Only a step that split
+    // writes them; a commit that writes no head leaves the stored one (and its version) alone.
+    if let Some((head, rows)) = &next.split {
+        let len = u64::try_from(rows.len())
+            .map_err(|_| StoreError::InvalidInput("a transcript is longer than u64".into()))?;
+        let head = Head::of(
+            &env,
+            head.clone(),
+            BodyRef {
+                commit: body_commit,
+                len,
+            },
+        );
+        update.head = Some(head.encode()?);
+        let rows = rows
+            .iter()
+            .enumerate()
+            .map(|(idx, message)| {
+                let idx = u32::try_from(idx).map_err(|_| {
+                    StoreError::InvalidInput("a transcript has more rows than u32::MAX".into())
+                })?;
+                Ok(BodyRow {
+                    idx,
+                    message: message.clone(),
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        update.body = Some(BodyWrite {
+            commit: body_commit,
+            rows,
+        });
+    }
     Ok(update)
 }
 
@@ -953,6 +1047,7 @@ async fn commit(
     base: &Envelope,
     next: &Next,
     parent: bool,
+    body_commit: Uuid,
 ) -> StoreResult<Option<RunRecord>> {
     let run = claimed.id;
     // On the first attempt the update is built from the borrowed record and envelope: nothing is
@@ -988,6 +1083,7 @@ async fn commit(
             base.rev,
             parent,
             inner.clock.now(),
+            body_commit,
         )?;
         // The bytes of every file artifact this commit's state names go to the store before the
         // commit that names them (ADR 0055). Fail-open in the expand release: the state still

@@ -28,8 +28,23 @@ pub(crate) trait ErasedStarter: Send + Sync {
 /// What stepping a run needs on top of starting it.
 #[async_trait]
 pub(crate) trait ErasedAgent: ErasedStarter {
-    async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError>;
+    /// Step `state` and, when the agent splits it, return the head and the transcript it would
+    /// keep beside it. `state` stays the whole state: the read path still serves the v4 format in
+    /// the expand release, so a step never receives a head with empty rows.
+    async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Stepped, AgentError>;
+
+    /// The whole state a head and its rows reconstruct ([`Agent::join`](crate::Agent::join)).
+    fn join(&self, head: Value, rows: Vec<Value>) -> Result<Value, AgentError>;
+
     async fn on_cancelled(&self, run: RunId, state: Value);
+}
+
+/// The outcome of one erased step: the transition the runtime commits, and the split of the state
+/// it carries, if the agent declares one.
+pub(crate) struct Stepped {
+    pub transition: Transition<Value>,
+    /// `(head, rows)` for [`Agent::split`](crate::Agent::split); `None` keeps the whole state.
+    pub split: Option<(Value, Vec<Value>)>,
 }
 
 pub(crate) struct Erased<A>(pub A);
@@ -109,7 +124,7 @@ impl<S: AgentStarter> ErasedStarter for StarterOnly<S> {
 
 #[async_trait]
 impl<A: Agent> ErasedAgent for Erased<A> {
-    async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
+    async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Stepped, AgentError> {
         let state: A::State = serde_json::from_value(state).map_err(|e| {
             // With a start-only front, a mismatch between the starter's and this agent's
             // `State` for the same name surfaces here, on the worker; say so.
@@ -120,25 +135,61 @@ impl<A: Agent> ErasedAgent for Erased<A> {
             ))
             .with_source(e)
         })?;
-        Ok(match self.0.step(ctx, state).await? {
-            Transition::Continue(s) => Transition::Continue(encode(&s)?),
-            Transition::Park { state, wake_at } => Transition::Park {
-                state: encode(&state)?,
-                wake_at,
+        // The split is taken from the typed state, inside the one place that already has it: the
+        // state is deserialized once, and the rows the head would keep are the agent's own.
+        let stepped = self.0.step(ctx, state).await?;
+        Ok(match stepped {
+            Transition::Continue(s) => Stepped {
+                split: self.split(&s)?,
+                transition: Transition::Continue(encode(&s)?),
             },
-            Transition::Done { state, output } => Transition::Done {
-                state: encode(&state)?,
-                output,
+            Transition::Park { state, wake_at } => Stepped {
+                split: self.split(&state)?,
+                transition: Transition::Park {
+                    state: encode(&state)?,
+                    wake_at,
+                },
             },
-            Transition::Fail { state, error } => Transition::Fail {
-                state: encode(&state)?,
-                error,
+            Transition::Done { state, output } => Stepped {
+                split: self.split(&state)?,
+                transition: Transition::Done {
+                    state: encode(&state)?,
+                    output,
+                },
+            },
+            Transition::Fail { state, error } => Stepped {
+                split: self.split(&state)?,
+                transition: Transition::Fail {
+                    state: encode(&state)?,
+                    error,
+                },
             },
         })
     }
 
+    fn join(&self, head: Value, rows: Vec<Value>) -> Result<Value, AgentError> {
+        let head: A::State = serde_json::from_value(head).map_err(|e| {
+            AgentError::permanent(format!(
+                "a run's head does not decode as {:?}'s state",
+                self.0.name()
+            ))
+            .with_source(e)
+        })?;
+        encode(&self.0.join(head, rows)?)
+    }
+
     async fn on_cancelled(&self, run: RunId, state: Value) {
         self.0.on_cancelled(run, state).await;
+    }
+}
+
+impl<A: Agent> Erased<A> {
+    /// `state` split as the agent declares it, with the head encoded for the head document.
+    fn split(&self, state: &A::State) -> Result<Option<(Value, Vec<Value>)>, AgentError> {
+        match self.0.split(state) {
+            None => Ok(None),
+            Some((head, rows)) => Ok(Some((encode(&head)?, rows))),
+        }
     }
 }
 

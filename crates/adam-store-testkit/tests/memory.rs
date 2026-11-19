@@ -9,4 +9,6 @@ adam_store_testkit::store_conformance!(make_store);
 
 adam_store_testkit::blob_conformance!(make_store);
 
+adam_store_testkit::body_conformance!(make_store);
+
 adam_store_testkit::transcript_measurement!(make_store);

@@ -32,10 +32,13 @@ trait at your rev: its doc comments are the contract.
    `journal_put` (first writer wins), `journal_list`, `claim_due`, `renew_lease`, `release_lease`,
    `lease_until`, `purge_finished`, then the listing (`list_runs` and `count_runs`: a caller's runs,
    newest update first, by keyset), the five push-notification methods (`push_put`, `push_list`,
-   `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the four **defaulted** blob
-   methods (`keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs`; schema version 5, part 1: file
-   bytes out of the run, content-addressed by `BlobId`). A defaulted method left out of your
-   implementation answers for your store with the trait's "I keep none" answer.
+   `push_delete`, `push_claim_due`, `push_commit`; schema version 3) and the **defaulted** methods:
+   the four blob ones (`keeps_blobs`, `put_blob`, `get_blob`, `purge_blobs`; schema version 5, part
+   1: file bytes out of the run, content-addressed by `BlobId`) and the three body ones
+   (`load_head`, which defaults to `load_run` and serves the v5 head only when
+   `head_version == version`; `keeps_bodies`; `body_list`; schema version 5, part 2: the transcript
+   beside the head). A defaulted method left out of your implementation answers for your store with
+   the trait's "I keep none" answer.
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
    `StoreError::corrupt_source(e)`; callers decide from the error class, never from the variant.
@@ -43,7 +46,8 @@ trait at your rev: its doc comments are the contract.
    contract" in `docs/reference/store-adapters.md` lists, per guarantee, how Postgres and MongoDB do it
    (CAS commit, first-writer-wins journal, exclusive claiming, `busy` runs never claimed,
    pinned claims and the run `owner`, one open run per conversation, journal deleted with its
-   run, blob put/get and the blob GC, schema version 5 part 1). Time is truncated to milliseconds
+   run, blob put/get and the blob GC, schema version 5 part 1, and the head and body of schema
+   version 5 part 2). Time is truncated to milliseconds
    in every store; lease expiry uses the `now` the caller passes.
 3. **Implement `Store`** in a crate of its own, depending on `adam-core` only (no driver type in
    a trait signature). Reference implementations: `crates/adam-core/src/store/memory.rs`
@@ -58,6 +62,7 @@ trait at your rev: its doc comments are the contract.
    }
    adam_store_testkit::store_conformance!(make_store);
    adam_store_testkit::blob_conformance!(make_store); // a store that keeps blobs
+   adam_store_testkit::body_conformance!(make_store); // a store that keeps bodies
    ```
 
    `store_conformance!` generates one `#[tokio::test]` per case (48 at the time of writing) and
@@ -65,7 +70,10 @@ trait at your rev: its doc comments are the contract.
    an idempotent put, an unknown id, empty bytes, a run's reference keeping a blob alive (including
    after a commit that names a different one), a shared digest surviving until the last run is
    purged, the cutoff, and `purge_finished`'s sweep); every
-   case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `None` skips the
+   case asserts `keeps_blobs()`, so do not give it to a store that keeps none. `body_conformance!`
+   adds the six body cases (a set round-tripping in `idx` order with its head, an idempotent retry,
+   a superseded set that stays readable, a headless commit leaving the head stale, sets per run, and
+   the purge); every case asserts `keeps_bodies()`. `None` skips the
    suites. Cases isolate themselves with a unique agent name, so they run in parallel on one shared
    database — **except the blob cases and the cases that purge**, which sweep every unreferenced
    blob and therefore must not overlap: keep them in one nextest test group (`.config/nextest.toml`,
@@ -123,6 +131,13 @@ trait at your rev: its doc comments are the contract.
   commit that names none keeps the earlier references. A blob a surviving run references is never
   collected; `purge_blobs(before)` and `purge_finished` delete only unreferenced blobs older than
   the cutoff.
+* Bodies: a body set is `(run, commit, idx)` and `RunUpdate.body` is the set one commit writes; write
+  the rows **before** the CAS and check that all of them landed (a duplicate key is a row that is
+  already there, from a retry of the same attempt), so a head never names a partial set. A commit
+  with `head: None` leaves the stored head **and its `head_version`** alone; `load_head` serves the
+  head only when `head_version == version`. A commit that loses the CAS leaves rows no head names:
+  ignore them, and collect the superseded sets after a grace period (`purge_finished` removes them
+  with the run).
 * A transient backend error must be classified transient so the runtime retries it.
 
 ## See also

@@ -7,11 +7,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use super::{
-    BlobId, ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
-    PushState, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult, add_ttl, now,
-    storable_owned, truncate_ms,
+    BlobId, BodyRow, BodyWrite, ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun,
+    PushProgress, PushRecord, PushState, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError,
+    StoreResult, add_ttl, now, storable_owned, truncate_ms,
 };
 
 #[derive(Default)]
@@ -24,10 +25,18 @@ struct Inner {
     runs: HashMap<RunId, Slot>,
     journal: BTreeMap<(RunId, u64), JournalEntry>,
     push: BTreeMap<(RunId, String), PushSlot>,
+    /// The transcript rows, by `(run, commit, idx)`: a commit writes a set, a later one supersedes
+    /// it, and a set no head names stays readable until the GC collects it.
+    bodies: BTreeMap<(RunId, Uuid, u32), BodySlot>,
     /// File bytes by content address. A blob is global: several runs may reference one digest.
     blobs: HashMap<BlobId, BlobSlot>,
     /// The digests each run references, append-only (`RunUpdate::blobs`).
     run_blobs: HashMap<RunId, HashSet<BlobId>>,
+}
+
+struct BodySlot {
+    message: serde_json::Value,
+    written_at: DateTime<Utc>,
 }
 
 struct BlobSlot {
@@ -45,6 +54,10 @@ struct Slot {
     lease: Option<(String, DateTime<Utc>)>,
     /// Set by the first [`ClaimScope::Pinned`] claim; never cleared.
     owner: Option<String>,
+    /// The v5 head last written by a commit, and the version it was written at. A commit that
+    /// writes no head leaves both alone, so a stale head is never served.
+    head: Option<serde_json::Value>,
+    head_version: Option<u64>,
 }
 
 impl MemoryStore {
@@ -107,6 +120,8 @@ impl Store for MemoryStore {
                 run: run.clone(),
                 lease: None,
                 owner: None,
+                head: None,
+                head_version: None,
             },
         );
         // The contract of `create_run`: the caller has the state it wrote.
@@ -126,6 +141,14 @@ impl Store for MemoryStore {
         expected: u64,
         update: RunUpdate,
     ) -> StoreResult<RunRecord> {
+        let RunUpdate {
+            status,
+            state,
+            head,
+            body,
+            blobs,
+            wake_at,
+        } = update;
         let mut inner = self.inner.lock().await;
         let current = inner.runs.get(&id).ok_or(StoreError::NotFound(id))?;
         if current.run.version != expected {
@@ -135,7 +158,7 @@ impl Store for MemoryStore {
                 actual: current.run.version,
             });
         }
-        if let (true, Some(conv)) = (update.status.is_open(), current.run.conversation_id.clone()) {
+        if let (true, Some(conv)) = (status.is_open(), current.run.conversation_id.clone()) {
             let agent = current.run.agent.clone();
             if inner.open_run(&agent, &conv, Some(id)).is_some() {
                 return Err(StoreError::ConversationBusy {
@@ -150,27 +173,63 @@ impl Store for MemoryStore {
                 reason = "presence was checked above under the same lock"
             )]
             let slot = inner.runs.get_mut(&id).expect("checked above");
-            slot.run.status = update.status;
-            slot.run.state = storable_owned(update.state);
-            slot.run.wake_at = update.wake_at.map(truncate_ms);
+            slot.run.status = status;
+            slot.run.state = storable_owned(state);
+            slot.run.wake_at = wake_at.map(truncate_ms);
             slot.run.version += 1;
             slot.run.updated_at = now();
+            if let Some(head) = head {
+                slot.head = Some(storable_owned(head));
+                slot.head_version = Some(slot.run.version);
+            }
             // The contract of `commit_run`: the caller has the state it wrote.
             RunRecord {
                 state: serde_json::Value::Null,
                 ..slot.run.clone()
             }
         };
+        if let Some(body) = body {
+            let BodyWrite { commit, rows } = body;
+            let written_at = now();
+            for row in rows {
+                // Rows are written once and never updated: a retry of the same attempt reuses the
+                // commit id and keeps the first bytes.
+                inner
+                    .bodies
+                    .entry((id, commit, row.idx))
+                    .or_insert_with(|| BodySlot {
+                        message: storable_owned(row.message),
+                        written_at,
+                    });
+            }
+            // A superseded set older than the grace period goes with the commit that superseded it.
+            gc_body(&mut inner, id, commit, written_at - BODY_GC_GRACE);
+        }
         // The refs go with the commit that names them, append-only: a digest is added once and
         // never removed while the run lives.
-        if !update.blobs.is_empty() {
+        if !blobs.is_empty() {
             inner
                 .run_blobs
                 .entry(id)
                 .or_default()
-                .extend(update.blobs.iter().cloned());
+                .extend(blobs.iter().cloned());
         }
         Ok(committed)
+    }
+
+    async fn load_head(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
+        let inner = self.inner.lock().await;
+        let Some(slot) = inner.runs.get(&id) else {
+            return Ok(None);
+        };
+        let mut rec = slot.run.clone();
+        // A head a later commit did not rebuild is stale: serve the whole state instead.
+        if slot.head_version == Some(rec.version)
+            && let Some(head) = &slot.head
+        {
+            rec.state = head.clone();
+        }
+        Ok(Some(rec))
     }
 
     async fn open_run_for_conversation(
@@ -471,6 +530,7 @@ impl Store for MemoryStore {
             })
             .map(|s| s.run.id)
             .collect();
+        let doomed_set: HashSet<RunId> = doomed.iter().copied().collect();
         for id in &doomed {
             inner.runs.remove(id);
             inner.push.retain(|(run, _), _| run != id);
@@ -484,10 +544,30 @@ impl Store for MemoryStore {
                 inner.journal.remove(&k);
             }
         }
+        // A run's transcript goes with it, as its journal and references do.
+        inner
+            .bodies
+            .retain(|(run, _, _), _| !doomed_set.contains(run));
         // The refs went with their runs; a digest no surviving run references and that was written
         // before the cutoff is collected in the same sweep, as the adapters do.
         sweep_blobs(&mut inner, before);
         Ok(doomed.len() as u64)
+    }
+
+    fn keeps_bodies(&self) -> bool {
+        true
+    }
+
+    async fn body_list(&self, run: RunId, commit: Uuid) -> StoreResult<Vec<BodyRow>> {
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .bodies
+            .range((run, commit, 0)..=(run, commit, u32::MAX))
+            .map(|((_, _, idx), slot)| BodyRow {
+                idx: *idx,
+                message: slot.message.clone(),
+            })
+            .collect())
     }
 
     fn keeps_blobs(&self) -> bool {
@@ -513,6 +593,20 @@ impl Store for MemoryStore {
         let mut inner = self.inner.lock().await;
         Ok(sweep_blobs(&mut inner, before))
     }
+}
+
+/// How long a superseded body set stays readable before the next commit of its run collects it.
+const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
+
+/// Delete the body sets of `run` other than `keep` that were written before `before`, and return
+/// how many rows went. The current set is never collected, however old it is; a superseded one is
+/// collected once the grace period has passed.
+fn gc_body(inner: &mut Inner, run: RunId, keep: Uuid, before: DateTime<Utc>) -> u64 {
+    let before_len = inner.bodies.len();
+    inner
+        .bodies
+        .retain(|(r, c, _), slot| !(*r == run && *c != keep && slot.written_at < before));
+    (before_len - inner.bodies.len()) as u64
 }
 
 /// Delete the blobs written before `before` that no run references; returns how many.
@@ -617,6 +711,152 @@ mod tests {
                 .expect("list")
                 .is_empty(),
             "another owner's namespace is not listed"
+        );
+    }
+
+    /// The head a commit writes is served by `load_head` at the version it was written at; a commit
+    /// that writes no head (a delivery, a cancel, a park) leaves it stale, and `load_head` falls
+    /// back to the whole state.
+    #[tokio::test]
+    async fn a_head_round_trips_and_a_headless_commit_makes_it_stale() {
+        let store = MemoryStore::new();
+        let run = store
+            .create_run(NewRun::new("a", json!({"v": 1, "turn": 0})))
+            .await
+            .expect("create");
+        let head = json!({"v": 5, "agent": {"turn": 1}, "body": {"commit": Uuid::nil(), "len": 0}});
+        store
+            .commit_run(
+                run.id,
+                1,
+                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1})).head(head.clone()),
+            )
+            .await
+            .expect("commit");
+        let loaded = store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run");
+        assert_eq!(loaded.state, head, "the head is served at its own version");
+        assert_eq!(loaded.version, 2);
+
+        // No head on this commit: the stored one is now stale.
+        store
+            .commit_run(
+                run.id,
+                2,
+                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 2})),
+            )
+            .await
+            .expect("commit");
+        let loaded = store
+            .load_head(run.id)
+            .await
+            .expect("load")
+            .expect("the run");
+        assert_eq!(
+            loaded.state,
+            json!({"v": 1, "turn": 2}),
+            "a stale head is not served: the whole state is"
+        );
+    }
+
+    /// The GC keeps the set the commit names and collects an older superseded one; the cutoff is
+    /// explicit, so the one-hour grace is not needed to observe it.
+    #[tokio::test]
+    async fn the_body_gc_keeps_the_current_set_and_collects_an_old_superseded_one() {
+        let store = MemoryStore::new();
+        let run = store
+            .create_run(NewRun::new("a", json!({})))
+            .await
+            .expect("create");
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let rows = |text: &str| BodyWrite {
+            commit: first,
+            rows: vec![BodyRow {
+                idx: 0,
+                message: json!(text),
+            }],
+        };
+        store
+            .commit_run(
+                run.id,
+                1,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1})).body(rows("old")),
+            )
+            .await
+            .expect("commit");
+        store
+            .commit_run(
+                run.id,
+                2,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 2})).body(BodyWrite {
+                    commit: second,
+                    rows: vec![BodyRow {
+                        idx: 0,
+                        message: json!("current"),
+                    }],
+                }),
+            )
+            .await
+            .expect("commit");
+        assert_eq!(
+            store.body_list(run.id, first).await.expect("list"),
+            vec![BodyRow {
+                idx: 0,
+                message: json!("old")
+            }]
+        );
+        assert_eq!(
+            store.body_list(run.id, second).await.expect("list"),
+            vec![BodyRow {
+                idx: 0,
+                message: json!("current")
+            }]
+        );
+
+        // Age the superseded set past the cutoff, then collect with that cutoff.
+        let cutoff = now();
+        {
+            let mut inner = store.inner.lock().await;
+            for ((_, commit, _), slot) in inner.bodies.iter_mut() {
+                if *commit == first {
+                    slot.written_at = cutoff - chrono::Duration::hours(2);
+                }
+            }
+            assert_eq!(gc_body(&mut inner, run.id, second, cutoff), 1);
+        }
+        assert!(
+            store
+                .body_list(run.id, first)
+                .await
+                .expect("list")
+                .is_empty(),
+            "the superseded set is collected"
+        );
+        assert_eq!(
+            store.body_list(run.id, second).await.expect("list").len(),
+            1,
+            "the current set is never collected, however old"
+        );
+        // Even a cutoff in the future leaves the current set alone.
+        {
+            let mut inner = store.inner.lock().await;
+            assert_eq!(
+                gc_body(
+                    &mut inner,
+                    run.id,
+                    second,
+                    cutoff + chrono::Duration::hours(24)
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            store.body_list(run.id, second).await.expect("list").len(),
+            1
         );
     }
 }

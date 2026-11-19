@@ -30,12 +30,14 @@ use std::time::Duration;
 
 use adam_core::store::{now, truncate_ms};
 use adam_core::{
-    BlobId, ClaimScope, ConversationScope, DynStore, JournalEntry, NewPushConfig, NewRun,
-    PushProgress, PushState, RunId, RunQuery, RunStatus, RunUpdate, StoreError,
+    BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, DynStore, JournalEntry,
+    NewPushConfig, NewRun, PushProgress, PushState, RunId, RunQuery, RunStatus, RunUpdate,
+    StoreError,
 };
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
-use serde_json::json;
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 /// Generate one `#[tokio::test]` per conformance case. `$make` is a path to an
 /// `async fn() -> Option<DynStore>`; returning `None` skips the suite (for
@@ -164,6 +166,40 @@ macro_rules! blob_conformance {
     };
 }
 
+/// Generate one `#[tokio::test]` per body conformance case. `$make` is a path to an
+/// `async fn() -> Option<DynStore>`, like [`store_conformance!`]: `None` skips the suite (and
+/// fails instead under `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
+///
+/// Every case asserts that the store keeps bodies ([`Store::keeps_bodies`](adam_core::Store::keeps_bodies)):
+/// a store that does not is not given this suite, rather than passing it by answering the
+/// defaulted methods.
+#[macro_export]
+macro_rules! body_conformance {
+    ($make:path) => {
+        $crate::body_conformance!(@cases $make;
+            body_round_trip, body_a_retry_reuses_the_set, body_a_superseded_set_stays_readable,
+            body_a_headless_commit_leaves_the_head_stale, body_sets_are_per_run,
+            body_purge_removes_the_rows,
+        );
+    };
+    (@cases $make:path; $($case:ident),* $(,)?) => {
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $case() {
+                let Some(store) = $make().await else {
+                    $crate::skipped(&format!(
+                        "{}: store not configured",
+                        stringify!($case)
+                    ));
+                    return;
+                };
+                store.migrate().await.expect("migrate");
+                $crate::cases::$case(store).await;
+            }
+        )*
+    };
+}
+
 /// Serialises the cases that sweep blobs inside one test binary: a blob is global and
 /// content-addressed, so a sweep (`purge_blobs`, and `purge_finished` in the same call) with a
 /// future cutoff deletes every unreferenced blob in the database, including one a case running at
@@ -191,6 +227,39 @@ pub mod cases {
             store.keeps_blobs(),
             "the blob suite needs a store that keeps blobs"
         );
+    }
+
+    /// A store the body suite runs against keeps bodies: a store that does not is not given
+    /// `body_conformance!`, rather than passing it by defaulting every answer.
+    fn keeps_bodies(store: &DynStore) {
+        assert!(
+            store.keeps_bodies(),
+            "the body suite needs a store that keeps bodies"
+        );
+    }
+
+    /// The smallest document a head can be for a store test: the store treats it as an opaque
+    /// value, so only its identity matters here.
+    fn head_doc(commit: Uuid, len: usize) -> Value {
+        json!({
+            "v": 5,
+            "agent": {},
+            "body": { "commit": commit, "len": len },
+        })
+    }
+
+    fn rows(commit: Uuid, messages: &[&str]) -> BodyWrite {
+        BodyWrite {
+            commit,
+            rows: messages
+                .iter()
+                .enumerate()
+                .map(|(idx, message)| BodyRow {
+                    idx: u32::try_from(idx).expect("a short transcript"),
+                    message: json!(message),
+                })
+                .collect(),
+        }
     }
 
     pub async fn blob_round_trip(store: DynStore) {
@@ -440,6 +509,305 @@ pub mod cases {
             store.load_run(run.id).await.unwrap().is_none(),
             "the run itself is gone"
         );
+    }
+
+    /// A body set round-trips, ordered by `idx` however the caller passed the rows, and the head
+    /// that names it is what `load_head` serves.
+    pub async fn body_round_trip(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({"turn": 0})))
+            .await
+            .unwrap();
+        let commit = Uuid::new_v4();
+        let head = head_doc(commit, 3);
+        // Deliberately out of order: a transcript is read oldest first.
+        let body = BodyWrite {
+            commit,
+            rows: vec![
+                BodyRow {
+                    idx: 2,
+                    message: json!({"n": 2}),
+                },
+                BodyRow {
+                    idx: 0,
+                    message: json!({"n": 0}),
+                },
+                BodyRow {
+                    idx: 1,
+                    message: json!({"n": 1}),
+                },
+            ],
+        };
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1}))
+                    .head(head.clone())
+                    .body(body),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.body_list(run.id, commit).await.unwrap(),
+            (0..3)
+                .map(|idx| BodyRow {
+                    idx,
+                    message: json!({"n": idx}),
+                })
+                .collect::<Vec<_>>(),
+            "the set comes back ordered by idx"
+        );
+        assert_eq!(
+            store.load_head(run.id).await.unwrap().unwrap().state,
+            head,
+            "the head that names the set is current"
+        );
+    }
+
+    /// A retry of the same attempt reuses the commit id: the second write adds no row and keeps the
+    /// first bytes, so the set is idempotent.
+    pub async fn body_a_retry_reuses_the_set(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let commit = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc(commit, 2))
+                    .body(rows(commit, &["first", "second"])),
+            )
+            .await
+            .unwrap();
+        // The same set again (a retry after a lost acknowledgement), with a row whose bytes differ.
+        let mut retry = rows(commit, &["changed", "second"]);
+        retry.rows.push(BodyRow {
+            idx: 9,
+            message: json!("late"),
+        });
+        store
+            .commit_run(
+                run.id,
+                run.version + 1,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc(commit, 2))
+                    .body(retry),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.body_list(run.id, commit).await.unwrap(),
+            vec![
+                BodyRow {
+                    idx: 0,
+                    message: json!("first")
+                },
+                BodyRow {
+                    idx: 1,
+                    message: json!("second")
+                },
+                BodyRow {
+                    idx: 9,
+                    message: json!("late")
+                },
+            ],
+            "rows already written are not rewritten"
+        );
+    }
+
+    /// A later commit supersedes the set with a new one; the old set stays readable, and the head
+    /// names the new one.
+    pub async fn body_a_superseded_set_stays_readable(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                    .head(head_doc(first, 1))
+                    .body(rows(first, &["old"])),
+            )
+            .await
+            .unwrap();
+        store
+            .commit_run(
+                run.id,
+                run.version + 1,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 2}))
+                    .head(head_doc(second, 2))
+                    .body(rows(second, &["new", "newer"])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.body_list(run.id, first).await.unwrap().len(),
+            1,
+            "the superseded set is still readable"
+        );
+        assert_eq!(
+            store.body_list(run.id, second).await.unwrap().len(),
+            2,
+            "the current set is complete"
+        );
+        assert_eq!(
+            store.load_head(run.id).await.unwrap().unwrap().state,
+            head_doc(second, 2),
+            "the head names the new set"
+        );
+    }
+
+    /// A commit that writes no head (a delivery, a cancel, a park) leaves the stored head stale:
+    /// `load_head` serves the whole state, and the rows it wrote are readable but named by nothing.
+    pub async fn body_a_headless_commit_leaves_the_head_stale(store: DynStore) {
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let current = Uuid::new_v4();
+        let unnamed = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 1}))
+                    .head(head_doc(current, 1))
+                    .body(rows(current, &["current"])),
+            )
+            .await
+            .unwrap();
+        // The shape of a `deliver`: the state is re-encoded, no head, and it happens to write rows
+        // too. The head must not move.
+        store
+            .commit_run(
+                run.id,
+                run.version + 1,
+                RunUpdate::new(
+                    RunStatus::Runnable,
+                    json!({"v": 1, "turn": 1, "late": true}),
+                )
+                .body(rows(unnamed, &["unnamed"])),
+            )
+            .await
+            .unwrap();
+        let loaded = store.load_head(run.id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.state,
+            json!({"v": 1, "turn": 1, "late": true}),
+            "a stale head is not served; the whole state is"
+        );
+        assert_eq!(
+            store.body_list(run.id, unnamed).await.unwrap().len(),
+            1,
+            "the rows a headless commit wrote are still there"
+        );
+        assert_eq!(
+            store.body_list(run.id, current).await.unwrap().len(),
+            1,
+            "the set the stale head names is untouched"
+        );
+        // A later step writes a head again and names a fresh set.
+        let next = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version + 2,
+                RunUpdate::new(RunStatus::Runnable, json!({"v": 1, "turn": 2}))
+                    .head(head_doc(next, 1))
+                    .body(rows(next, &["next"])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_head(run.id).await.unwrap().unwrap().state,
+            head_doc(next, 1)
+        );
+        assert_eq!(
+            store.body_list(run.id, unnamed).await.unwrap().len(),
+            1,
+            "a set no head ever named stays readable (and is collected later)"
+        );
+    }
+
+    /// Two runs may pick the same commit id: a set is `(run, commit, idx)`, not `(commit, idx)`.
+    pub async fn body_sets_are_per_run(store: DynStore) {
+        keeps_bodies(&store);
+        let commit = Uuid::new_v4();
+        let mut runs = Vec::new();
+        for text in ["one", "two"] {
+            let agent = agent();
+            let run = store
+                .create_run(NewRun::new(&agent, json!({})))
+                .await
+                .unwrap();
+            store
+                .commit_run(
+                    run.id,
+                    run.version,
+                    RunUpdate::new(RunStatus::Runnable, json!({"turn": 1}))
+                        .head(head_doc(commit, 1))
+                        .body(rows(commit, &[text])),
+                )
+                .await
+                .unwrap();
+            runs.push((run.id, text));
+        }
+        for (run, text) in runs {
+            assert_eq!(
+                store.body_list(run, commit).await.unwrap(),
+                vec![BodyRow {
+                    idx: 0,
+                    message: json!(text)
+                }],
+                "one run's set is not another's"
+            );
+        }
+    }
+
+    /// Purging a run removes its body rows with its journal and references.
+    pub async fn body_purge_removes_the_rows(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_bodies(&store);
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let commit = Uuid::new_v4();
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Done, json!({"done": true}))
+                    .head(head_doc(commit, 2))
+                    .body(rows(commit, &["one", "two"])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.body_list(run.id, commit).await.unwrap().len(), 2);
+        let cutoff = now() + chrono::Duration::hours(1);
+        assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 1);
+        assert!(
+            store.body_list(run.id, commit).await.unwrap().is_empty(),
+            "the rows went with the run"
+        );
+        assert!(store.load_head(run.id).await.unwrap().is_none());
     }
 
     pub async fn create_and_load(store: DynStore) {
