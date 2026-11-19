@@ -429,7 +429,7 @@ impl OpenAiCompatible {
     /// Ask `credentials` for the headers of every call instead of sending `api_key` (ADR 0058):
     /// a host that mints, renews or proves a credential at the moment of use, or an injector's run
     /// header with no key at all. It replaces the key of the [`OpenAiConfig`]. On a `401` the
-    /// provider is told why ([`ModelCredentials::rejected`]) and, if it asks, the call is sent once
+    /// provider is told why ([`ModelCredentials::rejected`](adam_model::ModelCredentials::rejected)) and, if it asks, the call is sent once
     /// more with new headers; a second `401` is the call's answer.
     #[must_use]
     pub fn with_credentials(mut self, credentials: DynCredentials) -> Self {
