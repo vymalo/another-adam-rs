@@ -317,6 +317,14 @@ impl RuntimeTaskBackend {
         self
     }
 
+    /// The sessions this backend serves `child-sessions/v1` for: what
+    /// [`with_child_sessions`](Self::with_child_sessions) kept, `None` when it was never given or
+    /// refused because a helper is not registered. A composition root that lists the extension on
+    /// the card checks this first, so the card never promises what the backend does not serve.
+    pub fn child_sessions(&self) -> Option<&crate::ChildSessions> {
+        self.child_sessions.as_ref()
+    }
+
     /// The run behind `task_id` if it exists, belongs to this agent and to
     /// `caller`: `(run id, its durable view, context id)`.
     pub(crate) async fn owned(
@@ -990,6 +998,9 @@ impl TaskBackend for RuntimeTaskBackend {
                 .map_err(map_err)?;
             view = self.view_of(run).await?;
             state = crate::task_state(&view);
+            if let Some(round) = self.round_of(caller, task_id).await? {
+                self.clean_up_after_cancel(caller, &round).await?;
+            }
         }
         match state {
             TaskState::Canceled => {

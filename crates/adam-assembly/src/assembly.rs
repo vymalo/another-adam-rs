@@ -37,6 +37,8 @@ pub struct BoundDef {
     wait_poll: Option<Duration>,
     max_parallel: Option<usize>,
     session_limits: SessionLimits,
+    #[cfg(feature = "a2a")]
+    child_sessions: Option<adam_a2a_runtime::ChildSessions>,
     step_io: Option<StepIo>,
     scrub: Option<Scrub>,
     scrub_longest: Option<crate::scrub::Longest>,
@@ -79,12 +81,24 @@ impl BoundDef {
             wait_poll: None,
             max_parallel: None,
             session_limits,
+            #[cfg(feature = "a2a")]
+            child_sessions: None,
             step_io: None,
             scrub: None,
             scrub_longest: None,
             #[cfg(feature = "mcp")]
             prompt_commands: Vec::new(),
         }
+    }
+
+    /// What the definition serves `child-sessions/v1` for, kept for [`Assembly::child_sessions`].
+    #[cfg(feature = "a2a")]
+    pub(crate) fn with_child_sessions(
+        mut self,
+        sessions: Option<adam_a2a_runtime::ChildSessions>,
+    ) -> Self {
+        self.child_sessions = sessions;
+        self
     }
 
     /// The prompts of the root's MCP servers, served as commands.
@@ -275,6 +289,8 @@ impl BoundDef {
             info,
             remotes,
             session_limits: self.session_limits,
+            #[cfg(feature = "a2a")]
+            child_sessions: self.child_sessions,
             #[cfg(feature = "mcp")]
             prompt_commands: self.prompt_commands,
         })
@@ -421,6 +437,8 @@ pub struct Assembly {
     info: Vec<AgentInfo>,
     remotes: Vec<RemoteInfo>,
     session_limits: SessionLimits,
+    #[cfg(feature = "a2a")]
+    child_sessions: Option<adam_a2a_runtime::ChildSessions>,
     #[cfg(feature = "mcp")]
     prompt_commands: Vec<adam_mcp::PromptCommand>,
 }
@@ -430,6 +448,14 @@ impl Assembly {
     /// ([`AgentDef::session_limits`](crate::AgentDef::session_limits)) lowered by the root's file.
     pub fn session_limits(&self) -> SessionLimits {
         self.session_limits
+    }
+
+    /// What the root's A2A front serves `child-sessions/v1` for, as
+    /// [`AgentDef::child_sessions`](crate::AgentDef::child_sessions) computed it when the
+    /// definition was bound: `None` when the root has no subagent. Only with the feature `a2a`.
+    #[cfg(feature = "a2a")]
+    pub fn child_sessions(&self) -> Option<&adam_a2a_runtime::ChildSessions> {
+        self.child_sessions.as_ref()
     }
 
     /// Every agent, the root first and then each subagent (depth first, in name order). What

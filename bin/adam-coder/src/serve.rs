@@ -15,7 +15,7 @@
 //! | Role | Components | Also |
 //! |---|---|---|
 //! | `all` (default) | `a2a-server` (control plane), `worker`, `notify` | |
-//! | `control-plane` | `a2a-server`, `notify` | [`Coder::control_plane_with`]: a runtime with the agent's starter only, no model or GitHub configuration |
+//! | `control-plane` | `a2a-server`, `notify` | a runtime with the starters of the agent and of its helpers only (`AgentDef::session_starters`), no model or GitHub configuration |
 //! | `worker` | `worker`, `health`, `notify` | `/healthz` on [`ServiceConfig::listen_addr`](adam_service::ServiceConfig::listen_addr), no A2A |
 //!
 //! `notify` is the `adam_notify_postgres::PgNotify` listener and publisher: live events and
@@ -406,6 +406,16 @@ pub async fn serve(
         );
     }
 
+    // What a person may open a session on (`child-sessions/v1`): the root's helpers with the
+    // effective limits, read from the files alone so every role that serves A2A lists and serves the
+    // same. A round of a person's has no workspace of the run's yet (ADR 0045 slice 7).
+    let helpers = files
+        .def()
+        .map_err(|e| *e)
+        .context("reading the agent definition")?
+        .session_limits(config.service.sessions.limits);
+    let sessions = helpers.child_sessions();
+
     // Only a role that runs workers builds the agent: model, GitHub client, workspaces, MCP
     // servers. A control plane starts, delivers to, cancels and views runs, which needs the
     // agent's name and `init` only (`CoderStarter`), so it takes no model or GitHub configuration.
@@ -432,8 +442,12 @@ pub async fn serve(
                 prompts,
             )
         }
+        // The starters of the helpers too, so a person's session round can be started here and a
+        // worker steps it.
         None => (
-            Agents::new(AGENT_NAME, |builder| builder.starter(CoderStarter)),
+            Agents::new(AGENT_NAME, move |builder| {
+                helpers.session_starters(builder.starter(CoderStarter))
+            }),
             Vec::new(),
         ),
     };
@@ -459,6 +473,10 @@ pub async fn serve(
         // The card lists the commands of the files and the prompts of the MCP servers (`commands/v1`);
         // the backend expands a message that names one before it is stored.
         .commands(commands);
+    let agents = match sessions {
+        Some(sessions) => agents.child_sessions(sessions),
+        None => agents,
+    };
     // The card of the files this process runs, like the workers' agent.
     let card = match &config.service.public_url {
         Some(public_url) => Some(
