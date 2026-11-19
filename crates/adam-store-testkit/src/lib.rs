@@ -143,7 +143,8 @@ macro_rules! blob_conformance {
     ($make:path) => {
         $crate::blob_conformance!(@cases $make;
             blob_round_trip, blob_four_mib_round_trip, blob_put_is_idempotent, blob_unknown_id_is_none,
-            blob_empty_bytes, blob_a_run_reference_keeps_the_blob_alive,
+            blob_stored_reports_what_is_stored, blob_empty_bytes,
+            blob_a_run_reference_keeps_the_blob_alive,
             blob_a_shared_digest_survives_until_the_last_run_is_purged,
             blob_purge_respects_before, blob_purge_finished_removes_the_refs_and_the_blob,
         );
@@ -179,7 +180,7 @@ macro_rules! body_conformance {
         $crate::body_conformance!(@cases $make;
             body_an_append_writes_only_the_delta, body_the_generation_is_stable_across_appends,
             body_a_compaction_starts_a_new_generation_and_the_gc_collects_the_old,
-            body_a_lost_cas_leaves_only_the_winners_rows,
+            body_a_stale_version_is_a_conflict,
             body_a_first_split_writes_the_whole_transcript,
             body_the_same_transcript_committed_again_adds_no_row, body_purge_removes_the_rows,
             body_a_non_contiguous_index_is_refused,
@@ -380,6 +381,33 @@ pub mod cases {
         keeps_blobs(&store);
         let id = BlobId::from_hex(&"0".repeat(64)).expect("64 lower-case hex digits");
         assert_eq!(store.get_blob(&id).await.unwrap(), None);
+    }
+
+    /// `blob_stored` answers what the store holds: false before a put, true after, false for an id
+    /// nothing wrote. The runtime checks it before it re-sends a file's bytes, so an answer that is
+    /// always true skips the put and a head names bytes that are not there.
+    pub async fn blob_stored_reports_what_is_stored(store: DynStore) {
+        let _turn = BLOB_SUITE.lock().await;
+        keeps_blobs(&store);
+        // A digest unique to this run: the suite must pass against a database that holds an
+        // earlier run's blobs, and a fixed one would already be stored.
+        let bytes = format!("asked for before it is sent: {}", Uuid::new_v4()).into_bytes();
+        let id = blob_digest(&bytes);
+        assert!(
+            !store.blob_stored(&id).await.unwrap(),
+            "nothing is stored under the digest yet"
+        );
+        store.put_blob(&id, &bytes).await.unwrap();
+        assert!(
+            store.blob_stored(&id).await.unwrap(),
+            "the bytes are there after the put"
+        );
+        // A digest this case never writes, distinct from every digest the other cases use.
+        let unknown = blob_digest(Uuid::new_v4().as_bytes());
+        assert!(
+            !store.blob_stored(&unknown).await.unwrap(),
+            "an id nothing wrote is not stored"
+        );
     }
 
     pub async fn blob_empty_bytes(store: DynStore) {
@@ -733,9 +761,10 @@ pub mod cases {
         );
     }
 
-    /// A commit at a stale version writes no row: the generation holds the winner's transcript,
-    /// not the loser's.
-    pub async fn body_a_lost_cas_leaves_only_the_winners_rows(store: DynStore) {
+    /// A commit at a stale version writes no row and changes no head: the store answers `Conflict`
+    /// before it reads or writes the transcript. (A real race — the rows inserted, then the CAS
+    /// lost — is the adapter's test: the suite cannot force a hook into a store.)
+    pub async fn body_a_stale_version_is_a_conflict(store: DynStore) {
         keeps_bodies(&store);
         let agent = agent();
         let run = store
