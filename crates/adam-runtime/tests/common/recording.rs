@@ -275,8 +275,8 @@ impl Store for RecordingStore {
         self.inner.keeps_bodies()
     }
 
-    async fn body_list(&self, run: RunId, commit: Uuid) -> StoreResult<Vec<BodyRow>> {
-        self.inner.body_list(run, commit).await
+    async fn body_list(&self, run: RunId, generation: Uuid) -> StoreResult<Vec<BodyRow>> {
+        self.inner.body_list(run, generation).await
     }
 
     fn keeps_blobs(&self) -> bool {

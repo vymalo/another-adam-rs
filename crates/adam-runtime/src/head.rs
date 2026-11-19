@@ -118,9 +118,20 @@ pub(crate) struct Head {
 }
 
 impl Head {
-    /// The head of `env` whose agent state is `agent` (the split's head) and whose transcript has
-    /// `len` rows. The generation is left for the store to resolve.
-    pub(crate) fn of(env: &Envelope, agent: Value, len: u32, files: &[(BlobId, u64)]) -> Self {
+    /// The head of `env` whose agent state is `agent` (the split's head), whose artifacts are
+    /// `artifacts` and whose transcript has `len` rows. The generation is left for the store to
+    /// resolve.
+    ///
+    /// `artifacts` is the list the commit's upload pass saw, not `env.artifacts`: a CAS retry can
+    /// merge deliveries into the envelope, and the head's file references must stay paired with
+    /// the digests that pass stored. `files` is positional, one entry per file artifact.
+    pub(crate) fn of(
+        env: &Envelope,
+        agent: Value,
+        len: u32,
+        artifacts: &[Artifact],
+        files: &[(BlobId, u64)],
+    ) -> Self {
         Self {
             v: VERSION,
             agent,
@@ -132,7 +143,7 @@ impl Head {
             error: env.error.clone(),
             artifacts: {
                 let mut files = files.iter();
-                env.artifacts
+                artifacts
                     .iter()
                     .map(|artifact| head_artifact(artifact, &mut files))
                     .collect()
@@ -215,6 +226,8 @@ pub(crate) enum Stored {
 }
 
 // S2a writes and verifies the head but reads neither; the read path (S2b) is what calls these.
+// The allow keeps `Stored` live, and through `Stored::decode` it keeps `Head::decode` live too:
+// without it a non-test build reports both, and S2b is the caller.
 #[allow(
     dead_code,
     reason = "S2a writes and verifies the head; S2b's read path decodes and serves it"
@@ -296,7 +309,7 @@ mod tests {
         env.artifacts
             .push(Artifact::new("plan", None, json!({"steps": [1]})));
         env.hb = true;
-        let head = Head::of(&env, json!({"turns": 3}), 2, &[]);
+        let head = Head::of(&env, json!({"turns": 3}), 2, &env.artifacts, &[]);
         assert_eq!(head.v, 5);
         assert_eq!(head.agent, json!({"turns": 3}));
         assert_eq!((head.seq, head.attempt, head.rev), (7, 1, 4));
@@ -326,9 +339,44 @@ mod tests {
         assert_eq!(Head::decode(RunId::new(), &encoded).expect("decodes"), head);
     }
 
+    /// The head's file references are paired **positionally** with the upload pass, and only a
+    /// file artifact consumes an entry: a JSON artifact before a file must not shift its digest.
+    /// The list is the one the pass saw, not whatever a retried envelope carries.
+    #[test]
+    fn the_file_list_is_paired_with_the_file_artifacts_of_the_upload_pass() {
+        let mut env = Envelope::new(json!({}));
+        env.artifacts
+            .push(Artifact::new("plan", None, json!({"steps": [1]})));
+        env.artifacts
+            .push(Artifact::file("a", "image/png", "a.png", b"aaa".to_vec()).expect("a file"));
+        env.artifacts
+            .push(Artifact::file("b", "image/png", "b.png", b"bbbb".to_vec()).expect("a file"));
+        let first = BlobId::from_hex(&"a".repeat(64)).expect("a digest");
+        let second = BlobId::from_hex(&"b".repeat(64)).expect("a digest");
+        let files = [(first.clone(), 3_u64), (second.clone(), 4_u64)];
+        let head = Head::of(&env, json!({}), 0, &env.artifacts, &files);
+        assert_eq!(head.artifacts[0].file, None);
+        let a = head.artifacts[1].file.as_ref().expect("the first file");
+        assert_eq!((a.digest.clone(), a.size), (first, 3));
+        let b = head.artifacts[2].file.as_ref().expect("the second file");
+        assert_eq!((b.digest.clone(), b.size), (second, 4));
+
+        // A retry's envelope may have grown, but the head pairs with the list the pass stored.
+        let mut retried = env.clone();
+        retried
+            .artifacts
+            .push(Artifact::new("late", None, json!({"steps": []})));
+        let head = Head::of(&retried, json!({}), 0, &env.artifacts, &files);
+        assert_eq!(
+            head.artifacts.len(),
+            env.artifacts.len(),
+            "the head describes the pass's list, not the retried envelope's"
+        );
+    }
+
     #[test]
     fn a_head_is_v5_and_a_v4_envelope_is_not_mistaken_for_one() {
-        let head = Head::of(&Envelope::new(json!({})), json!({}), 0, &[]);
+        let head = Head::of(&Envelope::new(json!({})), json!({}), 0, &[], &[]);
         let encoded = head.encode().expect("encodes");
         assert_eq!(encoded["v"], 5);
         // `Stored` tells them apart by `v`, and re-encodes the variant it read.
@@ -357,7 +405,9 @@ mod tests {
             Some("application/json".into()),
             json!({"steps": [1]}),
         ));
-        let encoded = Head::of(&env, json!({}), 0, &[]).encode().expect("encodes");
+        let encoded = Head::of(&env, json!({}), 0, &env.artifacts, &[])
+            .encode()
+            .expect("encodes");
         let artifacts = encoded["artifacts"].as_array().expect("artifacts");
         // A file artifact: the v4 keys, with `file` naming the digest and size, never the bytes.
         let mut keys: Vec<&str> = artifacts[0]
@@ -399,7 +449,7 @@ mod tests {
         assert_eq!(full.error(), Some("boom"));
         assert_eq!(full.inbox_mut().len(), 1);
 
-        let mut head = Head::of(&Envelope::new(json!({})), json!({}), 0, &[]);
+        let mut head = Head::of(&Envelope::new(json!({})), json!({}), 0, &[], &[]);
         head.error = Some("later".into());
         let mut stored = Stored::Head(head);
         stored

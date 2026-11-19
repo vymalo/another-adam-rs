@@ -485,6 +485,9 @@ struct Next {
     /// `Some(new)` when this commit starts a body generation (a first split or a compaction);
     /// `None` appends to the current one. Filled in `transition`, after the split is checked.
     generation: Option<Uuid>,
+    /// The merged artifacts the split's upload pass saw, in artifact order: `Head::of` pairs its
+    /// file references with **this** list, so a retried envelope cannot shift them.
+    head_artifacts: Option<Vec<Artifact>>,
     /// The digests the shadow's upload pass stored (the union the commit references).
     shadow_blobs: Vec<BlobId>,
     /// The digest and size of every file artifact in the head's upload pass, in artifact order, so
@@ -656,6 +659,10 @@ async fn transition(
                 Some(state) => match agent.transcript(state) {
                     Ok(rows) => (rows, false),
                     Err(e) => {
+                        // A step that decoded this state decoded the same `A::State`, so this arm
+                        // is a guard rather than a path: if it ever fires (a second state type
+                        // for the same agent name), the warning says why and a new generation is
+                        // the safe answer. It has no test because no public path reaches it.
                         tracing::warn!(
                             run = %run,
                             error = %report(&e),
@@ -682,6 +689,9 @@ async fn transition(
         let artifacts = merged_artifacts(&env, &next);
         let uploaded = crate::blob::upload_all(&inner.store, &artifacts).await;
         if uploaded.all_stored {
+            // The head pairs its file references with this pass, so carry the list the pass saw:
+            // a retry merges deliveries into the envelope, never artifacts.
+            next.head_artifacts = Some(artifacts);
             next.shadow_files = uploaded.files;
             next.shadow_blobs = uploaded.ids;
         } else {
@@ -793,6 +803,7 @@ fn plan(
         read: read.clone(),
         split,
         generation: None,
+        head_artifacts: None,
         shadow_blobs: Vec::new(),
         shadow_files: Vec::new(),
         deadline: base.deadline,
@@ -814,6 +825,7 @@ fn plan(
         read: Vec::new(),
         split: None,
         generation: None,
+        head_artifacts: None,
         shadow_blobs: Vec::new(),
         shadow_files: Vec::new(),
         deadline: base.deadline,
@@ -862,6 +874,7 @@ fn plan(
                 read: Vec::new(),
                 split: None,
                 generation: None,
+                head_artifacts: None,
                 shadow_blobs: Vec::new(),
                 shadow_files: Vec::new(),
                 deadline: base.deadline,
@@ -1039,7 +1052,13 @@ fn build_update(
     if let Some((head, rows)) = &next.split {
         let len = u32::try_from(rows.len())
             .map_err(|_| StoreError::InvalidInput("a transcript is longer than u32".into()))?;
-        let head = Head::of(&env, head.clone(), len, &next.shadow_files);
+        let head = Head::of(
+            &env,
+            head.clone(),
+            len,
+            next.head_artifacts.as_deref().unwrap_or(&env.artifacts),
+            &next.shadow_files,
+        );
         update.head = Some(head.encode()?);
         let rows = rows
             .iter()
