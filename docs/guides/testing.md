@@ -125,7 +125,8 @@ superuser, for its reconnect test). See [Store adapters](../reference/store-adap
 
 Scripts in `dev/` drive the compose stack through A2A and assert the whole chain on the mocks. Each script's
 header lists its steps and variables. CI runs them in `.github/workflows/coder.yml` ("Compose e2e") on the image
-it has just built. Start the stack first:
+it has just built: a pull request runs the seven default coder scenarios and two App-mode ones, main and a manual
+`workflow_dispatch` run all of them. Start the stack first:
 
 ```sh
 docker compose --profile app up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server coder
