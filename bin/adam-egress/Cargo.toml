@@ -21,6 +21,7 @@ path = "src/main.rs"
 adam-error.workspace = true
 async-trait.workspace = true
 httparse.workspace = true
+mimalloc.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "signal"] }
 tracing.workspace = true
