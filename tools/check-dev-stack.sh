@@ -7,9 +7,10 @@
 #   sh tools/check-dev-stack.sh
 #
 # It fails when dev/podman or dev/compose.devcontainer.yaml returns, when the engine is named
-# anywhere under dev/ or .github/, or when a script or a workflow names one of the four scenarios.
-# It reads the working tree, tracked and untracked files alike, so a local run sees a file that was
-# just added (a `git grep` would not).
+# anywhere under dev/ or .github/, or when a script, a workflow or a guide names one of the four
+# scenarios. It reads the working tree, tracked and untracked files alike, so a local run sees a
+# file that was just added (a `git grep` would not). The decision records are not scanned: they are
+# the history, and ADR 0052 names what it removes.
 set -eu
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -46,7 +47,7 @@ if [ -n "$hits" ]; then
   fail "the dev stack and CI name a container engine: ADR 0052 removes it (the lines above)"
 fi
 
-hits=$(scan_scenarios dev .github || true)
+hits=$(scan_scenarios dev .github docs/reference docs/guides || true)
 if [ -n "$hits" ]; then
   echo "$hits" >&2
   fail "a removed e2e scenario is named again: ADR 0052 removes devcontainer, default-env, broken-env and no-runtime"
