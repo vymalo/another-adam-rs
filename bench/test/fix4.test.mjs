@@ -264,6 +264,22 @@ test('R14: every own image is in the host\'s store before anything is spent, and
   assert.ok(q.log.includes('meter closed') && q.log.includes('stack down'));
 });
 
+test('R14: the host store has one pull for each image, however many slots and the grader ask at once', async (t) => {
+  // The store is the host's, so a pull is keyed by the image, never by the slot that asked: two slots preparing the
+  // same task at once must not pull it twice (the old key was `slotN|<image>`, which made the second slot's ask a
+  // second pull, and `bench/README.md` says one in-flight promise for each image).
+  const ref = `registry.example.test/task@sha256:${'c'.repeat(64)}`;
+  const task = { id: 'demo-3', source: 'public', image: { ref } };
+  const p = realParts(t, { tasks: [task] });
+  const h = await realHarness({ env: p.env, config: p.config, log: () => {}, sharedPrompt: 'shared', inject: p.inject });
+  try {
+    await Promise.all([h.deps.pullImage(1, task), h.deps.pullImage(2, task), h.deps.pullGraderImage(task)]);
+  } finally {
+    await h.close();
+  }
+  assert.deepEqual([...p.slotContainers.pulled, ...p.graderContainers.pulled], [ref], 'one pull, not one for each asker');
+});
+
 test('defect 2: a run stranded in Grading whose saved patch is gone or changed is recorded invalid and is not graded', async (t) => {
   for (const damage of ['gone', 'changed']) {
     const f = await fixture(t, { capUSD: 100, taskNames: ['hello-1'] });

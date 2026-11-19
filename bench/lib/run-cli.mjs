@@ -126,24 +126,18 @@ export async function realHarness({ env, config, log, sharedPrompt, inject = {} 
     await stack.up();
     const slots = config.concurrency;
 
-    // An image is made present once per slot and once for the grading, from the host's own store: the host pulls a
-    // public image, and an own image was built here by `bench tasks build`. `once` keeps the in-flight promise, so two
-    // slots never pull the same image twice.
+    // An image is made present once in the host's store, whatever slot or the grader asks: `docker pull` needs no
+    // particular container, so the promise is keyed by the image and never by the slot that asked. `once` keeps the
+    // in-flight promise, so two slots preparing the same task at once pull it once.
     const first = once();
     const pullImage = (slot, task) =>
-      first(`slot${slot}|${task.image.ref}`, async () => {
+      first(task.image.ref, async () => {
         const containers = stack.containers(slot);
         if (await containers.hasImage(task.image.ref)) return;
         if (task.source === 'own') throw new SelectionError(`the own task image ${task.image.ref} is not in the host's store: build it with bench tasks build`);
         await stack.pullWindow(slot, () => containers.pull(task.image.ref));
       });
-    const pullGraderImage = (task) =>
-      first(`grader|${task.image.ref}`, async () => {
-        const containers = stack.graderContainers();
-        if (await containers.hasImage(task.image.ref)) return;
-        if (task.source === 'own') throw new SelectionError(`the own task image ${task.image.ref} is not in the host's store: build it with bench tasks build`);
-        await stack.graderWindow(() => containers.pull(task.image.ref));
-      });
+    const pullGraderImage = (task) => pullImage(1, task);
     // Before any money is spent: every own image is in the host's store.
     for (const task of tasks.filter((t) => t.source === 'own')) {
       for (let slot = 1; slot <= slots; slot++) await pullImage(slot, task);
