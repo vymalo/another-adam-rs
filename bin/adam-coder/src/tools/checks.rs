@@ -22,9 +22,10 @@
 //!
 //! # A failed check is not run again on the same tree
 //!
-//! When the notes hold a **failed** record for the same command, directory and slot on exactly the
-//! tree the command is about to run on, made at the current `ChecksNotes::epoch` (`run` and
-//! `rebuild_environment` bump it; `write_file`, `edit_file` and `apply_patch` change the tree), the
+//! When the notes hold a **failed** record for the same command, directory, slot and timeout on
+//! exactly the tree the command is about to run on, made at the current `ChecksNotes::epoch` (`run`,
+//! `rebuild_environment` and the file tools bump it; the command is told apart by the SHA-256 of its
+//! raw text, so two commands that differ only in a secret are two checks), the
 //! command is not run: the result quotes that run's findings, names the call that made them, spends
 //! no check cycle and emits no `checks` artifact (the earlier run's is the verdict on this tree).
 //! It is still a failure, so the gate refuses a pull request on the tree. A passing record is never
@@ -33,16 +34,18 @@
 
 use adam::Artifact;
 use adam::prelude::*;
+use adam_llm_agent::sha256_hex;
 use adam_workspace::{EnvDescription, EnvKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::redact::Redactor;
 
-use super::notes::CheckRecord;
+use super::notes::{CheckKey, CheckRecord};
 use super::preexisting::{self, OnBase};
 use super::shell::{
-    MissingTool, ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, shell_spec,
+    MissingTool, ShellOutcome, cwd_key, missing_tool, project_dependency_hint, resolve_cwd,
+    shell_spec,
 };
 use super::{Outcome, ToolEnv, non_empty, notes_error, run_error};
 
@@ -549,7 +552,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 /// no `checks` artifact was emitted (the earlier run's is the verdict on this tree), and that the
 /// gate still refuses a pull request on it.
 fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, max: u32) -> String {
-    let tree = record.tree.as_deref().unwrap_or_default();
+    let tree = record.start_tree.as_deref().unwrap_or_default();
     let short = &tree[..tree.len().min(10)];
     let code = super::notes::exit_phrase(record.exit_code);
     let tail = record.tail.trim();
@@ -560,12 +563,12 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
     };
     format!(
         "The worktree is unchanged since `{command}` failed on tree {short}, and nothing a check \
-         reads has changed since (no `run` has run since and the environment was not rebuilt): the \
-         command was not run again, because it would fail the same way. This call cost no check \
-         cycle ({failures} of {max} used so far), and it emits no new `checks` artifact: the one the \
-         earlier run reported is the verdict on this tree. This is still a failure, not a green: a \
-         pull request on this tree is refused. What call `{}` found:\n{findings}\nChange the code, \
-         then run the check again.",
+         reads has changed since (no `run` or file change since, and the environment was not \
+         rebuilt): the command was not run again, because it would fail the same way. This call \
+         cost no check cycle ({failures} of {max} used so far), and it emits no new `checks` \
+         artifact: the one the earlier run reported is the verdict on this tree. This is still a \
+         failure, not a green: a pull request on this tree is refused. What call `{}` found:\n\
+         {findings}\nChange the code, then run the check again.",
         record.call_id
     )
 }
@@ -583,6 +586,8 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
 /// repository's own devcontainer when it has one), and get its exit code and the tail of
 /// its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited
 /// check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A
+/// failed check asked again on exactly the same unchanged code is answered from the earlier run
+/// (no cycle, no new `checks` artifact, still a failure). A
 /// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
 /// cycle, and is for the person to decide.
 #[tool(label = "Run the checks", icon = "execute", parallel = "exclusive")]
@@ -652,19 +657,27 @@ pub async fn run_checks(
     // report below is bound to the tree the command leaves (it may write a file), as it always was.
     let at = super::gitcli::GitAt::slot(&slot);
     let tree_before = super::gitcli::working_tree_id(&at).await;
-    let cwd_key = cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty() && *c != ".")
-        .unwrap_or("");
+    let dir_key = cwd_key(cwd.as_deref());
+    // The identity of the command is its raw text, not what the redactor shows: two commands that
+    // differ only in a secret are two checks.
+    let command_sha = sha256_hex(command.as_bytes());
 
-    // A failure on this exact tree, from this exact command in this directory and slot, with the
-    // run's files and environment unchanged since (`ChecksNotes::epoch`): the command would fail the
-    // same way, so it is not run again. It spends no cycle and emits no `checks` artifact (the
-    // earlier run's is the verdict on this tree); the gate still refuses the pull request.
+    // A failure on this exact tree, from this exact command (raw text, directory, slot, timeout) in
+    // this kind of work, with the run's files and environment unchanged since
+    // (`ChecksNotes::epoch`): the command would fail the same way, so it is not run again. It
+    // spends no cycle and emits no `checks` artifact (the earlier run's is the verdict on this
+    // tree); the gate still refuses the pull request.
     let epoch = notes.checks.epoch;
     let earlier = match tree_before.as_deref() {
-        Some(tree) => notes.failed_check_on(tree, &shown, cwd_key, slot.dir(), epoch),
+        Some(tree) => notes.failed_check_on(&CheckKey {
+            tree,
+            command_sha: &command_sha,
+            cwd: &dir_key,
+            slot: slot.dir(),
+            epoch,
+            timeout_secs: timeout.as_secs(),
+            scratch,
+        }),
         None => None,
     };
     if let Some(earlier) = earlier {
@@ -675,7 +688,7 @@ pub async fn run_checks(
             ToolOutput::error(unchanged_failure_text(earlier, &shown, failures, max))
                 .with_repeat_key(format!(
                     "unchanged:{}",
-                    earlier.tree.as_deref().unwrap_or_default()
+                    earlier.start_tree.as_deref().unwrap_or_default()
                 )),
         );
     }
@@ -772,8 +785,11 @@ pub async fn run_checks(
         exit_code: outcome.exit_code,
         tail: outcome.tail.clone(),
         tree,
-        cwd: cwd_key.to_owned(),
+        start_tree: tree_before,
+        cwd: dir_key,
         epoch,
+        timeout_secs: timeout.as_secs(),
+        command_sha,
         report: Some(report),
         slot: Some(slot.dir().to_owned()),
         scratch,

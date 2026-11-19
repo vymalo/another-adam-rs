@@ -75,7 +75,7 @@ use adam_model::ImageOrigin;
 use adam_workspace::safe_fs::{BeneathError, Dir, Meta, SlotDir, WalkError, race};
 
 use super::gitcli::GitAt;
-use super::{Outcome, ToolEnv, non_empty};
+use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// Most bytes of `content` `write_file` accepts.
 pub const WRITE_CAP: usize = 1024 * 1024;
@@ -992,6 +992,20 @@ pub async fn read_file(
     })
 }
 
+/// The check epoch moves: a file the project **ignores** does not change the tree id, and a check
+/// may read it, so a failed record from before this change is not reused
+/// (`ChecksNotes::epoch`). A write to a file the project tracks changes the tree anyway; the bump
+/// costs nothing there.
+async fn moved_the_epoch(env: &ToolEnv, ctx: &ToolCtx) -> Result<(), ToolError> {
+    let run = ctx.root_run_id().to_string();
+    env.notes
+        .update(&run, |notes| {
+            notes.checks.epoch = notes.checks.epoch.saturating_add(1);
+        })
+        .await
+        .map_err(|e| notes_error(&e))
+}
+
 // ------------------------------------------------------------------ read_files
 
 /// Most paths one `read_files` call accepts.
@@ -1377,6 +1391,7 @@ pub async fn write_file(
         .map_err(|e| ToolError::Transient(format!("the write was interrupted: {e}")))?;
     match written {
         Ok(done) => {
+            moved_the_epoch(&env, ctx).await?;
             ctx.emit_progress(format!("wrote {path} ({})", slot.dir()))
                 .await;
             let mut text = format!(
@@ -1416,6 +1431,7 @@ pub async fn apply_patch(
     };
     match apply_in(&GitAt::slot(&slot), &patch).await {
         Ok(paths) => {
+            moved_the_epoch(&env, ctx).await?;
             ctx.emit_progress(format!("patched {} ({})", listed(&paths), slot.dir()))
                 .await;
             let mut text = format!(
@@ -1878,6 +1894,7 @@ pub async fn edit_file(
         .map_err(|e| ToolError::Transient(format!("the edit was interrupted: {e}")))?;
     match edited {
         Ok(done) => {
+            moved_the_epoch(&env, ctx).await?;
             ctx.emit_progress(format!("edited {path} ({})", slot.dir()))
                 .await;
             let mut text = format!(

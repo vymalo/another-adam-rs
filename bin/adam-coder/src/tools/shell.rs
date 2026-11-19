@@ -170,6 +170,21 @@ pub fn resolve_cwd(root: &Path, relative: Option<&str>) -> Result<PathBuf, Strin
     Ok(resolved)
 }
 
+/// The identity of the directory a command ran in, relative to the worktree: `""` for the root.
+/// The same directory spelled `web`, `./web`, `web/` or `web//x` is one key, so that a check is
+/// told apart by where it ran and not by how the model wrote it. `..` never reaches here
+/// ([`resolve_cwd`] refuses it), and a symlink keeps its own name (two names for one directory are
+/// two keys, which only costs a check that runs again).
+pub(crate) fn cwd_key(cwd: Option<&str>) -> String {
+    let Some(cwd) = cwd.map(str::trim).filter(|c| !c.is_empty() && *c != ".") else {
+        return String::new();
+    };
+    cwd.split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The last `cap` bytes of everything pushed.
 struct Tail {
     buf: Vec<u8>,

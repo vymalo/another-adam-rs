@@ -13,7 +13,7 @@ use crate::redact::Redactor;
 
 use super::checks::cut_tail;
 use super::notes::{BaseResult, RunNotes};
-use super::shell::{RunError, ShellOutcome, missing_tool, resolve_cwd, shell_spec};
+use super::shell::{RunError, ShellOutcome, cwd_key, missing_tool, resolve_cwd, shell_spec};
 use super::{ToolEnv, notes_error};
 
 /// Most bytes of the base's output kept in the notes and shown to the model.
@@ -75,10 +75,7 @@ pub(super) async fn on_base(
         command,
         cwd,
     } = failing;
-    let cwd_key = cwd
-        .map(str::trim)
-        .filter(|c| !c.is_empty() && *c != ".")
-        .unwrap_or("");
+    let cwd_key = cwd_key(cwd);
     let base = match wt.base_commit().await {
         Ok(Some(base)) => base,
         Ok(None) => return Ok(OnBase::Unknown),
@@ -87,7 +84,7 @@ pub(super) async fn on_base(
             return Ok(OnBase::Unknown);
         }
     };
-    if let Some(known) = notes.base_result(shown, cwd_key, &base) {
+    if let Some(known) = notes.base_result(shown, &cwd_key, &base) {
         return Ok(OnBase::of(known));
     }
 
@@ -104,7 +101,7 @@ pub(super) async fn on_base(
             return Ok(OnBase::Unknown);
         }
     };
-    let ran = match resolve_cwd(checkout.path(), Some(cwd_key)) {
+    let ran = match resolve_cwd(checkout.path(), Some(&cwd_key)) {
         Ok(dir) => Some(
             env.run(
                 ctx,
@@ -131,7 +128,7 @@ pub(super) async fn on_base(
         }
         None => return Ok(OnBase::Unknown),
     };
-    let Some(result) = conclusion(&outcome, command, shown, cwd_key, &base, &env.redactor) else {
+    let Some(result) = conclusion(&outcome, command, shown, &cwd_key, &base, &env.redactor) else {
         return Ok(OnBase::Unknown);
     };
     notes.record_base_result(result.clone());
