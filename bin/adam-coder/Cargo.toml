@@ -42,7 +42,6 @@ adam-runtime.workspace = true
 adam-service = { workspace = true, features = ["mcp"] }
 adam-ui.workspace = true
 adam-workspace.workspace = true
-aho-corasick.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true

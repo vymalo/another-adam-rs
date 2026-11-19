@@ -6,6 +6,9 @@
 //! ([`sandbox`]), the scopes the tools share with the other calls of a turn ([`access`]), and the
 //! process's secrets kept out of everything that leaves it ([`redact`]).
 
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 pub mod access;
 pub mod redact;
 pub mod sandbox;

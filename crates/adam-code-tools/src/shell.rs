@@ -608,6 +608,9 @@ pub fn spawn_prepared(
 /// `process_group(0)`, so its group id is its pid). Uses the shell's `kill`
 /// builtin: this crate forbids `unsafe`, and `kill(1)` may be absent from slim
 /// images.
+///
+/// **`pid` must be that of a child this process started with [`spawn_prepared`]**
+/// (its own group), never one read from elsewhere: whatever group it names is killed.
 pub async fn kill_group(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     let killed = Command::new("sh")

@@ -336,7 +336,6 @@ dependencies = [
  "adam-store-testkit",
  "adam-ui",
  "adam-workspace",
- "aho-corasick",
  "anyhow",
  "async-trait",
  "axum",
