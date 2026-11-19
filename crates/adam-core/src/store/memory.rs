@@ -1,7 +1,7 @@
 //! In-memory [`Store`] for tests and `adam dev` without a database.
 //! Not durable: everything is lost when the process exits.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use super::{
-    ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord, PushState,
-    RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult, add_ttl, now,
+    BlobId, ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
+    PushState, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult, add_ttl, now,
     storable_owned, truncate_ms,
 };
 
@@ -24,6 +24,15 @@ struct Inner {
     runs: HashMap<RunId, Slot>,
     journal: BTreeMap<(RunId, u64), JournalEntry>,
     push: BTreeMap<(RunId, String), PushSlot>,
+    /// File bytes by content address. A blob is global: several runs may reference one digest.
+    blobs: HashMap<BlobId, BlobSlot>,
+    /// The digests each run references, append-only (`RunUpdate::blobs`).
+    run_blobs: HashMap<RunId, HashSet<BlobId>>,
+}
+
+struct BlobSlot {
+    bytes: Vec<u8>,
+    created_at: DateTime<Utc>,
 }
 
 struct PushSlot {
@@ -135,21 +144,33 @@ impl Store for MemoryStore {
                 });
             }
         }
-        #[allow(
-            clippy::expect_used,
-            reason = "presence was checked above under the same lock"
-        )]
-        let slot = inner.runs.get_mut(&id).expect("checked above");
-        slot.run.status = update.status;
-        slot.run.state = storable_owned(update.state);
-        slot.run.wake_at = update.wake_at.map(truncate_ms);
-        slot.run.version += 1;
-        slot.run.updated_at = now();
-        // The contract of `commit_run`: the caller has the state it wrote.
-        Ok(RunRecord {
-            state: serde_json::Value::Null,
-            ..slot.run.clone()
-        })
+        let committed = {
+            #[allow(
+                clippy::expect_used,
+                reason = "presence was checked above under the same lock"
+            )]
+            let slot = inner.runs.get_mut(&id).expect("checked above");
+            slot.run.status = update.status;
+            slot.run.state = storable_owned(update.state);
+            slot.run.wake_at = update.wake_at.map(truncate_ms);
+            slot.run.version += 1;
+            slot.run.updated_at = now();
+            // The contract of `commit_run`: the caller has the state it wrote.
+            RunRecord {
+                state: serde_json::Value::Null,
+                ..slot.run.clone()
+            }
+        };
+        // The refs go with the commit that names them, append-only: a digest is added once and
+        // never removed while the run lives.
+        if !update.blobs.is_empty() {
+            inner
+                .run_blobs
+                .entry(id)
+                .or_default()
+                .extend(update.blobs.iter().cloned());
+        }
+        Ok(committed)
     }
 
     async fn open_run_for_conversation(
@@ -453,6 +474,7 @@ impl Store for MemoryStore {
         for id in &doomed {
             inner.runs.remove(id);
             inner.push.retain(|(run, _), _| run != id);
+            inner.run_blobs.remove(id);
             let keys: Vec<_> = inner
                 .journal
                 .range((*id, 0)..=(*id, u64::MAX))
@@ -462,8 +484,50 @@ impl Store for MemoryStore {
                 inner.journal.remove(&k);
             }
         }
+        // The refs went with their runs; a digest no surviving run references and that was written
+        // before the cutoff is collected in the same sweep, as the adapters do.
+        sweep_blobs(&mut inner, before);
         Ok(doomed.len() as u64)
     }
+
+    fn keeps_blobs(&self) -> bool {
+        true
+    }
+
+    async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
+        let mut inner = self.inner.lock().await;
+        // Idempotent, and the bytes behind an id never change: the first put wins.
+        inner.blobs.entry(id.clone()).or_insert_with(|| BlobSlot {
+            bytes: bytes.to_vec(),
+            created_at: now(),
+        });
+        Ok(())
+    }
+
+    async fn get_blob(&self, id: &BlobId) -> StoreResult<Option<Vec<u8>>> {
+        let inner = self.inner.lock().await;
+        Ok(inner.blobs.get(id).map(|slot| slot.bytes.clone()))
+    }
+
+    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        let mut inner = self.inner.lock().await;
+        Ok(sweep_blobs(&mut inner, before))
+    }
+}
+
+/// Delete the blobs written before `before` that no run references; returns how many.
+fn sweep_blobs(inner: &mut Inner, before: DateTime<Utc>) -> u64 {
+    let referenced: HashSet<BlobId> = inner.run_blobs.values().flatten().cloned().collect();
+    let doomed: Vec<BlobId> = inner
+        .blobs
+        .iter()
+        .filter(|(id, slot)| slot.created_at < before && !referenced.contains(*id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &doomed {
+        inner.blobs.remove(id);
+    }
+    doomed.len() as u64
 }
 
 #[cfg(test)]

@@ -81,6 +81,7 @@
 #![warn(missing_docs)]
 
 mod agent;
+mod blob;
 mod cancel;
 mod child;
 mod clock;
@@ -103,6 +104,7 @@ pub use adam_core::RunHeader;
 pub use adam_error::{Classify, ErrorClass};
 pub use adam_model::Usage;
 pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
+pub use blob::blob_id;
 pub use cancel::CancelToken;
 pub use child::{CHILD_REPORTED_KIND, ChildStarter, ChildStatus, RUN_FINISHED_KIND, child_run_id};
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};

@@ -981,7 +981,7 @@ async fn commit(
             Some((rec, env)) => (rec, env),
             None => (claimed, base),
         };
-        let update = build_update(
+        let mut update = build_update(
             next,
             cur_env,
             base.inbox.len(),
@@ -989,6 +989,22 @@ async fn commit(
             parent,
             inner.clock.now(),
         )?;
+        // The bytes of every file artifact this commit's state names go to the store before the
+        // commit that names them (ADR 0055). Fail-open in the expand release: the state still
+        // carries them, so a failed upload costs a log line, not the transition.
+        //
+        // Only this transition's new artifacts, plus — before any worker commit (`rev == 0`) — the
+        // ones the run started with: a run seeded from a prior run's state (a session round) begins
+        // with file artifacts no commit has referenced yet, and this is the commit that names them.
+        // Afterwards every file is uploaded once, not once per commit.
+        let mut blobs = Vec::new();
+        if cur_env.rev == 0 {
+            blobs = crate::blob::upload_files(&inner.store, &cur_env.artifacts).await;
+        }
+        blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
+        blobs.sort();
+        blobs.dedup();
+        update.blobs = blobs;
         match inner.store.commit_run(run, cur_rec.version, update).await {
             Ok(rec) => {
                 if reopens(next, cur_env, base.inbox.len()) {

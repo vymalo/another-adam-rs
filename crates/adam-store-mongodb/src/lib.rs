@@ -2,7 +2,7 @@
 //!
 //! # Collections
 //!
-//! Three collections (names prefixed, `adam_` by default):
+//! Five collections (names prefixed, `adam_` by default):
 //!
 //! * `adam_runs`: one document per run. `_id` is the run's UUID (BSON binary
 //!   subtype 4), `state` is a real BSON document (see [`codec`] for how keys
@@ -12,6 +12,11 @@
 //!   `_id` = `"<run>:<config id>"` (a run id is 36 characters, so the join is unambiguous).
 //!   `config` holds the webhook **with its credentials, as the client gave them**; `cursor` is how
 //!   far delivery got. Deleted with its run by the purge.
+//! * `adam_blob` (schema version 5, part 1): file bytes out of the run. `_id` is the digest (64
+//!   lower-case hex), `bytes` the content, `size` its length, `created_at` when it was first
+//!   written. Global and content-addressed: every run that names a digest shares it.
+//! * `adam_run_blob` (schema version 5, part 1): the append-only set of digests one run
+//!   references, `_id` = `"<run>:<digest>"`, deleted with its run by the purge.
 //!
 //! # Concurrency without transactions
 //!
@@ -21,10 +26,14 @@
 //!
 //! * Commits: `findOneAndUpdate({_id, version: expected}, {$inc: {version: 1}, ..})`, after a
 //!   read projected to the metadata (no `state`) for `agent`/`conversation_id` and the record.
+//!   A commit's blob references are inserted **before** the CAS: rows a lost CAS leaves behind are
+//!   ignored (nothing names them) and go with the run's purge.
 //! * Journal: `insertOne` with a deterministic `_id = "<run>:<seq>"`; a duplicate key means an
 //!   earlier writer won, and their entry is read back and returned. After an insert, one check
 //!   that the run still exists (a purge that removed it must not leave an orphan), so a journaled
 //!   step is two round trips rather than the four of read, check, insert, check.
+//! * Blobs: `insertOne` on `_id = <digest>`; a duplicate key is a no-op, because the bytes behind
+//!   a digest never change. The references are one unordered `insertMany`, duplicates ignored.
 //! * Claiming: read a page of due candidates, then `updateMany` them with the
 //!   due/lease conditions re-checked in the filter and a fresh `lease_token`,
 //!   then read back what carries that token. MongoDB re-evaluates the filter
@@ -45,15 +54,16 @@
 
 pub mod codec;
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use adam_core::store::{
     add_ttl, now, open_conversation_key, sched_at, storable, storable_owned, truncate_ms,
 };
 use adam_core::{
-    ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
-    PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store,
-    StoreError, StoreResult,
+    BlobId, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun,
+    PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
+    RunUpdate, Store, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -79,7 +89,10 @@ use codec::{bson_to_json, json_to_bson};
 /// * 4: `adam_list_status`, the same listing with `status` before the sort keys, so a status
 ///   filter is answered from the index. `migrate()` creates a missing index on every run, so a
 ///   version 3 database gets it without a rewrite.
-pub const SCHEMA_VERSION: i32 = 4;
+/// * 5, part 1: file bytes out of the run. `adam_blob` (content-addressed) and `adam_run_blob`
+///   (the digests a run references). Nothing is rewritten: a version 4 document has no blob field
+///   at all.
+pub const SCHEMA_VERSION: i32 = 5;
 
 const DUPLICATE_KEY: i32 = 11000;
 const OPEN_CONVERSATION_INDEX: &str = "adam_open_conversation";
@@ -94,6 +107,8 @@ pub struct MongoStore {
     runs: Collection<Document>,
     journal: Collection<Document>,
     push: Collection<Document>,
+    blobs: Collection<Document>,
+    run_blobs: Collection<Document>,
 }
 
 impl MongoStore {
@@ -136,13 +151,17 @@ impl MongoStore {
             .build();
         let runs = db.collection_with_options(&format!("{prefix}runs"), primary.clone());
         let journal = db.collection_with_options(&format!("{prefix}journal"), primary.clone());
-        let push = db.collection_with_options(&format!("{prefix}push"), primary);
+        let push = db.collection_with_options(&format!("{prefix}push"), primary.clone());
+        let blobs = db.collection_with_options(&format!("{prefix}blob"), primary.clone());
+        let run_blobs = db.collection_with_options(&format!("{prefix}run_blob"), primary);
         Self {
             db,
             prefix,
             runs,
             journal,
             push,
+            blobs,
+            run_blobs,
         }
     }
 
@@ -209,6 +228,28 @@ impl MongoStore {
             .map_err(classify)?;
         found.as_ref().map(entry_from_doc).transpose()
     }
+
+    /// Append the blob references of `run`, ignoring the digests it already references: the set is
+    /// append-only, and a commit that is retried writes each row once.
+    async fn insert_run_blobs(&self, run: RunId, digests: &[BlobId]) -> StoreResult<()> {
+        let mut seen = HashSet::new();
+        let docs: Vec<Document> = digests
+            .iter()
+            .filter(|digest| seen.insert(digest.as_str()))
+            .map(|digest| {
+                doc! {
+                    "_id": run_blob_id(run, digest),
+                    "run_id": uuid(run),
+                    "digest": digest.as_str(),
+                }
+            })
+            .collect();
+        match self.run_blobs.insert_many(docs).ordered(false).await {
+            Ok(_) => Ok(()),
+            Err(err) if only_duplicate_keys(&err) => Ok(()),
+            Err(err) => Err(classify(err)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +269,12 @@ fn opt_date(t: Option<DateTime<Utc>>) -> Bson {
 
 fn journal_id(run: RunId, seq: u64) -> String {
     format!("{run}:{seq}")
+}
+
+/// The `_id` of one run's reference to a digest: a run id is 36 characters, so the join is
+/// unambiguous.
+fn run_blob_id(run: RunId, digest: &BlobId) -> String {
+    format!("{run}:{digest}")
 }
 
 /// The filters of a [`RunQuery`] (not its position or its limit).
@@ -465,6 +512,18 @@ fn is_duplicate_key(err: &mongodb::error::Error) -> bool {
     }
 }
 
+/// Whether every write of an unordered `insert_many` failed only because the document is already
+/// there: the operation's answer for "the rows I asked for exist".
+fn only_duplicate_keys(err: &mongodb::error::Error) -> bool {
+    match err.kind.as_ref() {
+        ErrorKind::InsertMany(e) => e
+            .write_errors
+            .as_ref()
+            .is_some_and(|errs| !errs.is_empty() && errs.iter().all(|w| w.code == DUPLICATE_KEY)),
+        _ => is_duplicate_key(err),
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -533,9 +592,21 @@ impl Store for MongoStore {
                 .options(named("adam_push_run"))
                 .build(),
         ];
+        // Schema version 5, part 1: the blob GC asks "which blobs were written before the cutoff",
+        // and the refs ask "does any run name this digest".
+        let blob_indexes = [IndexModel::builder()
+            .keys(doc! { "created_at": 1 })
+            .options(named("adam_blob_gc"))
+            .build()];
+        let run_blob_indexes = [IndexModel::builder()
+            .keys(doc! { "digest": 1 })
+            .options(named("adam_run_blob_digest"))
+            .build()];
         ensure_indexes(&self.runs, run_indexes).await?;
         ensure_indexes(&self.journal, journal_indexes).await?;
         ensure_indexes(&self.push, push_indexes).await?;
+        ensure_indexes(&self.blobs, blob_indexes).await?;
+        ensure_indexes(&self.run_blobs, run_blob_indexes).await?;
         self.db
             .collection::<Document>(&format!("{}meta", self.prefix))
             .update_one(
@@ -674,10 +745,17 @@ impl Store for MongoStore {
         let RunUpdate {
             status,
             state,
+            blobs,
             wake_at,
         } = update;
         let wake_at = wake_at.map(truncate_ms);
         let state = storable_owned(state);
+        // The refs go first, as the head that names them would: there is no multi-document
+        // transaction, so a commit that loses the CAS leaves rows nothing names. They are ignored
+        // by every reader and deleted with the run's purge.
+        if !blobs.is_empty() {
+            self.insert_run_blobs(id, &blobs).await?;
+        }
         let set = doc! {
             "status": status.as_str(),
             "state": json_to_bson(&state)?,
@@ -718,7 +796,15 @@ impl Store for MongoStore {
                 updated_at: t,
             }),
             Ok(None) => match self.live_version(id).await? {
-                None => Err(StoreError::NotFound(id)),
+                None => {
+                    // The run was purged between the refs and the CAS: no head can ever name them,
+                    // and nothing else would collect them.
+                    self.run_blobs
+                        .delete_many(doc! { "run_id": uuid(id) })
+                        .await
+                        .map_err(classify)?;
+                    Err(StoreError::NotFound(id))
+                }
                 Some(actual) => Err(StoreError::Conflict {
                     run: id,
                     expected,
@@ -1198,13 +1284,17 @@ impl Store for MongoStore {
             let doomed = self
                 .ids(doc! { "_id": { "$in": &ids }, "purging": true }, None)
                 .await?;
-            // 2. Journal, then 3. runs. A crash between steps leaves tombstoned
-            //    runs, which the next sweep picks up again.
+            // 2. Journal, then 3. the run's blob references, then 4. runs. A crash between steps
+            //    leaves tombstoned runs, which the next sweep picks up again.
             self.journal
                 .delete_many(doc! { "run_id": { "$in": &doomed } })
                 .await
                 .map_err(classify)?;
             self.push
+                .delete_many(doc! { "run_id": { "$in": &doomed } })
+                .await
+                .map_err(classify)?;
+            self.run_blobs
                 .delete_many(doc! { "run_id": { "$in": &doomed } })
                 .await
                 .map_err(classify)?;
@@ -1215,6 +1305,116 @@ impl Store for MongoStore {
                 .map_err(classify)?;
             total += deleted.deleted_count;
             if (ids.len() as i64) < PURGE_BATCH {
+                break;
+            }
+        }
+        // The refs went with their runs; a digest no surviving run references and that was written
+        // before the cutoff goes in the same sweep.
+        self.sweep_blobs(before).await?;
+        Ok(total)
+    }
+
+    fn keeps_blobs(&self) -> bool {
+        true
+    }
+
+    async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
+        let doc = doc! {
+            "_id": id.as_str(),
+            "bytes": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: bytes.to_vec(),
+            }),
+            "size": to_i64(bytes.len() as u64, "blob size")?,
+            "created_at": date(now()),
+        };
+        // Idempotent: the bytes behind a digest never change, so a duplicate key is the row that is
+        // already there.
+        match self.blobs.insert_one(&doc).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_duplicate_key(&err) => Ok(()),
+            Err(err) => Err(classify(err)),
+        }
+    }
+
+    async fn get_blob(&self, id: &BlobId) -> StoreResult<Option<Vec<u8>>> {
+        let found = self
+            .blobs
+            .find_one(doc! { "_id": id.as_str() })
+            .await
+            .map_err(classify)?;
+        match found.as_ref().and_then(|doc| doc.get("bytes")) {
+            None => Ok(None),
+            Some(Bson::Binary(binary)) => Ok(Some(binary.bytes.clone())),
+            Some(_) => Err(StoreError::Corrupt(format!(
+                "blob {id} has no binary `bytes`"
+            ))),
+        }
+    }
+
+    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        self.sweep_blobs(before).await
+    }
+}
+
+impl MongoStore {
+    /// Delete unreferenced blobs written before `before`, in batches; returns how many.
+    ///
+    /// Candidates are paged by `_id` (the digest) so a batch that is entirely referenced still
+    /// moves the cursor: a digest a surviving run names is kept, however old it is, and a shared
+    /// digest is deleted only with the last run that references it.
+    async fn sweep_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        let mut total = 0;
+        let mut last: Option<String> = None;
+        loop {
+            let mut filter = doc! { "created_at": { "$lt": date(before) } };
+            if let Some(last) = &last {
+                filter.insert("_id", doc! { "$gt": last });
+            }
+            let candidates: Vec<String> = self
+                .blobs
+                .find(filter)
+                .projection(doc! { "_id": 1 })
+                .sort(doc! { "_id": 1 })
+                .limit(PURGE_BATCH)
+                .await
+                .map_err(classify)?
+                .try_collect::<Vec<Document>>()
+                .await
+                .map_err(classify)?
+                .into_iter()
+                .filter_map(|doc| doc.get_str("_id").ok().map(str::to_owned))
+                .collect();
+            let Some(page_end) = candidates.last().cloned() else {
+                return Ok(total);
+            };
+            last = Some(page_end);
+            let referenced: HashSet<String> = self
+                .run_blobs
+                .find(doc! { "digest": { "$in": candidates.clone() } })
+                .projection(doc! { "digest": 1 })
+                .await
+                .map_err(classify)?
+                .try_collect::<Vec<Document>>()
+                .await
+                .map_err(classify)?
+                .into_iter()
+                .filter_map(|doc| doc.get_str("digest").ok().map(str::to_owned))
+                .collect();
+            let doomed: Vec<String> = candidates
+                .iter()
+                .filter(|digest| !referenced.contains(*digest))
+                .cloned()
+                .collect();
+            if !doomed.is_empty() {
+                let deleted = self
+                    .blobs
+                    .delete_many(doc! { "_id": { "$in": doomed } })
+                    .await
+                    .map_err(classify)?;
+                total += deleted.deleted_count;
+            }
+            if (candidates.len() as i64) < PURGE_BATCH {
                 return Ok(total);
             }
         }

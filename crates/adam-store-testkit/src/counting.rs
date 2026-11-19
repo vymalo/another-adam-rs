@@ -42,8 +42,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use adam_core::{
-    ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
-    RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreResult,
+    BlobId, ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
+    PushRecord, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreResult,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -304,10 +304,10 @@ impl fmt::Debug for CountingStore {
 
 // Every `Store` method is implemented here, `run_header` included: forwarding it keeps the measured
 // store's own query (`PgStore` and `MongoStore` project the header; `MemoryStore` answers with the
-// trait default). When the contract grows a **defaulted** method — S1/S2 add `keeps_bodies`,
-// `keeps_blobs`, `body_list`, `put_blob`, `get_blob` and `purge_blobs` — forward it explicitly too:
-// a default left to the wrapper answers for the wrapper, not for the store it wraps
-// (`keeps_bodies` would say `false` for a store that keeps bodies).
+// trait default). When the contract grows a **defaulted** method — S2 adds `keeps_bodies` and
+// `body_list`, and `load_head` — forward it explicitly too: a default left to the wrapper answers
+// for the wrapper, not for the store it wraps (`keeps_bodies` would say `false` for a store that
+// keeps bodies).
 #[async_trait]
 impl Store for CountingStore {
     async fn migrate(&self) -> StoreResult<()> {
@@ -477,6 +477,25 @@ impl Store for CountingStore {
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
         self.call(Method::PurgeFinished);
         self.inner.purge_finished(agent, before).await
+    }
+
+    fn keeps_blobs(&self) -> bool {
+        self.inner.keeps_blobs()
+    }
+
+    async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
+        self.call(Method::PutBlob);
+        self.inner.put_blob(id, bytes).await
+    }
+
+    async fn get_blob(&self, id: &BlobId) -> StoreResult<Option<Vec<u8>>> {
+        self.call(Method::GetBlob);
+        self.inner.get_blob(id).await
+    }
+
+    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        self.call(Method::PurgeBlobs);
+        self.inner.purge_blobs(before).await
     }
 }
 

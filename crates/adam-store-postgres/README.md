@@ -17,7 +17,7 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (4).
+* `PgStore::pool()`, `SCHEMA_VERSION` (5).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, the claim and the listings return the stored state; `journal_put`
@@ -42,7 +42,8 @@ Tables are `<prefix>runs` (state as `JSONB`), `<prefix>journal` (primary key
 `(run_id, seq)`, `ON DELETE CASCADE`), `<prefix>push` (the A2A push-notification configs, primary
 key `(run_id, id)`, `ON DELETE CASCADE`, schema version 3; a partial index on
 `(agent, next_attempt_at)` for active configs is the claim scan; `config` holds the webhook
-credentials as the client gave them) and `<prefix>meta`. Claiming is
+credentials as the client gave them), `<prefix>blob` and `<prefix>run_blob` (file bytes out of a
+run, schema version 5 part 1: see below) and `<prefix>meta`. Claiming is
 `FOR UPDATE SKIP LOCKED`, and it leaves out the runs the caller says it is stepping (`AND id <> ALL($busy)`,
 see [`adam-core`](../adam-core/README.md#runs-the-caller-is-stepping)); one open run per conversation is a partial unique
 index. No transaction is held open while agent code runs. `JSONB` cannot hold
@@ -102,6 +103,30 @@ the run; a purge: runs, then the cascaded push rows), so a start beside live tra
 every restart took an exclusive lock on `runs`. Only an older or missing schema runs the statements.
 The migration connection is always closed rather than pooled, so the session lock cannot outlive it.
 
+## Schema version 5, part 1: file bytes out of the run
+
+`<prefix>blob` is global and content-addressed: `digest` (64 lower-case hex, a SHA-256) is the
+primary key, `bytes` is `BYTEA`, `size` is checked against `octet_length(bytes)`, and `created_at`
+feeds the GC index `<prefix>blob_gc`. `<prefix>run_blob` is the append-only set of digests one run
+references (`(run_id, digest)`, `ON DELETE CASCADE`, index `<prefix>run_blob_digest` for the GC's
+"does any run still name this digest"). `put_blob` is `INSERT .. ON CONFLICT (digest) DO NOTHING`
+(a retried put writes nothing), and a commit writes its references **in the same transaction as the
+CAS**: a commit that loses the version check writes none.
+
+A version 4 database upgrades through `upgrade_blobs`, its own step gated on the stored version,
+run after the listing-index step. It is metadata-only: two new tables, their indexes and a foreign
+key from a table that is empty on a version 4 database, so no row of `runs` is rewritten. A version
+4 start does not re-check the version 4 listing index; a version 3 database runs both steps.
+
+`purge_finished` sweeps unreferenced blobs written before its cutoff in the same call (the run's
+references cascaded away), and `purge_blobs(before)` is the explicit knob for a host that reclaims
+bytes without purging runs. A blob a surviving run references is kept, however old it is.
+
+`RunUpdate` gained the public field `blobs` (the digests a commit's state references), so **a
+hand-built `RunUpdate { .. }` literal stops compiling**: add `blobs: Vec::new()` or use
+`RunUpdate::new(..)`/`.blobs(..)`. The four blob methods are **defaulted** on `Store`, so a store of
+your own that keeps no blobs still compiles and behaves as before.
+
 ## Schema version and the owner column
 
 The owner column is schema version 2. Version 2 adds `<prefix>runs.owner TEXT`, the worker a pinned claim
@@ -152,8 +177,9 @@ retryable (needs the server), and an unreachable server is `Transient` (offline)
 column, the version row, that the run survived and that pinning works on it; it also checks that an
 older release does not lower the version. A version 2 schema migrates to the current one and gets the
 push table, a version 3 schema's `runs_list` is replaced by `runs_list_status` (valid, old one
-gone), and a start on a current schema finishes while another connection holds `ROW EXCLUSIVE` locks
-on `runs` and `push` (it runs no DDL). A unit test
+gone), a version 4 schema gets the blob tables and keeps its runs, and a start on a current schema
+finishes while another connection holds `ROW EXCLUSIVE` locks on `runs` and `push` (it runs no
+DDL). A unit test
 (`the_listing_index_upgrade_does_not_wait_for_live_traffic`) holds a writer's lock open and writes
 beside the upgrade, which fails if the rebuild ever queues for `AccessExclusiveLock` again.
 Unit tests in `src/lib.rs` cover the driver-error table and the pool-size rule, and one of them

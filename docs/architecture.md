@@ -894,13 +894,17 @@ never shown as `submitted` again. A front that holds only the starter claims not
 
 ## Data: the run store
 
-Three tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
-the schema version (`push` holds A2A push-notification configurations, schema version 3). `state` is JSONB in Postgres and a real BSON document in MongoDB.
+Five tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
+the schema version: `push` holds A2A push-notification configurations (schema version 3), and `blob`
+and `run_blob` hold a run's file bytes and the digests it references (schema version 5, part 1).
+`state` is JSONB in Postgres and a real BSON document in MongoDB.
 
 ```mermaid
 erDiagram
     RUNS ||--o{ JOURNAL : "one entry per step (cascade delete)"
     RUNS ||--o{ PUSH : "one per webhook of a task (cascade delete)"
+    RUNS ||--o{ RUN_BLOB : "the digests it references (cascade delete)"
+    BLOB ||--o{ RUN_BLOB : "one blob per digest, shared by runs"
     RUNS |o--o{ RUNS : "parent_id: a child run"
     RUNS {
         uuid id PK
@@ -943,6 +947,16 @@ erDiagram
         timestamptz created_at
         timestamptz updated_at
     }
+    BLOB {
+        text digest PK "SHA-256, 64 lower-case hex"
+        bytea bytes "the file, as it was given"
+        bigint size "checked against the bytes"
+        timestamptz created_at "the GC cutoff"
+    }
+    RUN_BLOB {
+        uuid run_id PK
+        text digest PK
+    }
     META {
         text key PK
         text value "schema_version"
@@ -957,13 +971,16 @@ erDiagram
 | `runs (parent_id)` where set | children of a run |
 | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)` where set | `ListTasks`: an owner's runs, newest first, by keyset; the status filter is answered from the index |
 | `push (agent, next_attempt_at, run_id, id)` where active | claiming due push configs |
+| `blob (created_at)` | blob GC: unreferenced blobs older than the cutoff |
+| `run_blob (digest)` | blob GC: does any run still reference this digest |
 
 MongoDB keeps the same fields in `adam_runs` (`_id` is the run's UUID) plus `open_key` (a plain unique
 index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_list`
 (`(agent, conversation_id, updated_at, _id)`) and `adam_list_status`
 (`(agent, status, conversation_id, updated_at, _id)`, for a status filter), the journal in
-`adam_journal` with `_id = "<run>:<seq>"`, and the push configs in `adam_push` with
-`_id = "<run>:<config id>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
+`adam_journal` with `_id = "<run>:<seq>"`, the push configs in `adam_push` with
+`_id = "<run>:<config id>"`, the blobs in `adam_blob` with `_id` = the digest, and the digests a run
+references in `adam_run_blob` with `_id = "<run>:<digest>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 `crates/adam-runtime/src/envelope.rs`):
@@ -976,6 +993,11 @@ What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 | `seq`, `attempt`, `rev` | next journal seq; failed tries of this transition; bumped by each worker commit |
 | `output`, `error` | the result of a `Done` run; the reason of a `Failed` one |
 | `artifacts` | artifacts emitted so far, committed with their transitions |
+
+A **file artifact's** bytes are also written to the blob table under their SHA-256
+(`adam_runtime::blob_id`) and the commit references the digest (`RunUpdate::blobs`); the state keeps
+the bytes too until the contract release, so a reader of the old format still reads a run
+([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)).
 
 `Conversation` (`crates/adam-llm-agent/src/conversation.rs`) has `messages`, `turns`, `tool_calls`,
 `usage`, `pending_calls`, `pending_wait` (a question for the user, a child run or a remote task),
