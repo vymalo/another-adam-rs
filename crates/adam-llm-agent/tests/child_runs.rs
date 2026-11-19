@@ -1164,7 +1164,7 @@ mod cases {
 
     /// The child was purged before the parent looked and its message was lost: the model is told,
     /// and the run goes on.
-    pub async fn a_child_that_is_gone_is_an_error_result(store: DynStore) {
+    pub async fn a_child_that_is_gone_is_an_error_result_after_a_purge(store: DynStore) {
         let rig = Rig::new();
         rig.parent_script("moving on");
         let (faulty, dynamic) = faulty(store);
@@ -1426,7 +1426,7 @@ macro_rules! child_suite {
                 a_notice_that_beats_the_park_is_used,
                 a_retry_finds_the_notice_before_the_wait_is_recorded,
                 the_parent_looks_at_the_child_when_the_timer_fires,
-                a_child_that_is_gone_is_an_error_result,
+                a_child_that_is_gone_is_an_error_result_after_a_purge,
                 a_worker_that_loses_its_lease_while_answering_changes_nothing,
                 a_run_parked_by_the_old_field_name_resumes,
                 an_old_journal_entry_replays,

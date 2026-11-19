@@ -30,8 +30,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use adam_core::{
-    ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
-    RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult,
+    BlobId, ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
+    PushRecord, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -83,6 +83,12 @@ pub enum Method {
     PushClaimDue,
     /// [`Store::push_commit`].
     PushCommit,
+    /// [`Store::put_blob`].
+    PutBlob,
+    /// [`Store::get_blob`].
+    GetBlob,
+    /// [`Store::purge_blobs`].
+    PurgeBlobs,
 }
 
 /// When, relative to the real operation, a fault strikes.
@@ -478,6 +484,25 @@ impl Store for FaultyStore {
             self.inner.purge_finished(agent, before),
         )
         .await
+    }
+
+    fn keeps_blobs(&self) -> bool {
+        self.inner.keeps_blobs()
+    }
+
+    async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
+        self.run(Method::PutBlob, None, self.inner.put_blob(id, bytes))
+            .await
+    }
+
+    async fn get_blob(&self, id: &BlobId) -> StoreResult<Option<Vec<u8>>> {
+        self.run(Method::GetBlob, None, self.inner.get_blob(id))
+            .await
+    }
+
+    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        self.run(Method::PurgeBlobs, None, self.inner.purge_blobs(before))
+            .await
     }
 }
 

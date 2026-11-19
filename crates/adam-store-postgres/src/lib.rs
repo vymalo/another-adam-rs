@@ -2,7 +2,7 @@
 //!
 //! # Schema
 //!
-//! Three tables (names prefixed, `adam_` by default):
+//! Five tables (names prefixed, `adam_` by default):
 //!
 //! * `adam_runs`: one row per run. `state` is `JSONB`, so runs are queryable
 //!   from SQL for dashboards and debugging. `sched_at` is the precomputed "due
@@ -15,10 +15,15 @@
 //!   key `(run_id, id)`, deleted with its run through `ON DELETE CASCADE`. `config` holds the
 //!   webhook **with its credentials, as the client gave them**; `cursor` is how far delivery
 //!   got. A partial index over `(agent, next_attempt_at)` for active configs is the claim scan.
+//! * `adam_blob` and `adam_run_blob` (schema version 5, part 1): file bytes out of the run.
+//!   `adam_blob` is content-addressed (`digest` is the primary key, `size` is checked against the
+//!   bytes) and shared by every run that names a digest; `adam_run_blob` is the append-only set of
+//!   digests one run references, primary key `(run_id, digest)`, deleted with its run.
 //!
 //! # Concurrency
 //!
-//! * Commits are a single `UPDATE .. WHERE version = $expected`.
+//! * Commits are a single `UPDATE .. WHERE version = $expected`; one that carries blob references
+//!   writes them in the same transaction, so a commit that loses the version check writes none.
 //! * Claiming uses `FOR UPDATE SKIP LOCKED`, so concurrent workers split the due
 //!   runs between them instead of queueing on the same rows. A pinned claim adds
 //!   `owner IS NULL OR owner = $worker` and sets `owner` in the same statement.
@@ -29,18 +34,20 @@
 //! * Push configurations are claimed like runs (`FOR UPDATE SKIP LOCKED`, one statement) and
 //!   written with `UPDATE .. WHERE version = $expected`; putting an id again is one
 //!   `INSERT .. ON CONFLICT DO UPDATE` that bumps the version.
+//! * A blob is written once (`INSERT .. ON CONFLICT DO NOTHING`): the bytes behind a digest never
+//!   change, so a retried put is one no-op.
 //!
-//! Everything is single-statement; no multi-statement transactions are held
-//! open while agent code runs.
+//! No transaction is held open while agent code runs.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use adam_core::store::{add_ttl, now, sched_at, storable, truncate_ms};
 use adam_core::{
-    ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
-    PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store,
-    StoreError, StoreResult,
+    BlobId, ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun,
+    PushProgress, PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus,
+    RunUpdate, Store, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -61,7 +68,10 @@ use uuid::Uuid;
 ///   status filter is answered from the index instead of the heap. An upgrade builds it beside the
 ///   version 3 `runs_list` (`CREATE INDEX CONCURRENTLY`) and drops that one only once the new one
 ///   is valid, so `runs` stays readable and writable for the whole build.
-pub const SCHEMA_VERSION: i32 = 4;
+/// * 5, part 1: file bytes out of the run. `adam_blob` holds content-addressed bytes and
+///   `adam_run_blob` the digests each run references (`ON DELETE CASCADE`); the upgrade is
+///   metadata-only (two new tables and their indexes, no rewrite of `runs`).
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Purge deletes in batches of this many runs (plus their journals).
 const PURGE_BATCH: i64 = 500;
@@ -179,13 +189,21 @@ impl PgStore {
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(classify)?;
-            if stored.and_then(|v| v.parse::<i32>().ok()) >= Some(SCHEMA_VERSION) {
+            let stored = stored.and_then(|v| v.parse::<i32>().ok());
+            if stored >= Some(SCHEMA_VERSION) {
                 return Ok(());
             }
             // The listing index is replaced outside the transaction: `CONCURRENTLY` cannot run in
             // one, and the non-concurrent pair would hold `ACCESS EXCLUSIVE` on `runs` for the
-            // whole build.
-            self.upgrade_listing_index(conn).await?;
+            // whole build. A version 4 database already has it.
+            if stored.is_none_or(|v| v < 4) {
+                self.upgrade_listing_index(conn).await?;
+            }
+            // Schema version 5, part 1: the blob tables. Their own step, so a version 4 start does
+            // not re-check the listing index and a version 5 start does neither.
+            if stored == Some(4) {
+                self.upgrade_blobs(conn).await?;
+            }
         }
         let mut tx = conn.begin().await.map_err(classify)?;
         // Serialize concurrent migrations; CREATE .. IF NOT EXISTS alone can still race on the
@@ -247,6 +265,31 @@ impl PgStore {
             .await
             .map_err(classify)?;
         Ok(())
+    }
+
+    /// Schema version 4 -> 5, part 1: the blob tables.
+    ///
+    /// Metadata-only: two new tables, their indexes and a foreign key from a table that is empty on
+    /// a version 4 database. The only lock it takes on `runs` is the `SHARE ROW EXCLUSIVE` a new
+    /// foreign key holds for the length of this transaction; no row is rewritten. Its own step,
+    /// gated on `stored == Some(4)`, so a version 4 start neither re-checks the version 4 listing
+    /// index nor pays for its `CONCURRENTLY` inspection.
+    ///
+    /// Idempotent: `IF NOT EXISTS` everywhere, so a crash between statements re-runs cleanly.
+    async fn upgrade_blobs(&self, conn: &mut PgConnection) -> StoreResult<()> {
+        let mut tx = conn.begin().await.map_err(classify)?;
+        // The same advisory lock the migration transaction takes: re-entrant for this session,
+        // which holds the session lock already, and it still excludes a migrator of another
+        // release.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&self.sql.migrate_lock)
+            .execute(&mut *tx)
+            .await
+            .map_err(classify)?;
+        for stmt in &self.sql.migrate_blobs {
+            tx.execute(safe(stmt)).await.map_err(classify)?;
+        }
+        tx.commit().await.map_err(classify)
     }
 
     fn map_write_err(
@@ -367,6 +410,8 @@ struct Sql {
     runs_pkey: String,
     open_conversation_index: String,
     migrate: Vec<Arc<str>>,
+    /// Schema version 5 part 1's DDL: the blob tables, run on their own in `upgrade_blobs`.
+    migrate_blobs: Vec<Arc<str>>,
     /// The meta table's name with the prefix, bound to `to_regclass` before it is read.
     meta_table: String,
     /// The runs table's name with the prefix, checked before the listing index is built.
@@ -405,6 +450,10 @@ struct Sql {
     push_claim: Arc<str>,
     push_commit: Arc<str>,
     push_version: Arc<str>,
+    put_blob: Arc<str>,
+    get_blob: Arc<str>,
+    commit_blobs: Arc<str>,
+    purge_blobs: Arc<str>,
 }
 
 impl Sql {
@@ -420,7 +469,38 @@ impl Sql {
         let runs_list = format!("{p}runs_list_status");
         let runs_list_v3 = format!("{p}runs_list");
         let statuses = "'runnable', 'parked', 'done', 'failed'";
-        let migrate: Vec<Arc<str>> = [
+        // Schema version 5, part 1: file bytes out of the run. `adam_blob` is global and
+        // content-addressed; `adam_run_blob` is the append-only set of digests a run references, and
+        // cascades with it. Both are also in `migrate`, for a fresh database; `upgrade_blobs` runs
+        // this list on its own for a version 4 one.
+        let blob = format!("{p}blob");
+        let run_blob = format!("{p}run_blob");
+        let migrate_blobs: Vec<Arc<str>> = [
+            format!(
+                "CREATE TABLE IF NOT EXISTS {blob} (
+                    digest      TEXT        NOT NULL CHECK (digest ~ '^[0-9a-f]{{64}}$'),
+                    bytes       BYTEA       NOT NULL,
+                    size        BIGINT      NOT NULL CHECK (size = octet_length(bytes)),
+                    created_at  TIMESTAMPTZ NOT NULL,
+                    CONSTRAINT {p}blob_pkey PRIMARY KEY (digest)
+                )"
+            ),
+            format!("CREATE INDEX IF NOT EXISTS {p}blob_gc ON {blob} (created_at)"),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {run_blob} (
+                    run_id  UUID NOT NULL REFERENCES {runs} (id) ON DELETE CASCADE,
+                    digest  TEXT NOT NULL,
+                    CONSTRAINT {p}run_blob_pkey PRIMARY KEY (run_id, digest)
+                )"
+            ),
+            // The GC asks "does any run still reference this digest"; the primary key is
+            // `(run_id, digest)`, so it needs its own index.
+            format!("CREATE INDEX IF NOT EXISTS {p}run_blob_digest ON {run_blob} (digest)"),
+        ]
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+        let mut migrate: Vec<Arc<str>> = [
             format!(
                 "CREATE TABLE IF NOT EXISTS {meta} (
                     key   TEXT PRIMARY KEY,
@@ -516,19 +596,21 @@ impl Sql {
                     PRIMARY KEY (run_id, seq)
                 )"
             ),
-            // Record the version, and raise it from an older one. Never lower it: a process
-            // running an older release must not undo a newer one's migration.
-            format!(
-                "INSERT INTO {meta} (key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-                  WHERE {meta}.value::INT < EXCLUDED.value::INT"
-            ),
         ]
         .into_iter()
         .map(Arc::from)
         .collect();
+        migrate.extend(migrate_blobs.iter().cloned());
+        // Record the version, and raise it from an older one. Never lower it: a process
+        // running an older release must not undo a newer one's migration.
+        migrate.push(Arc::from(format!(
+            "INSERT INTO {meta} (key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+              WHERE {meta}.value::INT < EXCLUDED.value::INT"
+        )));
         Self {
             migrate,
+            migrate_blobs,
             meta_table: meta.clone(),
             runs_table: runs.clone(),
             migrate_lock: format!("adam-rs:migrate:{p}"),
@@ -655,6 +737,30 @@ impl Sql {
             )),
             push_version: Arc::from(format!(
                 "SELECT version FROM {push} WHERE run_id = $1 AND id = $2"
+            )),
+            put_blob: Arc::from(format!(
+                "INSERT INTO {blob} (digest, bytes, size, created_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (digest) DO NOTHING"
+            )),
+            get_blob: Arc::from(format!("SELECT bytes FROM {blob} WHERE digest = $1")),
+            // The refs of one commit. `ON CONFLICT DO NOTHING` makes a retried commit (or two
+            // artifacts with the same bytes) one no-op per digest already referenced.
+            commit_blobs: Arc::from(format!(
+                "INSERT INTO {run_blob} (run_id, digest)
+                 SELECT $1, digest FROM unnest($2::text[]) AS digest
+                 ON CONFLICT (run_id, digest) DO NOTHING"
+            )),
+            // Unreferenced blobs older than the cutoff, in batches so a backlog never becomes one
+            // huge transaction. `NOT EXISTS` on the digest index is the whole question.
+            purge_blobs: Arc::from(format!(
+                "DELETE FROM {blob}
+                  WHERE digest IN (
+                    SELECT b.digest FROM {blob} b
+                     WHERE b.created_at < $1
+                       AND NOT EXISTS (SELECT 1 FROM {run_blob} r WHERE r.digest = b.digest)
+                     LIMIT $2
+                  )"
             )),
             runs_pkey,
             open_conversation_index,
@@ -923,51 +1029,91 @@ impl Store for PgStore {
         update: RunUpdate,
     ) -> StoreResult<RunRecord> {
         let t = now();
-        let wake_at = update.wake_at.map(truncate_ms);
-        let state = storable(&update.state);
-        let result = sqlx::query(safe(&self.sql.commit_run))
+        let expected = to_i64(expected, "version")?;
+        let RunUpdate {
+            status,
+            state,
+            blobs,
+            wake_at,
+        } = update;
+        let wake_at = wake_at.map(truncate_ms);
+        let state = storable(&state);
+        let query = sqlx::query(safe(&self.sql.commit_run))
             .bind(id.0)
-            .bind(to_i64(expected, "version")?)
-            .bind(update.status.as_str())
+            .bind(expected)
+            .bind(status.as_str())
             .bind(Json(state.as_ref()))
             .bind(wake_at)
-            .bind(sched_at(update.status, wake_at, t))
-            .bind(t)
-            .fetch_optional(&self.pool)
-            .await;
+            .bind(sched_at(status, wake_at, t))
+            .bind(t);
+        // A commit with references is one transaction: a commit that loses the CAS writes no ref,
+        // and a commit that wins has all of them. A run with no file bytes keeps the single
+        // statement it always was (no BEGIN/COMMIT round trips on the common path).
+        let mut tx = if blobs.is_empty() {
+            None
+        } else {
+            Some(self.pool.begin().await.map_err(classify)?)
+        };
+        let result = match tx.as_mut() {
+            None => query.fetch_optional(&self.pool).await,
+            Some(tx) => query.fetch_optional(&mut **tx).await,
+        };
         let row = match result {
             Ok(row) => row,
-            Err(err)
-                if err.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") =>
-            {
-                // The only unique index an UPDATE can trip is the open-conversation
-                // one; look the run up to report which conversation is busy.
-                let run = self.load_run(id).await?.ok_or(StoreError::NotFound(id))?;
-                return Err(self.map_write_err(
-                    err,
-                    id,
-                    &run.agent,
-                    run.conversation_id.as_deref(),
-                ));
+            Err(err) => {
+                if let Some(tx) = tx {
+                    tx.rollback().await.map_err(classify)?;
+                }
+                if err.as_database_error().and_then(|e| e.code()).as_deref() == Some("23505") {
+                    // The only unique index an UPDATE can trip is the open-conversation
+                    // one; look the run up to report which conversation is busy.
+                    let run = self.load_run(id).await?.ok_or(StoreError::NotFound(id))?;
+                    return Err(self.map_write_err(
+                        err,
+                        id,
+                        &run.agent,
+                        run.conversation_id.as_deref(),
+                    ));
+                }
+                return Err(self.map_write_err(err, id, "", None));
             }
-            Err(err) => return Err(self.map_write_err(err, id, "", None)),
         };
-        if let Some(row) = row {
-            return run_metadata_from_row(&row);
+        let Some(row) = row else {
+            // Nothing was written: the version moved, or the run is gone.
+            if let Some(tx) = tx {
+                tx.rollback().await.map_err(classify)?;
+            }
+            let actual: Option<i64> = sqlx::query_scalar(safe(&self.sql.load_version))
+                .bind(id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(classify)?;
+            return match actual {
+                None => Err(StoreError::NotFound(id)),
+                Some(actual) => Err(StoreError::Conflict {
+                    run: id,
+                    expected: expected as u64,
+                    actual: actual as u64,
+                }),
+            };
+        };
+        if let Some(mut tx) = tx {
+            // One statement for the set; a digest named twice in one commit is one row.
+            let mut seen = HashSet::new();
+            let digests: Vec<String> = blobs
+                .iter()
+                .filter(|digest| seen.insert(digest.as_str()))
+                .map(|digest| digest.as_str().to_owned())
+                .collect();
+            sqlx::query(safe(&self.sql.commit_blobs))
+                .bind(id.0)
+                .bind(&digests)
+                .execute(&mut *tx)
+                .await
+                .map_err(classify)?;
+            tx.commit().await.map_err(classify)?;
         }
-        let actual: Option<i64> = sqlx::query_scalar(safe(&self.sql.load_version))
-            .bind(id.0)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(classify)?;
-        match actual {
-            None => Err(StoreError::NotFound(id)),
-            Some(actual) => Err(StoreError::Conflict {
-                run: id,
-                expected,
-                actual: actual as u64,
-            }),
-        }
+        run_metadata_from_row(&row)
     }
 
     async fn open_run_for_conversation(
@@ -1291,6 +1437,61 @@ impl Store for PgStore {
         loop {
             let done = sqlx::query(safe(&self.sql.purge))
                 .bind(agent)
+                .bind(before)
+                .bind(PURGE_BATCH)
+                .execute(&self.pool)
+                .await
+                .map_err(classify)?;
+            total += done.rows_affected();
+            if done.rows_affected() < PURGE_BATCH as u64 {
+                break;
+            }
+        }
+        // The run's refs cascaded with it; a digest no surviving run references and that was
+        // written before the cutoff goes in the same sweep.
+        self.sweep_blobs(before).await?;
+        Ok(total)
+    }
+
+    fn keeps_blobs(&self) -> bool {
+        true
+    }
+
+    async fn put_blob(&self, id: &BlobId, bytes: &[u8]) -> StoreResult<()> {
+        // Idempotent: `ON CONFLICT DO NOTHING` keeps the first bytes of a digest, and the CHECK on
+        // `size` refuses a row whose two columns disagree.
+        sqlx::query(safe(&self.sql.put_blob))
+            .bind(id.as_str())
+            .bind(bytes)
+            .bind(to_i64(bytes.len() as u64, "blob size")?)
+            .bind(now())
+            .execute(&self.pool)
+            .await
+            .map_err(classify)?;
+        Ok(())
+    }
+
+    async fn get_blob(&self, id: &BlobId) -> StoreResult<Option<Vec<u8>>> {
+        let row = sqlx::query(safe(&self.sql.get_blob))
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(classify)?;
+        row.map(|row| row.try_get("bytes").map_err(classify))
+            .transpose()
+    }
+
+    async fn purge_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        self.sweep_blobs(before).await
+    }
+}
+
+impl PgStore {
+    /// Delete unreferenced blobs older than `before` in batches; returns how many.
+    async fn sweep_blobs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
+        let mut total = 0;
+        loop {
+            let done = sqlx::query(safe(&self.sql.purge_blobs))
                 .bind(before)
                 .bind(PURGE_BATCH)
                 .execute(&self.pool)
