@@ -65,7 +65,7 @@ revision on the cards (`0.1.0+<sha7>`); unset, they say `unknown`.
 
 ## Measuring a run's writes
 
-`dev/p2-measure.sh` runs the conformance workload `the_state_write_is_quadratic_in_the_transcript` (one run,
+`dev/p2-measure.sh` runs the transcript measurement `counting::measure_transcript_write` (one run,
 50 commits, each appending a 10 KB message) against the stack and prints, per store, the `pg_relation_size` and
 `pg_total_relation_size` of the run and journal tables, the `pg_stat_wal` delta (PostgreSQL 14+), the
 `collStats` sizes and the WiredTiger block-manager and log deltas. It is run by hand — before and after the P2

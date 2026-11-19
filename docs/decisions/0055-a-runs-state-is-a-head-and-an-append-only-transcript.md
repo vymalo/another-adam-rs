@@ -80,6 +80,18 @@ a later cleanup.
 | **S3 — contract** | `state = null` on every commit; `load_run`, `claim_due`, `open_run` and `list_runs` return the head; the step path joins; `deliver`, `cancel_run` and `park_again` write the head they read; `start_continuing`/`on_cancelled` join; the v4 fixture test inverted to assert the documented failure | the 50 × 20 KB test green; `pg_relation_size`/WAL green; the "v4 cannot read a v5 run" test |
 | **S4 — later** | drop the v4 `Envelope` read path and the `state` column, after every live run is v5 | — |
 
+*Amended 2026-11-19 (S0)*: S0 lands the measurement **green**, not recorded red — a red test cannot
+land. The 50-commit workload is `counting::measure_transcript_write`, a measurement helper and not a
+conformance case; each adapter's `measure_the_transcript_write` test prints its line and asserts only
+that the workload ran. The `< 50 × 20 KB` and `max < 20 KB` bounds move to S3, where the contract
+release makes them true. The baseline S0 recorded, identical on Memory, PostgreSQL and MongoDB (the
+state JSON is the same): `commits=50 total_written=13290322 max_commit=521202 first_read=10434
+final_read=521202`. On a fresh database: PostgreSQL `pg_total_relation_size('adam_test_runs')`
+13,688,832 B and `pg_stat_wal.wal_bytes` 14,470,163 B; MongoDB `collStats(adam_runs).size` 514,331 B
+and the WiredTiger log 13,207,552 B. `pg_relation_size` alone is the wrong gate: the state is TOASTed,
+so the heap stays at 8,192 B; `pg_total_relation_size` is retained size including bloat, and
+`pg_stat_wal.wal_bytes` is the bytes written.
+
 ## Consequences
 
 * The quadratic write is gone: a commit writes one message plus a head, not the transcript. The

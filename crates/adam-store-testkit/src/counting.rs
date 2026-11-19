@@ -43,11 +43,11 @@ use std::time::Duration;
 
 use adam_core::{
     ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
-    RunHeader, RunId, RunQuery, RunRecord, RunUpdate, Store, StoreResult,
+    RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreResult,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::fault::Method;
 
@@ -91,6 +91,12 @@ impl CountingStore {
     /// The bytes of the `state` of every [`RunRecord`] returned since the last reset: what a
     /// reader transferred, not what it kept. A record a store returns without its state (a
     /// `create_run` or `commit_run` echo) adds nothing, and so does a `null` state.
+    ///
+    /// A header is the exception: [`Store::run_header`] is not overridden here, so the trait
+    /// default answers on the wrapper (one `lease_until`, one `load_run`, the record's state) —
+    /// what `MemoryStore` costs too. An adapter that overrides it answers in one small read with no
+    /// state, and this wrapper cannot see that read. Measure reads with `load_run`/`load_head`,
+    /// never `run_header`.
     pub fn state_bytes_read(&self) -> u64 {
         self.counts().state_bytes_read
     }
@@ -102,13 +108,16 @@ impl CountingStore {
         self.counts().state_bytes_written
     }
 
-    /// The largest state one commit wrote since the last reset: the last state of a transcript,
-    /// when every commit carries the whole thing.
+    /// The largest state payload handed to [`Store::commit_run`] since the last reset: the last
+    /// state of a transcript, when every commit carries the whole thing. It is the serialized
+    /// `serde_json` size, not the bytes an adapter wrote to disk.
     pub fn max_commit_bytes(&self) -> u64 {
         self.counts().max_commit_bytes
     }
 
-    /// Zero every counter, keeping the wrapped store.
+    /// Zero every counter, keeping the wrapped store. Reset only between measurements: a counter
+    /// read while a call is in flight sees a partial count, and a reset then loses that call's
+    /// bytes.
     pub fn reset(&self) {
         *self.counts() = Counts::default();
     }
@@ -147,12 +156,141 @@ fn state_bytes(state: &Value) -> u64 {
         .len() as u64
 }
 
+/// What one [`measure_transcript_write`] run measured, in serialized `serde_json` bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Measurement {
+    /// How many commits succeeded (50 when the workload ran to the end).
+    pub commits: usize,
+    /// The sum of every successful commit's [`RunUpdate::state`].
+    pub total_written: u64,
+    /// The largest [`RunUpdate::state`] a commit was handed.
+    pub max_commit: u64,
+    /// What the `load_run` after the first commit transferred.
+    pub first_read: u64,
+    /// What the `load_run` after the last commit transferred.
+    pub final_read: u64,
+}
+
+impl Measurement {
+    /// The one line `dev/p2-measure.sh` parses and a test prints:
+    /// `p2-measure: commits=50 total_written=13290322 max_commit=521202 first_read=10434 final_read=521202`.
+    pub fn report(&self) -> String {
+        format!(
+            "p2-measure: commits={} total_written={} max_commit={} first_read={} final_read={}",
+            self.commits, self.total_written, self.max_commit, self.first_read, self.final_read
+        )
+    }
+}
+
+impl fmt::Display for Measurement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.report())
+    }
+}
+
+/// Commits [`measure_transcript_write`] makes, and the bytes of the message each one appends.
+const COMMITS: usize = 50;
+const MESSAGE_BYTES: usize = 10 * 1024;
+
+/// Measure what a transcript-shaped run costs today: one run, 50 commits, each appending a 10 KB
+/// message, the last one leaving the run [`RunStatus::Done`] so it is purgeable.
+///
+/// **This is a measurement, not a conformance case.** The bytes it sums are the caller's
+/// [`RunUpdate::state`], which a wrapper sees before the store does: on its own the number says
+/// what the runtime handed over, not what an adapter wrote. It asserts nothing; each adapter's
+/// `measure_the_transcript_write` test prints [`Measurement::report`] and asserts only that the
+/// workload ran. S3 adds the `< 50 × 20 KB` and `max < 20 KB` assertions to those tests, when the
+/// contract release makes them true.
+///
+/// The measured baseline, on Memory, PostgreSQL and MongoDB (identical state JSON):
+/// `p2-measure: commits=50 total_written=13290322 max_commit=521202 first_read=10434
+/// final_read=521202`. The disk side is `dev/p2-measure.sh`; both numbers are recorded in
+/// [ADR 0055](../../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md).
+///
+/// # Panics
+///
+/// When the store errors: a measurement that cannot run is a broken test, not a number.
+pub async fn measure_transcript_write(store: DynStore) -> Measurement {
+    let store = CountingStore::new(store);
+    let run = store
+        .create_run(NewRun::new(crate::agent(), json!({"messages": []})))
+        .await
+        .expect("create the measured run");
+
+    let mut messages = Vec::with_capacity(COMMITS);
+    let mut version = run.version;
+    let mut commits = 0;
+    let mut first_read = 0;
+    for turn in 0..COMMITS {
+        messages.push(json!({
+            "role": "assistant",
+            "text": message_text(MESSAGE_BYTES, turn as u64),
+        }));
+        let status = if turn + 1 == COMMITS {
+            RunStatus::Done
+        } else {
+            RunStatus::Runnable
+        };
+        let update = RunUpdate::new(status, json!({"messages": messages}));
+        version = store
+            .commit_run(run.id, version, update)
+            .await
+            .expect("commit the measured state")
+            .version;
+        commits += 1;
+        if turn == 0 {
+            first_read = read_state_bytes(&store, run.id).await;
+        }
+    }
+    let final_read = read_state_bytes(&store, run.id).await;
+
+    Measurement {
+        commits,
+        total_written: store.state_bytes_written(),
+        max_commit: store.max_commit_bytes(),
+        first_read,
+        final_read,
+    }
+}
+
+/// One `load_run`, and the state bytes it transferred (a delta, not the cumulative counter).
+async fn read_state_bytes(store: &CountingStore, run: RunId) -> u64 {
+    let before = store.state_bytes_read();
+    store
+        .load_run(run)
+        .await
+        .expect("load the measured run")
+        .expect("the measured run exists");
+    store.state_bytes_read() - before
+}
+
+/// `len` bytes of text that does not compress away: a real transcript is tokens, not one repeated
+/// byte, and a store that compresses a large state (PostgreSQL TOASTs a big JSONB value) must be
+/// measured on content it cannot shrink to nothing.
+fn message_text(len: usize, seed: u64) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,\n";
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ALPHABET[(state >> 33) as usize % ALPHABET.len()] as char
+        })
+        .collect()
+}
+
 impl fmt::Debug for CountingStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CountingStore").finish_non_exhaustive()
     }
 }
 
+// Every `Store` method is implemented here except `run_header`, whose default deliberately answers
+// on the wrapper (see `state_bytes_read`). When the contract grows a **defaulted** method — S1/S2
+// add `keeps_bodies`, `keeps_blobs`, `body_list`, `put_blob`, `get_blob` and `purge_blobs` — forward
+// it explicitly too: a default left to the wrapper answers for the wrapper, not for the store it
+// wraps (`keeps_bodies` would say `false` for a store that keeps bodies).
 #[async_trait]
 impl Store for CountingStore {
     async fn migrate(&self) -> StoreResult<()> {
@@ -173,11 +311,6 @@ impl Store for CountingStore {
             self.read(record);
         }
         Ok(record)
-    }
-
-    async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
-        self.call(Method::RunHeader);
-        self.inner.run_header(id).await
     }
 
     async fn commit_run(
@@ -448,9 +581,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_header_crosses_the_wrapper_without_a_state() {
+    async fn a_header_reads_the_record_through_the_trait_default() {
         let store = counting();
         let run = create(&store).await;
+        let state = state_bytes(&store.load_run(run.id).await.unwrap().unwrap().state);
         store.reset();
         let header = store
             .run_header(run.id)
@@ -458,9 +592,11 @@ mod tests {
             .expect("header")
             .expect("run");
         assert_eq!(header.id, run.id);
-        assert_eq!(store.calls(Method::RunHeader), 1);
-        // The header is delegated whole: an adapter that overrides it reads no state, and the
-        // wrapper sees one call and no state bytes.
-        assert_eq!(store.state_bytes_read(), 0);
+        // The wrapper does not override `run_header`: the trait default reads the lease and then
+        // the record, so a header costs what `MemoryStore` costs.
+        assert_eq!(store.calls(Method::RunHeader), 0);
+        assert_eq!(store.calls(Method::LeaseUntil), 1);
+        assert_eq!(store.calls(Method::LoadRun), 1);
+        assert_eq!(store.state_bytes_read(), state);
     }
 }

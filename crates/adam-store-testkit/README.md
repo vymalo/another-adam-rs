@@ -14,11 +14,11 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (49
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (48
   cases: create/load, `run_header` against `load_run` + `lease_until`, state round trip, CAS
   conflicts, concurrent commits, journal ordering and first-writer-wins, claim rules and
   exclusivity, busy runs that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
-  run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run. The last case measures rather than asserts a rule: `the_state_write_is_quadratic_in_the_transcript` commits a 10 KB message 50 times through `counting::CountingStore` and pins today's quadratic write and the read that grows with the transcript, so the P2 slices can invert the bound.
+  run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
@@ -27,7 +27,14 @@ dependency.
   `open_run_for_conversation`) and every successful `commit_run` write — through `calls(method)`,
   `state_bytes_read()`, `state_bytes_written()`, `max_commit_bytes()` and `reset()`. A commit that
   failed wrote nothing and is not counted; `migrate` is not counted, and neither is a record
-  returned without its state (a `create_run` or `commit_run` echo, a header).
+  returned without its state (a `create_run` or `commit_run` echo). `run_header` is not overridden:
+  the trait default answers on the wrapper, so a header reads the record and its state.
+* `counting::measure_transcript_write`: a **measurement helper, not a conformance case**. One run,
+  50 commits of a 10 KB message, the last one `Done`; returns `Measurement` (`commits`,
+  `total_written`, `max_commit`, `first_read`, `final_read`) and `report()`, the `p2-measure:` line
+  `dev/p2-measure.sh` parses. It asserts nothing: each adapter's `measure_the_transcript_write` test
+  prints the line and asserts only that the workload ran; S3 adds the bound there. The measured
+  baseline is in [ADR 0055](../../docs/decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md).
 * `fault::FaultyStore`: wraps a `DynStore` and fails scripted calls
   (`fail`, `fail_always`, `fail_after_apply`, `heal`, `calls`, `injected`, and `claimed(run)`, how many times
   `claim_due` handed a run to its caller; and `fail_run` /
@@ -35,7 +42,7 @@ dependency.
   the message a finished child sends its parent), with
   `fault::Method` and `fault::Mode` selecting the method and whether the
   operation is applied before the error is returned. `fault::Method` is **not** `#[non_exhaustive]`:
-  a new variant (the last one was `RunHeader`) breaks an exhaustive `match` on it. `fault::is_injected`
+  a new variant breaks an exhaustive `match` on it. `fault::is_injected`
   tells an injected error from a real one.
 * `skipped`: re-export of `adam_core::testing::skipped`.
 
@@ -69,7 +76,11 @@ failure (see `adam_core::testing`).
 * `src/fault.rs`: unit tests and a doctest of `FaultyStore`.
 * `src/counting.rs`: unit tests of the counters (calls per method, reads through `load_run`,
   `list_runs` and `claim_due`, the write total and its high-water mark, a failed commit that
-  counts nothing, a header that crosses without a state) and a doctest of `CountingStore`.
+  counts nothing, a header that the trait default answers by reading the record) and a doctest of
+  `CountingStore`.
+* `tests/memory.rs` also prints the transcript measurement (`measure_the_transcript_write`); the
+  Postgres and MongoDB adapters print theirs in `tests/conformance.rs`. It is a measurement, not a
+  case: the tests assert only that the workload ran.
 
 The Postgres and MongoDB adapters run the suite from their own
 `tests/conformance.rs`.

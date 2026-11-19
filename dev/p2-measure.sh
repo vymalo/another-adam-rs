@@ -2,10 +2,11 @@
 # What a transcript-shaped run costs, on disk and on the wire: 50 commits, each appending a 10 KB
 # message, before and after the P2 slices. S0 records the baseline; S3 shows the drop.
 #
-# The workload is the conformance case `the_state_write_is_quadratic_in_the_transcript`
-# (crates/adam-store-testkit/src/lib.rs), run through the real adapter and a `CountingStore`. This
-# script brackets it with the database's own counters and prints one table per store. It is run by
-# hand and quoted in the pull request: CI does not call it, and a store whose variable is unset is
+# The workload is `counting::measure_transcript_write` (crates/adam-store-testkit/src/counting.rs),
+# run by the `measure_the_transcript_write` test in each adapter's test file: one run, 50 commits,
+# each appending a 10 KB message, through the real adapter and a `CountingStore`. This script
+# brackets it with the database's own counters and prints one table per store. It is run by hand
+# and quoted in the pull request: CI does not call it, and a store whose variable is unset is
 # skipped with a line, so it is a no-op on a machine without the databases.
 #
 #   ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/adam_test \
@@ -27,6 +28,7 @@
 #   ADAM_TEST_TABLE_PREFIX    its table prefix (default adam_test_, the conformance default)
 #   ADAM_TEST_MONGODB_URI     the server the MongoDB adapter connects to, as MongoStore::connect takes it
 #   ADAM_TEST_MONGODB_DB      its database (default adam_test)
+#   ADAM_TEST_MONGO_COLLECTION_PREFIX  its collection prefix (default adam_)
 #   CARGO_TARGET_DIR          inherited by cargo, as everywhere else
 set -eu
 
@@ -43,9 +45,16 @@ esac
 
 prefix=${ADAM_TEST_TABLE_PREFIX:-adam_test_}
 mongo_db=${ADAM_TEST_MONGODB_DB:-adam_test}
+mongo_prefix=${ADAM_TEST_MONGO_COLLECTION_PREFIX:-adam_}
 case $prefix in
     '' | *[!a-z0-9_]*)
         echo "ADAM_TEST_TABLE_PREFIX must be non-empty and match [a-z0-9_]+" >&2
+        exit 2
+        ;;
+esac
+case $mongo_prefix in
+    '' | *[!a-zA-Z0-9_-]*)
+        echo "ADAM_TEST_MONGO_COLLECTION_PREFIX must be non-empty and match [a-zA-Z0-9_-]+" >&2
         exit 2
         ;;
 esac
@@ -154,12 +163,17 @@ mongo_written() {
     mongo_eval 'db.adminCommand({ fsync: 1 }); const w = db.serverStatus().wiredTiger; print((w ? w["block-manager"]["bytes written"] : 0) + " " + (w && w.log ? w.log["log bytes written"] : 0))'
 }
 
-# Run the 50-commit case and keep the line it prints; `logical` is read by the caller.
+# Run the measurement and keep the line it prints; `logical` is read by the caller. A test that ran
+# but printed no line is a failure: a rename must not silently measure nothing.
 workload() {
     log=$(mktemp)
-    if cargo test -p "$1" --test conformance the_state_write_is_quadratic_in_the_transcript \
+    if cargo test -p "$1" --test conformance measure_the_transcript_write \
         --locked -- --exact --nocapture >"$log" 2>&1; then
         logical=$(sed -n 's/^p2-measure: //p' "$log" | tail -n 1)
+        if [ -z "$logical" ]; then
+            fail=1
+            echo "  no p2-measure: line in the test output; is the test still named measure_the_transcript_write?" >&2
+        fi
     else
         fail=1
         echo "  the workload failed; the numbers below cover a partial run:" >&2
@@ -192,10 +206,15 @@ measure_postgres() {
     # `pg_stat_wal` is PostgreSQL 14+; on an older server the row says n/a.
     [ -n "$wal_before" ] || wal_before=n/a
     [ -n "$wal_after" ] || wal_after=n/a
-    row "pg_relation_size(${prefix}runs)" "$runs_before" "$runs_after" "$(delta "$runs_before" "$runs_after")"
+    runs_delta=$(delta "$runs_before" "$runs_after")
+    total_delta=$(delta "$total_before" "$total_after")
+    row "pg_relation_size(${prefix}runs)" "$runs_before" "$runs_after" "$runs_delta"
     row "pg_relation_size(${prefix}journal)" "$journal_before" "$journal_after" "$(delta "$journal_before" "$journal_after")"
-    row "pg_total_relation_size(${prefix}runs)" "$total_before" "$total_after" "$(delta "$total_before" "$total_after")"
+    row "pg_total_relation_size(${prefix}runs)" "$total_before" "$total_after" "$total_delta"
     row "pg_stat_wal.wal_bytes (PG 14+)" "$wal_before" "$wal_after" "$(delta "$wal_before" "$wal_after")"
+    if [ "$runs_delta" = 0 ] && [ "$total_delta" = 0 ]; then
+        echo "  warning: neither the relation nor its total grew; check the table prefix and the database" >&2
+    fi
     echo "  counting store: ${logical:-the workload printed no line}"
 }
 
@@ -209,24 +228,31 @@ measure_mongo() {
         fail=1
         return
     fi
-    header "mongo $(host_of "$ADAM_TEST_MONGODB_URI")/$mongo_db, collections adam_runs, adam_journal"
-    runs_before=$(mongo_size adam_runs)
-    journal_before=$(mongo_size adam_journal)
+    header "mongo $(host_of "$ADAM_TEST_MONGODB_URI")/$mongo_db, collections ${mongo_prefix}runs, ${mongo_prefix}journal"
+    runs_before=$(mongo_size "${mongo_prefix}runs")
+    journal_before=$(mongo_size "${mongo_prefix}journal")
     written_before=$(mongo_written)
     workload adam-store-mongodb
-    runs_after=$(mongo_size adam_runs)
-    journal_after=$(mongo_size adam_journal)
+    runs_after=$(mongo_size "${mongo_prefix}runs")
+    journal_after=$(mongo_size "${mongo_prefix}journal")
     written_after=$(mongo_written)
-    row "collStats(adam_runs).size" "$runs_before" "$runs_after" "$(delta "$runs_before" "$runs_after")"
-    row "collStats(adam_journal).size" "$journal_before" "$journal_after" "$(delta "$journal_before" "$journal_after")"
+    runs_delta=$(delta "$runs_before" "$runs_after")
+    journal_delta=$(delta "$journal_before" "$journal_after")
+    row "collStats(${mongo_prefix}runs).size" "$runs_before" "$runs_after" "$runs_delta"
+    row "collStats(${mongo_prefix}journal).size" "$journal_before" "$journal_after" "$journal_delta"
     bm_before=$(printf '%s' "$written_before" | cut -d' ' -f1)
     bm_after=$(printf '%s' "$written_after" | cut -d' ' -f1)
     log_before=$(printf '%s' "$written_before" | cut -d' ' -f2)
     log_after=$(printf '%s' "$written_after" | cut -d' ' -f2)
     row "wiredTiger block-manager bytes written" "$bm_before" "$bm_after" "$(delta "$bm_before" "$bm_after")"
     row "wiredTiger log bytes written" "$log_before" "$log_after" "$(delta "$log_before" "$log_after")"
+    if [ "$runs_delta" = 0 ] && [ "$journal_delta" = 0 ]; then
+        echo "  warning: no collection grew; check the collection prefix and the database" >&2
+    fi
     echo "  counting store: ${logical:-the workload printed no line}"
 }
+
+echo "note: size deltas are retained bytes (a relation or collection includes bloat); pg_stat_wal.wal_bytes and the WiredTiger log are bytes written"
 
 case $stores in
     postgres) measure_postgres ;;

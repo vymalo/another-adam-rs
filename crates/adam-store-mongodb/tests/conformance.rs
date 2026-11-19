@@ -14,7 +14,13 @@ use adam_store_mongodb::MongoStore;
 async fn make_store() -> Option<adam_core::DynStore> {
     let uri = adam_core::testing::test_env("ADAM_TEST_MONGODB_URI")?;
     let db = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
-    let store = MongoStore::connect(&uri, &db).await.expect("connect");
+    let prefix =
+        std::env::var("ADAM_TEST_MONGO_COLLECTION_PREFIX").unwrap_or_else(|_| "adam_".into());
+    let store = MongoStore::connect(&uri, &db)
+        .await
+        .expect("connect")
+        .with_collection_prefix(&prefix)
+        .expect("prefix");
     Some(Arc::new(store))
 }
 
@@ -125,4 +131,20 @@ async fn a_document_without_an_owner_field_is_unowned() {
         .await
         .unwrap();
     assert!(other.is_empty(), "w1 owns the run now");
+}
+
+/// Prints the transcript measurement for this adapter. It is a measurement helper, not a
+/// conformance case: it asserts only that the workload ran. S3 adds the `< 50 × 20 KB` and
+/// `max < 20 KB` assertions here, when the contract release makes them true.
+#[tokio::test]
+async fn measure_the_transcript_write() {
+    let Some(store) = make_store().await else {
+        adam_store_testkit::skipped("measure_the_transcript_write: store not configured");
+        return;
+    };
+    store.migrate().await.expect("migrate");
+    let measured = adam_store_testkit::counting::measure_transcript_write(store).await;
+    println!("{measured}");
+    assert_eq!(measured.commits, 50, "the workload ran to the end");
+    assert!(measured.total_written > 0, "the commits wrote state");
 }
