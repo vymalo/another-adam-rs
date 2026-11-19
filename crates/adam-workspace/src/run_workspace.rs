@@ -278,7 +278,10 @@ impl Scratch {
             )));
         };
         meta.published_to = Some(url.to_owned());
-        inner.write_meta_at(&path, &meta).await
+        inner.write_meta_at(&path, &meta).await?;
+        // The value a listing gives is the one in the metadata: a list read before this is stale.
+        inner.forget_slots(&self.run);
+        Ok(())
     }
 
     /// `git` in the project, pinned to its own `.git` directory ([`GitPin`]): a `.git` that a
@@ -501,17 +504,84 @@ impl RunWorkspace {
     /// after its repository), then the others sorted by directory name. A slot whose directory is
     /// gone is not listed.
     ///
+    /// The list is kept for the process: it changes only through this type's own methods
+    /// ([`add_repository`](Self::add_repository), [`add_scratch`](Self::add_scratch),
+    /// [`remove`](Self::remove), ...), which forget it, and a tool call asks for it on every call.
+    /// What a command of the run can change under it — its slot's directory, and the mirror's
+    /// `worktrees/<name>/gitdir` when the run works in the coder's own environment — is checked
+    /// again on every call, as a fresh listing does.
+    ///
     /// # Errors
     ///
     /// [`WorkspaceError::Corrupt`] for unreadable metadata, I/O errors.
     #[tracing::instrument(skip(self), fields(run = %self.run))]
     pub async fn slots(&self) -> WorkspaceResult<Vec<Slot>> {
+        let inner = self.inner();
+        if let Some(cached) = inner.cached_slots(&self.run)
+            && let Some(slots) = self.rechecked(&cached).await
+        {
+            return Ok(slots);
+        }
+        let epoch = inner.slots_epoch();
         let mut slots = Vec::new();
         slots.extend(self.legacy_slot().await?);
-        for meta in self.inner().read_slot_metas(&self.run).await? {
+        for meta in inner.read_slot_metas(&self.run).await? {
             slots.extend(self.slot_of(&meta).await?);
         }
+        inner.cache_slots(&self.run, epoch, &slots);
         Ok(slots)
+    }
+
+    /// The cached slots, with the two things a command of the run can change under them checked
+    /// again: the slot's directory must still be the one the coder opened ([`Slot::root`]), and a
+    /// worktree's git directory must still name it (`Inner::admin_is_gone`). A slot that fails the
+    /// first is not listed; one that fails the second is listed without a git directory, and git
+    /// refuses to run on it.
+    ///
+    /// `None` when a worktree's git directory was never told: the mirror may have gained exactly
+    /// one answer since (a slot from before the directory was recorded), which a listing made now
+    /// finds and records, so the caller lists again.
+    async fn rechecked(&self, slots: &[Slot]) -> Option<Vec<Slot>> {
+        let inner = self.inner();
+        let mut checked = Vec::with_capacity(slots.len());
+        for slot in slots {
+            if !slot.root().is_still_here() {
+                continue;
+            }
+            let kind = match slot.kind() {
+                SlotKind::Repository(wt) => {
+                    // A worktree whose git directory was never told: list again.
+                    wt.git_dir()?;
+                    if inner.admin_is_gone(wt).await {
+                        SlotKind::Repository(wt.without_git_dir())
+                    } else {
+                        SlotKind::Repository(wt.clone())
+                    }
+                }
+                SlotKind::Reference(wt) => {
+                    // A worktree whose git directory was never told: list again.
+                    wt.git_dir()?;
+                    if inner.admin_is_gone(wt).await {
+                        SlotKind::Reference(wt.without_git_dir())
+                    } else {
+                        SlotKind::Reference(wt.clone())
+                    }
+                }
+                SlotKind::Scratch(scratch) => SlotKind::Scratch(scratch.clone()),
+            };
+            checked.push(Slot {
+                dir: slot.dir.clone(),
+                path: slot.path.clone(),
+                seq: slot.seq,
+                kind,
+            });
+        }
+        Some(checked)
+    }
+
+    /// Forget the slots this process listed for the run: one was added, removed or changed.
+    fn forget_slots(&self) {
+        self.inner().forget_slots(&self.run);
     }
 
     /// [`slots`](Self::slots) in the order they joined the run (the legacy worktree, then by
@@ -842,6 +912,7 @@ impl RunWorkspace {
             inner, &self.run, &path, &mut meta, &meta_path, fresh, identity,
         )
         .await?;
+        self.forget_slots();
         Ok(Slot {
             dir: dir.to_owned(),
             path,
@@ -900,6 +971,9 @@ impl RunWorkspace {
         };
         let _first = inner.lock_path(first).await?;
         let _second = inner.lock_path(second).await?;
+        // Projects may move: neither run's list outlives this call, whatever it does.
+        inner.forget_slots(from);
+        self.forget_slots();
         let theirs = inner.read_slot_metas(from).await?;
         let mine = inner.read_slot_metas(&self.run).await?;
         let legacy = inner.read_meta(&self.run).await?;
@@ -941,6 +1015,10 @@ impl RunWorkspace {
             names.insert(m.dir.clone());
             moved.push(m.dir);
         }
+        if !moved.is_empty() {
+            inner.forget_slots(from);
+            self.forget_slots();
+        }
         Ok(moved)
     }
 
@@ -979,6 +1057,8 @@ impl RunWorkspace {
     async fn remove_slots(&self, keep_scratch: bool) -> WorkspaceResult<usize> {
         let inner = self.inner();
         let _run = inner.lock_path(&self.path).await?;
+        // Whatever this call does, the list of slots it read before is not to be believed.
+        self.forget_slots();
         let mut kept = 0;
         match inner.read_slot_metas(&self.run).await {
             Ok(metas) => {
@@ -1025,6 +1105,7 @@ impl RunWorkspace {
         }
         inner.remove_legacy(&self.run).await?;
         if kept > 0 {
+            self.forget_slots();
             return Ok(kept);
         }
         remove_dir_if_exists(&inner.slot_meta_dir(&self.run)).await?;
@@ -1032,6 +1113,7 @@ impl RunWorkspace {
         // The run is over: its lock goes with it.
         let _ = tokio::fs::remove_file(crate::workspace::lock_file_of(&self.path)).await;
         inner.forget_lock(&self.path);
+        self.forget_slots();
         Ok(0)
     }
 }
@@ -1584,5 +1666,61 @@ mod tests {
         for bad in ["..", "a/../..", "/etc", ".git", "a/.GIT/b"] {
             assert!(destination_base(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A tool call lists the slots on every call (`ToolEnv::slot_to_read`, and `sole_owner` a
+    /// second time), and listing them reads every slot's metadata and opens its directory. The
+    /// list is kept for the process and forgotten when this type changes it.
+    #[tokio::test]
+    async fn a_turn_that_lists_the_slots_ten_times_reads_their_metadata_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::Workspaces::new(
+            tmp.path().join("root"),
+            Arc::new(crate::StaticToken::new("t")),
+        );
+        let run = ws.run("run-listed-1").unwrap();
+        let me = GitIdentity::new("Adam", "adam@example.com");
+        run.add_scratch("fib", &me).await.unwrap();
+
+        let reads = ws.inner.slot_reads();
+        for _ in 0..10 {
+            assert_eq!(run.slots().await.unwrap().len(), 1);
+        }
+        assert_eq!(
+            ws.inner.slot_reads() - reads,
+            1,
+            "ten calls read the metadata once"
+        );
+
+        // A project added through the workspace forgets the list: the next listing sees it.
+        run.add_scratch("notes", &me).await.unwrap();
+        let added = ws.inner.slot_reads();
+        assert_eq!(run.slots().await.unwrap().len(), 2);
+        assert_eq!(ws.inner.slot_reads() - added, 1, "and reads it again");
+
+        // A project that records where it was published changes what a listing says.
+        let fib = run.slot("fib").await.unwrap().unwrap();
+        fib.scratch()
+            .unwrap()
+            .set_published_to("http://git.example/fib.git")
+            .await
+            .unwrap();
+        assert_eq!(
+            run.slot("fib")
+                .await
+                .unwrap()
+                .unwrap()
+                .scratch()
+                .unwrap()
+                .published_to(),
+            Some("http://git.example/fib.git")
+        );
+
+        // A removed workspace forgets the list: nothing is listed afterwards.
+        run.remove().await.unwrap();
+        assert!(
+            run.slots().await.unwrap().is_empty(),
+            "a removed workspace lists nothing"
+        );
     }
 }

@@ -4825,6 +4825,8 @@ async fn a_scratch_project_taken_over_by_another_run_has_a_generation_of_its_own
             m.remove("dir_gen");
         },
     );
+    // A new handle on the root reads the metadata again: a process keeps the slots it listed.
+    let second = workspaces(tmp.path()).run("run-2").unwrap();
     assert_eq!(
         second.slot("site").await.unwrap().unwrap().generation(),
         None

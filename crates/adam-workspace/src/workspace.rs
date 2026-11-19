@@ -15,7 +15,7 @@ use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::{Auth, GitCmd, GitOutput, GitSandbox};
 use crate::mirror_config;
 use crate::repo::{RepoLocation, RepoRef, fnv1a};
-use crate::run_workspace::RunWorkspace;
+use crate::run_workspace::{RunWorkspace, Slot};
 use crate::safe_fs::{self, SlotDir};
 use crate::worktree::{GitIdentity, Worktree};
 
@@ -119,6 +119,24 @@ pub(crate) struct Inner {
     /// Where the commands that carry no credential run, when the deployment has a git sandbox.
     sandbox: Option<GitSandbox>,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// The slots of each run as this process last listed them (see [`SlotCache`]).
+    slots: Mutex<SlotCache>,
+    /// How many times the slot metadata of a run was read from disk, for the test that proves the
+    /// cache is hit.
+    #[cfg(test)]
+    slot_reads: AtomicU64,
+}
+
+/// The slots of each run as this process last listed them.
+///
+/// A tool call lists a run's slots on every call (`ToolEnv::slot_to_read`), and listing them
+/// opens every slot's directory and reads its metadata; the set changes only through
+/// [`RunWorkspace`]'s own methods in this process, which call `Inner::forget_slots`. `epoch`
+/// makes a listing that was read while a change was being written not overwrite the newer one.
+#[derive(Default)]
+struct SlotCache {
+    epoch: u64,
+    by_run: HashMap<String, Vec<Slot>>,
 }
 
 /// Held while a mirror is being changed: the in-process lock, then the file lock. Fields drop
@@ -288,6 +306,82 @@ impl SlotMeta {
     }
 }
 
+/// One metadata file of a slot, as it is written: the fields of a [`Meta`] and a [`ScratchMeta`]
+/// together, so that a file is parsed **once** and then told apart by its `kind`. A field added to
+/// either type is added here too, and the compiler says so where the variant is built
+/// ([`SlotFile::into_meta`]).
+#[derive(Deserialize)]
+struct SlotFile {
+    version: u32,
+    run: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    base_branch: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    remote_branch: Option<String>,
+    #[serde(default)]
+    dir: Option<String>,
+    #[serde(default)]
+    seq: Option<u32>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    admin: Option<String>,
+    #[serde(default)]
+    admin_gen: Option<String>,
+    #[serde(default)]
+    published_to: Option<String>,
+    #[serde(default)]
+    conversation: Option<String>,
+    #[serde(default)]
+    dir_gen: Option<String>,
+}
+
+impl SlotFile {
+    /// What the file says: a scratch project (`kind: "scratch"`), a reference (`kind:
+    /// "reference"`), or a repository slot (any other kind, including the files written before
+    /// `kind` existed). The reason is what the file lacks for the shape its `kind` names.
+    fn into_meta(self) -> Result<SlotMeta, String> {
+        if self.kind.as_deref() == Some("scratch") {
+            return Ok(SlotMeta::Scratch(ScratchMeta {
+                version: self.version,
+                run: self.run,
+                dir: self.dir.ok_or("a scratch project has no directory")?,
+                seq: self
+                    .seq
+                    .ok_or("a scratch project has no place in the order")?,
+                kind: "scratch".to_owned(),
+                published_to: self.published_to,
+                conversation: self.conversation,
+                dir_gen: self.dir_gen,
+            }));
+        }
+        let meta = Meta {
+            version: self.version,
+            run: self.run,
+            url: self.url.ok_or("a repository slot has no url")?,
+            base_branch: self
+                .base_branch
+                .ok_or("a repository slot has no base branch")?,
+            branch: self.branch.ok_or("a repository slot has no branch")?,
+            remote_branch: self.remote_branch,
+            dir: self.dir,
+            seq: self.seq,
+            kind: self.kind,
+            admin: self.admin,
+            admin_gen: self.admin_gen,
+        };
+        Ok(if meta.kind.as_deref() == Some(REFERENCE_KIND) {
+            SlotMeta::Reference(meta)
+        } else {
+            SlotMeta::Repo(meta)
+        })
+    }
+}
+
 /// Where a worktree is made, and the metadata file that records it.
 #[derive(Clone)]
 pub(crate) struct Target {
@@ -334,6 +428,9 @@ impl Workspaces {
                 policy: Policy::default(),
                 sandbox: None,
                 locks: Mutex::new(HashMap::new()),
+                slots: Mutex::default(),
+                #[cfg(test)]
+                slot_reads: AtomicU64::new(0),
             }),
         }
     }
@@ -398,6 +495,9 @@ impl Workspaces {
                 policy,
                 sandbox: self.inner.sandbox.clone(),
                 locks: Mutex::new(HashMap::new()),
+                slots: Mutex::default(),
+                #[cfg(test)]
+                slot_reads: AtomicU64::new(0),
             }),
         }
     }
@@ -430,6 +530,9 @@ impl Workspaces {
                 policy: self.inner.policy.clone(),
                 sandbox: Some(sandbox),
                 locks: Mutex::new(HashMap::new()),
+                slots: Mutex::default(),
+                #[cfg(test)]
+                slot_reads: AtomicU64::new(0),
             }),
         }
     }
@@ -735,9 +838,12 @@ impl Workspaces {
                 path.display()
             ))
         })?;
-        Ok(self
+        let worktree = self
             .inner
-            .worktree(&meta, &target.dir, Arc::new(root), mirror))
+            .worktree(&meta, &target.dir, Arc::new(root), mirror);
+        // The slots of the run were listed before this one was made (or found again).
+        self.inner.forget_slots(run);
+        Ok(worktree)
     }
 
     /// The default branch of the repository at `repo_url`: what the remote's `HEAD` points at
@@ -1155,6 +1261,50 @@ impl Inner {
     /// The workspace root.
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The slots of `run` as this process last listed them, if it did.
+    pub(crate) fn cached_slots(&self, run: &str) -> Option<Vec<Slot>> {
+        let cache = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.by_run.get(run).cloned()
+    }
+
+    /// The token a listing of the slots must still be current to be kept: [`Self::cache_slots`].
+    pub(crate) fn slots_epoch(&self) -> u64 {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .epoch
+    }
+
+    /// Keep the listing of `run`'s slots read at `epoch`, unless the slots changed meanwhile.
+    pub(crate) fn cache_slots(&self, run: &str, epoch: u64, slots: &[Slot]) {
+        let mut cache = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.epoch == epoch {
+            cache.by_run.insert(run.to_owned(), slots.to_vec());
+        }
+    }
+
+    /// Forget the slots listed for `run`: they changed, or its workspace is going.
+    pub(crate) fn forget_slots(&self, run: &str) {
+        let mut cache = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.epoch += 1;
+        cache.by_run.remove(run);
+    }
+
+    /// How many times the slot metadata was read from disk (a test proves the cache is hit).
+    #[cfg(test)]
+    pub(crate) fn slot_reads(&self) -> u64 {
+        self.slot_reads.load(Ordering::Relaxed)
     }
 
     /// The legacy worktree of `run`.
@@ -2001,6 +2151,25 @@ impl Inner {
             && names_worktree(mirror, name, slot).await
     }
 
+    /// Whether the git directory recorded for `wt` no longer names it: the directory is gone, it
+    /// is not this run's, or the mirror's `gitdir` was rewritten (a run without a container works
+    /// in the coder's own environment, where the mirror is writable). A listing made now would
+    /// record no git directory, and git is not run on the slot.
+    pub(crate) async fn admin_is_gone(&self, wt: &Worktree) -> bool {
+        match wt.git_dir() {
+            Some(admin) => {
+                let name = admin
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                !self
+                    .admin_is_current(wt.mirror(), wt.run(), name, wt.path())
+                    .await
+            }
+            None => false,
+        }
+    }
+
     /// The worktree `meta` describes, at `path`: with the git directory it records if that is
     /// still this run's ([`admin_is_current`](Self::admin_is_current)), or, for metadata that
     /// predates the record, the one the mirror says (`admin_by_backpointer`; not recorded again:
@@ -2125,6 +2294,8 @@ impl Inner {
 
     /// The metadata of every slot of `run`, by directory name.
     pub(crate) async fn read_slot_metas(&self, run: &str) -> WorkspaceResult<Vec<SlotMeta>> {
+        #[cfg(test)]
+        self.slot_reads.fetch_add(1, Ordering::Relaxed);
         let dir = self.slot_meta_dir(run);
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(entries) => entries,
@@ -2147,19 +2318,10 @@ impl Inner {
             let corrupt = |why: String| {
                 WorkspaceError::Corrupt(format!("{} is not valid metadata: {why}", path.display()))
             };
-            let probe: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|e| corrupt(e.to_string()))?;
-            let meta = if probe.get("kind").and_then(|k| k.as_str()) == Some("scratch") {
-                SlotMeta::Scratch(
-                    serde_json::from_value(probe).map_err(|e| corrupt(e.to_string()))?,
-                )
-            } else if probe.get("kind").and_then(|k| k.as_str()) == Some(REFERENCE_KIND) {
-                SlotMeta::Reference(
-                    serde_json::from_value(probe).map_err(|e| corrupt(e.to_string()))?,
-                )
-            } else {
-                SlotMeta::Repo(serde_json::from_value(probe).map_err(|e| corrupt(e.to_string()))?)
-            };
+            let meta = serde_json::from_slice::<SlotFile>(&bytes)
+                .map_err(|e| corrupt(e.to_string()))?
+                .into_meta()
+                .map_err(corrupt)?;
             let (version, expected, run_of, dir_of) = match &meta {
                 SlotMeta::Repo(m) => (
                     m.version,

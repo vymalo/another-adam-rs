@@ -282,6 +282,15 @@ impl Worktree {
         self.admin.as_deref()
     }
 
+    /// The same worktree with no git directory: what a listing gives when the directory the record
+    /// names no longer names this worktree (`Inner::admin_is_gone`).
+    pub(crate) fn without_git_dir(&self) -> Self {
+        let mut worktree = self.clone();
+        worktree.admin = None;
+        worktree.admin_gen = None;
+        worktree
+    }
+
     /// A token that is new each time the coder makes the directory [`git_dir`](Self::git_dir) names.
     /// The name is the same when a slot is removed and added again, the directory is not, and a run
     /// pod's mounts follow the directory it was made with: a caller that records what a pod mounts
