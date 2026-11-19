@@ -2560,7 +2560,7 @@ characters are not registered. The same redactor scrubs the input and the output
 SIGTERM stops accepting connections and lets in-flight steps finish and commit
 (see [Roles](#roles) for what stops in which order); a step cut short by a hard kill
 is taken over by the next start when its lease expires. Logs are JSON on stdout
-(`RUST_LOG` filters; unset, the filter is `info,rmcp=warn`: the MCP client library logs a whole `peer_info` at INFO, then "task cancelled" and "serve finished", each time the thread-tools endpoint is connected, which is every model turn. Setting `RUST_LOG` replaces the default whole). The startup line prints the configuration with the gateway (`MODEL_BASE_URL`), the GitHub API and MCP addresses and `PUBLIC_URL` as scheme and host only, the database URL as `[REDACTED]`: a deployment keeps them in secrets.
+(`RUST_LOG` filters; unset, the filter is `info,rmcp=warn`: the MCP client library logs a whole `peer_info` at INFO, then "task cancelled" and "serve finished", each time the thread-tools endpoint is connected (once per grant, again after the 60 s `LISTING_TTL`, and on every call). Setting `RUST_LOG` replaces the default whole). The startup line prints the configuration with the gateway (`MODEL_BASE_URL`), the GitHub API and MCP addresses and `PUBLIC_URL` as scheme and host only, the database URL as `[REDACTED]`: a deployment keeps them in secrets.
 
 Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 

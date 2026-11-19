@@ -69,7 +69,8 @@ use crate::tools::Commands;
 /// written.
 pub const IMAGE_SCOPE_BACKSTOP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// What one sweep learned about a run from its record's status: `Some(true)` over, `Some(false)`
+/// What one sweep learned about a run from its record's status: `Some(true)` over **and known**
+/// (an id the store does not have is never inserted: it can be recreated by a retry), `Some(false)`
 /// open, `None` not a run id. A later pass of the same sweep reuses it instead of asking the store
 /// again; the state is never decoded (the record's `status` is enough).
 type Verdicts = HashMap<String, Option<bool>>;
