@@ -119,6 +119,14 @@ of a round carries the session object on the update that ends the round and on t
 A2A JSON spelling (`TASK_STATE_COMPLETED`), as in the sessions object. A round that only closes the session reports nothing. Not built: the
 wiring into `adam-assembly`, `adam-service` and `adam-coder` (part c).
 
+*Amended 2026-11-19* (slice 6 part b, the listing cadence): the tracker is evaluated only when the
+subscription polls — its fallback (`RuntimeTaskBackend::with_poll_interval`, 2 s by default) or a
+`Status` event of the task it streams — so the bound on a session change is
+`max(SESSIONS_POLL, poll)`, **2 s with the defaults**, not the second the paragraph above says. The
+2 s fallback is the deliberate trade: a listing arm of its own every second would pay a whole
+`list_sessions` (two counts and a page, plus a view per changed open round) per subscriber per
+second, for a change nobody is blocked on.
+
 *Built 2026-11-18:* slice 5 (remote sessions, `crates/adam-assembly/src/remote_session.rs`, `RemoteEndpoint` in `remote.rs`, `Agent::on_cancelled`
 in `crates/adam-runtime`, the roster in `crates/adam-llm-agent/src/sessions.rs`): a session on an `a2a:` subagent of the root is a chain of
 rounds, each a run of `RemoteRoundAgent` registered as `<root>/<subagent>` (no model: card, send, look, report). The session tools,

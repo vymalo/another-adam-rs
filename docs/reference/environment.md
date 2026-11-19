@@ -74,7 +74,7 @@ shared configuration parses the variable, so a bad value is exit 78 in either; `
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (any case): keep this process's events local. `emit` delivers them to the in-process sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway. Signals (wake-ups, cancels) still cross. One **process** (`ROLE=all`, one pod): with `topology: split` (a front and its workers, even one replica each) it silences the live events between them, whose state changes still reach the 250 ms poll. A deployment choice, never detected. Anything else: a startup problem, exit 78 | `false` |
+| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (any case): keep this process's events local. `emit` delivers them to the in-process sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway. Signals (wake-ups, cancels) still cross. One **process** (`ROLE=all`, one pod): with `topology: split` (a front and its workers, even one replica each) it silences the live events between them, whose state changes still reach a subscriber's 2 s fallback poll. A deployment choice, never detected. Anything else: a startup problem, exit 78 | `false` |
 
 ## Agent folder (both binaries)
 

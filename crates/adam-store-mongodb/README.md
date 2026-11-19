@@ -14,7 +14,8 @@ binary picks one at composition time.
 There are none. A standalone `mongod` has no change streams (they need a replica
 set), and this adapter promises to work on one, so workers of other processes
 find new runs by polling `claim_due` (`poll_interval`), and a cancel issued by
-another process reaches a running step at its next poll. The
+another process reaches a running step at its next cancel poll
+(`cancel_poll_interval`, 1 s by default). The
 [`adam-notify-postgres`](../adam-notify-postgres/README.md) adapter needs a
 PostgreSQL, so it fits when that is the store (or one on the side); otherwise
 accept the poll latency.
@@ -30,6 +31,9 @@ accept the poll latency.
   state, and returning it would convert the document back on every transition. `load_run`, the claim
   and the listings return the stored state; `journal_put` returns the stored payload (the loop
   decodes the step's outcome from it).
+* `run_header` is one `find_one` projected to the header and `lease_until`: the state is never read,
+  so a reader that only needs the run's own bookkeeping (a cancel watch, a parent check) pays for one
+  small document.
 * `codec::{json_to_bson, bson_to_json, encode_key, decode_key}`: the reversible key escaping
   (`$ref`, dotted, empty keys, NUL). Ordinary keys are stored verbatim, so
   `state.messages.0.role` is still a valid query path. The store replaces a NUL with U+FFFD before

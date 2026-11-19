@@ -16,8 +16,8 @@ MongoDB has no equivalent here: a standalone `mongod` has no change streams, so
 
 Without it, processes share only the store: a worker finds a run another
 process started at its next poll (250 ms by default), and a cancel issued in
-one process reaches a step running in another at the worker's next read of the
-run. With it, both are immediate, and a front's SSE subscription sees
+one process reaches a step running in another at the step's next cancel poll
+(1 s by default). With it, both are immediate, and a front's SSE subscription sees
 `Progress` of a run a worker steps as it happens.
 
 **It is a latency optimisation, and nothing more.** `NOTIFY` is at most once and
@@ -179,7 +179,7 @@ forwarded to `sqlx`.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (ASCII case ignored): keep this process's events local. `PgEventSink::emit` delivers them to the local sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway, so a process with no other process to tell would pay for a round trip and an echo it discards. Signals (wake-ups, cancels) still cross. One **process** (`ROLE=all`, one pod): with `topology: split` (a front and its workers, even one replica each) it silences the live events between them, whose state changes still reach the 250 ms poll. It is a deployment choice, never detected. `PgNotify::new` reads it once; `.local_only(bool)` overrides it. Anything else: the binaries' configuration refuses it at startup (exit 78); an embedder that calls `PgNotify::new` itself gets `NotifyError::InvalidLocalOnly` (class `Invalid`) from `run` | `false` |
+| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (ASCII case ignored): keep this process's events local. `PgEventSink::emit` delivers them to the local sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway, so a process with no other process to tell would pay for a round trip and an echo it discards. Signals (wake-ups, cancels) still cross. One **process** (`ROLE=all`, one pod): with `topology: split` (a front and its workers, even one replica each) it silences the live events between them, whose state changes still reach the 2 s fallback poll. It is a deployment choice, never detected. `PgNotify::new` reads it once; `.local_only(bool)` overrides it. Anything else: the binaries' configuration refuses it at startup (exit 78); an embedder that calls `PgNotify::new` itself gets `NotifyError::InvalidLocalOnly` (class `Invalid`) from `run` | `false` |
 
 ## Tests
 
@@ -188,7 +188,7 @@ forwarded to `sqlx`.
 | `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step, the largest piece of streamed text and the largest usage report fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes, batching (the cap, the order and the channel of each item; a failed statement counted once whatever its batch carried), local-only (100 events reach the local sink and nothing is queued; the variable's spellings, a bad one fails `run`). Offline |
 | `tests/conformance.rs` | `adam-notify-testkit`'s `notifier_conformance!` with two `PgNotify` on separate pools, plus one case at the exact 7 999-byte limit |
 | `tests/batching.rs` | one statement per queued batch, counted by `statements_sent` (a full batch is 1, two batches and a remainder 3), 100 queued events arriving in queue order across batches, the stop-drain batching what is queued, and a signal still crossing from a `local_only(true)` process |
-| `tests/two_runtimes.rs` | a front (starter only) and a worker, each with its own pools, `PgNotify` and `Runtime`, poll interval 30 s: a start and a deliver wake an idle worker; a step's `Progress` reaches the front exactly once and before the `Parked` status; a cancel reaches the step within 2 s; terminating the listener's backend gives a `Resync` within 5 s, a run started meanwhile completes, and a later signal arrives |
+| `tests/two_runtimes.rs` | a front (starter only) and a worker, each with its own pools, `PgNotify` and `Runtime`, poll interval 30 s and cancel watch 30 s, so only the notifier can meet the 2 s bound: a start and a deliver wake an idle worker; a step's `Progress` reaches the front exactly once and before the `Parked` status; a cancel reaches the step within 2 s; terminating the listener's backend gives a `Resync` within 5 s, a run started meanwhile completes, and a later signal arrives |
 
 | Variable | Meaning |
 |---|---|

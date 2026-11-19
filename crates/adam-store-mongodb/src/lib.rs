@@ -52,8 +52,8 @@ use adam_core::store::{
 };
 use adam_core::{
     ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
-    PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
-    StoreResult,
+    PushRecord, PushState, RunHeader, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store,
+    StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -371,6 +371,24 @@ fn run_from_doc(d: &Document) -> StoreResult<RunRecord> {
     })
 }
 
+/// A document of [`MongoStore::run_header`]'s projection: the record's metadata and its lease,
+/// never `state`.
+fn run_header_from_doc(d: &Document) -> StoreResult<RunHeader> {
+    let status = get_str(d, "status")?.ok_or_else(|| bad("status"))?;
+    Ok(RunHeader {
+        id: get_uuid(d, "_id")?.ok_or_else(|| bad("_id"))?,
+        agent: get_str(d, "agent")?.ok_or_else(|| bad("agent"))?,
+        conversation_id: get_str(d, "conversation_id")?,
+        parent_id: get_uuid(d, "parent_id")?,
+        status: RunStatus::parse(&status).ok_or_else(|| bad("status"))?,
+        wake_at: get_date(d, "wake_at")?,
+        version: get_u64(d, "version")?,
+        created_at: get_date(d, "created_at")?.ok_or_else(|| bad("created_at"))?,
+        updated_at: get_date(d, "updated_at")?.ok_or_else(|| bad("updated_at"))?,
+        lease_until: get_date(d, "lease_until")?,
+    })
+}
+
 /// The fields [`MongoStore::commit_context`] reads: everything `commit_run` needs to build the
 /// record it returns and the `open_key`, and nothing else.
 struct CommitContext {
@@ -615,6 +633,20 @@ impl Store for MongoStore {
             .await
             .map_err(classify)?;
         found.as_ref().map(run_from_doc).transpose()
+    }
+
+    async fn run_header(&self, id: RunId) -> StoreResult<Option<RunHeader>> {
+        // One document, projected to the header and the lease: the state is never read.
+        let found = self
+            .runs
+            .find_one(doc! { "_id": uuid(id) })
+            .projection(doc! {
+                "agent": 1, "conversation_id": 1, "parent_id": 1, "status": 1, "wake_at": 1,
+                "version": 1, "created_at": 1, "updated_at": 1, "lease_until": 1
+            })
+            .await
+            .map_err(classify)?;
+        found.as_ref().map(run_header_from_doc).transpose()
     }
 
     async fn commit_run(
