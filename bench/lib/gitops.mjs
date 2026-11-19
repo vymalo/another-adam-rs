@@ -75,9 +75,12 @@ const preparations = new Map();
 export async function ensureAgentFolder({ repoDir, revision, dest, steps, folder = 'bin/adam-coder/agent', unpack = unpackAgentFolder }) {
   if (!Number.isSafeInteger(steps) || steps < 1) throw new Error('the turn limit is required: both agents are given the same one');
   if (!REV.test(revision)) throw new Error('the revision must be a full commit id');
-  if (folderIsMade(dest, revision, steps)) return dest;
-  return serialized(path.resolve(dest), async () => {
-    if (folderIsMade(dest, revision, steps)) return dest;
+  // One spelling of the destination for the marker, the lock, the temporary sibling and the rename: `dest/` and
+  // `dest` are one folder, and `${dest}/` + `.tmp` would put the temporary inside the folder it must replace.
+  const target = path.resolve(dest);
+  if (folderIsMade(target, revision, steps)) return dest;
+  return serialized(target, async () => {
+    if (folderIsMade(target, revision, steps)) return dest;
     const git = localGit(repoDir);
     try {
       await git(['cat-file', '-e', `${revision}^{commit}`]);
@@ -86,7 +89,7 @@ export async function ensureAgentFolder({ repoDir, revision, dest, steps, folder
     }
     const tarball = await git(['archive', '--format=tar', revision, '--', folder]);
     const strip = folder.split('/').length;
-    const temp = `${dest}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+    const temp = `${target}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
     try {
       fs.mkdirSync(temp, { recursive: true });
       await unpack(tarball, temp, strip);
@@ -94,8 +97,8 @@ export async function ensureAgentFolder({ repoDir, revision, dest, steps, folder
       setTurnLimit(path.join(temp, 'instructions.md'), steps);
       await new Promise((resolve) => execFile('chmod', ['-R', 'a+rX', temp], resolve));
       fs.writeFileSync(path.join(temp, '.revision'), `${revision}:${steps}\n`);
-      fs.rmSync(dest, { recursive: true, force: true });
-      fs.renameSync(temp, dest);
+      fs.rmSync(target, { recursive: true, force: true });
+      fs.renameSync(temp, target);
       return dest;
     } catch (e) {
       fs.rmSync(temp, { recursive: true, force: true });
