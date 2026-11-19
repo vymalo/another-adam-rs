@@ -312,7 +312,7 @@ check and the hold one step (vymalo/another-adam-rs#125):
   not one of its files any more (it was listed, and copied through the link).
 * `git` cannot be given a descriptor: it finds its work tree by name inside its own process (*verified*, git 2.43.0: a held descriptor,
   `/proc/self/fd/N` and a relative `GIT_WORK_TREE` do not change that). So `GitPin::check` looks at the directory against the descriptor
-  first and last, and `GitCmd` and the coder's `GitAt::command` once more after that, as near to the start of `git` as they can
+  first and last, and `GitCmd` and `adam-code-tools`'s `GitAt::command` once more after that, as near to the start of `git` as they can
   (`SlotDir::is_still_here`: `fstat` of the descriptor against `lstat` of the name, which must be a directory and not a link). A slot that
   was moved away and replaced by a directory of the same name (which `lstat` of the name alone calls fine, and `git add -A` calls a work
   tree in which every file was deleted) is refused. **This narrows the window and does not close it.** What closes it is a slot that cannot

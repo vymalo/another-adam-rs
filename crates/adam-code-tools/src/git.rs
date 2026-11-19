@@ -1,10 +1,9 @@
 //! Where the tools ask `git` ([`GitAt`]) and the one question every tool asks: the files of a
 //! slot ([`list_files`]). The coder asks more of the same `GitAt` (`adam_coder`'s `tools::gitcli`).
 //!
-//! The few `git` questions the tools ask that `adam-workspace` does not answer. They are asked
-//! **pinned** to the slot's repository as the coder's own metadata names it ([`GitAt`]): never to
-//! wherever the slot's `.git` file, a `commondir` or a `gitdir` says, which a run's commands write.
-//! No credentials are involved.
+//! A question is asked **pinned** to the slot's repository as the workspace's metadata names it:
+//! never to wherever the slot's `.git` file, a `commondir` or a `gitdir` says, which a run's commands
+//! write. No credentials are involved.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,10 +72,16 @@ impl GitAt {
         Self::of(Arc::clone(worktree.root()), worktree.git_pin())
     }
 
-    /// A slot's directory and its repository's pin; with no pin, the repository is **refused** (no
-    /// `git` is started there). [`slot`](Self::slot) and [`worktree`](Self::worktree) are this
-    /// with what the coder's metadata says.
-    pub fn of(root: Arc<SlotDir>, pin: Option<GitPin>) -> Self {
+    /// A slot's directory with no pin: the repository is **refused**, as for a slot whose metadata
+    /// cannot say (a test's). Only with the feature `test-util`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn refused_at(root: Arc<SlotDir>) -> Self {
+        Self::of(root, None)
+    }
+
+    // Private: a root paired with another slot's pin would ask `git` about one repository from the
+    // directory of another.
+    fn of(root: Arc<SlotDir>, pin: Option<GitPin>) -> Self {
         Self {
             root,
             pin: pin.map_or(Pin::Refused, Pin::Pinned),
@@ -252,7 +257,7 @@ fn without_host_paths(said: &str, slot: &Path) -> String {
 ///
 /// This is the **only** way the read tools enumerate files: it asks `git` through [`GitAt`], so the
 /// git sandbox applies when there is one, and nested `.gitignore` files, `info/exclude` and the
-/// global rules are `git`'s own and agree with what `commit_and_push` sees. It never walks the
+/// global rules are `git`'s own and agree with what a commit of the slot sees. It never walks the
 /// directory by its name. Left out: a path under a `.git` (any case) and a directory (an embedded
 /// repository is listed by `git` with a trailing `/`). A tracked file that was deleted is still
 /// listed: the caller looks at each file it uses.

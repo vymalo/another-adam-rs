@@ -1039,7 +1039,7 @@ pub(super) mod pinned_tests {
         let at = GitAt::slot(&f.slot);
         assert!(head_sha(&at).await.is_some());
         // The same slot as the coder finds it when its metadata cannot say: no pin.
-        let refused = GitAt::of(Arc::clone(f.slot.root()), None);
+        let refused = GitAt::refused_at(Arc::clone(f.slot.root()));
         assert_eq!(ask_everything(&refused).await, (None, None, None));
         assert!(!f.marker.exists());
     }
