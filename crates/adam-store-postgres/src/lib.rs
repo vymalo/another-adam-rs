@@ -68,6 +68,12 @@ const PUSH_COLUMNS: &str = "run_id, id, agent, owner, config, cursor, state, att
 
 const RUN_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, state, wake_at, version, created_at, updated_at";
 
+/// What `create_run` and `commit_run` return: [`RUN_COLUMNS`] without `state`. The caller wrote
+/// the state, and a `RETURNING` that echoed it would parse the largest column back on every
+/// transition.
+const RUN_METADATA_COLUMNS: &str =
+    "id, agent, conversation_id, parent_id, status, wake_at, version, created_at, updated_at";
+
 /// A [`Store`] backed by PostgreSQL (12+).
 #[derive(Clone, Debug)]
 pub struct PgStore {
@@ -359,7 +365,7 @@ impl Sql {
                 "INSERT INTO {runs} (id, agent, conversation_id, parent_id, status, state, wake_at,
                                      sched_at, version, created_at, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $9)
-                 RETURNING {RUN_COLUMNS}"
+                 RETURNING {RUN_METADATA_COLUMNS}"
             )),
             load_run: Arc::from(format!("SELECT {RUN_COLUMNS} FROM {runs} WHERE id = $1")),
             load_version: Arc::from(format!("SELECT version FROM {runs} WHERE id = $1")),
@@ -368,7 +374,7 @@ impl Sql {
                     SET status = $3, state = $4, wake_at = $5, sched_at = $6,
                         version = version + 1, updated_at = $7
                   WHERE id = $1 AND version = $2
-                 RETURNING {RUN_COLUMNS}"
+                 RETURNING {RUN_METADATA_COLUMNS}"
             )),
             open_run: Arc::from(format!(
                 "SELECT {RUN_COLUMNS} FROM {runs}
@@ -562,9 +568,17 @@ fn to_i64(n: u64, what: &str) -> StoreResult<i64> {
 }
 
 fn run_from_row(row: &PgRow) -> StoreResult<RunRecord> {
+    let mut run = run_metadata_from_row(row)?;
+    let Json(state): Json<Value> = row.try_get("state").map_err(classify)?;
+    run.state = state;
+    Ok(run)
+}
+
+/// A row of [`RUN_METADATA_COLUMNS`]: the record a write returns, whose `state` is
+/// [`Value::Null`].
+fn run_metadata_from_row(row: &PgRow) -> StoreResult<RunRecord> {
     let status: String = row.try_get("status").map_err(classify)?;
     let version: i64 = row.try_get("version").map_err(classify)?;
-    let Json(state): Json<Value> = row.try_get("state").map_err(classify)?;
     Ok(RunRecord {
         id: RunId(row.try_get::<Uuid, _>("id").map_err(classify)?),
         agent: row.try_get("agent").map_err(classify)?,
@@ -575,7 +589,7 @@ fn run_from_row(row: &PgRow) -> StoreResult<RunRecord> {
             .map(RunId),
         status: RunStatus::parse(&status)
             .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
-        state,
+        state: Value::Null,
         wake_at: row.try_get("wake_at").map_err(classify)?,
         version: u64::try_from(version)
             .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
@@ -674,7 +688,7 @@ impl Store for PgStore {
             .map_err(|e| {
                 self.map_write_err(e, new.id, &new.agent, new.conversation_id.as_deref())
             })?;
-        run_from_row(&row)
+        run_metadata_from_row(&row)
     }
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
@@ -723,7 +737,7 @@ impl Store for PgStore {
             Err(err) => return Err(self.map_write_err(err, id, "", None)),
         };
         if let Some(row) = row {
-            return run_from_row(&row);
+            return run_metadata_from_row(&row);
         }
         let actual: Option<i64> = sqlx::query_scalar(safe(&self.sql.load_version))
             .bind(id.0)

@@ -23,6 +23,12 @@ let run = store.create_run(NewRun::new("support-bot", json!({"turn": 0})).conver
 let run = store.commit_run(run.id, run.version, RunUpdate::new(RunStatus::Parked, json!({"turn": 1}))).await?;
 ```
 
+A `create_run` or a `commit_run` returns the record **without its state** (`RunRecord::state` is `null`):
+the caller has the state it wrote, and echoing it back would transfer the largest member of the record
+on every transition. Read the run for the stored state (a store may have replaced a NUL in it);
+`journal_put` is the exception and returns the payload it stored, because the loop decodes the step's
+outcome from it.
+
 Creating a run with a deterministic id gives idempotent "fire once" semantics, for example one run per
 cron tick across all replicas. A second message on a conversation that has an open run gets
 `ConversationBusy`; resume the open run instead.
@@ -54,9 +60,11 @@ cron tick across all replicas. A second message on a conversation that has an op
   (`adam_core::storable`), so the NUL escape is only for data written before ADR 0051.
 * **MongoDB integers** above `i64::MAX` are rejected with `InvalidInput`.
 * **NUL characters.** `JSONB` cannot hold `\u0000`. Every adapter replaces it with U+FFFD
-  (`adam_core::storable`) before it writes a state, a journal payload or a push configuration,
-  and returns what it stored, so the value is the same in every backend and a tool that printed a
-  NUL does not fail the run ([ADR 0051](../decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
+  (`adam_core::storable`) before it writes a state, a journal payload or a push configuration, so the
+  value is the same in every backend and a tool that printed a NUL does not fail the run
+  ([ADR 0051](../decisions/0051-a-nul-is-stored-as-the-replacement-character.md)). `journal_put`,
+  `push_put` and `push_commit` return the cleaned value they stored; a run's `create_run`/`commit_run`
+  return no state, and a read returns the stored one.
 * **Time** is truncated to milliseconds in every store. Lease expiry uses the `now` the caller passes in:
   keep worker clocks in sync (NTP) and lease TTLs well above the expected skew.
 

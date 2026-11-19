@@ -16,6 +16,10 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
 * `PgStore::pool()`, `SCHEMA_VERSION` (4).
+* `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
+  state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
+  every transition. `load_run`, the claim and the listings return the stored state; `journal_put`
+  returns the stored payload (the loop decodes the step's outcome from it).
 * The `Store` implementation: call `migrate()` once at boot (idempotent, safe
   from every replica). On a schema that is already current it runs no DDL and takes no table
   lock, so a start cannot deadlock with live traffic (see "Schema version 3").

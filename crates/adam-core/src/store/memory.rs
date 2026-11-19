@@ -100,7 +100,11 @@ impl Store for MemoryStore {
                 owner: None,
             },
         );
-        Ok(run)
+        // The contract of `create_run`: the caller has the state it wrote.
+        Ok(RunRecord {
+            state: serde_json::Value::Null,
+            ..run
+        })
     }
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
@@ -141,7 +145,11 @@ impl Store for MemoryStore {
         slot.run.wake_at = update.wake_at.map(truncate_ms);
         slot.run.version += 1;
         slot.run.updated_at = now();
-        Ok(slot.run.clone())
+        // The contract of `commit_run`: the caller has the state it wrote.
+        Ok(RunRecord {
+            state: serde_json::Value::Null,
+            ..slot.run.clone()
+        })
     }
 
     async fn open_run_for_conversation(
@@ -479,7 +487,16 @@ mod tests {
             if n % 2 == 0 {
                 run = run.status(RunStatus::Parked);
             }
-            made.push(store.create_run(run).await.expect("create a run"));
+            let created = store.create_run(run).await.expect("create a run");
+            // A create returns the record without its state; the listing comparisons want the
+            // stored one.
+            made.push(
+                store
+                    .load_run(created.id)
+                    .await
+                    .expect("load")
+                    .expect("the created run"),
+            );
         }
         // What the store's contract says the order is, computed from the records themselves.
         made.sort_by_key(|r| std::cmp::Reverse((r.updated_at, r.id)));

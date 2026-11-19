@@ -534,7 +534,8 @@ impl Store for MongoStore {
                 conversation_id,
                 parent_id,
                 status,
-                state,
+                // The contract of `create_run`: the caller has the state it wrote.
+                state: serde_json::Value::Null,
                 wake_at,
                 version: 1,
                 created_at: t,
@@ -630,7 +631,8 @@ impl Store for MongoStore {
                 conversation_id: current.conversation_id,
                 parent_id: current.parent_id,
                 status,
-                state,
+                // The contract of `commit_run`: the caller has the state it wrote.
+                state: serde_json::Value::Null,
                 wake_at,
                 version: expected + 1,
                 created_at: current.created_at,
@@ -1268,10 +1270,11 @@ mod returned_value_tests {
         let want = json!({
             "nested": {"k\u{FFFD}ey": ["a\u{FFFD}b", {"deep": [1, 2, {"text": "x\u{FFFD}y"}]}]},
         });
-        assert_eq!(created.state, want, "create_run returns what it stored");
+        assert!(created.state.is_null(), "a write does not echo the state");
         assert_eq!(
             store.load_run(created.id).await.unwrap().unwrap().state,
-            want
+            want,
+            "the stored state is the cleaned one"
         );
 
         let committed = store
@@ -1285,14 +1288,19 @@ mod returned_value_tests {
             )
             .await
             .unwrap();
+        assert!(committed.state.is_null());
+        let stored = store.load_run(created.id).await.unwrap().unwrap();
         assert_eq!(
-            committed.state,
+            stored.state,
             json!({"turn": 2, "log": ["ok", "bad\u{FFFD}byte"]})
         );
         assert_eq!(
-            committed,
-            store.load_run(created.id).await.unwrap().unwrap(),
-            "every field of the returned record is the stored one"
+            stored,
+            RunRecord {
+                state: stored.state.clone(),
+                ..committed
+            },
+            "every other field of the returned record is the stored one"
         );
 
         let entry = store
@@ -1308,7 +1316,8 @@ mod returned_value_tests {
             .unwrap();
         assert_eq!(
             entry.payload,
-            json!({"out": "a\u{FFFD}b", "nested": {"k\u{FFFD}ey": [1, {"x": "y"}]}})
+            json!({"out": "a\u{FFFD}b", "nested": {"k\u{FFFD}ey": [1, {"x": "y"}]}}),
+            "a journal entry returns the payload it stored"
         );
         assert_eq!(
             entry,
@@ -1333,7 +1342,11 @@ mod returned_value_tests {
             0,
             "create_run converts nothing back"
         );
-        assert_eq!(created.state, big);
+        assert!(created.state.is_null(), "a write does not echo the state");
+        assert_eq!(
+            store.load_run(created.id).await.unwrap().unwrap().state,
+            big
+        );
 
         // A read does convert, so a counter that never moved would fail here.
         let before = conversion_counter::calls();
@@ -1363,10 +1376,15 @@ mod returned_value_tests {
             1,
             "commit_run converts the old state once, never the new one"
         );
-        assert_eq!(committed.state, next);
+        assert!(committed.state.is_null());
+        let stored = store.load_run(created.id).await.unwrap().unwrap();
+        assert_eq!(stored.state, next);
         assert_eq!(
-            committed,
-            store.load_run(created.id).await.unwrap().unwrap()
+            stored,
+            RunRecord {
+                state: stored.state.clone(),
+                ..committed
+            }
         );
 
         let payload = json!({"content": "z".repeat(1024 * 1024)});
