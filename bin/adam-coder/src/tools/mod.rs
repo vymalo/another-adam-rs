@@ -1120,7 +1120,7 @@ impl Tool for Gated {
             let tier = self
                 .env
                 .notes
-                .load_existing(&run)
+                .load_shared(&run)
                 .await
                 .map_err(|e| notes_error(&e))?
                 .map_or(AccessTier::Plan, |notes| self.env.tier_of(&notes));
@@ -1131,6 +1131,13 @@ impl Tool for Gated {
             }
         }
         let result = self.inner.call(ctx, args).await;
+        // A tool that writes the worktree tells the language servers of the run: a server is told of
+        // the files it holds open, and of the others by the walk of its next call, which such a
+        // write must not leave to the walk interval.
+        if writes_the_worktree(&self.name) {
+            let run = ctx.root_run_id().to_string();
+            self.env.commands.language_servers().wrote(&run);
+        }
         // Taken whatever the result, so nothing outlives the call.
         let told = self.env.told(ctx);
         match result {
@@ -1148,6 +1155,18 @@ impl Tool for Gated {
 
 /// What a tool's time limit adds to the bound it has of its own.
 const LIMIT_MARGIN: Duration = Duration::from_secs(30);
+
+/// The tools whose call can change a file of the worktree under a language server's root. The
+/// servers are told of the files they hold open; a file they do not is reported by the walk their
+/// next call makes, which one of these calls must bring forward ([`Servers::wrote`]). An MCP tool
+/// that writes the worktree cannot be named here: its change is reported at the next walk, at most
+/// one interval later.
+fn writes_the_worktree(tool: &str) -> bool {
+    matches!(
+        tool,
+        "write_file" | "edit_file" | "apply_patch" | "run" | "run_checks" | "start_command"
+    )
+}
 
 /// The tools that **do not need a limit of their own**, because they are quick by construction: a
 /// file operation on the run's own directory, a request to the code host (its HTTP client gives up
