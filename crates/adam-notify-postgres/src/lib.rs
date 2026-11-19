@@ -20,6 +20,12 @@
 //! notification arriving. A listener that reconnects tells its subscribers
 //! ([`Delivery::Resync`]) so they look again at once.
 //!
+//! A batch is one statement, and PostgreSQL folds identical channel-and-payload
+//! pairs of one transaction into one notification: whether the second copy of an
+//! identical event arrives therefore depends on how the queue happened to be
+//! batched when it was sent, so nothing may depend on the count. A duplicate is
+//! indistinguishable from the first.
+//!
 //! # Channels and payloads
 //!
 //! Two channels, `{prefix}events` and `{prefix}signals` (prefix `adam_` by
@@ -50,10 +56,13 @@
 //! transaction-mode one. The publisher never blocks the caller: a full queue
 //! drops the item.
 //!
-//! A process whose events no one else needs (a single replica) can keep them
+//! A process whose events no one else needs (`ROLE=all`, one pod) can keep them
 //! local: set `NOTIFY_LOCAL_ONLY` (`true`/`1`, default `false`) and
 //! [`PgEventSink`] delivers to the local sink without encoding or queueing
-//! anything for `NOTIFY`. It is a deployment choice, never detected.
+//! anything for `NOTIFY`. With `topology: split` (a front and its workers, even
+//! one replica each) it silences the live events between them; their state
+//! changes still reach the 250 ms poll. It is a deployment choice, never
+//! detected.
 //!
 //! Its lifecycle, and the guarantees, are in the [crate README](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-notify-postgres/README.md)
 //! and `docs/architecture.md`.
@@ -141,6 +150,8 @@ struct Inner {
     listening: watch::Sender<bool>,
     dropped: AtomicU64,
     failed: AtomicU64,
+    /// Failed statements, whatever the size of the batch each carried.
+    failed_statements: AtomicU64,
     /// `pg_notify` statements issued, a batch counting once.
     statements: AtomicU64,
 }
@@ -250,7 +261,8 @@ impl PgNotify {
     /// Signals still cross: wake-ups and cancels are not events.
     ///
     /// Default `false`; [`new`](Self::new) takes the value from
-    /// [`LOCAL_ONLY_ENV`]. Call it before [`event_sink`](Self::event_sink), for
+    /// [`LOCAL_ONLY_ENV`], and this call overrides it, including a value that
+    /// is not a boolean. Call it before [`event_sink`](Self::event_sink), for
     /// the same reason as [`with_channel_prefix`](Self::with_channel_prefix).
     pub fn local_only(self, local_only: bool) -> Self {
         Self::build(
@@ -288,6 +300,7 @@ impl PgNotify {
                 listening: watch::channel(false).0,
                 dropped: AtomicU64::new(0),
                 failed: AtomicU64::new(0),
+                failed_statements: AtomicU64::new(0),
                 statements: AtomicU64::new(0),
             }),
         }
@@ -332,9 +345,10 @@ impl PgNotify {
     /// Returns `Ok(())` only when stopped. Connection trouble is not an error:
     /// the listener logs it, reconnects with a doubling backoff (100 ms to
     /// 10 s) and tells its subscribers to [`Resync`](Delivery::Resync), and a
-    /// failed `pg_notify` drops its item. Fails with
-    /// [`NotifyError::AlreadyRunning`] if it is already running (also through
-    /// a clone), and with [`NotifyError::PoolClosed`] once the pool is closed.
+    /// failed `pg_notify` drops its batch (up to [`MAX_BATCH_ITEMS`] items).
+    /// Fails with [`NotifyError::AlreadyRunning`] if it is already running
+    /// (also through a clone), and with [`NotifyError::PoolClosed`] once the
+    /// pool is closed.
     ///
     /// The listener holds one connection of the pool for as long as this
     /// runs. When `stop` resolves, the `pg_notify` in flight completes and the
@@ -344,7 +358,8 @@ impl PgNotify {
     /// any notification).
     ///
     /// Fails at once with [`NotifyError::InvalidLocalOnly`] when
-    /// [`LOCAL_ONLY_ENV`] was set to something that is not a boolean.
+    /// [`LOCAL_ONLY_ENV`] was set to something that is not a boolean and
+    /// [`local_only`](Self::local_only) did not override it.
     pub async fn run(&self, stop: impl Future<Output = ()> + Send) -> Result<(), NotifyError> {
         let inner = &*self.inner;
         if let Some(raw) = &inner.local_only_problem {
@@ -437,7 +452,9 @@ impl Inner {
                 // Drop the watch guard inside, so the future stays `Send`.
                 () = async { drop(stopped.wait_for(|stopped| *stopped).await); } => break,
                 item = outbox.recv() => match item {
-                    Some(item) => self.send(take_batch(item, outbox)).await,
+                    Some(item) => {
+                        self.send(take_batch(item, outbox)).await;
+                    }
                     // The sender lives in `self`; unreachable, but never spin.
                     None => break,
                 },
@@ -447,14 +464,16 @@ impl Inner {
     }
 
     /// Send what is already queued, one statement per batch, in order, for at
-    /// most `within`.
+    /// most `within`. Only a batch whose statement succeeded is counted.
     async fn drain(&self, outbox: &mut mpsc::Receiver<Outgoing>, within: Duration) {
         let sending = async {
             let mut sent = 0_usize;
             while let Ok(first) = outbox.try_recv() {
                 let batch = take_batch(first, outbox);
-                sent += batch.len();
-                self.send(batch).await;
+                let count = batch.len();
+                if self.send(batch).await {
+                    sent += count;
+                }
             }
             sent
         };
@@ -485,8 +504,9 @@ impl Inner {
 
     /// One `pg_notify` statement for a whole batch; a failure drops the items in
     /// it. PostgreSQL delivers the notifications in row order, and folds
-    /// identical channel-and-payload pairs of one statement into one.
-    async fn send(&self, items: Vec<Outgoing>) {
+    /// identical channel-and-payload pairs of one statement into one. `true`
+    /// when the statement succeeded.
+    async fn send(&self, items: Vec<Outgoing>) -> bool {
         debug_assert!(!items.is_empty(), "a batch has at least one item");
         let (channels, payloads) = self.columns(items);
         let count = channels.len();
@@ -498,10 +518,23 @@ impl Inner {
         .execute(&self.pool)
         .await;
         self.statements.fetch_add(1, Relaxed);
-        if let Err(e) = sent {
-            let n = self.failed.fetch_add(count as u64, Relaxed) + count as u64;
-            if should_log(n) {
-                tracing::warn!(error = %e, failed = n, "pg_notify failed, dropping (best effort)");
+        match sent {
+            Ok(_) => true,
+            Err(e) => {
+                let items = self.failed.fetch_add(count as u64, Relaxed) + count as u64;
+                let statements = self.failed_statements.fetch_add(1, Relaxed) + 1;
+                // The first failed statement, then every thousandth, whatever
+                // the batch size: a batch of 32 must not swallow the first one.
+                if should_log(statements) {
+                    tracing::warn!(
+                        error = %e,
+                        batch = count,
+                        failed = items,
+                        statements,
+                        "pg_notify failed, dropping the batch (best effort)"
+                    );
+                }
+                false
             }
         }
     }
@@ -674,13 +707,14 @@ mod tests {
     use super::*;
 
     /// A pool that never connects: enough to test everything that does not
-    /// touch the database.
+    /// touch the database. The explicit `local_only(false)` keeps an ambient
+    /// `NOTIFY_LOCAL_ONLY` from changing what these tests measure.
     fn notify() -> (PgNotify, BroadcastSink) {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://nobody@127.0.0.1:1/none")
             .expect("lazy pool");
         let local = BroadcastSink::default();
-        (PgNotify::new(pool, local.clone()), local)
+        (PgNotify::new(pool, local.clone()).local_only(false), local)
     }
 
     fn progress(m: &str) -> RunEvent {
@@ -977,5 +1011,39 @@ mod tests {
         let (channels, payloads) = n.inner.columns(batch);
         assert_eq!(channels, ["adam_events", "adam_signals", "adam_events"]);
         assert_eq!(payloads, ["e1", "s1", "e2"]);
+    }
+
+    /// The log rate limit counts failed **statements**, so the first one is
+    /// loud whatever its batch carried; the item counter keeps counting items.
+    #[tokio::test]
+    async fn a_failed_statement_is_counted_once_however_many_items_it_carried() {
+        let (n, _) = notify();
+        n.inner.pool.close().await;
+        let one = vec![Outgoing {
+            signals: false,
+            payload: "x".into(),
+        }];
+        assert!(
+            !n.inner.send(one).await,
+            "a closed pool fails the statement"
+        );
+        assert_eq!(n.inner.failed.load(Relaxed), 1);
+        assert_eq!(n.inner.failed_statements.load(Relaxed), 1);
+        assert!(should_log(1), "the first failed statement is logged");
+
+        let batch: Vec<Outgoing> = (0..MAX_BATCH_ITEMS)
+            .map(|_| Outgoing {
+                signals: false,
+                payload: "y".into(),
+            })
+            .collect();
+        assert!(!n.inner.send(batch).await);
+        assert_eq!(
+            n.inner.failed.load(Relaxed),
+            1 + MAX_BATCH_ITEMS as u64,
+            "the item counter counts every dropped item"
+        );
+        assert_eq!(n.inner.failed_statements.load(Relaxed), 2);
+        assert!(!should_log(2), "the second failed statement is not logged");
     }
 }

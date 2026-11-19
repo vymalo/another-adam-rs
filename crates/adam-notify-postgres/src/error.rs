@@ -13,7 +13,8 @@ pub enum NotifyError {
     /// anything but `[a-z0-9_]`.
     #[error("invalid channel prefix {0:?}")]
     InvalidPrefix(String),
-    /// `NOTIFY_LOCAL_ONLY` is set to something that is not `true`, `1`, `false` or `0`.
+    /// `NOTIFY_LOCAL_ONLY` is set to something that is not `true`, `1`, `false` or `0`, and
+    /// [`PgNotify::local_only`](crate::PgNotify::local_only) did not override it.
     #[error("NOTIFY_LOCAL_ONLY must be true or false, got {0:?}")]
     InvalidLocalOnly(String),
     /// [`PgNotify::run`](crate::PgNotify::run) is already running for this instance (or one of

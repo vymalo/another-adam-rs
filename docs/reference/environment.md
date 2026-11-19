@@ -9,7 +9,7 @@ The chart sets these from its values: [chart README](../../deploy/coder/README.m
 files or logs; they are `SecretString`s and absent from `Debug`.
 
 The roles that run workers (`all`, `worker`) read everything below except where a row says otherwise.
-A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
+A `control-plane` reads only `ROLE`, `DATABASE_URL`, `NOTIFY_LOCAL_ONLY`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
 `ADAM_AGENT_DIR`, the `SESSION_*` limits and the optional `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS`, and a chart may set the rest for every role.
 
 ## Both binaries (`adam-service`)
@@ -66,13 +66,14 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 
 ## Cross-process notifications (`adam-notify-postgres`)
 
-`adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. `adam-agent` does not
-use this crate. Source: `crates/adam-notify-postgres/src/lib.rs`,
+`adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'
+shared configuration parses the variable, so a bad value is exit 78 in either; `adam-agent` runs no
+`notify` component, so the value has no effect there. Source: `crates/adam-notify-postgres/src/lib.rs`,
 [the crate README](../../crates/adam-notify-postgres/README.md).
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (any case): keep this process's events local. `emit` delivers them to the in-process sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway, so a single replica would pay for a round trip and an echo it discards. Signals (wake-ups, cancels) still cross. A deployment choice for one replica; it is never detected. Anything else: the `notify` component stops at startup and the process exits **70** (the value is read by this crate, not by the binary's configuration, which reports a bad value as exit 78) | `false` |
+| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (any case): keep this process's events local. `emit` delivers them to the in-process sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway. Signals (wake-ups, cancels) still cross. One **process** (`ROLE=all`, one pod): with `topology: split` (a front and its workers, even one replica each) it silences the live events between them, whose state changes still reach the 250 ms poll. A deployment choice, never detected. Anything else: a startup problem, exit 78 | `false` |
 
 ## Agent folder (both binaries)
 

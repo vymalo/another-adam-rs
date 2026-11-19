@@ -1026,7 +1026,7 @@ sequenceDiagram
     W->>W: fire_cancel(run): ctx.cancelled() resolves in the step
 ```
 
-* **Best effort.** `publish` and `emit` queue (1 024 items, then drop); a failed `pg_notify` drops its item.
+* **Best effort.** `publish` and `emit` queue (1 024 items, then drop); a failed `pg_notify` drops its batch (up to `MAX_BATCH_ITEMS`, 32 items).
 * **No echo.** Events carry the sender's id and the listener skips its own; signals have no origin.
 * **Size.** PostgreSQL rejects a payload of 8000 bytes or more, so nothing over 7 999 is sent. An
   oversize `Status` loses the tail of its detail; any other oversize event stays local.

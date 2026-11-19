@@ -132,7 +132,8 @@ stateDiagram-v2
   queued items is ⌈N/32⌉ round trips instead of N, and the notifications keep
   the queue's order (`NOTIFY` delivers in commit order, and one statement's rows
   are evaluated in row order). A failed statement drops the items in that batch
-  and warns the same way; nothing is retried. When `stop` resolves, the items
+  and warns with the batch size: the first failed statement, then every
+  thousandth. Nothing is retried. When `stop` resolves, the items
   still queued are sent the same way, for up to `DRAIN_ON_STOP` (2 s) before
   `run` returns; what cannot be sent in that time is dropped, as any
   notification may be.
@@ -155,8 +156,9 @@ stateDiagram-v2
   lost (nobody listening, a reconnect, a full queue, an oversize event); none is
   duplicated by this crate. Nothing in the runtime depends on one arriving.
   PostgreSQL folds identical channel-and-payload pairs of one transaction into
-  one, so a batch that carries the same payload twice delivers it once; a
-  duplicate is indistinguishable from the first and nothing counts them.
+  one, so a batch that carries the same payload twice delivers it once; whether
+  the second copy is in that batch depends on timing, and a duplicate is
+  indistinguishable from the first, so nothing counts them.
 * **Events do not echo and are not re-published.**
 * **Events are not replayable.** After a gap the durable record
   (`Runtime::view`) is the truth; that is what the SSE subscription polls. The only memory is the
@@ -177,15 +179,15 @@ forwarded to `sqlx`.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (ASCII case ignored): keep this process's events local. `PgEventSink::emit` delivers them to the local sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway, so a single replica would pay for a round trip and an echo it discards. Signals (wake-ups, cancels) still cross. It is a deployment choice, never detected. `PgNotify::new` reads it once; `.local_only(bool)` overrides it. Anything else: `run` fails at once with `NotifyError::InvalidLocalOnly` (class `Invalid`), so the `notify` component stops at startup and the process exits 70 | `false` |
+| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (ASCII case ignored): keep this process's events local. `PgEventSink::emit` delivers them to the local sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway, so a process with no other process to tell would pay for a round trip and an echo it discards. Signals (wake-ups, cancels) still cross. One **process** (`ROLE=all`, one pod): with `topology: split` (a front and its workers, even one replica each) it silences the live events between them, whose state changes still reach the 250 ms poll. It is a deployment choice, never detected. `PgNotify::new` reads it once; `.local_only(bool)` overrides it. Anything else: the binaries' configuration refuses it at startup (exit 78); an embedder that calls `PgNotify::new` itself gets `NotifyError::InvalidLocalOnly` (class `Invalid`) from `run` | `false` |
 
 ## Tests
 
 | File | What |
 |---|---|
-| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step, the largest piece of streamed text and the largest usage report fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes, batching (the cap, the order and the channel of each item), local-only (100 events reach the local sink and nothing is queued; the variable's spellings, a bad one fails `run`). Offline |
+| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step, the largest piece of streamed text and the largest usage report fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes, batching (the cap, the order and the channel of each item; a failed statement counted once whatever its batch carried), local-only (100 events reach the local sink and nothing is queued; the variable's spellings, a bad one fails `run`). Offline |
 | `tests/conformance.rs` | `adam-notify-testkit`'s `notifier_conformance!` with two `PgNotify` on separate pools, plus one case at the exact 7 999-byte limit |
-| `tests/batching.rs` | one statement per queued batch, counted by `statements_sent` (a full batch is 1, two batches and a remainder 3), and 100 queued events arriving in queue order across batches |
+| `tests/batching.rs` | one statement per queued batch, counted by `statements_sent` (a full batch is 1, two batches and a remainder 3), 100 queued events arriving in queue order across batches, the stop-drain batching what is queued, and a signal still crossing from a `local_only(true)` process |
 | `tests/two_runtimes.rs` | a front (starter only) and a worker, each with its own pools, `PgNotify` and `Runtime`, poll interval 30 s: a start and a deliver wake an idle worker; a step's `Progress` reaches the front exactly once and before the `Parked` status; a cancel reaches the step within 2 s; terminating the listener's backend gives a `Resync` within 5 s, a run started meanwhile completes, and a later signal arrives |
 
 | Variable | Meaning |

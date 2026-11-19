@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use adam_core::RunId;
 use adam_notify_postgres::{MAX_BATCH_ITEMS, PgNotify};
-use adam_runtime::{BroadcastSink, EventSink, RunEvent, RunSubscription};
+use adam_runtime::{
+    BroadcastSink, Delivery, EventSink, Notifier, RunEvent, RunSubscription, Signal,
+};
+use futures::StreamExt;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -42,6 +45,13 @@ async fn quiet(url: &str, prefix: &str) -> (PgNotify, BroadcastSink) {
         // The ambient environment must not decide what this test measures.
         .local_only(false);
     (notify, local)
+}
+
+/// [`quiet`] with `NOTIFY_LOCAL_ONLY` on: events stay in the process, signals
+/// still cross.
+async fn quiet_local_only(url: &str, prefix: &str) -> (PgNotify, BroadcastSink) {
+    let (notify, local) = quiet(url, prefix).await;
+    (notify.local_only(true), local)
 }
 
 /// Start `run`; the stop and its task are returned for the end of the test.
@@ -164,6 +174,89 @@ async fn a_batch_keeps_the_order_of_the_queue() {
         "the test crossed a batch boundary: {}",
         sender.statements_sent()
     );
+
+    stop(listener_stop, listener_task).await;
+}
+
+/// `NOTIFY_LOCAL_ONLY` silences events only: a signal published by a local-only
+/// process still reaches the other process's notifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_only_process_still_sends_its_signals() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let prefix = format!("adam_b{}_", short());
+
+    let (listener, _) = quiet(&url, &prefix).await;
+    let (listener_stop, listener_task) = run(&listener);
+    listener.wait_listening().await;
+    let mut deliveries = listener.notifier().subscribe();
+
+    let (sender, _) = quiet_local_only(&url, &prefix).await;
+    let (sender_stop, sender_task) = run(&sender);
+    let signal = Signal::Finished { run: RunId::new() };
+    sender.notifier().publish(signal.clone()).await;
+    let got = tokio::time::timeout(PATIENCE, async {
+        while let Some(delivery) = deliveries.next().await {
+            if let Delivery::Signal(signal) = delivery {
+                return signal;
+            }
+        }
+        panic!("the subscription ended");
+    })
+    .await
+    .expect("a signal in time");
+    assert_eq!(got, signal);
+
+    stop(sender_stop, sender_task).await;
+    stop(listener_stop, listener_task).await;
+}
+
+/// The drain at stop batches too: N items queued before `run`, a stop that is
+/// already resolved, and one statement per `MAX_BATCH_ITEMS` of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stop_drain_sends_one_statement_per_batch() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let prefix = format!("adam_b{}_", short());
+
+    let (listener, _) = quiet(&url, &prefix).await;
+    let (listener_stop, listener_task) = run(&listener);
+    listener.wait_listening().await;
+    let mut deliveries = listener.notifier().subscribe();
+
+    let count = 2 * MAX_BATCH_ITEMS + 5;
+    let (stopping, _) = quiet(&url, &prefix).await;
+    let notifier = stopping.notifier();
+    let sent: Vec<Signal> = (0..count)
+        .map(|_| Signal::Finished { run: RunId::new() })
+        .collect();
+    for signal in &sent {
+        notifier.publish(signal.clone()).await;
+    }
+    stopping
+        .run(std::future::ready(()))
+        .await
+        .expect("a stopped run is Ok");
+    assert_eq!(
+        stopping.statements_sent(),
+        3,
+        "ceil({count} / {MAX_BATCH_ITEMS}) statements"
+    );
+
+    // The drain really sent them: the other process's notifier gets every one.
+    let mut got = Vec::new();
+    while got.len() < sent.len() {
+        let delivery = tokio::time::timeout(PATIENCE, deliveries.next())
+            .await
+            .expect("the drained signals arrive in time")
+            .expect("the sink is open");
+        if let Delivery::Signal(signal) = delivery {
+            got.push(signal);
+        }
+    }
+    assert_eq!(got, sent, "every queued signal arrives, in order");
 
     stop(listener_stop, listener_task).await;
 }
