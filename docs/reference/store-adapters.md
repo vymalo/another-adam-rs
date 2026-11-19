@@ -23,6 +23,17 @@ let run = store.create_run(NewRun::new("support-bot", json!({"turn": 0})).conver
 let run = store.commit_run(run.id, run.version, RunUpdate::new(RunStatus::Parked, json!({"turn": 1}))).await?;
 ```
 
+A `create_run` or a `commit_run` returns the record **without its state** (`RunRecord::state` is `null`):
+the caller has the state it wrote, and echoing it back would transfer the largest member of the record
+on every transition. Read the run for the stored state (a store may have replaced a NUL in it);
+`journal_put` is the exception and returns the payload it stored, because the loop decodes the step's
+outcome from it.
+
+`PgStore::connect` sizes its pool from `ADAM_PG_POOL_SIZE` (2 to 65535, default 16, per process;
+one is refused because the `adam-notify-postgres` listener holds a connection for the process's
+life); `connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A
+value that is not an integer in range fails the connect rather than falling back to 16.
+
 Creating a run with a deterministic id gives idempotent "fire once" semantics, for example one run per
 cron tick across all replicas. A second message on a conversation that has an open run gets
 `ConversationBusy`; resume the open run instead.
@@ -32,7 +43,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Guarantee | PostgreSQL 12+ (`sqlx`) | MongoDB 5.0+ (standalone is enough) |
 |---|---|---|
 | Commit CAS | `UPDATE .. WHERE version = $n RETURNING` | `findOneAndUpdate({_id, version: n}, {$inc: {version: 1}})` |
-| Journal first-writer-wins | `INSERT .. ON CONFLICT DO NOTHING`, read winner | `insertOne` with `_id = "<run>:<seq>"`, duplicate key: read winner |
+| Journal first-writer-wins | `INSERT .. ON CONFLICT DO NOTHING`, read winner | `insertOne` on `_id = "<run>:<seq>"`; a duplicate key means an earlier writer won, and their entry is read back |
 | Exclusive claiming | `FOR UPDATE SKIP LOCKED` in one statement | read candidates, `updateMany` re-checking due/lease in the filter with a claim token, read back by token |
 | Busy runs never claimed | `AND id <> ALL($busy)` | `_id: { $nin: busy }` |
 | Pinned claiming (`owner`, schema version 2) | `AND (owner IS NULL OR owner = $w)` and `owner = COALESCE(owner, $w)` | the same condition in the candidate and `updateMany` filters (a missing field is `null`) |
@@ -40,7 +51,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Journal deleted with its run | `ON DELETE CASCADE` | journal first, then runs, in batches |
 | Push configs (`push_*`, schema version 3): put, claim, commit | `INSERT .. ON CONFLICT DO UPDATE` bumping `version`; one `FOR UPDATE SKIP LOCKED` claim; `UPDATE .. WHERE version = $n` | update-or-insert on `_id = "<run>:<id>"`; a loop of `findOneAndUpdate` claims, each atomic; `findOneAndUpdate({_id, version: n})` |
 | Push configs deleted with their run | `ON DELETE CASCADE` | deleted with the journal by the purge |
-| `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC)`, a prefix is a range plus `starts_with` | `(agent, conversation_id, updated_at, _id)`, a prefix is an anchored escaped regex |
+| `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`, a prefix is a range plus `starts_with`; a prefix page sorts the matching index entries (the status filter is answered from the index) | `(agent, conversation_id, updated_at, _id)`, and `(agent, status, conversation_id, updated_at, _id)` when a status filter is set: a prefix is an anchored escaped regex, so the index bounds the scan but the page still sorts the matches; a listing of one conversation is read in index order |
 | State | `JSONB` (queryable with SQL) | real BSON document (queryable with dot paths) |
 | Transactions | none held open | none |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll |
@@ -54,9 +65,11 @@ cron tick across all replicas. A second message on a conversation that has an op
   (`adam_core::storable`), so the NUL escape is only for data written before ADR 0051.
 * **MongoDB integers** above `i64::MAX` are rejected with `InvalidInput`.
 * **NUL characters.** `JSONB` cannot hold `\u0000`. Every adapter replaces it with U+FFFD
-  (`adam_core::storable`) before it writes a state, a journal payload or a push configuration,
-  and returns what it stored, so the value is the same in every backend and a tool that printed a
-  NUL does not fail the run ([ADR 0051](../decisions/0051-a-nul-is-stored-as-the-replacement-character.md)).
+  (`adam_core::storable`) before it writes a state, a journal payload or a push configuration, so the
+  value is the same in every backend and a tool that printed a NUL does not fail the run
+  ([ADR 0051](../decisions/0051-a-nul-is-stored-as-the-replacement-character.md)). `journal_put`,
+  `push_put` and `push_commit` return the cleaned value they stored; a run's `create_run`/`commit_run`
+  return no state, and a read returns the stored one.
 * **Time** is truncated to milliseconds in every store. Lease expiry uses the `now` the caller passes in:
   keep worker clocks in sync (NTP) and lease TTLs well above the expected skew.
 

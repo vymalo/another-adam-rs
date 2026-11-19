@@ -523,7 +523,12 @@ async fn transition(
                 inner
                     .emit_status(run, &rec.agent, RunStatus::Failed, Some(e.to_string()))
                     .await;
-                inner.notify_parent(&committed).await;
+                // The report the parent gets is the one `ChildStatus::from_record` would build
+                // from a record whose state cannot be decoded.
+                let unreadable = format!("the run's state is unreadable: {e}");
+                inner
+                    .notify_parent(&committed, &Value::Null, Some(&unreadable))
+                    .await;
             }
             return true;
         }
@@ -612,7 +617,10 @@ async fn transition(
         Ok(Some(committed)) => {
             announce(inner, &committed, &next).await;
             // After the commit, never before: the parent's timer is the fallback for a crash here.
-            inner.notify_parent(&committed).await;
+            // The report is built from what was just written: the store does not echo the state.
+            inner
+                .notify_parent(&committed, &next.output, next.error.as_deref())
+                .await;
             true
         }
         Ok(None) => {

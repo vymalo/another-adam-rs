@@ -366,9 +366,11 @@ impl Inner {
                     self.run_cancel_hook(run, &rec.agent, env.agent);
                     self.fire_cancel(run);
                     self.announce_finished(run).await;
-                    self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
+                    self.emit_status(run, &rec.agent, RunStatus::Failed, Some(error.clone()))
                         .await;
-                    self.notify_parent(&committed).await;
+                    // A failed run reports its error; its output is not part of the notice.
+                    self.notify_parent(&committed, &Value::Null, Some(&error))
+                        .await;
                     return Ok(());
                 }
                 Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
@@ -436,11 +438,16 @@ impl Inner {
     /// ([`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND), or
     /// [`CHILD_REPORTED_KIND`](crate::CHILD_REPORTED_KIND) when the child has a conversation).
     ///
+    /// `output` and `error` are the values the caller just committed. The store returns the record
+    /// without its state ([`Store::commit_run`](adam_core::Store::commit_run)), so the caller
+    /// passes what it wrote instead of decoding what it sent; `child` supplies the ids, the status
+    /// and the parent.
+    ///
     /// Best effort by design, and never an error for the child: this runs after the child's own
     /// commit, so a crash or a store error here loses the message and nothing else. The parent
     /// keeps a timer and reads the child when it fires (`Ctx::child_status`), which is what makes
     /// the whole exchange at-least-once. A parent that is finished or gone has nobody to tell.
-    pub async fn notify_parent(&self, child: &RunRecord) {
+    pub async fn notify_parent(&self, child: &RunRecord, output: &Value, error: Option<&str>) {
         let Some(parent) = child.parent_id else {
             return;
         };
@@ -453,7 +460,7 @@ impl Inner {
         } else {
             RUN_FINISHED_KIND
         };
-        let notice = ChildStatus::from_record(child).notice(child.id, kind);
+        let notice = ChildStatus::from_parts(child.status, output, error).notice(child.id, kind);
         match self.deliver(parent, notice).await {
             Ok(()) => {}
             Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {

@@ -43,6 +43,13 @@ let run = store
     .await?;
 ```
 
+`create_run` and `commit_run` return the record **without its state** (`state` is `null`): the caller
+supplied it, and the state is the largest member of the record. Read the run for the stored state.
+Of the run writes, `journal_put` is the exception: it returns the payload it stored, which is what the
+loop decodes the step's outcome from (a store may have replaced a NUL in it,
+[ADR 0051](../../docs/decisions/0051-a-nul-is-stored-as-the-replacement-character.md)); the push
+methods return the cleaned configuration and cursor too.
+
 The semantics (CAS commits, first-writer-wins journal, leases, one open run
 per conversation) are described in the [architecture](../../docs/architecture.md#the-mental-model).
 

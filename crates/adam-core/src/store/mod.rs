@@ -187,6 +187,9 @@ impl NewRun {
 }
 
 /// Input for [`Store::commit_run`]: the next state of the run.
+///
+/// The returned record does not echo `state` ([`Store::commit_run`]): the caller wrote it, and a
+/// commit that transferred the whole state back would pay for the largest member twice.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunUpdate {
     pub status: RunStatus,
@@ -405,8 +408,12 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// provides a conformance suite every implementation should pass.
 ///
 /// Every JSON value a method writes is passed through [`storable`] first (a NUL in a string or a
-/// key becomes U+FFFD), and the method returns the value it stored, so the same run reads the same
-/// bytes on every backend and a tool that printed a NUL does not fail it.
+/// key becomes U+FFFD), so the same run reads the same bytes on every backend and a tool that
+/// printed a NUL does not fail it. A read returns the stored value. [`Store::journal_put`] returns
+/// the payload it stored (the loop decodes the step's outcome from it) and the push methods return
+/// the cleaned configuration and cursor; [`Store::create_run`] and [`Store::commit_run`] return the
+/// record without its state ([`RunRecord::state`] is [`Value::Null`]), which the caller wrote and
+/// does not need echoed back on every transition.
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
     /// Create tables/collections and indexes. Idempotent and safe to call
@@ -419,6 +426,9 @@ pub trait Store: Send + Sync + 'static {
     /// [`StoreError::ConversationBusy`] if the run is open and its
     /// conversation already has an open run. A deterministic id makes this
     /// an idempotent "fire once" (e.g. one run per schedule tick).
+    ///
+    /// The returned record carries no state ([`RunRecord::state`] is [`Value::Null`]): the caller
+    /// supplied it, and a read returns the stored one (a store may have replaced a NUL in it).
     async fn create_run(&self, run: NewRun) -> StoreResult<RunRecord>;
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>>;
@@ -430,6 +440,11 @@ pub trait Store: Send + Sync + 'static {
     /// [`StoreError::NotFound`] if the run doesn't exist, and
     /// [`StoreError::ConversationBusy`] if re-opening a finished run would give
     /// its conversation two open runs. Does not touch the lease.
+    ///
+    /// The returned record carries no state ([`RunRecord::state`] is [`Value::Null`]): the caller
+    /// supplied `update.state`, and a read returns the stored one. Every other field is the stored
+    /// one, so a caller that reports the commit (the version, the status, the parent notice) reads
+    /// it here and does not decode the state it already has.
     async fn commit_run(
         &self,
         id: RunId,
@@ -450,6 +465,10 @@ pub trait Store: Send + Sync + 'static {
     /// the entry that is recorded afterwards: `entry` if this call won, or the
     /// earlier winner. Errors with [`StoreError::NonDeterminism`] if the
     /// recorded entry has a different step name.
+    ///
+    /// The entry returned is the stored one, payload included: the payload went through
+    /// [`storable`], and the loop decodes the step's outcome from what is returned, so it must be
+    /// the bytes a replay will read.
     async fn journal_put(&self, run: RunId, entry: JournalEntry) -> StoreResult<JournalEntry>;
 
     /// All journal entries of a run, ordered by `seq`.
