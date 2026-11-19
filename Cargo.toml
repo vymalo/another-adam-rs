@@ -78,6 +78,9 @@ kube = { version = "4.2", default-features = false, features = ["client", "rustl
 libc = "0.2"
 # Finds line ends in the SSE parser (adam-model-openai); already in the tree under regex.
 memchr = "2"
+# The global allocator of the image's six binaries (ADR 0053 decision 11): musl's own is slow under
+# many threads. The crate compiles mimalloc's C sources with `cc`, so a musl build needs `musl-gcc`.
+mimalloc = "0.1"
 notify = "8"
 proc-macro2 = "1"
 proptest = "1"
