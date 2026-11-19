@@ -3877,6 +3877,9 @@ mod cases {
         // Two rounds are the most, and one of them is ours: the person's second is still allowed.
         rig.parent_mock
             .push_tool_calls(vec![send_call("s1", session, "more")])
+            // The parent reads the round it started, so its turn has one model call more whether
+            // the round ends before the next call or after it.
+            .push_tool_calls(vec![read_call("r1", session, true)])
             .push_text("sent");
         let second = rt
             .start_continuing(&rig.parent_name, user_message("second"), Some(&conv), first)
