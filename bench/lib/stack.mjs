@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { HostContainers, buildRunArgs } from './containers.mjs';
+import { HostContainers, buildRunArgs, dockerEnv } from './containers.mjs';
 import { PINS, coderRef } from './pins.mjs';
 import { RUNTIME, runtimeLimits, runtimeUser } from './runtime.mjs';
 import { extractEntries, parseTar, pickFiles } from './tarstream.mjs';
@@ -220,7 +220,9 @@ export class Stack {
   meterHostAddress() {
     if (this.meterAddress) return this.meterAddress;
     try {
-      const r = execFileSync('ip', ['-4', 'route', 'get', '1.1.1.1'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      // `ip` is a host program the harness starts, so it gets the same allow-list as a `docker` child: it must not
+      // carry the model's key while it runs (`ps e`).
+      const r = execFileSync('ip', ['-4', 'route', 'get', '1.1.1.1'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: this.dockerEnv() });
       const m = /\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b/.exec(r);
       if (m && !m[1].startsWith('127.')) return (this.meterAddress = m[1]);
     } catch {
@@ -247,10 +249,7 @@ export class Stack {
 
   /** The environment the docker CLI gets: what finds the daemon, and none of the model's variables. */
   dockerEnv() {
-    const keep = ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'XDG_RUNTIME_DIR'];
-    const env = {};
-    for (const k of keep) if (this.baseEnv[k] !== undefined) env[k] = this.baseEnv[k];
-    return env;
+    return dockerEnv(this.baseEnv);
   }
 
   composeArgs(args) {

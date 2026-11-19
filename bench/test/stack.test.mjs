@@ -77,6 +77,35 @@ test('a compose call gets the variables of the file and none of the model\'s: th
   await stack.up();
   const env = calls[0].opts.env;
   assert.ok(!Object.values(env).some((v) => v.includes('the-real-model-key') || v.includes('another-secret-value')));
+  // ... and it does get what finds the daemon: an empty environment would pass the check above and break compose.
+  const baseEnv = { PATH: '/usr/bin', HOME: '/home/x', DOCKER_HOST: 'unix:///run/user/4242/docker.sock', BENCH_MODEL_API_KEY: 'the-real-model-key-123456' };
+  const custom = makeStack(t, { baseEnv });
+  await custom.stack.up();
+  assert.equal(custom.calls[0].opts.env.DOCKER_HOST, baseEnv.DOCKER_HOST, 'the compose call finds the daemon the stack was built for');
+  assert.equal(custom.calls[0].opts.env.PATH, baseEnv.PATH);
+});
+
+test('the host child that finds the meter address gets the allow-list too: the key is not in its environment', (t) => {
+  // `ip` is a host program, not a docker child, but it is started by every compose call (composeEnv -> meterHostAddress),
+  // so it carries the same exposure: a key in its environment is readable with `ps e` for as long as it runs.
+  const bin = tmp(t);
+  const dump = path.join(bin, 'ip-env.txt');
+  const fake = path.join(bin, 'ip');
+  fs.writeFileSync(fake, `#!/bin/sh\nenv > '${dump}'\necho '1.1.1.1 via 10.0.0.1 dev eth0 src 10.9.8.7 uid 1000'\n`, { mode: 0o755 });
+  const key = 'the-real-model-key-123456';
+  const before = { PATH: process.env.PATH, BENCH_MODEL_API_KEY: process.env.BENCH_MODEL_API_KEY };
+  process.env.PATH = `${bin}:${before.PATH}`;
+  process.env.BENCH_MODEL_API_KEY = key;
+  t.after(() => {
+    process.env.PATH = before.PATH;
+    if (before.BENCH_MODEL_API_KEY === undefined) delete process.env.BENCH_MODEL_API_KEY;
+    else process.env.BENCH_MODEL_API_KEY = before.BENCH_MODEL_API_KEY;
+  });
+  const stack = new Stack({ composeFile: COMPOSE, home: tmp(t), meterPort: 1 });
+  assert.equal(stack.meterHostAddress(), '10.9.8.7');
+  const seen = fs.readFileSync(dump, 'utf8');
+  assert.doesNotMatch(seen, new RegExp(key), 'the key reaches the ip child');
+  assert.match(seen, /^PATH=/m, 'the child still finds its program');
 });
 
 test('finding 17: every compose call has a finite time, and one that times out is an error that says so', async (t) => {

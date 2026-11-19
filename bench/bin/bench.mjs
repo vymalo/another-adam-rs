@@ -94,7 +94,7 @@ async function doctorCommand(argv, env) {
   } catch (e) {
     if (env.BENCH_CONFIG || fs.existsSync(configPath(env))) taskError = e.message;
   }
-  const result = await doctor({ home, pins: PINS, stack, start: values.start === true, tasks, taskError, containers: stack.hostContainers() });
+  const result = await doctor({ home, pins: PINS, stack, start: values.start === true, tasks, taskError, containers: stack.hostContainers(), env });
   process.stdout.write(`${renderDoctor(result)}\n`);
   return result.exitCode;
 }
