@@ -1110,6 +1110,65 @@ async fn a_turn_over_max_tool_calls_starts_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// 7b. A turn that goes over the limit after a call started
+// ---------------------------------------------------------------------------
+
+/// ADR 0049, amended, *What is not decided here*: a turn whose first call fits under
+/// `max_tool_calls` starts it early, and a later call that pushes the turn over means every call
+/// is answered "not run" — the early call's work is not undone. The gate's room check is per
+/// position, so the call that fits starts and the one that does not waits (and is answered
+/// without running). This pins the accepted loss so it cannot grow silently.
+#[tokio::test]
+async fn a_turn_that_goes_over_max_tool_calls_keeps_the_early_call_it_started() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    let began = Arc::new(Notify::new());
+    let c1 = call(
+        "c1",
+        "probe",
+        json!({"use": "independent", "ms": 0, "tag": 1}),
+    );
+    let c2 = call(
+        "c2",
+        "probe",
+        json!({"use": "independent", "ms": 0, "tag": 2}),
+    );
+    h.script(vec![
+        started("c1", "probe"),
+        complete(&c1),
+        started("c2", "probe"),
+        complete(&c2),
+        text("working"),
+        finished(asks(vec![c1, c2], "working")),
+    ]);
+    h.script(answer("closing words"));
+    let agent = h.agent(10, |b| {
+        b.tool(Probe::new(&log, &began))
+            .limits(adam_llm_agent::Limits {
+                max_tool_calls: 1,
+                ..adam_llm_agent::Limits::default()
+            })
+    });
+    let (run, view) = h.run(agent, "go").await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    assert_eq!(
+        log.starts("c1"),
+        1,
+        "the call that fit started early; its result is dropped with the turn's"
+    );
+    assert_eq!(log.starts("c2"), 0, "the call over the limit did not start");
+    let answers = tool_answers(&view);
+    assert_eq!(answers.len(), 2);
+    assert!(
+        answers
+            .iter()
+            .all(|(text, is_error)| text.starts_with("not run:") && *is_error),
+        "{answers:?}"
+    );
+    assert_eq!(h.words(run), ["working", "closing words"]);
+}
+
+// ---------------------------------------------------------------------------
 // 8. The journal
 // ---------------------------------------------------------------------------
 

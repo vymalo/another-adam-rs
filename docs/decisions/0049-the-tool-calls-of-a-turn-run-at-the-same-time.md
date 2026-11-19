@@ -283,7 +283,8 @@ two calls of a segment does (decision 10). The model step is not written: the ru
 **What is not decided here.** A turn over `max_tool_calls` may have started its first calls early (their position was
 within the limit when each was announced) and then answers all of them "not run": their results are dropped, and the run
 goes to the closing turn. The step events of those calls say `running` and their end, and the answer says "not run"; the
-alternative (never starting a call early until the whole turn is known) is not possible while the model writes. An early
+alternative (never starting a call early until the whole turn is known) is not possible while the model writes. The test
+`a_turn_that_goes_over_max_tool_calls_keeps_the_early_call_it_started` pins it. An early
 call that runs in a segment of one (because the call after it is a barrier) is still answered like a call of a segment for
 `NeedsInput`, `Await*` and `reported` rounds (decision 11): a tool that asks or parks must declare `Alone`, and the gate
 never starts one.
