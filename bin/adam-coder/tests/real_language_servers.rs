@@ -1,5 +1,6 @@
-//! The tools against the **real** language servers (ADR 0044 slice 17), on four tiny projects with
-//! one deliberate error each (`tests/fixtures/language-servers/`): Rust, TypeScript, Python and Go.
+//! The tools against the **real** language servers (ADR 0044 slice 17), on five tiny projects with
+//! one deliberate error each (`tests/fixtures/language-servers/`): Rust, TypeScript, Python, Go and
+//! Dart.
 //!
 //! Gated, like the tests that need a database (Rule 7): without `ADAM_TEST_LANGUAGE_SERVERS=1` they
 //! do nothing and say so; with it, a language whose server is not on `PATH` is skipped, and
@@ -183,5 +184,12 @@ async fn real_pyright_reports_an_error_and_finds_a_definition_and_references() {
 async fn real_gopls_reports_an_error_and_finds_a_definition_and_references() {
     if run_for("gopls") {
         check("go", "main.go", 8, 8, "main.go:3:6").await;
+    }
+}
+
+#[tokio::test]
+async fn real_dart_language_server_reports_an_error_and_finds_a_definition_and_references() {
+    if run_for("dart") {
+        check("dart", "lib/main.dart", 4, 4, "lib/main.dart:1:5").await;
     }
 }

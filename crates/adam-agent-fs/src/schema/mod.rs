@@ -10,8 +10,9 @@ mod schedule;
 mod skill;
 
 pub use agent::{
-    AgentFrontmatter, Card, CardSkill, ExtendedCard, Limits, MAX_MINUTES_LIMIT, MAX_PARALLEL_LIMIT,
-    ModelRef, SkillSelection, ToolList,
+    AgentFrontmatter, Card, CardSkill, ExtendedCard, Limits, MAX_MINUTES_LIMIT,
+    MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT, MAX_SESSION_ROUNDS_LIMIT,
+    MAX_WORKING_SESSIONS_LIMIT, ModelRef, SkillSelection, ToolList,
 };
 pub use command::CommandFrontmatter;
 pub use mcp::{

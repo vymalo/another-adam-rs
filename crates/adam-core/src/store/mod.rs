@@ -460,6 +460,10 @@ pub trait Store: Send + Sync + 'static {
     /// due (`sched_at <= now`) and has no unexpired lease. Concurrent callers
     /// never receive the same run while its lease is valid.
     ///
+    /// The record returned may be read after the lease was set, so it can be newer than what
+    /// the claim matched, terminal included ([`Store::commit_run`] does not touch the lease).
+    /// A caller must not step a returned run that is not open.
+    ///
     /// `scope` decides whose runs are claimable (see [`ClaimScope`]): with
     /// [`ClaimScope::Pinned`] a run that another worker owns is skipped, and
     /// the first claim of a run without an owner makes `worker` its owner.

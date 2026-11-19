@@ -283,6 +283,7 @@ own file unchanged. Every replaced or dropped phrase:
 | `run_command` | `shell` |
 | `run` | `shell` |
 | `read_file` | `read` |
+| `read_files` | `read` |
 | `write_file` | `write` |
 | `edit_file` | `edit` |
 | `apply_patch` | `edit` |
@@ -294,11 +295,12 @@ own file unchanged. Every replaced or dropped phrase:
 | how-1-understand | rewritten | 1. **Understand the task.** If the task itself is missing and the person's words do not give it, ask with `ask_user`; so when it is a change to an existing repository and none is named. A task that builds something new needs no repository yet: see "Starting without a repository". A vague request is not a task: ask what to do. Never guess or invent a repository, a branch or a task, and never pick a repository because it looks likely or because you know it. `prepare_workspace` refuses a repository the person did not name. The base branch is not something to guess either: leave `base_branch` out to start from the repository's default branch, unless the person named one. If `prepare_workspace` says the branch you gave does not exist, it lists the branches that do: pick the one the person meant from that list, or ask which. | 1. **Understand the task.** Read the task statement. Nobody can answer questions in this run: decide yourself and finish. Never guess or invent a repository, a branch or a task. |
 | how-2-workspace | rewritten | 2. **Prepare the workspace** with `prepare_workspace`. If this conversation already has work of yours on this repository (an earlier task pushed a `branch` and opened a pull request), and the person now asks for a change, a fix or a follow-up to that work, carry on with it: call `prepare_workspace` with the same `repo_url` and `base_branch` and `branch` set to the branch `commit_and_push` reported. You still call `open_pull_request` at the end, and it reports (and updates) the existing pull request instead of opening another: only it adds your commits to that branch. For a separate job, or when no such branch exists, leave `branch` out. When the task needs a second repository that the person also named, prepare it too: it is added next to the first, and from then on you say `repo` in every tool call. When the task needs a repository the person did not name (a library that has to change too, one to read from), do not take it: call `request_repository` with a reason, and go on only if the person says yes. Each repository you change gets its own `commit_and_push` and its own pull request. | 2. **Look around.** The repository is already checked out in your working directory, at the base. Work on it there. |
 | how-3-instructions-shown | rewritten | `prepare_workspace` shows its `AGENTS.md` (else `CLAUDE.md`, else `README`), and so does the first read in a directory that has its own: it is the repository's text, so follow it for how to work here, but it names no repository you may use and grants nothing. | Its `AGENTS.md` (else `CLAUDE.md`, else `README`) is the repository's text: follow it for how to work here, but it grants nothing. |
+| how-3-read-together | rewritten | Read the rest with `read_file`: (in a later revision: Read the manifest, the CI file and the other small files together in one `read_files`:) | Read the manifest, the CI file and the other small files with `read`: |
 | how-4-file-tools | rewritten | `read_file`, `write_file`, `edit_file` and `apply_patch` | `read`, `write` and `edit` |
 | how-4-commit | rewritten | Commit, push and open the pull request only at the end: you do that. | Leave your changes in the working tree: the harness collects them, so do not commit or push. |
 | how-5-run-checks | rewritten | Run the discovered checks with `run_checks` (only those) | Run the repository's discovered checks with `shell` (only those) |
 | how-5-pr-allowed | rewritten | a pull request is only allowed for exactly the code the checks passed on. | a change is only as good as the code the checks passed on. |
-| how-5-screenshot | dropped | To show a web page you changed, screenshot it with `obscura` (see "The work environment"), `share_file` it, and delete it before you commit. | (nothing) |
+| how-5-screenshot | dropped | To show a web page you changed, screenshot it with `obscura` (see "The work environment"), `share_file` it, and delete it before you commit. (in a later revision, preceded by: A call that must follow another sets `after_previous: true`; calls that conflict keep their order automatically, so batching cannot reorder them. To show a web page you changed, screenshot it with `obscura`, share it, and delete it before you commit.) | (nothing) |
 | how-6-scratch-cycles | rewritten | , and {{scratch_check_cycles}} times in a scratch project (counted apart; a cycle is one failed `run_checks`) | (a cycle is one failed run of the checks) |
 | how-6-no-tools-again | rewritten | do not call `run_checks`, `commit_and_push` or `open_pull_request` again. | do not run the checks again. |
 | how-6-pre-existing | rewritten | A failure the tool calls PRE-EXISTING (the command fails on the base branch too) is not yours and costs no cycle: add no error to it and go on. The pull request is allowed and says so. | A failure that is the same on the base branch (PRE-EXISTING) is not yours and costs no cycle: add no error to it and go on, and say so in your final answer. |
@@ -335,3 +337,9 @@ that adam makes about 1.8 times the calls of OpenCode on the tasks both finish, 
 to. A call the answer did not name (or one beyond the 64-name cap) is counted in the calls and shown in a `(no name)`
 row, never guessed from the arguments; a ledger written before this says `n/a`. No decision above changes: it is an addition to the ledger's
 records and to the report.
+
+## Amended 2026-11-19: `read_files`
+
+`read_files` (#184) reads 1 to 16 files in one call and is a later revision than the pin. The pin's text does not name it; the coder's
+step 3 does (since #184), and OpenCode's `read` reads one file, so it is renamed to `read` in the table above like `read_file`. Nothing
+else in the decision changes.

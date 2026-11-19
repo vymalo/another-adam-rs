@@ -28,6 +28,13 @@ pub struct RuntimeOptions {
     /// How often an idle worker polls for due runs, and a subscription re-reads
     /// a run.
     pub poll_interval: Duration,
+    /// How long a kept-open session may sit idle before it reads closed
+    /// ([`adam_runtime::RuntimeBuilder::session_idle_ttl`]); default seven days. [`serve`]
+    /// takes it from `SESSION_IDLE_DAYS` ([`ServiceConfig::sessions`]) instead.
+    ///
+    /// [`serve`]: crate::serve
+    /// [`ServiceConfig::sessions`]: crate::ServiceConfig::sessions
+    pub session_idle_ttl: Duration,
 }
 
 impl Default for RuntimeOptions {
@@ -38,6 +45,7 @@ impl Default for RuntimeOptions {
             concurrency: 4,
             lease_ttl: Duration::from_secs(30),
             poll_interval: Duration::from_millis(250),
+            session_idle_ttl: adam_runtime::DEFAULT_SESSION_IDLE_TTL,
         }
     }
 }
@@ -128,7 +136,8 @@ impl Service {
             .claim_scope(options.claim_scope)
             .concurrency(options.concurrency)
             .lease_ttl(options.lease_ttl)
-            .poll_interval(options.poll_interval);
+            .poll_interval(options.poll_interval)
+            .session_idle_ttl(options.session_idle_ttl);
         if let Some(id) = &options.worker_id {
             builder = builder.worker_id(id.clone());
         }

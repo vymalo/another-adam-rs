@@ -1,12 +1,12 @@
 {
   "name": "file_diagnostics",
-  "description": "What a language server says is wrong in a file: errors and warnings as `path:line:col: error: message [code]`, sorted, a page of at most 100 (the last line says `[more: ... offset=N]` or `[end: ...]`). The server (Rust, TypeScript and JavaScript, Python, Go) runs in the workspace's environment and is kept between calls; the first call on a project may wait for it to index (`wait` seconds, 1 to 120, default 30; a first line says when it still is). Nothing is changed. With no server in the environment the answer says so: use run_checks or run_command. Example: {\"path\":\"src/lib.rs\"}",
+  "description": "What a language server says is wrong in a file: errors and warnings as `path:line:col: error: message [code]`, sorted, a page of at most 100 (the last line says `[more: ... offset=N]` or `[end: ...]`). The server (Rust, TypeScript and JavaScript, Python, Go, Dart) runs in the workspace's environment and is kept between calls; the first call on a project may wait for it to index (`wait` seconds, 1 to 120, default 30; a first line says when it still is). Nothing is changed. With no server in the environment the answer says so: use run_checks or run_command. Example: {\"path\":\"src/lib.rs\"}",
   "parameters": {
     "type": "object",
     "properties": {
       "path": {
         "type": "string",
-        "description": "The file, relative to the worktree root (.rs, .ts .tsx .js .jsx, .py, .go)"
+        "description": "The file, relative to the worktree root (.rs, .ts .tsx .js .jsx, .py, .go, .dart)"
       },
       "repo": {
         "type": "string",

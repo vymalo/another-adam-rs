@@ -573,3 +573,5 @@ the client that named the extension, in whole numbers, and `GetTask` says the to
 [`adam-runtime`](../adam-runtime/README.md),
 [`adam-coder`](../../bin/adam-coder/README.md),
 [`adam-error`](../adam-error/README.md).
+
+New in slice 4 ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)): `ChildSessions::with_limits(SessionLimits)` sets the card's `maxOpen`, the most rounds working at once and the most rounds a session may have (without it the front uses the tools' defaults, 16/4/20, with `max_working` at most `max_open`; **nothing in this repository calls it yet**, slice 6 part c wires it and must pass the root's effective limits, `Assembly::session_limits()`, not `SessionSettings.limits`). A person's start, or a message that would start a round, past `max_working` is `UnsupportedOperation` with words (this adds a refusal case to `child-sessions/v1`: say so to its clients); a message to a session that sat idle past the runtime's TTL is refused as closed and says why. Tests: `the_card_max_open_follows_the_limits`, `a_persons_round_past_max_working_is_refused_in_words`, `an_expired_session_refuses_a_message`.

@@ -384,7 +384,10 @@ pub(super) async fn with_nested(
     }
 }
 
-async fn nested(
+/// The nested project-instructions block `path` touches and has not shown yet, if any (see
+/// [`with_nested`]). A caller that shows several paths in one result asks for each in turn: the
+/// first file of a directory claims its block, and the files after it get `None`.
+pub(super) async fn nested(
     env: &ToolEnv,
     ctx: &ToolCtx,
     slot: &Slot,

@@ -3,7 +3,7 @@
 Status: **Accepted** (2026-11-14), the owner's decision: *"we need to add the capability that opencode has to create child
 session, and exchange messages with it. At creation, there should be a button to auto-close after work is done, so that the
 child session can further be reused."* The six defaults under [What was put to the owner](#what-was-put-to-the-owner) are
-recommendations the owner was told the work proceeds with. Slices 1 and 2 are built (below). Reverses "one-shot child runs" and "no
+recommendations the owner was told the work proceeds with. Slices 1, 2 and 3 are built (below). Reverses "one-shot child runs" and "no
 resume" of [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md); amends
 [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md), [ADR 0003](0003-a-new-task-continues-the-task-it-references.md),
 [ADR 0016](0016-a-message-sent-to-a-working-task-is-steered-into-it.md) and
@@ -42,8 +42,8 @@ decisions above, each for a reason found while building:
 * **The turn-end wait** appends a `subagent_read` call (id `wait_<turn>`) to the model's own message and waits for one session at
   a time, in the order the listing gives; it is skipped when the history has no `subagent_start` or `subagent_send` call, so a run
   that never uses sessions journals what it always did.
-* **Two bounds of slice 4 are constants here** because a missing one is unsafe: 16 open sessions per conversation and 20 rounds
-  per session (a close counts as a round). `idle_ttl`, `max_working` and the settings are slice 4.
+* **Two bounds of slice 4 were constants here** because a missing one is unsafe: 16 open sessions per conversation and 20 rounds
+  per session (a close counts as a round). *Built 2026-11-18, slice 4: they are the defaults of settings; see the note below.*
 * **`subagent_start` lists remote subagents in the enum** and refuses them in words (slice 5 builds them); a session tool is given
   only to a root with at least one local subagent. (*Amended 2026-11-18:* slice 5 built them: no refusal, and a root with any subagent has the five.)
 * **The coder's tier**: the five are `plan` tier, like the helpers they run.
@@ -54,6 +54,55 @@ decisions above, each for a reason found while building:
   a read of a closed session gives the last round that worked; a close request survives `Runtime::cancel`, and a round whose state
   cannot be read closes its session; a call that acts on a session is committed before it runs; a run that ends cancels rounds it
   could not wait for; at most 4 rounds work at once (`max_working` as a constant); retention must outlast a session's idle life.
+
+*Built 2026-11-18:* slice 3 (reports during a turn, `crates/adam-llm-agent/src/{agent,sessions,conversation}.rs`). The rounds that ended reach
+the model without a read of its own; the design departs from the slice's text in these ways, each to leave committed journals replaying and to move
+no step's seq (as ADR 0050 decision 9 does for messages):
+
+1. **No `children:<turn>` or `report:<round id>` steps.** The listing and the reads are made inside the step `model:<turn>` and recorded in
+   its record (`reports`, `sessions_open`, both absent when empty), so a committed journal from before replays as it was. At the end of a turn the
+   existing step `sessions:<turn>` and the read `wait_<turn>` are used. **No mixed versions**, as for slice 2: a transition in flight when a worker
+   of the other revision takes the run can replay differently, so stop every worker of the old revision before a run uses sessions.
+2. **Reports are read through `ChildStarter::session` and the read tool's `poll_remote`**, not `Ctx::child_status`, which refuses the rounds of
+   other parents, a person's round included. The appended calls are `subagent_read` calls with ids `report_<32 hex of the round id>`.
+3. **`Ctx::arrived` does not count reports.** The turn that a report keeps going is decided from the store at the end of the turn (a round that
+   ended during the final model call is read with `wait_<turn>`, which answers at once), which needs no notice: every round this run started has
+   either ended or is waited for, and a person's round never notifies a parent. A notice stays a wake-up; a lost one costs at most one turn, a
+   duplicate matches nothing.
+4. **A report is of the session's latest round that worked** (`SessionSummary::report`, new in `adam-runtime`), so a closing round that follows does not
+   hide it. It is due once: the round has ended, is not in `Conversation::reported_rounds` (the last 128, carried to a later task), its call id is not
+   already in the history (the cap can give up a round that is still due), and this run started it or a person did **after the chain of tasks began**
+   (`Conversation::chain_started`, set at the first model call and carried; a task that does not continue another does not re-tell a person's old
+   round). A round an earlier task's run started is not reported: that run waited for it or cancelled it. A round that a later round of the same
+   session replaced before the parent looked is **not reported on its own**: only the latest round that worked is. A round cancelled by the close that follows it is not reported either: whoever closed the session knows (`a_closing_round_does_not_hide_the_report_of_the_round_before` and the remote cancel cases hold both).
+5. **When the loop lists:** at the first model call of each run, and before every call while `Conversation::sessions_open` is set (a session that is not
+   closed was seen, a call started or sent to one since, or a due report was not appended). A person's session that starts while none is open is
+   reported at the parent's next task: decision 7's "now or in a later task".
+6. **Appended reports are not calls of the model.** They do not count toward `max_tool_calls` or `doom_loop`, carry no `after_previous` and are added
+   only when no result is owed, so never inside an ADR 0049 segment. The report at the end of a turn is a real call (`wait_<turn>`), as in slice 2.
+   A record whose answer predates a message the run has read leaves its reports for the next call, and the rounds are counted all the same, so the
+   steps of a replay do not depend on it.
+7. **A person's round** is reported with its header marked "started by the person"; the person's words are not in the report, and it is a tool result,
+   never a user message. Decision 7 as amended for slice 6 part a ("waits for slice 3") is built.
+
+Proof: the cases of `crates/adam-llm-agent/tests/sessions.rs` for slice 3 (memory, PostgreSQL, MongoDB), the due rule in `sessions.rs`, and the record
+in `agent.rs`. Three existing cases that count the tokens of a round **nobody read** (`a_round_never_read_is_counted_when_its_session_closes`,
+`a_round_never_read_is_counted_when_the_parent_ends`, `a_store_error_on_the_usage_read_is_retried`) run on `LlmAgentBuilder::without_session_reports`
+(a hidden builder method that makes the agent as a build from before), because the loop now reads such a round at its next model call. **Unverified
+risks:** the appended assistant message carries no reasoning (a model with `echo_reasoning`); two assistant messages in a row can happen; the listing
+runs inside `model:<turn>` before the call with no time limit of its own; the step events of the appended reads are emitted after the answer has streamed.
+
+*Built 2026-11-18:* slice 4 (limits as settings, `idle_ttl`; `crates/adam-runtime/src/session.rs`, `adam-llm-agent/src/sessions.rs`, `adam-agent-fs`, `adam-assembly/src/def.rs`, `adam-service/src/config.rs`, `adam-a2a-runtime/src/child_sessions.rs`). Departures and decisions:
+* **Where the settings live.** The environment, read by every role (the control plane's A2A front checks starts and reads sessions): `SESSION_MAX_OPEN` (1-100, 16), `SESSION_MAX_WORKING` (1-32, at most open, 4), `SESSION_MAX_ROUNDS` (2-200, 20), `SESSION_IDLE_DAYS` (1-365, 7); a bad value is exit 78. The root's file may only lower the three limits (`limits.max_open_sessions`, `max_working_sessions`, `max_session_rounds`; a larger value is lowered with a warning, a subagent's keys are ignored with a warning). `idle_ttl` is deployment-only and runtime-wide, not a file key.
+* **The time limit per round** is the subagent's `limits.max_minutes` or a remote round's `remote_timeout` (built before), not a session setting.
+* **`idle_ttl` is read, not written**, when a session is listed or viewed, including a session with no header: a round that ended at least `idle_ttl` ago in a session that would stay open reads `Closed` (`idle_expired`). This amends the "never closes by itself" sentence of `SessionHeader`. A working round never expires; an expired session frees its place under `max_open`; the tools and the A2A front refuse a send in words.
+* **An expired session's report is still told once.** The due rule reads the round, not the session's state, so a report nobody was told of is given at the next task's first model call even if the session has expired, and not again.
+* **`max_working` also refuses a person's rounds** in the A2A front (`UnsupportedOperation`, in words): a start, and a message that would start a round. This adds a refusal case to the `child-sessions/v1` contract (the clients' repository changes with it). **`subagent_send` now checks `max_working` before it starts a round** (before, only a start did); a steer into a working round is not a new round.
+* **Cancel (decision 6)** was built by ADR 0044 slice 10 and slice 5; slice 4 adds regression proofs of that ADR 0044 slice 10 behaviour, not proofs of slice 4 (`a_parent_that_fails_stops_its_rounds`, `a_cancel_frees_the_working_slots_for_the_next_task`).
+* **A close is no working round:** the working limit counts rounds that work (`SessionSummary::does_work`), so the round that closes a session never counts; a session can have `max_rounds + 1` rounds counting the closing one.
+* **Contract (2026-11-18):** the `UnsupportedOperation` refusal for a start or a new round past `max_working` is a change to `child-sessions/v1` in vymalo/another-agentic-system; **that change is the owner's to make there**, not this repository's.
+* **Retention** is documented, not enforced: `purge_finished(before)` must be older than `idle_ttl` plus a round's time limit and retries.
+* The coder sets the limits from `bin/adam-coder/src/serve.rs` only; no chart change (`config.extraEnv` sets the variables).
 
 *Built 2026-11-18:* slice 6 part a (the A2A front, `crates/adam-a2a-runtime/src/child_sessions.rs`, the card entry in `crates/adam-a2a`, two
 readers and `closing_round_payload` in `crates/adam-runtime`): a client that activates `child-sessions/v1` sees the sessions of a parent
@@ -118,9 +167,9 @@ round agents' starters on the A2A front; a reload of `LiveAssembly` keeps the ro
 * **Decision 1, a person's round is its own parent.** A round a person starts has no run of an agent behind it, so it is started with
   its own id as parent: no run's end cancels it and no run waits for it. The runtime says it
   (`SessionView::started_outside_a_run`) and the A2A front derives `by: person` from it. A round the model starts is unchanged.
-* **Decision 7**: a person's round reports to no parent; the report of a person's round to the parent run waits for slice 3.
+* **Decision 7**: a person's round reports to no parent; the report of a person's round to the parent run waits for slice 3. (*Built 2026-11-18, slice 3:* the parent reads it from the store at its next listing; see the note above.)
 * **Decision 9**: a round a person starts always has a tier written (the one its message names, else the agent's default).
-* **Decision 5**: the card's `maxOpen` is the value the deployment passes to `ChildSessions::new`, which must equal the model tools' constant (16) until slice 4 makes it a setting. It is checked before a start, so concurrent starts may exceed it by the number racing, as the tools' check may.
+* **Decision 5**: the card's `maxOpen` is the value the deployment passes to `ChildSessions::new`, which must equal the model tools' limit (16 by default). *Built 2026-11-18, slice 4: `ChildSessions::with_limits` takes `SessionLimits`; **nothing calls it yet** (slice 6 part c wires the front and must pass the root's effective limits, `Assembly::session_limits()` or `AgentDef::effective_session_limits()`, not `SessionSettings.limits`); until then the front uses the tools' defaults.* It is checked before a start, so concurrent starts may exceed it by the number racing, as the tools' check may.
 * **Not built here:** the live usage of a model round stays on the parent until the loop is free to change; push configs on round
   tasks are unsupported.
 

@@ -238,6 +238,7 @@ pub(crate) struct Config {
     pub retry: RetryPolicy,
     pub concurrency: usize,
     pub lease_renewal: bool,
+    pub session_idle_ttl: Duration,
 }
 
 /// One entry of the registry: a full agent, or a start-only starter. Closed on
@@ -612,6 +613,19 @@ impl RuntimeBuilder {
         self
     }
 
+    /// How long a kept-open session may sit idle before it reads closed (ADR 0045 slice 4): its
+    /// latest round ended at least this long ago, and nobody has written to it since. Default
+    /// [`DEFAULT_SESSION_IDLE_TTL`](crate::DEFAULT_SESSION_IDLE_TTL), seven days.
+    ///
+    /// It decides what a listing and a session read *say*; nothing is written, so a longer TTL
+    /// reopens what a shorter one closed. Set it the same on every process that serves the same
+    /// store. Purge finished runs only after more than this (see `Store::purge_finished`): a
+    /// purged latest round makes the session read wrongly.
+    pub fn session_idle_ttl(mut self, ttl: Duration) -> Self {
+        self.cfg.session_idle_ttl = ttl;
+        self
+    }
+
     /// Time source. Default: [`SystemClock`].
     pub fn clock(mut self, clock: impl Clock) -> Self {
         self.clock = Arc::new(clock);
@@ -663,6 +677,7 @@ impl Runtime {
                 retry: RetryPolicy::default(),
                 concurrency: 4,
                 lease_renewal: true,
+                session_idle_ttl: crate::DEFAULT_SESSION_IDLE_TTL,
             },
         }
     }
@@ -675,6 +690,12 @@ impl Runtime {
     /// This runtime's lease identity.
     pub fn worker_id(&self) -> &str {
         &self.inner.cfg.worker_id
+    }
+
+    /// How long a kept-open session may sit idle before it reads closed
+    /// ([`RuntimeBuilder::session_idle_ttl`]).
+    pub fn session_idle_ttl(&self) -> Duration {
+        self.inner.cfg.session_idle_ttl
     }
 
     /// Whose runs this runtime's worker claims.
@@ -1161,7 +1182,14 @@ impl Runtime {
                     }
                 }
             }
-            return Ok(page_of_sessions(parent_conversation, rounds, offset, limit));
+            return Ok(page_of_sessions(
+                parent_conversation,
+                rounds,
+                offset,
+                limit,
+                self.inner.clock.now(),
+                self.inner.cfg.session_idle_ttl,
+            ));
         }
         Err(RuntimeError::Contended(format!(
             "the sessions of {parent_conversation:?} changed while they were listed"
@@ -1219,7 +1247,12 @@ impl Runtime {
                 _ => break,
             }
         }
-        Ok(SessionView::from_rounds(session, rounds))
+        Ok(SessionView::from_rounds(
+            session,
+            rounds,
+            self.inner.clock.now(),
+            self.inner.cfg.session_idle_ttl,
+        ))
     }
 
     /// The record of a new run. With `prior` (the run continued and its stored agent state) the

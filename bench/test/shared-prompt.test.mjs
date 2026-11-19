@@ -155,7 +155,7 @@ test('OpenCode\'s shared text names no adam-only tool, and none of adam\'s produ
   if (!file) return;
   const { text } = sharedPrompt(file);
   assert.deepEqual(namedTools(text, adamToolNames(file)), []);
-  for (const word of ['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository', 'apply_patch', 'run_command', 'read_file', 'write_file', 'edit_file', 'accept_red_checks', 'obscura', 'scratch']) {
+  for (const word of ['prepare_workspace', 'run_checks', 'ask_user', 'commit_and_push', 'open_pull_request', 'share_file', 'start_scratch', 'request_repository', 'apply_patch', 'run_command', 'read_file', 'read_files', 'write_file', 'edit_file', 'accept_red_checks', 'obscura', 'scratch']) {
     assert.ok(!text.includes(word), `${word} is not in OpenCode's text`);
   }
   for (const own of ['`shell`', '`read`', '`write`', '`edit`']) assert.ok(text.includes(own), `${own} is named`);
@@ -175,10 +175,12 @@ test('every adam tool named in the four sections is in the mapping table: a rena
     assert.ok(inSpan.length > 0, `${tool} is handled by a span`);
   }
   for (const [from, to] of Object.entries(NAMES)) {
+    // A name a later revision introduced (`read_files`, #184) is not in the pin's text: the checkout test below is where it is exercised.
+    if (!template.includes(`\`${from}\``)) continue;
     const renamed = applied.some((a) => a.id === `name:${from}`) || applied.some((a) => a.kind !== 'name' && a.original.includes(`\`${from}\``));
     assert.ok(renamed, `${from} is mapped to ${to}`);
   }
-  assert.deepEqual(NAMES, { run_command: 'shell', run: 'shell', read_file: 'read', write_file: 'write', edit_file: 'edit', apply_patch: 'edit' });
+  assert.deepEqual(NAMES, { run_command: 'shell', run: 'shell', read_file: 'read', read_files: 'read', write_file: 'write', edit_file: 'edit', apply_patch: 'edit' });
 });
 
 test('the mapped text is the original with only the table\'s substitutions applied, segment by segment', async (t) => {
@@ -233,4 +235,12 @@ test("the shared prompt builds from adam's instructions as they are in this chec
   const instructions = fs.readFileSync(path.join(REPO, INSTRUCTIONS_PATH), 'utf8');
   const shared = sharedPrompt(instructions);
   assert.ok(shared.text.length > 0);
+  // This checkout is ahead of the pin: `after_previous` (ADR 0049) and `read_files` (#184) are in it, and OpenCode gets neither. A span that
+  // matches the wrong spelling of a later sentence leaves `after_previous` in the mapped text; a missing rename leaves `read_files`.
+  assert.ok(shared.template.includes('after_previous'), 'the checkout has the sentence the map drops');
+  assert.ok(!shared.mapped.includes('after_previous'), "after_previous is adam's reserved argument, not OpenCode's");
+  assert.ok(shared.template.includes('`read_files`'), 'the checkout names the tool the pin did not have');
+  assert.ok(!shared.mapped.includes('read_files'), 'read_files is renamed to `read`');
+  assert.ok(shared.mapped.includes('several `read` calls'), 'the batching sentence reaches OpenCode as several `read` calls');
+  assert.deepEqual(namedTools(shared.mapped, adamToolNames(instructions)), []);
 });

@@ -224,6 +224,14 @@ fn rust_project(lsp: &Lsp) {
     lsp.put("src/lib.rs", LIB);
 }
 
+fn dart_project(lsp: &Lsp) {
+    lsp.put("pubspec.yaml", "name: x\nenvironment:\n  sdk: ^3.0.0\n");
+    lsp.put(
+        "lib/main.dart",
+        "int add(int a, int b) => a + b;\nint broken() => add(1, 'two');\n",
+    );
+}
+
 // ------------------------------------------------------------------------------- no server
 
 #[tokio::test]
@@ -264,11 +272,49 @@ async fn a_file_no_server_serves_is_answered_with_what_they_serve() {
     let out = lsp.diagnostics(json!({"path": "notes.txt"})).await;
     assert!(!out.is_error, "{}", out.content);
     assert!(
-        out.content.contains(".rs (Rust)") && out.content.contains(".go (Go)"),
+        out.content.contains(".rs (Rust)")
+            && out.content.contains(".go (Go)")
+            && out.content.contains(".dart (Dart)"),
         "{}",
         out.content
     );
     assert!(lsp.servers().is_empty());
+}
+
+#[tokio::test]
+async fn dart_files_start_a_dart_server_at_the_nearest_pubspec() {
+    let lsp =
+        Lsp::new(json!({"diagnostics": [diag(1, 1, 23, "argument_type_not_assignable")]})).await;
+    dart_project(&lsp);
+    lsp.put("apps/mobile/pubspec.yaml", "name: mobile\n");
+    lsp.put("apps/mobile/lib/app.dart", "void main() {}\n");
+
+    let out = lsp.diagnostics(json!({"path": "lib/main.dart"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content
+            .contains("lib/main.dart:2:24: error: argument_type_not_assignable"),
+        "{}",
+        out.content
+    );
+
+    let servers = lsp.servers();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    assert_eq!(servers[0].language, Language::Dart);
+    assert_eq!(servers[0].root, lsp.worktree());
+
+    let sub = lsp
+        .diagnostics(json!({"path": "apps/mobile/lib/app.dart"}))
+        .await;
+    assert!(!sub.is_error, "{}", sub.content);
+    let servers = lsp.servers();
+    assert_eq!(servers.len(), 2, "{servers:?}");
+    assert!(servers.iter().all(|s| s.language == Language::Dart));
+    assert!(
+        servers
+            .iter()
+            .any(|s| s.root == lsp.worktree().join("apps/mobile"))
+    );
 }
 
 // ------------------------------------------------------------------------------- diagnostics

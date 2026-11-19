@@ -186,16 +186,16 @@ fn position_of(
 
 /// What a language server says is wrong in a file: errors and warnings as `path:line:col: error:
 /// message [code]`, sorted, a page of at most 100 (the last line says `[more: ... offset=N]` or
-/// `[end: ...]`). The server (Rust, TypeScript and JavaScript, Python, Go) runs in the workspace's
-/// environment and is kept between calls; the first call on a project may wait for it to index
-/// (`wait` seconds, 1 to 120, default 30; a first line says when it still is). Nothing is changed.
-/// With no server in the environment the answer says so: use run_checks or run_command. Example:
-/// {"path":"src/lib.rs"}
+/// `[end: ...]`). The server (Rust, TypeScript and JavaScript, Python, Go, Dart) runs in the
+/// workspace's environment and is kept between calls; the first call on a project may wait for it
+/// to index (`wait` seconds, 1 to 120, default 30; a first line says when it still is). Nothing is
+/// changed. With no server in the environment the answer says so: use run_checks or run_command.
+/// Example: {"path":"src/lib.rs"}
 #[tool(label = "Diagnostics of a file", icon = "search", paged, access = super::access::asks_a_language_server)]
 pub async fn file_diagnostics(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
-    /// The file, relative to the worktree root (.rs, .ts .tsx .js .jsx, .py, .go)
+    /// The file, relative to the worktree root (.rs, .ts .tsx .js .jsx, .py, .go, .dart)
     path: String,
     /// The slot the file is in: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
@@ -227,11 +227,11 @@ pub async fn file_diagnostics(
 }
 
 /// Where the symbol on a line of a file is defined, by a language server (Rust, TypeScript and
-/// JavaScript, Python, Go): at most 20 locations, each as `path:line:col: the source line`. Give
-/// the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once; if
-/// the symbol is not on that line the answer shows the line. A first call on a project starts the
-/// server and may wait for it to index (`wait` seconds, 1 to 120, default 30); where there is no
-/// server the answer says so. Nothing is changed. Example:
+/// JavaScript, Python, Go, Dart): at most 20 locations, each as `path:line:col: the source line`.
+/// Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than
+/// once; if the symbol is not on that line the answer shows the line. A first call on a project
+/// starts the server and may wait for it to index (`wait` seconds, 1 to 120, default 30); where
+/// there is no server the answer says so. Nothing is changed. Example:
 /// {"path":"src/main.rs","line":12,"symbol":"parse_config"}
 #[tool(label = "Find a definition", icon = "search", access = super::access::asks_a_language_server)]
 #[allow(clippy::too_many_arguments)] // the model's arguments, one each
@@ -276,9 +276,9 @@ pub async fn find_definition(
 }
 
 /// Where the symbol on a line of a file is used, by a language server (Rust, TypeScript and
-/// JavaScript, Python, Go): `path:line:col: the source line`, sorted, a page of at most 100 (the last
-/// line says `[more: ... offset=N]` or `[end: ...]`); at most 2000 are collected. Give the `line`
-/// (from 1) and the `symbol` on it, and `occurrence` when it is there more than once;
+/// JavaScript, Python, Go, Dart): `path:line:col: the source line`, sorted, a page of at most 100
+/// (the last line says `[more: ... offset=N]` or `[end: ...]`); at most 2000 are collected. Give
+/// the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once;
 /// `include_declaration` (default true) lists the definition too. The first call on a project may
 /// wait for the server to index (`wait` seconds, 1 to 120, default 30). Nothing is changed. Example:
 /// {"path":"src/main.rs","line":12,"symbol":"parse_config"}
@@ -368,6 +368,7 @@ fn instead(language: Language) -> &'static str {
         Language::TypeScript => "`tsc --noEmit`",
         Language::Python => "a type checker or the tests",
         Language::Go => "`go vet ./...` or `go build ./...`",
+        Language::Dart => "`dart analyze`",
     }
 }
 
@@ -383,7 +384,7 @@ async fn serve(env: &ToolEnv, ctx: &ToolCtx, ask: Ask) -> Outcome {
     let Some((language, language_id)) = Language::of_path(&path) else {
         return Ok(ToolOutput::text(format!(
             "No language server serves `{path}`: they serve .rs (Rust), .ts .tsx .mts .cts .js .jsx \
-             .mjs .cjs (TypeScript and JavaScript), .py .pyi (Python) and .go (Go). Read the file \
+             .mjs .cjs (TypeScript and JavaScript), .py .pyi (Python), .go (Go) and .dart (Dart). Read the file \
              with read_file, and look for its uses with search_files."
         )));
     };
@@ -1390,6 +1391,12 @@ mod tests {
         std::fs::write(slot.join("crates/a/go.mod"), "module a").unwrap();
         assert_eq!(
             root("crates/a/src/x.go", Language::Go),
+            slot.join("crates/a")
+        );
+        assert_eq!(root("crates/a/lib/main.dart", Language::Dart), slot);
+        std::fs::write(slot.join("crates/a/pubspec.yaml"), "name: a").unwrap();
+        assert_eq!(
+            root("crates/a/lib/main.dart", Language::Dart),
             slot.join("crates/a")
         );
     }

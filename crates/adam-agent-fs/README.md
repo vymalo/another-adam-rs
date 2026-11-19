@@ -217,3 +217,5 @@ custom agent (`.github/agents/x.agent.md`) read as subagents when copied into `s
 * Unit tests next to the code: the digest (framing, resources), the embedded types (conversion,
   damaged JSON, `verify`), the literal escaping of the generator, and the serde round trip of the
   frontmatter.
+
+New in slice 4 ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)): `limits.max_open_sessions` (1 to `MAX_OPEN_SESSIONS_LIMIT` = 100), `max_working_sessions` (1 to `MAX_WORKING_SESSIONS_LIMIT` = 32, at most the open one when both are given) and `max_session_rounds` (`MAX_SESSION_ROUNDS_LIMIT` = 2 to 200), with camelCase aliases: errors outside the range, a warning on a subagent (the keys are the root's). They only lower the deployment's `SESSION_*`. **Breaking:** three new fields of `Limits`, so struct literals stop compiling.

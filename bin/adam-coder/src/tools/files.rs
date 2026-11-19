@@ -1,4 +1,4 @@
-//! `read_file`, `write_file`, `edit_file` and `apply_patch`: the coder edits small, well-located things itself.
+//! `read_file`, `read_files`, `write_file`, `edit_file` and `apply_patch`: the coder edits small, well-located things itself.
 //!
 //! These tools read and change files of the
 //! worktree directly, in the coder's own process, and are **confined to it**: the model chooses
@@ -75,7 +75,7 @@ use adam_model::ImageOrigin;
 use adam_workspace::safe_fs::{BeneathError, Dir, Meta, SlotDir, WalkError, race};
 
 use super::gitcli::GitAt;
-use super::{Outcome, ToolEnv, non_empty};
+use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// Most bytes of `content` `write_file` accepts.
 pub const WRITE_CAP: usize = 1024 * 1024;
@@ -992,6 +992,372 @@ pub async fn read_file(
     })
 }
 
+/// The check epoch moves: a file the project **ignores** does not change the tree id, and a check
+/// may read it, so a failed record from before this change is not reused
+/// (`ChecksNotes::epoch`). A write to a file the project tracks changes the tree anyway; the bump
+/// costs nothing there.
+async fn moved_the_epoch(env: &ToolEnv, ctx: &ToolCtx) -> Result<(), ToolError> {
+    let run = ctx.root_run_id().to_string();
+    env.notes
+        .update(&run, |notes| {
+            notes.checks.epoch = notes.checks.epoch.saturating_add(1);
+        })
+        .await
+        .map_err(|e| notes_error(&e))
+}
+
+// ------------------------------------------------------------------ read_files
+
+/// Most paths one `read_files` call accepts.
+pub const READ_FILES_MAX: usize = 16;
+/// Most lines of one file's page in a `read_files` result.
+pub const READ_FILES_LINES: u32 = 400;
+/// Most bytes of one file's page in a `read_files` result.
+pub const READ_FILES_PAGE_BYTES: usize = 8 * 1024;
+/// Most bytes of the whole `read_files` result.
+pub const READ_FILES_TOTAL_BYTES: usize = 32 * 1024;
+/// Most bytes the escaped paths of one call may take together: they bound what the lines for the
+/// files a result does not show cost, so the whole result stays under [`READ_FILES_TOTAL_BYTES`].
+const READ_FILES_PATHS_BYTES: usize = 8 * 1024;
+/// The room a nested project-instructions block may take (its own cap and its frame), reserved
+/// before a file's page is shown so that a block that was claimed is always shown.
+const BLOCK_ROOM: usize = super::project::NESTED_CAP + 4 * 1024;
+
+/// Why one file of a `read_files` call is not shown.
+enum Unreadable {
+    /// A NUL byte in it.
+    Binary,
+    /// Bytes that are not UTF-8 (where `read_file` shows the replacement character).
+    NotUtf8,
+    /// It could not be read.
+    Io(io::Error),
+}
+
+/// One file of a `read_files` call: its numbered rows, how many lines it has, the first line not
+/// shown, and whether its last line has no line end.
+struct Paged {
+    rows: String,
+    total: u64,
+    next: Option<u64>,
+    no_final_newline: bool,
+}
+
+/// Push the row of the line just read, when the page has room for it, and count it as shown.
+/// Once a row does not fit, `full` is set and every later row is skipped: a page is contiguous, so
+/// the line after the last one shown is the line the next page starts at.
+fn push_row(
+    rows: &mut String,
+    shown: &mut u64,
+    full: &mut bool,
+    line: &[u8],
+    chars: u64,
+    number: u64,
+) {
+    if *full {
+        return;
+    }
+    if *shown >= u64::from(READ_FILES_LINES) {
+        *full = true;
+        return;
+    }
+    let text: String = String::from_utf8_lossy(line)
+        .chars()
+        .take(paging::MAX_LINE_CHARS)
+        .collect();
+    let mut row = format!("{number:>6}\t{text}");
+    if chars > paging::MAX_LINE_CHARS as u64 {
+        row.push_str(&format!("… [line cut: {chars} chars]"));
+    }
+    row.push('\n');
+    // The first row is always shown, as a page of `read_file` always has a line.
+    if *shown > 0 && rows.len() + row.len() > READ_FILES_PAGE_BYTES {
+        *full = true;
+        return;
+    }
+    rows.push_str(&row);
+    *shown += 1;
+}
+
+/// The page of `reader`: the first [`READ_FILES_LINES`] lines (at most [`READ_FILES_PAGE_BYTES`]
+/// of rows) behind the numbers and tabs `read_file` uses, and how many lines the file has.
+///
+/// The whole stream is read, to count its lines, and every byte of it is checked: a NUL is
+/// [`Unreadable::Binary`] and a byte that is not UTF-8 is [`Unreadable::NotUtf8`]. A line over
+/// [`paging::MAX_LINE_CHARS`] characters is cut and says how long it was, as `read_file` cuts one.
+fn page_in(mut reader: impl io::BufRead, stop: &AtomicBool) -> Result<Paged, Unreadable> {
+    let mut rows = String::new();
+    let mut total: u64 = 0;
+    let mut shown: u64 = 0;
+    let mut full = false;
+    let mut line: Vec<u8> = Vec::new();
+    let mut chars: u64 = 0;
+    let mut ends_with_newline = true;
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err(Unreadable::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "out of time",
+            )));
+        }
+        let buf = reader.fill_buf().map_err(Unreadable::Io)?;
+        if buf.is_empty() {
+            break;
+        }
+        // UTF-8 across the chunks: the bytes of a sequence the end of a chunk split wait in
+        // `carry` for the next one.
+        let mut whole = std::mem::take(&mut carry);
+        whole.extend_from_slice(buf);
+        match std::str::from_utf8(&whole) {
+            Ok(_) => {}
+            Err(e) if e.error_len().is_none() => carry = whole[e.valid_up_to()..].to_vec(),
+            Err(_) => return Err(Unreadable::NotUtf8),
+        }
+        if buf.contains(&0) {
+            return Err(Unreadable::Binary);
+        }
+        for &byte in buf {
+            if byte == b'\n' {
+                total += 1;
+                ends_with_newline = true;
+                push_row(&mut rows, &mut shown, &mut full, &line, chars, total);
+                line.clear();
+                chars = 0;
+            } else {
+                chars += u64::from(byte & 0xC0 != 0x80);
+                if line.len() < paging::MAX_LINE_CHARS * 4 {
+                    line.push(byte);
+                }
+            }
+        }
+        let used = buf.len();
+        reader.consume(used);
+    }
+    if !carry.is_empty() {
+        return Err(Unreadable::NotUtf8);
+    }
+    if !line.is_empty() || chars > 0 {
+        total += 1;
+        ends_with_newline = false;
+        push_row(&mut rows, &mut shown, &mut full, &line, chars, total);
+    }
+    Ok(Paged {
+        rows,
+        total,
+        next: (shown < total).then(|| shown + 1),
+        no_final_newline: total > 0 && !ends_with_newline,
+    })
+}
+
+/// Why a path could not be resolved for a `read_files` call, as a phrase that follows the path.
+fn why_not(e: BeneathError) -> String {
+    match e {
+        BeneathError::Escapes => {
+            "leads outside the worktree (through a symlink): refused".to_owned()
+        }
+        BeneathError::Avoided(_) => "leads into .git (through a symlink): refused".to_owned(),
+        BeneathError::TooManyLinks => {
+            "cannot be resolved: too many levels of symbolic links".to_owned()
+        }
+        BeneathError::Changed => {
+            "changed while it was opened (a symlink is on its way now): refused".to_owned()
+        }
+        BeneathError::Io(e) if e.kind() == io::ErrorKind::NotFound => "does not exist".to_owned(),
+        BeneathError::Io(e) => format!("cannot be resolved: {e}"),
+    }
+}
+
+/// One path of a `read_files` call.
+enum One {
+    /// Its page.
+    Page(Paged),
+    /// The one line the result gives for it.
+    Refused(String),
+}
+
+/// Read `rel` of the slot `root` for a `read_files` call: its page, or the one line that says why
+/// it is not shown (a path that is not there, is not text, is over the read cap or leaves the
+/// slot: never a failure of the whole call).
+fn read_one(root: &SlotDir, rel: &str, stop: &AtomicBool) -> One {
+    let shown = rel.trim();
+    // The name starts the one line a refused path gets, so a leading `[` is escaped too.
+    let name = paging::escape_item_name(shown.as_bytes());
+    let parts = match parts_of(rel) {
+        Ok(parts) => parts,
+        // The message names the path already (`\`../a\` goes up with `..`), and the path is the
+        // model's: its control characters are escaped so the refusal stays one line.
+        Err(line) => return One::Refused(paging::escape_text(line.as_bytes())),
+    };
+    let path: PathBuf = parts.iter().collect();
+    let (file, meta) = match root.open_following(&path, &is_dot_git) {
+        Ok(opened) => opened,
+        Err(e) => return One::Refused(format!("{name}: {}", why_not(e))),
+    };
+    if meta.is_dir() {
+        return One::Refused(format!("{name}: is a directory: list it with list_files"));
+    }
+    if !meta.is_file() {
+        return One::Refused(format!("{name}: is not a regular file"));
+    }
+    if meta.size() > READ_MAX_FILE {
+        return One::Refused(format!(
+            "{name}: is {} bytes, over the {READ_MAX_FILE} a read opens: search it with search_files",
+            meta.size()
+        ));
+    }
+    let reader = io::BufReader::new(StopRead { inner: file, stop });
+    match page_in(reader, stop) {
+        Ok(page) => One::Page(page),
+        Err(Unreadable::Binary) => One::Refused(format!(
+            "{name}: is a binary file, {} bytes, not shown",
+            meta.size()
+        )),
+        Err(Unreadable::NotUtf8) => One::Refused(format!("{name}: is not UTF-8 text, not shown")),
+        Err(Unreadable::Io(e)) => One::Refused(format!("{name}: cannot be read: {e}")),
+    }
+}
+
+/// The section of one file in a `read_files` result: the line that names it, its rows, and the line
+/// that says what is left (or that it is the end). It ends with one line end.
+fn section(name: &str, page: &Paged) -> String {
+    let mut out = format!("== {name} ==\n");
+    out.push_str(&page.rows);
+    match page.next {
+        Some(next) => out.push_str(&format!(
+            "[more: {} lines left; next page: read_file path={name} offset={next}]\n",
+            page.total - next + 1
+        )),
+        None if page.total == 0 => out.push_str("[end: 0 lines]\n"),
+        None if page.no_final_newline => out.push_str(&format!(
+            "[end: {} lines; no newline at the end of the file]\n",
+            page.total
+        )),
+        None => out.push_str(&format!("[end: {} lines]\n", page.total)),
+    }
+    out
+}
+
+/// Read several text files of your worktree in one call: 1 to 16 paths, relative to the root, in
+/// the order you give them. Each file comes behind a line that names it, then its numbered lines
+/// (the numbers of `read_file`): its first page, at most 400 lines or 8 KiB. A page that was cut
+/// ends with `[more: N lines left; next page: read_file path=<path> offset=K]`: read on with
+/// read_file. The whole result is at most 32 KiB: a file that did not fit is one line, `[not
+/// shown: read it alone with read_file path=<path>]`. A file that is not there, is binary or is
+/// not UTF-8 is one line that says why, and the other files are still shown. Read the manifest,
+/// the CI file and the other small files of a repository together with it. Example:
+/// {"paths":["Cargo.toml","justfile"]}
+#[tool(label = "Read files", icon = "read", parallel = "read")]
+pub async fn read_files(
+    env: State<ToolEnv>,
+    ctx: &ToolCtx,
+    /// Paths relative to the worktree root, in the order to show them (1 to 16)
+    paths: Vec<String>,
+    /// The slot to read in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
+) -> Outcome {
+    if paths.is_empty() || paths.len() > READ_FILES_MAX {
+        return Ok(ToolOutput::error(format!(
+            "paths must be 1 to {READ_FILES_MAX} paths: give the files to read in one call"
+        )));
+    }
+    let escaped: Vec<String> = paths
+        .iter()
+        .map(|path| paging::escape_name(path.trim().as_bytes()))
+        .collect();
+    let named: usize = escaped.iter().map(|path| path.len() + 1).sum();
+    if named > READ_FILES_PATHS_BYTES {
+        return Ok(ToolOutput::error(format!(
+            "the paths are {named} bytes together, over the {READ_FILES_PATHS_BYTES} one call may \
+             name: split it into two calls"
+        )));
+    }
+    let slot = match env.slot_to_read(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
+        Err(outcome) => return outcome,
+    };
+    ctx.emit_progress(format!("read {} files ({})", paths.len(), slot.dir()))
+        .await;
+    let root = Arc::clone(slot.root());
+    let wanted: Vec<String> = paths.iter().map(|path| path.trim().to_owned()).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&stop);
+    let reading = wanted.clone();
+    let work = async {
+        tokio::task::spawn_blocking(move || {
+            reading
+                .iter()
+                .map(|path| read_one(&root, path, &seen))
+                .collect::<Vec<One>>()
+        })
+        .await
+        .map_err(|e| format!("the read was interrupted: {e}"))
+    };
+    let read = match super::find::within(super::find::DEADLINE, &stop, work).await {
+        Ok(read) => read,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
+    };
+    // The one line a result that has no room for a file gives for it.
+    let fallback = |at: usize| -> String {
+        match &read[at] {
+            One::Refused(line) => format!("{line}\n"),
+            One::Page(_) => format!(
+                "[not shown: read it alone with read_file path={}]\n",
+                escaped[at]
+            ),
+        }
+    };
+    let mut out = String::new();
+    // The blocks shown by this call: the same call id shows a directory's file again (a retry),
+    // and a call that reads two files of one directory asks for it twice.
+    let mut shown: Vec<String> = Vec::new();
+    for at in 0..read.len() {
+        // What the files after this one cost when the result has no room for them.
+        let rest: usize = (at + 1..read.len()).map(|i| fallback(i).len() + 1).sum();
+        let alone = fallback(at);
+        let mut piece = String::new();
+        match &read[at] {
+            One::Refused(_) => piece.push_str(&alone),
+            One::Page(page) => {
+                let page = section(&escaped[at], page);
+                let gap = out.len() + usize::from(!out.is_empty());
+                let room = READ_FILES_TOTAL_BYTES.saturating_sub(gap + rest);
+                if page.len() + BLOCK_ROOM <= room {
+                    // Room for a block: claim it. A block that was claimed is always shown.
+                    match super::project::nested(
+                        &env,
+                        ctx,
+                        &slot,
+                        Some(&wanted[at]),
+                        super::project::Target::File,
+                    )
+                    .await?
+                    {
+                        Some(block) if !shown.contains(&block) => {
+                            shown.push(block.clone());
+                            piece.push_str(&block);
+                            piece.push_str("\n\n");
+                            piece.push_str(&page);
+                        }
+                        _ => piece.push_str(&page),
+                    }
+                } else if page.len() <= room {
+                    piece.push_str(&page);
+                } else {
+                    piece.push_str(&alone);
+                }
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&piece);
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    Ok(ToolOutput::text(out))
+}
+
 /// Create a file, or replace one, with exactly `content`. Parent directories are created. The
 /// path is relative to the root of the worktree; nothing inside `.git` and nothing through a
 /// symlink can be written. For a change to part of a file use edit_file (exact text replaced) or
@@ -1025,6 +1391,7 @@ pub async fn write_file(
         .map_err(|e| ToolError::Transient(format!("the write was interrupted: {e}")))?;
     match written {
         Ok(done) => {
+            moved_the_epoch(&env, ctx).await?;
             ctx.emit_progress(format!("wrote {path} ({})", slot.dir()))
                 .await;
             let mut text = format!(
@@ -1064,6 +1431,7 @@ pub async fn apply_patch(
     };
     match apply_in(&GitAt::slot(&slot), &patch).await {
         Ok(paths) => {
+            moved_the_epoch(&env, ctx).await?;
             ctx.emit_progress(format!("patched {} ({})", listed(&paths), slot.dir()))
                 .await;
             let mut text = format!(
@@ -1163,29 +1531,44 @@ fn edit_in(
         return Err(binary_notice(shown, meta.size()));
     }
 
-    let places: Vec<usize> = content.match_indices(old).map(|(at, _)| at).collect();
-    let lines: Vec<usize> = places.iter().map(|at| line_of(&content, *at)).collect();
-    match places.len() {
-        0 => return Err(not_found(shown, &content, old)),
-        1 => {}
-        n if !replace_all => {
-            return Err(format!(
-                "`old` is in `{shown}` {n} times (starting at {}): nothing was changed. Add the \
-                 lines around the one you mean to `old` so that it matches once, or set \
-                 replace_all to replace every one",
-                places_listed(&lines)
-            ));
+    let exact: Vec<usize> = content.match_indices(old).map(|(at, _)| at).collect();
+    let (edited, lines) = if exact.is_empty() {
+        // The exact match is the rule; the tolerance is the one fallback that keeps a model from
+        // spending a turn on a line ending or a blank it copied wrong. Leading whitespace is never
+        // ignored: an indentation is semantic.
+        let Some(places) = normalized_places(&content, old) else {
+            return Err(not_found(shown, &content, old));
+        };
+        if places.len() > 1 && !replace_all {
+            return Err(not_found(shown, &content, old));
         }
-        _ => {}
-    }
-    let edited = if replace_all {
-        content.replace(old, new)
+        let lines: Vec<usize> = places.iter().map(|(_, _, line)| *line).collect();
+        let spans: Vec<(usize, usize)> = places.iter().map(|(at, end, _)| (*at, *end)).collect();
+        (replace_spans(&content, &spans, new), lines)
     } else {
-        content.replacen(old, new, 1)
+        let lines: Vec<usize> = exact.iter().map(|at| line_of(&content, *at)).collect();
+        match exact.len() {
+            1 => {}
+            n if !replace_all => {
+                return Err(format!(
+                    "`old` is in `{shown}` {n} times (starting at {}): nothing was changed. Add the \
+                     lines around the one you mean to `old` so that it matches once, or set \
+                     replace_all to replace every one",
+                    places_listed(&lines)
+                ));
+            }
+            _ => {}
+        }
+        let edited = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        (edited, lines)
     };
     let written = write_located(&located, &edited)?;
     Ok(Edited {
-        replaced: places.len(),
+        replaced: lines.len(),
         lines,
         bytes: written.bytes,
     })
@@ -1194,6 +1577,75 @@ fn edit_in(
 /// The 1-based line of the byte offset `at` of `text`.
 fn line_of(text: &str, at: usize) -> usize {
     text[..at].bytes().filter(|b| *b == b'\n').count() + 1
+}
+
+/// `text` with `\r\n` and `\r` read as `\n`, and the spaces and tabs at the end of every line
+/// dropped, and where each byte of the result came from: `spans[i]` is the byte range of `text`
+/// the result's byte `i` covers, one byte or one line ending. The blanks dropped at the end of a
+/// line are in no range, so a match that stops at the last character of a line leaves them.
+fn normalized(text: &str) -> (String, Vec<(usize, usize)>) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut spans = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let mut end = at;
+        while end < bytes.len() && bytes[end] != b'\r' && bytes[end] != b'\n' {
+            end += 1;
+        }
+        let mut kept = end;
+        while kept > at && (bytes[kept - 1] == b' ' || bytes[kept - 1] == b'\t') {
+            kept -= 1;
+        }
+        spans.extend((at..kept).map(|byte| (byte, byte + 1)));
+        out.push_str(&text[at..kept]);
+        if end < bytes.len() {
+            let line_end = if bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n') {
+                end + 2
+            } else {
+                end + 1
+            };
+            spans.push((end, line_end));
+            out.push('\n');
+            at = line_end;
+        } else {
+            at = end;
+        }
+    }
+    (out, spans)
+}
+
+/// The places `old` is in `content` once [`normalized`]: each as the byte span of `content` the
+/// match covers and the 1-based line of the normalized text it starts on. `None` when nothing
+/// matches, or when `old` is only blanks (which would match everywhere).
+fn normalized_places(content: &str, old: &str) -> Option<Vec<(usize, usize, usize)>> {
+    let (needle, _) = normalized(old);
+    if needle.is_empty() {
+        return None;
+    }
+    let (haystack, spans) = normalized(content);
+    let places: Vec<(usize, usize, usize)> = haystack
+        .match_indices(needle.as_str())
+        .map(|(at, _)| {
+            let (start, _) = spans[at];
+            let (_, end) = spans[at + needle.len() - 1];
+            (start, end, line_of(&haystack, at))
+        })
+        .collect();
+    (!places.is_empty()).then_some(places)
+}
+
+/// `content` with each byte span of `places` (in order, not overlapping) replaced by `new`.
+fn replace_spans(content: &str, places: &[(usize, usize)], new: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut at = 0;
+    for (start, end) in places {
+        out.push_str(&content[at..*start]);
+        out.push_str(new);
+        at = *end;
+    }
+    out.push_str(&content[at..]);
+    out
 }
 
 /// `lines 3, 9, 14` (the first [`MAX_PLACES`], then how many more).
@@ -1335,11 +1787,6 @@ fn not_found(shown: &str, content: &str, old: &str) -> String {
     let content_lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old.lines().collect();
     let mut message = format!("`old` was not found in `{shown}`, and nothing was changed.");
-    if content.contains("\r\n") && !old.contains('\r') {
-        message.push_str(
-            " The file uses CRLF line endings, which a multi-line `old` must have as well.",
-        );
-    }
     let Some(start) =
         closest_window(&content_lines, &old_lines).filter(|s| *s < content_lines.len())
     else {
@@ -1404,13 +1851,15 @@ fn not_found(shown: &str, content: &str, old: &str) -> String {
 
 /// Replace exact text in a file of your worktree: every character of `old`, blanks and line breaks
 /// included, is replaced by `new`. It is the way to make a small change without writing a diff:
-/// read the file, copy the lines you mean to change as `old`, write what they become as `new`. It
-/// refuses, and changes nothing, when `old` is not in the file (the error shows the closest region
-/// with line numbers, so you can copy it right) or when `old` is in the file more than once and
-/// `replace_all` is not set (the error lists the lines: add more of the text around it to make it
-/// unique). The path is relative to the root of the worktree; nothing inside `.git` and nothing
-/// through a symlink can be edited. The file must be text of at most 1 MiB. To create a file or
-/// replace it whole use write_file, for several files at once apply_patch.
+/// read the file, copy the lines you mean to change as `old`, write what they become as `new`. The
+/// exact match is tried first; when it fails, line endings and trailing blanks are tolerated;
+/// leading whitespace is not. It refuses, and changes nothing, when `old` is not in the file (the
+/// error shows the closest region with line numbers, so you can copy it right) or when `old` is in
+/// the file more than once and `replace_all` is not set (the error lists the lines: add more of the
+/// text around it to make it unique). The path is relative to the root of the worktree; nothing
+/// inside `.git` and nothing through a symlink can be edited. The file must be text of at most
+/// 1 MiB. To create a file or replace it whole use write_file, for several files at once
+/// apply_patch.
 #[tool(
     label = "Edit a file",
     icon = "edit",
@@ -1422,7 +1871,7 @@ pub async fn edit_file(
     ctx: &ToolCtx,
     /// Path of the file, relative to the root of the worktree
     path: String,
-    /// The exact text to replace, copied from the file (blanks and line breaks too). Must be in the file; and once, unless replace_all is set.
+    /// The text to replace, copied from the file (blanks and line breaks too). Must be in the file; and once, unless replace_all is set.
     old: String,
     /// What it becomes. May be empty, to delete the text.
     new: String,
@@ -1445,6 +1894,7 @@ pub async fn edit_file(
         .map_err(|e| ToolError::Transient(format!("the edit was interrupted: {e}")))?;
     match edited {
         Ok(done) => {
+            moved_the_epoch(&env, ctx).await?;
             ctx.emit_progress(format!("edited {path} ({})", slot.dir()))
                 .await;
             let mut text = format!(
@@ -2728,14 +3178,405 @@ mod tests {
     }
 
     #[test]
-    fn a_text_nothing_is_like_says_so_and_a_crlf_file_is_noticed() {
+    fn a_text_nothing_is_like_says_so() {
         let dir = with_main();
         let why = edit(dir.path(), "zzzzzzzz qqqqqqqq", "x", false).unwrap_err();
         assert!(why.contains("Nothing in the file is like it"), "{why}");
-        fs::write(dir.path().join("src/crlf.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
-        let why = edit_in(dir.path(), "src/crlf.txt", "one\ntwo", "x", false).unwrap_err();
-        assert!(why.contains("CRLF"), "{why}");
-        assert!(why.contains("closest region is lines 1-2"), "{why}");
+    }
+
+    /// The tolerance: a line ending or trailing blanks that differ are not a miss. The edit is
+    /// applied to the original bytes at the matched span, so the lines around it keep their own
+    /// endings and blanks.
+    #[test]
+    fn a_crlf_file_is_edited_by_an_old_with_lf_and_keeps_its_other_endings() {
+        let dir = root();
+        fs::write(dir.path().join("mixed.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let done = edit_in(dir.path(), "mixed.txt", "beta\ngamma", "BETA\nGAMMA", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("mixed.txt")).unwrap(),
+            "alpha\r\nBETA\nGAMMA\r\n",
+            "the replaced span has new's bytes, the rest keeps CRLF"
+        );
+    }
+
+    #[test]
+    fn trailing_blanks_on_a_line_do_not_hide_it() {
+        let dir = root();
+        fs::write(dir.path().join("blanks.txt"), "one\ntwo   \nthree\n").unwrap();
+        let done = edit_in(dir.path(), "blanks.txt", "two\nthree", "2\n3", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("blanks.txt")).unwrap(),
+            "one\n2\n3\n"
+        );
+    }
+
+    /// The tolerance is on both sides: an `old` copied with CRLF endings or with trailing blanks
+    /// the file does not have is normalized too.
+    #[test]
+    fn an_old_with_crlf_or_trailing_blanks_is_normalized_too() {
+        let dir = root();
+        fs::write(dir.path().join("old.txt"), "one\ntwo\nthree\n").unwrap();
+        let done = edit_in(dir.path(), "old.txt", "one\r\ntwo  ", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("old.txt")).unwrap(),
+            "1\n2\nthree\n"
+        );
+    }
+
+    #[test]
+    fn a_normalized_match_in_two_places_is_refused_as_a_miss_and_changes_nothing() {
+        let dir = root();
+        let body = "foo   \nbar\nfoo\t\n";
+        fs::write(dir.path().join("twice.txt"), body).unwrap();
+        let why = edit_in(dir.path(), "twice.txt", "foo\n", "x\n", false).unwrap_err();
+        assert!(
+            why.contains("was not found") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(why.contains("closest region is lines "), "{why}");
+        assert!(
+            why.contains(">     1\t") || why.contains(">     3\t"),
+            "the region is numbered: {why}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("twice.txt")).unwrap(),
+            body,
+            "nothing changed"
+        );
+        // `replace_all` takes every normalized place, each at its own span.
+        let done = edit_in(dir.path(), "twice.txt", "foo\n", "x\n", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("twice.txt")).unwrap(),
+            "x\nbar\nx\n"
+        );
+    }
+
+    #[test]
+    fn a_leading_indentation_that_differs_is_still_a_miss() {
+        let dir = root();
+        let body = "fn main() {\n    let a = 1;\n}\n";
+        fs::write(dir.path().join("indent.rs"), body).unwrap();
+        let why = edit_in(
+            dir.path(),
+            "indent.rs",
+            "fn main() {\n  let a = 1;\n}\n",
+            "x",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("was not found") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(
+            why.contains("First difference, at line 2: only the blanks differ"),
+            "{why}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("indent.rs")).unwrap(),
+            body,
+            "leading whitespace is not guessed"
+        );
+    }
+
+    /// The exact match is tried first: `foo\n` is in the file once exactly and twice once the
+    /// trailing blanks are ignored. The exact place is the one replaced.
+    #[test]
+    fn an_exact_match_is_taken_before_the_tolerant_one() {
+        let dir = root();
+        fs::write(dir.path().join("exact.txt"), "foo  \nbar\nfoo\n").unwrap();
+        let done = edit_in(dir.path(), "exact.txt", "foo\n", "bar\n", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("exact.txt")).unwrap(),
+            "foo  \nbar\nbar\n",
+            "the trailing blanks of the first line are untouched"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_edit_changes_only_its_span_among_mixed_endings() {
+        let dir = root();
+        fs::write(dir.path().join("mixed.txt"), "a\r\nb   \nc\r\nd\r\n").unwrap();
+        let done = edit_in(dir.path(), "mixed.txt", "b\nc", "B\nC", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("mixed.txt")).unwrap(),
+            "a\r\nB\nC\r\nd\r\n"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_alone_is_a_line_ending_too() {
+        let dir = root();
+        fs::write(dir.path().join("cr.txt"), "one\rtwo\r").unwrap();
+        let done = edit_in(dir.path(), "cr.txt", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("cr.txt")).unwrap(),
+            "1\n2\r"
+        );
+    }
+
+    #[test]
+    fn an_old_of_blanks_only_does_not_match_everywhere() {
+        let dir = root();
+        let body = "abc\n";
+        fs::write(dir.path().join("blank.txt"), body).unwrap();
+        for old in ["   ", "\t", " \t "] {
+            for all in [false, true] {
+                let why = edit_in(dir.path(), "blank.txt", old, "x", all).unwrap_err();
+                assert!(why.contains("was not found"), "{old:?}, all={all}: {why}");
+                assert_eq!(
+                    fs::read_to_string(dir.path().join("blank.txt")).unwrap(),
+                    body
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_blanks_at_the_end_of_the_file_are_tolerated() {
+        let dir = root();
+        fs::write(dir.path().join("eof.txt"), "one  \ntwo   ").unwrap();
+        let done = edit_in(dir.path(), "eof.txt", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("eof.txt")).unwrap(),
+            "1\n2   ",
+            "the blanks after the last byte the model matched stay"
+        );
+    }
+
+    #[test]
+    fn the_tolerance_keeps_multibyte_characters_whole() {
+        let dir = root();
+        fs::write(dir.path().join("utf8.txt"), "héllo  \nwörld\n").unwrap();
+        edit_in(dir.path(), "utf8.txt", "héllo\nwörld", "x", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("utf8.txt")).unwrap(),
+            "x\n"
+        );
+    }
+
+    /// The blanks after the last byte of a match are not the edit's: the two spaces of a Markdown
+    /// hard break survive an edit that stops at the last character of the line.
+    #[test]
+    fn trailing_blanks_after_the_matched_text_are_kept() {
+        let dir = root();
+        fs::write(dir.path().join("hard.md"), "one  \ntwo  \nthree\n").unwrap();
+        let done = edit_in(dir.path(), "hard.md", "one\ntwo", "1\n2", false).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hard.md")).unwrap(),
+            "1\n2  \nthree\n",
+            "the hard break after `two` is outside the match"
+        );
+    }
+
+    #[test]
+    fn replace_all_keeps_the_blanks_of_every_line_it_does_not_match() {
+        let dir = root();
+        fs::write(dir.path().join("all.txt"), "x  \ny  \nx  \ny  \n").unwrap();
+        let done = edit_in(dir.path(), "all.txt", "x\ny", "X\nY", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 3]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("all.txt")).unwrap(),
+            "X\nY  \nX\nY  \n"
+        );
+    }
+
+    /// `new` is inserted once and never read back as more places to replace.
+    #[test]
+    fn a_new_that_contains_the_needle_is_inserted_once() {
+        let dir = root();
+        fs::write(dir.path().join("grow.txt"), "a  \nb  \n").unwrap();
+        let done = edit_in(dir.path(), "grow.txt", "a\nb", "a\nb\nc", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![1]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("grow.txt")).unwrap(),
+            "a\nb\nc  \n"
+        );
+    }
+
+    /// A match that ends with the line ending takes the whole `\r\n`, not just the `\r`.
+    #[test]
+    fn a_tolerant_edit_that_ends_with_a_newline_takes_the_whole_crlf() {
+        let dir = root();
+        fs::write(dir.path().join("crlf.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let done = edit_in(dir.path(), "crlf.txt", "beta\n", "BETA\n", false).unwrap();
+        assert_eq!((done.replaced, done.lines), (1, vec![2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("crlf.txt")).unwrap(),
+            "alpha\r\nBETA\ngamma\r\n"
+        );
+    }
+
+    /// A tolerant deletion takes only the matched bytes; the blanks after the match stay.
+    #[test]
+    fn a_tolerant_deletion_keeps_the_blanks_after_the_match() {
+        let dir = root();
+        fs::write(dir.path().join("del.txt"), "a  \nb  \n").unwrap();
+        edit_in(dir.path(), "del.txt", "a\nb", "", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("del.txt")).unwrap(),
+            "  \n"
+        );
+    }
+
+    /// Every span is the bytes the match covers: it starts and ends on a character boundary, its
+    /// text normalizes to `old`, and it ends at the last byte matched.
+    #[test]
+    fn a_tolerant_span_covers_exactly_the_matched_bytes() {
+        for (content, old) in [
+            ("ab  \ncd", "ab"),
+            ("ab\t\r\ncd", "ab"),
+            ("ab  ", "ab"),
+            ("ab", "ab"),
+            ("ab\t\ncd", "ab  \ncd"),
+            ("a  \nb\n", "a\nb"),
+            ("a\r\nb  \r\nc\r\n", "a\nb"),
+            ("a\r\nb\nc\rd", "b\nc"),
+            ("a\r\nb\n", "\nb"),
+            ("héllo  \nwörld\n", "héllo\nwörld"),
+            ("cafe\u{301}  \nx\n", "cafe\u{301}"),
+            ("😀  \nx\n", "😀"),
+            ("one\rtwo\r", "two"),
+            ("a\n   \nb\n", "a\n\nb"),
+        ] {
+            let (needle, _) = normalized(old);
+            let places = normalized_places(content, old)
+                .unwrap_or_else(|| panic!("{content:?} has no tolerant match for {old:?}"));
+            let mut before = 0;
+            for (start, end, _) in places {
+                assert!(
+                    content.is_char_boundary(start) && content.is_char_boundary(end),
+                    "{content:?} {old:?}: {start}..{end} is not on character boundaries"
+                );
+                assert!(
+                    before <= start && start < end,
+                    "{content:?} {old:?}: {start}..{end}"
+                );
+                assert_eq!(
+                    normalized(&content[start..end]).0,
+                    needle,
+                    "{content:?} {old:?}: the span is not the match"
+                );
+                let last = content.as_bytes()[end - 1];
+                assert!(
+                    last != b' ' && last != b'\t',
+                    "{content:?} {old:?}: the span ends in a blank the match ignored"
+                );
+                assert_eq!(
+                    replace_spans(content, &[(start, end)], "N"),
+                    format!("{}N{}", &content[..start], &content[end..]),
+                    "the bytes outside the span are untouched"
+                );
+                before = end;
+            }
+        }
+    }
+
+    /// The map [`normalized`] returns says, for every byte it kept, which byte of the original it
+    /// is: one byte copied, or one line ending, and nothing overlaps.
+    #[test]
+    fn normalized_maps_every_byte_back_to_the_original() {
+        for text in [
+            "",
+            "abc",
+            "a  \n b\t\r\nc\r",
+            "héllo  \n😀\t\n",
+            "\n\n",
+            "   ",
+            "a\r\r\nb",
+        ] {
+            let (out, spans) = normalized(text);
+            assert_eq!(spans.len(), out.len(), "{text:?}");
+            for (i, (start, end)) in spans.iter().enumerate() {
+                assert!(start < end, "{text:?} byte {i}: {start}..{end}");
+                assert!(*end <= text.len(), "{text:?} byte {i}: {start}..{end}");
+                let source = &text.as_bytes()[*start..*end];
+                assert!(
+                    (source.len() == 1 && source[0] == out.as_bytes()[i])
+                        || matches!(source, [b'\n'] | [b'\r'] | [b'\r', b'\n']),
+                    "{text:?} byte {i}: {source:?} for {:?}",
+                    out.as_bytes()[i] as char
+                );
+                if i > 0 {
+                    assert!(
+                        spans[i - 1].1 <= *start,
+                        "{text:?} byte {i}: {}..{} overlaps the one before",
+                        start,
+                        end
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_old_of_only_a_line_ending_matches_one_place_or_is_refused() {
+        let dir = root();
+        fs::write(dir.path().join("nl.txt"), "a\rb\r").unwrap();
+        let why = edit_in(dir.path(), "nl.txt", "\n", "x", false).unwrap_err();
+        assert!(why.contains("was not found"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("nl.txt")).unwrap(),
+            "a\rb\r"
+        );
+        let done = edit_in(dir.path(), "nl.txt", "\n", "x", true).unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (2, vec![1, 2]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("nl.txt")).unwrap(),
+            "axbx"
+        );
+    }
+
+    /// The exact match decides even when it is ambiguous: the tolerance does not turn an error the
+    /// model must fix into an edit of some other place.
+    #[test]
+    fn an_exact_match_that_is_ambiguous_is_not_rescued_by_the_tolerance() {
+        let dir = root();
+        let body = "foo\nbar\nfoo\nbaz\nfoo  \n";
+        fs::write(dir.path().join("exact2.txt"), body).unwrap();
+        let why = edit_in(dir.path(), "exact2.txt", "foo\n", "x\n", false).unwrap_err();
+        assert!(why.contains("2 times (starting at lines 1, 3)"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("exact2.txt")).unwrap(),
+            body,
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_and_a_file_of_blanks_are_clean_misses() {
+        let dir = root();
+        for (name, body) in [("empty.txt", ""), ("blanks.txt", "   \n\t\n")] {
+            fs::write(dir.path().join(name), body).unwrap();
+            for all in [false, true] {
+                let why = edit_in(dir.path(), name, "a", "b", all).unwrap_err();
+                assert!(
+                    why.contains("was not found") && why.contains("nothing was changed"),
+                    "{name}, all={all}: {why}"
+                );
+                assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), body);
+            }
+        }
+    }
+
+    #[test]
+    fn an_edit_of_a_file_over_the_cap_is_refused() {
+        let dir = root();
+        fs::write(dir.path().join("big.txt"), "x".repeat(WRITE_CAP + 1)).unwrap();
+        let why = edit_in(dir.path(), "big.txt", "x", "y", false).unwrap_err();
+        assert!(
+            why.contains("over the") && why.contains("edit_file works on"),
+            "{why}"
+        );
     }
 
     #[test]

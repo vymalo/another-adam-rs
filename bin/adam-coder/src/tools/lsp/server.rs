@@ -86,7 +86,7 @@ pub const REQUEST_MIN: Duration = Duration::from_secs(2);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Names of directories that are not looked into for changes: dependencies and build output.
-const SKIPPED_DIRS: [&str; 10] = [
+const SKIPPED_DIRS: [&str; 11] = [
     ".git",
     "node_modules",
     "target",
@@ -97,6 +97,7 @@ const SKIPPED_DIRS: [&str; 10] = [
     "dist",
     "build",
     ".mypy_cache",
+    ".dart_tool",
 ];
 
 /// What identifies a server.

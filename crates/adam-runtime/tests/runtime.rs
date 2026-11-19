@@ -6061,6 +6061,110 @@ mod cases {
         );
     }
 
+    // -- child sessions (ADR 0045, slice 4) -------------------------------
+
+    /// A session whose latest round ended and that nobody wrote to for the idle TTL reads closed,
+    /// in a listing and in a single read, and its report is still there to read.
+    pub async fn a_session_idle_past_its_ttl_reads_closed(store: DynStore) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let clock = ManualClock::new();
+        let ttl = Duration::from_secs(3600);
+        let rt = Runtime::builder(store.clone())
+            .agent(child_parked(&parent_name))
+            .agent(RoundAgent {
+                name: agent.clone(),
+                waits: false,
+            })
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20))
+            .clock(clock.clone())
+            .session_idle_ttl(ttl)
+            .build();
+        assert_eq!(rt.session_idle_ttl(), ttl);
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        let session = child_run_id(parent, "call-1");
+        let ctx = uniq("u:ctx");
+        rt.start_child_continuing(
+            parent,
+            session,
+            &agent,
+            say("one"),
+            &session_conversation_id(&ctx, session),
+            None,
+        )
+        .await
+        .unwrap();
+        wait_done(&rt, session).await;
+        worker.stop().await;
+
+        let read = |rt: &Runtime| {
+            let (rt, ctx, agent) = (rt.clone(), ctx.clone(), agent.clone());
+            async move {
+                let listed = rt.list_sessions(&ctx, &[&agent], 0, 10).await.unwrap();
+                let view = rt.session_view(&ctx, session).await.unwrap().unwrap();
+                (listed.sessions[0].clone(), view)
+            }
+        };
+        let (listed, view) = read(&rt).await;
+        assert_eq!(listed.state, SessionState::Idle);
+        assert!(!listed.closed && !listed.idle_expired);
+        assert!(!view.closed && !view.idle_expired);
+
+        clock.advance(ttl - Duration::from_secs(60));
+        let (listed, view) = read(&rt).await;
+        assert_eq!(listed.state, SessionState::Idle, "just inside the TTL");
+        assert!(!view.idle_expired);
+
+        clock.advance(Duration::from_secs(60));
+        let (listed, view) = read(&rt).await;
+        assert_eq!(listed.state, SessionState::Closed, "at the TTL");
+        assert!(listed.closed && listed.idle_expired);
+        assert_eq!(view.state, SessionState::Closed);
+        assert!(view.closed && view.idle_expired);
+        assert!(listed.report.ended, "the round's report stays readable");
+        assert_eq!(view.latest.status, RunStatus::Done);
+    }
+
+    /// A round that works never expires, however long it has worked: the TTL is for idle sessions.
+    pub async fn a_working_round_never_expires(store: DynStore) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let clock = ManualClock::new();
+        let rt = Runtime::builder(store.clone())
+            .agent(child_parked(&parent_name))
+            .agent(RoundAgent {
+                name: agent.clone(),
+                waits: true,
+            })
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20))
+            .clock(clock.clone())
+            .session_idle_ttl(Duration::from_secs(60))
+            .build();
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let worker = spawn_worker(&rt);
+        let session = child_run_id(parent, "call-1");
+        let ctx = uniq("u:ctx");
+        rt.start_child_continuing(
+            parent,
+            session,
+            &agent,
+            say("one"),
+            &session_conversation_id(&ctx, session),
+            None,
+        )
+        .await
+        .unwrap();
+        wait_waiting(&rt, session).await;
+        clock.advance(Duration::from_secs(30 * 24 * 3600));
+        let listed = rt.list_sessions(&ctx, &[&agent], 0, 10).await.unwrap();
+        assert_eq!(listed.sessions[0].state, SessionState::Working);
+        assert!(!listed.sessions[0].closed && !listed.sessions[0].idle_expired);
+        let view = rt.session_view(&ctx, session).await.unwrap().unwrap();
+        assert!(!view.closed && !view.idle_expired);
+        worker.stop().await;
+    }
+
     // -- child sessions (ADR 0045, slice 1) -------------------------------
 
     /// Round 2 starts from round 1's conversation, round 3 from round 2's, and every round is a
@@ -7301,6 +7405,8 @@ macro_rules! runtime_suite {
                 session_listings_do_not_mix_awkward_parent_ids,
                 a_session_listing_dedupes_agents_caps_the_page_and_reads_every_page,
                 a_session_listing_says_how_the_round_ended,
+                a_session_idle_past_its_ttl_reads_closed,
+                a_working_round_never_expires,
                 a_report_that_lands_while_a_run_finishes_does_not_reopen_it,
                 a_large_state_lands_unchanged,
                 a_permanent_failure_keeps_the_agents_state,

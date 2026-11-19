@@ -24,8 +24,10 @@
 //!   files included, and refused: a command that moved `HEAD` or rewrote `.git` did more than make
 //!   a file, and what it made on the way cannot be told from what it broke. The model is told to use
 //!   `commit_and_push` for commits.
-//! * **It is never a check.** It spends no check cycle, emits no `checks` artifact and writes
-//!   nothing to the run's notes, so the gate cannot see it. The files it changes change the
+//! * **It is never a check.** It spends no check cycle, emits no `checks` artifact and writes no
+//!   check record to the run's notes, so the gate cannot see it. (It does move the notes' check
+//!   epoch, so a failed check from before it is not reused: its files, ignored ones included, may be
+//!   what the check reads.) The files it changes change the
 //!   worktree's tree, so a check that passed before no longer covers the code: `commit_and_push`
 //!   and `open_pull_request` bind a verdict to a tree, and a changed tree is unchecked until
 //!   `run_checks` has run on it (the same rule as for `write_file`).
@@ -41,7 +43,7 @@ use super::checks::missing_tool_answer;
 use super::gitcli::{GitAt, status_text};
 use super::inspect::{Snapshot, render};
 use super::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
-use super::{Outcome, ToolEnv, non_empty, output, run_error};
+use super::{Outcome, ToolEnv, non_empty, notes_error, output, run_error};
 
 /// Most changed files the result lists.
 const MAX_LISTED: usize = 20;
@@ -125,6 +127,18 @@ pub async fn run(
         .await
         .map_err(|e| run_error(redactor, &e))?;
     output::settle(&env, ctx, &mut outcome).await;
+
+    // The command ran and its files are kept, ignored ones included (`target/`, `node_modules/`):
+    // what a check reads may have changed without the tree id changing, so no failed check record is
+    // reused from before this call (`ChecksNotes::epoch`). A refused command bumps it too: what it
+    // made before the refusal is undone, but a change to an ignored file may stay.
+    let run = ctx.root_run_id().to_string();
+    env.notes
+        .update(&run, |notes| {
+            notes.checks.epoch = notes.checks.epoch.saturating_add(1);
+        })
+        .await
+        .map_err(|e| notes_error(&e))?;
 
     // Did it touch git? The files are its to change; HEAD, the branch, the refs, the
     // configuration and `.git` are not.

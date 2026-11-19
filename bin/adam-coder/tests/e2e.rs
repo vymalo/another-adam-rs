@@ -78,6 +78,7 @@ fn options() -> RuntimeOptions {
         concurrency: 2,
         lease_ttl: Duration::from_secs(30),
         poll_interval: Duration::from_millis(20),
+        ..RuntimeOptions::default()
     }
 }
 
@@ -475,6 +476,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "stop_command",
             "list_commands",
             "read_file",
+            "read_files",
             "list_files",
             "find_files",
             "search_files",
