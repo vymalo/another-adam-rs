@@ -1429,6 +1429,9 @@ async fn a_session_change_is_seen_within_the_subscriptions_fallback_poll() {
             &store,
             Options {
                 hold_parent_on: Some(0),
+                // The session's round stays working, so its first listing has exactly one thing to
+                // say (`opened`) and a second event would have to wait for the next poll.
+                hold_helper_on: Some(0),
                 view_poll: Duration::from_secs(2),
                 ..Options::new()
             },
@@ -1440,21 +1443,31 @@ async fn a_session_change_is_seen_within_the_subscriptions_fallback_poll() {
             .await
             .unwrap();
         rig.parent_gate.reached.notified().await;
-        let events = subscribed(&rig, &alice(), &parent.id).await;
-        let reader = spawn_said(events, event_count(1));
+        let mut events = subscribed(&rig, &alice(), &parent.id).await;
         let started = Instant::now();
         let start = rig.start(&alice(), Some("ctx-l"), "plan it", true).await;
-        let said = reader.await.unwrap();
+        let said = said_on(&mut events, event_count(1)).await;
         let seen = started.elapsed();
-        assert_eq!(said.len(), 1, "the session is told once: {said:?}");
-        assert_eq!(said[0]["event"], "opened");
+        assert_eq!(said[0]["event"], "opened", "{said:?}");
         assert_eq!(said[0]["session"], start.id);
+        assert_eq!(
+            said[0]["round"]["state"], "TASK_STATE_WORKING",
+            "the round is held, so the listing has nothing else to say"
+        );
         assert!(
             seen >= Duration::from_millis(1500),
             "the session was listed after {seen:?}: the 1 s SESSIONS_POLL is not the bound, the \
              2 s subscription poll is"
         );
         assert!(seen <= Duration::from_secs(10), "the listing took {seen:?}");
+        // The held round gives the listing nothing more to say, and the next listing is a poll
+        // away: nothing arrives in the next half second.
+        let extra = tokio::time::timeout(Duration::from_millis(500), events.next()).await;
+        assert!(
+            extra.is_err(),
+            "a second session event arrived before the next poll: {extra:?}"
+        );
+        rig.gate.release.notify_one();
         rig.parent_gate.release.notify_one();
         rig.until(&alice(), &parent.id, TaskState::Completed).await;
         rig.stop().await;

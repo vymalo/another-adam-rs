@@ -87,7 +87,7 @@ breaking for implementers, proved by the `list_runs_*` and `count_runs_*` confor
 
 `Store::run_header(id)` answers a `RunHeader` — the run's id, agent,
 conversation, parent, status, wake time, version, timestamps and lease, **never its state** — or
-`None`. A reader that only needs what the run is doing (a subscriber polling for a status change, a
+`None`. A reader that only needs the run's own bookkeeping (a parent check, a
 step's cancel watch, a listing that builds its view from the record it already has) reads this
 instead of `load_run`: the state is the largest member of a run, and for an `LlmAgent` it is the
 whole transcript. `RunHeader::claimed(now)` applies the same rule as `RunView::claimed`: only a

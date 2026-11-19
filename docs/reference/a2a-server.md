@@ -310,7 +310,7 @@ sequenceDiagram
   B->>R: cancel
   C->>B: SubscribeToTask {parent task}
   B->>R: list_sessions (the snapshot, no event)
-  loop the parent's record changed or a second passed
+  loop the parent's record changed, or on the subscription's poll (2 s by default)
     B->>R: list_sessions
     B-->>C: status update, metadata event (opened, round, reported or closed)
   end

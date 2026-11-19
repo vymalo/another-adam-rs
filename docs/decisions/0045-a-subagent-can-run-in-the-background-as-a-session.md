@@ -124,8 +124,8 @@ subscription polls — its fallback (`RuntimeTaskBackend::with_poll_interval`, 2
 `Status` event of the task it streams — so the bound on a session change is
 `max(SESSIONS_POLL, poll)`, **2 s with the defaults**, not the second the paragraph above says. The
 2 s fallback is the deliberate trade: a listing arm of its own every second would pay a whole
-`list_sessions` (two counts, a page and a lease read per open round) per subscriber per second, for
-a change only a person acting on a session can cause.
+`list_sessions` (two counts and a page, plus a view per changed open round) per subscriber per
+second, for a change nobody is blocked on.
 
 *Built 2026-11-18:* slice 5 (remote sessions, `crates/adam-assembly/src/remote_session.rs`, `RemoteEndpoint` in `remote.rs`, `Agent::on_cancelled`
 in `crates/adam-runtime`, the roster in `crates/adam-llm-agent/src/sessions.rs`): a session on an `a2a:` subagent of the root is a chain of

@@ -155,8 +155,8 @@ record changed, and on the subscription's next poll once a second has passed (`S
 listing that fails is warned about and retried at the next poll; and it lists once more before the final event. **The real
 bound for a session change is `max(SESSIONS_POLL, poll)` — 2 s with the default 2 s fallback poll** — because the tracker is
 evaluated only when the subscription polls. That is the deliberate trade: a listing arm of its own every second would pay a
-whole `list_sessions` (two counts, a page and a lease read per open round) per subscriber per second, for a change only a
-person acting on a session can cause. A session whose latest round the listing cannot
+whole `list_sessions` (two counts and a page, plus a view per changed open round) per subscriber per second, for a change
+nobody is blocked on. A session whose latest round the listing cannot
 read is left out until it can. **A session whose listing row did not change is not read again**: the tracker keeps the row its
 `Seen` came from and skips the `view` (two queries and the full state of an open round) when the next listing returns the same
 row. The row is the version that matters — a commit moves `updated_at`, a new round moves `round` and `latestRun`, and the

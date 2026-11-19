@@ -172,8 +172,8 @@ impl Agent for Scripted {
         if text.contains("[turns]") {
             // Five turns: the first outlives the subscription's 2 s fallback and the watch's 1 s
             // interval, so a counting test sees both loops tick; the rest are short, so the run is
-            // a few seconds and its commits are what the stream reads it for.
-            let hold = if phase == 0 { 1300 } else { 500 };
+            // about four seconds and its commits are what the stream reads it for.
+            let hold = if phase == 0 { 2000 } else { 500 };
             tokio::time::sleep(Duration::from_millis(hold)).await;
             if phase < 4 {
                 state["phase"] = json!(phase + 1);
@@ -575,9 +575,9 @@ async fn a_stream_reads_the_run_once_per_commit_not_once_per_poll() {
     // `tokio::time::interval` fires at once) and the tick at 2 s. The 250 ms fallback would be
     // ~10 polls of the stream alone.
     assert!(loads <= 12, "the stream read the record {loads} times");
-    // The first step outlives the 1 s cancel interval and the rest do not, so the watch reads one
-    // header. The 250 ms interval it used to share read the whole record instead, once per tick
-    // while the step ran.
+    // The first step outlives the 1 s cancel interval by a second (and the 2 s fallback), so the
+    // watch reads it at least once; the rest do not. The 250 ms interval it used to share read the
+    // whole record instead, once per tick while the step ran.
     assert!(
         (1..=3).contains(&headers),
         "the cancel watch read {headers} headers"

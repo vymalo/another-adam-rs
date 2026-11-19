@@ -30,7 +30,9 @@ trait at your rev: its doc comments are the contract.
    never reads the state, as both shipped adapters do, and pass `run_header_matches_the_record`),
    `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`,
    `journal_put` (first writer wins), `journal_list`, `claim_due`, `renew_lease`, `release_lease`,
-   `lease_until`, `purge_finished`.
+   `lease_until`, `purge_finished`, then the listing (`list_runs` and `count_runs`: a caller's runs,
+   newest update first, by keyset) and the five push-notification methods (`push_put`, `push_list`,
+   `push_delete`, `push_claim_due`, `push_commit`; schema version 3).
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
    `StoreError::corrupt_source(e)`; callers decide from the error class, never from the variant.

@@ -29,8 +29,8 @@ use crate::task_state;
 /// `max(SESSIONS_POLL, poll)`: 2 s with the defaults, not 1 s.
 ///
 /// That is deliberate. A listing arm of its own every second would pay a whole `list_sessions`
-/// (two counts, a page and a lease read per open round) per subscriber per second, for a change
-/// that only a person acting on a session can cause; the fallback poll already bounds it.
+/// (two counts and a page, plus a view per changed open round) per subscriber per second, for a
+/// change nobody is blocked on; the fallback poll already bounds it.
 pub(crate) const SESSIONS_POLL: Duration = Duration::from_secs(1);
 
 /// The least time between two listings when the parent's record changed: a busy parent commits far
