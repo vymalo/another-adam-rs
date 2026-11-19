@@ -41,12 +41,12 @@ const CHANNEL_CAPACITY: usize = 64;
 
 /// The most bytes of event payload one subscription holds for a client that does not read: without
 /// it, 64 events of a 4 MiB file artifact would be 256 MiB per subscriber. Past it, a **durable**
-/// artifact event is dropped for that subscriber (it is in the task: `GetTask`, or a resubscription's
-/// snapshot, brings it back); a transient chunk of a stream, a snapshot, a status and an error wait
-/// for room instead, because no read can bring them back. A snapshot larger than this takes the
-/// whole budget and its excess is outside it, so a subscriber holds at most one snapshot plus this
-/// much. The cap is per subscriber: N subscribers on a stalled run hold N times it, not one shared
-/// copy.
+/// artifact event that would fit an empty queue is dropped for that subscriber (it is in the task:
+/// `GetTask`, or a resubscription's snapshot, brings it back); a transient chunk of a stream, a
+/// snapshot, a status and an error wait for room instead, because no read can bring them back. A
+/// snapshot larger than this takes the whole budget and its excess is outside it, so a subscriber
+/// holds at most one snapshot or one over-budget artifact, plus this much. The cap is per
+/// subscriber: N subscribers on a stalled run hold N times it, not one shared copy.
 const CHANNEL_BYTES: usize = 8 * 1024 * 1024;
 
 /// How often a step reports the same state again to a client that activated `steps/v1`: the
@@ -114,8 +114,8 @@ impl Queue {
     /// empty queue (`bytes < CHANNEL_BYTES`) and does not fit now is dropped: it is in the task, so
     /// `GetTask` and a resubscription's snapshot bring it back. An artifact larger than the whole
     /// budget waits for the queue to drain — it could not have fitted even an empty one, so dropping
-    /// it would lose what the stream alone carries. A transient chunk, a snapshot, a status and an
-    /// error are never dropped either: they wait for room.
+    /// it would leave it out of every stream, though `GetTask` still has it. A transient chunk, a
+    /// snapshot, a status and an error are never dropped either: they wait for room.
     async fn push(&self, item: Result<TaskEvent, BackendError>) -> bool {
         let bytes = item_bytes(&item);
         let want = u32::try_from(bytes.min(CHANNEL_BYTES)).unwrap_or(u32::MAX);

@@ -545,7 +545,9 @@ A model turn streams by default (`LlmAgentBuilder::stream_text`): the journaled 
 `ModelClient::stream` and sends what the model has written as `RunEvent::TextDelta` pieces. A client that
 **activated `text-stream/v1`** gets each as an artifact chunk with its byte offset. The whole text is stated
 once, by a `working` status for words before a tool call or by the status that ends the turn (`completed`
-with `output.stream`, or `input-required` for a reply turned into a question).
+with `output.stream`, or `input-required` for a reply turned into a question). A stream has a bounded queue:
+a reader slower than the run emits may miss a **durable** artifact event, which `GetTask` and a
+resubscription's snapshot still have; a streamed chunk is never dropped.
 
 ```mermaid
 sequenceDiagram
