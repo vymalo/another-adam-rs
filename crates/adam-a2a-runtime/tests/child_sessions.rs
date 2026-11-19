@@ -1914,3 +1914,26 @@ async fn max_working_counts_across_pages() {
         rig.stop().await;
     }
 }
+
+/// The backend says the sessions it serves, so a composition root can check that the front took
+/// them (a helper nobody registered is refused, and then there are none).
+#[tokio::test]
+async fn the_backend_says_which_sessions_it_serves() {
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        let sessions = rig.backend.child_sessions().expect("served");
+        assert_eq!(sessions.agents().len(), 1);
+        assert_eq!(sessions.agents()[0].name, "planner");
+        assert_eq!(sessions.agents()[0].agent, rig.helper);
+
+        let bare =
+            RuntimeTaskBackend::new(rig.runtime.clone(), BroadcastSink::default(), uniq("bare"));
+        assert!(bare.child_sessions().is_none());
+        let unregistered = bare.with_child_sessions(
+            ChildSessions::new([ChildSessionAgent::new("x", uniq("nobody"), "No one.")], 4)
+                .unwrap(),
+        );
+        assert!(unregistered.child_sessions().is_none());
+        rig.stop().await;
+    }
+}

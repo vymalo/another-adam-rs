@@ -180,16 +180,21 @@ impl ChildSessions {
     /// front uses the tools' defaults (16 open, 4 working, 20 rounds), with `max_working` at most
     /// `max_open`.
     ///
-    /// **Nothing in this repository calls it yet** (slice 6 part c wires the front). When it does,
-    /// pass the root's *effective* limits (`Assembly::session_limits()` or
+    /// Pass the root's *effective* limits (`Assembly::session_limits()` or
     /// `AgentDef::effective_session_limits()`), which the file may have lowered, so that the card
-    /// and the tools agree, and not the deployment's `SessionSettings::limits`.
+    /// and the tools agree, and not the deployment's `SessionSettings::limits`:
+    /// `AgentDef::child_sessions` in `adam-assembly` does it.
     #[must_use]
     pub fn with_limits(mut self, limits: SessionLimits) -> Self {
         self.max_open = limits.max_open();
         self.max_working = limits.max_working();
         self.max_rounds = limits.max_rounds();
         self
+    }
+
+    /// The helpers, in the order the card lists them.
+    pub fn agents(&self) -> &[ChildSessionAgent] {
+        &self.agents
     }
 
     /// The card entry, `None` only when the contract's bounds are not met.

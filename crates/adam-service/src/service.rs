@@ -180,6 +180,26 @@ impl Service {
         self
     }
 
+    /// Serve `child-sessions/v1` for an agent whose card lists `sessions`
+    /// ([`RuntimeTaskBackend::with_child_sessions`]); `None` changes nothing. A helper that is not
+    /// registered on the runtime is refused by the backend: check
+    /// [`child_sessions`](Self::child_sessions) afterwards before listing the extension.
+    #[must_use]
+    pub fn with_child_sessions(
+        mut self,
+        sessions: Option<adam_a2a_runtime::ChildSessions>,
+    ) -> Self {
+        if let Some(sessions) = sessions {
+            self.backend = self.backend.with_child_sessions(sessions);
+        }
+        self
+    }
+
+    /// The sessions the backend serves `child-sessions/v1` for, if it does.
+    pub fn child_sessions(&self) -> Option<&adam_a2a_runtime::ChildSessions> {
+        self.backend.child_sessions()
+    }
+
     /// Advance runs until `shutdown` resolves; in-flight steps finish first.
     ///
     /// # Errors
