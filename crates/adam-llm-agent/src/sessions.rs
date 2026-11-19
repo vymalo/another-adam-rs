@@ -728,7 +728,7 @@ impl Tool for Send {
                 }
             }
             let limits = self.roster.limits;
-            if view.round >= limits.max_rounds() {
+            if view.countable_rounds() >= limits.max_rounds() {
                 return refuse(format!(
                     "session `{session}` has had {} rounds, the most a session may have: close \
                      it and start a new one with `{SUBAGENT_START}`",

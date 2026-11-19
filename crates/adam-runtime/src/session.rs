@@ -690,9 +690,17 @@ pub struct SessionView {
     pub report_run: RunId,
     /// The run that started the latest round.
     pub started_by: Option<RunId>,
+    /// How many of [`round`](Self::round) only cancel what the round before left running (a closing
+    /// round in a session that stays open): ours, not the person's, so no limit counts them.
+    pub cleanup_rounds: u32,
 }
 
 impl SessionView {
+    /// The rounds the person's limit counts: [`round`](Self::round) without the cleanup rounds.
+    pub fn countable_rounds(&self) -> u32 {
+        self.round.saturating_sub(self.cleanup_rounds)
+    }
+
     /// Whether the latest round was started by a person and not by a run of an agent: a round
     /// that is its own parent.
     pub fn started_outside_a_run(&self) -> bool {
@@ -733,6 +741,12 @@ impl SessionView {
             latest: read.status,
             report_run: runs[worked].0.id,
             started_by: latest.parent_id,
+            cleanup_rounds: u32::try_from(
+                runs.iter()
+                    .filter(|(_, f)| f.header.as_ref().is_some_and(|h| h.closing && !h.closed))
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
         })
     }
 }

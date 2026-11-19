@@ -431,8 +431,23 @@ impl Rig {
     }
 
     fn runtime(&self, store: &DynStore, limit: Option<Duration>) -> Runtime {
+        self.runtime_with_idle(store, limit, None)
+    }
+
+    /// [`runtime`](Self::runtime) whose sessions read closed after `idle` (the deployment's
+    /// `SESSION_IDLE_DAYS`, which every process takes the same).
+    fn runtime_with_idle(
+        &self,
+        store: &DynStore,
+        limit: Option<Duration>,
+        idle: Option<Duration>,
+    ) -> Runtime {
+        let mut builder = Runtime::builder(store.clone());
+        if let Some(idle) = idle {
+            builder = builder.session_idle_ttl(idle);
+        }
         self.assemble(limit)
-            .register(Runtime::builder(store.clone()))
+            .register(builder)
             .poll_interval(Duration::from_millis(20))
             .retry(RetryPolicy {
                 max_attempts: 4,
@@ -1315,11 +1330,28 @@ mod split {
             Self::with_idle_ttl(rig, store, None).await
         }
 
+        /// As [`with_idle_ttl`](Self::with_idle_ttl), with the rounds limited to `rounds`.
+        pub async fn with_max_rounds(rig: &Rig, store: &DynStore, rounds: u32) -> Self {
+            Self::build(rig, store, None, Some(rounds)).await
+        }
+
         /// The control plane reads a session closed after `idle` of nobody writing to it.
         pub async fn with_idle_ttl(rig: &Rig, store: &DynStore, idle: Option<Duration>) -> Self {
-            let worker_rt = rig.runtime(store, None);
+            Self::build(rig, store, idle, None).await
+        }
+
+        async fn build(
+            rig: &Rig,
+            store: &DynStore,
+            idle: Option<Duration>,
+            rounds: Option<u32>,
+        ) -> Self {
+            let worker_rt = rig.runtime_with_idle(store, None, idle);
             let events = BroadcastSink::default();
-            let def = rig.def(None);
+            let mut def = rig.def(None);
+            if let Some(rounds) = rounds {
+                def = def.session_limits(adam_runtime::SessionLimits::new(16, 4, rounds).unwrap());
+            }
             let sessions = def.child_sessions().expect("a root with a helper");
             let mut builder = Runtime::builder(store.clone()).starter(LlmStarter::new(&rig.root));
             if let Some(idle) = idle {
@@ -1525,6 +1557,75 @@ mod split {
             })
             .await;
             assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            split.worker.stop().await;
+        }
+    }
+
+    /// Nobody reads the session again: the worker's own timer ends the remote task after the idle
+    /// TTL, as a question nobody answers must not stay open for good.
+    #[tokio::test]
+    async fn a_remote_session_nobody_reads_again_has_its_remote_task_cancelled_after_the_ttl() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::with_idle_ttl(&rig, &store, Some(Duration::from_millis(300))).await;
+            let start = split.start("invoice [input]", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            let made = rig.remote.made();
+            rig.remote.release();
+            until(&split, &start.id, TaskState::Completed).await;
+            // No request about the session from here on: only the remote is watched.
+            wait_for("the CancelTask with nobody reading", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            assert_eq!(rig.remote.cancels(), [made[0].0.clone()], "{backend}");
+            split.worker.stop().await;
+        }
+    }
+
+    /// The round that cleans up after a cancel is ours: a person's session with room for two
+    /// rounds still takes its second after the first was cancelled.
+    #[tokio::test]
+    async fn a_cleanup_round_does_not_count_toward_the_rounds_of_a_session() {
+        for (backend, store) in stores().await {
+            let rig = Rig::new(usize::MAX, false).await;
+            let split = Split::with_max_rounds(&rig, &store, 2).await;
+            let start = split.start("invoice 7", true).await;
+            wait_for("the remote's task", || async {
+                (!rig.remote.made().is_empty()).then_some(())
+            })
+            .await;
+            split.backend.cancel(&split.alice, &start.id).await.unwrap();
+            wait_for("the CancelTask", || async {
+                (!rig.remote.cancels().is_empty()).then_some(())
+            })
+            .await;
+            wait_for("the session idle", || async {
+                let task = split.backend.get(&split.alice, &start.id).await.ok()??;
+                (object(&task)["state"] == "idle").then_some(())
+            })
+            .await;
+            rig.remote.release();
+            let send = |text: &'static str| {
+                split.backend.submit(
+                    split.alice.clone(),
+                    said(text, Some(&start.context_id), json!({})),
+                    None,
+                    Some(start.context_id.clone()),
+                )
+            };
+            let second = send("invoice 8")
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: the second round of two: {e:?}"));
+            until(&split, &second.id, TaskState::Completed).await;
+            let third = send("invoice 9").await;
+            assert!(
+                matches!(&third, Err(adam_a2a::BackendError::UnsupportedOperation(_))),
+                "{backend}: the limit still holds for the person's own rounds: {third:?}"
+            );
             split.worker.stop().await;
         }
     }

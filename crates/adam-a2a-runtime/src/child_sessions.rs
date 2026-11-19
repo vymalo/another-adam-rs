@@ -1026,7 +1026,7 @@ impl RuntimeTaskBackend {
                     Err(e) => return Err(map_err(e)),
                 }
             }
-            if view.round >= sessions.max_rounds {
+            if view.countable_rounds() >= sessions.max_rounds {
                 return Err(BackendError::UnsupportedOperation(format!(
                     "session {session} has had {} rounds, the most it may have",
                     sessions.max_rounds

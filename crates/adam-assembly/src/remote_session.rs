@@ -23,8 +23,9 @@ use a2a::{
 };
 use adam_llm_agent::{MESSAGE_KIND, ToolError};
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, Ctx, Inbound, SESSION_CLOSE_KIND, SESSION_CLOSE_ROUND_KEY,
-    SESSION_STATE_KEY, SessionHeader, Transition, child_run_id,
+    Agent, AgentError, AgentStarter, Ctx, Inbound, RuntimeError, SESSION_CLOSE_KIND,
+    SESSION_CLOSE_ROUND_KEY, SESSION_STATE_KEY, SessionHeader, SessionState, Transition,
+    child_run_id, closing_round_payload,
 };
 use async_trait::async_trait;
 use chrono::Duration as ChronoDuration;
@@ -107,6 +108,10 @@ pub struct RoundState {
     /// What the next send says: the round's message and the messages that waited.
     #[serde(default)]
     queued: Vec<Queued>,
+    /// Set on a **timer run**, never on a round: when the session this round ended may have
+    /// expired, a run parked until then ends the remote task of a session nobody reads again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reap: Option<Reap>,
     /// What the remote answered, in order.
     #[serde(default)]
     answers: Vec<String>,
@@ -191,6 +196,18 @@ enum Action {
     Poll(String),
     /// Nothing is in flight and nothing waits: report.
     Finish,
+}
+
+/// [`Inbound::kind`] of the message that starts a timer run of a session (see [`Reap`]).
+const REAP_KIND: &str = "adam.session.reap";
+
+/// What a timer run watches: round `round` of `session`, the latest when the timer was set, and
+/// the instant the session expires if nobody writes to it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Reap {
+    session: adam_core::RunId,
+    round: adam_core::RunId,
+    due: chrono::DateTime<chrono::Utc>,
 }
 
 impl RoundState {
@@ -565,11 +582,125 @@ impl RemoteRoundAgent {
         Ok(now + ChronoDuration::from_std(wait).unwrap_or(ChronoDuration::seconds(60)))
     }
 
+    /// A round of a session that may stay open has ended: start the timer run that, if nobody
+    /// writes to the session by the time it expires, starts the closing round whose first act is to
+    /// cancel what the remote still runs. Best effort and journaled: a failure is a warning, and
+    /// the next read of the session cleans up as well. The timer is a run of this agent in the
+    /// session's parent conversation, parked until the expiry, so a worker wakes it with no process
+    /// of its own.
+    async fn schedule_reap(&self, ctx: &mut Ctx, st: &RoundState) -> Result<(), AgentError> {
+        let Some(header) = &st.session else {
+            return Ok(());
+        };
+        if header.closing || header.closed {
+            return Ok(());
+        }
+        let starter = ctx.child_starter();
+        let ttl =
+            ChronoDuration::from_std(starter.session_idle_ttl()).unwrap_or(ChronoDuration::days(7));
+        let round = ctx.run_id();
+        let due = ctx.now_journaled().await? + ttl;
+        let input = Inbound::new(
+            REAP_KIND,
+            serde_json::to_value(Reap {
+                session: header.id,
+                round,
+                due,
+            })
+            .map_err(|e| AgentError::permanent(format!("the timer message: {e}")))?,
+        );
+        let (id, name) = (child_run_id(round, "reap"), self.name.clone());
+        let started: Result<(), String> = ctx
+            .step("schedule-reap", move || async move {
+                starter
+                    .start_in_parent_conversation(id, &name, input)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+            .await?;
+        if let Err(error) = started {
+            tracing::warn!(agent = %self.name, %error, "the expiry timer of a session was not set");
+        }
+        Ok(())
+    }
+
+    /// The timer run: wait for the expiry, then, if the session is as the round left it (no other
+    /// round, none working, no closing round), start the closing round, which a worker steps and
+    /// which cancels the remote task. Any activity since makes it a no-op, because everything is
+    /// read again here.
+    async fn reap(
+        ctx: &mut Ctx,
+        st: RoundState,
+        agent: &str,
+    ) -> Result<Transition<RoundState>, AgentError> {
+        let done = |st: RoundState, what: &str| {
+            Ok(Transition::Done {
+                state: st,
+                output: json!({ "reaped": what }),
+            })
+        };
+        let Some(reap) = st.reap.clone() else {
+            return done(st, "nothing");
+        };
+        let now = ctx.now();
+        if now < reap.due {
+            return Ok(Transition::Park {
+                wake_at: Some(reap.due),
+                state: st,
+            });
+        }
+        let starter = ctx.child_starter();
+        let Some(view) = starter
+            .session(reap.session)
+            .await
+            .map_err(AgentError::transient)?
+        else {
+            return done(st, "gone");
+        };
+        let Some(header) = view.header.clone() else {
+            return done(st, "no header");
+        };
+        if view.latest_run != reap.round || view.state == SessionState::Working || header.closing {
+            return done(st, "activity since");
+        }
+        if !(view.idle_expired || view.closed) {
+            // The clocks differ by a moment: look again.
+            return Ok(Transition::Park {
+                wake_at: Some(now + ChronoDuration::seconds(1)),
+                state: st,
+            });
+        }
+        let mut header = header;
+        header.round = view.round + 1;
+        header.closed = true;
+        header.closing = true;
+        let input = Inbound::new(MESSAGE_KIND, closing_round_payload(&header));
+        match starter
+            .start_round(
+                reap.session,
+                child_run_id(ctx.run_id(), "close"),
+                agent,
+                input,
+                Some(view.latest_run),
+                None,
+            )
+            .await
+        {
+            // Busy: a reader got there first, and that round cancels as well.
+            Ok(_) | Err(RuntimeError::ConversationBusy { .. }) => done(st, "closed"),
+            Err(e) => Err(AgentError::transient(e)),
+        }
+    }
+
     async fn run(
         &self,
         ctx: &mut Ctx,
         mut st: RoundState,
     ) -> Result<Transition<RoundState>, AgentError> {
+        if st.reap.is_some() {
+            return Self::reap(ctx, st, &self.name).await;
+        }
         ctx.reopen_on_arrival();
         let started = *st.started.get_or_insert_with(|| ctx.now());
         st.absorb_inbox(ctx.take_inbox());
@@ -606,7 +737,11 @@ impl RemoteRoundAgent {
                 failed
             }
             Action::Finish => {
-                return Ok(match st.finish() {
+                let finished = st.finish();
+                if finished.is_ok() {
+                    self.schedule_reap(ctx, &st).await?;
+                }
+                return Ok(match finished {
                     Ok(text) => Transition::Done {
                         state: st,
                         output: json!({ "text": text }),
@@ -753,6 +888,14 @@ async fn stop_tasks(
 /// the front that starts the round and the worker that steps it make the same state.
 fn start_round(input: &Inbound) -> Result<RoundState, AgentError> {
     let payload = &input.payload;
+    if input.kind == REAP_KIND {
+        let reap: Reap = serde_json::from_value(payload.clone())
+            .map_err(|e| AgentError::permanent(format!("unusable timer message: {e}")))?;
+        return Ok(RoundState {
+            reap: Some(reap),
+            ..RoundState::default()
+        });
+    }
     let mut header: Option<SessionHeader> = payload
         .get(SESSION_STATE_KEY)
         .and_then(|value| serde_json::from_value(value.clone()).ok());

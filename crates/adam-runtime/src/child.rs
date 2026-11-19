@@ -206,6 +206,40 @@ impl ChildStarter {
             .await
     }
 
+    /// How long a kept-open session may sit idle before it reads closed: the runtime's
+    /// [`session_idle_ttl`](Runtime::session_idle_ttl).
+    pub fn session_idle_ttl(&self) -> std::time::Duration {
+        self.runtime.session_idle_ttl()
+    }
+
+    /// Start a run of `agent` as a child of [`parent`](Self::parent) under `id`, in the conversation
+    /// the sessions of this run belong to, from a round of one of them: the round's conversation is
+    /// the session's, and the new run's is its parent's. A timer run that is parked until the
+    /// session may have expired starts here, and reads the session with [`session`](Self::session)
+    /// when it wakes (its own [`Ctx::child_starter`](crate::Ctx::child_starter) then speaks for that
+    /// conversation). Idempotent, as [`Runtime::start_child`].
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidSession`] when this run is not a round of a session, and the errors
+    /// of [`Runtime::start_child_in`].
+    pub async fn start_in_parent_conversation(
+        &self,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+    ) -> Result<bool, RuntimeError> {
+        let Some((parent, _)) = crate::session::parse_session_conversation_id(&self.conversation)
+        else {
+            return Err(RuntimeError::InvalidSession {
+                reason: "this run is not a round of a session".into(),
+            });
+        };
+        self.runtime
+            .start_child_in(self.parent, id, agent, input, &parent)
+            .await
+    }
+
     /// The session `session` of this conversation: [`Runtime::session_view`].
     ///
     /// # Errors

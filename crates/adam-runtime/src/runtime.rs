@@ -956,6 +956,38 @@ impl Runtime {
         }
     }
 
+    /// [`start_child`](Self::start_child) for a child that lives in `conversation_id`, which is not
+    /// a session's: a timer run of a session ([`ChildStarter::start_in_parent_conversation`]) sits
+    /// in the conversation its session belongs to, so that it can read the session later.
+    pub async fn start_child_in(
+        &self,
+        parent: RunId,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+        conversation_id: &str,
+    ) -> Result<bool, RuntimeError> {
+        let registered = self.registered(agent)?;
+        let new = self
+            .new_run_within(
+                registered.starter(),
+                input,
+                None,
+                Some(id),
+                Some(conversation_id),
+                None,
+            )?
+            .parent(parent);
+        match self.inner.store.create_run(new).await {
+            Ok(rec) => {
+                self.started(&rec).await;
+                Ok(true)
+            }
+            Err(StoreError::AlreadyExists(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Start a round of a child **session** (ADR 0045): [`start_child`](Self::start_child) for a
     /// child that has a conversation, `conversation_id` (build it with
     /// [`session_conversation_id`](crate::session_conversation_id)), and, from round 2 on, that
