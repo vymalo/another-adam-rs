@@ -26,7 +26,7 @@ use a2a::{
 };
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -54,7 +54,7 @@ pub struct PushCursor {
     pub pending: Option<StreamResponse>,
     /// When the pending event first failed: what the give-up bound counts from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failing_since: Option<DateTime<Utc>>,
+    pub failing_since: Option<Timestamp>,
 }
 
 /// The key that tells two statuses apart for "did anything change": the state and a digest of the
@@ -325,7 +325,7 @@ impl PushCursor {
     }
 
     /// `event` failed to be delivered at `now`: keep it to be sent again as it is.
-    pub fn fail(&mut self, event: StreamResponse, now: DateTime<Utc>) {
+    pub fn fail(&mut self, event: StreamResponse, now: Timestamp) {
         self.pending = Some(event);
         self.failing_since.get_or_insert(now);
     }
@@ -372,7 +372,7 @@ mod tests {
             status: TaskStatus {
                 state,
                 message: text.map(|t| Message::new(Role::Agent, vec![Part::text(t)])),
-                timestamp: Some(Utc::now()),
+                timestamp: Some(chrono::Utc::now()),
             },
             artifacts: (!artifacts.is_empty()).then(|| {
                 artifacts
@@ -418,7 +418,7 @@ mod tests {
     fn a_timestamp_alone_is_not_news() {
         let a = task(TaskState::Working, Some("on it"), &[]);
         let mut b = a.clone();
-        b.status.timestamp = Some(Utc::now() + chrono::Duration::seconds(5));
+        b.status.timestamp = Some(chrono::Utc::now() + chrono::Duration::seconds(5));
         assert!(PushCursor::baseline(&a).next_event(&b).is_none());
         let c = task(TaskState::Working, Some("still on it"), &[]);
         assert!(
@@ -446,9 +446,9 @@ mod tests {
         let mut cursor = PushCursor::baseline(&task(TaskState::Submitted, None, &[]));
         let working = task(TaskState::Working, None, &[]);
         let event = cursor.next_event(&working).unwrap();
-        let t0 = Utc::now();
+        let t0 = Timestamp::now();
         cursor.fail(event.clone(), t0);
-        cursor.fail(event, t0 + chrono::Duration::seconds(9));
+        cursor.fail(event, t0 + jiff::SignedDuration::from_secs(9));
         assert_eq!(
             cursor.failing_since,
             Some(t0),
@@ -469,12 +469,32 @@ mod tests {
         let event = cursor
             .next_event(&task(TaskState::Completed, None, &["a"]))
             .unwrap();
-        cursor.fail(event, Utc::now());
+        cursor.fail(event, Timestamp::now());
         let back: PushCursor =
             serde_json::from_value(serde_json::to_value(&cursor).unwrap()).unwrap();
         assert_eq!(back, cursor);
         let empty: PushCursor = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(empty, PushCursor::default());
+    }
+
+    /// A cursor written at `.120` keeps chrono's three digits in the store's JSON (jiff's own
+    /// serde would write `.12`), and re-encodes to the same bytes.
+    #[test]
+    fn a_cursor_at_a_fraction_of_a_millisecond_keeps_its_bytes() {
+        let at: Timestamp = "2026-01-02T03:04:05.120Z".parse().unwrap();
+        let mut cursor = PushCursor::baseline(&task(TaskState::Submitted, None, &[]));
+        let event = cursor
+            .next_event(&task(TaskState::Working, None, &[]))
+            .unwrap();
+        cursor.fail(event, at);
+        let json = serde_json::to_string(&cursor).unwrap();
+        assert!(
+            json.contains(r#""failing_since":"2026-01-02T03:04:05.120Z""#),
+            "{json}"
+        );
+        let back: PushCursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.failing_since, Some(at));
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 }
 

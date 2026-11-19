@@ -132,7 +132,10 @@ Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandl
   client resolves names itself and never connects to a private address, never follows a redirect and ignores
   `HTTP(S)_PROXY`. The specification asks for no signature on notifications (*verified 2026-10-07*), so there is none.
   Run one `PushDeliverer` beside the server (`PushSupport::deliverer`); several replicas share the work by leases. The
-  durable store is `adam_a2a_runtime::StorePushStore`.
+  durable store is `adam_a2a_runtime::StorePushStore`. **Breaking ([ADR 0057](../../docs/decisions/0057-time-is-jiff-with-the-bytes-chrono-wrote.md)):**
+  `PushCursor::failing_since`, `PushRecord::next_attempt_at`, `PushProgress::next_attempt_at` and `PushStore::claim_due`'s
+  `now` are `adam_core::time::Timestamp` (a `jiff::Timestamp` whose serde bytes are the ones chrono wrote); the A2A
+  types (`TaskStatus.timestamp`, `TaskQuery`, `PageToken`) stay `chrono`.
 * A send whose configuration names the push config the way earlier drafts did (`pushNotificationConfig`) is refused with
   `InvalidParams` before any task starts: the SDK reads requests as proto3 JSON, which has no such member, so the config
   would be dropped silently (*observed 2026-10-07*). The 1.0 name is `taskPushNotificationConfig`.
