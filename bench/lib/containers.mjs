@@ -36,8 +36,25 @@ const SAFE_PATH = /^\/[A-Za-z0-9._/@+=-]*$/;
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const SAFE_ARG = /^[^\n\0]*$/;
 
-/** What a `docker` child needs to find the daemon; nothing else of the harness's environment reaches it. */
-export const DOCKER_ENV_KEEP = ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'XDG_RUNTIME_DIR'];
+/**
+ * What a `docker` child needs to find the daemon and the material that authenticates it; nothing else of the harness's
+ * environment reaches it. Every entry is a path or a flag, never a secret: the credentials themselves stay in the files
+ * `DOCKER_CONFIG` and `DOCKER_CERT_PATH` name, which the CLI is meant to read. `HTTPS_PROXY` and the other proxy
+ * variables are deliberately absent (they can carry a password), as is anything the model's configuration sets.
+ */
+export const DOCKER_ENV_KEEP = [
+  'PATH',
+  'HOME',
+  'DOCKER_HOST',
+  'DOCKER_CONTEXT',
+  'DOCKER_CONFIG',
+  'DOCKER_TLS_VERIFY',
+  'DOCKER_CERT_PATH',
+  'XDG_RUNTIME_DIR',
+  'TMPDIR',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+];
 
 /** The environment of a `docker` child: the allow-list above, taken from `baseEnv`. Pure. */
 export function dockerEnv(baseEnv = process.env) {

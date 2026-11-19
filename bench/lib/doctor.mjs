@@ -78,13 +78,18 @@ export async function osRelease({ containers, image, timeoutMs = 60_000 }) {
  * @param {(file: string, args: string[]) => Promise<{exitCode: number, stdout: string, stderr: string}>} [o.exec]
  * @param {object} [o.stack]    a Stack; with `start` it is brought up and a container is run on the host
  * @param {boolean} [o.start]
+ * @param {object} [o.env]      the environment to read (default: the stack's `baseEnv`, or `process.env` without a stack)
  * @returns {Promise<{checks: object[], exitCode: number}>}
  */
-export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, tasks = [], taskError = null, containers = null, env = process.env }) {
+export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfsSync, nodeVersion = process.versions.node, arch = process.arch, stack = null, start = false, slots = 2, tasks = [], taskError = null, containers = null, env = null }) {
+  // A stack carries the environment it was built with (`baseEnv`), which is what its compose calls and host containers
+  // already use. The doctor's own docker calls must use the same one, never the ambient environment: a caller that
+  // injects a stack (the tests do, and `bench doctor` builds it from `main`'s env) would otherwise get two lists.
+  const baseEnv = env ?? stack?.baseEnv ?? process.env;
   const checks = [];
   const run = async (file, args) => {
     try {
-      return await exec(file, args, { env: dockerEnv(env) });
+      return await exec(file, args, { env: dockerEnv(baseEnv) });
     } catch {
       return { exitCode: 127, stdout: '', stderr: '' };
     }
@@ -94,12 +99,12 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
   checks.push(major >= 22 ? ok('node', `Node ${nodeVersion} (CI runs 22 and 24)`) : fail('node', `Node ${nodeVersion} is too old`, 'install Node 22 or newer (CI runs 22 and 24)'));
 
   // The meter reaches the endpoint with Node's own http client, which uses a proxy from the environment only when asked to.
-  const proxy = env.HTTPS_PROXY ?? env.https_proxy;
+  const proxy = baseEnv.HTTPS_PROXY ?? baseEnv.https_proxy;
   if (proxy) {
     if (!envProxyInRequest(nodeVersion)) {
       checks.push(warn('proxy', `HTTPS_PROXY is set but Node ${nodeVersion}'s https.request ignores it, so the meter would reach the endpoint directly`, 'use Node 22.21.0 or newer, or 24.5.0 or newer, and start the harness with NODE_USE_ENV_PROXY=1'));
     } else {
-      checks.push(env.NODE_USE_ENV_PROXY === '1' ? ok('proxy', 'HTTPS_PROXY is set and NODE_USE_ENV_PROXY=1: the meter reaches the endpoint through it') : warn('proxy', 'HTTPS_PROXY is set but the meter would reach the endpoint directly', 'start the harness with NODE_USE_ENV_PROXY=1 if the endpoint is reached through that proxy'));
+      checks.push(baseEnv.NODE_USE_ENV_PROXY === '1' ? ok('proxy', 'HTTPS_PROXY is set and NODE_USE_ENV_PROXY=1: the meter reaches the endpoint through it') : warn('proxy', 'HTTPS_PROXY is set but the meter would reach the endpoint directly', 'start the harness with NODE_USE_ENV_PROXY=1 if the endpoint is reached through that proxy'));
     }
   }
 

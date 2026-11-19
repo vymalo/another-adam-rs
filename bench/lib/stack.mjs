@@ -220,7 +220,9 @@ export class Stack {
   meterHostAddress() {
     if (this.meterAddress) return this.meterAddress;
     try {
-      const r = execFileSync('ip', ['-4', 'route', 'get', '1.1.1.1'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      // `ip` is a host program the harness starts, so it gets the same allow-list as a `docker` child: it must not
+      // carry the model's key while it runs (`ps e`).
+      const r = execFileSync('ip', ['-4', 'route', 'get', '1.1.1.1'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: this.dockerEnv() });
       const m = /\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b/.exec(r);
       if (m && !m[1].startsWith('127.')) return (this.meterAddress = m[1]);
     } catch {

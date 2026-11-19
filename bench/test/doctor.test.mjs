@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
 import { coderProbe, doctor, osRelease, renderDoctor } from '../lib/doctor.mjs';
 import { FakeContainers, HostContainers } from '../lib/containers.mjs';
 import { PINS, coderRef } from '../lib/pins.mjs';
+import { Stack } from '../lib/stack.mjs';
 import { tmp } from './helpers.mjs';
 
 const GB = 1024 ** 3;
@@ -293,6 +295,54 @@ test('a probe that echoes its environment cannot put the key in the doctor\'s re
   assert.doesNotMatch(JSON.stringify(r), new RegExp(`${SENTINEL}|${OTHER_SECRET}`));
   assert.equal(by(r, 'task image hello').status, 'fail');
   assert.match(by(r, 'task image hello').detail, /exec format error/);
+});
+
+test('with --start every docker child uses the stack\'s injected baseEnv, not the ambient environment, and none sees the key', async (t) => {
+  const seen = [];
+  const record = (file, args, opts) => seen.push({ file, args, env: opts?.env ?? process.env });
+  const exec = async (file, args, opts) => {
+    record(file, args, opts);
+    const key = args.join(' ');
+    if (key.startsWith('compose version')) return { exitCode: 0, stdout: '2.40.0\n', stderr: '' };
+    if (args[0] === 'compose') return { exitCode: 0, stdout: '', stderr: '' };
+    if (args[0] === 'info') return { exitCode: 0, stdout: INFO(), stderr: '' };
+    if (args[0] === 'image' && args[1] === 'inspect') return { exitCode: 0, stdout: JSON.stringify([`${PINS.coder.image}@${PINS.coder.digest}`]), stderr: '' };
+    if (args[0] === 'network') return { exitCode: 0, stdout: 'true\n', stderr: '' };
+    if (args[0] === 'create') return { exitCode: 0, stdout: 'id\n', stderr: '' };
+    if (args[0] === 'cp') {
+      fs.writeFileSync(args[2], '');
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+    if (args[0] === 'run') {
+      if (args.includes('/bin/cat')) return { exitCode: 0, stdout: 'PRETTY_NAME="Debian GNU/Linux 13 (trixie)"\n', stderr: '' };
+      if (args.includes('/opt/adam/bin/adam-coder')) return { exitCode: 78, stdout: '', stderr: '' };
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+    return { exitCode: 0, stdout: '', stderr: '' };
+  };
+  const baseEnv = { PATH: process.env.PATH, HOME: '/home/bench-test', DOCKER_HOST: 'unix:///from-base-env', XDG_RUNTIME_DIR: '/run/user/1000', BENCH_MODEL_API_KEY: SENTINEL, ANTHROPIC_API_KEY: OTHER_SECRET };
+  withEnv(t, { DOCKER_HOST: 'unix:///from-process-env' });
+  const home = tmp(t);
+  const stack = new Stack({ composeFile: path.join(home, 'compose.yaml'), home, meterPort: 18090, exec, baseEnv, meterHost: '10.0.0.9' });
+  const statfs = () => ({ bavail: Math.floor((500 * GB) / 4096), bsize: 4096 });
+  const r = await doctor({ home, pins: PINS, nodeVersion: '24.1.0', arch: 'x64', stack, start: true, tasks: [TASK], exec, statfs });
+  const dockerRows = seen.filter((row) => row.file === 'docker');
+  const verbs = new Set(dockerRows.map((row) => row.args[0]));
+  for (const v of ['compose', 'info', 'image', 'network', 'create', 'cp', 'rm', 'run']) assert.ok(verbs.has(v), `no docker ${v} child`);
+  assert.ok(dockerRows.some((row) => row.args[0] === 'run' && row.args.includes('/bin/cat')), 'the distribution probe ran');
+  assert.ok(dockerRows.some((row) => row.args[0] === 'run' && row.args.includes('/opt/adam/bin/adam-coder')), 'the coder probe ran');
+  assert.ok(dockerRows.some((row) => row.args.includes('--cpus')), 'the limits probe ran');
+  for (const row of dockerRows) {
+    assert.equal(row.env.BENCH_MODEL_API_KEY, undefined, `the key reaches: docker ${row.args[0]}`);
+    assert.equal(row.env.ANTHROPIC_API_KEY, undefined, `another secret reaches: docker ${row.args[0]}`);
+    assert.equal(row.env.DOCKER_HOST, 'unix:///from-base-env', `the stack baseEnv is not the one used: docker ${row.args[0]}`);
+    assert.equal(row.env.PATH, process.env.PATH, `PATH is missing: docker ${row.args[0]}`);
+  }
+  assert.equal(by(r, 'stack').status, 'ok');
+  assert.equal(by(r, 'task image hello').status, 'ok');
+  assert.equal(by(r, 'runtime limits').status, 'ok');
+  assert.equal(by(r, 'host runtime, slot 1').status, 'ok');
+  assert.equal(r.exitCode, 0);
 });
 
 test('a probe that times out is unclear, and the doctor still reports the image', async () => {

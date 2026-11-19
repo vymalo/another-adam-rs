@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ContainerError, FakeContainers, HostContainers, buildRunArgs } from '../lib/containers.mjs';
+import { ContainerError, FakeContainers, HostContainers, buildRunArgs, dockerEnv } from '../lib/containers.mjs';
 
 const IMAGE = `registry.example.test/x@sha256:${'a'.repeat(64)}`;
 
@@ -111,6 +111,42 @@ test('the image\'s environment and its files: inspect and create/cp/rm, never a 
   assert.deepEqual(calls[1].args.slice(0, 2), ['create', '--name']);
   assert.equal(calls[2].args[2], '/h/coder-bin/adam-coder');
   assert.deepEqual(calls[3].args.slice(0, 2), ['rm', '-f']);
+});
+
+test('dockerEnv is the allow-list: what finds the daemon and its TLS material and a temp directory, and no secret', () => {
+  const base = {
+    PATH: '/bin',
+    HOME: '/h',
+    DOCKER_HOST: 'tcp://d:2376',
+    DOCKER_CONTEXT: 'c',
+    DOCKER_CONFIG: '/cfg',
+    DOCKER_TLS_VERIFY: '1',
+    DOCKER_CERT_PATH: '/certs',
+    XDG_RUNTIME_DIR: '/run/user/1000',
+    TMPDIR: '/tmp/x',
+    SSL_CERT_FILE: '/ca.pem',
+    SSL_CERT_DIR: '/cas',
+    BENCH_MODEL_API_KEY: 'sk-secret',
+    ANTHROPIC_API_KEY: 'sk-other',
+    HTTPS_PROXY: 'http://u:p@proxy.example.test:3128',
+    AWS_SECRET_ACCESS_KEY: 'aws-secret',
+  };
+  assert.deepEqual(dockerEnv(base), {
+    PATH: '/bin',
+    HOME: '/h',
+    DOCKER_HOST: 'tcp://d:2376',
+    DOCKER_CONTEXT: 'c',
+    DOCKER_CONFIG: '/cfg',
+    DOCKER_TLS_VERIFY: '1',
+    DOCKER_CERT_PATH: '/certs',
+    XDG_RUNTIME_DIR: '/run/user/1000',
+    TMPDIR: '/tmp/x',
+    SSL_CERT_FILE: '/ca.pem',
+    SSL_CERT_DIR: '/cas',
+  });
+  assert.equal(base.BENCH_MODEL_API_KEY, 'sk-secret', 'the base environment is read, never changed');
+  assert.deepEqual(dockerEnv({}), {});
+  assert.deepEqual(dockerEnv({ DOCKER_HOST: undefined, PATH: '/bin' }), { PATH: '/bin' }, 'an unset variable is not invented');
 });
 
 test('a run that times out is removed by name; a build argument that is not plain is refused', async () => {
