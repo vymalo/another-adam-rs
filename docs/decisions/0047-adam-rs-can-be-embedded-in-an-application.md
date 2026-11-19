@@ -71,6 +71,10 @@ workspace as it is.
 5. **Secrets are a port.** A `SecretSource` trait replaces the direct reads of the process environment (a remote
    subagent's bearer, MCP variables). The process environment stays the default of a server; the engine's default
    refuses every name.
+   *Built 2026-11-19 (slice 2):* `adam_core::SecretSource` with `ProcessEnv` (the default of `AgentDef` and
+   `adam_mcp::Env`) and `NoSecrets`; `AgentDef::secrets` gives one source to the remote subagents and the MCP servers,
+   after the values of `AgentDef::env`. A refused name is `RemoteAuthProblem::Refused` or `VarProblem::Refused`, and a
+   `${VAR:-default}` keeps its default. `adam-engine` takes `NoSecrets` as its default when its builder exists (slice 4).
 6. **A tool call can need the person's approval.** An `ApprovalPolicy` decides before a tool's journaled step: allow,
    refuse, or ask. An ask parks the run as a question; the answer runs or refuses **the same call**, once, and a replay
    never asks again. The access tiers of ADR 0036 decide what is asked.

@@ -353,6 +353,7 @@ dependencies = [
  "adam-error",
  "async-trait",
  "chrono",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
@@ -497,6 +498,7 @@ name = "adam-mcp"
 version = "0.1.0"
 dependencies = [
  "adam-agent-fs",
+ "adam-core",
  "adam-error",
  "adam-llm-agent",
  "adam-mcp-testkit",
