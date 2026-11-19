@@ -7,6 +7,7 @@ Start with the [root README](../README.md), then the guide for what you are doin
 
 | Guide | When |
 |---|---|
+| [Try the agents](guides/try-the-agents.md) | you want to chat with the Assistant, give Adam a task, write your own agent, then do it all on a real model |
 | [Run it locally](guides/run-locally.md) | you want the coder and the general agent running on your machine in minutes |
 | [Write an agent](guides/write-an-agent.md) | you want an agent that is a folder of Markdown, or one with `#[tool]` functions |
 | [Deploy the coder](guides/deploy-the-coder.md) | you are installing the image and the Helm chart on Kubernetes |
@@ -100,6 +101,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0054](decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) | a child session can be configured, edited and deleted: an optional `config` on `subagent_start` and on a person's start only chooses within, or narrows, what the subagent's folder and the deployment allow (limits, context window, tools, token budget, instructions, skills, tier, report schema, model from an allow-list); it is recorded in the session header; `subagent_edit`, `subagent_close {delete}` and a fixed section on the session tools in the system prompt (accepted 2026-11-19; nothing is built) |
 | [0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md) | a run's state is a head and an append-only transcript: one body row per message, file bytes in a content-addressed blob store, schema 5, defaulted store methods; expand then contract, two releases; follows the I/O-layer pull request (accepted 2026-11-19; S0 is built — the counting store and the measurement; the rest is not) |
 | [0056](decisions/0056-a2ui-v1-0-only-a-hard-cutover.md) | A2UI v1.0 only, a hard cutover in R1: envelopes say `"version": "1.0"`, the card lists `https://a2ui.org/a2a-extension/a2ui/v1.0` and `ui-catalog/v2`, the renderer's capabilities are read only under `a2uiRendererCapabilities["1.0"]` and a turn without them draws nothing; the v0.9.1 constants are removed, the media type stays; the official schemas, vendored at `a2ui-project/a2ui` `b4f91c2`, are the test oracle; two slices merged into `main` once (accepted 2026-11-19; nothing is built) |
+| [0058](decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md) | the model's credentials come from a provider asked for every call (`ModelCredentials` in `adam-model`): the key is the default provider, a host mints, renews or proves a token, or tags the run for an injector; one retry on 401; nothing cached or journaled by the client (accepted 2026-11-19; built: the port, the OpenAI client, and the device grant of `adam-model-oauth` behind `MODEL_AUTH=device`) |
 
 ## Keeping these docs short and true
 

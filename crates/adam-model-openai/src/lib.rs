@@ -38,6 +38,10 @@
 //!   sensitive `Authorization: Bearer` header and never appears in `Debug`
 //!   output, error messages or logs. Extra header *values* are hidden from
 //!   `Debug` too. An empty key sends no `Authorization` header (local servers).
+//! * **Credentials per call** ([ADR 0058](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)).
+//!   The key is the default [`ModelCredentials`](adam_model::ModelCredentials) provider;
+//!   [`OpenAiCompatible::with_credentials`] gives another, asked for the headers of every call and told
+//!   about a `401`, after which the call is sent once more if the provider asks.
 //! * **Tool calls** arrive in streamed deltas keyed by index and are assembled
 //!   before parsing; malformed argument JSON is a
 //!   [`Protocol`](adam_model::ModelError::Protocol) error, empty arguments are
@@ -69,15 +73,18 @@ mod wire;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use adam_error::{BoxError, Classify, ErrorClass};
 use adam_model::{
-    InputModalities, Message, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
+    AfterRejection, CredentialHeaders, CredentialRequest, DynCredentials, InputModalities, Message,
+    ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, Rejection, StaticBearer,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 
 /// `url` as a log line may show it: its scheme, host and port, nothing else. A gateway's address is
@@ -226,6 +233,7 @@ impl Classify for OpenAiConfigError {
 pub struct OpenAiCompatible {
     http: reqwest::Client,
     url: String,
+    credentials: DynCredentials,
     timeout: Duration,
     max_tokens_field: MaxTokensField,
     extra_body: Option<serde_json::Map<String, serde_json::Value>>,
@@ -243,6 +251,8 @@ impl fmt::Debug for OpenAiCompatible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenAiCompatible")
             .field("url", &endpoint_for_logs(&self.url))
+            // A provider's own `Debug` decides what it shows; the shipped ones show no value.
+            .field("credentials", &"[provider]")
             .field("timeout", &self.timeout)
             .field("max_tokens_field", &self.max_tokens_field)
             // Which members, not their values: an extra body is not a secret, but it is not a log line.
@@ -285,12 +295,13 @@ impl OpenAiCompatible {
             header_value.set_sensitive(true);
             headers.insert(header_name, header_value);
         }
+        // The key is no default header: it is the default provider (ADR 0058), asked for each call
+        // like any other, so `with_credentials` replaces it. Checked here, so a bad key still fails
+        // at build time and never at the first call.
         let key = config.api_key.expose_secret();
         if !key.is_empty() {
-            let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+            HeaderValue::from_str(&format!("Bearer {key}"))
                 .map_err(|_| OpenAiConfigError::InvalidApiKey)?;
-            value.set_sensitive(true);
-            headers.insert(AUTHORIZATION, value);
         }
 
         let http = reqwest::Client::builder()
@@ -305,6 +316,7 @@ impl OpenAiCompatible {
         Ok(Self {
             http,
             url: format!("{base}/chat/completions"),
+            credentials: Arc::new(StaticBearer::new(config.api_key.clone())),
             timeout: config.timeout,
             max_tokens_field: MaxTokensField::default(),
             extra_body: None,
@@ -414,24 +426,56 @@ impl OpenAiCompatible {
         self
     }
 
+    /// Ask `credentials` for the headers of every call instead of sending `api_key` (ADR 0058):
+    /// a host that mints, renews or proves a credential at the moment of use, or an injector's run
+    /// header with no key at all. It replaces the key of the [`OpenAiConfig`]. On a `401` the
+    /// provider is told why ([`ModelCredentials::rejected`](adam_model::ModelCredentials::rejected)) and, if it asks, the call is sent once
+    /// more with new headers; a second `401` is the call's answer.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: DynCredentials) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
     /// Send the request and return the response if it is a success.
     async fn send(&self, body: Vec<u8>, streaming: bool) -> Result<reqwest::Response, ModelError> {
-        let mut request = self
-            .http
-            .post(&self.url)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body);
-        if streaming {
-            request = request.header(ACCEPT, "text/event-stream");
-        } else {
-            request = request.timeout(self.timeout);
-        }
+        let body = Bytes::from(body);
+        let mut attempt = 0;
+        let response = loop {
+            let call = CredentialRequest {
+                method: "POST",
+                url: &self.url,
+                attempt,
+            };
+            let credentials = self.credentials.headers(call).await?;
+            let mut request = self
+                .http
+                .post(&self.url)
+                .headers(credential_headers(&credentials)?)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.clone());
+            if streaming {
+                request = request.header(ACCEPT, "text/event-stream");
+            } else {
+                request = request.timeout(self.timeout);
+            }
 
-        // For streams the timeout covers only the wait for response headers.
-        let response = tokio::time::timeout(self.timeout, request.send())
-            .await
-            .map_err(|_| ModelError::transient(format!("no response within {:?}", self.timeout)))?
-            .map_err(transport_error)?;
+            // For streams the timeout covers only the wait for response headers.
+            let response = tokio::time::timeout(self.timeout, request.send())
+                .await
+                .map_err(|_| {
+                    ModelError::transient(format!("no response within {:?}", self.timeout))
+                })?
+                .map_err(transport_error)?;
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED || attempt > 0 {
+                break response;
+            }
+            let rejection = rejection_of(&response);
+            if self.credentials.rejected(call, &rejection).await == AfterRejection::GiveUp {
+                break response;
+            }
+            attempt += 1;
+        };
 
         let status = response.status();
         if status.is_success() {
@@ -448,6 +492,51 @@ impl OpenAiCompatible {
             .and_then(Result::ok)
             .unwrap_or_default();
         Err(errors::from_http(status, retry_after, &text))
+    }
+}
+
+/// The headers a provider gave, as a request's: names checked, values sensitive (never in `Debug`).
+/// A provider may not set the headers that frame the request.
+fn credential_headers(credentials: &CredentialHeaders) -> Result<HeaderMap, ModelError> {
+    const FRAMING: [&str; 5] = [
+        "content-type",
+        "content-length",
+        "accept",
+        "host",
+        "transfer-encoding",
+    ];
+    let mut headers = HeaderMap::new();
+    for (name, value) in credentials.iter() {
+        let refused = || {
+            ModelError::invalid_request(format!(
+                "the credential provider gave a header that cannot be sent: {name}"
+            ))
+        };
+        if FRAMING.iter().any(|f| name.eq_ignore_ascii_case(f)) {
+            return Err(refused());
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| refused())?;
+        let mut header_value =
+            HeaderValue::from_str(value.expose_secret()).map_err(|_| refused())?;
+        header_value.set_sensitive(true);
+        headers.insert(header_name, header_value);
+    }
+    Ok(headers)
+}
+
+/// What a provider is told about a `401`.
+fn rejection_of(response: &reqwest::Response) -> Rejection {
+    let text = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    Rejection {
+        status: response.status().as_u16(),
+        www_authenticate: text("www-authenticate"),
+        dpop_nonce: text("dpop-nonce"),
     }
 }
 
