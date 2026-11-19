@@ -35,8 +35,9 @@ this crate removed, only later.
 | `.notifier()` -> `PgNotifier` | `RuntimeBuilder::notifier(..)` |
 | `.run(stop)` | drives the publisher and the listener until `stop` resolves; `Ok` only on stop |
 | `.wait_listening()` | resolves once `LISTEN` is active on the current connection |
+| `.local_only(bool)` | keep this process's events local: no encoding, no outbox, no `NOTIFY` (see *Features and environment*); call it first |
 | `MAX_PAYLOAD_BYTES` | 7 999 |
-| `NotifyError` | `InvalidPrefix` (`Invalid`), `AlreadyRunning` (`Internal`), `PoolClosed` (`Rejected`); `#[non_exhaustive]`, `Classify` |
+| `NotifyError` | `InvalidPrefix` and `InvalidLocalOnly` (`Invalid`), `AlreadyRunning` (`Internal`), `PoolClosed` (`Rejected`); `#[non_exhaustive]`, `Classify` |
 
 ```rust
 use adam_runtime::{BroadcastSink, Runtime};
@@ -162,13 +163,17 @@ stateDiagram-v2
 ## Features and environment
 
 Cargo features mirror the store's: `tls-rustls` (default) and `tls-native-tls`,
-forwarded to `sqlx`. No environment variables at runtime.
+forwarded to `sqlx`.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (ASCII case ignored): keep this process's events local. `PgEventSink::emit` delivers them to the local sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway, so a single replica would pay for a round trip and an echo it discards. Signals (wake-ups, cancels) still cross. It is a deployment choice, never detected. `PgNotify::new` reads it once; `.local_only(bool)` overrides it. Anything else: `run` fails at once with `NotifyError::InvalidLocalOnly` (class `Invalid`), so the `notify` component stops at startup and the process exits 70 | `false` |
 
 ## Tests
 
 | File | What |
 |---|---|
-| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step, the largest piece of streamed text and the largest usage report fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes. Offline |
+| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step, the largest piece of streamed text and the largest usage report fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes, local-only (100 events reach the local sink and nothing is queued; the variable's spellings, a bad one fails `run`). Offline |
 | `tests/conformance.rs` | `adam-notify-testkit`'s `notifier_conformance!` with two `PgNotify` on separate pools, plus one case at the exact 7 999-byte limit |
 | `tests/two_runtimes.rs` | a front (starter only) and a worker, each with its own pools, `PgNotify` and `Runtime`, poll interval 30 s: a start and a deliver wake an idle worker; a step's `Progress` reaches the front exactly once and before the `Parked` status; a cancel reaches the step within 2 s; terminating the listener's backend gives a `Resync` within 5 s, a run started meanwhile completes, and a later signal arrives |
 

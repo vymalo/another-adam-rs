@@ -49,6 +49,11 @@
 //! directly or through a session-mode pooler, not a transaction-mode one. The
 //! publisher never blocks the caller: a full queue drops the item.
 //!
+//! A process whose events no one else needs (a single replica) can keep them
+//! local: set `NOTIFY_LOCAL_ONLY` (`true`/`1`, default `false`) and
+//! [`PgEventSink`] delivers to the local sink without encoding or queueing
+//! anything for `NOTIFY`. It is a deployment choice, never detected.
+//!
 //! Its lifecycle, and the guarantees, are in the [crate README](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-notify-postgres/README.md)
 //! and `docs/architecture.md`.
 
@@ -57,6 +62,7 @@
 mod error;
 mod wire;
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -78,6 +84,11 @@ pub use crate::wire::MAX_PAYLOAD_BYTES;
 /// How long [`PgNotify::run`] keeps sending the items still queued when its
 /// `stop` resolves.
 pub const DRAIN_ON_STOP: Duration = Duration::from_secs(2);
+
+/// The variable that keeps this process's events local: `true`/`1` or
+/// `false`/`0` (ASCII case ignored), absent is `false`. Read by
+/// [`PgNotify::new`]; [`PgNotify::local_only`] overrides it.
+pub const LOCAL_ONLY_ENV: &str = "NOTIFY_LOCAL_ONLY";
 
 /// Channel-name prefix unless [`PgNotify::with_channel_prefix`] says otherwise.
 const DEFAULT_PREFIX: &str = "adam_";
@@ -110,8 +121,13 @@ struct Inner {
     local: BroadcastSink,
     /// Tells our own events from those of others.
     origin: Uuid,
+    prefix: String,
     events_channel: String,
     signals_channel: String,
+    /// Events stay in this process: no encoding, no outbox, no `NOTIFY`.
+    local_only: bool,
+    /// The value of [`LOCAL_ONLY_ENV`] when it was not a boolean: `run` refuses it.
+    local_only_problem: Option<String>,
     queue: mpsc::Sender<Outgoing>,
     /// The receiving end of `queue`, held by `run` while it runs.
     outbox: Mutex<Option<mpsc::Receiver<Outgoing>>>,
@@ -141,12 +157,51 @@ fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(BACKOFF_MAX)
 }
 
+/// `true`/`1` or `false`/`0`, ASCII case ignored; anything else is not a boolean.
+fn parse_flag(raw: &str) -> Option<bool> {
+    if raw.eq_ignore_ascii_case("true") || raw == "1" {
+        Some(true)
+    } else if raw.eq_ignore_ascii_case("false") || raw == "0" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// [`LOCAL_ONLY_ENV`] from `lookup`: the value, and the raw text when it is not a boolean (then
+/// the value is `false`, and `run` refuses it).
+fn local_only_from(lookup: impl Fn(&str) -> Option<OsString>) -> (bool, Option<String>) {
+    let Some(raw) = lookup(LOCAL_ONLY_ENV) else {
+        return (false, None);
+    };
+    let raw = raw.to_string_lossy().into_owned();
+    match parse_flag(&raw) {
+        Some(on) => (on, None),
+        None => (false, Some(raw)),
+    }
+}
+
+fn local_only_from_env() -> (bool, Option<String>) {
+    local_only_from(|name| std::env::var_os(name))
+}
+
 impl PgNotify {
     /// Notifications over `pool`, delivering the events of other processes to
     /// `local` (the sink the process's A2A backend subscribes to). Call
     /// [`run`](Self::run) for anything to flow.
+    ///
+    /// [`LOCAL_ONLY_ENV`] is read here, once: an unset variable is `false`, and
+    /// [`local_only`](Self::local_only) overrides it.
     pub fn new(pool: PgPool, local: BroadcastSink) -> Self {
-        Self::build(pool, local, DEFAULT_PREFIX, Uuid::new_v4())
+        let (local_only, local_only_problem) = local_only_from_env();
+        Self::build(
+            pool,
+            local,
+            DEFAULT_PREFIX,
+            Uuid::new_v4(),
+            local_only,
+            local_only_problem,
+        )
     }
 
     /// Use channels `{prefix}events` and `{prefix}signals` instead of the
@@ -164,18 +219,48 @@ impl PgNotify {
             self.inner.local.clone(),
             prefix,
             self.inner.origin,
+            self.inner.local_only,
+            self.inner.local_only_problem.clone(),
         ))
     }
 
-    fn build(pool: PgPool, local: BroadcastSink, prefix: &str, origin: Uuid) -> Self {
+    /// Keep this process's events local: [`PgEventSink::emit`] delivers them to
+    /// the local sink and does not encode them, queue them or `NOTIFY` them.
+    /// Signals still cross: wake-ups and cancels are not events.
+    ///
+    /// Default `false`; [`new`](Self::new) takes the value from
+    /// [`LOCAL_ONLY_ENV`]. Call it before [`event_sink`](Self::event_sink), for
+    /// the same reason as [`with_channel_prefix`](Self::with_channel_prefix).
+    pub fn local_only(self, local_only: bool) -> Self {
+        Self::build(
+            self.inner.pool.clone(),
+            self.inner.local.clone(),
+            &self.inner.prefix,
+            self.inner.origin,
+            local_only,
+            None,
+        )
+    }
+
+    fn build(
+        pool: PgPool,
+        local: BroadcastSink,
+        prefix: &str,
+        origin: Uuid,
+        local_only: bool,
+        local_only_problem: Option<String>,
+    ) -> Self {
         let (queue, outbox) = mpsc::channel(QUEUE_CAPACITY);
         Self {
             inner: Arc::new(Inner {
                 pool,
                 local,
                 origin,
+                prefix: prefix.to_owned(),
                 events_channel: format!("{prefix}events"),
                 signals_channel: format!("{prefix}signals"),
+                local_only,
+                local_only_problem,
                 queue,
                 outbox: Mutex::new(Some(outbox)),
                 fanout: LocalNotifier::default(),
@@ -228,8 +313,14 @@ impl PgNotify {
     /// returns, so the events of a step that ended just before the stop still
     /// go out; what cannot be sent in that time is dropped (best effort, like
     /// any notification).
+    ///
+    /// Fails at once with [`NotifyError::InvalidLocalOnly`] when
+    /// [`LOCAL_ONLY_ENV`] was set to something that is not a boolean.
     pub async fn run(&self, stop: impl Future<Output = ()> + Send) -> Result<(), NotifyError> {
         let inner = &*self.inner;
+        if let Some(raw) = &inner.local_only_problem {
+            return Err(NotifyError::InvalidLocalOnly(raw.clone()));
+        }
         let mut outbox = inner.take_outbox()?;
         // The listener ends the run; the publisher notices between two items
         // (never in the middle of a `pg_notify`) and then drains the queue.
@@ -468,21 +559,26 @@ pub struct PgEventSink {
 #[async_trait]
 impl EventSink for PgEventSink {
     async fn emit(&self, run: RunId, agent: &str, event: RunEvent) {
-        let encoded = encode_event(self.inner.origin, run, agent, &event);
+        // Local only: no encoding and no outbox entry. The listener of every
+        // process drops an event of its own origin, this one included, so
+        // nothing would come of sending it.
+        let encoded =
+            (!self.inner.local_only).then(|| encode_event(self.inner.origin, run, agent, &event));
         self.inner.local.emit(run, agent, event).await;
         match encoded {
-            Encoded::Fits(payload) => self.inner.enqueue(Outgoing {
+            None => {}
+            Some(Encoded::Fits(payload)) => self.inner.enqueue(Outgoing {
                 signals: false,
                 payload,
             }),
-            Encoded::Truncated(payload) => {
+            Some(Encoded::Truncated(payload)) => {
                 tracing::debug!(%run, "event cut to fit a notification (a status's detail, a step's input and output)");
                 self.inner.enqueue(Outgoing {
                     signals: false,
                     payload,
                 });
             }
-            Encoded::Dropped => {
+            Some(Encoded::Dropped) => {
                 tracing::debug!(%run, max = MAX_PAYLOAD_BYTES, "event too big for a notification, not sent to other processes");
             }
         }
@@ -713,5 +809,74 @@ mod tests {
     fn logging_is_rate_limited() {
         let logged: Vec<u64> = (1..=3000).filter(|n| should_log(*n)).collect();
         assert_eq!(logged, [1, 1000, 2000, 3000]);
+    }
+
+    #[test]
+    fn the_local_only_variable_is_a_boolean_or_a_problem() {
+        assert_eq!(local_only_from(|_| None), (false, None));
+        for (raw, want) in [
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("1", true),
+            ("false", false),
+            ("False", false),
+            ("0", false),
+        ] {
+            assert_eq!(
+                local_only_from(|_| Some(raw.into())),
+                (want, None),
+                "{raw:?}"
+            );
+        }
+        for bad in ["", "yes", "on", "2", " true", "false "] {
+            assert_eq!(
+                local_only_from(|_| Some(bad.into())),
+                (false, Some(bad.to_owned())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bad_local_only_value_fails_run_without_taking_the_outbox() {
+        let (n, _) = notify();
+        let bad = PgNotify::build(
+            n.inner.pool.clone(),
+            n.inner.local.clone(),
+            "adam_",
+            n.inner.origin,
+            false,
+            Some("yes".into()),
+        );
+        assert!(matches!(
+            bad.run(std::future::ready(())).await,
+            Err(NotifyError::InvalidLocalOnly(raw)) if raw == "yes"
+        ));
+        assert!(bad.inner.take_outbox().is_ok(), "nothing was started");
+    }
+
+    #[tokio::test]
+    async fn local_only_keeps_every_event_in_this_process() {
+        let (n, local) = notify();
+        let n = n.local_only(true);
+        let sink = n.event_sink();
+        let mut rx = local.subscribe();
+        let run = RunId::new();
+        for i in 0..100 {
+            sink.emit(run, "a", progress(&format!("{i}"))).await;
+        }
+        // Every event reached the local sink, in order and whole.
+        for i in 0..100 {
+            let got = rx.try_recv().expect("the local sink gets every event");
+            assert_eq!((got.run, got.event), (run, progress(&format!("{i}"))));
+        }
+        // Nothing was encoded or queued for the other processes.
+        let mut outbox = n.inner.take_outbox().expect("not running");
+        assert!(
+            outbox.receiver().try_recv().is_err(),
+            "no outbox entry with the flag on"
+        );
+        assert_eq!(n.inner.dropped.load(Relaxed), 0);
     }
 }

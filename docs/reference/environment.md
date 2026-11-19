@@ -3,7 +3,8 @@
 Configuration of both agents is environment variables only. Problems are reported all at once at startup
 (`invalid configuration`, exit 78). Sources of truth: `crates/adam-service/src/config.rs` (the common ones),
 `bin/adam-coder/src/config.rs`, `bin/adam-agent/src/config.rs`, `crates/adam-env-kubernetes/src/settings.rs`,
-`bin/adam-egress/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`.
+`bin/adam-egress/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`, and for the one row below
+`crates/adam-notify-postgres/src/lib.rs`.
 The chart sets these from its values: [chart README](../../deploy/coder/README.md). Secrets are never in
 files or logs; they are `SecretString`s and absent from `Debug`.
 
@@ -62,6 +63,16 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `A2A_CARD_SIGNING_KEY_ID` | the signature's `kid`; needs the key file | the key's RFC 7638 thumbprint |
 | `A2A_CARD_SIGNING_JKU` | the `jku` in the signature's header (where clients fetch the key set; the server serves it at `/.well-known/jwks.json`); needs the key file | unset |
 | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` (or `0`) turns them off | `true` |
+
+## Cross-process notifications (`adam-notify-postgres`)
+
+`adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. `adam-agent` does not
+use this crate. Source: `crates/adam-notify-postgres/src/lib.rs`,
+[the crate README](../../crates/adam-notify-postgres/README.md).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `NOTIFY_LOCAL_ONLY` | `true`/`1` or `false`/`0` (any case): keep this process's events local. `emit` delivers them to the in-process sink and does not encode, queue or `NOTIFY` them; every process's listener drops an event of its own origin anyway, so a single replica would pay for a round trip and an echo it discards. Signals (wake-ups, cancels) still cross. A deployment choice for one replica; it is never detected. Anything else: the `notify` component stops at startup and the process exits **70** (the value is read by this crate, not by the binary's configuration, which reports a bad value as exit 78) | `false` |
 
 ## Agent folder (both binaries)
 
