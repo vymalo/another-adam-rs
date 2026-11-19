@@ -20,7 +20,8 @@ env:
   # cargo-llvm-cov 0.6.21 (workspace, Postgres, no MongoDB: adam-store-mongodb's
   # 273 lines counted as uncovered, so CI with MongoDB reads higher), gated at
   # measured minus 2. Raise it whenever coverage rises, never lower it to get a
-  # change through.
+  # change through. The job runs on main only (see its `if`): a pull request
+  # still runs the whole suite twice in conformance, just not instrumented.
   COVERAGE_MIN_LINES: "87"
   # Not coverage: fake agent binary, the MCP test server and the test code itself.
   COVERAGE_IGNORE: '(adam-acp-fake-agent|adam-mcp-testkit|/tests/)'
@@ -186,7 +187,13 @@ jobs:
 
   # Line coverage of the whole workspace against the newest servers. The lcov
   # file is an artifact; the summary is on the run page; the gate ratchets.
+  # Main only: on a pull request this was a third full workspace run (after the
+  # two conformance arms) on the critical path, for a measurement that is about
+  # the tree as a whole. The trade-off is that a pull request can lower coverage
+  # and main's run says so after the merge; the gate itself is unchanged (87)
+  # and still fails main, so the ratchet cannot silently drift.
   coverage:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     services:

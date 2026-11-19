@@ -31,7 +31,8 @@ npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs   # dia
 ```
 
 CI also runs the MSRV build (`rust-version` in `Cargo.toml`), `cargo deny`, line coverage
-(`cargo llvm-cov nextest --workspace`), and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
+(`cargo llvm-cov nextest --workspace`, on main: the two conformance arms run the suite on every pull request),
+and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
 (`.github/workflows/nightly.yml`, needs secrets). The CI jobs are the reference:
 `.github/workflows/ci.yml` and `coder.yml`.
 
