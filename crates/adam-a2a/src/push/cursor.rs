@@ -46,7 +46,7 @@ pub struct PushCursor {
     pub revisions: BTreeMap<String, String>,
     /// A cheap fingerprint of the content each revision was taken of, by id: what lets a poll tell
     /// an artifact that is what it was from one that changed, without canonicalising and digesting
-    /// it again. A hint, never the truth: when it differs, [`revision`] is computed and decides.
+    /// it again. A hint, never the truth: when it differs, `revision` is computed and decides.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fingerprints: BTreeMap<String, String>,
     /// The event being delivered: sent, not acknowledged, to be sent again as it is.
