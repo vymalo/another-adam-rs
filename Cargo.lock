@@ -311,6 +311,7 @@ dependencies = [
  "adam-runtime",
  "adam-service",
  "adam-store-postgres",
+ "adam-store-testkit",
  "adam-ui",
  "adam-workspace",
  "aho-corasick",

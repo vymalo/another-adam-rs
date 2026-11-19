@@ -355,6 +355,46 @@ async fn a_sweep_removes_what_is_over_and_keeps_what_is_open() {
     );
 }
 
+/// One sweep asks the store about each run once, whatever the later passes look at it for: the
+/// loop over workspaces, the kept outputs, and what the environment still holds all reuse the
+/// verdict of that one read.
+#[tokio::test]
+async fn a_sweep_reads_each_run_once() {
+    use adam_llm_agent::KeptOutputs as _;
+    use adam_store_testkit::fault::{FaultyStore, Method};
+
+    let fx = Fixture::new().await;
+    let counting = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let store: DynStore = counting.clone();
+    let fake = FakeEnvironment::new(Some(&fx.root));
+    let mut runs = Vec::new();
+    for status in [
+        RunStatus::Runnable,
+        RunStatus::Parked,
+        RunStatus::Done,
+        RunStatus::Failed,
+    ] {
+        let run = run_in(&store, status).await.to_string();
+        workspace_of(&fx, &run).await;
+        let id = adam_llm_agent::output_id(&run, "c1");
+        fx.env.kept.keep(&run, &id, "kept\n", 0).await.unwrap();
+        runs.push(run);
+    }
+    // Every one of them is also something the environment still holds: the orphan pass would ask
+    // again about the open ones, and the kept-output pass about all four.
+    *fake.held.lock().unwrap() = runs.clone();
+
+    let report = janitor_with(&fx, &fake)
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(
+        counting.calls(Method::LoadRun),
+        4,
+        "one read per run, not one per pass: {report:?}"
+    );
+}
+
 /// A sweep that is told to stop between two runs stops.
 #[tokio::test]
 async fn a_cancelled_sweep_stops_before_it_removes_anything() {
