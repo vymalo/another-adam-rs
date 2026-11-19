@@ -11,22 +11,42 @@ use std::sync::Arc;
 
 use secrecy::SecretString;
 
-/// Gives the value of a secret an agent file names. Asked each time a value is needed, never
-/// cached by the caller; the value is never logged or put in an error.
-pub trait SecretSource: Send + Sync + fmt::Debug {
+/// Gives the value of a secret an agent file names. Asked when an agent is bound (a remote
+/// subagent's bearer) and when its MCP servers are connected (`${VAR}`); what it gives is kept for
+/// the life of that binding or connection, and never logged or put in an error.
+///
+/// The call is synchronous and made on the caller's async runtime: a source answers from memory. A
+/// host whose secrets are in a vault fetches them first, and gives them here or through
+/// `AgentDef::env`. `Debug` of a source, and of what holds one, shows [`kind`](Self::kind) only,
+/// never a value: a host's source needs no `Debug` of its own.
+pub trait SecretSource: Send + Sync {
     /// The value of `name`, or why there is none.
     ///
     /// # Errors
     ///
     /// [`SecretError`]: not set, not valid Unicode, or refused by this source.
     fn secret(&self, name: &str) -> Result<SecretString, SecretError>;
+
+    /// What this source is, for `Debug` and startup logs. Never a value.
+    fn kind(&self) -> &'static str {
+        "host"
+    }
+}
+
+impl fmt::Debug for dyn SecretSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecretSource({})", self.kind())
+    }
 }
 
 /// A shared [`SecretSource`].
 pub type DynSecretSource = Arc<dyn SecretSource>;
 
-/// Why a [`SecretSource`] has no value for a name. Carries no value.
+/// Why a [`SecretSource`] has no value for a name. Carries no value. Not exhaustive, so a reason
+/// can be added without a break: a reader treats one it does not know as [`Refused`](Self::Refused),
+/// which fails closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SecretError {
     /// The source would give it, and it is not set.
     #[error("it is not set")]
@@ -45,6 +65,10 @@ pub enum SecretError {
 pub struct ProcessEnv;
 
 impl SecretSource for ProcessEnv {
+    fn kind(&self) -> &'static str {
+        "process environment"
+    }
+
     fn secret(&self, name: &str) -> Result<SecretString, SecretError> {
         match std::env::var(name) {
             Ok(value) => Ok(SecretString::from(value)),
@@ -60,6 +84,10 @@ impl SecretSource for ProcessEnv {
 pub struct NoSecrets;
 
 impl SecretSource for NoSecrets {
+    fn kind(&self) -> &'static str {
+        "none"
+    }
+
     fn secret(&self, _name: &str) -> Result<SecretString, SecretError> {
         Err(SecretError::Refused)
     }
@@ -71,15 +99,15 @@ mod tests {
 
     use super::*;
 
-    /// A variable every test process has: cargo sets it for the test binary.
-    const SET: &str = "CARGO_PKG_NAME";
+    /// A variable every process has.
+    const SET: &str = "PATH";
     /// A name no environment has.
     const UNSET: &str = "ADAM_CORE_TEST_SURELY_UNSET_5C1E";
 
     #[test]
     fn the_process_environment_gives_what_it_has_and_says_what_it_lacks() {
         let value = ProcessEnv.secret(SET).unwrap();
-        assert_eq!(value.expose_secret(), "adam-core");
+        assert_eq!(value.expose_secret(), std::env::var(SET).unwrap());
         assert_eq!(ProcessEnv.secret(UNSET).unwrap_err(), SecretError::Missing);
     }
 
@@ -94,7 +122,35 @@ mod tests {
     fn a_shared_source_is_asked_like_its_implementation() {
         let source: DynSecretSource = Arc::new(NoSecrets);
         assert_eq!(source.secret(SET).unwrap_err(), SecretError::Refused);
-        assert_eq!(format!("{source:?}"), "NoSecrets");
+        assert_eq!(format!("{source:?}"), "SecretSource(none)");
+        let process: DynSecretSource = Arc::new(ProcessEnv);
+        assert_eq!(format!("{process:?}"), "SecretSource(process environment)");
+    }
+
+    /// A host's source with values, and a derived `Debug` that would show them: what holds it
+    /// shows its kind only.
+    #[derive(Debug)]
+    struct Map(Vec<(&'static str, &'static str)>);
+
+    impl SecretSource for Map {
+        fn secret(&self, name: &str) -> Result<SecretString, SecretError> {
+            self.0
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| SecretString::from(*v))
+                .ok_or(SecretError::Missing)
+        }
+    }
+
+    #[test]
+    fn a_held_source_never_shows_its_values() {
+        let source: DynSecretSource = Arc::new(Map(vec![("TOKEN", "s3cret-value")]));
+        assert_eq!(
+            source.secret("TOKEN").unwrap().expose_secret(),
+            "s3cret-value"
+        );
+        let shown = format!("{source:?}");
+        assert_eq!(shown, "SecretSource(host)");
     }
 
     #[test]

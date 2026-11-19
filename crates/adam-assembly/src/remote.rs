@@ -95,8 +95,9 @@ impl RemoteSettings {
             None => match self.secrets.secret(var) {
                 Ok(value) => value.expose_secret().to_owned(),
                 Err(SecretError::Missing) => return Err(fail(RemoteAuthProblem::Missing)),
-                Err(SecretError::Refused) => return Err(fail(RemoteAuthProblem::Refused)),
                 Err(SecretError::NotUnicode) => return Err(fail(RemoteAuthProblem::NotAToken)),
+                // `Refused`, and any reason added later: not given (fail closed).
+                Err(_) => return Err(fail(RemoteAuthProblem::Refused)),
             },
         };
         let token = raw.trim();

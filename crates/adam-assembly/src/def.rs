@@ -303,8 +303,8 @@ impl AgentDef {
     /// Where a variable that agent files name and [`env`](Self::env) does not give is asked: the
     /// process environment by default, which is a server's. An application that embeds adam gives
     /// its own source, or [`NoSecrets`](adam_core::NoSecrets), which refuses every name (ADR 0047,
-    /// decision 5). It serves the bearer tokens of remote subagents and the `${VAR}` of the
-    /// `mcp.json` files alike.
+    /// decision 5). It serves the bearer tokens of remote subagents (asked at [`bind`](Self::bind))
+    /// and the `${VAR}` of the `mcp.json` files (asked at `connect_mcp`, so call this first).
     #[must_use]
     pub fn secrets(mut self, source: adam_core::DynSecretSource) -> Self {
         self.remote.secrets = source;
@@ -454,15 +454,17 @@ impl AgentDef {
     ///
     /// Each agent gets its own connections: two directories that both name a server `linear`
     /// connect twice, with their own headers. `${VAR}` in the files is expanded from
-    /// [`env`](Self::env) first and then from the process environment, so a token given in code
-    /// reaches a server the same way it reaches a remote subagent. Everything that can be wrong
+    /// [`env`](Self::env) first and then from the [`secrets`](Self::secrets) source (the process
+    /// environment by default), so a token given in code reaches a server the same way it reaches
+    /// a remote subagent. Everything that can be wrong
     /// (an unset variable, `type: sse`, a local process the policy does not allow, a server that
     /// is down, an allow-list that names a tool the server lacks) is an error here, at startup:
     /// see `adam_mcp::McpServers::connect`.
     ///
     /// The connections live as long as the tools do: as long as the [`Assembly`](crate::Assembly)
-    /// built from this definition. Call it after the [`env`](Self::env) calls it should see, and
-    /// once: it connects again each time.
+    /// built from this definition. Call it after the [`env`](Self::env) and
+    /// [`secrets`](Self::secrets) calls it should see, and once: it connects again each time. A
+    /// `secrets` called later reaches the remote subagents at `bind`, not these servers.
     ///
     /// # Errors
     ///

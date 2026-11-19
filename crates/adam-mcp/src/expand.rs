@@ -24,7 +24,7 @@ use crate::redact::Redactor;
 /// let env = Env::new().var("LINEAR_API_TOKEN", "lin_api_example");
 /// assert_eq!(
 ///     format!("{env:?}"),
-///     r#"Env { names: ["LINEAR_API_TOKEN"], source: ProcessEnv }"#
+///     r#"Env { names: ["LINEAR_API_TOKEN"], source: SecretSource(process environment) }"#
 /// );
 /// ```
 #[derive(Clone)]
@@ -43,7 +43,7 @@ impl Default for Env {
 }
 
 impl Env {
-    /// No values: only the process environment.
+    /// No values, and the process environment as the source.
     pub fn new() -> Self {
         Self::default()
     }
@@ -152,8 +152,9 @@ impl<'a> Expander<'a> {
             None => match self.env.source.secret(&reference.name) {
                 Ok(value) => Ok(value.expose_secret().to_owned()),
                 Err(SecretError::Missing) => Err(VarProblem::Missing),
-                Err(SecretError::Refused) => Err(VarProblem::Refused),
                 Err(SecretError::NotUnicode) => return Err(fail(VarProblem::NotUnicode)),
+                // `Refused`, and any reason added later: not given (fail closed).
+                Err(_) => Err(VarProblem::Refused),
             },
         };
         // POSIX `:-`: the default stands for a variable that is unset *or empty*. Without a
@@ -237,7 +238,7 @@ mod tests {
         let process = Env::from_values(Arc::default());
         assert_eq!(
             format!("{process:?}"),
-            "Env { names: [], source: ProcessEnv }"
+            "Env { names: [], source: SecretSource(process environment) }"
         );
     }
 

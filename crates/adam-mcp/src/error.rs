@@ -8,8 +8,8 @@ use adam_error::{Classify, ErrorClass};
 /// What is wrong with an environment variable a `mcp.json` refers to, in [`Error::Var`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VarProblem {
-    /// Not set, in [`Env`](crate::Env) or in the process environment, and the reference has no
-    /// `:-default`.
+    /// Not set, in [`Env`](crate::Env) or by its source (the process environment by default), and
+    /// the reference has no `:-default`.
     Missing,
     /// Set, and not valid Unicode.
     NotUnicode,
