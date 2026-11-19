@@ -14,7 +14,8 @@ binary picks one at composition time.
 There are none. A standalone `mongod` has no change streams (they need a replica
 set), and this adapter promises to work on one, so workers of other processes
 find new runs by polling `claim_due` (`poll_interval`), and a cancel issued by
-another process reaches a running step at its next poll. The
+another process reaches a running step at its next cancel poll
+(`cancel_poll_interval`, 1 s by default). The
 [`adam-notify-postgres`](../adam-notify-postgres/README.md) adapter needs a
 PostgreSQL, so it fits when that is the store (or one on the side); otherwise
 accept the poll latency.

@@ -250,7 +250,10 @@ pub(crate) struct Config {
     pub worker_id: String,
     pub claim_scope: ClaimScope,
     pub lease_ttl: Duration,
+    /// How often an idle worker polls the store for due runs.
     pub poll_interval: Duration,
+    /// How often a step's cancel watch re-reads the run it steps.
+    pub cancel_poll_interval: Duration,
     pub retry: RetryPolicy,
     pub concurrency: usize,
     pub lease_renewal: bool,
@@ -611,8 +614,28 @@ impl RuntimeBuilder {
     /// `deliver`/`start` on the same `Runtime` wake local workers at once, and
     /// with a [`notifier`](Self::notifier) so do those of other processes.
     /// Timers and retry backoffs are found by polling only.
+    ///
+    /// This is the worker's idle poll, **not** how fast a step learns of a cancel: that is
+    /// [`cancel_poll_interval`](Self::cancel_poll_interval).
     pub fn poll_interval(mut self, every: Duration) -> Self {
         self.cfg.poll_interval = every;
+        self
+    }
+
+    /// How often a step's cancel watch re-reads the run it is stepping. Default 1 s.
+    ///
+    /// The watch is how a step learns that its run turned terminal in another process (a cancel, a
+    /// time limit, a parent that ended) when no [`notifier`](Self::notifier) told it, and it is the
+    /// fallback for the signal: a `Signal::Finished` fires the step's token at once. It reads the
+    /// run's **header** ([`Store::run_header`](adam_core::Store::run_header)), never its state, so
+    /// it is one small read per interval. The bound it implies: a state change that no event
+    /// announced reaches a step's cancel watch within this interval.
+    ///
+    /// Slower than [`poll_interval`](Self::poll_interval) on purpose: the worker's idle poll finds
+    /// work that appeared, which a person waits for, while the cancel watch waits on something a
+    /// person asked for and a signal normally delivers.
+    pub fn cancel_poll_interval(mut self, every: Duration) -> Self {
+        self.cfg.cancel_poll_interval = every;
         self
     }
 
@@ -697,6 +720,7 @@ impl Runtime {
                 claim_scope: ClaimScope::Any,
                 lease_ttl: Duration::from_secs(30),
                 poll_interval: Duration::from_millis(250),
+                cancel_poll_interval: Duration::from_secs(1),
                 retry: RetryPolicy::default(),
                 concurrency: 4,
                 lease_renewal: true,
@@ -953,9 +977,9 @@ impl Runtime {
     /// [`start_child`](Self::start_child) with a time limit: the child must finish within `within`
     /// of now, by the runtime's own clock (`None`: no limit, which is `start_child`). The deadline is
     /// stored with the run. Past it the worker fails the child with `cancelled: time limit: the run
-    /// did not finish within N min`, before a step and, for a step in flight, within one poll
-    /// (the step's token fires), and a child that is parked is woken at it. The parent gets the
-    /// failure as it gets any: the child's error.
+    /// did not finish within N min`, before a step and, for a step in flight, within one
+    /// cancel poll interval (the step's token fires), and a child that is parked is woken at it.
+    /// The parent gets the failure as it gets any: the child's error.
     #[tracing::instrument(skip(self, input))]
     pub async fn start_child_within(
         &self,
@@ -1384,7 +1408,7 @@ impl Runtime {
     /// [`CancelToken`] ([`Ctx::cancelled`](crate::Ctx::cancelled)): at once if
     /// this runtime holds the run, and if another process does, at once too
     /// when both runtimes share a [`Notifier`] (a
-    /// [`Signal::Finished`]), otherwise within one poll interval. The step is
+    /// [`Signal::Finished`]), otherwise within one cancel poll interval. The step is
     /// not aborted by the runtime: a step that listens to the token stops
     /// early (`LlmAgent` drops its model request, the coder kills its
     /// commands), one that does not runs to its end (its result is dropped
@@ -1538,5 +1562,29 @@ mod error_tests {
             "{e:?}"
         );
         assert!(std::error::Error::source(&e).is_some_and(|s| s.is::<serde_json::Error>()));
+    }
+}
+
+#[cfg(test)]
+mod defaults {
+    use std::sync::Arc;
+
+    use adam_core::MemoryStore;
+
+    use super::*;
+
+    /// The two polls are separate, with the fallbacks the docs promise: an idle worker every
+    /// 250 ms (a person waits for work to start), a step's cancel watch every second (a signal
+    /// normally tells it, and its read is one header).
+    #[test]
+    fn the_worker_and_the_cancel_watch_poll_at_their_own_intervals() {
+        let builder = Runtime::builder(Arc::new(MemoryStore::new()));
+        assert_eq!(builder.cfg.poll_interval, Duration::from_millis(250));
+        assert_eq!(builder.cfg.cancel_poll_interval, Duration::from_secs(1));
+        let builder = builder
+            .poll_interval(Duration::from_millis(5))
+            .cancel_poll_interval(Duration::from_millis(7));
+        assert_eq!(builder.cfg.poll_interval, Duration::from_millis(5));
+        assert_eq!(builder.cfg.cancel_poll_interval, Duration::from_millis(7));
     }
 }

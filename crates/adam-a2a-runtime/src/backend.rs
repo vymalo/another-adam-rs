@@ -23,8 +23,12 @@ use crate::ids::task_id_for;
 use crate::subscribe;
 use crate::tier;
 
-/// Default interval at which a subscription re-reads the durable run.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Default interval at which a subscription re-reads the durable run: the fallback, for a state
+/// change that no live event announced. Two seconds, because the events are the mechanism: a
+/// worker's commit emits a `Status` event in-process and (with a notifier) to every other process,
+/// and the pump polls at once on one. A slower fallback costs nothing when events arrive and saves
+/// a full record read per subscriber per interval when they do not.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Reason recorded on a run cancelled through A2A.
 const CANCEL_REASON: &str = "canceled by client";
@@ -243,8 +247,10 @@ impl RuntimeTaskBackend {
     }
 
     /// How often a subscription re-reads the durable run (default
-    /// [`DEFAULT_POLL_INTERVAL`]). This bounds the latency of a state change
-    /// that no live event announced, e.g. one made by another replica.
+    /// [`DEFAULT_POLL_INTERVAL`], 2 s). This bounds the latency of a state change
+    /// that no live event announced, e.g. one made by another replica; a `Status`
+    /// event (a commit) makes the pump poll at once, so the interval is the
+    /// fallback, not the latency of a run this process steps.
     #[must_use]
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll = interval.max(Duration::from_millis(1));

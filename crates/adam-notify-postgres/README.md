@@ -16,8 +16,8 @@ MongoDB has no equivalent here: a standalone `mongod` has no change streams, so
 
 Without it, processes share only the store: a worker finds a run another
 process started at its next poll (250 ms by default), and a cancel issued in
-one process reaches a step running in another at the worker's next read of the
-run. With it, both are immediate, and a front's SSE subscription sees
+one process reaches a step running in another at the step's next cancel poll
+(1 s by default). With it, both are immediate, and a front's SSE subscription sees
 `Progress` of a run a worker steps as it happens.
 
 **It is a latency optimisation, and nothing more.** `NOTIFY` is at most once and

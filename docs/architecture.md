@@ -351,7 +351,7 @@ sequenceDiagram
         par live events
             K-->>B: Progress, Custom or Artifact event
             B-->>C: SSE: status-update (working) or artifact-update
-        and durable poll, every 250 ms or when a Status event arrives
+        and durable poll, every 2 s or when a Status event arrives
             B->>R: view(run)
             R->>DB: load_run
             B-->>C: SSE: status change or new artifact
@@ -371,7 +371,8 @@ Rules this diagram cannot show:
 * **A request names the extensions it wants; the card decides.** The handler passes the backend only the
   ones the card declares (`Caller::extensions`), so each extension is optional on both sides.
 * **Streams survive restarts.** The snapshot comes from `Runtime::view` (the durable record) and is
-  polled every 250 ms; live events only cut latency. A subscriber that attaches after the worker began
+  polled every 2 s; a `Status` event (a commit) makes the pump poll at once, so live events cut the
+  latency and the interval is only the fallback for a change no event announced. A subscriber that attaches after the worker began
   first gets the run's recent live events from a bounded replay in `BroadcastSink` (the newest 64, none older
   than 30 s, dropped at each status change), so a step that started before it attached keeps its input; a
   repeat is possible and harmless. Dropping the SSE stream drops only the subscription; only `CancelTask` cancels.
@@ -588,9 +589,9 @@ sequenceDiagram
         W->>DB: claim_due(agents, worker id, claim scope, runs in flight here, now, lease ttl, free slots)
         DB-->>W: leases: due runs with no live lease, not in flight here (and, if pinned, not owned by another worker), earliest first
         W->>T: spawn advance(lease), at most concurrency at once
-        T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every poll interval)
+        T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every cancel poll interval)
         opt the run has a parent_id
-            T->>DB: load_run(parent)
+            T->>DB: run_header(parent)
             DB-->>T: Failed: cancel_run(run), cancelled: the parent run ended, no step
         end
         T->>T: decode the Envelope, and cancel_run (cancelled: time limit) when its deadline has passed
@@ -674,7 +675,8 @@ sequenceDiagram
   park resumes at once.
 * **Retry.** A transient failure is committed as `Runnable` with a future `wake_at`; the failed try's
   journal entries are abandoned.
-* **Defaults** (`runtime.rs`, `retry.rs`): lease 30 s, poll 250 ms, 4 concurrent runs per worker loop,
+* **Defaults** (`runtime.rs`, `retry.rs`): lease 30 s, worker poll 250 ms, cancel watch 1 s,
+  subscription poll 2 s, 4 concurrent runs per worker loop,
   5 tries per transition, backoff 1 s doubling to 60 s.
 
 ### Compaction: a long history is summarised once

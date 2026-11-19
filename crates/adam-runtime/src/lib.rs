@@ -38,7 +38,7 @@
 //!   A step that is running at that moment can observe it through
 //!   [`Ctx::cancelled`] / [`CancelToken`] and stop early: at once when the
 //!   runtime that holds it is the one cancelling or shares a [`Notifier`],
-//!   within one poll interval otherwise.
+//!   within one `cancel_poll_interval` otherwise.
 //!
 //! # Several processes
 //!

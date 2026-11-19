@@ -18,6 +18,7 @@ use adam_runtime::{
     Agent, AgentError, AgentStarter, Artifact as RunArtifact, BroadcastSink, Ctx, Inbound,
     RunEvent, Runtime, Transition,
 };
+use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -168,6 +169,19 @@ impl Agent for Scripted {
                 output: json!({"text": format!("answered: {answer}")}),
             });
         }
+        if text.contains("[turns]") {
+            // Five turns of half a second: long enough that a subscription's fallback poll would
+            // tick if it were fast, which is what a counting test measures.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if phase < 4 {
+                state["phase"] = json!(phase + 1);
+                return Ok(Transition::Continue(state));
+            }
+            return Ok(Transition::Done {
+                state,
+                output: json!({"text": "finished"}),
+            });
+        }
         if text.contains("[flip]") {
             // A, then B, then A again, all under one id.
             if let Some(v) = ["A", "B", "A"].get(usize::try_from(phase).unwrap_or(3)) {
@@ -268,6 +282,32 @@ impl Rig {
         Self {
             store,
             agent: agent.to_owned(),
+            runtime,
+            backend,
+        }
+    }
+
+    /// A rig whose three intervals are explicit: the worker's idle poll, a step's cancel watch and
+    /// a subscription's re-read. `over` uses 10 ms for all of them, which measures a test rather
+    /// than what a deployment pays.
+    fn over_with_polls(
+        store: DynStore,
+        poll: Duration,
+        cancel_poll: Duration,
+        view_poll: Duration,
+    ) -> Self {
+        let events = BroadcastSink::default();
+        let runtime = Runtime::builder(store.clone())
+            .agent(Scripted(AGENT.to_owned()))
+            .event_sink(events.clone())
+            .poll_interval(poll)
+            .cancel_poll_interval(cancel_poll)
+            .build();
+        let backend =
+            RuntimeTaskBackend::new(runtime.clone(), events, AGENT).with_poll_interval(view_poll);
+        Self {
+            store,
+            agent: AGENT.to_owned(),
             runtime,
             backend,
         }
@@ -495,6 +535,44 @@ async fn a_new_task_is_a_run_and_streams_snapshot_progress_artifact_completed() 
     let artifacts = done.artifacts.expect("artifacts on the task");
     assert_eq!(artifacts[0].name.as_deref(), Some("report"));
     assert_eq!(artifacts[0].parts[0].as_text(), Some("# done"));
+}
+
+/// A subscriber reads the run once per commit (a `Status` event makes it poll at once) and on its
+/// fallback interval, not on the worker's, and a step's cancel watch reads a header rather than
+/// the record: a five-turn run of 2.5 s costs a handful of record reads where the 250 ms fallback
+/// of both loops cost tens. The stream is the only reader of the state.
+#[tokio::test]
+async fn a_stream_reads_the_run_once_per_commit_not_once_per_poll() {
+    let faulty = Arc::new(FaultyStore::new(Arc::new(MemoryStore::new())));
+    let rig = Rig::over_with_polls(
+        faulty.clone(),
+        Duration::from_millis(10),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    );
+    let task = rig
+        .backend
+        .submit(alice(), user("[turns]"), None, Some("ctx-turns".into()))
+        .await
+        .expect("submit");
+    let mut events = rig.backend.subscribe(&alice(), &task.id);
+    let _snapshot = next(&mut events).await;
+    let before_loads = faulty.calls(Method::LoadRun);
+    let before_headers = faulty.calls(Method::RunHeader);
+    let worker = rig.worker();
+    let events = rest(&mut events).await;
+    worker.stop().await;
+
+    assert_eq!(label(events.last().unwrap()), "status:Completed");
+    let loads = faulty.calls(Method::LoadRun) - before_loads;
+    let headers = faulty.calls(Method::RunHeader) - before_headers;
+    // Five steps of 500 ms commit five times: one poll each, plus the first tick of the interval
+    // (which `tokio::time::interval` fires at once) and the tick at 2 s. The 250 ms fallback
+    // would be ~10 polls of the stream alone.
+    assert!(loads <= 12, "the stream read the record {loads} times");
+    // Every step is shorter than the 1 s cancel interval, so the watch normally reads nothing;
+    // the 250 ms interval it used to share read the whole record ~10 times over the run.
+    assert!(headers <= 3, "the cancel watch read {headers} headers");
 }
 
 /// A file the agent shares reaches an A2A client as a standard artifact: one `raw` part with its

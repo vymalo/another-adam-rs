@@ -2,9 +2,10 @@
 //!
 //! Workers find due runs by polling the store (`poll_interval`), and a step
 //! running in one process learns of a cancel issued in another by reading its
-//! run once per poll. That is correct on its own, and slow: up to one poll
-//! interval of latency for a run started or resumed by another process, and
-//! for a cancel. A [`Notifier`] removes the latency and nothing else.
+//! run once per `cancel_poll_interval`. That is correct on its own, and slow:
+//! up to one poll interval of latency for a run started or resumed by another
+//! process, and up to one cancel poll interval for a cancel. A [`Notifier`]
+//! removes the latency and nothing else.
 //!
 //! **A signal is a hint, never the truth.** It may be lost, duplicated or
 //! late; the store's compare-and-swap, the lease and the polling loop stay

@@ -362,7 +362,7 @@ fn spawn_cancel_watch(
     watched: Watched,
     token: CancelToken,
 ) -> AbortOnDrop {
-    let every = inner.cfg.poll_interval.max(Duration::from_millis(1));
+    let every = inner.cfg.cancel_poll_interval.max(Duration::from_millis(1));
     AbortOnDrop(tokio::spawn(async move {
         let mut parent_read: Option<tokio::time::Instant> = None;
         loop {
