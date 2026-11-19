@@ -18,8 +18,8 @@
 //! message, a silence with stdin open, a 64 KiB message, then EOF or a kill: `adam_workspace::testing_stdio`);
 //! `ADAM_TEST_STDIO_SILENCE_SECS` sets the silence (20 s by default).
 //!
-//! `ADAM_TEST_REQUIRE_DEVCONTAINER=1` makes a run that would skip fail instead (CI sets it). The
-//! stack and the command are in `dev/podman/README.md`.
+//! `ADAM_TEST_REQUIRE_DEVCONTAINER=1` makes a run that would skip fail instead (no CI job sets it
+//! any more: ADR 0052 removed the devcontainer job). What the test needs is listed above.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::MetadataExt;
