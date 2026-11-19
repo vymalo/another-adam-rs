@@ -74,7 +74,7 @@ test('a section that names an adam-only tool is never shared, except the four th
   assert.deepEqual(offenders.map((s) => s.heading), [], 'no other shared section names a tool');
   // The four the owner named do name tools OpenCode does not have; kept word for word as decided, and listed so the README is held to it.
   const named = new Set(sections.filter((s) => SECTIONS[s.heading].owner).flatMap((s) => namedTools(s.raw, tools)));
-  assert.deepEqual([...named].sort(), ['apply_patch', 'ask_user', 'commit_and_push', 'edit_file', 'open_pull_request', 'prepare_workspace', 'read_file', 'request_repository', 'run', 'run_checks', 'run_command', 'share_file', 'start_scratch', 'write_file']);
+  assert.deepEqual([...named].sort(), ['apply_patch', 'ask_user', 'commit_and_push', 'edit_file', 'open_pull_request', 'prepare_workspace', 'read_file', 'read_files', 'request_repository', 'run', 'run_checks', 'run_command', 'share_file', 'start_scratch', 'write_file']);
   assert.ok(named.has('prepare_workspace') && named.has('run_checks') && named.has('open_pull_request'));
   // and the sections that were left out do name them, which is part of why
   const left = sections.filter((s) => !SECTIONS[s.heading].shared && s.heading !== PREAMBLE);
@@ -175,7 +175,7 @@ test('every adam tool named in the four sections is in the mapping table: a rena
     assert.ok(inSpan.length > 0, `${tool} is handled by a span`);
   }
   for (const [from, to] of Object.entries(NAMES)) {
-    // A name a later revision introduced (`read_files`, #184) is not in the pin's text: the checkout test below is where it is exercised.
+    // A name the pin's text does not use (`read_files` before 3f668c3) is exercised by the checkout test below.
     if (!template.includes(`\`${from}\``)) continue;
     const renamed = applied.some((a) => a.id === `name:${from}`) || applied.some((a) => a.kind !== 'name' && a.original.includes(`\`${from}\``));
     assert.ok(renamed, `${from} is mapped to ${to}`);
@@ -235,11 +235,11 @@ test("the shared prompt builds from adam's instructions as they are in this chec
   const instructions = fs.readFileSync(path.join(REPO, INSTRUCTIONS_PATH), 'utf8');
   const shared = sharedPrompt(instructions);
   assert.ok(shared.text.length > 0);
-  // This checkout is ahead of the pin: `after_previous` (ADR 0049) and `read_files` (#184) are in it, and OpenCode gets neither. A span that
+  // This checkout has `after_previous` (ADR 0049) and `read_files` (#184), and OpenCode gets neither. A span that
   // matches the wrong spelling of a later sentence leaves `after_previous` in the mapped text; a missing rename leaves `read_files`.
   assert.ok(shared.template.includes('after_previous'), 'the checkout has the sentence the map drops');
   assert.ok(!shared.mapped.includes('after_previous'), "after_previous is adam's reserved argument, not OpenCode's");
-  assert.ok(shared.template.includes('`read_files`'), 'the checkout names the tool the pin did not have');
+  assert.ok(shared.template.includes('`read_files`'), 'the checkout names read_files');
   assert.ok(!shared.mapped.includes('read_files'), 'read_files is renamed to `read`');
   assert.ok(shared.mapped.includes('several `read` calls'), 'the batching sentence reaches OpenCode as several `read` calls');
   assert.deepEqual(namedTools(shared.mapped, adamToolNames(instructions)), []);

@@ -428,7 +428,7 @@ them equal.
 
 | Pin | Value | |
 |---|---|---|
-| coder image | `ghcr.io/vymalo/another-adam-rs/coder:sha-2d5d0b3@sha256:3476…ac91`, revision `2d5d0b3926cb…` | *verified 2026-11-17*: the digest by an anonymous manifest request to `ghcr.io` for the tag `deploy/coder/values.yaml` names, the revision from the image's `org.opencontainers.image.revision` label |
+| coder image | `ghcr.io/vymalo/another-adam-rs/coder:sha-3f668c3@sha256:dad8…c72b`, revision `3f668c3b207b…` | *verified 2026-11-18*: the digest by an anonymous manifest request to `ghcr.io` for the tag the `coder` workflow pushed for main `3f668c3`, the revision from the image's `org.opencontainers.image.revision` label |
 | OpenCode V2 | `@opencode/cli` 2.3.0, platform package `@opencode/cli-linux-x64`, integrity `sha512-8T3K…FFg==` | *verified 2026-11-17* on `registry.npmjs.org`: the newest 2.x at least three days old (2.3.0 was published 2026-11-13, the platform package at 08:43 UTC, `@opencode/cli` at 08:54); the integrity is of the exact tarball that is mounted and was computed again from the download; the tarball holds `package/bin/opencode`, a 250 MB native executable (`@opencode/cli` itself has only a `postinstall` that picks a platform package and a launcher; nothing is installed at run time) |
 
 |  | adam-coder | OpenCode |
@@ -618,8 +618,8 @@ section table with a decision and a reason.
 | `edit_file` | `edit` |
 | `apply_patch` | `edit` |
 
-`read_files` (1 to 16 files in one call) is a later revision than the pin: the pin's text does not name it, and OpenCode's `read` reads one
-file, so it is renamed like `read_file`.
+`read_files` (1 to 16 files in one call, #184; the pin's text names it since `3f668c3`): OpenCode's `read` reads one file, so it is
+renamed like `read_file`.
 
 **Tools OpenCode has no counterpart for** (`prepare_workspace`, `run_checks`, `ask_user`, `commit_and_push`, `open_pull_request`, `share_file`, `start_scratch`, `request_repository`): the sentence that uses each is rewritten to a fixed neutral sentence or dropped, as listed next. In this benchmark the repository is already checked out, nobody answers a question, and the harness collects the working tree, so there is no pull request.
 
@@ -638,7 +638,7 @@ file, so it is renamed like `read_file`.
 | how-6-no-tools-again | rewritten | do not call `run_checks`, `commit_and_push` or `open_pull_request` again. | do not run the checks again. |
 | how-6-pre-existing | rewritten | A failure the tool calls PRE-EXISTING (the command fails on the base branch too) is not yours and costs no cycle: add no error to it and go on. The pull request is allowed and says so. | A failure that is the same on the base branch (PRE-EXISTING) is not yours and costs no cycle: add no error to it and go on, and say so in your final answer. |
 | how-7-commit | rewritten | 7. **Commit in small, focused commits.** When checks are green, call `commit_and_push` with a Conventional Commit message (`feat(scope): ...`, `fix: ...`). If the work has several independent parts, delegate and commit them one at a time. | 7. **Stop when the checks are green.** Your changes stay in the working tree for the harness to collect. |
-| how-8-pull-request | rewritten | 8. **Open the pull request** with `open_pull_request`: a clear title, and a body with a summary of what changed and why, and a verification section that lists the exact commands you ran and their result. Never claim a check passed that you did not run. | 8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run. |
+| how-8-pull-request | rewritten | 8. **Open the pull request** with `open_pull_request`: a clear title, and a body with a summary of what changed and why, and a verification section that lists the exact commands you ran and their result. Never claim a check passed that you did not run. (in a later revision: 8. **Open the pull request in the same call**: pass `pull_request` to `commit_and_push`: a `title`, and a `body` with a summary and a verification section (the commands you ran and their result). Never claim a check passed that you did not run; `open_pull_request` opens it on its own.) | 8. **Report.** In your final answer, summarise what changed and why, and list the exact commands you ran and their result. Never claim a check passed that you did not run. |
 | how-9-finish | rewritten | telling the person the pull request URL and what you verified. | telling the person what you changed and what you verified. |
 | toolchain-which-tools | rewritten | When `run_checks`, `run` or `run_command` says the workspace has no `mvn` | When a command says the workspace has no `mvn` |
 | toolchain-result-says | dropped | The result says whether the tool has to be added to the repository's devcontainer or the repository has none. | (nothing) |
@@ -654,7 +654,7 @@ file, so it is renamed like `read_file`.
 | rules-scratch | dropped | - Never publish a scratch project to a repository the person did not name; the tool refuses, and so must you. Ask which one. | (nothing) |
 | rules-unclear | rewritten | - When something is unclear and a wrong guess would waste real work, ask once with `ask_user`, with a specific question. | - When something is unclear, decide yourself, say what you assumed in your final answer, and finish. |
 
-Renames outside those spans: `read_file` 1 time, `edit_file` 1 time.
+Renames outside those spans: none at `3f668c3` (`edit_file` 1 time at `2d5d0b3`).
 
 How OpenCode receives it: the text is written, byte for byte, to `shared-prompt.md` in the run's read-only input directory (beside the
 statement), and the run's configuration names that file in its `instructions` list. The hash of the text is part of the ledger's

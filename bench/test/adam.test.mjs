@@ -116,7 +116,7 @@ test('prepare: the folder with the configured turn limit, a clean database, the 
   assert.match(calls[1][2], new RegExp(`push -q --force http://git-server:8080/bench/${repo}\\.git FETCH_HEAD:refs/heads/main`));
   assert.match(calls[1][2], /fetch -q \/work\/bench-base\/base\.git refs\/heads\/main/);
   assert.deepEqual(calls[2][2], { MODEL_BASE_URL: METER, A2A_BEARER_TOKENS: BEARER, DEVCONTAINER_DEFAULT_IMAGE: task.image.ref, MODEL_CONTEXT_WINDOW: '131072' });
-  assert.match(ctx.stack.agentDir, /agent-folder\/2d5d0b3926cb-t150$/);
+  assert.match(ctx.stack.agentDir, new RegExp(`agent-folder/${PINS.coder.revision.slice(0, 12)}-t150$`));
 });
 
 test('finding 4: two runs of one task push to two repositories, and the second never sees the first\'s branches', async (t) => {
