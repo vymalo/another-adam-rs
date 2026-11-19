@@ -11,8 +11,8 @@ metadata:
 spec:
   replicas: {{ .Values.replicaCount }}
   serviceName: {{ include "coder.fullname" . }}
-  {{- /* Nothing needs ordinal ordering: a worker's identity is its pod name, and there is one database and one volume.
-         OrderedReady makes each replica wait for the previous one to be ready; Parallel starts them together. */}}
+  {{- /* No ordinal owns anything: a worker's identity is its pod name. OrderedReady makes each replica wait for the
+         previous one to be ready; Parallel starts them together. */}}
   podManagementPolicy: Parallel
   updateStrategy:
     type: RollingUpdate

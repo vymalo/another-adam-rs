@@ -30,8 +30,9 @@ name: coder
 # answers (dev/coder-choices-e2e.sh), and the same service on the researcher folder answers with
 # source cards and a graph on a screen that draws them (dev/agent-cards-e2e.sh), and on the painter folder
 # it makes a picture with an image MCP server and shares it as a file (dev/painter-e2e.sh). There is no second
-# image. A pull request runs the seven default coder scenarios and two of the App-mode ones; main and a manual
-# dispatch run all of them (the work environments, the other agent folders and the other five App scenarios).
+# image. A pull request runs the seven default coder scenarios and two of the App-mode ones; one that carries the
+# e2e-full label, or changes dev/ or compose.yaml, runs all 23. main and a manual dispatch run all of them (the work
+# environments, the other agent folders and the other five App scenarios).
 # On main the very image that passed is the one pushed.
 #
 # The bump follows the pattern of vymalo/another-agentic-system#11 (deploy-bump):
@@ -258,6 +259,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # The full e2e is chosen from the pull request's labels and changed files.
+      pull-requests: read
     outputs:
       pushed: ${{ steps.guard.outputs.push }}
     services:
@@ -335,12 +338,30 @@ jobs:
       # the same three again with the coder as a GitHub App installation.
       # The job's own Postgres service holds 5432, so the stack's Postgres
       # moves to POSTGRES_PORT.
+      # A pull request runs the default and the first App scenarios; the full set when it carries the e2e-full label
+      # or changes the compose stack's own scripts. main and workflow_dispatch run everything.
+      - name: Does this pull request need the full compose e2e?
+        id: e2e
+        if: github.event_name == 'pull_request' && steps.guard.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -eu
+          full=false
+          if printf '%s' "$LABELS" | grep -q '"e2e-full"'; then
+            full=true
+          fi
+          if gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.number }}/files" \
+              --jq '.[].filename' | grep -Eq '^(dev/|compose\.yaml$)'; then
+            full=true
+          fi
+          echo "full=$full" >> "$GITHUB_OUTPUT"
       - name: Compose e2e
         if: steps.guard.outputs.ready == 'true'
         env:
           POSTGRES_PORT: "15432"
-          # A pull request runs the default and the first App scenarios; main and workflow_dispatch run everything.
-          E2E_FULL: ${{ github.event_name != 'pull_request' }}
+          E2E_FULL: ${{ github.event_name != 'pull_request' || steps.e2e.outputs.full == 'true' }}
         run: |
           set -eu
           docker tag coder:smoke adam-rs/coder:dev

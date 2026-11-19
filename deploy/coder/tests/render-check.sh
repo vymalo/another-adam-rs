@@ -1299,6 +1299,14 @@ helm_rp > "$out"
 check "default volume: the sandbox mounts the volume the claim template makes (work)" \
   dhas StatefulSet '^        name: work$'
 # Refusals.
+check "refused: a waitSecs below idleSecs + 62 (the idle life, the sweep and the delete grace)" \
+  fails helm_rp --set runPods.idleSecs=900 --set runPods.waitSecs=961
+message=$(helm_rp --set runPods.idleSecs=900 --set runPods.waitSecs=961 2>&1 || true)
+check "... the error names the bound" says "$message" 'must be at least runPods.idleSecs + 62'
+helm_rp --set runPods.idleSecs=900 --set runPods.waitSecs=962 > "$out"
+check "waitSecs of exactly idleSecs + 62 is accepted" sts_of 'name: RUN_POD_WAIT_SECS'
+helm_rp --set runPods.idleSecs=0 --set runPods.waitSecs=0 > "$out"
+check "idleSecs 0 (keep the pod until the run ends) puts no bound on the wait" sts_of 'name: RUN_POD_IDLE_SECS'
 check "refused: the sandbox without a memory limit" fails helm_rp --set runPods.gitSandbox.resources.limits.memory=null
 check "refused: a /tmp size that is not a quantity" fails helm_rp --set runPods.gitSandbox.tmpSize=lots
 check "refused: no commands at once" fails helm_rp --set runPods.gitSandbox.maxCommands=0
@@ -1511,7 +1519,7 @@ check "values: ... its request" tpl '^          memory: 1Gi$'
 check "values: ... CARGO_BUILD_JOBS" tpl 'value: "4"'
 check "values: ... extra environment" tpl 'name: RUSTFLAGS'
 helm_rp --set runPods.quota.pods=2 --set runPods.quota.limitsMemory=4Gi --set runPods.idleSecs=60 \
-  --set runPods.waitSecs=30 --set runPods.readyTimeoutSecs=900 > "$out"
+  --set runPods.waitSecs=122 --set runPods.readyTimeoutSecs=900 > "$out"
 check "values: the quota" rhas ResourceQuota coder-run-pods 'pods: "2"'
 check "values: ... its memory" rhas ResourceQuota coder-run-pods 'limits.memory: "4Gi"'
 check "values: the idle timeout" sts_of 'name: RUN_POD_IDLE_SECS'

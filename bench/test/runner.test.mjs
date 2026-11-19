@@ -36,20 +36,26 @@ test('the grades are 1, 1, 0: a wrong answer fails, the right ones pass, for bot
   }
 });
 
-test('a plan folds the ledger once, not once per run and twice per new run', async (t) => {
-  const f = await fixture(t);
-  let folds = 0;
-  const fold = f.ledger.fold.bind(f.ledger);
-  f.ledger.fold = () => {
-    folds += 1;
-    return fold();
-  };
-  const plan = [spec(f, 'hello-1', 'adam'), spec(f, 'hello-1', 'opencode'), spec(f, 'fix-add-1', 'adam')];
-  const out = await runPlan({ deps: f.deps(), plan });
-  assert.deepEqual(out.map((o) => o.state), ['Done', 'Done', 'Done']);
-  // resumeLedger reads the ledger once, and runPlan once after the resume records; advance uses that map and folds the
-  // one Planned record of a new run instead of replaying the ledger, which made a plan O(n^2) in its records.
-  assert.equal(folds, 2);
+test('a plan folds the ledger the same number of times whatever its length', async (t) => {
+  const counts = [];
+  for (const size of [1, 6]) {
+    const f = await fixture(t);
+    let folds = 0;
+    const fold = f.ledger.fold.bind(f.ledger);
+    f.ledger.fold = () => {
+      folds += 1;
+      return fold();
+    };
+    const all = ['hello-1', 'fix-add-1', 'wrong-1'].flatMap((n) => [spec(f, n, 'adam'), spec(f, n, 'opencode')]);
+    const plan = size === 1 ? [spec(f, 'hello-1', 'adam')] : all;
+    assert.equal(plan.length, size);
+    const out = await runPlan({ deps: f.deps(), plan });
+    assert.ok(out.every((o) => o.state === 'Done'));
+    counts.push(folds);
+  }
+  // The folds are per plan (resumeLedger's and runPlan's), not per run: the old code read 2 for one spec and 7 for six.
+  assert.equal(counts[0], counts[1], `a plan folds ${counts[0]} times for 1 spec and ${counts[1]} for 6`);
+  assert.ok(counts[0] <= 3, `a plan folds a constant number of times, got ${counts[0]}`);
 });
 
 test('the ledger cost is the scripted usage times the price, for each run and in total, and the model saw exactly those calls', async (t) => {

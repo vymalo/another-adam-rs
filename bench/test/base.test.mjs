@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { BASE_MARKER, BaseCache, baseKey, baseScript, prepareBase } from '../lib/base.mjs';
+import { BASE_MARKER, BaseCache, baseKey, baseScript, makeContainerBase, makeHostBase, parseBaseMarker } from '../lib/base.mjs';
 import { repoSlug } from '../lib/gitops.mjs';
 import { extractEntries, parseTar } from '../lib/tarstream.mjs';
 import { FakeContainers } from '../lib/containers.mjs';
@@ -65,22 +65,29 @@ function fakeStack(produced, calls) {
   };
 }
 
-test('prepareBase: made in the slot\'s volume in the task image with no network, then rebuilt on the host from a tar stream by a repository the harness owns', async (t) => {
+test('the base is made in the slot\'s volume in the task image with no network, then rebuilt on the host from a tar stream by a repository the harness owns', async (t) => {
   const hostRoot = tmp(t);
   const task = loadTask(makeTask(tmp(t), 'demo-1'));
   const app = appRepo(t);
   const produced = runBase(t, app);
   const calls = [];
   const containers = new FakeContainers();
-  const base = await prepareBase({ containers, stack: fakeStack(produced, calls), slot: 2, task, hostRoot });
+  const stack = fakeStack(produced, calls);
+  await makeContainerBase({ containers, stack, slot: 2, task });
+  const base = await makeHostBase({ stack, slot: 2, task, hostRoot });
   const spec = containers.runs[0];
   assert.deepEqual([spec.image, spec.network, spec.workdir], [`${IMAGE}@${DIGEST}`, 'none', '/']);
   assert.deepEqual(spec.mounts, [{ source: '/work/bench-base', target: '/out' }]);
   assert.match(spec.script, /git clone -q --no-hardlinks \/app /);
+  // the marker is the content a clone would read and the tree the host rebuilds, not a name
+  assert.match(spec.script, /base-marker/);
+  assert.match(spec.script, /rev-parse refs\/heads\/main/);
   assert.deepEqual(calls.map((c) => c.slice(0, 4).join(' ')), ['workDir 2 /work/bench-base true', 'workDir 2 /work/bench-base false', 'extractTree 2 /work/bench-base/tree']);
   assert.equal(base.containerRepo, '/work/bench-base/base.git');
   assert.notEqual(base.dir, base.containerRepo);
   assert.equal(git(base.dir, 'rev-parse', 'HEAD').trim(), base.sha);
+  assert.equal(git(base.dir, 'rev-parse', 'HEAD^{tree}').trim(), base.tree);
+  assert.equal(base.tree, git(produced.bare, 'rev-parse', 'HEAD^{tree}').trim(), 'the host tree is the container\'s');
   assert.equal(base.slug, repoSlug('demo-1'));
   // the host's repository is the base for patch collection: untouched is empty, a new file is the patch, the links are left out
   fs.cpSync(base.dir, path.join(hostRoot, 'work'), { recursive: true });
@@ -90,17 +97,27 @@ test('prepareBase: made in the slot\'s volume in the task image with no network,
   assert.deepEqual((await adapterSymlinks(localGit(base.dir), base.sha, app)).sort(), ['dist', 'node_modules']);
 });
 
-test('prepareBase says why it failed', async (t) => {
+test('makeContainerBase says why it failed', async (t) => {
   const task = loadTask(makeTask(tmp(t), 'demo-2'));
   const containers = new FakeContainers({ onRun: () => ({ exitCode: 3, stderr: 'fatal: not a git repository\n' }) });
-  await assert.rejects(prepareBase({ containers, stack: fakeStack({}, []), slot: 1, task, hostRoot: tmp(t) }), /could not be made \(exit 3\).*not a git repository/);
+  await assert.rejects(makeContainerBase({ containers, stack: fakeStack({}, []), slot: 1, task }), /could not be made \(exit 3\).*not a git repository/);
 });
 
-/** A stack whose slot volumes remember what a base build would have written (the fake containers only record the script). */
-function cacheStack(produced, calls, volumes) {
+/**
+ * A stack whose slot volumes remember what a base build wrote (the fake containers only record the script): a build in
+ * progress is materialised by the next look, with the marker and the ref a real build would write.
+ */
+function cacheStack(produced, calls, volumes, content) {
   const vol = (slot) => {
-    if (!volumes.has(slot)) volumes.set(slot, { marker: null, names: new Set() });
+    if (!volumes.has(slot)) volumes.set(slot, { marker: null, ref: null, names: new Set(), pending: false });
     return volumes.get(slot);
+  };
+  const materialize = (v) => {
+    if (!v.pending) return;
+    v.pending = false;
+    v.names = new Set(['base.git', 'tree', BASE_MARKER]);
+    v.marker = `${content.commit} ${content.tree}\n`;
+    v.ref = `${content.commit}\n`;
   };
   return {
     workDir: async (slot, dir, o) => {
@@ -108,13 +125,23 @@ function cacheStack(produced, calls, volumes) {
       if (o?.remove) {
         const v = vol(slot);
         v.marker = null;
+        v.ref = null;
         v.names.clear();
+        v.pending = true;
       }
     },
-    listDir: async (slot) => [...vol(slot).names],
+    listDir: async (slot) => {
+      const v = vol(slot);
+      materialize(v);
+      return [...v.names];
+    },
     readFiles: async (slot) => {
       const v = vol(slot);
-      return { files: v.marker === null ? new Map() : new Map([[BASE_MARKER, Buffer.from(`${v.marker}\n`)]]), refused: [] };
+      materialize(v);
+      const files = new Map();
+      if (v.marker) files.set(BASE_MARKER, Buffer.from(v.marker));
+      if (v.ref) files.set('base.git/refs/heads/main', Buffer.from(v.ref));
+      return { files, refused: [] };
     },
     extractTree: async (slot, dir, dest) => {
       calls.push(['extractTree', slot, dir]);
@@ -124,29 +151,27 @@ function cacheStack(produced, calls, volumes) {
   };
 }
 
-test('the cache makes a task base once per (task, image): the slot copy and the host repository are reused', async (t) => {
+test('the cache makes a task base once per (task, image, workdir): the slot copy and the host repository are reused', async (t) => {
   const task = loadTask(makeTask(tmp(t), 'demo-3'));
   const produced = runBase(t, appRepo(t));
+  const content = { commit: produced.sha, tree: git(produced.bare, 'rev-parse', 'HEAD^{tree}').trim() };
   const calls = [];
   const volumes = new Map();
   const containers = new FakeContainers();
-  const stack = cacheStack(produced, calls, volumes);
+  const stack = cacheStack(produced, calls, volumes, content);
   const cache = new BaseCache();
   const hostRoot = path.join(tmp(t), 'bases', baseKey(task));
   const builds = () => containers.runs.length;
   const extracts = () => calls.filter((c) => c[0] === 'extractTree').length;
-  const mark = (slot, marker = baseKey(task)) => {
-    volumes.set(slot, { marker, names: new Set(['base.git', 'tree', BASE_MARKER]) });
-  };
 
   const first = await cache.prepare({ containers, stack, slot: 1, task, hostRoot });
   assert.equal(builds(), 1);
   assert.equal(extracts(), 1);
   assert.ok(first.dir.startsWith(hostRoot), 'the host repository lives under the key, not under a run');
   assert.equal(git(first.dir, 'rev-parse', 'HEAD').trim(), first.sha);
-  mark(1);
+  assert.equal(first.tree, content.tree, 'the host tree is the container\'s');
   const again = await cache.prepare({ containers, stack, slot: 1, task, hostRoot });
-  assert.equal(builds(), 1, 'the slot copy is reused when its marker names the key');
+  assert.equal(builds(), 1, 'the slot copy is reused while its marker records the same content');
   assert.equal(extracts(), 1);
   assert.deepEqual([again.dir, again.sha], [first.dir, first.sha]);
   // Another slot has no copy: its own container side is made, the host's repository is not made again.
@@ -154,26 +179,53 @@ test('the cache makes a task base once per (task, image): the slot copy and the 
   assert.equal(builds(), 2);
   assert.equal(extracts(), 1);
   assert.deepEqual([other.dir, other.sha], [first.dir, first.sha]);
-  // A marker of another base (a task run with another image, or a deleted one) is remade.
-  mark(2, 'another-task-0000000000000000');
+  // A branch changed in the slot (a commit added to the bare repository) is not trusted: the base is remade from the image.
+  const edited = volumes.get(2);
+  edited.ref = `${'f'.repeat(40)}\n`;
   await cache.prepare({ containers, stack, slot: 2, task, hostRoot });
   assert.equal(builds(), 3);
   assert.equal(extracts(), 1);
+  // Two tasks that differ only in the working directory are two bases, with two host repositories.
+  const elsewhere = { ...task, workdir: '/src' };
+  assert.notEqual(baseKey(elsewhere), baseKey(task));
+  const separate = await cache.prepare({ containers, stack, slot: 3, task: elsewhere, hostRoot: path.join(tmp(t), 'bases', baseKey(elsewhere)) });
+  assert.notEqual(separate.dir, first.dir);
+  assert.equal(builds(), 4);
+  assert.equal(extracts(), 2);
+  // A tree edited after the host copy was made is never read again in this process: the copy is the base.
+  fs.writeFileSync(path.join(produced.tree, 'src', 'index.js'), 'tampered\n');
+  const warm = await cache.prepare({ containers, stack, slot: 1, task, hostRoot });
+  assert.equal(builds(), 4);
+  assert.equal(extracts(), 2);
+  assert.deepEqual([warm.sha, warm.tree], [first.sha, first.tree]);
   // A volume with no base at all is remade too.
   volumes.delete(1);
   await cache.prepare({ containers, stack, slot: 1, task, hostRoot });
-  assert.equal(builds(), 4);
-  assert.equal(extracts(), 1);
+  assert.equal(builds(), 5);
+  assert.equal(extracts(), 2);
 });
 
-test('the key of a base names the task and its image, and refuses a task without either', () => {
-  const a = { id: 'demo-1', image: { ref: 'ghcr.io/x/y@sha256:aa' } };
+test('the key of a base names the task, its image and its working directory, and refuses a task without them', () => {
+  const a = { id: 'demo-1', image: { ref: 'ghcr.io/x/y@sha256:aa' }, workdir: '/app' };
   assert.equal(baseKey(a), baseKey({ ...a }));
   assert.notEqual(baseKey(a), baseKey({ ...a, id: 'demo-2' }));
   assert.notEqual(baseKey(a), baseKey({ ...a, image: { ref: 'ghcr.io/x/y@sha256:bb' } }));
+  assert.notEqual(baseKey(a), baseKey({ ...a, workdir: '/src' }));
   assert.match(baseKey(a), /^demo-1-[0-9a-f]{16}$/);
-  assert.throws(() => baseKey({ id: '', image: a.image }), /task id and an image/);
-  assert.throws(() => baseKey({ id: 'demo-1' }), /task id and an image/);
+  assert.throws(() => baseKey({ id: '', image: a.image, workdir: '/app' }), /task id, an image reference and a working directory/);
+  assert.throws(() => baseKey({ id: 'demo-1', workdir: '/app' }), /task id, an image reference and a working directory/);
+  assert.throws(() => baseKey({ id: 'demo-1', image: a.image }), /task id, an image reference and a working directory/);
+});
+
+test('a marker is a bare repository\'s HEAD and a tree digest, or nothing', () => {
+  const commit = 'a'.repeat(40);
+  const tree = 'b'.repeat(40);
+  assert.deepEqual(parseBaseMarker(`${commit} ${tree}\n`), { commit, tree });
+  assert.deepEqual(parseBaseMarker(`${commit} ${tree}`), { commit, tree });
+  assert.equal(parseBaseMarker('demo-1-0123456789abcdef'), null);
+  assert.equal(parseBaseMarker(`${commit} not-a-tree`), null);
+  assert.equal(parseBaseMarker(''), null);
+  assert.equal(parseBaseMarker(undefined), null);
 });
 
 test('the run\'s worktree is the one slot of the one run directory, or the one named after the repository', () => {
