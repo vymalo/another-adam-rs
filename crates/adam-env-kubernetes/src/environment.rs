@@ -438,7 +438,8 @@ impl KubeEnvironment {
         let params = WatchParams::default()
             .fields(&format!("metadata.name={name}"))
             .timeout(secs);
-        // An API that never answers must not outlive `ready_timeout`.
+        // A watch that never answers must not outlive `ready_timeout`; the plain read before it is
+        // still unbounded (a pre-existing gap, not this wait's).
         let stream = match tokio::time::timeout_at(
             deadline.into(),
             self.inner.pods.watch(&params, rv),

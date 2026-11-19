@@ -369,6 +369,8 @@ async fn answer(state: &Shared, request: Request<Body>) -> Response<Body> {
                 );
             }
             let mut stored = pod;
+            // A real apiserver reports `Pending` on the create; the fake's first status is a change,
+            // which is why the fixed client reads 3 times, not 2.
             stored.status = None;
             st.version += 1;
             stored.metadata.resource_version = Some(st.version.to_string());
@@ -805,7 +807,8 @@ mod tests {
         assert_eq!(
             fx.gets(&name),
             3,
-            "not found, the pod's first status, then the one the watch said is ready: {:?}",
+            "not found, the pod's first status, then the one the watch said is ready (a real create \
+             is already Pending; the fake's first status is a change, hence 3 and not 2): {:?}",
             lock(&fx.api).requests
         );
         let watches = fx.watches();
