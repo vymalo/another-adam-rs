@@ -314,7 +314,9 @@ binary as `WORKSPACE_PLACEMENT` (`bin/adam-coder/README.md`, "Workspace placemen
   (`updates to statefulset spec ...: Forbidden`) from `helm upgrade`, and Argo CD or Flux stays `OutOfSync`. Delete
   the StatefulSet once, keeping its pods, and upgrade; the new pods adopt the volumes:
   `kubectl delete statefulset <release>-coder --cascade=orphan` then `helm upgrade ...`. A fresh install needs
-  nothing, and the upgrade does not interrupt a run in flight.
+  nothing, and the upgrade does not interrupt a run in flight. The render also changes the `helm.sh/chart` label on
+  every object, which changes the checksums of the ConfigMaps it labels (`run-pod`, `egress-allow`, and `extra-mcp`
+  when any `mcp.*` value is set), so the coder and egress proxy pods roll once.
 * Moving a running release from empty to a pinning placement is safe for runs in flight: a
   run with no owner is claimed, and so owned, by the first worker that steps it.
 
@@ -613,8 +615,9 @@ on the cluster.
 
 ## Push notifications and the card's signature (`a2a.*`)
 
-Two optional features of the A2A server, **both off by default**; with both off the render is byte for byte what it was
-(`tests/golden/combined.yaml`; the chart version moved to 0.4.0, the one line that differs). They belong to the pod that serves A2A: the StatefulSet with `topology: combined`, the front
+Two optional features of the A2A server, **both off by default**; with both off they add nothing
+(`tests/golden/combined.yaml` is the default render, which since 0.5.0 carries `podManagementPolicy: Parallel` and the
+`helm.sh/chart: coder-0.5.0` label). They belong to the pod that serves A2A: the StatefulSet with `topology: combined`, the front
 Deployment with `topology: split` (the worker renders none of it). Design and what a client sees:
 [ADR 0030](../../docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md),
 [the A2A server](../../docs/reference/a2a-server.md#push-notifications).

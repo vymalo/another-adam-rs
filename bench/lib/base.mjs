@@ -41,6 +41,17 @@ export function parseBaseMarker(text) {
   return m ? { commit: m[1], tree: m[2] } : null;
 }
 
+/** The sha a `packed-refs` file gives `name`, or ''. Peeled tag lines (`^...`) and comments are skipped. */
+export function packedRef(text, name) {
+  for (const line of String(text ?? '').split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith('^')) continue;
+    const [sha, ref] = trimmed.split(' ');
+    if (ref === name && /^[0-9a-f]{40}$/.test(sha)) return sha;
+  }
+  return '';
+}
+
 /** The shell that makes `<out>/base.git` (branch main), `<out>/tree` and the marker, from the repository at `workdir`. Pure. */
 export function baseScript({ workdir, out = '/out', scratch = '/tmp/bench-base' }) {
   for (const p of [workdir, out, scratch]) if (!SAFE_PATH.test(p)) throw new Error('a path in the base script is not a plain absolute path');
@@ -145,10 +156,12 @@ export class BaseCache {
   async #markerOf(stack, slot) {
     const names = await stack.listDir(slot, BASE_DIR);
     if (!names.includes('base.git') || !names.includes('tree') || !names.includes(BASE_MARKER)) return null;
-    const { files } = await stack.readFiles(slot, BASE_DIR, [BASE_MARKER, 'base.git/refs/heads/main']);
+    const { files } = await stack.readFiles(slot, BASE_DIR, [BASE_MARKER, 'base.git/refs/heads/main', 'base.git/packed-refs']);
     const marker = parseBaseMarker(files.get(BASE_MARKER)?.toString('utf8'));
-    const ref = (files.get('base.git/refs/heads/main')?.toString('utf8') ?? '').trim();
     // The ref is what an agent's clone reads: a commit added there changes it, and an edited object cannot keep its id.
+    // A clone reads the loose ref, or the packed one after `git pack-refs`/`git gc`; both count.
+    const loose = (files.get('base.git/refs/heads/main')?.toString('utf8') ?? '').trim();
+    const ref = loose || packedRef(files.get('base.git/packed-refs')?.toString('utf8'), 'refs/heads/main');
     return marker && marker.commit === ref ? marker : null;
   }
 

@@ -165,7 +165,7 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/stack.mjs`, `bench/compose.yaml`, `bench/lib/relay.mjs` | the stack, the Podman clients inside the services, the relays |
 | `bench/lib/tarstream.mjs` | what a container wrote, as a tar stream parsed with limits |
 | `bench/lib/classify.mjs` | infrastructure told apart from the agent, from the meter's record |
-| `bench/lib/base.mjs` | the base of a task: its repository with the dependency links, made in the slot's volume, and the host's own copy of it; both once per (task, image, workdir) for the harness's life |
+| `bench/lib/base.mjs` | the base of a task: its repository with the dependency links, made in the slot's volume, and the host's own copy of it; both once per (task, image, workdir) for the harness's life; the host copy's tree must equal the container's, which assumes the image's git normalises like the host's (`core.autocrlf=false`, `attributesFile=/dev/null`, `fsmonitor=false`) |
 | `bench/lib/agents/adam.mjs`, `opencode.mjs`, `common.mjs` | the two drivers (prepare, run, collect, cleanup) and what they share |
 | `bench/lib/runner.mjs` | one run through its states, resume of the ledger, and a plan one run at a time |
 | `bench/lib/plan.mjs`, `bench/lib/schedule.mjs`, `bench/lib/budget.mjs`, `bench/lib/run-cli.mjs` | task blocks in a seeded balanced order; the slots and the wait for budget; the pilot's budget and its confirmation; `bench pilot`, `confirm`, `run`, `regrade` |

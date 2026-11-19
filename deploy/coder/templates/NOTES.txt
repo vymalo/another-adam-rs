@@ -21,17 +21,6 @@ Workspace placement: {{ . }}
 {{- end }}
 {{- end }}
 
-{{- if .Release.IsUpgrade }}
-
-Upgrading a release installed with chart 0.4.x or earlier: `podManagementPolicy` is immutable, and this chart sets
-`Parallel` where 0.4.x set `OrderedReady`. `helm upgrade` is refused (422, "updates to statefulset spec ...") until
-the StatefulSet is deleted once, keeping its pods, and recreated by the upgrade:
-
-  kubectl delete statefulset {{ include "coder.fullname" . }} -n {{ .Release.Namespace }} --cascade=orphan
-  helm upgrade {{ .Release.Name }} <chart> ...   # the new pods adopt the volumes
-
-The runs in flight are not interrupted: the orphaned pods keep running until the new ones replace them.
-{{- end }}
 {{- if gt (int .Values.replicaCount) 1 }}
 
 Scaling down deletes every removed worker at once (`podManagementPolicy: Parallel`). A per-pod volume stays, and the

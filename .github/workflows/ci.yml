@@ -330,12 +330,12 @@ jobs:
             lcov.info
             summary.txt
           if-no-files-found: ignore
-      # Nothing else follows up a red main: open one issue (or comment on the open one) with the run's link.
+      # Nothing else follows up a red main: one open issue (deduplicated by its title) with the run's link.
       - name: Open an issue when main's coverage falls below the gate
         if: failure() && steps.gate.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
-          TITLE: coverage on main fell below 87
+          TITLE: coverage on main fell below the gate
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -eu
@@ -345,6 +345,19 @@ jobs:
             gh issue comment "$existing" --body "$body"
           else
             gh issue create --title "$TITLE" --body "$body"
+          fi
+      # A recovered main must not leave the issue open.
+      - name: Close the coverage issue when main is green again
+        if: success() && steps.gate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: coverage on main fell below the gate
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          existing=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --comment "The gate passed again on main: ${RUN_URL}"
           fi
 
   # compose.yaml must keep working: the WireMock mappings are exercised by the
