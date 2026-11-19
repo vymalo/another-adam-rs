@@ -972,7 +972,7 @@ fn build_update(
     base_rev: u64,
     parent: bool,
     now: DateTime<Utc>,
-    body_commit: Uuid,
+    body_writer: Uuid,
 ) -> StoreResult<RunUpdate> {
     // Messages that arrived while stepping sit after the ones we started
     // with. A parked agent must not sleep through them.
@@ -1053,7 +1053,7 @@ fn build_update(
         update.body = Some(BodyWrite {
             generation: next.generation,
             rows,
-            writer: body_commit,
+            writer: body_writer,
         });
     }
     Ok(update)
@@ -1115,7 +1115,7 @@ async fn commit(
     base: &Envelope,
     next: &Next,
     parent: bool,
-    body_commit: Uuid,
+    body_writer: Uuid,
 ) -> StoreResult<Option<RunRecord>> {
     let run = claimed.id;
     // On the first attempt the update is built from the borrowed record and envelope: nothing is
@@ -1151,7 +1151,7 @@ async fn commit(
             base.rev,
             parent,
             inner.clock.now(),
-            body_commit,
+            body_writer,
         )?;
         // The bytes of every file artifact this commit's state names go to the store before the
         // commit that names them (ADR 0055). Fail-open in the expand release: the state still

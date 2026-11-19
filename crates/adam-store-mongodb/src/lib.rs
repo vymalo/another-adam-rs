@@ -722,12 +722,14 @@ impl Store for MongoStore {
                 .options(named("adam_run_blob_run"))
                 .build(),
         ];
-        // Schema version 5, part 2: a set is read by `(run, commit)` in index order, and the GC
-        // asks "which sets of this run were written before the cutoff".
+        // Schema version 5, part 2: a generation is read by `(run, generation)` in index order, and
+        // the GC asks "which generations of this run were written before the cutoff". The name is
+        // new because `ensure_indexes` matches by name only: a database migrated from the earlier
+        // S2a shape keeps its old `adam_body_run` index without the new keys.
         let body_indexes = [
             IndexModel::builder()
-                .keys(doc! { "run_id": 1, "commit_id": 1, "idx": 1 })
-                .options(named("adam_body_run"))
+                .keys(doc! { "run_id": 1, "generation": 1, "idx": 1 })
+                .options(named("adam_body_generation"))
                 .build(),
             IndexModel::builder()
                 .keys(doc! { "written_at": 1 })

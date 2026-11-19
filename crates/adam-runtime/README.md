@@ -78,10 +78,10 @@ safe.
   exists: the state is deserialized once, and the rows are the agent's own values.
 * A step commit that splits writes the head (`v: 5`: the agent's head, the envelope's other members,
   file artifacts **by reference** — `file.digest` and `file.size`, never the bytes — and
-  `body: {commit, len}`) and the rows, beside the full `state`. The `commit` UUID is chosen once per
-  step attempt, so a CAS retry of that attempt reuses the set and writes no duplicate row; a commit
-  that loses the CAS leaves rows no head names, which readers ignore and the store collects after an
-  hour.
+  `body: {generation, len}`) and the rows, beside the full `state`. The generation is the current
+  one for an append, or a new one for a first split or a compaction; the `writer` UUID is chosen once
+  per step attempt, so a CAS retry of that attempt writes no duplicate row and a commit that loses
+  deletes its own rows and refs.
 * A commit that does not split (`deliver`, `cancel`, `park_again`, a run whose state is unreadable)
   writes no head: it re-encodes the format it read, and the stored head becomes stale
   (`head_version < version`), which `Store::load_head` reads as "serve the state".

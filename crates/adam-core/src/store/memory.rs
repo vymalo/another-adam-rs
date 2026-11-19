@@ -650,7 +650,8 @@ impl Store for MemoryStore {
     }
 }
 
-/// How long a superseded body set stays readable before the next commit of its run collects it.
+/// How long a superseded body generation stays readable before the next commit of its run collects
+/// it.
 const BODY_GC_GRACE: chrono::Duration = chrono::Duration::hours(1);
 
 /// Delete the body rows of `run` outside `keep_generation` that were written before `before`, and

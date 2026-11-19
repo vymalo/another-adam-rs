@@ -27,7 +27,7 @@ accept the poll latency.
 * `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
 * `MongoStore::database()`, `SCHEMA_VERSION` (5, parts 1 and 2).
-* `MongoStore::gc_body(run, keep, before)`: delete the superseded body sets of `run` written before
+* `MongoStore::gc_body(run, keep, before)`: delete the superseded body generations of `run` written before
   `before` (the commit path calls it with a one-hour grace; a test or an operator can pass its own
   cutoff).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
@@ -137,8 +137,7 @@ both alone, so the head becomes stale (`head_version < version`) and `load_head`
 
 `<prefix>body` holds the transcript, **append-only per generation**: `_id =
 "<run>:<generation>:<idx>"`, `run_id`, `generation` and `writer` (binary UUIDs), `idx` (int),
-`message` (BSON through the codec) and `written_at`. Indexes: `adam_body_run` (`run_id,
-generation, idx`) for reading a generation in order, `adam_body_gc` (`written_at`) for the sweep.
+`message` (BSON through the codec) and `written_at`. Indexes: `adam_body_generation` (`run_id, generation, idx`) for reading a generation in order, `adam_body_gc` (`written_at`) for the sweep.
 
 A commit resolves the generation: `RunUpdate.body.generation` names a new one (a compaction, or a
 first split), else the current head's, else a new UUID. It writes only the rows after the old head's

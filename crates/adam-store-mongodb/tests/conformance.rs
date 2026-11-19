@@ -144,8 +144,8 @@ async fn a_document_without_an_owner_field_is_unowned() {
 
 adam_store_testkit::transcript_measurement!(make_store);
 
-/// A body set is `(run, commit, idx)`: two rows of one set go in, the head names the set, and
-/// `load_head` serves it at the version it was written at.
+/// A body generation is `(run, generation, idx)`: its rows go in, the head names the generation,
+/// and `load_head` serves it at the version it was written at.
 ///
 /// The adapter-local half of the body suite: the conformance cases cannot make an insert fail, and
 /// cannot see the stored `head_version` a commit that writes no head leaves alone.

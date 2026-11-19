@@ -973,7 +973,7 @@ erDiagram
     }
     BODY {
         uuid run_id PK
-        uuid commit_id PK "the set the head names"
+        uuid generation PK "the generation the head names"
         integer idx PK "the message's position"
         jsonb message "one message, as the agent holds it"
         timestamptz written_at "the GC cutoff"
@@ -994,7 +994,7 @@ erDiagram
 | `push (agent, next_attempt_at, run_id, id)` where active | claiming due push configs |
 | `blob (created_at)` | blob GC: unreferenced blobs older than the cutoff |
 | `run_blob (digest)` | blob GC: does any run still reference this digest |
-| `body (run_id, generation, idx)` | reading one generation in order, and the GC's "which generations of this run" (MongoDB now) |
+| `body (run_id, generation, idx)` | reading one generation in order, and the GC's "which generations of this run" (MongoDB now; index `adam_body_generation`) |
 | `body (written_at)` | body GC: superseded generations older than the cutoff (MongoDB now) |
 
 MongoDB keeps the same fields in `adam_runs` (`_id` is the run's UUID) plus `open_key` (a plain unique

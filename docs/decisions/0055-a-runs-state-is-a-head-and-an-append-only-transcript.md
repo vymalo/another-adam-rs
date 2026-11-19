@@ -33,7 +33,8 @@ Two constraints decide the shape of the fix, and neither is in the review:
 
 1. **Three homes.** A run's `state` becomes a **head**: the runtime envelope with `agent` reduced to the
    agent's head, the artifact list by reference, and the counters, inbox, output, error and deadlines.
-   The agent's transcript is **one row per message** in a body table, in a body set named by the head.
+   The agent's transcript is **one row per message** in a body table, in a body generation named by
+   the head (append-only per generation, per the S2a amendment).
    File bytes — and only a file artifact's bytes — are **content-addressed blobs** (SHA-256) referenced
    by the head; a JSON artifact's `data` stays in the head.
 2. **The store contract grows by defaulted methods only** (rule 2): `keeps_bodies`, `body_list`,

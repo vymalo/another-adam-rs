@@ -1,4 +1,4 @@
-//! The v5 head: a run's state without its transcript, beside the transcript's body set.
+//! The v5 head: a run's state without its transcript, beside the transcript's body generation.
 //!
 //! The expand release (S2a) writes the head next to the full v4 `state` and reads neither; the
 //! read path (S2b) serves the head and joins the rows it names. [`Stored`] is the enum that makes
@@ -206,7 +206,7 @@ fn head_artifact(artifact: &Artifact, sizes: &HashMap<BlobId, u64>) -> HeadArtif
 pub(crate) enum Stored {
     /// The whole run, the v4 format (`v: 1`).
     Full(Envelope),
-    /// The head and the body set it names (`v: 5`).
+    /// The head and the body generation it names (`v: 5`).
     Head(Head),
 }
 
