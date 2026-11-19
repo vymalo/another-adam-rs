@@ -37,7 +37,7 @@ use anyhow::Context as _;
 use crate::agent::CoderStarter;
 use crate::github_mcp::{GitHubReadBearer, SERVER_NAME as GITHUB_SERVER};
 use crate::janitor::Janitor;
-use crate::redact::Redactor;
+use crate::redact::{Redactor, RedactorFromConfig};
 use crate::repos::workspaces_for;
 use crate::tools::CommandsSweep;
 use crate::{
