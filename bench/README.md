@@ -431,6 +431,7 @@ git server, postgres and the mock answer on both; they do not connect the slots)
 * **`ALLOW_LOCAL_REPOS` stays on**, because the bench serves plain `http://`; `ALLOWED_REPO_HOSTS` is the git server only. The
   coder's policy still accepts a local path or a `file://` URL when it is on (`Policy::check` in `crates/adam-workspace`);
   the coder's container holds nothing but the work directory, so that reaches nothing of the host's.
+* **`BENCH_COMPOSE_BUILD=0`** starts the stack without `--build` (the default builds). A host whose builds cannot reach the package mirrors (behind a proxy) builds the git-server image itself (`docker build -t adam-bench-git-server dev/git-server`) and sets this; `bench doctor` then fails if an image compose would have built is missing (`compose images`), so a run never starts on one. Any other value is refused.
 * The compose file has two slots. A third needs its own services (listed in the file's header) and a database.
 
 ## The agents

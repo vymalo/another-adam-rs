@@ -217,6 +217,15 @@ export async function doctor({ home, pins, exec = runCommand, statfs = fs.statfs
     }
   }
 
+  // With BENCH_COMPOSE_BUILD=0 compose does not build: every image it would have built must already be here.
+  if (stack && stack.composeBuild === false) {
+    const absent = [];
+    for (const img of stack.builtImages()) if ((await run('docker', ['image', 'inspect', '--format', '{{.Id}}', img])).exitCode !== 0) absent.push(img);
+    checks.push(absent.length === 0
+      ? ok('compose images', 'BENCH_COMPOSE_BUILD=0 and every image compose would build is present')
+      : fail('compose images', `BENCH_COMPOSE_BUILD=0 and ${absent.join(', ')} ${absent.length > 1 ? 'are' : 'is'} not on this machine`, `build ${absent.length > 1 ? 'each' : 'it'} with \`docker build -t ${absent[0]} <its context in the compose file>\` (a host that cannot reach the package mirrors builds it itself), or unset BENCH_COMPOSE_BUILD`));
+  }
+
   // The host runtime itself, which needs the stack.
   if (stack && start && checks.every((c) => c.status !== 'fail')) {
     try {

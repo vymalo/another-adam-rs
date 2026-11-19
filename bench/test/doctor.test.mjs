@@ -368,3 +368,23 @@ test('a probe that times out is unclear, and the doctor still reports the image'
   assert.equal(by(r, 'task image hello').status, 'warn');
   assert.match(by(r, 'task image hello').detail, /unclear/);
 });
+
+test('with the compose build off, the doctor fails closed when an image compose would have built is missing, and says how to build it', async () => {
+  const stack = { composeBuild: false, builtImages: () => ['adam-bench-git-server'], removeStaleEnvFiles: () => [], up: async () => { throw new Error('the stack must not start'); } };
+  const missing = machine({ digests: [`${PINS.coder.image}@${PINS.coder.digest}`] });
+  const exec = async (file, args) => (args[0] === 'image' && args.includes('adam-bench-git-server') ? { exitCode: 1, stdout: '', stderr: 'No such image' } : missing.exec(file, args));
+  const r = await run({ exec, statfs: missing.statfs }, { stack, start: true });
+  const c = by(r, 'compose images');
+  assert.equal(c.status, 'fail');
+  assert.match(c.detail, /adam-bench-git-server/);
+  assert.match(c.fix, /docker build/);
+  assert.match(c.fix, /BENCH_COMPOSE_BUILD/);
+  assert.equal(r.exitCode, 1);
+  assert.equal(by(r, 'stack'), undefined, 'the stack is never started');
+  // present: ok, and the stack starts
+  const upStack = { ...stack, up: async () => {}, containers: () => new FakeContainers(), graderContainers: () => new FakeContainers(), slots: 0, ensureCoderFiles: async () => '/h/bin' };
+  const present = await run(machine(), { stack: upStack, start: true });
+  assert.equal(by(present, 'compose images').status, 'ok');
+  // build on (the default): nothing to check
+  assert.equal(by(await run(machine(), { stack: { composeBuild: true, builtImages: () => ['x'], removeStaleEnvFiles: () => [] } }), 'compose images'), undefined);
+});
