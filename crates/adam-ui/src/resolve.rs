@@ -42,7 +42,11 @@ use serde_json::{Map, Value};
 
 use crate::cache::CatalogCache;
 use crate::catalog::{Catalog, Claimed};
+#[cfg(feature = "thread-tools")]
 use crate::thread_tools::ThreadToolsClient;
+
+/// Why a catalog cannot be read again when this process has no thread tools.
+const NO_THREAD_TOOLS: &str = "it cannot be read again: this agent has no thread tools";
 
 /// What this process holds of the screen's catalog, before it asks anyone.
 enum Held {
@@ -66,7 +70,10 @@ pub(crate) enum Resolved {
 /// current one again.
 pub(crate) struct UiState {
     pub(crate) cache: CatalogCache,
-    pub(crate) client: Arc<ThreadToolsClient>,
+    /// How to read the catalog again; none in a build without thread tools, which keeps only what a
+    /// message carried.
+    #[cfg(feature = "thread-tools")]
+    pub(crate) client: Option<Arc<ThreadToolsClient>>,
 }
 
 /// `{catalogId, version, digest}` of a context entry.
@@ -90,10 +97,20 @@ fn claimed(entry: &Value) -> Option<Claimed> {
 }
 
 impl UiState {
+    #[cfg(feature = "thread-tools")]
     pub(crate) fn new(client: Arc<ThreadToolsClient>) -> Self {
         Self {
             cache: CatalogCache::new(),
-            client,
+            client: Some(client),
+        }
+    }
+
+    /// No way to read a catalog again: only the one a message carried is used.
+    pub(crate) fn without_thread_tools() -> Self {
+        Self {
+            cache: CatalogCache::new(),
+            #[cfg(feature = "thread-tools")]
+            client: None,
         }
     }
 
@@ -153,14 +170,25 @@ impl UiState {
         Held::Stale
     }
 
+    #[cfg(feature = "thread-tools")]
     fn keep(&self, catalog: Catalog) -> Resolved {
         let catalog = Arc::new(catalog);
         self.cache.insert(Arc::clone(&catalog));
         Resolved::Found(catalog)
     }
 
+    #[cfg(not(feature = "thread-tools"))]
+    #[allow(clippy::unused_async)] // the same signature as the build with thread tools
+    async fn refetch(&self, _context: &Map<String, Value>) -> Resolved {
+        Resolved::Unreadable(NO_THREAD_TOOLS.into())
+    }
+
+    #[cfg(feature = "thread-tools")]
     async fn refetch(&self, context: &Map<String, Value>) -> Resolved {
-        let grant = match self.client.grant(context) {
+        let Some(client) = &self.client else {
+            return Resolved::Unreadable(NO_THREAD_TOOLS.into());
+        };
+        let grant = match client.grant(context) {
             Ok(grant) => grant,
             Err(why) => {
                 tracing::debug!(
@@ -170,7 +198,7 @@ impl UiState {
                 return Resolved::Unreadable(format!("it cannot be read again: {}", why.reason()));
             }
         };
-        let fetched = match self.client.fetch_catalog(&grant, None).await {
+        let fetched = match client.fetch_catalog(&grant, None).await {
             Ok(fetched) => fetched,
             Err(error) => {
                 tracing::warn!(%error, "the screen's catalog could not be read again");

@@ -26,6 +26,8 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 |---|---|
 | `Ui::new(McpPolicy)`, `Ui::with_client(..)` | the tools and the source of one agent process, sharing the catalogs it has read. `McpPolicy` is the deployment's (`MCP_ALLOW_INSECURE` decides whether the thread-tools URL may be plain `http` to another machine; the call timeout, and `thread_tools_max_call`, the cap of `THREAD_TOOLS_MAX_CALL_SECS`) |
 | `Ui::tools() -> ToolSet`, `Ui::with_ask_lead(text)`, `DEFAULT_ASK_LEAD` | `ask_user`, `show`, `ui_catalog`, `plan_work`, `plan_check`, `plan_add`, in that order (**six tools; it was three**: the specs are part of the prompt's stable prefix, so their order is fixed and a build that adds one changes every agent's prefix once). `with_ask_lead` opens the description of `ask_user` with the agent's own words about when to ask (the coder names pull requests); what follows, about `choices`, is the same |
+| `Ui::embedded()` | the same tools with **no thread-tools client** ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), every build): a catalog a message carries is used, one that would have to be read again is not (the tool says so and the agent answers in text), and no endpoint is ever asked, even when a message names one; its `source()` offers and calls nothing |
+| `Ui::screen() -> ScreenSource` | the screen's source for an agent without thread tools: no tool, the "Mentioned agents" block and `show` described with the components of a catalog this process holds, as `ThreadTools` does them. Register it **or** `source()`, never both |
 | `Ui::source() -> ThreadTools` | a `ToolSource` that offers **every tool the thread-tools endpoint lists, under its listed name**, read once per grant (a turn reuses the listing; a new grant, a refused call or `LISTING_TTL` lists again), **except `get_ui_catalog`** (the model has `ui_catalog`; the relayed tools of attached servers and `ask_agent` appear with no change here), and that **describes `show` with the components of the conversation's screen** (`ToolSource::refine`, from the catalogs this process holds). Add it last among an agent's sources, and register `Ui::tools()` on the same agent |
 | `AskUser`, `ASK_USER` | `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`: see *The tools* |
 | `Show`, `SHOW`, `MAX_BLOCKS` | `show { blocks, title? }`, at most 16 blocks; refuses a `Choices` block |
@@ -388,7 +390,15 @@ stateDiagram-v2
   `MCP_ALLOW_INSECURE` allows it (a compose stack where the orchestrator is `http://orchestrator:8080` sets it);
   credentials in the URL are refused.
 
+## Features
+
+| Feature | Default | Effect |
+|---|---|---|
+| `thread-tools` | **yes** | `thread-tools/v1`: `Ui::new`, `Ui::with_client`, `Ui::source`, `ThreadTools`, `ThreadToolsClient` and the reading of a catalog again, over `adam-mcp` (`rmcp`). Without it ([ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), the embedded set) the crate is the screen's tools over the catalog a message carries, `Ui::embedded` and `Ui::screen`; `adam-a2a` and `adam-a2a-runtime` are dependencies with `default-features = false` |
+
 ## Tests
+
+* `tests/embedded.rs`: `Ui::embedded` uses an inline catalog, never asks an endpoint a message names (and its `source()` offers and calls nothing), and `Ui::screen` describes `show` once the catalog is held and names the mentioned agents, with no tool.
 
 * `src/catalog.rs`: the known-answer vector (canonical form and digest), whole doubles hashing as integers, what the
   canonical form refuses, a digest that is not the claimed one, a document that is not the catalog it says, a schema

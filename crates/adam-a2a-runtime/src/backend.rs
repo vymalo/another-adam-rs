@@ -238,6 +238,7 @@ impl RuntimeTaskBackend {
         }
     }
 
+    #[cfg(feature = "push")]
     /// The push-notification state of this backend's agent, kept in the same store as its runs
     /// ([`StorePushStore`](crate::StorePushStore)): give it to
     /// `adam_a2a::push::PushSupport::new` so configs and delivery progress survive a restart and

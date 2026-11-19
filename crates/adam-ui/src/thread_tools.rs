@@ -508,7 +508,8 @@ fn is_relayed(name: &str) -> bool {
 /// conversation (see [`refine`](ToolSource::refine)).
 #[derive(Clone)]
 pub struct ThreadTools {
-    client: Arc<ThreadToolsClient>,
+    /// None for the source of a [`Ui::embedded`](crate::Ui::embedded): it offers and calls nothing.
+    client: Option<Arc<ThreadToolsClient>>,
     /// The tools of the endpoint the model is not shown, and cannot call through this source.
     hidden: Vec<&'static str>,
     /// What describes `show` with the screen's components: the catalogs this process has read.
@@ -528,7 +529,7 @@ impl ThreadTools {
     /// The source over `client`: every tool the endpoint lists, as it lists it.
     pub fn new(client: Arc<ThreadToolsClient>) -> Self {
         Self {
-            client,
+            client: Some(client),
             hidden: Vec::new(),
             ui: None,
         }
@@ -538,7 +539,7 @@ impl ThreadTools {
     /// catalog) and `show` is described with the screen's components.
     pub(crate) fn of_ui(state: Arc<UiState>) -> Self {
         Self {
-            client: Arc::clone(&state.client),
+            client: state.client.clone(),
             hidden: vec![GET_UI_CATALOG],
             ui: Some(state),
         }
@@ -574,7 +575,10 @@ impl ToolSource for ThreadTools {
     }
 
     async fn listing(&self, ctx: &SourceCtx) -> Listing {
-        let grant = match self.client.grant(ctx.context_map()) {
+        let Some(client) = &self.client else {
+            return Listing::default();
+        };
+        let grant = match client.grant(ctx.context_map()) {
             Ok(grant) => grant,
             Err(Unavailable::Absent) => return Listing::default(),
             Err(why) => {
@@ -582,7 +586,7 @@ impl ToolSource for ThreadTools {
                 return Listing::default();
             }
         };
-        let listed = self.client.listed(&grant).await;
+        let listed = client.listed(&grant).await;
         match listed {
             Ok(tools) => {
                 let tools: Vec<&RemoteTool> = tools
@@ -639,7 +643,8 @@ impl ToolSource for ThreadTools {
         if self.hidden.contains(&name) {
             return None;
         }
-        let grant = match self.client.grant(ctx.context_map()) {
+        let client = self.client.as_ref()?;
+        let grant = match client.grant(ctx.context_map()) {
             Ok(grant) => grant,
             // Nothing was announced: the name is nobody's here.
             Err(Unavailable::Absent) => return None,
@@ -669,9 +674,9 @@ impl ToolSource for ThreadTools {
         // orchestrator reports its step under (and dedupes an ask by), and stops at once when the
         // run is cancelled: an hour is too long to wait for a call nobody will read.
         let options = CallOptions::new()
-            .timeout(self.client.wait_for(ctx.note()))
+            .timeout(client.wait_for(ctx.note()))
             .meta(META_KEY, request_meta(ctx));
-        let called = match self.client.endpoint(&grant) {
+        let called = match client.endpoint(&grant) {
             Ok(endpoint) => {
                 tokio::select! {
                     biased;
@@ -692,7 +697,7 @@ impl ToolSource for ThreadTools {
                 None => ToolOutput::text(result.text),
             })),
             Err(EndpointError::Unauthorized) => {
-                self.client.forget_listing(&grant);
+                client.forget_listing(&grant);
                 error_result(format!(
                     "`{name}` was refused: the endpoint does not accept this conversation's grant any \
                      more (it may have expired). Go on without it."
@@ -700,7 +705,7 @@ impl ToolSource for ThreadTools {
             }
             Err(EndpointError::Rejected(why)) => {
                 // The endpoint may have changed its tools: the next turn lists again.
-                self.client.forget_listing(&grant);
+                client.forget_listing(&grant);
                 error_result(format!("`{name}` was refused by the endpoint: {why}"))
             }
             Err(other) => error_result(format!(
@@ -996,9 +1001,10 @@ mod tests {
         // The refetch of the catalog, which this crate does itself, still reaches the endpoint
         // (`tests/tools.rs` pins that): hiding is for the model.
         // A plain source offers everything, and `hiding` hides what it is told to.
-        let plain = ThreadTools::new(Arc::clone(&ui.state.client));
+        let plain = ThreadTools::new(ui.state.client.clone().expect("a Ui made with a client"));
         assert_eq!(plain.specs(&ctx).await.len(), 2);
-        let hiding = ThreadTools::new(Arc::clone(&ui.state.client)).hiding("relay__search");
+        let hiding = ThreadTools::new(ui.state.client.clone().expect("a Ui made with a client"))
+            .hiding("relay__search");
         assert_eq!(
             hiding
                 .specs(&ctx)

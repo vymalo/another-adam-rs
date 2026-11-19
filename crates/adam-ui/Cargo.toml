@@ -8,18 +8,25 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# thread-tools/v1: the MCP client that lists and calls the conversation's tools and reads the screen's catalog
+# again (adam-mcp, rmcp). On by default; an embedded build (adam ADR 0047) turns it off and keeps the
+# screen's tools over the catalog a message carries.
+default = ["thread-tools"]
+thread-tools = ["dep:adam-mcp", "dep:secrecy"]
+
 [dependencies]
 a2a-lf.workspace = true
-adam-a2a.workspace = true
-adam-a2a-runtime.workspace = true
+adam-a2a = { path = "../adam-a2a", version = "0.1.0", default-features = false }
+adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0", default-features = false }
 adam-llm-agent.workspace = true
-adam-mcp.workspace = true
+adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 jsonschema.workspace = true
-secrecy.workspace = true
+secrecy = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

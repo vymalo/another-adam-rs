@@ -23,6 +23,18 @@ uses, so an application whose own state is on cratestack links one `sqlite3`. Th
 writer, immediate transactions, WAL, `LocalNotifier`, the lock file) and decision 2's check on `adam-engine` stand. Slice 3 here is
 ADR 0053's slice 3.
 
+*Built 2026-11-19, slice 1* (the owner exempted this ADR's slices on 2026-11-19, so they start now; the epic is
+vymalo/another-agentic-system#387): `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools`,
+all on by default, so a server build is unchanged; `adam-engine` exists as the embedded set (its API is slice 4), and
+`tools/embedded-deps/check.sh` (CI job `embedded`, part of the required `lint`) builds each split crate with its defaults
+off and with each feature alone, and fails when `adam-engine`'s tree holds an HTTP server or client, the A2A SDK's server
+or client, a database driver, the Kubernetes client, a TLS stack or the MCP client; its self-test plants `axum` and
+`rustls` and turns two gates back on, and each fails it. Without `thread-tools`, `adam-ui` keeps the screen's tools over a
+catalog a message carries (`Ui::embedded`) and `Ui::screen`, a source that adds the mentioned agents and describes `show`.
+**Not yet:** `adam-assembly`'s `remote` gate, whose files another track holds (asked on the coordination channel), so
+`adam-engine` does not depend on `adam-assembly` yet; and the check on Windows and macOS, which is slice 8's runner.
+The model's credentials are ADR 0058's port: the host gives `ModelCredentials`, so the engine reads no key.
+
 ## Context
 
 A program that links adam-rs today takes `adam-service` (an HTTP server, Postgres, an OpenAI client, configuration read

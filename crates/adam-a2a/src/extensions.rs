@@ -590,3 +590,9 @@ mod tests {
         assert!(ExtensionConfig::commands(&[]).is_none());
     }
 }
+
+/// The member of an artifact's `metadata` that says its id is **its own and kept**: the run replaces
+/// the artifact under that id when it changes, so the same id can carry different content later. An
+/// artifact without it has an id made from its content (a different content is a different id),
+/// and a delivery cursor keeps nothing more about it than the id.
+pub const REPLACEABLE_ARTIFACT: &str = "vymalo.replaceable";
