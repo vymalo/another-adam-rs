@@ -29,9 +29,10 @@ on every transition. Read the run for the stored state (a store may have replace
 `journal_put` is the exception and returns the payload it stored, because the loop decodes the step's
 outcome from it.
 
-`PgStore::connect` sizes its pool from `ADAM_PG_POOL_SIZE` (1 to 65535, default 16, per process);
-`connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A value
-that is not an integer in range fails the connect rather than falling back to 16.
+`PgStore::connect` sizes its pool from `ADAM_PG_POOL_SIZE` (2 to 65535, default 16, per process;
+one is refused because the `adam-notify-postgres` listener holds a connection for the process's
+life); `connect_with_pool_size` takes the size explicitly, and `from_pool` uses the pool you pass. A
+value that is not an integer in range fails the connect rather than falling back to 16.
 
 Creating a run with a deterministic id gives idempotent "fire once" semantics, for example one run per
 cron tick across all replicas. A second message on a conversation that has an open run gets
@@ -50,7 +51,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Journal deleted with its run | `ON DELETE CASCADE` | journal first, then runs, in batches |
 | Push configs (`push_*`, schema version 3): put, claim, commit | `INSERT .. ON CONFLICT DO UPDATE` bumping `version`; one `FOR UPDATE SKIP LOCKED` claim; `UPDATE .. WHERE version = $n` | update-or-insert on `_id = "<run>:<id>"`; a loop of `findOneAndUpdate` claims, each atomic; `findOneAndUpdate({_id, version: n})` |
 | Push configs deleted with their run | `ON DELETE CASCADE` | deleted with the journal by the purge |
-| `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`, a prefix is a range plus `starts_with` | `(agent, conversation_id, updated_at, _id)`; `(agent, status, conversation_id, updated_at, _id)` when a status filter is set; a prefix is an anchored escaped regex |
+| `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`, a prefix is a range plus `starts_with`; a prefix page sorts the matching index entries (the status filter is answered from the index) | `(agent, conversation_id, updated_at, _id)`, and `(agent, status, conversation_id, updated_at, _id)` when a status filter is set: a prefix is an anchored escaped regex, so the index bounds the scan but the page still sorts the matches; a listing of one conversation is read in index order |
 | State | `JSONB` (queryable with SQL) | real BSON document (queryable with dot paths) |
 | Transactions | none held open | none |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll |

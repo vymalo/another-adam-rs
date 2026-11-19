@@ -17,7 +17,7 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `ADAM_PG_POOL_SIZE`, `A2A_B
 |---|---|---|
 | `ROLE` | `all`, `control-plane` or `worker` | `all` |
 | `DATABASE_URL` | Postgres for the run store | required |
-| `ADAM_PG_POOL_SIZE` | connections in the Postgres store's pool, **per process** (1 to 65535); an `adam-notify-postgres` listener holds one of them for the process's lifetime. Read by `adam-store-postgres` when it connects, not by `adam-service`'s own configuration: a value that is not an integer in range fails that connect at startup | `16` |
+| `ADAM_PG_POOL_SIZE` | connections in the Postgres store's pool, **per process** (2 to 65535; one is refused because an `adam-notify-postgres` listener holds a connection for the process's lifetime, so a one-connection pool would leave none for a query). Read by `adam-store-postgres` when it connects, not by `adam-service`'s own configuration: a value that is not an integer in range fails that connect at startup | `16` |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens; **none = no server** | required by `all`, `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (goes in the agent card) | required by `all`, `control-plane` |
 | `LISTEN_ADDR` | the A2A server, or a worker's `/healthz` | `0.0.0.0:8080` |

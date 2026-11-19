@@ -72,15 +72,26 @@ requirement is `3.9` (verified 2026-09-29, `Cargo.toml`).
 `cursor` as BSON, the scheduling fields (`state`, `next_attempt_at`, `lease_until`) and `version`.
 Indexes: `(agent, state, next_attempt_at)` for claiming and `(run_id, id)` for listing. Runs get `adam_list`
 (`agent, conversation_id, updated_at -1, _id -1`) for `list_runs`, which matches a conversation prefix with an anchored,
-escaped regular expression, and `adam_list_status` (`agent, status, conversation_id, updated_at -1, _id -1`) for the
-same listing with a status filter: the status is an equality bound before the prefix range, so the index yields only
-the matching runs and a page fetches its own rows, not every candidate (`explain` on 2 000 runs: 10 documents examined
-for a page of 10, against 500 with the index absent). Neither index carries
-`purging`: a tombstoned run is left out of `commit_run`, and a listing may show one for the moments before the purge
-deletes it. Claiming is
+escaped regular expression: a listing of one conversation is read in index order, while a prefix is a range over the
+index, so its page is a blocking sort of the matching runs. Claiming is
 a loop of `findOneAndUpdate` (each atomic on its document, so two workers never lease one config),
 progress is `findOneAndUpdate({_id, version: expected})`, and the purge deletes a purged run's
 configs after its journal. Still single-document writes only, so a standalone `mongod` is enough.
+
+## Schema version 4: the status-filtered listing index
+
+`adam_list_status` (`agent, status, conversation_id, updated_at -1, _id -1`) is the same listing with a status filter.
+`status` is an equality bound before `conversation_id`, so the index yields the runs of that status and the prefix is a
+range inside it: a page fetches its own rows instead of every candidate the filter excludes (`explain` on 2 000 runs:
+10 documents examined for a page of 10, against 500 fetched to test the filter without it). It serves the order of a
+listing of **one conversation** (`agent`, `status` and `conversation_id` are equalities, so `updated_at, _id` is the
+index's order and no sort runs); a **prefix** listing — the default `ListTasks` path — still sorts its matches, because
+the range on `conversation_id` breaks the order. The index bounds that sort to the matching entries and keeps the state
+of the ones it drops out of it. Neither listing index carries `purging`: a tombstoned run is left out of `commit_run`,
+and a listing may show one until the sweep deletes it — up to a batch of deletes, or the next sweep after a crash.
+
+`ensure_indexes` matches an existing index **by name only**, so a future change to `adam_list_status`'s keys needs a new
+name: reusing the name would leave every existing database on the old keys, silently.
 
 ## Schema version and the owner field
 

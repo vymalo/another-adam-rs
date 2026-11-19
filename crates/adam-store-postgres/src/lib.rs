@@ -46,9 +46,9 @@ use adam_error::ErrorClass;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
 use sqlx::types::Json;
-use sqlx::{AssertSqlSafe, Executor, Row};
+use sqlx::{AssertSqlSafe, Connection, Executor, Row};
 use uuid::Uuid;
 
 /// Current schema version written to the `<prefix>meta` table.
@@ -57,8 +57,10 @@ use uuid::Uuid;
 /// * 2: `runs.owner`, the worker a pinned claim ties a run to (see [`ClaimScope`]).
 /// * 3: the `push` table (A2A push-notification configurations and their delivery progress) and
 ///   the index `ListTasks` reads runs by (`runs_list`).
-/// * 4: `runs_list` gains `INCLUDE (status)`, so the listing's status filter is answered from the
-///   index instead of the heap.
+/// * 4: the listing index becomes `runs_list_status` with `INCLUDE (status)`, so the listing's
+///   status filter is answered from the index instead of the heap. An upgrade builds it beside the
+///   version 3 `runs_list` (`CREATE INDEX CONCURRENTLY`) and drops that one only once the new one
+///   is valid, so `runs` stays readable and writable for the whole build.
 pub const SCHEMA_VERSION: i32 = 4;
 
 /// Purge deletes in batches of this many runs (plus their journals).
@@ -67,6 +69,14 @@ const PURGE_BATCH: i64 = 500;
 /// The pool size [`PgStore::connect`] uses when `ADAM_PG_POOL_SIZE` is unset: 16 connections per
 /// process.
 pub const DEFAULT_POOL_SIZE: u32 = 16;
+
+/// The smallest pool `ADAM_PG_POOL_SIZE` or [`PgStore::connect_with_pool_size`] accepts.
+///
+/// Two, not one: `adam-service` builds its `adam-notify-postgres` listener on the store's own
+/// pool, and `PgListener::connect_with(&pool)` holds one connection for the process's life. A
+/// one-connection pool hands that connection to the listener, and every store query then waits
+/// out sqlx's acquire timeout — for ever, while startup succeeded and the pod reports Ready.
+pub const MIN_POOL_SIZE: u32 = 2;
 
 /// The largest pool `ADAM_PG_POOL_SIZE` or [`PgStore::connect_with_pool_size`] accepts.
 pub const MAX_POOL_SIZE: u32 = 65_535;
@@ -85,7 +95,6 @@ const RUN_METADATA_COLUMNS: &str =
 #[derive(Clone, Debug)]
 pub struct PgStore {
     pool: PgPool,
-    prefix: String,
     sql: Sql,
 }
 
@@ -96,12 +105,14 @@ impl PgStore {
         Self::connect_with_pool_size(url, pool_size_from_env()?).await
     }
 
-    /// Connect with a pool of exactly `max_connections` (1 to [`MAX_POOL_SIZE`]), whatever the
-    /// environment says. Call [`Store::migrate`] before first use.
+    /// Connect with a pool of exactly `max_connections` ([`MIN_POOL_SIZE`] to
+    /// [`MAX_POOL_SIZE`]), whatever the environment says. Call [`Store::migrate`] before first
+    /// use.
     pub async fn connect_with_pool_size(url: &str, max_connections: u32) -> StoreResult<Self> {
-        if !(1..=MAX_POOL_SIZE).contains(&max_connections) {
+        if !(MIN_POOL_SIZE..=MAX_POOL_SIZE).contains(&max_connections) {
             return Err(StoreError::InvalidInput(format!(
-                "pool size {max_connections} is out of range (1 to {MAX_POOL_SIZE})"
+                "pool size {max_connections} is out of range ({MIN_POOL_SIZE} to {MAX_POOL_SIZE}): \
+                 a one-connection pool cannot serve the notify listener and a query at the same time"
             )));
         }
         let pool = PgPoolOptions::new()
@@ -113,6 +124,9 @@ impl PgStore {
     }
 
     /// Use an existing pool, e.g. the one your app already has.
+    ///
+    /// Sizing is the caller's: a pool of one connection cannot serve an `adam-notify-postgres`
+    /// listener and a store query at the same time (see [`MIN_POOL_SIZE`]).
     pub fn from_pool(pool: PgPool) -> Self {
         Self::build(pool, "adam_".to_owned())
     }
@@ -141,7 +155,93 @@ impl PgStore {
 
     fn build(pool: PgPool, prefix: String) -> Self {
         let sql = Sql::new(&prefix);
-        Self { pool, prefix, sql }
+        Self { pool, sql }
+    }
+
+    /// The migration proper, on the connection that holds the session advisory lock.
+    ///
+    /// Steady-state starts take no table lock (even a no-op `ALTER TABLE` or `CREATE INDEX IF NOT
+    /// EXISTS` does), which is why a start cannot deadlock with live traffic: a current schema
+    /// returns before any DDL.
+    async fn migrate_locked(&self, conn: &mut PgConnection) -> StoreResult<()> {
+        let meta_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(&self.sql.meta_table)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(classify)?;
+        if meta_exists {
+            let stored: Option<String> = sqlx::query_scalar(safe(&self.sql.schema_version))
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(classify)?;
+            if stored.and_then(|v| v.parse::<i32>().ok()) >= Some(SCHEMA_VERSION) {
+                return Ok(());
+            }
+            // The listing index is replaced outside the transaction: `CONCURRENTLY` cannot run in
+            // one, and the non-concurrent pair would hold `ACCESS EXCLUSIVE` on `runs` for the
+            // whole build.
+            self.upgrade_listing_index(conn).await?;
+        }
+        let mut tx = conn.begin().await.map_err(classify)?;
+        // Serialize concurrent migrations; CREATE .. IF NOT EXISTS alone can still race on the
+        // catalog. Re-entrant for this session, which already holds the session lock; a migrator of
+        // an older release takes only this lock, so it is excluded too.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&self.sql.migrate_lock)
+            .execute(&mut *tx)
+            .await
+            .map_err(classify)?;
+        for stmt in &self.sql.migrate {
+            tx.execute(safe(stmt)).await.map_err(classify)?;
+        }
+        tx.commit().await.map_err(classify)
+    }
+
+    /// Schema version 3 -> 4, without blocking traffic on `runs`.
+    ///
+    /// The version 3 listing index is replaced by [`Sql::listing_index`]: the new one is built with
+    /// `CREATE INDEX CONCURRENTLY` and the old one dropped the same way. Both take only
+    /// `SHARE UPDATE EXCLUSIVE`, which reads and writes do not conflict with; the non-concurrent
+    /// pair took `ACCESS EXCLUSIVE` for the drop and `SHARE` for the build, inside the migration
+    /// transaction, so every read and write queued behind the whole build. Neither concurrent
+    /// statement can run in a transaction block, which is why this runs before one is opened.
+    ///
+    /// Idempotent: `IF NOT EXISTS` and the validity check make a crash between the statements
+    /// re-run cleanly, and a build that failed leaves an INVALID index, which is dropped and
+    /// rebuilt rather than kept. The old index is dropped only after the new one is valid, so a
+    /// listing always has one; the new index has the same key columns, and an older release does
+    /// not name an index, so its queries keep using it across a rolling upgrade.
+    async fn upgrade_listing_index(&self, conn: &mut PgConnection) -> StoreResult<()> {
+        let runs: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(&self.sql.runs_table)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(classify)?;
+        if !runs {
+            // A fresh database: the transaction below creates the table and the index.
+            return Ok(());
+        }
+        let valid: Option<bool> = sqlx::query_scalar(safe(&self.sql.listing_index_state))
+            .bind(&self.sql.listing_index)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(classify)?;
+        if valid == Some(false) {
+            // A concurrent build that failed leaves an INVALID index, and `IF NOT EXISTS` would
+            // keep it for ever: drop it and build again.
+            conn.execute(safe(&self.sql.drop_listing_index))
+                .await
+                .map_err(classify)?;
+        }
+        if valid != Some(true) {
+            conn.execute(safe(&self.sql.create_listing_index))
+                .await
+                .map_err(classify)?;
+        }
+        conn.execute(safe(&self.sql.drop_v3_listing_index))
+            .await
+            .map_err(classify)?;
+        Ok(())
     }
 
     fn map_write_err(
@@ -180,11 +280,13 @@ impl PgStore {
     }
 }
 
-/// `ADAM_PG_POOL_SIZE`: the connections one process's pool may open, 1 to [`MAX_POOL_SIZE`].
+/// `ADAM_PG_POOL_SIZE`: the connections one process's pool may open, [`MIN_POOL_SIZE`] to
+/// [`MAX_POOL_SIZE`].
 ///
 /// Unset means [`DEFAULT_POOL_SIZE`]. The pool is **per process**: a deployment of N replicas opens
 /// up to N × this many connections, and an `adam-notify-postgres` listener holds one of them for
-/// the process's lifetime. A value that is not an integer in range is
+/// the process's lifetime — which is why one connection is refused, not accepted: it would leave
+/// no connection for a query. A value that is not an integer in range is
 /// [`StoreError::InvalidInput`], not a silent fallback: a typo must not change capacity without
 /// saying so.
 pub fn pool_size_from_env() -> StoreResult<u32> {
@@ -201,12 +303,13 @@ pub fn pool_size_from_env() -> StoreResult<u32> {
 fn pool_size_from_text(raw: &str) -> StoreResult<u32> {
     let size: u32 = raw.trim().parse().map_err(|_| {
         StoreError::InvalidInput(format!(
-            "ADAM_PG_POOL_SIZE {raw:?} is not an integer (1 to {MAX_POOL_SIZE})"
+            "ADAM_PG_POOL_SIZE {raw:?} is not an integer ({MIN_POOL_SIZE} to {MAX_POOL_SIZE})"
         ))
     })?;
-    if !(1..=MAX_POOL_SIZE).contains(&size) {
+    if !(MIN_POOL_SIZE..=MAX_POOL_SIZE).contains(&size) {
         return Err(StoreError::InvalidInput(format!(
-            "ADAM_PG_POOL_SIZE {raw:?} is out of range (1 to {MAX_POOL_SIZE})"
+            "ADAM_PG_POOL_SIZE {raw:?} is out of range ({MIN_POOL_SIZE} to {MAX_POOL_SIZE}): a \
+             one-connection pool cannot serve the notify listener and a query at the same time"
         )));
     }
     Ok(size)
@@ -261,6 +364,16 @@ struct Sql {
     migrate: Vec<Arc<str>>,
     /// The meta table's name with the prefix, bound to `to_regclass` before it is read.
     meta_table: String,
+    /// The runs table's name with the prefix, checked before the listing index is built.
+    runs_table: String,
+    /// The advisory-lock key every migrator of this prefix takes.
+    migrate_lock: String,
+    /// The listing index (schema version 4) and the SQL that builds, drops and inspects it.
+    listing_index: String,
+    listing_index_state: Arc<str>,
+    create_listing_index: Arc<str>,
+    drop_listing_index: Arc<str>,
+    drop_v3_listing_index: Arc<str>,
     schema_version: Arc<str>,
     insert_run: Arc<str>,
     load_run: Arc<str>,
@@ -296,6 +409,10 @@ impl Sql {
         let push = format!("{p}push");
         let runs_pkey = format!("{p}runs_pkey");
         let open_conversation_index = format!("{p}runs_open_conversation");
+        // Schema version 4's listing index, and the name schema version 3 gave it. The new name is
+        // what lets the upgrade build it beside the old one and drop that one only afterwards.
+        let runs_list = format!("{p}runs_list_status");
+        let runs_list_v3 = format!("{p}runs_list");
         let statuses = "'runnable', 'parked', 'done', 'failed'";
         let migrate: Vec<Arc<str>> = [
             format!(
@@ -373,13 +490,11 @@ impl Sql {
             format!("CREATE INDEX IF NOT EXISTS {p}runs_parent ON {runs} (parent_id) WHERE parent_id IS NOT NULL"),
             // Listing an owner's runs, newest first (`ListTasks`): the conversation id is compared
             // in the "C" collation, so that a prefix is a range the index can serve. `status` is
-            // included so a status filter is answered from the index; the page is ordered across
-            // the conversations of a prefix, which is a sort of the matching index entries, not of
-            // the rows. Schema version 4: `CREATE INDEX IF NOT EXISTS` leaves an index made by
-            // version 3 alone, so the old one is dropped first.
-            format!("DROP INDEX IF EXISTS {p}runs_list"),
+            // included so a status filter is answered from the index. A fresh database gets it
+            // here; a version 3 database gets it from `upgrade_listing_index`, which builds it
+            // concurrently under this name and drops the version 3 index only afterwards.
             format!(
-                "CREATE INDEX IF NOT EXISTS {p}runs_list
+                "CREATE INDEX IF NOT EXISTS {runs_list}
                  ON {runs} (agent, (conversation_id COLLATE \"C\"), updated_at DESC, id DESC)
                  INCLUDE (status)
                  WHERE conversation_id IS NOT NULL"
@@ -409,6 +524,24 @@ impl Sql {
         Self {
             migrate,
             meta_table: meta.clone(),
+            runs_table: runs.clone(),
+            migrate_lock: format!("adam-rs:migrate:{p}"),
+            listing_index: runs_list.clone(),
+            listing_index_state: Arc::from(
+                "SELECT i.indisvalid FROM pg_index i
+                   JOIN pg_class c ON c.oid = i.indexrelid
+                  WHERE c.relname = $1",
+            ),
+            create_listing_index: Arc::from(format!(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS {runs_list}
+                 ON {runs} (agent, (conversation_id COLLATE \"C\"), updated_at DESC, id DESC)
+                 INCLUDE (status)
+                 WHERE conversation_id IS NOT NULL"
+            )),
+            drop_listing_index: Arc::from(format!("DROP INDEX CONCURRENTLY IF EXISTS {runs_list}")),
+            drop_v3_listing_index: Arc::from(format!(
+                "DROP INDEX CONCURRENTLY IF EXISTS {runs_list_v3}"
+            )),
             schema_version: Arc::from(format!(
                 "SELECT value FROM {meta} WHERE key = 'schema_version'"
             )),
@@ -690,34 +823,22 @@ fn entry_from_row(row: &PgRow) -> StoreResult<JournalEntry> {
 #[async_trait]
 impl Store for PgStore {
     async fn migrate(&self) -> StoreResult<()> {
-        let mut tx = self.pool.begin().await.map_err(classify)?;
-        // Serialize concurrent migrations; CREATE .. IF NOT EXISTS alone can
-        // still race on the catalog.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(format!("adam-rs:migrate:{}", self.prefix))
-            .execute(&mut *tx)
+        // One connection for the whole migration: the listing-index upgrade must run outside a
+        // transaction, so the migration takes a session-level advisory lock on this connection and
+        // opens its transaction on it too. The transaction's own `pg_advisory_xact_lock` is
+        // re-entrant for this session and still excludes a migrator of an older release, which
+        // takes only that lock.
+        let mut conn = self.pool.acquire().await.map_err(classify)?;
+        // A session lock lives as long as its connection. Close this one on drop rather than
+        // returning it to the pool, so an error or a panic cannot leave the lock held on a
+        // connection another task would reuse; the close releases it.
+        conn.close_on_drop();
+        sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
+            .bind(&self.sql.migrate_lock)
+            .execute(&mut *conn)
             .await
             .map_err(classify)?;
-        // Steady-state starts take no table lock (even a no-op `ALTER TABLE` or `CREATE INDEX IF
-        // NOT EXISTS` does), which is why a start cannot deadlock with live traffic.
-        let meta_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(&self.sql.meta_table)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(classify)?;
-        if meta_exists {
-            let stored: Option<String> = sqlx::query_scalar(safe(&self.sql.schema_version))
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(classify)?;
-            if stored.and_then(|v| v.parse::<i32>().ok()) >= Some(SCHEMA_VERSION) {
-                return tx.commit().await.map_err(classify);
-            }
-        }
-        for stmt in &self.sql.migrate {
-            tx.execute(safe(stmt)).await.map_err(classify)?;
-        }
-        tx.commit().await.map_err(classify)
+        self.migrate_locked(&mut conn).await
     }
 
     async fn create_run(&self, new: NewRun) -> StoreResult<RunRecord> {
@@ -1201,13 +1322,14 @@ mod tests {
 
     #[test]
     fn the_pool_size_is_validated_and_defaults_to_sixteen() {
-        assert_eq!(pool_size_from_text("1").unwrap(), 1);
+        assert_eq!(MIN_POOL_SIZE, 2);
+        assert_eq!(pool_size_from_text("2").unwrap(), MIN_POOL_SIZE);
         assert_eq!(pool_size_from_text(" 16 ").unwrap(), 16);
         assert_eq!(
             pool_size_from_text(&MAX_POOL_SIZE.to_string()).unwrap(),
             MAX_POOL_SIZE
         );
-        for bad in ["0", "65536", "", "sixteen", "-1", "1.5"] {
+        for bad in ["0", "1", "65536", "", "sixteen", "-1", "1.5"] {
             let err = pool_size_from_text(bad).unwrap_err();
             assert!(
                 matches!(err, StoreError::InvalidInput(_)),
@@ -1215,6 +1337,9 @@ mod tests {
             );
             assert_eq!(err.class(), ErrorClass::Invalid);
         }
+        // A one-connection pool would be taken by the notify listener alone: the message says so.
+        let one = pool_size_from_text("1").unwrap_err().to_string();
+        assert!(one.contains("notify listener"), "{one}");
         // The unset path is the default; a suite that sets the variable checks its value instead.
         match std::env::var("ADAM_PG_POOL_SIZE") {
             Err(std::env::VarError::NotPresent) => {
@@ -1231,8 +1356,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_pool_size_out_of_range_is_refused_before_connecting() {
-        // No server is needed: the size is checked before a connection is attempted.
-        for size in [0, MAX_POOL_SIZE + 1] {
+        // No server is needed: the size is checked before a connection is attempted. One is
+        // refused too: the notify listener holds a connection for the process's life.
+        for size in [0, 1, MAX_POOL_SIZE + 1] {
             let err = PgStore::connect_with_pool_size("postgres://example.invalid/db", size)
                 .await
                 .unwrap_err();
@@ -1240,6 +1366,123 @@ mod tests {
                 matches!(err, StoreError::InvalidInput(_)),
                 "{size}: {err:?}"
             );
+        }
+    }
+
+    /// The version 3 -> 4 listing index is rebuilt without taking `runs` from live traffic: a
+    /// concurrent build and drop take `SHARE UPDATE EXCLUSIVE`, which a writer's `ROW EXCLUSIVE`
+    /// does not conflict with, so a write beside them completes. The non-concurrent pair took
+    /// `ACCESS EXCLUSIVE` for the drop and `SHARE` for the build, and every write queued behind
+    /// the whole build.
+    #[tokio::test]
+    async fn the_listing_index_upgrade_does_not_wait_for_live_traffic() {
+        let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .unwrap();
+        let p = format!(
+            "adam_online_{}_",
+            &Uuid::new_v4().simple().to_string()[..12]
+        );
+        let store = PgStore::from_pool(pool.clone())
+            .with_table_prefix(&p)
+            .unwrap();
+        store.migrate().await.unwrap();
+        // Put the database back at version 3: the old index, and no new one.
+        for stmt in [
+            format!("DROP INDEX {p}runs_list_status"),
+            format!(
+                "CREATE INDEX {p}runs_list ON {p}runs (agent, (conversation_id COLLATE \"C\"),
+                                                        updated_at DESC, id DESC)
+                 WHERE conversation_id IS NOT NULL"
+            ),
+            format!("UPDATE {p}meta SET value = '3' WHERE key = 'schema_version'"),
+        ] {
+            sqlx::query(AssertSqlSafe(stmt))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        // A writer holds its table lock open. A concurrent build runs beside it; a non-concurrent
+        // one queues for `ACCESS EXCLUSIVE`/`SHARE` and a write queues behind it.
+        let mut writer = pool.begin().await.unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "LOCK TABLE {p}runs IN ROW EXCLUSIVE MODE"
+        )))
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+        let upgrade = {
+            let store = store.clone();
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut conn = pool.acquire().await.expect("a connection");
+                store.upgrade_listing_index(&mut conn).await
+            })
+        };
+        // Let the upgrade reach its DDL, then write from another connection. A concurrent build
+        // takes `SHARE UPDATE EXCLUSIVE`, which a write does not conflict with; a non-concurrent
+        // one takes `SHARE` (against writes) or `ACCESS EXCLUSIVE` (against everything), and this
+        // insert would queue behind the whole build.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let probe = Uuid::new_v4();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {p}runs (id, agent, status, state, version, created_at, updated_at)
+                 VALUES ($1, 'probe', 'runnable', '{{}}'::jsonb, 1, now(), now())"
+            )))
+            .bind(probe)
+            .execute(&pool),
+        )
+        .await
+        .expect("a write waited for the listing-index upgrade")
+        .expect("the write");
+
+        // The build waits for the writer's transaction to end, not the other way round.
+        writer.rollback().await.unwrap();
+        upgrade.await.unwrap().expect("the listing index upgrade");
+        let written: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT count(*) FROM {p}runs WHERE id = $1"
+        )))
+        .bind(probe)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(written, 1, "the write landed beside the build");
+
+        let valid: Option<bool> = sqlx::query_scalar(
+            "SELECT i.indisvalid FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname = $1",
+        )
+        .bind(format!("{p}runs_list_status"))
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(valid, Some(true), "the new index is valid");
+        let old: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes
+              WHERE schemaname = current_schema() AND indexname = $1",
+        )
+        .bind(format!("{p}runs_list"))
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old, None, "the version 3 index was dropped");
+
+        for table in ["push", "journal", "runs", "meta"] {
+            let _ = sqlx::query(AssertSqlSafe(format!(
+                "DROP TABLE IF EXISTS {p}{table} CASCADE"
+            )))
+            .execute(&pool)
+            .await;
         }
     }
 

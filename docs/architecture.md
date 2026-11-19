@@ -953,12 +953,15 @@ erDiagram
 | unique `runs (agent, conversation_id)` where the run is open | one open run per conversation |
 | `runs (agent, updated_at)` where finished | retention sweeps |
 | `runs (parent_id)` where set | children of a run |
-| `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC)` where set | `ListTasks`: an owner's runs, newest first, by keyset |
+| `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)` where set | `ListTasks`: an owner's runs, newest first, by keyset; the status filter is answered from the index |
 | `push (agent, next_attempt_at, run_id, id)` where active | claiming due push configs |
 
 MongoDB keeps the same fields in `adam_runs` (`_id` is the run's UUID) plus `open_key` (a plain unique
-index; closed runs get `~<run id>`) and `lease_token`, and the journal in `adam_journal` with
-`_id = "<run>:<seq>"`, and the push configs in `adam_push` with `_id = "<run>:<config id>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
+index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_list`
+(`(agent, conversation_id, updated_at, _id)`) and `adam_list_status`
+(`(agent, status, conversation_id, updated_at, _id)`, for a status filter), the journal in
+`adam_journal` with `_id = "<run>:<seq>"`, and the push configs in `adam_push` with
+`_id = "<run>:<config id>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 `crates/adam-runtime/src/envelope.rs`):

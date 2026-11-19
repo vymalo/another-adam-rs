@@ -232,10 +232,11 @@ fn journal_id(run: RunId, seq: u64) -> String {
 
 /// The filters of a [`RunQuery`] (not its position or its limit).
 ///
-/// A run a purge has tombstoned is not filtered out: `purging` is a short-lived field with no
-/// index, so checking it here would make the listing fetch every candidate document (state
-/// included) to test one boolean. A tombstoned run is deleted by the same sweep moments later,
-/// and `commit_run` still refuses to revive it.
+/// A run a purge has tombstoned is not filtered out: `purging` has no index, so checking it here
+/// would make the listing fetch every candidate document (state included) to test one boolean. The
+/// tombstone is short-lived but not instant: the sweep deletes a batch of them after deleting their
+/// journals and push configs, and a crash in between leaves them until the next sweep.
+/// `commit_run` still refuses to revive one.
 fn run_query_filter(query: &RunQuery) -> Document {
     let mut filter = doc! { "agent": &query.agent };
     match &query.scope {
@@ -479,17 +480,20 @@ impl Store for MongoStore {
                 .options(named("adam_parent"))
                 .build(),
             // Listing an owner's runs, newest first (`ListTasks`): an anchored prefix on
-            // `conversation_id` is a range over this index.
+            // `conversation_id` is a range over this index, and one conversation is an equality,
+            // which the index's `updated_at, _id` order then serves. A prefix is a range, so the
+            // sort cannot come from the index and is a blocking one over the matching entries.
             IndexModel::builder()
                 .keys(doc! { "agent": 1, "conversation_id": 1, "updated_at": -1, "_id": -1 })
                 .options(named("adam_list"))
                 .build(),
-            // The same listing with a status filter: `status` before `conversation_id` makes it an
-            // equality bound, so the index yields the matching runs of the agent and the prefix is
-            // a range inside it; the page fetches its own rows instead of every candidate. (With
-            // `conversation_id` first the planner does not choose this index for a prefix, and the
-            // unfiltered listing keeps `adam_list`; measured with `explain` on MongoDB 7, 2 000
-            // runs: 10 documents examined for a page of 10, against 500 with the index absent.)
+            // The same listing with a status filter. `status` before `conversation_id` makes it an
+            // equality bound, so the index yields the runs of that status and the prefix is a
+            // range inside it: a page fetches its own rows instead of every candidate (measured
+            // with `explain` on MongoDB 7, 2 000 runs: 10 documents examined for a page of 10,
+            // against 500 fetched to test the filter without it). A listing of **one**
+            // conversation is read in index order, no sort; a **prefix** listing still sorts its
+            // matches (the range breaks the order), which is the default `ListTasks` path.
             IndexModel::builder()
                 .keys(doc! { "agent": 1, "status": 1, "conversation_id": 1, "updated_at": -1, "_id": -1 })
                 .options(named("adam_list_status"))
@@ -1188,6 +1192,11 @@ impl Store for MongoStore {
 /// Create the indexes that don't exist yet. Re-issuing `createIndexes` for
 /// existing indexes is a no-op on MongoDB, but skipping them saves a round of
 /// catalog work on every boot and sidesteps servers that handle it poorly.
+///
+/// **The match is by name only.** Changing an index's keys without changing its name leaves an
+/// existing database on the old keys for ever, silently: `adam_list_status`'s order is a contract
+/// now, and a future change to it needs a new name (the PostgreSQL adapter needed an explicit
+/// `DROP INDEX` for exactly this reason when version 4 replaced `runs_list`).
 async fn ensure_indexes<const N: usize>(
     coll: &Collection<Document>,
     models: [IndexModel; N],
@@ -1507,9 +1516,7 @@ mod returned_value_tests {
             )
             .await
             .unwrap();
-        // The one conversion is the current document `commit_run` reads for `agent` and
-        // `conversation_id` before the CAS; the record it returns adds none, and the projection
-        // leaves the old state out.
+        // The projected pre-read leaves the old state out and the record it returns adds none.
         assert_eq!(
             conversion_counter::calls() - before,
             0,

@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use adam_core::store::now;
-use adam_core::{ClaimScope, RunStatus, RunUpdate, Store};
+use adam_core::{ClaimScope, ConversationScope, NewRun, RunQuery, RunStatus, RunUpdate, Store};
 use adam_store_postgres::{PgStore, SCHEMA_VERSION};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -260,12 +260,26 @@ async fn index_definition(pool: &PgPool, name: &str) -> Option<String> {
     .unwrap()
 }
 
+/// `Some(true)` for a valid index, `Some(false)` for one a failed build left INVALID, `None` for
+/// no such index.
+async fn index_valid(pool: &PgPool, name: &str) -> Option<bool> {
+    sqlx::query_scalar(
+        "SELECT i.indisvalid FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE c.relname = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
 /// The listing index answers the status filter from the index (`INCLUDE (status)`), so a page does
-/// not fetch the rows it filters out. A database made by schema version 3 has the same index name
-/// without it, and `CREATE INDEX IF NOT EXISTS` would leave it alone: the migration drops and
-/// recreates it.
+/// not fetch the rows it filters out. Schema version 4 gives it a new name, `runs_list_status`: the
+/// upgrade builds it beside the version 3 `runs_list` and drops that one only afterwards, so a
+/// database made by version 3 ends with the new index, valid, and without the old one.
 #[tokio::test]
-async fn the_listing_index_answers_the_status_filter() {
+async fn the_listing_index_answers_the_status_filter_and_replaces_the_version_3_one() {
     let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
         return;
     };
@@ -281,22 +295,48 @@ async fn the_listing_index_answers_the_status_filter() {
     let store = PgStore::from_pool(pool.clone())
         .with_table_prefix(&p)
         .unwrap();
+    let new_index = format!("{p}runs_list_status");
+    let old_index = format!("{p}runs_list");
+
     store.migrate().await.unwrap();
-    let index = format!("{p}runs_list");
-    let fresh = index_definition(&pool, &index).await.expect("the index");
+    let fresh = index_definition(&pool, &new_index)
+        .await
+        .expect("the listing index");
     assert!(
         fresh.contains("INCLUDE (status)"),
         "the listing index covers the status filter: {fresh}"
     );
     assert!(fresh.contains("updated_at DESC"), "{fresh}");
+    assert_eq!(
+        index_definition(&pool, &old_index).await,
+        None,
+        "a fresh database never gets the version 3 name"
+    );
+    assert_eq!(index_valid(&pool, &new_index).await, Some(true));
 
-    // A version 3 database: the same index, without the included column, and the version row.
-    sqlx::query(AssertSqlSafe(format!("DROP INDEX {index}")))
+    // Runs the listing must still find after the upgrade.
+    let agent = format!(
+        "listing-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let first = store
+        .create_run(NewRun::new(&agent, json!({"n": 1})).conversation("c:1"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    let second = store
+        .create_run(NewRun::new(&agent, json!({"n": 2})).conversation("c:2"))
+        .await
+        .unwrap();
+
+    // A version 3 database: the same index under its old name, without the included column, and
+    // the version row.
+    sqlx::query(AssertSqlSafe(format!("DROP INDEX {new_index}")))
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query(AssertSqlSafe(format!(
-        "CREATE INDEX {index} ON {p}runs (agent, (conversation_id COLLATE \"C\"),
+        "CREATE INDEX {old_index} ON {p}runs (agent, (conversation_id COLLATE \"C\"),
                                             updated_at DESC, id DESC)
          WHERE conversation_id IS NOT NULL"
     )))
@@ -309,20 +349,41 @@ async fn the_listing_index_answers_the_status_filter() {
     .execute(&pool)
     .await
     .unwrap();
+    assert!(index_definition(&pool, &new_index).await.is_none());
     assert!(
-        !index_definition(&pool, &index)
+        !index_definition(&pool, &old_index)
             .await
             .unwrap()
             .contains("INCLUDE")
     );
 
     store.migrate().await.unwrap();
-    let migrated = index_definition(&pool, &index).await.expect("the index");
+    let migrated = index_definition(&pool, &new_index)
+        .await
+        .expect("the new listing index");
     assert!(
         migrated.contains("INCLUDE (status)"),
         "the version 3 index was replaced: {migrated}"
     );
+    assert_eq!(
+        index_valid(&pool, &new_index).await,
+        Some(true),
+        "the index built beside the old one is valid"
+    );
+    assert_eq!(
+        index_definition(&pool, &old_index).await,
+        None,
+        "the version 3 index was dropped after the new one was valid"
+    );
     assert_eq!(version(&pool, &p).await, "4");
+
+    // The listing still reads the runs, newest first, through the new index.
+    let query = RunQuery::new(&agent, ConversationScope::Prefix("c:".into()), 10);
+    let listed = store.list_runs(&query).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![second.id, first.id]
+    );
 
     drop_tables(&pool, &p).await;
 }

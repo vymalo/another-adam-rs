@@ -11,8 +11,9 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 
 ## API at a glance
 
-* `PgStore::connect(url)`: a pool of `ADAM_PG_POOL_SIZE` connections (default 16, per process).
-* `PgStore::connect_with_pool_size(url, n)`: the same with an explicit size (1 to 65535).
+* `PgStore::connect(url)`: a pool of `ADAM_PG_POOL_SIZE` connections (default 16, 2 to 65535, per
+  process).
+* `PgStore::connect_with_pool_size(url, n)`: the same with an explicit size (2 to 65535).
 * `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
@@ -49,37 +50,54 @@ The guarantee table is in the [store adapters reference](../../docs/reference/st
 
 ## Pool
 
-`connect` sizes the pool from `ADAM_PG_POOL_SIZE` (1 to 65535, default 16) and
+`connect` sizes the pool from `ADAM_PG_POOL_SIZE` (2 to 65535, default 16) and
 `connect_with_pool_size` from its argument; `from_pool` uses the pool you pass. The pool is **per
 process**: N replicas open up to N × the size against one server, and an `adam-notify-postgres`
-listener holds one connection for the process's lifetime. A value that is not an integer in range
-fails the connect with `InvalidInput`; it never falls back to 16 silently.
+listener holds one connection for the process's lifetime. **One is refused, not accepted**: with a
+single connection the listener takes it and every store query waits out sqlx's acquire timeout, for
+ever, while startup succeeded and the pod reports Ready. Two is the floor (one for the listener, one
+for queries); the default leaves room for concurrency. A value that is not an integer in range fails
+the connect with `InvalidInput`; it never falls back to 16 silently.
 
 ## Schema version 3: the push table
 
-`migrate()` also creates the index `ListTasks` reads runs by (`<prefix>runs_list`: `(agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`; a conversation prefix is a range over it plus an exact `starts_with`, and the status filter is answered from the index, not the heap). It creates `<prefix>push` and its index **before** the statements that lock `runs`
+`migrate()` also creates the index `ListTasks` reads runs by (schema version 4's `<prefix>runs_list_status`: `(agent, conversation_id COLLATE "C", updated_at DESC, id DESC) INCLUDE (status)`; a conversation prefix is a range over it plus an exact `starts_with`, and the status filter is answered from the index, not the heap). It creates `<prefix>push` and its index **before** the statements that lock `runs`
 exclusively, so a migration takes its locks in the order a `push_put` does and the two cannot
 deadlock (found by the conformance suite, whose cases all migrate). Claiming push configs is
 `FOR UPDATE SKIP LOCKED` in one statement, progress is `UPDATE .. WHERE version = $expected`, and
 putting an id again is `INSERT .. ON CONFLICT DO UPDATE` that bumps the version.
 
-## Schema version 4: the listing index covers the status filter
+## Schema version 4: the listing index covers the status filter, online
 
-`runs_list` gains `INCLUDE (status)`. A page is ordered across the conversations of a prefix, so
-the sort remains; with the status in the index the sort is over index entries and the page fetches
-only the rows it returns, instead of heap-fetching every candidate to test its status. The migration
-drops the index first: `CREATE INDEX IF NOT EXISTS` leaves an index of the same name alone, whatever
-its definition. The drop and the recreate hold `AccessExclusiveLock`/`ShareLock` on `runs` for the
-length of the rebuild, once, on the upgrade.
+The listing index is now `<prefix>runs_list_status`: the same keys as version 3's
+`<prefix>runs_list`, with `INCLUDE (status)`, so the status filter is answered without a heap fetch.
+A page is still ordered across the conversations of a prefix (that sort remains); the index keeps
+the filtered-out rows out of it and out of the fetch. A **fresh** database gets the index in the
+migration transaction, on an empty table.
 
-A start on a current schema runs **no DDL**. After the advisory lock `migrate()` checks that the
-meta table exists (`to_regclass`) and reads `schema_version`; at `SCHEMA_VERSION` or above (an
-older binary on a newer database counts) it commits and returns. This matters because even a
-no-op `ALTER TABLE .. ADD COLUMN IF NOT EXISTS` takes `AccessExclusiveLock` and `CREATE INDEX IF
-NOT EXISTS` takes `ShareLock`, and clients lock `push` and `runs` in both orders (`push_put`:
-push, then the run; a purge: runs, then the cascaded push rows), so a start beside live traffic
-deadlocked, and every restart took an exclusive lock on `runs`. Only an older or missing schema
-runs the statements.
+A **version 3** database gets it from a step that runs *before* the migration transaction, because a
+concurrent statement cannot run inside one. `CREATE INDEX CONCURRENTLY` builds the new index beside
+the old one; only when it is valid does `DROP INDEX CONCURRENTLY` remove the version 3 index. Both
+take `ShareUpdateExclusiveLock`, which reads and writes do not conflict with, so `runs` stays
+readable and writable for the whole build. (The non-concurrent pair held `AccessExclusiveLock` for
+the drop and `ShareLock` for the build inside the transaction, and every query queued behind the
+build.) The step is idempotent: `IF NOT EXISTS` and a validity check (an INVALID index left by a
+failed build is dropped and rebuilt) make a crash between the statements re-run cleanly, and the old
+index is dropped only after the new one is valid, so a listing always has one. A query does not name
+an index, and the new one has the same key columns, so a process of an older release keeps using it
+across a rolling upgrade. The upgrade still runs the version 2 `ALTER TABLE .. ADD COLUMN IF NOT
+EXISTS owner`, which takes `AccessExclusiveLock` for the moment it takes to see the column exists;
+the long part, the index build, no longer does.
+
+A start on a current schema runs **no DDL**. Before opening its transaction `migrate()` takes a
+session-level advisory lock on one connection, checks that the meta table exists (`to_regclass`) and
+reads `schema_version`; at `SCHEMA_VERSION` or above (an older binary on a newer database counts) it
+closes that connection (which releases the lock) and returns. This matters because even a no-op
+`ALTER TABLE .. ADD COLUMN IF NOT EXISTS` takes `AccessExclusiveLock` and `CREATE INDEX IF NOT
+EXISTS` takes `ShareLock`, and clients lock `push` and `runs` in both orders (`push_put`: push, then
+the run; a purge: runs, then the cascaded push rows), so a start beside live traffic deadlocked, and
+every restart took an exclusive lock on `runs`. Only an older or missing schema runs the statements.
+The migration connection is always closed rather than pooled, so the session lock cannot outlive it.
 
 ## Schema version and the owner column
 
@@ -130,10 +148,12 @@ retryable (needs the server), and an unreachable server is `Transient` (offline)
 `tests/migrate.rs` builds a version 1 schema by hand with a legacy run, migrates it and checks the
 column, the version row, that the run survived and that pinning works on it; it also checks that an
 older release does not lower the version. A version 2 schema migrates to the current one and gets the
-push table, a version 3 schema gets the listing index with `INCLUDE (status)`, and a start on a
-current schema finishes while another connection holds `ROW EXCLUSIVE` locks on `runs` and `push`
-(it runs no DDL).
-Unit tests in `src/lib.rs` cover the driver-error table, and one of them
+push table, a version 3 schema's `runs_list` is replaced by `runs_list_status` (valid, old one
+gone), and a start on a current schema finishes while another connection holds `ROW EXCLUSIVE` locks
+on `runs` and `push` (it runs no DDL). A unit test
+(`the_listing_index_upgrade_does_not_wait_for_live_traffic`) holds a writer's lock open and writes
+beside the upgrade, which fails if the rebuild ever queues for `AccessExclusiveLock` again.
+Unit tests in `src/lib.rs` cover the driver-error table and the pool-size rule, and one of them
 (`sqlstates_are_classified_against_a_real_server`) provokes real SQLSTATEs
 when the server variable is set.
 
