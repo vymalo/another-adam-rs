@@ -11,6 +11,13 @@ devcontainer on a rootless Podman service) except its lookup of the file (decisi
 [ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md) and
 [ADR 0043](0043-sandbox-time-as-usage.md) (dated notes there).
 
+*Amended 2026-11-19 ([ADR 0053](0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)), an owner decision:*
+decision 10's open point is decided. The image's binaries are static (`x86_64-unknown-linux-musl`), so the coder started from a
+task image needs nothing of its C library, and selection no longer drops a task for it. Slice B1 changes as ADR 0053 decision 12
+says: Postgres leaves the bench and each slot gets a store service with SQLite under it; both arms run as uid 10001 with equal CPU
+and memory limits; the configuration fingerprint gains a runtime marker; gradings share one `verifier` network. B1 is cut in two
+there: 6a (this record's B1, the bench's Postgres kept) and 6b (the store service and the static coder's pin).
+
 ## Context
 
 A run's commands (`run_command`, `run`, `start_command`, `run_checks`) go through the `Environment` port of `adam-workspace`
