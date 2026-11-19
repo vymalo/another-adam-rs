@@ -7,7 +7,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use serde_json::Value;
@@ -348,7 +348,7 @@ async fn cancel_for_deadline(inner: &Inner, run: RunId, limit_secs: Option<u64>)
 #[derive(Clone, Copy)]
 struct Watched {
     parent: Option<RunId>,
-    deadline: Option<DateTime<Utc>>,
+    deadline: Option<Timestamp>,
     limit_secs: Option<u64>,
 }
 
@@ -432,7 +432,7 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
         .then(|| envelope.as_ref().ok().and_then(|e| e.remaining_secs))
         .flatten()
         .map(|secs| {
-            inner.clock.now() + chrono::Duration::seconds(secs.try_into().unwrap_or(i64::MAX))
+            inner.clock.now() + jiff::SignedDuration::from_secs(secs.try_into().unwrap_or(i64::MAX))
         });
     let watched = Watched {
         parent: lease.run.parent_id,
@@ -456,7 +456,7 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
 /// What to commit after a transition.
 struct Next {
     status: RunStatus,
-    wake_at: Option<DateTime<Utc>>,
+    wake_at: Option<Timestamp>,
     /// The agent's state to store.
     agent: Value,
     output: Value,
@@ -475,7 +475,7 @@ struct Next {
     read: Vec<String>,
     /// The deadline and what is left of the time limit to store (set once, when the run is made, or
     /// restored from what was left after a wait for a person: never recomputed from the commit).
-    deadline: Option<DateTime<Utc>>,
+    deadline: Option<Timestamp>,
     remaining_secs: Option<u64>,
 }
 
@@ -551,7 +551,7 @@ async fn transition(
     // A run that waited for a person gets the rest of its time again from now.
     let (deadline, remaining_secs) = match (env.deadline, env.remaining_secs) {
         (None, Some(secs)) => (
-            Some(now + chrono::Duration::seconds(secs.try_into().unwrap_or(i64::MAX))),
+            Some(now + jiff::SignedDuration::from_secs(secs.try_into().unwrap_or(i64::MAX))),
             None,
         ),
         both => both,
@@ -605,7 +605,7 @@ async fn transition(
         && next.wake_at.is_none()
         && let Some(deadline) = next.deadline.take()
     {
-        let left = (deadline - inner.clock.now()).num_seconds().max(0);
+        let left = (deadline - inner.clock.now()).as_secs().max(0);
         next.remaining_secs = Some(u64::try_from(left).unwrap_or(0));
     }
     match commit(inner, &rec, &env, &next, rec.parent_id.is_some()).await {
@@ -718,13 +718,7 @@ fn plan(
                 Some(at_least) => policy.delay_with_hint(failures, at_least),
                 None => policy.backoff(failures),
             };
-            let wake_at = inner
-                .clock
-                .now()
-                .checked_add_signed(
-                    chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX),
-                )
-                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            let wake_at = inner.clock.now() + adam_core::time::span_of(delay);
             Next {
                 status: RunStatus::Runnable,
                 wake_at: Some(wake_at),
@@ -803,8 +797,8 @@ fn plan(
     Plan::Commit(Box::new(next))
 }
 
-fn chrono_of(d: Duration) -> chrono::Duration {
-    chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
+fn span_of(d: Duration) -> jiff::SignedDuration {
+    adam_core::time::span_of(d)
 }
 
 /// Park a watched run again without stepping it: its parent and deadline were just looked at. The
@@ -813,13 +807,13 @@ fn chrono_of(d: Duration) -> chrono::Duration {
 /// lands meanwhile moves the version and this commit is dropped: the run is runnable and is claimed.
 ///
 /// Takes the record by value: its state is moved into the update, not copied.
-async fn park_again(inner: &Inner, rec: RunRecord, env: &Envelope, now: DateTime<Utc>) {
-    let mut wake = now + chrono_of(CHILD_WAIT_POLL);
+async fn park_again(inner: &Inner, rec: RunRecord, env: &Envelope, now: Timestamp) {
+    let mut wake = now + span_of(CHILD_WAIT_POLL);
     if let Some(agent) = env.agent_wake {
         wake = wake.min(agent);
     }
     if let Some(deadline) = env.deadline {
-        wake = wake.min(deadline + chrono_of(DEADLINE_SKEW));
+        wake = wake.min(deadline + span_of(DEADLINE_SKEW));
     }
     let mut update = RunUpdate::new(RunStatus::Parked, rec.state);
     update.wake_at = Some(wake);
@@ -841,7 +835,7 @@ fn build_update(
     base_inbox_len: usize,
     base_rev: u64,
     parent: bool,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> StoreResult<RunUpdate> {
     // Messages that arrived while stepping sit after the ones we started
     // with. A parked agent must not sleep through them.
@@ -859,8 +853,8 @@ fn build_update(
     let heartbeat = status == RunStatus::Parked && (parent || next.deadline.is_some());
     let wake_at = match status {
         RunStatus::Parked if heartbeat => {
-            let mut wake = wake_at.map_or(now + chrono_of(CHILD_WAIT_POLL), |w| {
-                w.min(now + chrono_of(CHILD_WAIT_POLL))
+            let mut wake = wake_at.map_or(now + span_of(CHILD_WAIT_POLL), |w| {
+                w.min(now + span_of(CHILD_WAIT_POLL))
             });
             if let Some(deadline) = next.deadline {
                 wake = wake.min(deadline);

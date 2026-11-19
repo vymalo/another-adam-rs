@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use adam_core::time::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,7 +26,7 @@ pub struct Inbound {
     /// Arbitrary content.
     pub payload: Value,
     /// When the message entered the system.
-    pub received_at: DateTime<Utc>,
+    pub received_at: Timestamp,
 }
 
 impl Inbound {
@@ -59,7 +59,7 @@ pub enum Transition<S> {
         /// State to commit.
         state: S,
         /// Optional timer.
-        wake_at: Option<DateTime<Utc>>,
+        wake_at: Option<Timestamp>,
     },
     /// Finish successfully.
     Done {
