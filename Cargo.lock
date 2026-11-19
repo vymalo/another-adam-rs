@@ -426,6 +426,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-engine"
+version = "0.1.0"
+dependencies = [
+ "adam-a2a-runtime",
+ "adam-agent-fs",
+ "adam-core",
+ "adam-error",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-runtime",
+ "adam-ui",
+]
+
+[[package]]
 name = "adam-env-kubernetes"
 version = "0.1.0"
 dependencies = [
