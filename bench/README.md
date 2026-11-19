@@ -857,7 +857,8 @@ Tests that need Docker skip unless `BENCH_TEST_DOCKER=1` and fail under `BENCH_T
 ## Unverified
 
 * **What the dry run did not cover:** a model key and a real endpoint (the scripted model is the only server the tests
-  have seen), a bookworm task image (the probe's rule is tested on fakes; the dry run's images are built from the
+  have seen), a bookworm task image in a run (the probe's rule is tested on fakes and the static coder was probed in
+  Debian 12 bookworm by hand — exit 78; the dry run's images are built from the
   workspace base), two slots at once with real task
   images, and `bench doctor --start` (the probe and the stack's `up` ran, not that command). The probe, the stack, the
   coder in the trixie self image, both arms with the pinned OpenCode binary, the grading, the budget and the kill/resume

@@ -405,8 +405,12 @@ The note above is built, with the changes ADR 0053 decision 12 makes:
   rule that a task's commands reach the meter and nothing else no longer holds, and is not claimed.
 * The bench's Postgres stays: moving it to a store service with SQLite is slice 6b.
 
-The table "Runs in" of `bench/README.md` and the stack's networks change with it. The proof is that
-`node --test "bench/test/*.test.mjs"`, `node tools/docs-check/check-docs.mjs` and `bench/dry-run.sh` pass on the owner's
-host (Docker 29.9.3 rootless, 2026-11-19); the dry run's phases and what it could not cover are in `bench/README.md`,
-"Unverified". *Unverified*: a bookworm task image (the probe refuses one until slice 1), a real OpenCode binary and a
-model key (neither was on the machine), and two slots at once with real task images.
+The table "Runs in" of `bench/README.md` and the stack's networks change with it. The proof, on the owner's host
+(Docker 29.9.3 rootless, 2026-11-19): `node --test "bench/test/*.test.mjs"` (640 tests, 637 pass, the 3 gated ones
+skipped), `node tools/docs-check/check-docs.mjs`, and `BENCH_TEST_DOCKER=1 sh bench/dry-run.sh` pass — the environment
+checks, the six runs with grades 1, 1, 0 and their costs, the budget phase, and the kill and resume. The dry run's phases
+and what it could not cover are in `bench/README.md`, "Unverified". The static build's coder was probed by hand and by
+`coderProbe` in Debian 12 bookworm: exit 78, it starts; the pre-static image the pin still names fails there with
+`GLIBC_2.38` and `GLIBC_2.39` not found, which the probe reports until the pin moves. *Unverified*: a real model endpoint
+and key (the scripted model only), a real OpenCode binary (`BENCH_TEST_OPENCODE_BIN`), and two slots at once with real
+task images.
